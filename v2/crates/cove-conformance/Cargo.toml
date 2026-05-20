@@ -12,6 +12,7 @@ cove-core = { path = "../cove-core" }
 cove-index = { path = "../cove-index" }
 cove-layout = { path = "../cove-layout" }
 cove-map = { path = "../cove-map" }
+cove-profile-validation = { path = "../cove-profile-validation" }
 cove-runtime = { path = "../cove-runtime" }
 serde_json = "1"
 arrow-array = "58"

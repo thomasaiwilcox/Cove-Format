@@ -8,14 +8,16 @@ use crate::{
     collation::CollationRegistry,
     compression,
     constants::{
-        SectionKind, StorageClass, FEATURE_ENGINE_PROFILE, FEATURE_EXTENSION_REGISTRY,
-        FEATURE_FILE_DICTIONARY, FEATURE_HARBOR_PROFILE, FEATURE_OBJECT_PROFILE,
-        FEATURE_SEMANTIC_MAP,
+        PrimaryProfile, SectionKind, StorageClass, FEATURE_ENGINE_PROFILE,
+        FEATURE_EXTENSION_REGISTRY, FEATURE_FILE_DICTIONARY, FEATURE_HARBOR_PROFILE,
+        FEATURE_OBJECT_PROFILE, FEATURE_SEMANTIC_MAP,
     },
     dictionary::FileDictionaryView,
     digest::DigestManifest,
     domain::ColumnDomain,
     extensions::{ExtensionRegistry, ExtensionValidationContext},
+    feature_binding::OperationKindV2,
+    feature_scope::FeatureUseRequestV2,
     footer::CoveSectionEntryV1,
     header::CoveHeaderV1,
     index::{
@@ -196,6 +198,7 @@ pub(super) fn validate_shared_semantics(
             | SectionKind::ProfileCapabilityMatrix
             | SectionKind::ExtendedFeatureSet
             | SectionKind::CodecExtensionRegistry
+            | SectionKind::RuntimeCompatibilityHints
             | SectionKind::LayoutPlan
             | SectionKind::ScanSplitIndex
             | SectionKind::PageClusterDirectory
@@ -242,7 +245,7 @@ pub(super) fn validate_shared_semantics(
             | SectionKind::MapEvidenceIndex
             | SectionKind::MapConversionReport
             | SectionKind::MapProjectionCatalog => {
-                if is_optional_pushdown_section(kind)
+                if is_optional_advisory_section(kind)
                     && opts.optional_pushdown_policy == OptionalPushdownPolicy::FailOpen
                 {
                     let _ = optional_section_payload(
@@ -570,6 +573,7 @@ pub(super) fn validate_cove_t_semantics(
             | SectionKind::ExecutionScopeDescriptor
             | SectionKind::CodeSpaceDescriptor
             | SectionKind::EngineMountPolicy
+            | SectionKind::RuntimeCompatibilityHints
             | SectionKind::ObjectTypeCatalog
             | SectionKind::TemporalSegmentIndex
             | SectionKind::TemporalSegmentData
@@ -627,7 +631,7 @@ fn optional_section_parse_error(
     ignored_optional_sections: &mut Vec<IgnoredOptionalSection>,
     error: CoveError,
 ) -> Result<(), CoveError> {
-    if policy == OptionalPushdownPolicy::FailOpen && is_optional_pushdown_entry(entry) {
+    if policy == OptionalPushdownPolicy::FailOpen && is_optional_advisory_entry(entry) {
         if ignored_optional_sections
             .iter()
             .any(|ignored| ignored.section_id == entry.section_id)
@@ -644,14 +648,89 @@ fn optional_section_parse_error(
     Err(error)
 }
 
-pub(super) fn is_optional_pushdown_entry(entry: &CoveSectionEntryV1) -> bool {
+pub(super) fn is_optional_advisory_entry(entry: &CoveSectionEntryV1) -> bool {
     entry.required_features == 0
         && SectionKind::from_u16(entry.section_kind)
-            .map(is_optional_pushdown_section)
+            .map(is_optional_advisory_section)
             .unwrap_or(false)
 }
 
-fn is_optional_pushdown_section(kind: SectionKind) -> bool {
+pub(super) fn ignored_section_required_for_feature_use(
+    ignored: &IgnoredOptionalSection,
+    request: &FeatureUseRequestV2,
+) -> bool {
+    if request.needed_section_ids.contains(&ignored.section_id) {
+        return true;
+    }
+    if request
+        .needed_page_refs
+        .iter()
+        .any(|target| target.section_id == ignored.section_id)
+    {
+        return true;
+    }
+    SectionKind::from_u16(ignored.section_kind)
+        .map(|kind| section_kind_required_for_feature_use(kind, request))
+        .unwrap_or(false)
+}
+
+pub(super) fn section_entry_required_for_feature_use(
+    entry: &CoveSectionEntryV1,
+    request: &FeatureUseRequestV2,
+) -> bool {
+    request.needed_section_ids.contains(&entry.section_id)
+        || request
+            .needed_page_refs
+            .iter()
+            .any(|target| target.section_id == entry.section_id)
+        || SectionKind::from_u16(entry.section_kind)
+            .map(|kind| section_kind_required_for_feature_use(kind, request))
+            .unwrap_or(false)
+}
+
+pub(super) fn is_embedded_optional_profile_section(kind: SectionKind) -> bool {
+    is_layout_section(kind)
+        || is_coverage_section(kind)
+        || matches!(
+            kind,
+            SectionKind::IndexOnlyCapability | SectionKind::RuntimeCompatibilityHints
+        )
+}
+
+fn section_kind_required_for_feature_use(kind: SectionKind, request: &FeatureUseRequestV2) -> bool {
+    request
+        .requested_operation
+        .map(|operation| operation_requires_section(operation, kind))
+        .unwrap_or(false)
+        || request
+            .requested_profile
+            .map(|profile| profile_requires_section(profile, kind))
+            .unwrap_or(false)
+}
+
+fn operation_requires_section(operation: OperationKindV2, kind: SectionKind) -> bool {
+    match operation {
+        OperationKindV2::CoveragePlanning => is_coverage_section(kind),
+        OperationKindV2::IndexOnlyAnswer => kind == SectionKind::IndexOnlyCapability,
+        OperationKindV2::ZeroCopyExport => kind == SectionKind::ZeroCopyBufferMap,
+        OperationKindV2::RuntimeAdapterSelection => kind == SectionKind::RuntimeCompatibilityHints,
+        _ => false,
+    }
+}
+
+fn profile_requires_section(profile: u8, kind: SectionKind) -> bool {
+    match PrimaryProfile::from_u8(profile) {
+        Some(PrimaryProfile::LayoutPlanning) => is_layout_section(kind),
+        Some(PrimaryProfile::RuntimeCompatibility) => {
+            kind == SectionKind::RuntimeCompatibilityHints
+        }
+        Some(PrimaryProfile::CoverageMetadata) => is_coverage_section(kind),
+        Some(PrimaryProfile::SecondaryIndex) => kind == SectionKind::IndexOnlyCapability,
+        _ => false,
+    }
+}
+
+fn is_optional_advisory_section(kind: SectionKind) -> bool {
     matches!(
         kind,
         SectionKind::ColumnDomain
@@ -662,6 +741,40 @@ fn is_optional_pushdown_section(kind: SectionKind) -> bool {
             | SectionKind::AggregateSynopsis
             | SectionKind::CompositeZoneIndex
             | SectionKind::TopNZoneSummary
+            | SectionKind::LayoutPlan
+            | SectionKind::ScanSplitIndex
+            | SectionKind::PageClusterDirectory
+            | SectionKind::ZeroCopyBufferMap
+            | SectionKind::FastMetadataIndex
+            | SectionKind::CoverageProviderRegistry
+            | SectionKind::CoverageSet
+            | SectionKind::CoveragePlanCandidate
+            | SectionKind::PredicateNormalForm
+            | SectionKind::CoverageProofRecord
+            | SectionKind::IndexOnlyCapability
+            | SectionKind::RuntimeCompatibilityHints
+    )
+}
+
+fn is_layout_section(kind: SectionKind) -> bool {
+    matches!(
+        kind,
+        SectionKind::LayoutPlan
+            | SectionKind::ScanSplitIndex
+            | SectionKind::PageClusterDirectory
+            | SectionKind::ZeroCopyBufferMap
+            | SectionKind::FastMetadataIndex
+    )
+}
+
+fn is_coverage_section(kind: SectionKind) -> bool {
+    matches!(
+        kind,
+        SectionKind::CoverageProviderRegistry
+            | SectionKind::CoverageSet
+            | SectionKind::CoveragePlanCandidate
+            | SectionKind::PredicateNormalForm
+            | SectionKind::CoverageProofRecord
     )
 }
 

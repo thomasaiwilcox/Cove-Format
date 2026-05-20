@@ -4,8 +4,8 @@ use std::{collections::BTreeSet, ops::Range, path::Path, sync::Arc};
 
 use cove_core::{
     canonical::CanonicalValue,
-    constants::{CoveLogicalType, CovePhysicalKind},
-    CoveError,
+    constants::{CoveLogicalType, CovePhysicalKind, ValueTag},
+    wire, CoveError,
 };
 use serde_json::{json, Value};
 
@@ -443,6 +443,7 @@ fn build_filter_plan(state: &DatasetState, filter: &FilterDsl) -> Result<FilterP
         FilterOp::In if column.physical == CovePhysicalKind::FileCode => {
             let raw_values = filter.value.as_deref().unwrap_or_default();
             let mut canonical_values = Vec::new();
+            let mut canonical_keys = Vec::new();
             let mut file_codes = Vec::new();
             for value in raw_values
                 .split('|')
@@ -452,17 +453,19 @@ fn build_filter_plan(state: &DatasetState, filter: &FilterDsl) -> Result<FilterP
                 let canonical = canonical_literal(column.logical, value)?;
                 for file_ordinal in 0..state.file_count() {
                     if let Some(file_code) =
-                        state.file_code_for_canonical(file_ordinal, &canonical)?
+                        state.file_code_for_canonical(file_ordinal, &canonical.payload)?
                     {
                         file_codes.push(file_code);
                     }
                 }
-                canonical_values.push(canonical);
+                canonical_values.push(canonical.payload);
+                canonical_keys.push(canonical.key);
             }
-            Ok(FilterPlan::pruning_file_code_in_with_canonical(
+            Ok(FilterPlan::pruning_file_code_in_with_canonical_keys(
                 column_index,
                 file_codes,
                 canonical_values,
+                canonical_keys,
                 display,
             ))
         }
@@ -471,14 +474,17 @@ fn build_filter_plan(state: &DatasetState, filter: &FilterDsl) -> Result<FilterP
             let canonical = canonical_literal(column.logical, value)?;
             let mut file_codes = Vec::new();
             for file_ordinal in 0..state.file_count() {
-                if let Some(file_code) = state.file_code_for_canonical(file_ordinal, &canonical)? {
+                if let Some(file_code) =
+                    state.file_code_for_canonical(file_ordinal, &canonical.payload)?
+                {
                     file_codes.push(file_code);
                 }
             }
-            Ok(FilterPlan::pruning_file_code_in_with_canonical(
+            Ok(FilterPlan::pruning_file_code_in_with_canonical_keys(
                 column_index,
                 file_codes,
-                vec![canonical],
+                vec![canonical.payload],
+                vec![canonical.key],
                 display,
             ))
         }
@@ -573,14 +579,22 @@ fn filter_display(column_name: &str, filter: &FilterDsl) -> String {
     }
 }
 
-fn canonical_literal(logical: CoveLogicalType, value: &str) -> Result<Vec<u8>, CoveError> {
+struct FilterCanonicalLiteral {
+    payload: Vec<u8>,
+    key: Vec<u8>,
+}
+
+fn canonical_literal(
+    logical: CoveLogicalType,
+    value: &str,
+) -> Result<FilterCanonicalLiteral, CoveError> {
     match logical {
-        CoveLogicalType::Utf8 => CanonicalValue::Utf8(value).encode(),
+        CoveLogicalType::Utf8 => tagged_canonical_literal(CanonicalValue::Utf8(value)),
         CoveLogicalType::Binary => {
             let bytes = parse_bytes_literal(value)?;
-            CanonicalValue::Bytes(&bytes).encode()
+            tagged_canonical_literal(CanonicalValue::Bytes(&bytes))
         }
-        CoveLogicalType::Bool => CanonicalValue::Bool(parse_bool(value)?).encode(),
+        CoveLogicalType::Bool => tagged_canonical_literal(CanonicalValue::Bool(parse_bool(value)?)),
         CoveLogicalType::Int8
         | CoveLogicalType::Int16
         | CoveLogicalType::Int32
@@ -588,7 +602,7 @@ fn canonical_literal(logical: CoveLogicalType, value: &str) -> Result<Vec<u8>, C
             width: integer_width(logical),
             value: i128::from(parse_i64(value)?),
         }
-        .encode(),
+        .pipe_tagged(),
         CoveLogicalType::UInt8
         | CoveLogicalType::UInt16
         | CoveLogicalType::UInt32
@@ -596,21 +610,55 @@ fn canonical_literal(logical: CoveLogicalType, value: &str) -> Result<Vec<u8>, C
             width: integer_width(logical),
             value: u128::from(parse_u64(value)?),
         }
-        .encode(),
-        CoveLogicalType::Float32 => CanonicalValue::Float32(parse_f64(value)? as f32).encode(),
-        CoveLogicalType::Float64 => CanonicalValue::Float64(parse_f64(value)?).encode(),
-        CoveLogicalType::DateDays => CanonicalValue::DateDays(parse_i64(value)? as i32).encode(),
+        .pipe_tagged(),
+        CoveLogicalType::Float32 => {
+            tagged_canonical_literal(CanonicalValue::Float32(parse_f64(value)? as f32))
+        }
+        CoveLogicalType::Float64 => {
+            tagged_canonical_literal(CanonicalValue::Float64(parse_f64(value)?))
+        }
+        CoveLogicalType::DateDays => {
+            tagged_canonical_literal(CanonicalValue::DateDays(parse_i64(value)? as i32))
+        }
         CoveLogicalType::TimestampMicros => {
-            CanonicalValue::TimestampMicros(parse_i64(value)?).encode()
+            tagged_canonical_literal(CanonicalValue::TimestampMicros(parse_i64(value)?))
         }
         CoveLogicalType::TimestampNanos => {
-            CanonicalValue::TimestampNanos(parse_i64(value)?).encode()
+            tagged_canonical_literal(CanonicalValue::TimestampNanos(parse_i64(value)?))
         }
-        CoveLogicalType::Json => CanonicalValue::Json(value).encode(),
+        CoveLogicalType::Json => tagged_canonical_literal(CanonicalValue::Json(value)),
         _ => Err(CoveError::UnsupportedEncoding(format!(
             "filter DSL cannot encode canonical literal for {logical:?}"
         ))),
     }
+}
+
+trait FilterCanonicalLiteralExt<'a> {
+    fn pipe_tagged(self) -> Result<FilterCanonicalLiteral, CoveError>;
+}
+
+impl<'a> FilterCanonicalLiteralExt<'a> for CanonicalValue<'a> {
+    fn pipe_tagged(self) -> Result<FilterCanonicalLiteral, CoveError> {
+        tagged_canonical_literal(self)
+    }
+}
+
+fn tagged_canonical_literal(
+    value: CanonicalValue<'_>,
+) -> Result<FilterCanonicalLiteral, CoveError> {
+    let tag = value.value_tag();
+    let payload = value.encode()?;
+    Ok(FilterCanonicalLiteral {
+        key: tagged_key(tag, &payload),
+        payload,
+    })
+}
+
+fn tagged_key(tag: ValueTag, payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + payload.len());
+    wire::append_u64_leb128(&mut out, tag as u64);
+    out.extend_from_slice(payload);
+    out
 }
 
 fn numeric_literal(logical: CoveLogicalType, value: &str) -> Result<PredicateLiteral, CoveError> {

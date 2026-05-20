@@ -6,6 +6,9 @@ use cove_core::{
     feature_scope::FeatureUseRequestV2,
     reader::{self, ValidationOptions},
 };
+use cove_profile_validation::{
+    validate_embedded_optional_profile_sections, EmbeddedOptionalProfileValidator,
+};
 
 use crate::{args::CliArgs, format::profile_name};
 
@@ -279,10 +282,25 @@ fn validate_cove_bytes(
     opts: ValidationOptions,
     feature_use: Option<FeatureUseRequestV2>,
 ) -> Result<reader::ValidationReport, cove_core::CoveError> {
-    match feature_use {
-        Some(request) => reader::validate_bytes_for_feature_use(data, opts, request),
+    let optional_pushdown_policy = opts.optional_pushdown_policy;
+    let embedded_feature_use = feature_use.clone();
+    let validator = EmbeddedOptionalProfileValidator;
+    let report = match feature_use {
+        Some(request) => reader::validate_bytes_for_feature_use_with_optional_profile_validator(
+            data, opts, request, &validator,
+        ),
         None => reader::validate_bytes_with_options(data, opts),
+    }?;
+    if report.semantic_checked || embedded_feature_use.is_some() {
+        validate_embedded_optional_profile_sections(
+            data,
+            &report,
+            optional_pushdown_policy,
+            embedded_feature_use.as_ref(),
+            !report.semantic_checked,
+        )?;
     }
+    Ok(report)
 }
 
 fn validate_covemap_bytes(

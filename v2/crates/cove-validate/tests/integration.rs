@@ -32,6 +32,12 @@ fn reject_fixture(name: &str) -> std::path::PathBuf {
         .join(name)
 }
 
+fn runtime_fixture(name: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../conformance/runtime")
+        .join(name)
+}
+
 fn run_validate(path: &std::path::Path, semantic: bool) -> std::process::Output {
     let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_cove-validate"));
     if semantic {
@@ -50,6 +56,14 @@ fn run_validate_json_explain(path: &std::path::Path, semantic: bool) -> std::pro
         .arg(path)
         .output()
         .unwrap()
+}
+
+fn run_validate_with_args(path: &std::path::Path, args: &[&str]) -> std::process::Output {
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_cove-validate"));
+    for arg in args {
+        cmd.arg(arg);
+    }
+    cmd.arg("--json").arg(path).output().unwrap()
 }
 
 fn dictionary_index_bytes(redacted: bool) -> Vec<u8> {
@@ -852,5 +866,53 @@ fn semantic_cli_rejects_bad_table_segment_payload() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(!output.status.success());
     assert!(stdout.contains("COVE_E_SEGMENT_CORRUPT"));
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn requested_runtime_operation_rejects_required_hint_without_semantic_flag() {
+    let path = runtime_fixture("runtime_hints_embedded_required_unsupported_reject.cove");
+    let output = run_validate_with_args(
+        &path,
+        &["--requested-operation", "runtime_adapter_selection"],
+    );
+    assert!(!output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("COVE_E_RUNTIME_HINT_UNSUPPORTED"));
+}
+
+#[test]
+fn structural_validation_still_ignores_required_runtime_hint() {
+    let path = runtime_fixture("runtime_hints_embedded_required_unsupported_reject.cove");
+    let output = run_validate(&path, false);
+    assert!(output.status.success());
+}
+
+#[test]
+fn requested_runtime_operation_skips_unrelated_optional_sections_without_semantic_flag() {
+    let mut writer = MinimalCoveWriter::new();
+    writer.primary_profile = PrimaryProfile::Mixed as u8;
+    writer.optional_features = FEATURE_ENGINE_PROFILE;
+    writer.sections.push(SectionPayload {
+        section_kind: SectionKind::ExecutionCodeDescriptor as u16,
+        profile: 4,
+        flags: 0,
+        item_count: 1,
+        row_count: 0,
+        compression: 0,
+        alignment_log2: 0,
+        required_features: 0,
+        optional_features: FEATURE_ENGINE_PROFILE,
+        data: invalid_execution_descriptor_payload(),
+    });
+    let path = write_temp_file(
+        "runtime_request_unrelated_optional_bad",
+        &writer.write().unwrap(),
+    );
+    let output = run_validate_with_args(
+        &path,
+        &["--requested-operation", "runtime_adapter_selection"],
+    );
+    assert!(output.status.success());
     let _ = std::fs::remove_file(&path);
 }

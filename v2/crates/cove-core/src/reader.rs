@@ -25,7 +25,8 @@ mod digest_verification;
 mod reports;
 
 pub use reports::{
-    validate_bytes_for_feature_use, validate_bytes_with_options, IgnoredOptionalSection,
+    validate_bytes_for_feature_use, validate_bytes_for_feature_use_with_optional_profile_validator,
+    validate_bytes_with_options, IgnoredOptionalSection, OptionalProfilePayloadValidator,
     OptionalPushdownPolicy, ValidationOptions, ValidationReport, ValidationStage,
     ValidationStageReport, ValidationStageStatus,
 };
@@ -133,7 +134,7 @@ fn validate_sections(
         let section_bytes = &data[entry.offset as usize..section_end as usize];
         if checksum::crc32c(section_bytes) != entry.crc32c {
             if optional_pushdown_policy == OptionalPushdownPolicy::FailOpen
-                && profile_validators::is_optional_pushdown_entry(entry)
+                && profile_validators::is_optional_advisory_entry(entry)
             {
                 ignored_optional_sections.push(IgnoredOptionalSection {
                     section_id: entry.section_id,
@@ -441,6 +442,8 @@ fn validate_section_profile(section_kind: u16, profile: u8) -> Result<(), CoveEr
         | SectionKind::FastMetadataIndex
         | SectionKind::SectionFeatureBinding
         | SectionKind::VendorExtension => &[0],
+        // COVE-R (profile 9)
+        SectionKind::RuntimeCompatibilityHints => &[9],
         // COVE-T only (profile 2)
         SectionKind::TableCatalog
         | SectionKind::NestedSchema
@@ -513,9 +516,11 @@ mod tests {
     use crate::{constants::CompressionCodec, footer::CoveFooter};
     use crate::{
         constants::{
-            SectionKind, FEATURE_BLOOM_FILTERS, FEATURE_CODEC_LZ4, FEATURE_ENGINE_PROFILE,
-            FEATURE_EXTENDED_FEATURE_SET, FEATURE_EXTENSION_REGISTRY, FEATURE_FILE_DICTIONARY,
-            FEATURE_HARBOR_PROFILE, FEATURE_OBJECT_PROFILE, FEATURE_TABLE_PROFILE,
+            SectionKind, FEATURE_BLOOM_FILTERS, FEATURE_CODEC_LZ4, FEATURE_COVERAGE_METADATA,
+            FEATURE_ENGINE_PROFILE, FEATURE_EXTENDED_FEATURE_SET, FEATURE_EXTENSION_REGISTRY,
+            FEATURE_FILE_DICTIONARY, FEATURE_HARBOR_PROFILE, FEATURE_INDEX_ONLY_CAPABILITY,
+            FEATURE_LAYOUT_PLAN, FEATURE_OBJECT_PROFILE, FEATURE_RUNTIME_COMPATIBILITY_HINTS,
+            FEATURE_SECONDARY_INDEX_ARTIFACT, FEATURE_TABLE_PROFILE,
         },
         digest::{DigestEntry, DigestManifest, DigestScope, DigestTargetKind},
         extensions::{ExtensionKind, ExtensionRegistry, ExtensionRegistryEntry},
@@ -545,6 +550,31 @@ mod tests {
             alignment_log2: 0,
             required_features: 0,
             optional_features: FEATURE_BLOOM_FILTERS,
+            data,
+        });
+        writer.write().unwrap()
+    }
+
+    fn optional_advisory_fixture(
+        section_kind: SectionKind,
+        profile: PrimaryProfile,
+        feature: u64,
+        data: Vec<u8>,
+    ) -> Vec<u8> {
+        let mut writer = MinimalCoveWriter::new();
+        writer.primary_profile = PrimaryProfile::Mixed as u8;
+        writer.required_features = 0;
+        writer.optional_features = feature;
+        writer.sections.push(SectionPayload {
+            section_kind: section_kind as u16,
+            profile: profile as u8,
+            flags: 0,
+            item_count: 1,
+            row_count: 0,
+            compression: 0,
+            alignment_log2: 0,
+            required_features: 0,
+            optional_features: feature,
             data,
         });
         writer.write().unwrap()
@@ -823,6 +853,108 @@ mod tests {
         )
         .unwrap();
         assert_eq!(report.ignored_optional_sections.len(), 1);
+    }
+
+    #[test]
+    fn fail_open_ignores_optional_advisory_crc_mismatch() {
+        let cases = [
+            (
+                SectionKind::LayoutPlan,
+                PrimaryProfile::LayoutPlanning,
+                FEATURE_LAYOUT_PLAN,
+            ),
+            (
+                SectionKind::CoverageSet,
+                PrimaryProfile::CoverageMetadata,
+                FEATURE_COVERAGE_METADATA,
+            ),
+            (
+                SectionKind::IndexOnlyCapability,
+                PrimaryProfile::SecondaryIndex,
+                FEATURE_SECONDARY_INDEX_ARTIFACT | FEATURE_INDEX_ONLY_CAPABILITY,
+            ),
+            (
+                SectionKind::RuntimeCompatibilityHints,
+                PrimaryProfile::RuntimeCompatibility,
+                FEATURE_RUNTIME_COMPATIBILITY_HINTS,
+            ),
+        ];
+
+        for (section_kind, profile, feature) in cases {
+            let mut bytes = optional_advisory_fixture(section_kind, profile, feature, vec![1; 16]);
+            corrupt_first_section_byte(&mut bytes);
+            let report = validate_bytes_with_options(
+                &bytes,
+                ValidationOptions {
+                    semantic: false,
+                    verify_digests: false,
+                    allow_unknown_optional_extensions: true,
+                    optional_pushdown_policy: OptionalPushdownPolicy::FailOpen,
+                },
+            )
+            .expect("optional advisory CRC mismatch should fail open");
+            assert_eq!(
+                report.ignored_optional_sections.len(),
+                1,
+                "{section_kind:?}"
+            );
+            assert_eq!(
+                report.ignored_optional_sections[0].section_kind,
+                section_kind as u16
+            );
+        }
+    }
+
+    #[test]
+    fn fail_open_rejects_ignored_advisory_section_when_requested() {
+        let mut layout = optional_advisory_fixture(
+            SectionKind::LayoutPlan,
+            PrimaryProfile::LayoutPlanning,
+            FEATURE_LAYOUT_PLAN,
+            vec![1; 16],
+        );
+        corrupt_first_section_byte(&mut layout);
+        let opts = ValidationOptions {
+            semantic: false,
+            verify_digests: false,
+            allow_unknown_optional_extensions: true,
+            optional_pushdown_policy: OptionalPushdownPolicy::FailOpen,
+        };
+        assert_eq!(
+            validate_bytes_for_feature_use(
+                &layout,
+                opts.clone(),
+                FeatureUseRequestV2::new().with_section(1),
+            )
+            .map(|_| ()),
+            Err(CoveError::ChecksumMismatch)
+        );
+        assert_eq!(
+            validate_bytes_for_feature_use(
+                &layout,
+                opts.clone(),
+                FeatureUseRequestV2::new().with_profile(PrimaryProfile::LayoutPlanning as u8),
+            )
+            .map(|_| ()),
+            Err(CoveError::ChecksumMismatch)
+        );
+
+        let mut runtime = optional_advisory_fixture(
+            SectionKind::RuntimeCompatibilityHints,
+            PrimaryProfile::RuntimeCompatibility,
+            FEATURE_RUNTIME_COMPATIBILITY_HINTS,
+            vec![1; 16],
+        );
+        corrupt_first_section_byte(&mut runtime);
+        assert_eq!(
+            validate_bytes_for_feature_use(
+                &runtime,
+                opts,
+                FeatureUseRequestV2::new().with_operation(OperationKindV2::RuntimeAdapterSelection),
+            )
+            .map(|_| ()),
+            Err(CoveError::ChecksumMismatch)
+        );
     }
 
     #[test]

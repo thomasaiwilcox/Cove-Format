@@ -5,6 +5,7 @@ use arrow_schema::SchemaRef;
 use cove_core::{
     canonical::CanonicalValue,
     constants::{CoveLogicalType, ValueTag},
+    wire,
 };
 use cove_core::{constants::CovePhysicalKind, CoveError};
 #[cfg(feature = "covi")]
@@ -119,6 +120,8 @@ pub enum CovePredicate {
         /// Canonical dictionary values are the source of truth and must be
         /// resolved against each concrete file before pruning or execution.
         canonical_values: Vec<Vec<u8>>,
+        /// COVE-I CanonicalValueBytes keys: [value_tag: varint][canonical payload].
+        canonical_keys: Vec<Vec<u8>>,
     },
     VarBytesEq {
         column_index: usize,
@@ -230,18 +233,37 @@ impl FilterPlan {
 
     pub fn pruning_file_code_in_with_canonical(
         column_index: usize,
+        file_codes: Vec<u32>,
+        canonical_values: Vec<Vec<u8>>,
+        display: impl Into<String>,
+    ) -> Self {
+        Self::pruning_file_code_in_with_canonical_keys(
+            column_index,
+            file_codes,
+            canonical_values,
+            Vec::new(),
+            display,
+        )
+    }
+
+    pub fn pruning_file_code_in_with_canonical_keys(
+        column_index: usize,
         mut file_codes: Vec<u32>,
         mut canonical_values: Vec<Vec<u8>>,
+        mut canonical_keys: Vec<Vec<u8>>,
         display: impl Into<String>,
     ) -> Self {
         file_codes.sort_unstable();
         file_codes.dedup();
         canonical_values.sort();
         canonical_values.dedup();
+        canonical_keys.sort();
+        canonical_keys.dedup();
         let predicate = CovePredicate::FileCodeIn {
             column_index,
             file_codes,
             canonical_values,
+            canonical_keys,
         };
         Self {
             use_kind: CoveFilterUse::PruningOnly,
@@ -425,14 +447,19 @@ fn lookup_keys_for_predicate(
         CovePredicate::FileCodeIn {
             column_index,
             canonical_values,
+            canonical_keys,
             ..
         } => {
             let column = &state.table().columns[*column_index];
-            let tag = value_tag_for_logical(column.logical)?;
-            let keys = canonical_values
-                .iter()
-                .map(|value| tagged_key(tag, value.clone()))
-                .collect::<Vec<_>>();
+            let keys = if !canonical_keys.is_empty() {
+                canonical_keys.clone()
+            } else {
+                let tag = value_tag_for_logical(column.logical)?;
+                canonical_values
+                    .iter()
+                    .map(|value| tagged_key(tag, value.clone()))
+                    .collect::<Vec<_>>()
+            };
             Some((*column_index, keys))
         }
         CovePredicate::VarBytesEq {
@@ -499,7 +526,6 @@ fn value_tag_for_logical(logical: CoveLogicalType) -> Option<ValueTag> {
     match logical {
         CoveLogicalType::Utf8 => Some(ValueTag::Utf8),
         CoveLogicalType::Binary => Some(ValueTag::Binary),
-        CoveLogicalType::Bool => Some(ValueTag::BoolTrue),
         CoveLogicalType::Int8
         | CoveLogicalType::Int16
         | CoveLogicalType::Int32
@@ -531,7 +557,7 @@ fn tagged_canonical(value: CanonicalValue<'_>) -> Result<Vec<u8>, CoveError> {
 #[cfg(feature = "covi")]
 fn tagged_key(tag: ValueTag, payload: Vec<u8>) -> Vec<u8> {
     let mut out = Vec::with_capacity(2 + payload.len());
-    out.extend_from_slice(&(tag as u16).to_le_bytes());
+    wire::append_u64_leb128(&mut out, tag as u64);
     out.extend_from_slice(&payload);
     out
 }
@@ -631,7 +657,8 @@ fn validate_filter_shapes(state: &DatasetState, filters: &[FilterPlan]) -> Resul
 
 #[cfg(test)]
 mod tests {
-    use super::PredicateLiteral;
+    use super::*;
+    use cove_core::wire;
 
     #[test]
     fn float_predicate_literals_compare_deterministically() {
@@ -647,5 +674,31 @@ mod tests {
             PredicateLiteral::Float64(f64::from_bits(0x7ff8_0000_0000_0001)),
             PredicateLiteral::Float64(f64::from_bits(0x7ff8_0000_0000_0002))
         );
+    }
+
+    #[cfg(feature = "covi")]
+    #[test]
+    fn covi_canonical_keys_use_varint_value_tags() {
+        let key = tagged_key(ValueTag::Utf8, vec![3, b'f', b'o', b'o']);
+        let (tag, consumed) = wire::decode_u64_leb128(&key).unwrap();
+        assert_eq!(tag, ValueTag::Utf8 as u64);
+        assert_eq!(consumed, 1);
+        assert_eq!(&key[consumed..], &[3, b'f', b'o', b'o']);
+    }
+
+    #[cfg(feature = "covi")]
+    #[test]
+    fn bool_payload_only_filecode_predicates_do_not_derive_covi_keys() {
+        assert_eq!(value_tag_for_logical(CoveLogicalType::Bool), None);
+    }
+
+    #[cfg(feature = "covi")]
+    #[test]
+    fn bool_filecode_covi_keys_preserve_truth_value_tags() {
+        let false_key = tagged_key(ValueTag::BoolFalse, Vec::new());
+        let true_key = tagged_key(ValueTag::BoolTrue, Vec::new());
+        assert_ne!(false_key, true_key);
+        assert_eq!(false_key, vec![ValueTag::BoolFalse as u8]);
+        assert_eq!(true_key, vec![ValueTag::BoolTrue as u8]);
     }
 }

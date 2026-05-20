@@ -45,8 +45,10 @@ use cove_core::{
         FEATURE_CODEC_LZ4, FEATURE_CODEC_ZSTD, FEATURE_COLUMN_DOMAINS, FEATURE_ENGINE_PROFILE,
         FEATURE_EXTENDED_FEATURE_SET, FEATURE_FILE_DICTIONARY, FEATURE_HARBOR_PROFILE,
         FEATURE_LAYOUT_PLAN, FEATURE_OBJECT_PROFILE, FEATURE_PAGE_PAYLOAD_ELISION,
-        FEATURE_REGISTERED_ENCODINGS, FEATURE_SEMANTIC_MAP, FEATURE_TABLE_PROFILE,
-        FEATURE_TRUST_CHAIN, FEATURE_ZERO_COPY_BUFFER_MAP,
+        FEATURE_REGISTERED_ENCODINGS, FEATURE_RUNTIME_COMPATIBILITY_HINTS,
+        FEATURE_SECONDARY_INDEX_ARTIFACT, FEATURE_SEMANTIC_MAP, FEATURE_TABLE_PROFILE,
+        FEATURE_TRUST_CHAIN, FEATURE_ZERO_COPY_BUFFER_MAP, MAGIC_COVI, POSTSCRIPT_VERSION_V1,
+        VERSION_MAJOR_V1,
     },
     dictionary::{FileDictionaryHeaderV1, FileDictionaryIndexEntryV1},
     digest::{compute_digest, DigestEntry, DigestManifest, DigestScope, DigestTargetKind},
@@ -163,14 +165,15 @@ use cove_coverage::{
 use cove_index::{
     CoviAggregateAnswerBlockHeaderV2, CoviAggregateAnswerBlockV2, CoviAggregateAnswerV2,
     CoviArtifactV2, CoviByteRangePostingV2, CoviComparatorKindV2, CoviDimensionalBucketPostingV2,
-    CoviEntryBlockHeaderV2, CoviEntryBlockV2, CoviFileRefPostingV2, CoviIndexEntryV2,
+    CoviEntryBlockHeaderV2, CoviEntryBlockV2, CoviFileRefPostingV2, CoviHeaderV2, CoviIndexEntryV2,
     CoviIndexKindV2, CoviIndexRootV2, CoviIndexedTargetKindV2, CoviKeyBlockHeaderV2,
     CoviKeyBlockV2, CoviKeyEncodingKindV2, CoviMorselRefPostingV2, CoviObjectPathPostingV2,
     CoviPageRefPostingV2, CoviPostingRepresentationV2, CoviPostingsBlockHeaderV2,
-    CoviPostingsBlockV2, CoviPostingsHeaderV2, CoviReferencedFileV2, CoviRowOrdinalSetHeaderV2,
-    CoviRowRangePostingV2, CoviSectionKindV2, CoviSectionPayloadV2, CoviSegmentRefPostingV2,
-    CoviSnapshotValidityV2, IndexCapabilityExactnessV2, IndexCapabilityV2, IndexOnlyCapabilityV2,
-    COVI_HEADER_LEN, COVI_SECTION_ENTRY_LEN,
+    CoviPostingsBlockV2, CoviPostingsHeaderV2, CoviPostscriptV2, CoviReferencedFileV2,
+    CoviRowOrdinalSetHeaderV2, CoviRowRangePostingV2, CoviSectionEntryV2, CoviSectionKindV2,
+    CoviSectionPayloadV2, CoviSegmentRefPostingV2, CoviSnapshotValidityV2,
+    IndexCapabilityExactnessV2, IndexCapabilityV2, IndexOnlyCapabilityV2, COVI_HEADER_LEN,
+    COVI_POSTSCRIPT_LEN, COVI_SECTION_ENTRY_LEN, COVI_TAIL_LEN,
 };
 use cove_layout::{
     build_default_layout_plan, build_default_scan_split_index, FastMetadataIndexEntryV2,
@@ -320,6 +323,32 @@ fn main() {
             &["§19", "§24", "§25", "§73"],
         ),
         cove_t_bool_numcode_file(true),
+    );
+
+    write_fixture(
+        &root,
+        &mut entries,
+        fixture(
+            "reject/cove_t_bool_numcode_invalid_value.cove",
+            "cove",
+            "reject",
+            Some("COVE_E_PAGE_CORRUPT"),
+            &["§19", "§24", "§27.3", "§73", "§76"],
+        ),
+        cove_t_bool_numcode_invalid_value_file(),
+    );
+
+    write_fixture(
+        &root,
+        &mut entries,
+        fixture(
+            "accept/cove_t_constant_numcode_high_bits.cove",
+            "cove",
+            "accept",
+            None,
+            &["§20.3", "§73"],
+        ),
+        cove_t_constant_numcode_high_bits_file(),
     );
 
     write_fixture(
@@ -5818,6 +5847,32 @@ fn write_v2_profile_fixtures(root: &Path, entries: &mut Vec<Value>) {
         ),
         runtime_operation_case_payload(),
     );
+    write_fixture(
+        root,
+        entries,
+        fixture(
+            "runtime/runtime_hints_embedded_valid.cove",
+            "cove",
+            "accept",
+            None,
+            &["§67.8", "§73"],
+        ),
+        cove_with_runtime_hints_section(false),
+    );
+    write_fixture(
+        root,
+        entries,
+        feature_scope_use_fixture(
+            "runtime/runtime_hints_embedded_required_unsupported_reject.cove",
+            "reject",
+            Some("COVE_E_RUNTIME_HINT_UNSUPPORTED"),
+            Some(PrimaryProfile::RuntimeCompatibility as u8),
+            Some(OperationKindV2::RuntimeAdapterSelection),
+            &[],
+            &[],
+        ),
+        cove_with_runtime_hints_section(true),
+    );
 
     write_fixture(
         root,
@@ -6258,6 +6313,50 @@ fn write_v2_profile_fixtures(root: &Path, entries: &mut Vec<Value>) {
             &["§11", "§11.1", "§67.5", "§73"],
         ),
         cove_with_optional_layout_section(),
+    );
+    write_fixture(
+        root,
+        entries,
+        fixture(
+            "feature-scope/optional_layout_crc_ignored.cove",
+            "cove",
+            "accept",
+            None,
+            &["§11", "§11.1", "§67.5", "§73"],
+        ),
+        corrupt_first_section_payload_crc(
+            cove_with_optional_layout_section(),
+            SectionKind::LayoutPlan,
+        ),
+    );
+    write_fixture(
+        root,
+        entries,
+        feature_scope_use_fixture(
+            "feature-scope/requested_layout_crc_reject.cove",
+            "reject",
+            Some("COVE_E_CHECKSUM_MISMATCH"),
+            Some(PrimaryProfile::LayoutPlanning as u8),
+            None,
+            &[],
+            &[],
+        ),
+        corrupt_first_section_payload_crc(
+            cove_with_optional_layout_section(),
+            SectionKind::LayoutPlan,
+        ),
+    );
+    write_fixture(
+        root,
+        entries,
+        fixture(
+            "feature-scope/required_layout_bad_payload_reject.cove",
+            "cove",
+            "reject",
+            Some("COVE_E_BAD_LAYOUT_PLAN"),
+            &["§67.5", "§73"],
+        ),
+        cove_with_required_bad_layout_section(),
     );
     let scoped_operation = cove_with_operation_scoped_unknown_feature();
     write_fixture(
@@ -6925,10 +7024,14 @@ fn scan_split_index_duplicate_payload() -> Vec<u8> {
 }
 
 fn runtime_hints_payload() -> Vec<u8> {
+    runtime_hints_payload_with_required(false)
+}
+
+fn runtime_hints_payload_with_required(required: bool) -> Vec<u8> {
     RuntimeCompatibilityHintV2 {
         hint_id: 1,
         hint_kind: RuntimeHintKindV2::EngineAdapter,
-        required: false,
+        required,
         flags: 0,
         namespace: "org.cove".into(),
         name: "datafusion".into(),
@@ -7365,6 +7468,18 @@ fn covi_hardening_cases() -> Vec<CoviHardeningCase> {
         json!({}),
         json!({"file_digest": vec![0xEEu8; 32]}),
     );
+    let bad_root_enum = covi_case_payload(
+        covi_bad_root_logical_type_artifact(),
+        "valid",
+        json!({"kind": "validate"}),
+        json!({}),
+    );
+    let malformed_unsorted_key = covi_case_payload(
+        covi_malformed_unsorted_key_artifact(),
+        "valid",
+        json!({"kind": "validate"}),
+        json!({}),
+    );
     let schema_stale = covi_case_payload_with_context(
         covi_row_range_artifact_with_snapshot_refs(7, u32::MAX, u32::MAX),
         "stale_ignored",
@@ -7499,6 +7614,20 @@ fn covi_hardening_cases() -> Vec<CoviHardeningCase> {
             ),
         },
         CoviHardeningCase {
+            path: "covi/root_bad_logical_type_reject.json",
+            expect: "reject",
+            error_code: Some("COVE_E_BAD_COVI"),
+            sections: &["§33.1"],
+            payload: bad_root_enum,
+        },
+        CoviHardeningCase {
+            path: "covi/unsorted_malformed_key_reject.json",
+            expect: "reject",
+            error_code: Some("COVE_E_BAD_COVI"),
+            sections: &["§33.1"],
+            payload: malformed_unsorted_key,
+        },
+        CoviHardeningCase {
             path: "covi/duplicate_key_without_chain_reject.json",
             expect: "reject",
             error_code: Some("COVE_E_BAD_COVI"),
@@ -7628,7 +7757,9 @@ fn covi_test_digest() -> Vec<u8> {
 }
 
 fn key_bytes(value: u8) -> Vec<u8> {
-    vec![value]
+    let mut out = cove_core::wire::encode_u64_leb128(ValueTag::Int64 as u64);
+    out.extend_from_slice(&(value as i64).to_le_bytes());
+    out
 }
 
 fn covi_row_range_artifact() -> Vec<u8> {
@@ -8037,6 +8168,35 @@ fn covi_unsorted_entries_artifact() -> Vec<u8> {
     )
 }
 
+fn covi_bad_root_logical_type_artifact() -> Vec<u8> {
+    covi_artifact_for_postings(
+        vec![key_bytes(1)],
+        vec![row_range_posting_spec()],
+        Vec::new(),
+        None,
+        RootOverrides {
+            logical_type: 254,
+            unchecked_root: true,
+            unchecked_artifact: true,
+            ..RootOverrides::default()
+        },
+    )
+}
+
+fn covi_malformed_unsorted_key_artifact() -> Vec<u8> {
+    covi_artifact_for_postings(
+        vec![vec![0xfe]],
+        vec![row_range_posting_spec()],
+        Vec::new(),
+        None,
+        RootOverrides {
+            index_kind: CoviIndexKindV2::Hash,
+            unchecked_artifact: true,
+            ..RootOverrides::default()
+        },
+    )
+}
+
 fn covi_duplicate_key_without_chain_artifact() -> Vec<u8> {
     covi_artifact_for_postings(
         vec![key_bytes(1), key_bytes(1)],
@@ -8168,6 +8328,24 @@ fn posting_spec(
     }
 }
 
+fn row_range_posting_spec() -> PostingSpec {
+    posting_spec(
+        CoviPostingRepresentationV2::RowRangeList,
+        row_range_payload(&[CoviRowRangePostingV2 {
+            file_ref: 0,
+            table_id: 1,
+            segment_id: 1,
+            morsel_id: 1,
+            row_start: 0,
+            row_count: 1,
+            flags: 0,
+            checksum: 0,
+        }]),
+        1,
+        u32::MAX,
+    )
+}
+
 #[derive(Clone)]
 struct RootOverrides {
     key_section_id: u32,
@@ -8175,6 +8353,10 @@ struct RootOverrides {
     schema_ref: u32,
     semantic_map_ref: u32,
     visibility_ref: u32,
+    index_kind: CoviIndexKindV2,
+    logical_type: u16,
+    unchecked_root: bool,
+    unchecked_artifact: bool,
     supports_index_only: bool,
     capability_exactness: IndexCapabilityExactnessV2,
 }
@@ -8187,6 +8369,10 @@ impl Default for RootOverrides {
             schema_ref: u32::MAX,
             semantic_map_ref: u32::MAX,
             visibility_ref: u32::MAX,
+            index_kind: CoviIndexKindV2::Sorted,
+            logical_type: CoveLogicalType::Int64 as u16,
+            unchecked_root: false,
+            unchecked_artifact: false,
             supports_index_only: false,
             capability_exactness: IndexCapabilityExactnessV2::Exact,
         }
@@ -8259,7 +8445,7 @@ fn covi_artifact_from_blocks(
     let root = CoviIndexRootV2 {
         index_root_id: 0,
         indexed_target_kind: CoviIndexedTargetKindV2::TableColumn,
-        index_kind: CoviIndexKindV2::Sorted,
+        index_kind: overrides.index_kind,
         coverage_granularity: CoverageGranularityV2::Morsel as u8,
         proof_strength: CoverageProofStrengthV2::ExactConservative as u8,
         exactness: CoverageExactnessV2::Exact as u8,
@@ -8270,7 +8456,7 @@ fn covi_artifact_from_blocks(
         property_id: u32::MAX,
         path_ref: u32::MAX,
         semantic_dimension_ref: u32::MAX,
-        logical_type: CoveLogicalType::Int64 as u16,
+        logical_type: overrides.logical_type,
         physical_kind: CovePhysicalKind::NumCode as u8,
         key_encoding_kind: CoviKeyEncodingKindV2::CanonicalValueBytes as u8,
         comparator_kind: CoviComparatorKindV2::CanonicalOrdering as u16,
@@ -8363,6 +8549,18 @@ fn covi_artifact_from_blocks(
             optional_features: 0,
         });
     }
+    if overrides.unchecked_artifact {
+        return serialize_covi_artifact_unchecked(
+            covi_test_file_id(),
+            covi_test_snapshot_id(),
+            &[referenced_file],
+            &[snapshot],
+            &[root],
+            &[capability],
+            &sections,
+            overrides.unchecked_root,
+        );
+    }
     CoviArtifactV2::serialize_with_sections(
         covi_test_file_id(),
         covi_test_snapshot_id(),
@@ -8373,6 +8571,170 @@ fn covi_artifact_from_blocks(
         &sections,
     )
     .unwrap()
+}
+
+fn serialize_covi_artifact_unchecked(
+    dataset_id: [u8; 16],
+    snapshot_id: [u8; 16],
+    referenced_files: &[CoviReferencedFileV2],
+    snapshot_validity: &[CoviSnapshotValidityV2],
+    index_roots: &[CoviIndexRootV2],
+    capabilities: &[IndexCapabilityV2],
+    section_payloads: &[CoviSectionPayloadV2],
+    unchecked_roots: bool,
+) -> Vec<u8> {
+    let section_directory_length = section_payloads.len() * COVI_SECTION_ENTRY_LEN;
+    let mut cursor = (COVI_HEADER_LEN as usize) + section_directory_length;
+    let mut regions = Vec::new();
+    let referenced_files_offset =
+        append_unchecked_region(&mut regions, &mut cursor, referenced_files, |item| {
+            item.serialize().unwrap().to_vec()
+        });
+    let snapshot_validity_offset =
+        append_unchecked_region(&mut regions, &mut cursor, snapshot_validity, |item| {
+            item.serialize().to_vec()
+        });
+    let index_roots_offset =
+        append_unchecked_region(&mut regions, &mut cursor, index_roots, |item| {
+            if unchecked_roots {
+                serialize_covi_index_root_unchecked(item).to_vec()
+            } else {
+                item.serialize().unwrap().to_vec()
+            }
+        });
+    let capabilities_offset =
+        append_unchecked_region(&mut regions, &mut cursor, capabilities, |item| {
+            item.serialize().unwrap().to_vec()
+        });
+    let mut sections = Vec::with_capacity(section_payloads.len());
+    let mut section_bytes = Vec::new();
+    for payload in section_payloads {
+        let len = payload.payload.len();
+        sections.push(CoviSectionEntryV2 {
+            section_id: payload.section_id,
+            section_kind: payload.section_kind,
+            flags: 0,
+            offset: cursor as u64,
+            length: len as u64,
+            uncompressed_length: len as u64,
+            item_count: payload.item_count,
+            compression: CompressionCodec::None as u8,
+            encryption: 0,
+            alignment_log2: 0,
+            reserved0: 0,
+            required_features: payload.required_features,
+            optional_features: payload.optional_features,
+            crc32c: checksum::crc32c(&payload.payload),
+            checksum: 0,
+        });
+        cursor += len;
+        section_bytes.extend_from_slice(&payload.payload);
+    }
+    let file_len = cursor + COVI_TAIL_LEN;
+    let string_table_section_ref = section_payloads
+        .iter()
+        .find(|section| section.section_kind == CoviSectionKindV2::StringTable)
+        .map(|section| section.section_id)
+        .unwrap_or(u32::MAX);
+    let header = CoviHeaderV2 {
+        magic: MAGIC_COVI,
+        header_len: COVI_HEADER_LEN,
+        version_major: VERSION_MAJOR_V1,
+        version_minor: 0,
+        flags: 0,
+        index_artifact_id: [0u8; 16],
+        dataset_id,
+        snapshot_id,
+        section_count: section_payloads.len() as u32,
+        referenced_file_count: referenced_files.len() as u32,
+        snapshot_validity_count: snapshot_validity.len() as u32,
+        index_root_count: index_roots.len() as u32,
+        capability_count: capabilities.len() as u32,
+        section_directory_offset: COVI_HEADER_LEN as u64,
+        section_directory_length: section_directory_length as u64,
+        referenced_files_offset,
+        snapshot_validity_offset,
+        index_roots_offset,
+        capabilities_offset,
+        string_table_section_ref,
+        created_at_us: 0,
+        reserved: [0u8; 24],
+        checksum: 0,
+    };
+    let postscript = CoviPostscriptV2 {
+        required_features: FEATURE_SECONDARY_INDEX_ARTIFACT,
+        optional_features: 0,
+        file_len: file_len as u64,
+        header_offset: 0,
+        header_length: COVI_HEADER_LEN as u64,
+        checksum: 0,
+    };
+    let mut out = Vec::with_capacity(file_len);
+    out.extend_from_slice(&header.serialize());
+    for section in &sections {
+        out.extend_from_slice(&section.serialize().unwrap());
+    }
+    out.extend_from_slice(&regions);
+    out.extend_from_slice(&section_bytes);
+    out.extend_from_slice(&postscript.serialize());
+    out.extend_from_slice(&POSTSCRIPT_VERSION_V1.to_le_bytes());
+    out.extend_from_slice(&(COVI_POSTSCRIPT_LEN as u16).to_le_bytes());
+    out.extend_from_slice(&MAGIC_COVI);
+    out
+}
+
+fn append_unchecked_region<T>(
+    out: &mut Vec<u8>,
+    cursor: &mut usize,
+    items: &[T],
+    serialize: impl Fn(&T) -> Vec<u8>,
+) -> u64 {
+    let offset = *cursor as u64;
+    for item in items {
+        let bytes = serialize(item);
+        *cursor += bytes.len();
+        out.extend_from_slice(&bytes);
+    }
+    offset
+}
+
+fn serialize_covi_index_root_unchecked(root: &CoviIndexRootV2) -> [u8; CoviIndexRootV2::LEN] {
+    let mut out = [0u8; CoviIndexRootV2::LEN];
+    out[0..4].copy_from_slice(&root.index_root_id.to_le_bytes());
+    out[4..6].copy_from_slice(&(root.indexed_target_kind as u16).to_le_bytes());
+    out[6..8].copy_from_slice(&(root.index_kind as u16).to_le_bytes());
+    out[8] = root.coverage_granularity;
+    out[9] = root.proof_strength;
+    out[10] = root.exactness;
+    out[11] = root.flags;
+    out[12..16].copy_from_slice(&root.table_id.to_le_bytes());
+    out[16..20].copy_from_slice(&root.column_id.to_le_bytes());
+    out[20..24].copy_from_slice(&root.object_type_id.to_le_bytes());
+    out[24..28].copy_from_slice(&root.property_id.to_le_bytes());
+    out[28..32].copy_from_slice(&root.path_ref.to_le_bytes());
+    out[32..36].copy_from_slice(&root.semantic_dimension_ref.to_le_bytes());
+    out[36..38].copy_from_slice(&root.logical_type.to_le_bytes());
+    out[38] = root.physical_kind;
+    out[39] = root.key_encoding_kind;
+    out[40..42].copy_from_slice(&root.comparator_kind.to_le_bytes());
+    out[42..44].copy_from_slice(&root.collation_id.to_le_bytes());
+    out[44] = root.null_semantics;
+    out[45] = root.sort_order;
+    out[46..54].copy_from_slice(&root.value_count.to_le_bytes());
+    out[54..62].copy_from_slice(&root.distinct_count.to_le_bytes());
+    out[62..70].copy_from_slice(&root.null_count.to_le_bytes());
+    out[70..74].copy_from_slice(&root.min_key_ref.to_le_bytes());
+    out[74..78].copy_from_slice(&root.max_key_ref.to_le_bytes());
+    out[78..82].copy_from_slice(&root.key_block_section_id.to_le_bytes());
+    out[82..86].copy_from_slice(&root.entry_block_section_id.to_le_bytes());
+    out[86..90].copy_from_slice(&root.postings_block_section_id.to_le_bytes());
+    out[90..94].copy_from_slice(&root.aggregate_block_section_id.to_le_bytes());
+    out[94..98].copy_from_slice(&root.coverage_set_ref.to_le_bytes());
+    out[98..102].copy_from_slice(&root.capability_ref.to_le_bytes());
+    out[102..106].copy_from_slice(&root.snapshot_validity_ref.to_le_bytes());
+    let crc = checksum::crc32c(&out);
+    out[106..110].copy_from_slice(&crc.to_le_bytes());
+    out
 }
 
 fn covi_key_and_entries(
@@ -8961,6 +9323,43 @@ fn cove_with_optional_layout_section() -> Vec<u8> {
         required_features: 0,
         optional_features: FEATURE_LAYOUT_PLAN,
         data: layout_plan_payload(),
+    });
+    writer.write().unwrap()
+}
+
+fn cove_with_required_bad_layout_section() -> Vec<u8> {
+    let mut writer = MinimalCoveWriter::new();
+    writer.required_features = FEATURE_TABLE_PROFILE | FEATURE_LAYOUT_PLAN;
+    writer.sections.push(SectionPayload {
+        section_kind: SectionKind::LayoutPlan as u16,
+        profile: PrimaryProfile::LayoutPlanning as u8,
+        flags: 0,
+        item_count: 1,
+        row_count: 0,
+        compression: 0,
+        alignment_log2: 0,
+        required_features: FEATURE_LAYOUT_PLAN,
+        optional_features: 0,
+        data: layout_plan_bad_child_range_payload(),
+    });
+    writer.write().unwrap()
+}
+
+fn cove_with_runtime_hints_section(required_hint: bool) -> Vec<u8> {
+    let mut writer = MinimalCoveWriter::new();
+    writer.required_features = FEATURE_TABLE_PROFILE;
+    writer.optional_features = FEATURE_RUNTIME_COMPATIBILITY_HINTS;
+    writer.sections.push(SectionPayload {
+        section_kind: SectionKind::RuntimeCompatibilityHints as u16,
+        profile: PrimaryProfile::RuntimeCompatibility as u8,
+        flags: 0,
+        item_count: 1,
+        row_count: 0,
+        compression: 0,
+        alignment_log2: 0,
+        required_features: 0,
+        optional_features: FEATURE_RUNTIME_COMPATIBILITY_HINTS,
+        data: runtime_hints_payload_with_required(required_hint),
     });
     writer.write().unwrap()
 }
@@ -10807,6 +11206,90 @@ fn cove_t_bool_numcode_file(declared_numeric: bool) -> Vec<u8> {
     }
 }
 
+fn bool_numcode_catalog(row_count: u64) -> TableCatalog {
+    TableCatalog {
+        flags: 0,
+        tables: vec![TableEntry {
+            table_id: 1,
+            namespace: "public".into(),
+            name: "flags".into(),
+            row_count,
+            primary_sort_key_count: 0,
+            clustering_key_count: 0,
+            flags: 0,
+            columns: vec![ColumnEntry {
+                column_id: 1,
+                name: "active_code".into(),
+                logical: CoveLogicalType::Bool,
+                physical: CovePhysicalKind::NumCode,
+                nullable: false,
+                sort_order: 0,
+                collation_id: 0,
+                precision: 0,
+                scale: 0,
+                flags: COLUMN_FLAG_BOOL_DECLARED_NUMERIC,
+            }],
+        }],
+    }
+}
+
+fn cove_t_bool_numcode_invalid_value_file() -> Vec<u8> {
+    let mut segment = ScanSegment::new(1, 0, 0, 1, 1);
+    segment.set_column_pages(
+        1,
+        vec![ScanPageSpec::new(1, 2u64.to_le_bytes().to_vec())
+            .with_counts(1, 0)
+            .with_encoding_root(CoveEncodingKind::NumCode as u32)],
+    );
+    let mut writer = ScanProfileCoveWriter::new(bool_numcode_catalog(1));
+    writer.push_segment(segment);
+    writer.write().unwrap()
+}
+
+fn cove_t_constant_numcode_high_bits_file() -> Vec<u8> {
+    let catalog = TableCatalog {
+        flags: 0,
+        tables: vec![TableEntry {
+            table_id: 1,
+            namespace: "public".into(),
+            name: "codes".into(),
+            row_count: 2,
+            primary_sort_key_count: 0,
+            clustering_key_count: 0,
+            flags: 0,
+            columns: vec![ColumnEntry {
+                column_id: 1,
+                name: "raw_u64".into(),
+                logical: CoveLogicalType::UInt64,
+                physical: CovePhysicalKind::NumCode,
+                nullable: false,
+                sort_order: 0,
+                collation_id: 0,
+                precision: 0,
+                scale: 0,
+                flags: 0,
+            }],
+        }],
+    };
+    let raw = i64::MAX as u64 + 1;
+    let payload = ConstantPayload {
+        value: i64::from_le_bytes(raw.to_le_bytes()),
+        row_count: 2,
+    }
+    .encode()
+    .to_vec();
+    let mut segment = ScanSegment::new(1, 0, 0, 2, 1);
+    segment.set_column_pages(
+        1,
+        vec![ScanPageSpec::new(2, payload)
+            .with_counts(2, 0)
+            .with_encoding_root(CoveEncodingKind::Constant as u32)],
+    );
+    let mut writer = ScanProfileCoveWriter::new(catalog);
+    writer.push_segment(segment);
+    writer.write().unwrap()
+}
+
 fn cove_t_payload_elision_stats_only_all_null_file() -> Vec<u8> {
     let catalog = TableCatalog {
         flags: 0,
@@ -12438,6 +12921,26 @@ fn rewrite_first_section_payload(
         postscript.footer.crc32c = checksum::crc32c(&bytes[footer_start..footer_end]);
         let tail_start = bytes.len() - POSTSCRIPT_TOTAL_SIZE;
         bytes[tail_start..].copy_from_slice(&postscript.serialize_tail());
+        return bytes;
+    }
+    panic!("generated COVE file did not contain requested section");
+}
+
+fn corrupt_first_section_payload_crc(mut bytes: Vec<u8>, section_kind: SectionKind) -> Vec<u8> {
+    let postscript = CovePostscriptV1::parse_from_tail(&bytes).unwrap();
+    let footer_start = postscript.footer.offset as usize;
+    let footer_header = CoveFooterHeaderV1::parse(&bytes[footer_start..]).unwrap();
+    let entries_start = footer_start + FOOTER_HEADER_SIZE;
+    for index in 0..footer_header.section_count as usize {
+        let entry_start = entries_start + index * SECTION_ENTRY_SIZE;
+        let section_entry =
+            CoveSectionEntryV1::parse(&bytes[entry_start..entry_start + SECTION_ENTRY_SIZE])
+                .unwrap();
+        if section_entry.section_kind != section_kind as u16 {
+            continue;
+        }
+        let start = section_entry.offset as usize;
+        bytes[start] ^= 0x01;
         return bytes;
     }
     panic!("generated COVE file did not contain requested section");

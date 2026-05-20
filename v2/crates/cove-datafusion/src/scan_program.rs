@@ -143,13 +143,17 @@ pub fn compile_scan_program(state: &DatasetState, filters: &[FilterPlan]) -> Cov
             CovePredicate::FileCodeIn {
                 file_codes,
                 canonical_values,
+                canonical_keys,
                 ..
             } => ScanOp::FileCodeIn {
                 column_index,
                 column_id: column.column_id,
                 exactness,
                 kernel,
-                literal_count: file_codes.len().max(canonical_values.len()),
+                literal_count: file_codes
+                    .len()
+                    .max(canonical_values.len())
+                    .max(canonical_keys.len()),
             },
             CovePredicate::VarBytesEq { literal, .. } => ScanOp::VarBytesEq {
                 column_index,
@@ -279,7 +283,14 @@ fn lookup_rowref_eligible(state: &DatasetState, filters: &[FilterPlan]) -> bool 
             column_index,
             op: NumericPredicateOp::Eq,
             literal,
-        } if crate::decode::numeric_lookup_key(*literal).is_some() => {
+        } if state
+            .table()
+            .columns
+            .get(*column_index)
+            .is_some_and(|column| {
+                !crate::decode::numeric_lookup_keys(column.logical, *literal).is_empty()
+            }) =>
+        {
             (*column_index, LookupKeyKind::NumCode)
         }
         _ => return false,

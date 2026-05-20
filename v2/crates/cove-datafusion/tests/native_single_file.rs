@@ -81,6 +81,11 @@ use cove_coverage::{
 };
 #[cfg(feature = "covm")]
 use cove_datafusion::register::{cove_table_from_covm_path, register_cove_covm};
+#[cfg(feature = "covi")]
+use cove_datafusion::{
+    bootstrap::bootstrap_bytes_with_covi_artifacts,
+    metadata_aggregate::exact_covi_unfiltered_min_max,
+};
 use cove_datafusion::{
     bootstrap::{
         bootstrap_bytes, bootstrap_bytes_with_options, bootstrap_local_file,
@@ -1532,6 +1537,36 @@ async fn projection_order_and_exact_filter_are_correct() {
 }
 
 #[tokio::test]
+async fn float_numcode_filters_compare_logical_values() {
+    let path = write_temp_cove("float_metrics", float_metrics_file());
+    let ctx = SessionContext::new();
+    register_cove_file(&ctx, "metrics", &path).unwrap();
+
+    let batches = ctx
+        .sql("SELECT id FROM metrics WHERE f64 > 2.0 ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let expected = ["+----+", "| id |", "+----+", "| 2  |", "+----+"];
+    assert_batches_eq!(expected, &batches);
+
+    let batches = ctx
+        .sql("SELECT id FROM metrics WHERE f32 = CAST(2.25 AS REAL) ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let expected = ["+----+", "| id |", "+----+", "| 2  |", "+----+"];
+    assert_batches_eq!(expected, &batches);
+    fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
 async fn between_filter_uses_inclusive_lower_and_upper_bounds() {
     let path = write_temp_cove("events_between", primitive_events_file());
     let ctx = SessionContext::new();
@@ -2072,6 +2107,118 @@ fn lookup_numcode_equality_uses_exact_key_conversion() {
     assert_batches_eq!(expected, &decoded.batches);
     assert_eq!(decoded.stats.lookup_index_hits, 1);
     assert_eq!(decoded.stats.pages_decoded, 1);
+}
+
+#[test]
+fn lookup_float_zero_equality_uses_both_signed_zero_keys() {
+    let state = bootstrap_bytes("metrics", float_zero_lookup_file()).unwrap();
+    let projection = vec![0];
+    let filter = FilterPlan::pruning_numeric(
+        1,
+        NumericPredicateOp::Eq,
+        PredicateLiteral::Float64(0.0),
+        "f64 = 0.0",
+    );
+    let plan = plan_scan(&state, Some(&projection), vec![filter]).unwrap();
+
+    let decoded = decode_scan(&state, &plan).unwrap();
+
+    let expected = ["+----+", "| id |", "+----+", "| 1  |", "| 2  |", "+----+"];
+    assert_batches_eq!(expected, &decoded.batches);
+    assert_eq!(decoded.stats.lookup_index_hits, 2);
+    assert_eq!(decoded.stats.index_rows_selected, 2);
+}
+
+#[cfg(feature = "covi")]
+#[test]
+fn generated_covi_filecode_utf8_filters_match_sidecar_keys() {
+    let bytes = dictionary_items_file_with_lookup_index();
+    let covi = cove_index::build::build_covi_from_cove_bytes(
+        &bytes,
+        &cove_index::build::CoviBuildOptions {
+            all_columns: true,
+            ..cove_index::build::CoviBuildOptions::default()
+        },
+    )
+    .unwrap();
+    let state = bootstrap_bytes_with_covi_artifacts(
+        "items",
+        bytes,
+        vec![covi],
+        CoveTableOptions::default(),
+    )
+    .unwrap();
+    let projection = vec![1];
+    let filter = lower_filter(
+        &state,
+        &LowerExpr::InList {
+            expr: Box::new(LowerExpr::Column("name".into())),
+            list: vec![LowerExpr::Literal(LowerLiteral::Utf8("red".into()))],
+            negated: false,
+        },
+        "name IN ('red')",
+    );
+    let plan = plan_scan(&state, Some(&projection), vec![filter]).unwrap();
+    assert_eq!(plan.covi_candidates.as_ref().map(Vec::len), Some(1));
+
+    let decoded = decode_scan(&state, &plan).unwrap();
+
+    let expected = [
+        "+---------+",
+        "| payload |",
+        "+---------+",
+        "| first   |",
+        "+---------+",
+    ];
+    assert_batches_eq!(expected, &decoded.batches);
+}
+
+#[cfg(feature = "covi")]
+#[test]
+fn generated_covi_min_max_answers_feed_datafusion_metadata_path() {
+    let bytes = dictionary_items_file_with_lookup_index();
+    let covi = cove_index::build::build_covi_from_cove_bytes(
+        &bytes,
+        &cove_index::build::CoviBuildOptions {
+            all_columns: true,
+            include_index_only_min_max: true,
+            ..cove_index::build::CoviBuildOptions::default()
+        },
+    )
+    .unwrap();
+    let plain_state = bootstrap_bytes("items_plain", bytes.clone()).unwrap();
+    let identity = plain_state.file(0).unwrap().identity();
+    let digest =
+        cove_core::digest::compute_digest(cove_core::constants::DigestAlgorithm::Sha256, &bytes)
+            .expect("sha256 digest");
+    let context = cove_index::execution::CoviValidationContextV2::for_file(
+        identity.file_id,
+        identity.file_len,
+        identity.footer_crc32c,
+    )
+    .with_dataset_id(identity.file_id)
+    .with_file_code_keys(true)
+    .with_file_digest(cove_core::constants::DigestAlgorithm::Sha256, digest);
+    cove_index::execution::ValidatedCoviArtifactV2::parse_and_validate(&covi, context).unwrap();
+    let state = bootstrap_bytes_with_covi_artifacts(
+        "items",
+        bytes,
+        vec![covi],
+        CoveTableOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(state.bootstrap_stats().covi_sidecars_loaded, 1);
+
+    let plan = exact_covi_unfiltered_min_max(
+        &state,
+        &[
+            (0, cove_index::execution::CoviAggregateKindV2::Min),
+            (0, cove_index::execution::CoviAggregateKindV2::Max),
+        ],
+    )
+    .unwrap();
+
+    assert!(plan.is_some());
 }
 
 #[tokio::test]
@@ -3182,6 +3329,52 @@ fn primitive_events_file() -> Vec<u8> {
     primitive_events_writer().write().unwrap()
 }
 
+fn float_metrics_file() -> Vec<u8> {
+    let catalog = TableCatalog {
+        flags: 0,
+        tables: vec![TableEntry {
+            table_id: 1,
+            namespace: "public".into(),
+            name: "metrics".into(),
+            row_count: 3,
+            primary_sort_key_count: 0,
+            clustering_key_count: 0,
+            flags: 0,
+            columns: vec![
+                column(
+                    1,
+                    "id",
+                    CoveLogicalType::Int64,
+                    CovePhysicalKind::NumCode,
+                    false,
+                ),
+                column(
+                    2,
+                    "f32",
+                    CoveLogicalType::Float32,
+                    CovePhysicalKind::NumCode,
+                    false,
+                ),
+                column(
+                    3,
+                    "f64",
+                    CoveLogicalType::Float64,
+                    CovePhysicalKind::NumCode,
+                    false,
+                ),
+            ],
+        }],
+    };
+    let mut segment = ScanSegment::new(1, 0, 0, 3, 3);
+    segment.set_column_pages(1, vec![numcode_page(3, numcode_i64(&[1, 2, 3]))]);
+    segment.set_column_pages(2, vec![numcode_page(3, numcode_f32(&[1.5, 2.25, -3.0]))]);
+    segment.set_column_pages(3, vec![numcode_page(3, numcode_f64(&[1.5, 2.25, -3.0]))]);
+
+    let mut writer = ScanProfileCoveWriter::new(catalog);
+    writer.push_segment(segment);
+    writer.write().unwrap()
+}
+
 fn primitive_events_file_with_name_gamma_coverage(bad_checksum: bool) -> Vec<u8> {
     let mut writer = primitive_events_writer();
     for section in name_gamma_coverage_sections(bad_checksum) {
@@ -4065,6 +4258,96 @@ fn numeric_lookup_events_file() -> Vec<u8> {
     writer.write().unwrap()
 }
 
+fn float_zero_lookup_file() -> Vec<u8> {
+    let catalog = TableCatalog {
+        flags: 0,
+        tables: vec![TableEntry {
+            table_id: 9,
+            namespace: "public".into(),
+            name: "metrics".into(),
+            row_count: 3,
+            primary_sort_key_count: 0,
+            clustering_key_count: 0,
+            flags: 0,
+            columns: vec![
+                column(
+                    1,
+                    "id",
+                    CoveLogicalType::Int64,
+                    CovePhysicalKind::NumCode,
+                    false,
+                ),
+                column(
+                    2,
+                    "f64",
+                    CoveLogicalType::Float64,
+                    CovePhysicalKind::NumCode,
+                    false,
+                ),
+            ],
+        }],
+    };
+    let mut segment = ScanSegment::new(9, 0, 0, 3, 2);
+    segment.set_column_pages(1, vec![numcode_page(3, numcode_i64(&[1, 2, 3]))]);
+    segment.set_column_pages(2, vec![numcode_page(3, numcode_f64(&[0.0, -0.0, 1.0]))]);
+
+    let mut writer = ScanProfileCoveWriter::new(catalog);
+    writer.push_extra_section(float_zero_lookup_index_section());
+    writer.push_segment(segment);
+    writer.write().unwrap()
+}
+
+fn float_zero_lookup_index_section() -> SectionPayload {
+    let index = LookupIndex {
+        header: LookupIndexHeaderV1 {
+            table_id: 9,
+            column_id: 2,
+            key_kind: LookupKeyKind::NumCode,
+            index_kind: LookupIndexKind::SparseSorted,
+            uniqueness: LookupUniqueness::NonUnique,
+            flags: 0,
+            entry_count: 0,
+            entries_offset: 0,
+            entries_length: 0,
+            rowref_offset: 0,
+            rowref_length: 0,
+            checksum: 0,
+        },
+        entries: vec![
+            LookupEntry {
+                key: 0.0f64.to_bits(),
+                rows: vec![RowRef {
+                    table_id: 9,
+                    segment_id: 0,
+                    morsel_id: 0,
+                    row_in_morsel: 0,
+                }],
+            },
+            LookupEntry {
+                key: (-0.0f64).to_bits(),
+                rows: vec![RowRef {
+                    table_id: 9,
+                    segment_id: 0,
+                    morsel_id: 0,
+                    row_in_morsel: 1,
+                }],
+            },
+        ],
+    };
+    SectionPayload {
+        section_kind: SectionKind::LookupIndex as u16,
+        profile: PrimaryProfile::ArchiveAcceleration as u8,
+        flags: 0,
+        item_count: 1,
+        row_count: 3,
+        compression: 0,
+        alignment_log2: 0,
+        required_features: 0,
+        optional_features: 0,
+        data: index.serialize().unwrap(),
+    }
+}
+
 fn dictionary_items_payload_catalog() -> TableCatalog {
     TableCatalog {
         flags: 0,
@@ -4632,6 +4915,20 @@ fn numcode_i64(values: &[i64]) -> Vec<u8> {
     values
         .iter()
         .flat_map(|value| (*value as u64).to_le_bytes())
+        .collect()
+}
+
+fn numcode_f32(values: &[f32]) -> Vec<u8> {
+    values
+        .iter()
+        .flat_map(|value| u64::from(value.to_bits()).to_le_bytes())
+        .collect()
+}
+
+fn numcode_f64(values: &[f64]) -> Vec<u8> {
+    values
+        .iter()
+        .flat_map(|value| value.to_bits().to_le_bytes())
         .collect()
 }
 

@@ -86,6 +86,22 @@ pub struct ValidationReport {
     pub ignored_optional_sections: Vec<IgnoredOptionalSection>,
 }
 
+/// Optional-profile payload validator used by feature-use validation.
+///
+/// `cove-core` can identify when requested feature use depends on embedded
+/// optional profile sections, but it intentionally does not depend on the
+/// layout, coverage, runtime, or COVE-I crates that parse those payloads.
+pub trait OptionalProfilePayloadValidator {
+    fn validate_optional_profile_sections(
+        &self,
+        data: &[u8],
+        report: &ValidationReport,
+        optional_pushdown_policy: OptionalPushdownPolicy,
+        feature_use: Option<&FeatureUseRequestV2>,
+        only_required_for_feature_use: bool,
+    ) -> Result<(), CoveError>;
+}
+
 /// Validate a COVE file with configurable options.
 ///
 /// Always performs structural validation (equivalent to [`super::validate_bytes`]).
@@ -177,10 +193,65 @@ pub fn validate_bytes_for_feature_use(
     opts: ValidationOptions,
     request: FeatureUseRequestV2,
 ) -> Result<ValidationReport, CoveError> {
+    let optional_pushdown_policy = opts.optional_pushdown_policy;
     let report = validate_bytes_with_options(data, opts)?;
+    for ignored in &report.ignored_optional_sections {
+        if super::profile_validators::ignored_section_required_for_feature_use(ignored, &request) {
+            return Err(CoveError::ChecksumMismatch);
+        }
+    }
     let scope_table = super::feature_scope_table_for(data, &report.validated)?;
     scope_table.reject_unknowns_for_request(&request)?;
+    fail_closed_required_optional_profile_sections(&report, optional_pushdown_policy, &request)?;
     Ok(report)
+}
+
+pub fn validate_bytes_for_feature_use_with_optional_profile_validator<V>(
+    data: &[u8],
+    opts: ValidationOptions,
+    request: FeatureUseRequestV2,
+    validator: &V,
+) -> Result<ValidationReport, CoveError>
+where
+    V: OptionalProfilePayloadValidator + ?Sized,
+{
+    let optional_pushdown_policy = opts.optional_pushdown_policy;
+    let report = validate_bytes_with_options(data, opts)?;
+    for ignored in &report.ignored_optional_sections {
+        if super::profile_validators::ignored_section_required_for_feature_use(ignored, &request) {
+            return Err(CoveError::ChecksumMismatch);
+        }
+    }
+    let scope_table = super::feature_scope_table_for(data, &report.validated)?;
+    scope_table.reject_unknowns_for_request(&request)?;
+    validator.validate_optional_profile_sections(
+        data,
+        &report,
+        optional_pushdown_policy,
+        Some(&request),
+        !report.semantic_checked,
+    )?;
+    Ok(report)
+}
+
+fn fail_closed_required_optional_profile_sections(
+    report: &ValidationReport,
+    _optional_pushdown_policy: OptionalPushdownPolicy,
+    request: &FeatureUseRequestV2,
+) -> Result<(), CoveError> {
+    for entry in &report.validated.footer.sections {
+        let Some(kind) = crate::constants::SectionKind::from_u16(entry.section_kind) else {
+            continue;
+        };
+        if super::profile_validators::is_embedded_optional_profile_section(kind)
+            && super::profile_validators::section_entry_required_for_feature_use(entry, request)
+        {
+            return Err(CoveError::UnsupportedEncoding(
+                "requested optional profile payload requires a semantic validator".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn push_stage(

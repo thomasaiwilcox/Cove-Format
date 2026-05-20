@@ -74,7 +74,7 @@ use materialize::{
 use morsels::{ordered_morsels, prepare_segment_payload, read_segment_metadata};
 #[cfg(test)]
 use predicates::apply_predicate_to_selection;
-pub(crate) use predicates::numeric_lookup_key;
+pub(crate) use predicates::numeric_lookup_keys;
 use predicates::{plan_has_exact_row_predicate, plan_has_residual};
 use pruning::{
     apply_overlay_to_selection, covi_morsel_pruned, selected_rows_for_morsel,
@@ -1314,6 +1314,27 @@ mod tests {
             .collect()
     }
 
+    fn numcode_i32(values: &[i32]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| (*value as i64 as u64).to_le_bytes())
+            .collect()
+    }
+
+    fn numcode_f32(values: &[f32]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| u64::from(value.to_bits()).to_le_bytes())
+            .collect()
+    }
+
+    fn numcode_f64(values: &[f64]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| value.to_bits().to_le_bytes())
+            .collect()
+    }
+
     fn varbytes(values: &[&str]) -> Vec<u8> {
         let mut out = Vec::new();
         for value in values {
@@ -1825,6 +1846,237 @@ mod tests {
         let mut rows = Vec::new();
         selected.write_selected_rows(&mut rows).unwrap();
         assert_eq!(rows, vec![1, 2]);
+    }
+
+    #[test]
+    fn numeric_predicate_filters_signed_numcode_by_logical_type() {
+        let bytes = numcode_i32(&[-8, -1, 3]);
+        let array = EncodedArray::new(
+            CoveLogicalType::Int32,
+            CovePhysicalKind::NumCode,
+            3,
+            CoveEncodingKind::NumCode,
+            None,
+            &bytes,
+            None,
+        );
+        let prepared = array.prepare().unwrap();
+        let predicate = CovePredicate::Numeric {
+            column_index: 0,
+            op: NumericPredicateOp::Lt,
+            literal: PredicateLiteral::Int64(0),
+        };
+        let mut selected = SelectionMask::default();
+        selected.fill_all(3);
+        let mut scratch = SelectionMask::default();
+        assert!(
+            apply_predicate_to_selection(&predicate, &prepared, &mut selected, &mut scratch)
+                .unwrap()
+        );
+
+        let mut rows = Vec::new();
+        selected.write_selected_rows(&mut rows).unwrap();
+        assert_eq!(rows, vec![0, 1]);
+    }
+
+    #[test]
+    fn numeric_predicate_filters_temporal_and_decimal_numcode_by_logical_type() {
+        for logical in [
+            CoveLogicalType::Decimal64,
+            CoveLogicalType::TimestampMicros,
+            CoveLogicalType::TimestampNanos,
+        ] {
+            let bytes = numcode_i64(&[-20, -1, 10]);
+            let array = EncodedArray::new(
+                logical,
+                CovePhysicalKind::NumCode,
+                3,
+                CoveEncodingKind::NumCode,
+                None,
+                &bytes,
+                None,
+            );
+            let prepared = array.prepare().unwrap();
+            let predicate = CovePredicate::Numeric {
+                column_index: 0,
+                op: NumericPredicateOp::GtEq,
+                literal: PredicateLiteral::Int64(-1),
+            };
+            let mut selected = SelectionMask::default();
+            selected.fill_all(3);
+            let mut scratch = SelectionMask::default();
+            assert!(apply_predicate_to_selection(
+                &predicate,
+                &prepared,
+                &mut selected,
+                &mut scratch
+            )
+            .unwrap());
+
+            let mut rows = Vec::new();
+            selected.write_selected_rows(&mut rows).unwrap();
+            assert_eq!(rows, vec![1, 2]);
+        }
+
+        let bytes = numcode_i32(&[-2, 0, 4]);
+        let array = EncodedArray::new(
+            CoveLogicalType::DateDays,
+            CovePhysicalKind::NumCode,
+            3,
+            CoveEncodingKind::NumCode,
+            None,
+            &bytes,
+            None,
+        );
+        let prepared = array.prepare().unwrap();
+        let predicate = CovePredicate::Numeric {
+            column_index: 0,
+            op: NumericPredicateOp::Eq,
+            literal: PredicateLiteral::Int64(-2),
+        };
+        let mut selected = SelectionMask::default();
+        selected.fill_all(3);
+        let mut scratch = SelectionMask::default();
+        assert!(
+            apply_predicate_to_selection(&predicate, &prepared, &mut selected, &mut scratch)
+                .unwrap()
+        );
+
+        let mut rows = Vec::new();
+        selected.write_selected_rows(&mut rows).unwrap();
+        assert_eq!(rows, vec![0]);
+    }
+
+    #[test]
+    fn numeric_predicate_filters_float_numcode_rows_by_value() {
+        let bytes = numcode_f64(&[1.5, 2.25, -3.0]);
+        let array = EncodedArray::new(
+            CoveLogicalType::Float64,
+            CovePhysicalKind::NumCode,
+            3,
+            CoveEncodingKind::NumCode,
+            None,
+            &bytes,
+            None,
+        );
+        let prepared = array.prepare().unwrap();
+        let predicate = CovePredicate::Numeric {
+            column_index: 0,
+            op: NumericPredicateOp::Gt,
+            literal: PredicateLiteral::Float64(2.0),
+        };
+        let mut selected = SelectionMask::default();
+        selected.fill_all(3);
+        let mut scratch = SelectionMask::default();
+        assert!(
+            apply_predicate_to_selection(&predicate, &prepared, &mut selected, &mut scratch)
+                .unwrap()
+        );
+
+        let mut rows = Vec::new();
+        selected.write_selected_rows(&mut rows).unwrap();
+        assert_eq!(rows, vec![1]);
+    }
+
+    #[test]
+    fn numeric_predicate_filters_float32_numcode_rows_by_value() {
+        let bytes = numcode_f32(&[1.5, 2.25, -3.0]);
+        let array = EncodedArray::new(
+            CoveLogicalType::Float32,
+            CovePhysicalKind::NumCode,
+            3,
+            CoveEncodingKind::NumCode,
+            None,
+            &bytes,
+            None,
+        );
+        let prepared = array.prepare().unwrap();
+        let predicate = CovePredicate::Numeric {
+            column_index: 0,
+            op: NumericPredicateOp::Eq,
+            literal: PredicateLiteral::Float64(2.25),
+        };
+        let mut selected = SelectionMask::default();
+        selected.fill_all(3);
+        let mut scratch = SelectionMask::default();
+        assert!(
+            apply_predicate_to_selection(&predicate, &prepared, &mut selected, &mut scratch)
+                .unwrap()
+        );
+
+        let mut rows = Vec::new();
+        selected.write_selected_rows(&mut rows).unwrap();
+        assert_eq!(rows, vec![1]);
+    }
+
+    #[test]
+    fn numeric_lookup_keys_use_logical_numcode_bits() {
+        assert_eq!(
+            numeric_lookup_keys(CoveLogicalType::Float64, PredicateLiteral::Float64(2.25)),
+            vec![2.25f64.to_bits()]
+        );
+        assert_eq!(
+            numeric_lookup_keys(CoveLogicalType::Float32, PredicateLiteral::Float64(2.25)),
+            vec![u64::from(2.25f32.to_bits())]
+        );
+        assert!(
+            numeric_lookup_keys(CoveLogicalType::Float32, PredicateLiteral::Float64(0.1))
+                .is_empty()
+        );
+        assert_eq!(
+            numeric_lookup_keys(CoveLogicalType::Float64, PredicateLiteral::Float64(0.0)),
+            vec![0.0f64.to_bits(), (-0.0f64).to_bits()]
+        );
+        assert_eq!(
+            numeric_lookup_keys(CoveLogicalType::Bool, PredicateLiteral::Int64(0)),
+            vec![0]
+        );
+        assert_eq!(
+            numeric_lookup_keys(CoveLogicalType::Bool, PredicateLiteral::UInt64(1)),
+            vec![1]
+        );
+        assert!(numeric_lookup_keys(CoveLogicalType::Bool, PredicateLiteral::Int64(2)).is_empty());
+        assert_eq!(
+            numeric_lookup_keys(CoveLogicalType::Int64, PredicateLiteral::Int64(-2)),
+            vec![(-2i64) as u64]
+        );
+        assert_eq!(
+            numeric_lookup_keys(CoveLogicalType::UInt64, PredicateLiteral::Float64(2.0)),
+            vec![2]
+        );
+    }
+
+    #[test]
+    fn numeric_predicate_filters_bool_numcode_rows_by_numeric_value() {
+        let bytes = [0u64.to_le_bytes(), 1u64.to_le_bytes(), 1u64.to_le_bytes()].concat();
+        let array = EncodedArray::new(
+            CoveLogicalType::Bool,
+            CovePhysicalKind::NumCode,
+            3,
+            CoveEncodingKind::NumCode,
+            None,
+            &bytes,
+            None,
+        );
+        let prepared = array.prepare().unwrap();
+        let mut selected = SelectionMask::default();
+        selected.fill_all(3);
+        let mut scratch = SelectionMask::default();
+        assert!(apply_predicate_to_selection(
+            &CovePredicate::Numeric {
+                column_index: 0,
+                op: NumericPredicateOp::Lt,
+                literal: PredicateLiteral::Int64(1),
+            },
+            &prepared,
+            &mut selected,
+            &mut scratch,
+        )
+        .unwrap());
+
+        let mut rows = Vec::new();
+        selected.write_selected_rows(&mut rows).unwrap();
+        assert_eq!(rows, vec![0]);
     }
 
     #[test]

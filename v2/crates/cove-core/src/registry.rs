@@ -625,6 +625,15 @@ pub const SECTION_REGISTRY: &[SectionInfo] = &[
         description: "Authoritative recursive child schema metadata for native COVE-T nested columns.",
     },
     SectionInfo {
+        kind: SectionKind::RuntimeCompatibilityHints,
+        id: 48,
+        wire_name: "RUNTIME_COMPATIBILITY_HINTS",
+        profiles: &[PrimaryProfile::RuntimeCompatibility],
+        required_feature: Some(FEATURE_RUNTIME_COMPATIBILITY_HINTS),
+        spec_section: "Spec §67.8",
+        description: "Embedded runtime/session adapter selection hints.",
+    },
+    SectionInfo {
         kind: SectionKind::HarborMountHints,
         id: 50,
         wire_name: "HARBOR_MOUNT_HINTS",
@@ -1255,7 +1264,7 @@ mod tests {
             assert_eq!(SectionKind::from_u16(info.id), Some(info.kind));
             assert_eq!(info.kind as u16, info.id);
         }
-        assert_eq!(SECTION_REGISTRY.len(), 44);
+        assert_eq!(SECTION_REGISTRY.len(), 45);
         let exact_set = section_info(SectionKind::ExactSetIndex).unwrap();
         assert!(exact_set.profiles.contains(&PrimaryProfile::TableScan));
         assert!(exact_set

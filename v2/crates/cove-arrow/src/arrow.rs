@@ -3008,6 +3008,9 @@ fn try_direct_decoded_array(
             if payload.row_count != array.row_count {
                 return Err(CoveError::PageCorrupt);
             }
+            if array.physical == CovePhysicalKind::NumCode {
+                return Ok(None);
+            }
             direct_i64_values_to_arrow(array, selection, data_type, |row| {
                 let _ = row;
                 Ok(payload.value)
@@ -4826,6 +4829,55 @@ mod tests {
         let arrow = encoded_array_to_arrow(&cove).unwrap();
         let ints = arrow.as_any().downcast_ref::<Int64Array>().unwrap();
         assert_eq!(ints.values(), &[42, 42, 42]);
+    }
+
+    #[test]
+    fn exports_constant_numcode_uint64_from_raw_bits() {
+        let raw = i64::MAX as u64 + 1;
+        let payload = ConstantPayload {
+            value: i64::from_le_bytes(raw.to_le_bytes()),
+            row_count: 2,
+        }
+        .encode();
+        let cove = EncodedArray::new(
+            CoveLogicalType::UInt64,
+            CovePhysicalKind::NumCode,
+            2,
+            CoveEncodingKind::Constant,
+            None,
+            &payload,
+            None,
+        );
+
+        let arrow = encoded_array_to_arrow(&cove).unwrap();
+        let uints = arrow.as_any().downcast_ref::<UInt64Array>().unwrap();
+        assert_eq!(uints.values(), &[raw, raw]);
+    }
+
+    #[test]
+    fn exports_constant_numcode_signed_from_raw_bits() {
+        let raw = (-7i64) as u64;
+        let payload = ConstantPayload {
+            value: i64::from_le_bytes(raw.to_le_bytes()),
+            row_count: 2,
+        }
+        .encode();
+        let cove = EncodedArray::new(
+            CoveLogicalType::TimestampNanos,
+            CovePhysicalKind::NumCode,
+            2,
+            CoveEncodingKind::Constant,
+            None,
+            &payload,
+            None,
+        );
+
+        let arrow = encoded_array_to_arrow(&cove).unwrap();
+        let timestamps = arrow
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .unwrap();
+        assert_eq!(timestamps.values(), &[-7, -7]);
     }
 
     #[test]

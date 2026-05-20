@@ -7,7 +7,7 @@ use cove_core::CoveError;
 
 use crate::{
     dataset_state::DatasetState,
-    decode::numeric_lookup_key,
+    decode::numeric_lookup_keys,
     planner::{CovePredicate, NumericPredicateOp, ScanPlan},
     prune,
 };
@@ -210,7 +210,8 @@ fn build_lookup_rowref_task_graph(
     for file_ordinal in 0..state.file_count() {
         let file_state = state.single_file_view(file_ordinal)?;
         let file_plan = state.resolved_plan_for_file(plan, file_ordinal)?;
-        let Some((column_index, key_kind, keys)) = lookup_keys_for_plan(&file_plan) else {
+        let Some((column_index, key_kind, keys)) = lookup_keys_for_plan(&file_state, &file_plan)
+        else {
             return Ok(None);
         };
         let Some(column) = file_state.table().columns.get(column_index) else {
@@ -302,7 +303,10 @@ fn build_lookup_rowref_task_graph(
     Ok(Some(graph))
 }
 
-fn lookup_keys_for_plan(plan: &ScanPlan) -> Option<(usize, LookupKeyKind, Vec<u64>)> {
+fn lookup_keys_for_plan(
+    state: &DatasetState,
+    plan: &ScanPlan,
+) -> Option<(usize, LookupKeyKind, Vec<u64>)> {
     if plan.filters.len() != 1 {
         return None;
     }
@@ -320,11 +324,14 @@ fn lookup_keys_for_plan(plan: &ScanPlan) -> Option<(usize, LookupKeyKind, Vec<u6
             column_index,
             op: NumericPredicateOp::Eq,
             literal,
-        } => Some((
-            *column_index,
-            LookupKeyKind::NumCode,
-            vec![numeric_lookup_key(*literal)?],
-        )),
+        } => {
+            let column = state.table().columns.get(*column_index)?;
+            let keys = numeric_lookup_keys(column.logical, *literal);
+            if keys.is_empty() {
+                return None;
+            }
+            Some((*column_index, LookupKeyKind::NumCode, keys))
+        }
         _ => None,
     }
 }

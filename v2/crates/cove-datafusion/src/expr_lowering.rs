@@ -2,8 +2,8 @@
 
 use cove_core::{
     canonical::CanonicalValue,
-    constants::{CoveLogicalType, CovePhysicalKind},
-    CoveError,
+    constants::{CoveLogicalType, CovePhysicalKind, ValueTag},
+    wire, CoveError,
 };
 
 use crate::{
@@ -257,20 +257,25 @@ fn classify_in_list_filter(
         return FilterPlan::unsupported(display);
     }
     let mut canonical_values = Vec::with_capacity(list.len());
+    let mut canonical_keys = Vec::with_capacity(list.len());
     for item in list {
         let LowerExpr::Literal(literal) = item else {
             return FilterPlan::unsupported(display);
         };
         match file_code_canonical_literal(column.logical, literal) {
-            Ok(Some(canonical)) => canonical_values.push(canonical),
+            Ok(Some(canonical)) => {
+                canonical_values.push(canonical.payload);
+                canonical_keys.push(canonical.key);
+            }
             Ok(None) => {}
             Err(_) => return FilterPlan::unsupported(display),
         }
     }
-    FilterPlan::pruning_file_code_in_with_canonical(
+    FilterPlan::pruning_file_code_in_with_canonical_keys(
         column_index,
         Vec::new(),
         canonical_values,
+        canonical_keys,
         display,
     )
 }
@@ -292,10 +297,11 @@ fn classify_column_literal(
         }
         CovePhysicalKind::FileCode if op == LowerOperator::Eq => {
             match file_code_canonical_literal(column.logical, literal) {
-                Ok(Some(canonical)) => FilterPlan::pruning_file_code_in_with_canonical(
+                Ok(Some(canonical)) => FilterPlan::pruning_file_code_in_with_canonical_keys(
                     column_index,
                     Vec::new(),
-                    vec![canonical],
+                    vec![canonical.payload],
+                    vec![canonical.key],
                     display,
                 ),
                 Ok(None) => FilterPlan::pruning_file_code_in_with_canonical(
@@ -343,39 +349,44 @@ fn top_level_column_index(state: &DatasetState, expr: &LowerExpr) -> Option<usiz
         .position(|candidate| candidate.name == *name)
 }
 
+struct FileCodeCanonicalLiteral {
+    payload: Vec<u8>,
+    key: Vec<u8>,
+}
+
 fn file_code_canonical_literal(
     logical: CoveLogicalType,
     literal: &LowerLiteral,
-) -> Result<Option<Vec<u8>>, CoveError> {
+) -> Result<Option<FileCodeCanonicalLiteral>, CoveError> {
     canonical_literal(logical, literal)
 }
 
 fn canonical_literal(
     logical: CoveLogicalType,
     literal: &LowerLiteral,
-) -> Result<Option<Vec<u8>>, CoveError> {
+) -> Result<Option<FileCodeCanonicalLiteral>, CoveError> {
     match (logical, literal) {
         (_, LowerLiteral::Null) => Ok(None),
         (CoveLogicalType::Utf8, LowerLiteral::Utf8(value)) => {
-            CanonicalValue::Utf8(value).encode().map(Some)
+            tagged_canonical_literal(CanonicalValue::Utf8(value)).map(Some)
         }
         (CoveLogicalType::Binary, LowerLiteral::Binary(value)) => {
-            CanonicalValue::Bytes(value).encode().map(Some)
+            tagged_canonical_literal(CanonicalValue::Bytes(value)).map(Some)
         }
         (CoveLogicalType::Json, LowerLiteral::Utf8(value)) => {
-            CanonicalValue::Json(value).encode().map(Some)
+            tagged_canonical_literal(CanonicalValue::Json(value)).map(Some)
         }
         (CoveLogicalType::Uuid, LowerLiteral::Utf8(value)) => {
             let uuid = parse_uuid_literal(value)?;
-            CanonicalValue::Uuid(uuid).encode().map(Some)
+            tagged_canonical_literal(CanonicalValue::Uuid(uuid)).map(Some)
         }
         (CoveLogicalType::Uuid, LowerLiteral::Binary(value)) if value.len() == 16 => {
             let mut uuid = [0u8; 16];
             uuid.copy_from_slice(value);
-            CanonicalValue::Uuid(uuid).encode().map(Some)
+            tagged_canonical_literal(CanonicalValue::Uuid(uuid)).map(Some)
         }
         (CoveLogicalType::Bool, LowerLiteral::Boolean(value)) => {
-            CanonicalValue::Bool(*value).encode().map(Some)
+            tagged_canonical_literal(CanonicalValue::Bool(*value)).map(Some)
         }
         (
             CoveLogicalType::Int8
@@ -387,8 +398,7 @@ fn canonical_literal(
             width: integer_width(logical),
             value: signed_literal(literal)?,
         }
-        .encode()
-        .map(Some),
+        .pipe_tagged(),
         (
             CoveLogicalType::UInt8
             | CoveLogicalType::UInt16
@@ -399,47 +409,72 @@ fn canonical_literal(
             width: integer_width(logical),
             value: unsigned_literal(literal)?,
         }
-        .encode()
-        .map(Some),
+        .pipe_tagged(),
         (CoveLogicalType::Float32, LowerLiteral::Float64(value)) => {
-            CanonicalValue::Float32(*value as f32).encode().map(Some)
+            tagged_canonical_literal(CanonicalValue::Float32(*value as f32)).map(Some)
         }
         (CoveLogicalType::Float64, LowerLiteral::Float64(value)) => {
-            CanonicalValue::Float64(*value).encode().map(Some)
+            tagged_canonical_literal(CanonicalValue::Float64(*value)).map(Some)
         }
         (CoveLogicalType::Decimal64, literal) => {
             let value = i64::try_from(signed_literal(literal)?).map_err(|_| {
                 CoveError::UnsupportedEncoding("decimal64 literal out of range".into())
             })?;
-            CanonicalValue::Decimal64(value).encode().map(Some)
+            tagged_canonical_literal(CanonicalValue::Decimal64(value)).map(Some)
         }
         (CoveLogicalType::Decimal128, literal) => {
-            CanonicalValue::Decimal128(signed_literal(literal)?)
-                .encode()
-                .map(Some)
+            tagged_canonical_literal(CanonicalValue::Decimal128(signed_literal(literal)?)).map(Some)
         }
         (CoveLogicalType::DateDays, literal) => {
             let value = i32::try_from(signed_literal(literal)?).map_err(|_| {
                 CoveError::UnsupportedEncoding("date_days literal out of range".into())
             })?;
-            CanonicalValue::DateDays(value).encode().map(Some)
+            tagged_canonical_literal(CanonicalValue::DateDays(value)).map(Some)
         }
         (CoveLogicalType::TimestampMicros, literal) => {
             let value = i64::try_from(signed_literal(literal)?).map_err(|_| {
                 CoveError::UnsupportedEncoding("timestamp_micros literal out of range".into())
             })?;
-            CanonicalValue::TimestampMicros(value).encode().map(Some)
+            tagged_canonical_literal(CanonicalValue::TimestampMicros(value)).map(Some)
         }
         (CoveLogicalType::TimestampNanos, literal) => {
             let value = i64::try_from(signed_literal(literal)?).map_err(|_| {
                 CoveError::UnsupportedEncoding("timestamp_nanos literal out of range".into())
             })?;
-            CanonicalValue::TimestampNanos(value).encode().map(Some)
+            tagged_canonical_literal(CanonicalValue::TimestampNanos(value)).map(Some)
         }
         _ => Err(CoveError::UnsupportedEncoding(format!(
             "unsupported FileCode literal for {logical:?}"
         ))),
     }
+}
+
+trait TaggedCanonicalLiteralExt<'a> {
+    fn pipe_tagged(self) -> Result<Option<FileCodeCanonicalLiteral>, CoveError>;
+}
+
+impl<'a> TaggedCanonicalLiteralExt<'a> for CanonicalValue<'a> {
+    fn pipe_tagged(self) -> Result<Option<FileCodeCanonicalLiteral>, CoveError> {
+        tagged_canonical_literal(self).map(Some)
+    }
+}
+
+fn tagged_canonical_literal(
+    value: CanonicalValue<'_>,
+) -> Result<FileCodeCanonicalLiteral, CoveError> {
+    let tag = value.value_tag();
+    let payload = value.encode()?;
+    Ok(FileCodeCanonicalLiteral {
+        key: tagged_key(tag, &payload),
+        payload,
+    })
+}
+
+fn tagged_key(tag: ValueTag, payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + payload.len());
+    wire::append_u64_leb128(&mut out, tag as u64);
+    out.extend_from_slice(payload);
+    out
 }
 
 fn integer_width(logical: CoveLogicalType) -> u8 {
@@ -553,8 +588,9 @@ fn is_top_level_scalar(logical: CoveLogicalType, physical: CovePhysicalKind) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::{numeric_literal, LowerLiteral};
+    use super::{file_code_canonical_literal, numeric_literal, LowerLiteral};
     use crate::planner::PredicateLiteral;
+    use cove_core::constants::{CoveLogicalType, ValueTag};
 
     #[test]
     fn numeric_lowering_rejects_nan_and_normalizes_negative_zero() {
@@ -563,5 +599,21 @@ mod tests {
             numeric_literal(&LowerLiteral::Float64(-0.0)),
             Some(PredicateLiteral::Float64(0.0))
         );
+    }
+
+    #[test]
+    fn bool_filecode_literals_have_distinct_covi_keys() {
+        let false_literal =
+            file_code_canonical_literal(CoveLogicalType::Bool, &LowerLiteral::Boolean(false))
+                .unwrap()
+                .unwrap();
+        let true_literal =
+            file_code_canonical_literal(CoveLogicalType::Bool, &LowerLiteral::Boolean(true))
+                .unwrap()
+                .unwrap();
+        assert_eq!(false_literal.payload, Vec::<u8>::new());
+        assert_eq!(true_literal.payload, Vec::<u8>::new());
+        assert_eq!(false_literal.key, vec![ValueTag::BoolFalse as u8]);
+        assert_eq!(true_literal.key, vec![ValueTag::BoolTrue as u8]);
     }
 }

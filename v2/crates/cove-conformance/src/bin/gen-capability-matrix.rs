@@ -128,7 +128,7 @@ fn rows() -> Vec<Row> {
             parsed: "n/a",
             validated: "yes",
             written: "yes",
-            notes: "types.rs validates strict/default pairs plus explicit Bool-as-NumCode declarations through table, segment, and COVE-O property flags; full-file accept/reject corpus covers declared and missing Bool NumCode cases",
+            notes: "types.rs validates strict/default pairs plus explicit Bool-as-NumCode declarations through table, segment, and COVE-O property flags; full-file accept/reject corpus covers declared, missing, and invalid-domain Bool NumCode cases",
         },
         Row {
             section: "§20",
@@ -641,7 +641,7 @@ fn rows() -> Vec<Row> {
             parsed: "yes",
             validated: "yes",
             written: "yes",
-            notes: "cove-runtime parses and serializes runtime compatibility hints, exposes RuntimeSession registries for codecs, layouts, predicate kernels, mapping functions, engine profiles, and FFI adapters, validates uniqueness and required-operation matching, and gates runtime/ binary plus operation fixtures",
+            notes: "cove-runtime parses and serializes runtime compatibility hints, exposes RuntimeSession registries for codecs, layouts, predicate kernels, mapping functions, engine profiles, and FFI adapters, validates uniqueness and runtime-operation matching, and gates standalone plus embedded COVE-R runtime fixtures",
         },
         Row {
             section: "§68",

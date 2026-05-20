@@ -1529,6 +1529,7 @@ struct CoveSectionEntryV2 {
 | 45 | SECTION_FEATURE_BINDING | shared | Section/profile/operation-scoped extended feature requiredness bindings. |
 | 46 | COVERAGE_PROOF_RECORD | COVE-COVERAGE | Proof records binding predicate forms, providers, coverage sets, validity, and proof semantics. |
 | 47 | NESTED_SCHEMA | COVE-T | Authoritative recursive child schema metadata for native List/Struct/Map table columns. |
+| 48 | RUNTIME_COMPATIBILITY_HINTS | COVE-R | Optional runtime/session adapter selection hints. |
 | 30 | ENGINE_PROFILE_REGISTRY | COVE-E | Registered engine execution profiles. |
 | 31 | EXECUTION_CODE_DESCRIPTOR | COVE-E | ExecutionCode description. |
 | 32 | EXECUTION_SCOPE_DESCRIPTOR | COVE-E | Execution scope metadata. |

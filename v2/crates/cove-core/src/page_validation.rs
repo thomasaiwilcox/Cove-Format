@@ -433,12 +433,15 @@ fn validate_values_buffer(
 ) -> Result<(), CoveError> {
     match encoding_kind {
         CoveEncodingKind::FileCode => validate_filecodes(values, row_count, dictionary),
-        CoveEncodingKind::NumCode => require_len(values.len(), fixed_rows_len(row_count, 8)?),
+        CoveEncodingKind::NumCode => validate_numcode_values(logical_type, values, row_count),
         CoveEncodingKind::PlainFixed => {
             let width = fixed_width_for(logical_type, physical_kind)?;
             require_len(values.len(), fixed_rows_len(row_count, width)?)?;
             if physical_kind == CovePhysicalKind::Boolean {
                 validate_boolean_bytes(values)?;
+            }
+            if physical_kind == CovePhysicalKind::NumCode {
+                validate_numcode_values(logical_type, values, row_count)?;
             }
             Ok(())
         }
@@ -454,6 +457,9 @@ fn validate_values_buffer(
             if physical_kind == CovePhysicalKind::Boolean && !matches!(payload.value, 0 | 1) {
                 return Err(CoveError::PageCorrupt);
             }
+            if physical_kind == CovePhysicalKind::NumCode {
+                validate_numcode(logical_type, physical_kind, payload.raw_value_bits())?;
+            }
             Ok(())
         }
         CoveEncodingKind::LocalCodebook => {
@@ -463,13 +469,14 @@ fn validate_values_buffer(
             if decoded.len() != row_count as usize {
                 return Err(CoveError::PageCorrupt);
             }
-            validate_local_codebook_values(&decoded, physical_kind, dictionary)
+            validate_local_codebook_values(&decoded, logical_type, physical_kind, dictionary)
         }
         CoveEncodingKind::Rle => {
             let payload = RlePayload::parse(values)?;
             require_len(values.len(), payload.encode().len())?;
             validate_i64_values(
                 Rle::fast_decode(&payload)?,
+                logical_type,
                 physical_kind,
                 row_count,
                 dictionary,
@@ -489,6 +496,7 @@ fn validate_values_buffer(
             require_len(values.len(), expected)?;
             validate_i64_values(
                 RunEnd::fast_decode(&payload)?,
+                logical_type,
                 physical_kind,
                 row_count,
                 dictionary,
@@ -505,6 +513,7 @@ fn validate_values_buffer(
             }
             validate_i64_values(
                 BitPacked::fast_decode(&payload)?,
+                logical_type,
                 physical_kind,
                 row_count,
                 dictionary,
@@ -515,6 +524,7 @@ fn validate_values_buffer(
             require_len(values.len(), payload.encode().len())?;
             validate_i64_values(
                 Delta::fast_decode(&payload)?,
+                logical_type,
                 physical_kind,
                 row_count,
                 dictionary,
@@ -525,6 +535,7 @@ fn validate_values_buffer(
             require_len(values.len(), payload.encode().len())?;
             validate_i64_values(
                 FrameOfReference::fast_decode(&payload)?,
+                logical_type,
                 physical_kind,
                 row_count,
                 dictionary,
@@ -552,6 +563,7 @@ fn validate_values_buffer(
             require_len(values.len(), expected)?;
             validate_i64_values(
                 PatchedBase::fast_decode(&payload)?,
+                logical_type,
                 physical_kind,
                 row_count,
                 dictionary,
@@ -571,6 +583,7 @@ fn validate_values_buffer(
             require_len(values.len(), expected)?;
             validate_i64_values(
                 Sparse::fast_decode(&payload)?,
+                logical_type,
                 physical_kind,
                 row_count,
                 dictionary,
@@ -603,8 +616,39 @@ fn validate_filecodes(
     Ok(())
 }
 
+fn validate_numcode_values(
+    logical_type: CoveLogicalType,
+    values: &[u8],
+    row_count: u32,
+) -> Result<(), CoveError> {
+    require_len(values.len(), fixed_rows_len(row_count, 8)?)?;
+    if logical_type != CoveLogicalType::Bool {
+        return Ok(());
+    }
+    for chunk in values.chunks_exact(8) {
+        let code = u64::from_le_bytes(chunk.try_into().unwrap());
+        validate_numcode(logical_type, CovePhysicalKind::NumCode, code)?;
+    }
+    Ok(())
+}
+
+fn validate_numcode(
+    logical_type: CoveLogicalType,
+    physical_kind: CovePhysicalKind,
+    code: u64,
+) -> Result<(), CoveError> {
+    if logical_type == CoveLogicalType::Bool
+        && physical_kind == CovePhysicalKind::NumCode
+        && !matches!(code, 0 | 1)
+    {
+        return Err(CoveError::PageCorrupt);
+    }
+    Ok(())
+}
+
 fn validate_i64_values(
     values: Vec<i64>,
+    logical_type: CoveLogicalType,
     physical_kind: CovePhysicalKind,
     row_count: u32,
     dictionary: Option<&FileDictionaryView<'_>>,
@@ -629,7 +673,8 @@ fn validate_i64_values(
         }
         CovePhysicalKind::NumCode => {
             for value in values {
-                u64::try_from(value).map_err(|_| CoveError::PageCorrupt)?;
+                let code = u64::try_from(value).map_err(|_| CoveError::PageCorrupt)?;
+                validate_numcode(logical_type, physical_kind, code)?;
             }
         }
         _ => {}
@@ -639,6 +684,7 @@ fn validate_i64_values(
 
 fn validate_local_codebook_values(
     values: &[LocalCodebookValue],
+    logical_type: CoveLogicalType,
     physical_kind: CovePhysicalKind,
     dictionary: Option<&FileDictionaryView<'_>>,
 ) -> Result<(), CoveError> {
@@ -651,8 +697,10 @@ fn validate_local_codebook_values(
                     }
                 }
             }
-            (CovePhysicalKind::NumCode, LocalCodebookValue::NumCode(_))
-            | (CovePhysicalKind::Boolean, LocalCodebookValue::Boolean(_))
+            (CovePhysicalKind::NumCode, LocalCodebookValue::NumCode(code)) => {
+                validate_numcode(logical_type, physical_kind, *code)?;
+            }
+            (CovePhysicalKind::Boolean, LocalCodebookValue::Boolean(_))
             | (CovePhysicalKind::VarBytes, LocalCodebookValue::VarBytes(_)) => {}
             _ => return Err(CoveError::PageCorrupt),
         }
@@ -727,13 +775,13 @@ fn fixed_width_for(
 ) -> Result<usize, CoveError> {
     match physical_kind {
         CovePhysicalKind::Boolean => Ok(1),
-        CovePhysicalKind::FixedBytes | CovePhysicalKind::NumCode | CovePhysicalKind::FileCode => {
-            logical_fixed_width(logical_type).ok_or_else(|| {
-                CoveError::UnsupportedEncoding(format!(
-                    "fixed-width page validation for {logical_type:?}"
-                ))
-            })
-        }
+        CovePhysicalKind::NumCode => Ok(8),
+        CovePhysicalKind::FileCode => Ok(4),
+        CovePhysicalKind::FixedBytes => logical_fixed_width(logical_type).ok_or_else(|| {
+            CoveError::UnsupportedEncoding(format!(
+                "fixed-width page validation for {logical_type:?}"
+            ))
+        }),
         _ => logical_fixed_width(logical_type).ok_or_else(|| {
             CoveError::UnsupportedEncoding(format!(
                 "fixed-width page validation for {logical_type:?}"
@@ -807,6 +855,7 @@ mod tests {
     use super::*;
     use crate::{
         constants::CoveEncodingKind,
+        encoding::local_codebook::{LocalCodebookValues, LocalIndexPayload},
         page::{
             PAGE_FLAG_ALL_NON_NULL, PAGE_FLAG_STATS_ONLY_CONSTANT, PAGE_FLAG_VALUE_STREAM_ELIDED,
         },
@@ -849,6 +898,29 @@ mod tests {
         }
     }
 
+    fn constant_numcode_payload(
+        logical_type: CoveLogicalType,
+        raw_value_bits: u64,
+        row_count: u32,
+    ) -> ColumnPagePayloadV1 {
+        let values = ConstantPayload {
+            value: i64::from_le_bytes(raw_value_bits.to_le_bytes()),
+            row_count: u64::from(row_count),
+        }
+        .encode()
+        .to_vec();
+        let payload = ColumnPagePayloadV1::build_single_node(
+            row_count,
+            CoveEncodingKind::Constant,
+            logical_type,
+            CovePhysicalKind::NumCode,
+            None,
+            values,
+        )
+        .unwrap();
+        ColumnPagePayloadV1::parse(&payload).unwrap()
+    }
+
     #[test]
     fn rejects_short_numcode_values() {
         let payload = ColumnPagePayloadV1::build_single_node(
@@ -867,6 +939,120 @@ mod tests {
             &payload,
         );
         assert_eq!(err, Err(CoveError::PageCorrupt));
+    }
+
+    #[test]
+    fn bool_numcode_rejects_invalid_direct_code() {
+        let payload = ColumnPagePayloadV1::build_single_node(
+            1,
+            CoveEncodingKind::NumCode,
+            CoveLogicalType::Bool,
+            CovePhysicalKind::NumCode,
+            None,
+            2u64.to_le_bytes().to_vec(),
+        )
+        .unwrap();
+        let payload = ColumnPagePayloadV1::parse(&payload).unwrap();
+        let err = validate_column_page_payload(
+            &context(CoveLogicalType::Bool, CovePhysicalKind::NumCode, None),
+            &base_page(1, CoveEncodingKind::NumCode),
+            &payload,
+        );
+        assert_eq!(err, Err(CoveError::PageCorrupt));
+    }
+
+    #[test]
+    fn bool_numcode_rejects_invalid_transform_decoded_code() {
+        let values = RlePayload { runs: vec![(2, 1)] }.encode();
+        let payload = ColumnPagePayloadV1::build_single_node(
+            1,
+            CoveEncodingKind::Rle,
+            CoveLogicalType::Bool,
+            CovePhysicalKind::NumCode,
+            None,
+            values,
+        )
+        .unwrap();
+        let payload = ColumnPagePayloadV1::parse(&payload).unwrap();
+        let err = validate_column_page_payload(
+            &context(CoveLogicalType::Bool, CovePhysicalKind::NumCode, None),
+            &base_page(1, CoveEncodingKind::Rle),
+            &payload,
+        );
+        assert_eq!(err, Err(CoveError::PageCorrupt));
+    }
+
+    #[test]
+    fn bool_numcode_rejects_invalid_local_codebook_code() {
+        let values = LocalCodebookPayload {
+            values: LocalCodebookValues::NumCode(vec![0, 2]),
+            indexes: LocalIndexPayload::Rle(RlePayload { runs: vec![(1, 1)] }),
+        }
+        .encode();
+        let payload = ColumnPagePayloadV1::build_single_node(
+            1,
+            CoveEncodingKind::LocalCodebook,
+            CoveLogicalType::Bool,
+            CovePhysicalKind::NumCode,
+            None,
+            values,
+        )
+        .unwrap();
+        let payload = ColumnPagePayloadV1::parse(&payload).unwrap();
+        let err = validate_column_page_payload(
+            &context(CoveLogicalType::Bool, CovePhysicalKind::NumCode, None),
+            &base_page(1, CoveEncodingKind::LocalCodebook),
+            &payload,
+        );
+        assert_eq!(err, Err(CoveError::PageCorrupt));
+    }
+
+    #[test]
+    fn plain_fixed_numcode_uses_eight_byte_physical_width() {
+        let payload = ColumnPagePayloadV1::build_single_node(
+            2,
+            CoveEncodingKind::PlainFixed,
+            CoveLogicalType::Int8,
+            CovePhysicalKind::NumCode,
+            None,
+            [(-1i64 as u64).to_le_bytes(), 7u64.to_le_bytes()].concat(),
+        )
+        .unwrap();
+        let payload = ColumnPagePayloadV1::parse(&payload).unwrap();
+        assert_eq!(
+            validate_column_page_payload(
+                &context(CoveLogicalType::Int8, CovePhysicalKind::NumCode, None),
+                &base_page(2, CoveEncodingKind::PlainFixed),
+                &payload,
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn plain_fixed_numcode_rejects_logical_width_buffer() {
+        let payload = ColumnPagePayloadV1::build_single_node(
+            2,
+            CoveEncodingKind::PlainFixed,
+            CoveLogicalType::Float32,
+            CovePhysicalKind::NumCode,
+            None,
+            [
+                1.0f32.to_bits().to_le_bytes(),
+                2.0f32.to_bits().to_le_bytes(),
+            ]
+            .concat(),
+        )
+        .unwrap();
+        let payload = ColumnPagePayloadV1::parse(&payload).unwrap();
+        assert_eq!(
+            validate_column_page_payload(
+                &context(CoveLogicalType::Float32, CovePhysicalKind::NumCode, None),
+                &base_page(2, CoveEncodingKind::PlainFixed),
+                &payload,
+            ),
+            Err(CoveError::PageCorrupt)
+        );
     }
 
     #[test]
@@ -941,6 +1127,53 @@ mod tests {
                 &payload,
             ),
             Ok(())
+        );
+    }
+
+    #[test]
+    fn constant_numcode_preserves_raw_high_bits_for_signed_logicals() {
+        for (logical, raw) in [
+            (CoveLogicalType::Int64, (-1i64 as u64)),
+            (CoveLogicalType::TimestampNanos, (-123i64 as u64)),
+            (CoveLogicalType::Decimal64, (-456i64 as u64)),
+            (CoveLogicalType::Float64, (-2.5f64).to_bits()),
+        ] {
+            let payload = constant_numcode_payload(logical, raw, 2);
+            assert_eq!(
+                validate_column_page_payload(
+                    &context(logical, CovePhysicalKind::NumCode, None),
+                    &base_page(2, CoveEncodingKind::Constant),
+                    &payload,
+                ),
+                Ok(()),
+                "{logical:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn constant_numcode_accepts_uint64_above_i64_max() {
+        let payload = constant_numcode_payload(CoveLogicalType::UInt64, i64::MAX as u64 + 1, 2);
+        assert_eq!(
+            validate_column_page_payload(
+                &context(CoveLogicalType::UInt64, CovePhysicalKind::NumCode, None),
+                &base_page(2, CoveEncodingKind::Constant),
+                &payload,
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn constant_bool_numcode_still_rejects_non_bool_code() {
+        let payload = constant_numcode_payload(CoveLogicalType::Bool, 2, 1);
+        assert_eq!(
+            validate_column_page_payload(
+                &context(CoveLogicalType::Bool, CovePhysicalKind::NumCode, None),
+                &base_page(1, CoveEncodingKind::Constant),
+                &payload,
+            ),
+            Err(CoveError::PageCorrupt)
         );
     }
 
