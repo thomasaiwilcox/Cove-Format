@@ -39,7 +39,9 @@ use cove_layout::{
 };
 
 use crate::{
-    dataset_state::{LayoutPlanningMetadataV2, PruningMetadata},
+    dataset_state::{
+        selected_coverage_snapshot_validity_ref, LayoutPlanningMetadataV2, PruningMetadata,
+    },
     range_reader::{CoveRangeReader, RangeReadKind},
 };
 
@@ -197,6 +199,8 @@ pub(super) async fn parse_segment_index<R: CoveRangeReader + ?Sized>(
 
 pub(super) async fn parse_pruning_metadata<R: CoveRangeReader + ?Sized>(
     reader: &R,
+    header: &CoveHeaderV1,
+    file_len: u64,
     footer: &CoveFooter,
 ) -> Result<PruningMetadata, CoveError> {
     let zone_stats = parse_optional_sections(
@@ -211,6 +215,11 @@ pub(super) async fn parse_pruning_metadata<R: CoveRangeReader + ?Sized>(
         .flat_map(|section| section.entries.iter().cloned())
         .collect::<Vec<ZoneStatsEntry>>();
     Ok(PruningMetadata {
+        selected_coverage_snapshot_validity_ref: selected_coverage_snapshot_validity_ref(
+            footer,
+            &header.file_id,
+            file_len,
+        ),
         nested_schemas: Arc::new(
             parse_optional_sections(
                 reader,
@@ -371,9 +380,9 @@ pub(super) async fn parse_layout_metadata<R: CoveRangeReader + ?Sized>(
         "fast_metadata_section_id",
     ) {
         Ok(Some(entry)) => match read_section_payload(reader, entry).await {
-            Ok(payload) => match FastMetadataIndexV2::parse(&payload)
-                .and_then(|index| validate_fast_metadata_authority(&index, footer).map(|_| index))
-            {
+            Ok(payload) => match FastMetadataIndexV2::parse(&payload).and_then(|index| {
+                validate_fast_metadata_authority(&index, footer, table, segments).map(|_| index)
+            }) {
                 Ok(index) => {
                     layout.record_loaded();
                     Some(Arc::new(index))

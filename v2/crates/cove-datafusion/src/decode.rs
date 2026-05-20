@@ -506,11 +506,14 @@ pub(crate) fn decode_scan_to_sink<S: DecodeSink + ?Sized>(
 
             let mut page_payloads = Vec::with_capacity(plan.scan_projection.len());
             let mut page_indexes = Vec::with_capacity(plan.scan_projection.len());
+            let mut page_refs = Vec::with_capacity(plan.scan_projection.len());
             let mut columns = Vec::with_capacity(plan.scan_projection.len());
             for projection_index in &plan.scan_projection {
                 let column = &state.table().columns[*projection_index];
                 let segment_column = prepared_segment.column(column.column_id)?;
                 let page = prepared_segment.page_for_morsel(segment_column, morsel.morsel_id)?;
+                let page_ref =
+                    prepared_segment.page_ref_for_morsel(segment_column, morsel.morsel_id)?;
                 state.reject_table_scan_page_feature_use(segment_ref, page)?;
                 let payload = materialize_page_payload(
                     segment_bytes,
@@ -536,6 +539,7 @@ pub(crate) fn decode_scan_to_sink<S: DecodeSink + ?Sized>(
                     .ok_or(CoveError::ArithOverflow)?;
                 page_payloads.push(payload);
                 page_indexes.push(page.clone());
+                page_refs.push(page_ref);
                 columns.push(column);
             }
 
@@ -557,6 +561,7 @@ pub(crate) fn decode_scan_to_sink<S: DecodeSink + ?Sized>(
                 &columns,
                 &encoded_columns,
                 &page_indexes,
+                &page_refs,
                 &page_payloads,
                 arrow_options,
             );
@@ -790,6 +795,7 @@ async fn decode_scan_with_reader_to_sink_cached<
             }
 
             let mut page_indexes = Vec::with_capacity(plan.scan_projection.len());
+            let mut page_refs = Vec::with_capacity(plan.scan_projection.len());
             let mut columns = Vec::with_capacity(plan.scan_projection.len());
             let mut ranges = Vec::new();
             let mut range_hints = Vec::new();
@@ -798,6 +804,7 @@ async fn decode_scan_with_reader_to_sink_cached<
                 let column = &state.table().columns[*projection_index];
                 let segment_column = segment.column(column.column_id)?;
                 let page = segment.page_for_morsel(segment_column, morsel.morsel_id)?;
+                let page_ref = segment.page_ref_for_morsel(segment_column, morsel.morsel_id)?;
                 state.reject_table_scan_page_feature_use(segment_ref, page)?;
                 if page.page_length == 0 {
                     range_slots.push(None);
@@ -820,6 +827,7 @@ async fn decode_scan_with_reader_to_sink_cached<
                 }
                 stats.pages_decoded += usize::from(page.page_length != 0);
                 page_indexes.push(page.clone());
+                page_refs.push(page_ref);
                 columns.push(column);
             }
 
@@ -897,6 +905,7 @@ async fn decode_scan_with_reader_to_sink_cached<
                 &columns,
                 &encoded_columns,
                 &page_indexes,
+                &page_refs,
                 &page_payloads,
                 arrow_options,
             );
@@ -1066,6 +1075,7 @@ async fn decode_scan_with_reader_tasks_to_sink_cached<
             }
 
             let mut page_indexes = Vec::with_capacity(plan.scan_projection.len());
+            let mut page_refs = Vec::with_capacity(plan.scan_projection.len());
             let mut columns = Vec::with_capacity(plan.scan_projection.len());
             let mut ranges = Vec::new();
             let mut range_hints = Vec::new();
@@ -1074,6 +1084,7 @@ async fn decode_scan_with_reader_tasks_to_sink_cached<
                 let column = &state.table().columns[*projection_index];
                 let segment_column = segment.column(column.column_id)?;
                 let page = segment.page_for_morsel(segment_column, morsel.morsel_id)?;
+                let page_ref = segment.page_ref_for_morsel(segment_column, morsel.morsel_id)?;
                 state.reject_table_scan_page_feature_use(segment_ref, page)?;
                 if page.page_length == 0 {
                     range_slots.push(None);
@@ -1096,6 +1107,7 @@ async fn decode_scan_with_reader_tasks_to_sink_cached<
                 }
                 stats.pages_decoded += usize::from(page.page_length != 0);
                 page_indexes.push(page.clone());
+                page_refs.push(page_ref);
                 columns.push(column);
             }
 
@@ -1173,6 +1185,7 @@ async fn decode_scan_with_reader_tasks_to_sink_cached<
                 &columns,
                 &encoded_columns,
                 &page_indexes,
+                &page_refs,
                 &page_payloads,
                 arrow_options,
             );

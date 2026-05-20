@@ -471,6 +471,11 @@ fn pruning_from_bytes(bytes: &[u8], mounted: &MountedCoveFile) -> PruningMetadat
         .flat_map(|section| section.entries.iter().cloned())
         .collect::<Vec<_>>();
     PruningMetadata {
+        selected_coverage_snapshot_validity_ref: selected_coverage_snapshot_validity_ref(
+            &mounted.footer,
+            &mounted.header.file_id,
+            bytes.len() as u64,
+        ),
         nested_schemas: Arc::new(mounted.nested_schemas.clone()),
         codec_descriptors: Arc::new(parse_codec_descriptors_from_sections(
             bytes,
@@ -521,7 +526,7 @@ fn layout_from_bytes(
         .and_then(|entry| section_payload_from_entry(bytes, entry).ok())
         .and_then(|payload| FastMetadataIndexV2::parse(&payload).ok())
         .and_then(|index| {
-            validate_fast_metadata_authority(&index, &mounted.footer)
+            validate_fast_metadata_authority(&index, &mounted.footer, table, segments)
                 .ok()
                 .map(|_| Arc::new(index))
         });

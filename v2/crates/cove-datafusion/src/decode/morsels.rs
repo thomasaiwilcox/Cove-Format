@@ -177,6 +177,19 @@ impl SegmentMetadata {
             .get(page_position)
             .ok_or(CoveError::PageCorrupt)
     }
+
+    #[inline]
+    pub(super) fn page_ref_for_morsel(
+        &self,
+        column: &PreparedSegmentColumn,
+        morsel_id: u32,
+    ) -> Result<u32, CoveError> {
+        let Some(&Some(page_position)) = column.page_positions_by_morsel.get(morsel_id as usize)
+        else {
+            return Err(CoveError::PageCorrupt);
+        };
+        u32::try_from(page_position + 1).map_err(|_| CoveError::ArithOverflow)
+    }
 }
 
 pub(super) async fn read_segment_metadata<R: CoveRangeReader + ?Sized>(

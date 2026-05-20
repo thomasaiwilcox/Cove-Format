@@ -157,10 +157,7 @@ use cove_layout::{
     ZeroCopyMaterializationReasonV2,
 };
 use cove_map::ProjectionFormat;
-use cove_profile_validation::{
-    validate_embedded_optional_profile_sections as validate_shared_embedded_optional_profile_sections,
-    EmbeddedOptionalProfileValidator,
-};
+use cove_profile_validation::EmbeddedOptionalProfileValidator;
 use cove_runtime::{
     unsupported_required_hints, validate_hints, RuntimeCompatibilityHintV2, RuntimeHintKindV2,
 };
@@ -296,13 +293,14 @@ fn validate_cove_fixture(bytes: &[u8]) -> Result<(), CoveError> {
             ..ValidationOptions::default()
         },
     )?;
-    validate_shared_embedded_optional_profile_sections(
-        bytes,
-        &report,
-        OptionalPushdownPolicy::FailOpen,
-        None,
-        false,
-    )
+    EmbeddedOptionalProfileValidator::default_builtins()
+        .validate_embedded_optional_profile_sections(
+            bytes,
+            &report,
+            OptionalPushdownPolicy::FailOpen,
+            None,
+            false,
+        )
 }
 
 fn validate_feature_scope_use_fixture(entry: &Entry, bytes: &[u8]) -> Result<(), CoveError> {
@@ -361,7 +359,7 @@ fn validate_feature_scope_use_fixture(entry: &Entry, bytes: &[u8]) -> Result<(),
                 ));
         }
     }
-    let validator = EmbeddedOptionalProfileValidator;
+    let validator = EmbeddedOptionalProfileValidator::default_builtins();
     let report = reader::validate_bytes_for_feature_use_with_optional_profile_validator(
         bytes,
         ValidationOptions {
@@ -374,7 +372,7 @@ fn validate_feature_scope_use_fixture(entry: &Entry, bytes: &[u8]) -> Result<(),
         request.clone(),
         &validator,
     )?;
-    validate_shared_embedded_optional_profile_sections(
+    validator.validate_embedded_optional_profile_sections(
         bytes,
         &report,
         OptionalPushdownPolicy::FailOpen,

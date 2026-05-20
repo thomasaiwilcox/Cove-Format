@@ -12,3 +12,7 @@ path = "src/main.rs"
 [dependencies]
 cove-core = { path = "../cove-core" }
 cove-profile-validation = { path = "../cove-profile-validation" }
+
+[dev-dependencies]
+cove-layout = { path = "../cove-layout" }
+cove-runtime = { path = "../cove-runtime" }

@@ -1285,6 +1285,16 @@ pub fn validate_scan_split_authority(
     page_clusters: Option<&PageClusterDirectoryV2>,
 ) -> Result<(), CoveError> {
     validate_scan_splits(&index.header, &index.entries)?;
+    let mut expected_morsels = BTreeSet::new();
+    for segment in segments
+        .iter()
+        .filter(|segment| table.table_id == segment.table_id)
+    {
+        for morsel_id in 0..segment.morsel_count {
+            expected_morsels.insert((segment.segment_id, morsel_id));
+        }
+    }
+    let mut covered_morsels = BTreeSet::new();
     let clusters = page_clusters.map(|directory| {
         directory
             .entries
@@ -1321,6 +1331,14 @@ pub fn validate_scan_split_authority(
             if take == 0 {
                 return Err(CoveError::BadLayoutPlan);
             }
+            let morsel_end = start_morsel
+                .checked_add(take)
+                .ok_or(CoveError::ArithOverflow)?;
+            for morsel_id in start_morsel..morsel_end {
+                if !covered_morsels.insert((segment.segment_id, morsel_id)) {
+                    return Err(CoveError::BadLayoutPlan);
+                }
+            }
             let start_row = segment_morsel_row_start(segment, start_morsel)?;
             if actual_row_start.is_none() {
                 actual_row_start = Some(start_row);
@@ -1355,6 +1373,9 @@ pub fn validate_scan_split_authority(
                 }
             }
         }
+    }
+    if covered_morsels != expected_morsels {
+        return Err(CoveError::BadLayoutPlan);
     }
     Ok(())
 }
@@ -1419,6 +1440,8 @@ pub fn validate_page_clusters(
 pub fn validate_fast_metadata_authority(
     index: &FastMetadataIndexV2,
     footer: &CoveFooter,
+    table: &TableEntry,
+    segments: &[TableSegmentIndexEntryV1],
 ) -> Result<(), CoveError> {
     validate_fast_metadata_entries(&index.header, &index.entries)?;
     for entry in &index.entries {
@@ -1431,6 +1454,7 @@ pub fn validate_fast_metadata_authority(
         if entry.offset < section.offset || entry_end > section_end {
             return Err(CoveError::BadLayoutPlan);
         }
+        validate_fast_metadata_target(entry, table, segments)?;
     }
     Ok(())
 }
@@ -1478,6 +1502,14 @@ pub fn validate_page_cluster_authority(
         if morsel_end > segment.morsel_count {
             return Err(CoveError::BadLayoutPlan);
         }
+        if !page_ref_span_exists(
+            segment,
+            table.columns.len(),
+            cluster.first_page_ref,
+            cluster.page_count,
+        )? {
+            return Err(CoveError::BadLayoutPlan);
+        }
     }
     Ok(())
 }
@@ -1522,12 +1554,99 @@ pub fn validate_zero_copy_map_authority(
             return Err(CoveError::BadLayoutPlan);
         }
         let segment = segment_by_id(segments, table.table_id, entry.segment_id)?;
-        if entry.morsel_id >= segment.morsel_count || is_absent_ref(entry.page_ref) {
+        if entry.morsel_id >= segment.morsel_count
+            || !column_page_ref_exists(segment, entry.page_ref)
+        {
             return Err(CoveError::BadLayoutPlan);
         }
         if entry.source_endianness != 0 {
             return Err(CoveError::BadLayoutPlan);
         }
+    }
+    Ok(())
+}
+
+fn validate_fast_metadata_target(
+    entry: &FastMetadataIndexEntryV2,
+    table: &TableEntry,
+    segments: &[TableSegmentIndexEntryV1],
+) -> Result<(), CoveError> {
+    match entry.target_kind {
+        // table
+        0 => {
+            if entry.table_id != table.table_id {
+                return Err(CoveError::BadLayoutPlan);
+            }
+        }
+        // column
+        1 => {
+            validate_table_column(table, entry.table_id, entry.column_id)?;
+        }
+        // segment
+        2 => {
+            if entry.table_id != table.table_id {
+                return Err(CoveError::BadLayoutPlan);
+            }
+            segment_by_id(segments, entry.table_id, entry.segment_id)?;
+        }
+        // morsel
+        3 => {
+            if entry.table_id != table.table_id {
+                return Err(CoveError::BadLayoutPlan);
+            }
+            let segment = segment_by_id(segments, entry.table_id, entry.segment_id)?;
+            if entry.morsel_id >= segment.morsel_count {
+                return Err(CoveError::BadLayoutPlan);
+            }
+        }
+        // page
+        4 => {
+            validate_table_column(table, entry.table_id, entry.column_id)?;
+            let segment = segment_by_id(segments, entry.table_id, entry.segment_id)?;
+            if entry.morsel_id >= segment.morsel_count
+                || !column_page_ref_exists(segment, entry.local_id)
+            {
+                return Err(CoveError::BadLayoutPlan);
+            }
+        }
+        // stats
+        5 => {
+            if entry.table_id != table.table_id {
+                return Err(CoveError::BadLayoutPlan);
+            }
+            if is_absent_ref(entry.local_id) {
+                return Err(CoveError::BadLayoutPlan);
+            }
+        }
+        // section
+        6 => {
+            if is_absent_ref(entry.section_id) {
+                return Err(CoveError::BadLayoutPlan);
+            }
+        }
+        // layout_node
+        7 => {
+            if is_absent_ref(entry.local_id) {
+                return Err(CoveError::BadLayoutPlan);
+            }
+        }
+        _ => return Err(CoveError::BadLayoutPlan),
+    }
+    Ok(())
+}
+
+fn validate_table_column(
+    table: &TableEntry,
+    table_id: u32,
+    column_id: u32,
+) -> Result<(), CoveError> {
+    if table_id != table.table_id
+        || !table
+            .columns
+            .iter()
+            .any(|column| column.column_id == column_id)
+    {
+        return Err(CoveError::BadLayoutPlan);
     }
     Ok(())
 }
@@ -1727,6 +1846,26 @@ pub fn validate_layout_nodes(
             parent = parent_node.parent_node_id;
         }
     }
+    let mut declared_children = BTreeSet::new();
+    for node in nodes {
+        let child_end = node
+            .first_child_index
+            .checked_add(node.child_count)
+            .ok_or(CoveError::ArithOverflow)? as usize;
+        for child in &nodes[node.first_child_index as usize..child_end] {
+            if child.parent_node_id != node.node_id {
+                return Err(CoveError::BadLayoutPlan);
+            }
+            if !declared_children.insert(child.node_id) {
+                return Err(CoveError::BadLayoutPlan);
+            }
+        }
+    }
+    for node in nodes {
+        if node.node_id != header.root_node_id && !declared_children.contains(&node.node_id) {
+            return Err(CoveError::BadLayoutPlan);
+        }
+    }
     Ok(())
 }
 
@@ -1909,6 +2048,31 @@ fn segment_morsel_span_rows(
     Ok(rows)
 }
 
+fn column_page_ref_exists(segment: &TableSegmentIndexEntryV1, page_ref: u32) -> bool {
+    !is_absent_ref(page_ref) && page_ref <= segment.morsel_count
+}
+
+fn page_ref_span_exists(
+    segment: &TableSegmentIndexEntryV1,
+    table_column_count: usize,
+    first_page_ref: u32,
+    page_count: u32,
+) -> Result<bool, CoveError> {
+    if is_absent_ref(first_page_ref) || page_count == 0 {
+        return Ok(false);
+    }
+    let column_count = u32::try_from(table_column_count).map_err(|_| CoveError::ArithOverflow)?;
+    let max_page_ref = segment
+        .morsel_count
+        .checked_mul(column_count)
+        .ok_or(CoveError::ArithOverflow)?;
+    let last_page_ref = first_page_ref
+        .checked_add(page_count)
+        .and_then(|value| value.checked_sub(1))
+        .ok_or(CoveError::ArithOverflow)?;
+    Ok(last_page_ref <= max_page_ref)
+}
+
 fn is_absent_ref(value: u32) -> bool {
     value == 0 || value == ABSENT_ID
 }
@@ -2050,6 +2214,51 @@ mod tests {
         };
         assert!(matches!(
             validate_layout_nodes(&header, &[node.clone(), node]),
+            Err(CoveError::BadLayoutPlan)
+        ));
+    }
+
+    #[test]
+    fn layout_plan_rejects_child_range_parent_mismatch() {
+        let mut root = root_node();
+        root.first_child_index = 1;
+        root.child_count = 1;
+        let child = LayoutPlanNodeV2 {
+            node_id: 2,
+            parent_node_id: 99,
+            node_kind: 255,
+            ..root_node()
+        };
+        let header = LayoutPlanHeaderV2 {
+            layout_id: 7,
+            node_count: 2,
+            root_node_id: 1,
+            flags: 0,
+            checksum: 0,
+        };
+        assert!(matches!(
+            validate_layout_nodes(&header, &[root, child]),
+            Err(CoveError::BadLayoutPlan)
+        ));
+    }
+
+    #[test]
+    fn layout_plan_rejects_orphan_non_root_node() {
+        let child = LayoutPlanNodeV2 {
+            node_id: 2,
+            parent_node_id: 1,
+            node_kind: 255,
+            ..root_node()
+        };
+        let header = LayoutPlanHeaderV2 {
+            layout_id: 7,
+            node_count: 2,
+            root_node_id: 1,
+            flags: 0,
+            checksum: 0,
+        };
+        assert!(matches!(
+            validate_layout_nodes(&header, &[root_node(), child]),
             Err(CoveError::BadLayoutPlan)
         ));
     }
@@ -2351,6 +2560,40 @@ mod tests {
     }
 
     #[test]
+    fn scan_split_authority_rejects_partial_coverage() {
+        let table = authority_table();
+        let segments = authority_segments();
+        let index = ScanSplitIndexV2 {
+            header: ScanSplitIndexHeaderV2 {
+                split_count: 1,
+                flags: 0,
+                checksum: 0,
+            },
+            entries: vec![ScanSplitEntryV2 {
+                split_id: 1,
+                table_id: 1,
+                row_start: 0,
+                row_count: 256,
+                first_segment_id: 1,
+                segment_count: 1,
+                first_morsel_id: 0,
+                morsel_count: 1,
+                first_cluster_id: 0,
+                cluster_count: 0,
+                stats_ref: ABSENT_ID,
+                estimated_uncompressed_bytes: 256,
+                estimated_encoded_bytes: 256,
+                flags: 0,
+                checksum: 0,
+            }],
+        };
+        assert!(matches!(
+            validate_scan_split_authority(&index, &table, &segments, None),
+            Err(CoveError::BadLayoutPlan)
+        ));
+    }
+
+    #[test]
     fn layout_plan_authority_rejects_missing_section_refs() {
         let table = authority_table();
         let segments = authority_segments();
@@ -2365,11 +2608,106 @@ mod tests {
     }
 
     #[test]
+    fn fast_metadata_authority_rejects_missing_column_targets() {
+        let table = authority_table();
+        let segments = authority_segments();
+        let mut entry = FastMetadataIndexEntryV2 {
+            target_kind: 1,
+            flags: 0,
+            table_id: 1,
+            column_id: 99,
+            segment_id: 1,
+            morsel_id: 0,
+            section_id: 1,
+            local_id: 1,
+            offset: 1024,
+            length: 64,
+            checksum_or_crc32c: 0,
+            reserved: 0,
+        };
+        let index = FastMetadataIndexV2 {
+            header: FastMetadataIndexHeaderV2 {
+                entry_count: 1,
+                entry_len: FastMetadataIndexEntryV2::LEN as u16,
+                index_kind: 0,
+                flags: 0,
+                entries_offset: FastMetadataIndexHeaderV2::LEN as u64,
+                entries_length: FastMetadataIndexEntryV2::LEN as u64,
+                checksum: 0,
+            },
+            entries: vec![entry.clone()],
+        };
+        let footer = authority_footer(vec![authority_section(1, SectionKind::TableCatalog)]);
+        assert!(matches!(
+            validate_fast_metadata_authority(&index, &footer, &table, &segments),
+            Err(CoveError::BadLayoutPlan)
+        ));
+
+        entry.column_id = 1;
+        let index = FastMetadataIndexV2 {
+            entries: vec![entry],
+            ..index
+        };
+        validate_fast_metadata_authority(&index, &footer, &table, &segments).unwrap();
+    }
+
+    #[test]
+    fn page_cluster_authority_rejects_missing_page_refs() {
+        let table = authority_table();
+        let segments = authority_segments();
+        let mut section = authority_section(1, SectionKind::TableSegmentData);
+        section.offset = 4096;
+        section.length = 8192;
+        section.uncompressed_length = 8192;
+        let footer = authority_footer(vec![section]);
+        let directory = PageClusterDirectoryV2 {
+            header: PageClusterDirectoryHeaderV2 {
+                cluster_count: 1,
+                flags: 0,
+                checksum: 0,
+            },
+            entries: vec![PageClusterEntryV2 {
+                cluster_id: 1,
+                section_id: 1,
+                offset: 4096,
+                length: 128,
+                table_id: 1,
+                segment_id: 1,
+                first_morsel_id: 0,
+                morsel_count: 1,
+                first_page_ref: 99,
+                page_count: 1,
+                preferred_read_alignment: 0,
+                preferred_coalesce_distance: 0,
+                flags: 0,
+                checksum: 0,
+            }],
+        };
+        assert!(matches!(
+            validate_page_cluster_authority(&directory, &footer, &table, &segments),
+            Err(CoveError::BadLayoutPlan)
+        ));
+    }
+
+    #[test]
     fn zero_copy_authority_rejects_missing_page_refs() {
         let table = authority_table();
         let segments = authority_segments();
         let mut entry = zero_copy_entry();
         entry.page_ref = ABSENT_ID;
+        let map = zero_copy_map(entry);
+        assert!(matches!(
+            validate_zero_copy_map_authority(&map, &table, &segments),
+            Err(CoveError::BadLayoutPlan)
+        ));
+    }
+
+    #[test]
+    fn zero_copy_authority_rejects_out_of_range_page_refs() {
+        let table = authority_table();
+        let segments = authority_segments();
+        let mut entry = zero_copy_entry();
+        entry.page_ref = 99;
         let map = zero_copy_map(entry);
         assert!(matches!(
             validate_zero_copy_map_authority(&map, &table, &segments),

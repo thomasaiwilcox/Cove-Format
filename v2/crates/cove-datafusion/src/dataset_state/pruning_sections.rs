@@ -1,4 +1,5 @@
 use cove_core::{
+    checksum,
     codec::CodecExtensionDescriptorV2,
     compression,
     constants::SectionKind,
@@ -15,6 +16,64 @@ use cove_coverage::{
     CoveragePlanCandidateV2, CoverageProofRecordV2, CoverageProviderDescriptorV2, CoverageSetV2,
     PredicateNormalFormV2, PredicateNormalFormWithPayloadV2,
 };
+
+const ABSENT_ID: u32 = u32::MAX;
+
+pub fn embedded_coverage_snapshot_validity_ref(
+    footer: &CoveFooter,
+    file_id: &[u8; 16],
+    file_len: u64,
+) -> u32 {
+    let mut seed = Vec::new();
+    seed.extend_from_slice(file_id);
+    seed.extend_from_slice(&file_len.to_le_bytes());
+    for entry in footer
+        .sections
+        .iter()
+        .filter(|entry| !is_coverage_section_kind(entry.section_kind))
+    {
+        seed.extend_from_slice(&entry.section_id.to_le_bytes());
+        seed.extend_from_slice(&entry.section_kind.to_le_bytes());
+        seed.extend_from_slice(&entry.length.to_le_bytes());
+        seed.extend_from_slice(&entry.uncompressed_length.to_le_bytes());
+        seed.extend_from_slice(&entry.item_count.to_le_bytes());
+        seed.extend_from_slice(&entry.row_count.to_le_bytes());
+        seed.extend_from_slice(&entry.crc32c.to_le_bytes());
+    }
+    let ref_id = checksum::crc32c(&seed);
+    if ref_id == ABSENT_ID {
+        ABSENT_ID - 1
+    } else {
+        ref_id
+    }
+}
+
+pub fn selected_coverage_snapshot_validity_ref(
+    footer: &CoveFooter,
+    file_id: &[u8; 16],
+    file_len: u64,
+) -> Option<u32> {
+    has_embedded_coverage_metadata(footer)
+        .then(|| embedded_coverage_snapshot_validity_ref(footer, file_id, file_len))
+}
+
+fn has_embedded_coverage_metadata(footer: &CoveFooter) -> bool {
+    footer
+        .sections
+        .iter()
+        .any(|entry| is_coverage_section_kind(entry.section_kind))
+}
+
+fn is_coverage_section_kind(section_kind: u16) -> bool {
+    matches!(
+        SectionKind::from_u16(section_kind),
+        Some(
+            SectionKind::CoverageProviderRegistry
+                | SectionKind::CoverageSet
+                | SectionKind::CoverageProofRecord
+        )
+    )
+}
 
 pub fn parse_column_domains_from_sections(bytes: &[u8], footer: &CoveFooter) -> Vec<ColumnDomain> {
     footer

@@ -65,6 +65,7 @@ use cove_core::{
         ExecutionCodeKind, ExecutionCodeLifetime, FileCodeMappingKind, MissingValuePolicy,
         NullCodePolicy, ReverseLookupPolicy, StaleMappingPolicy,
     },
+    reader,
     redaction::{RedactionEntry, RedactionManifest},
     row_ref::RowRef,
     table::{ColumnEntry, TableCatalog, TableEntry},
@@ -94,6 +95,7 @@ use cove_datafusion::{
         bootstrap_bytes, bootstrap_bytes_with_options, bootstrap_local_file,
         bootstrap_local_file_async, bootstrap_range_reader_with_options, CoveMetadataCache,
     },
+    dataset_state::embedded_coverage_snapshot_validity_ref,
     decode::{decode_local_dataset_scan_tasks, decode_scan},
     expr_lowering::{lower_filter, LowerExpr, LowerLiteral, LowerOperator},
     overlay::{CoveOverlaySnapshot, OverlayFile, OverlayFileIdentity, RowRange, RowVisibility},
@@ -1804,6 +1806,46 @@ async fn coverage_metadata_bad_checksum_fails_open() {
     assert_eq!(decoded.stats.morsels_pruned, 0);
 
     let path = write_temp_cove("coverage_sql_bad_checksum", bytes);
+    let ctx = SessionContext::new();
+    register_cove_file(&ctx, "events", &path).unwrap();
+
+    let (batches, morsels_pruned) = collect_sql_with_cove_metric(
+        &ctx,
+        "SELECT id, name FROM events WHERE name = 'gamma'",
+        "cove_morsels_pruned",
+    )
+    .await;
+
+    let expected = [
+        "+----+-------+",
+        "| id | name  |",
+        "+----+-------+",
+        "| 3  | gamma |",
+        "+----+-------+",
+    ];
+    assert_batches_eq!(expected, &batches);
+    assert_eq!(morsels_pruned, 0);
+    fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn coverage_metadata_stale_snapshot_fails_open() {
+    let bytes = primitive_events_file_with_name_gamma_coverage_snapshot(false, 2);
+    let state = bootstrap_bytes("coverage_sql_stale_snapshot", bytes.clone()).unwrap();
+    let filter = lower_filter(
+        &state,
+        &LowerExpr::Binary {
+            left: Box::new(LowerExpr::Column("name".into())),
+            op: LowerOperator::Eq,
+            right: Box::new(LowerExpr::Literal(LowerLiteral::Utf8("gamma".into()))),
+        },
+        "name = 'gamma'",
+    );
+    let plan = plan_scan(&state, Some(&vec![0, 1]), vec![filter]).unwrap();
+    let decoded = decode_scan(&state, &plan).unwrap();
+    assert_eq!(decoded.stats.morsels_pruned, 0);
+
+    let path = write_temp_cove("coverage_sql_stale_snapshot", bytes);
     let ctx = SessionContext::new();
     register_cove_file(&ctx, "events", &path).unwrap();
 
@@ -3594,8 +3636,24 @@ fn stats_only_entry(
 }
 
 fn primitive_events_file_with_name_gamma_coverage(bad_checksum: bool) -> Vec<u8> {
+    let placeholder = primitive_events_file_with_name_gamma_coverage_snapshot(bad_checksum, 0);
+    let placeholder_footer = reader::validate_bytes(&placeholder).unwrap().footer;
+    primitive_events_file_with_name_gamma_coverage_snapshot(
+        bad_checksum,
+        embedded_coverage_snapshot_validity_ref(
+            &placeholder_footer,
+            &[0; 16],
+            placeholder.len() as u64,
+        ),
+    )
+}
+
+fn primitive_events_file_with_name_gamma_coverage_snapshot(
+    bad_checksum: bool,
+    snapshot_validity_ref: u32,
+) -> Vec<u8> {
     let mut writer = primitive_events_writer();
-    for section in name_gamma_coverage_sections(bad_checksum) {
+    for section in name_gamma_coverage_sections(bad_checksum, snapshot_validity_ref) {
         writer.push_extra_section(section);
     }
     writer.write().unwrap()
@@ -3650,11 +3708,13 @@ fn coverage_cache_bytes_for_state(state: &cove_datafusion::dataset_state::Datase
     .unwrap()
 }
 
-fn name_gamma_coverage_sections(bad_checksum: bool) -> Vec<SectionPayload> {
+fn name_gamma_coverage_sections(
+    bad_checksum: bool,
+    snapshot_validity_ref: u32,
+) -> Vec<SectionPayload> {
     let predicate_form_ref = 1;
     let provider_id = 1;
     let coverage_set_id = 1;
-    let snapshot_validity_ref = 1;
     let predicate_form_section =
         predicate_normal_form_ast_section(predicate_form_ref, 1, name_eq_gamma_ast_payload());
 

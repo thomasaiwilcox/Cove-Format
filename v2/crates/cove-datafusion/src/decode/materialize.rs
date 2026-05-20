@@ -17,18 +17,21 @@ pub(super) fn arrow_encoded_columns_for_payloads<'name, 'array, 'data>(
     columns: &[&ColumnEntry],
     encoded_columns: &'array [(&'name str, EncodedArray<'data>)],
     page_indexes: &'array [ColumnPageIndexEntryV1],
+    page_refs: &[u32],
     page_payloads: &'array [RetainedColumnPagePayloadV1],
     _options: ArrowExportOptions,
 ) -> Vec<DecodedArrowColumn<'name, 'array, 'data>> {
     debug_assert_eq!(columns.len(), encoded_columns.len());
     debug_assert_eq!(page_indexes.len(), encoded_columns.len());
+    debug_assert_eq!(page_refs.len(), encoded_columns.len());
     debug_assert_eq!(encoded_columns.len(), page_payloads.len());
     columns
         .iter()
         .zip(encoded_columns.iter())
         .zip(page_indexes.iter())
+        .zip(page_refs.iter())
         .zip(page_payloads.iter())
-        .map(|(((column, (name, array)), page), payload)| {
+        .map(|((((column, (name, array)), page), page_ref), payload)| {
             let nested_schema = state.nested_schema_for_column(column.column_id).cloned();
             let data_owner = if array.physical == CovePhysicalKind::VarBytes {
                 Some(arrow_buffer_owner(payload.data.owner()))
@@ -42,7 +45,8 @@ pub(super) fn arrow_encoded_columns_for_payloads<'name, 'array, 'data>(
                 nested_schema,
                 data_owner,
                 utf8_proof_key: Utf8ProofKey::new(state.identity(), column, page),
-                zero_copy: state.zero_copy_compatibility_for_page(segment_id, column, page),
+                zero_copy: state
+                    .zero_copy_compatibility_for_page(segment_id, column, page, *page_ref),
             }
         })
         .collect()

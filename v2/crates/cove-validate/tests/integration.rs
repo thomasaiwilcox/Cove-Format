@@ -3,8 +3,8 @@ use cove_core::{
     constants::{
         CoveEncodingKind, CoveLogicalType, CovePhysicalKind, PrimaryProfile, SectionKind,
         FEATURE_COLUMN_DOMAINS, FEATURE_ENGINE_PROFILE, FEATURE_FILE_DICTIONARY,
-        FEATURE_HARBOR_PROFILE, FEATURE_OBJECT_PROFILE, FEATURE_REDACTIONS, FEATURE_TABLE_PROFILE,
-        FEATURE_TRUST_CHAIN,
+        FEATURE_HARBOR_PROFILE, FEATURE_LAYOUT_PLAN, FEATURE_OBJECT_PROFILE, FEATURE_REDACTIONS,
+        FEATURE_RUNTIME_COMPATIBILITY_HINTS, FEATURE_TABLE_PROFILE, FEATURE_TRUST_CHAIN,
     },
     page::{ColumnPageIndexEntryV1, COLUMN_PAGE_INDEX_ENTRY_LEN},
     reader,
@@ -12,6 +12,8 @@ use cove_core::{
     table::{ColumnEntry, TableCatalog, TableEntry},
     writer::{MinimalCoveWriter, ScanProfileCoveWriter, ScanSegment, SectionPayload},
 };
+use cove_layout::{LayoutPlanHeaderV2, LayoutPlanNodeV2, LayoutPlanV2};
+use cove_runtime::{RuntimeCompatibilityHintV2, RuntimeHintKindV2};
 use std::io::Write;
 
 fn write_temp_file(name: &str, bytes: &[u8]) -> std::path::PathBuf {
@@ -1018,8 +1020,39 @@ fn semantic_cli_rejects_bad_table_segment_payload() {
 }
 
 #[test]
-fn requested_runtime_operation_rejects_required_hint_without_semantic_flag() {
-    let path = runtime_fixture("runtime_hints_embedded_required_unsupported_reject.cove");
+fn requested_layout_profile_rejects_bad_layout_authority() {
+    let path = write_temp_file(
+        "bad_layout_authority",
+        &scan_file_with_bad_layout_authority(),
+    );
+    let requested_profile = (PrimaryProfile::LayoutPlanning as u8).to_string();
+    let output = run_validate_with_args(&path, &["--requested-profile", &requested_profile]);
+    assert!(!output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("COVE_E_BAD_LAYOUT_PLAN"));
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn requested_runtime_operation_accepts_supported_required_hint_without_semantic_flag() {
+    let path = write_temp_file(
+        "runtime_required_supported",
+        &cove_with_required_runtime_hint("org.cove", "datafusion"),
+    );
+    let output = run_validate_with_args(
+        &path,
+        &["--requested-operation", "runtime_adapter_selection"],
+    );
+    assert!(output.status.success());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn requested_runtime_operation_rejects_unsupported_required_hint_without_semantic_flag() {
+    let path = write_temp_file(
+        "runtime_required_unsupported",
+        &cove_with_required_runtime_hint("example.invalid", "not-registered"),
+    );
     let output = run_validate_with_args(
         &path,
         &["--requested-operation", "runtime_adapter_selection"],
@@ -1027,6 +1060,7 @@ fn requested_runtime_operation_rejects_required_hint_without_semantic_flag() {
     assert!(!output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("COVE_E_RUNTIME_HINT_UNSUPPORTED"));
+    let _ = std::fs::remove_file(&path);
 }
 
 #[test]
@@ -1034,6 +1068,147 @@ fn structural_validation_still_ignores_required_runtime_hint() {
     let path = runtime_fixture("runtime_hints_embedded_required_unsupported_reject.cove");
     let output = run_validate(&path, false);
     assert!(output.status.success());
+}
+
+fn scan_file_with_bad_layout_authority() -> Vec<u8> {
+    let catalog = TableCatalog {
+        flags: 0,
+        tables: vec![TableEntry {
+            table_id: 1,
+            namespace: "public".into(),
+            name: "events".into(),
+            row_count: 2,
+            primary_sort_key_count: 0,
+            clustering_key_count: 0,
+            flags: 0,
+            columns: vec![ColumnEntry {
+                column_id: 1,
+                name: "id".into(),
+                logical: CoveLogicalType::Int64,
+                physical: CovePhysicalKind::NumCode,
+                nullable: false,
+                sort_order: 0,
+                collation_id: 0,
+                precision: 0,
+                scale: 0,
+                flags: 0,
+            }],
+        }],
+    };
+    let mut segment = ScanSegment::new(1, 0, 0, 2, 1);
+    segment.morsel_row_count = 1;
+    segment.set_column_pages(
+        1,
+        vec![
+            cove_core::writer::ScanPageSpec::new(1, 1u64.to_le_bytes().to_vec())
+                .with_encoding_root(CoveEncodingKind::NumCode as u32),
+            cove_core::writer::ScanPageSpec::new(1, 2u64.to_le_bytes().to_vec())
+                .with_encoding_root(CoveEncodingKind::NumCode as u32),
+        ],
+    );
+    let mut writer = ScanProfileCoveWriter::new(catalog);
+    writer.push_segment(segment);
+    writer.push_extra_section(SectionPayload {
+        section_kind: SectionKind::LayoutPlan as u16,
+        profile: PrimaryProfile::LayoutPlanning as u8,
+        flags: 0,
+        item_count: 1,
+        row_count: 0,
+        compression: 0,
+        alignment_log2: 0,
+        required_features: 0,
+        optional_features: FEATURE_LAYOUT_PLAN,
+        data: bad_layout_authority_payload(),
+    });
+    writer.write().unwrap()
+}
+
+fn bad_layout_authority_payload() -> Vec<u8> {
+    LayoutPlanV2 {
+        header: LayoutPlanHeaderV2 {
+            layout_id: 1,
+            node_count: 2,
+            root_node_id: 1,
+            flags: 0,
+            checksum: 0,
+        },
+        nodes: vec![
+            LayoutPlanNodeV2 {
+                node_id: 1,
+                parent_node_id: u32::MAX,
+                node_kind: 0,
+                flags: 0,
+                table_id: u32::MAX,
+                column_id: u32::MAX,
+                segment_id: u32::MAX,
+                first_morsel_id: 0,
+                morsel_count: 0,
+                row_start: 0,
+                row_count: 2,
+                section_id: 0,
+                cluster_id: 0,
+                first_child_index: 1,
+                child_count: 1,
+                stats_ref: u32::MAX,
+                split_ref: u32::MAX,
+                checksum: 0,
+            },
+            LayoutPlanNodeV2 {
+                node_id: 2,
+                parent_node_id: 1,
+                node_kind: 1,
+                flags: 0,
+                table_id: 99,
+                column_id: u32::MAX,
+                segment_id: u32::MAX,
+                first_morsel_id: 0,
+                morsel_count: 0,
+                row_start: 0,
+                row_count: 2,
+                section_id: 0,
+                cluster_id: 0,
+                first_child_index: 0,
+                child_count: 0,
+                stats_ref: u32::MAX,
+                split_ref: u32::MAX,
+                checksum: 0,
+            },
+        ],
+    }
+    .serialize()
+    .unwrap()
+}
+
+fn cove_with_required_runtime_hint(namespace: &str, name: &str) -> Vec<u8> {
+    let mut writer = MinimalCoveWriter::new();
+    writer.required_features = FEATURE_TABLE_PROFILE;
+    writer.optional_features = FEATURE_RUNTIME_COMPATIBILITY_HINTS;
+    writer.sections.push(SectionPayload {
+        section_kind: SectionKind::RuntimeCompatibilityHints as u16,
+        profile: PrimaryProfile::RuntimeCompatibility as u8,
+        flags: 0,
+        item_count: 1,
+        row_count: 0,
+        compression: 0,
+        alignment_log2: 0,
+        required_features: 0,
+        optional_features: FEATURE_RUNTIME_COMPATIBILITY_HINTS,
+        data: RuntimeCompatibilityHintV2 {
+            hint_id: 1,
+            hint_kind: RuntimeHintKindV2::EngineAdapter,
+            required: true,
+            flags: 0,
+            namespace: namespace.into(),
+            name: name.into(),
+            version_major: 1,
+            version_minor: 0,
+            payload_ref: u32::MAX,
+            checksum: 0,
+        }
+        .serialize()
+        .unwrap(),
+    });
+    writer.write().unwrap()
 }
 
 #[test]

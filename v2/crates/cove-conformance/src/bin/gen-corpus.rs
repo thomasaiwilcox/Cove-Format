@@ -7272,8 +7272,16 @@ fn runtime_hints_payload_with_required(required: bool) -> Vec<u8> {
         hint_kind: RuntimeHintKindV2::EngineAdapter,
         required,
         flags: 0,
-        namespace: "org.cove".into(),
-        name: "datafusion".into(),
+        namespace: if required {
+            "example.invalid".into()
+        } else {
+            "org.cove".into()
+        },
+        name: if required {
+            "not-registered".into()
+        } else {
+            "datafusion".into()
+        },
         version_major: 1,
         version_minor: 0,
         payload_ref: u32::MAX,

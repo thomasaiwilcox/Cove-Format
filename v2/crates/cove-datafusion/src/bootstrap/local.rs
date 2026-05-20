@@ -152,7 +152,7 @@ pub async fn bootstrap_range_reader_with_options<R: CoveRangeReader + ?Sized>(
         .into_iter()
         .filter(|segment| segment.table_id == table.table_id)
         .collect::<Vec<_>>();
-    let pruning = parse_pruning_metadata(reader, &footer).await?;
+    let pruning = parse_pruning_metadata(reader, &header, file_len, &footer).await?;
     let layout = parse_layout_metadata(reader, &header, &footer, &table, &segments).await;
 
     let state = Arc::new(DatasetState::from_metadata_with_options_and_feature_scope(
@@ -286,6 +286,23 @@ fn coverage_cache_entry_usable(
     state: &DatasetState,
     entry: &cove_cache::CoverageCacheEntryV2,
 ) -> bool {
+    const ABSENT_REF: u32 = u32::MAX;
+
+    if entry.interval_normal_form_ref != ABSENT_REF {
+        return false;
+    }
+    if entry.producer_engine_ref != ABSENT_REF && entry.producer_engine_ref != 0 {
+        return false;
+    }
+    let Some(selected_snapshot_ref) = state.pruning().selected_coverage_snapshot_validity_ref
+    else {
+        return false;
+    };
+    if entry.valid_until_snapshot_ref != ABSENT_REF
+        && entry.valid_until_snapshot_ref != selected_snapshot_ref
+    {
+        return false;
+    }
     let predicate_exists = state
         .pruning()
         .predicate_forms
@@ -305,6 +322,7 @@ fn coverage_cache_entry_usable(
             && set.header.granularity == entry.coverage_granularity
             && set.header.proof_strength == entry.proof_strength
             && set.header.exactness == entry.exactness
+            && set.header.snapshot_validity_ref == selected_snapshot_ref
             && !set.header.exactness.may_under_include()
             && set.header.proof_strength.allows_pruning()
     })

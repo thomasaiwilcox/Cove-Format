@@ -682,6 +682,9 @@ fn coverage_atom_prunes_morsel(
         if !coverage_record_usable_for_pruning(record) {
             continue;
         }
+        if !coverage_snapshot_matches_selected(state, record.snapshot_validity_ref) {
+            continue;
+        }
         let Some(provider) = state.pruning().coverage_providers.iter().find(|provider| {
             coverage_provider_matches_filter(
                 provider,
@@ -789,7 +792,19 @@ fn cached_coverage_atom_decision(
         if set.header.predicate_form_ref != atom.predicate_form_ref
             || set.header.exactness.may_under_include()
             || !set.header.proof_strength.allows_pruning()
+            || !coverage_snapshot_matches_selected(state, set.header.snapshot_validity_ref)
             || !coverage_set_supports_morsel_pruning(set)
+        {
+            continue;
+        }
+        if matching_coverage_proof_chain_for_set(
+            state,
+            set,
+            table_id,
+            atom.column_id,
+            atom.predicate_form_ref,
+        )
+        .is_none()
         {
             continue;
         }
@@ -823,6 +838,13 @@ fn coverage_record_usable_for_pruning(record: &CoverageProofRecordV2) -> bool {
         )
 }
 
+fn coverage_snapshot_matches_selected(state: &DatasetState, snapshot_validity_ref: u32) -> bool {
+    state
+        .pruning()
+        .selected_coverage_snapshot_validity_ref
+        .is_some_and(|selected| selected == snapshot_validity_ref)
+}
+
 fn coverage_provider_matches_filter(
     provider: &CoverageProviderDescriptorV2,
     record: &CoverageProofRecordV2,
@@ -843,6 +865,46 @@ fn coverage_provider_matches_filter(
         && !provider.exactness.may_under_include()
         && (provider.predicate_form_ref == u32::MAX
             || provider.predicate_form_ref == predicate_form_ref)
+}
+
+fn matching_coverage_proof_chain_for_set<'a>(
+    state: &'a DatasetState,
+    set: &'a CoverageSetV2,
+    table_id: u32,
+    column_id: u32,
+    predicate_form_ref: u32,
+) -> Option<(&'a CoverageProofRecordV2, &'a CoverageProviderDescriptorV2)> {
+    state
+        .pruning()
+        .coverage_proofs
+        .iter()
+        .filter(|record| {
+            record.coverage_set_id == set.header.coverage_set_id
+                && record.predicate_form_ref == predicate_form_ref
+        })
+        .find_map(|record| {
+            if !coverage_record_usable_for_pruning(record)
+                || !coverage_snapshot_matches_selected(state, record.snapshot_validity_ref)
+            {
+                return None;
+            }
+            let provider = state.pruning().coverage_providers.iter().find(|provider| {
+                coverage_provider_matches_filter(
+                    provider,
+                    record,
+                    table_id,
+                    column_id,
+                    predicate_form_ref,
+                )
+            })?;
+            if coverage_record_matches_set(record, provider, set, predicate_form_ref)
+                && coverage_set_payload_matches(record, set)
+            {
+                Some((record, provider))
+            } else {
+                None
+            }
+        })
 }
 
 fn coverage_record_matches_set(

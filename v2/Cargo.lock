@@ -934,7 +934,9 @@ name = "cove-validate"
 version = "0.1.0"
 dependencies = [
  "cove-core",
+ "cove-layout",
  "cove-profile-validation",
+ "cove-runtime",
 ]
 
 [[package]]

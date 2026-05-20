@@ -80,10 +80,7 @@ pub fn build_task_graph(state: &DatasetState, plan: &ScanPlan) -> Result<TaskGra
                     .first_segment_id
                     .checked_add(split.segment_count)
                     .ok_or(CoveError::ArithOverflow)?;
-                let morsel_end = split
-                    .first_morsel_id
-                    .checked_add(split.morsel_count)
-                    .ok_or(CoveError::ArithOverflow)?;
+                let mut remaining_morsels = split.morsel_count;
                 for segment_id in split.first_segment_id..segment_end {
                     let Some(segment_index) = segment_by_id.get(&segment_id).copied() else {
                         continue;
@@ -92,10 +89,30 @@ pub fn build_task_graph(state: &DatasetState, plan: &ScanPlan) -> Result<TaskGra
                         .segments()
                         .get(segment_index)
                         .ok_or(CoveError::SegmentCorrupt)?;
+                    let start_morsel = if segment_id == split.first_segment_id {
+                        split.first_morsel_id
+                    } else {
+                        0
+                    };
+                    if start_morsel >= segment.morsel_count {
+                        return Err(CoveError::BadLayoutPlan);
+                    }
+                    let available = segment
+                        .morsel_count
+                        .checked_sub(start_morsel)
+                        .ok_or(CoveError::ArithOverflow)?;
+                    let take = available.min(remaining_morsels);
+                    if take == 0 {
+                        break;
+                    }
+                    let morsel_end = start_morsel
+                        .checked_add(take)
+                        .ok_or(CoveError::ArithOverflow)?;
                     let morsels = segment_morsels_for_task_graph(&file_state, segment)?;
-                    for morsel in morsels.iter().filter(|morsel| {
-                        morsel_in_split_range(morsel, split.first_morsel_id, morsel_end)
-                    }) {
+                    for morsel in morsels
+                        .iter()
+                        .filter(|morsel| morsel_in_split_range(morsel, start_morsel, morsel_end))
+                    {
                         maybe_push_task(
                             &file_state,
                             &file_plan,
@@ -109,6 +126,12 @@ pub fn build_task_graph(state: &DatasetState, plan: &ScanPlan) -> Result<TaskGra
                             Some(&mut partition),
                             None,
                         )?;
+                    }
+                    remaining_morsels = remaining_morsels
+                        .checked_sub(take)
+                        .ok_or(CoveError::ArithOverflow)?;
+                    if remaining_morsels == 0 {
+                        break;
                     }
                 }
                 if !partition.tasks.is_empty() {
@@ -469,7 +492,13 @@ mod tests {
             MinimalCoveWriter, ScanPageSpec, ScanProfileCoveWriter, ScanSegment, SectionPayload,
         },
     };
-    use cove_layout::build_default_scan_split_index;
+    use cove_layout::{
+        build_default_scan_split_index, ScanSplitEntryV2, ScanSplitIndexHeaderV2, ScanSplitIndexV2,
+        ZeroCopyBufferMapEntryV2, ZeroCopyBufferMapHeaderV2, ZeroCopyBufferMapV2,
+        ZeroCopyDictionarySemanticsV2, ZeroCopyLifetimeScopeV2, ZeroCopyNestedLayoutKindV2,
+        ZeroCopyNullBitmapPolarityV2, ZeroCopySourceBufferRoleV2, ZeroCopyTargetBufferRoleV2,
+        ZeroCopyTargetV2,
+    };
 
     use crate::planner::{plan_scan, FilterPlan, PredicateLiteral};
 
@@ -572,6 +601,99 @@ mod tests {
         }
 
         writer.write().unwrap()
+    }
+
+    fn split_test_file_with_extra_sections(extra_sections: Vec<SectionPayload>) -> Vec<u8> {
+        let mut writer = ScanProfileCoveWriter::new(split_test_table());
+        let mut first = ScanSegment::new(1, 1, 0, 2, 1);
+        first.morsel_row_count = 1;
+        first.set_column_pages(1, vec![split_test_page(1), split_test_page(2)]);
+        writer.push_segment(first);
+
+        let mut second = ScanSegment::new(1, 2, 2, 2, 1);
+        second.morsel_row_count = 1;
+        second.set_column_pages(1, vec![split_test_page(3), split_test_page(4)]);
+        writer.push_segment(second);
+
+        for section in extra_sections {
+            writer.push_extra_section(section);
+        }
+
+        writer.write().unwrap()
+    }
+
+    fn scan_split_section_payload(entries: Vec<ScanSplitEntryV2>) -> Vec<u8> {
+        ScanSplitIndexV2 {
+            header: ScanSplitIndexHeaderV2 {
+                split_count: entries.len() as u32,
+                flags: 0,
+                checksum: 0,
+            },
+            entries,
+        }
+        .serialize()
+        .unwrap()
+    }
+
+    fn zero_copy_section(page_ref: u32) -> SectionPayload {
+        let map = ZeroCopyBufferMapV2 {
+            header: ZeroCopyBufferMapHeaderV2 {
+                map_count: 1,
+                target_count: 1,
+                flags: 0,
+                checksum: 0,
+            },
+            targets: vec![ZeroCopyTargetV2 {
+                target_id: 1,
+                namespace: "org.apache.arrow".into(),
+                target_name: "arrow".into(),
+                version_major: 1,
+                version_minor: 0,
+                flags: 0,
+            }],
+            entries: vec![ZeroCopyBufferMapEntryV2 {
+                target_id: 1,
+                table_id: 1,
+                column_id: 1,
+                segment_id: 1,
+                morsel_id: 0,
+                page_ref,
+                buffer_id: 0,
+                buffer_kind: 0,
+                logical_type: CoveLogicalType::Int64 as u16,
+                physical_kind: CovePhysicalKind::NumCode as u8,
+                source_endianness: 0,
+                required_alignment_log2: 3,
+                null_bitmap_polarity: ZeroCopyNullBitmapPolarityV2::OneMeansNull,
+                source_offset_width_bits: 0,
+                target_offset_width_bits: 0,
+                dictionary_key_width_bits: 0,
+                dictionary_semantics: ZeroCopyDictionarySemanticsV2::NoDictionary,
+                lifetime_scope: ZeroCopyLifetimeScopeV2::ReaderSession,
+                nested_layout_kind: ZeroCopyNestedLayoutKindV2::NotNested,
+                compression_required_none: 1,
+                target_buffer_role: ZeroCopyTargetBufferRoleV2::Values,
+                source_buffer_role: ZeroCopySourceBufferRoleV2::CoveValues,
+                target_type_ref: u32::MAX,
+                dictionary_values_ref: u32::MAX,
+                child_layout_ref: u32::MAX,
+                owner_lifetime_ref: u32::MAX,
+                flags: 0,
+                checksum: 0,
+            }],
+        };
+        SectionPayload {
+            section_kind: SectionKind::ZeroCopyBufferMap as u16,
+            profile: PrimaryProfile::LayoutPlanning as u8,
+            flags: 0,
+            item_count: 1,
+            row_count: 0,
+            compression: cove_core::constants::CompressionCodec::None as u8,
+            alignment_log2: 0,
+            required_features: 0,
+            optional_features: cove_core::constants::FEATURE_ZERO_COPY_BUFFER_MAP,
+            data: map.serialize().unwrap(),
+        }
     }
 
     fn one_segment_two_morsel_file(with_lookup: bool) -> Vec<u8> {
@@ -744,6 +866,134 @@ mod tests {
         assert_eq!(graph.scan_splits_used, 0);
         assert!(graph.tasks.iter().all(|task| task.split_id.is_none()));
         assert_eq!(state.bootstrap_stats().covel_sections_ignored, 1);
+    }
+
+    #[test]
+    fn partial_optional_scan_splits_fall_back_to_default_partitioning() {
+        let split_index = scan_split_section_payload(vec![ScanSplitEntryV2 {
+            split_id: 1,
+            table_id: 1,
+            row_start: 0,
+            row_count: 2,
+            first_segment_id: 1,
+            segment_count: 1,
+            first_morsel_id: 0,
+            morsel_count: 2,
+            first_cluster_id: 0,
+            cluster_count: 0,
+            stats_ref: u32::MAX,
+            estimated_uncompressed_bytes: 2,
+            estimated_encoded_bytes: 2,
+            flags: 0,
+            checksum: 0,
+        }]);
+        let state =
+            DatasetState::from_bytes("partial-split-test", split_test_file(Some(split_index)))
+                .unwrap();
+        let plan = plan_scan(&state, None, Vec::new()).unwrap();
+
+        let graph = build_task_graph(&state, &plan).unwrap();
+
+        assert_eq!(graph.scan_splits_used, 0);
+        assert_eq!(graph.tasks.len(), 4);
+        assert!(graph.tasks.iter().all(|task| task.split_id.is_none()));
+        assert_eq!(state.bootstrap_stats().covel_sections_ignored, 1);
+    }
+
+    #[test]
+    fn cross_segment_split_resets_morsel_start_after_first_segment() {
+        let split_index = scan_split_section_payload(vec![
+            ScanSplitEntryV2 {
+                split_id: 1,
+                table_id: 1,
+                row_start: 0,
+                row_count: 1,
+                first_segment_id: 1,
+                segment_count: 1,
+                first_morsel_id: 0,
+                morsel_count: 1,
+                first_cluster_id: 0,
+                cluster_count: 0,
+                stats_ref: u32::MAX,
+                estimated_uncompressed_bytes: 1,
+                estimated_encoded_bytes: 1,
+                flags: 0,
+                checksum: 0,
+            },
+            ScanSplitEntryV2 {
+                split_id: 2,
+                table_id: 1,
+                row_start: 1,
+                row_count: 3,
+                first_segment_id: 1,
+                segment_count: 2,
+                first_morsel_id: 1,
+                morsel_count: 3,
+                first_cluster_id: 0,
+                cluster_count: 0,
+                stats_ref: u32::MAX,
+                estimated_uncompressed_bytes: 3,
+                estimated_encoded_bytes: 3,
+                flags: 0,
+                checksum: 0,
+            },
+        ]);
+        let state = DatasetState::from_bytes(
+            "cross-segment-split-test",
+            split_test_file(Some(split_index)),
+        )
+        .unwrap();
+        let plan = plan_scan(&state, None, Vec::new()).unwrap();
+
+        let graph = build_task_graph(&state, &plan).unwrap();
+
+        assert_eq!(graph.scan_splits_used, 2);
+        assert_eq!(
+            graph
+                .tasks
+                .iter()
+                .map(|task| (task.split_id, task.segment_id, task.morsel_id))
+                .collect::<Vec<_>>(),
+            vec![
+                (Some(1), 1, 0),
+                (Some(2), 1, 1),
+                (Some(2), 2, 0),
+                (Some(2), 2, 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn invalid_zero_copy_page_ref_is_ignored() {
+        let state = DatasetState::from_bytes(
+            "zero-copy-page-ref",
+            split_test_file_with_extra_sections(vec![zero_copy_section(99)]),
+        )
+        .unwrap();
+        let column = &state.table().columns[0];
+        let page = ColumnPageIndexEntryV1 {
+            column_id: 1,
+            morsel_id: 0,
+            row_count: 1,
+            non_null_count: 1,
+            null_count: 0,
+            encoding_root: CoveEncodingKind::NumCode as u32,
+            page_offset: 0,
+            page_length: 8,
+            uncompressed_length: 8,
+            stats_ref: u32::MAX,
+            flags: 0,
+            checksum: 0,
+        };
+
+        assert_eq!(
+            state.zero_copy_compatibility_for_page(1, column, &page, 1),
+            None
+        );
+        assert_eq!(
+            state.zero_copy_compatibility_for_page(1, column, &page, 99),
+            None
+        );
     }
 
     #[test]

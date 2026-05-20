@@ -59,14 +59,15 @@ use crate::{
 };
 
 pub use pruning_sections::{
-    parse_aggregates_from_sections, parse_blooms_from_sections,
-    parse_codec_descriptors_from_sections, parse_column_domains_from_sections,
-    parse_composites_from_sections, parse_coverage_plan_candidates_from_sections,
-    parse_coverage_proofs_from_sections, parse_coverage_providers_from_sections,
-    parse_coverage_sets_from_sections, parse_exact_sets_from_sections,
-    parse_inverted_from_sections, parse_lookups_from_sections, parse_predicate_forms_from_sections,
-    parse_predicate_forms_with_payloads_from_sections, parse_topn_from_sections,
-    parse_zone_stats_from_sections,
+    embedded_coverage_snapshot_validity_ref, parse_aggregates_from_sections,
+    parse_blooms_from_sections, parse_codec_descriptors_from_sections,
+    parse_column_domains_from_sections, parse_composites_from_sections,
+    parse_coverage_plan_candidates_from_sections, parse_coverage_proofs_from_sections,
+    parse_coverage_providers_from_sections, parse_coverage_sets_from_sections,
+    parse_exact_sets_from_sections, parse_inverted_from_sections, parse_lookups_from_sections,
+    parse_predicate_forms_from_sections, parse_predicate_forms_with_payloads_from_sections,
+    parse_topn_from_sections, parse_zone_stats_from_sections,
+    selected_coverage_snapshot_validity_ref,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -169,6 +170,7 @@ impl Default for CoverageCacheMetadata {
 
 #[derive(Debug, Clone, Default)]
 pub struct PruningMetadata {
+    pub selected_coverage_snapshot_validity_ref: Option<u32>,
     pub nested_schemas: Arc<Vec<NestedSchemaSectionV1>>,
     pub codec_descriptors: Arc<Vec<CodecExtensionDescriptorV2>>,
     pub column_domains: Arc<Vec<ColumnDomain>>,
@@ -520,6 +522,7 @@ impl DatasetState {
         segment_id: u32,
         column: &ColumnEntry,
         page: &ColumnPageIndexEntryV1,
+        page_ref: u32,
     ) -> Option<ZeroCopyCompatibilityV2> {
         let dictionary_semantics = match column.physical {
             CovePhysicalKind::FileCode => ZeroCopyDictionarySemanticsV2::FileCodeDictionary,
@@ -547,6 +550,7 @@ impl DatasetState {
                         && entry.column_id == column.column_id
                         && entry.segment_id == segment_id
                         && entry.morsel_id == page.morsel_id
+                        && entry.page_ref == page_ref
                 })
                 .map(|entry| {
                     if page_compressed && entry.compression_required_none != 0 {

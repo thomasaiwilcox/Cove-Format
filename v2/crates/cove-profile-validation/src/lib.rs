@@ -7,6 +7,8 @@ use cove_core::{
     feature_scope::FeatureUseRequestV2,
     footer::CoveSectionEntryV1,
     reader::{OptionalProfilePayloadValidator, OptionalPushdownPolicy, ValidationReport},
+    segment::TableSegmentIndex,
+    table::{TableCatalog, TableEntry},
     CoveError,
 };
 use cove_coverage::{
@@ -15,13 +17,48 @@ use cove_coverage::{
 };
 use cove_index::IndexOnlyCapabilityV2;
 use cove_layout::{
-    FastMetadataIndexV2, LayoutPlanV2, PageClusterDirectoryV2, ScanSplitIndexV2,
-    ZeroCopyBufferMapV2,
+    validate_fast_metadata_authority, validate_page_cluster_authority, FastMetadataIndexV2,
+    LayoutPlanV2, PageClusterDirectoryV2, ScanSplitIndexV2, ValidatedLayoutPlanV2,
+    ValidatedScanSplitIndexV2, ValidatedZeroCopyBufferMapV2, ZeroCopyBufferMapV2,
 };
-use cove_runtime::{validate_hints, RuntimeCompatibilityHintV2};
+use cove_runtime::{validate_hints, RuntimeCompatibilityHintV2, RuntimeSession};
 
-#[derive(Debug, Clone, Copy, Default)]
-pub struct EmbeddedOptionalProfileValidator;
+#[derive(Debug, Clone, Default)]
+pub struct EmbeddedOptionalProfileValidator {
+    runtime_session: RuntimeSession,
+}
+
+impl EmbeddedOptionalProfileValidator {
+    pub fn new(runtime_session: RuntimeSession) -> Self {
+        Self { runtime_session }
+    }
+
+    pub fn empty() -> Self {
+        Self::new(RuntimeSession::empty())
+    }
+
+    pub fn default_builtins() -> Self {
+        Self::new(RuntimeSession::default_builtins())
+    }
+
+    pub fn validate_embedded_optional_profile_sections(
+        &self,
+        data: &[u8],
+        report: &ValidationReport,
+        optional_pushdown_policy: OptionalPushdownPolicy,
+        feature_use: Option<&FeatureUseRequestV2>,
+        only_required_for_feature_use: bool,
+    ) -> Result<(), CoveError> {
+        validate_embedded_optional_profile_sections_with_runtime_session(
+            data,
+            report,
+            optional_pushdown_policy,
+            feature_use,
+            only_required_for_feature_use,
+            &self.runtime_session,
+        )
+    }
+}
 
 impl OptionalProfilePayloadValidator for EmbeddedOptionalProfileValidator {
     fn validate_optional_profile_sections(
@@ -32,7 +69,7 @@ impl OptionalProfilePayloadValidator for EmbeddedOptionalProfileValidator {
         feature_use: Option<&FeatureUseRequestV2>,
         only_required_for_feature_use: bool,
     ) -> Result<(), CoveError> {
-        validate_embedded_optional_profile_sections(
+        self.validate_embedded_optional_profile_sections(
             data,
             report,
             optional_pushdown_policy,
@@ -48,6 +85,24 @@ pub fn validate_embedded_optional_profile_sections(
     optional_pushdown_policy: OptionalPushdownPolicy,
     feature_use: Option<&FeatureUseRequestV2>,
     only_required_for_feature_use: bool,
+) -> Result<(), CoveError> {
+    validate_embedded_optional_profile_sections_with_runtime_session(
+        data,
+        report,
+        optional_pushdown_policy,
+        feature_use,
+        only_required_for_feature_use,
+        &RuntimeSession::empty(),
+    )
+}
+
+pub fn validate_embedded_optional_profile_sections_with_runtime_session(
+    data: &[u8],
+    report: &ValidationReport,
+    optional_pushdown_policy: OptionalPushdownPolicy,
+    feature_use: Option<&FeatureUseRequestV2>,
+    only_required_for_feature_use: bool,
+    runtime_session: &RuntimeSession,
 ) -> Result<(), CoveError> {
     for entry in &report.validated.footer.sections {
         if only_required_for_feature_use && !section_is_required_for_feature_use(entry, feature_use)
@@ -108,7 +163,7 @@ pub fn validate_embedded_optional_profile_sections(
                 let hints = RuntimeCompatibilityHintV2::parse_many(&payload)?;
                 validate_hints(&hints)?;
                 if section_is_required_for_feature_use(entry, feature_use)
-                    && hints.iter().any(|hint| hint.required)
+                    && !required_runtime_hints_supported(&hints, runtime_session)
                 {
                     return Err(CoveError::RuntimeHintUnsupported);
                 }
@@ -123,7 +178,287 @@ pub fn validate_embedded_optional_profile_sections(
             return Err(error);
         }
     }
+    validate_layout_sections_with_authority(
+        data,
+        report,
+        optional_pushdown_policy,
+        feature_use,
+        only_required_for_feature_use,
+    )?;
     Ok(())
+}
+
+fn validate_layout_sections_with_authority(
+    data: &[u8],
+    report: &ValidationReport,
+    optional_pushdown_policy: OptionalPushdownPolicy,
+    feature_use: Option<&FeatureUseRequestV2>,
+    only_required_for_feature_use: bool,
+) -> Result<(), CoveError> {
+    let layout_entries = report
+        .validated
+        .footer
+        .sections
+        .iter()
+        .filter(|entry| {
+            SectionKind::from_u16(entry.section_kind)
+                .map(is_layout_section)
+                .unwrap_or(false)
+        })
+        .filter(|entry| {
+            !only_required_for_feature_use
+                || section_is_required_for_feature_use(entry, feature_use)
+        })
+        .collect::<Vec<_>>();
+    if layout_entries.is_empty() {
+        return Ok(());
+    }
+
+    let Some(authority) = load_layout_authority(data, report)? else {
+        return first_non_fail_open_layout_error(
+            &layout_entries,
+            optional_pushdown_policy,
+            feature_use,
+            CoveError::BadLayoutPlan,
+        );
+    };
+
+    let mut page_clusters = Vec::new();
+    for entry in layout_entries
+        .iter()
+        .copied()
+        .filter(|entry| entry.section_kind == SectionKind::PageClusterDirectory as u16)
+    {
+        let result = layout_payload(data, entry)
+            .and_then(|payload| PageClusterDirectoryV2::parse(&payload))
+            .and_then(|directory| {
+                validate_against_any_table(&authority.catalog, |table| {
+                    validate_page_cluster_authority(
+                        &directory,
+                        &report.validated.footer,
+                        table,
+                        &authority.segments.entries,
+                    )
+                })
+                .map(|_| directory)
+            });
+        match layout_result(result, entry, optional_pushdown_policy, feature_use)? {
+            Some(directory) => page_clusters.push(directory),
+            None => continue,
+        }
+    }
+
+    let mut scan_splits = Vec::new();
+    for entry in layout_entries
+        .iter()
+        .copied()
+        .filter(|entry| entry.section_kind == SectionKind::ScanSplitIndex as u16)
+    {
+        let result = layout_payload(data, entry)
+            .and_then(|payload| ScanSplitIndexV2::parse(&payload))
+            .and_then(|index| {
+                validate_scan_split_for_any_authority(
+                    index,
+                    &authority.catalog,
+                    &authority.segments.entries,
+                    &page_clusters,
+                )
+            });
+        match layout_result(result, entry, optional_pushdown_policy, feature_use)? {
+            Some(index) => scan_splits.push(index),
+            None => continue,
+        }
+    }
+
+    for entry in layout_entries.iter().copied() {
+        let result = match SectionKind::from_u16(entry.section_kind) {
+            Some(SectionKind::LayoutPlan) => layout_payload(data, entry)
+                .and_then(|payload| LayoutPlanV2::parse(&payload))
+                .and_then(|plan| {
+                    validate_layout_plan_for_any_authority(
+                        plan,
+                        &report.validated.footer,
+                        &authority.catalog,
+                        &authority.segments.entries,
+                        &page_clusters,
+                        &scan_splits,
+                    )
+                })
+                .map(|_| ()),
+            Some(SectionKind::ZeroCopyBufferMap) => layout_payload(data, entry)
+                .and_then(|payload| ZeroCopyBufferMapV2::parse(&payload))
+                .and_then(|map| {
+                    validate_against_any_table(&authority.catalog, |table| {
+                        ValidatedZeroCopyBufferMapV2::validate(
+                            map.clone(),
+                            table,
+                            &authority.segments.entries,
+                        )
+                        .map(|_| ())
+                    })
+                }),
+            Some(SectionKind::FastMetadataIndex) => layout_payload(data, entry)
+                .and_then(|payload| FastMetadataIndexV2::parse(&payload))
+                .and_then(|index| {
+                    validate_against_any_table(&authority.catalog, |table| {
+                        validate_fast_metadata_authority(
+                            &index,
+                            &report.validated.footer,
+                            table,
+                            &authority.segments.entries,
+                        )
+                    })
+                }),
+            Some(SectionKind::PageClusterDirectory | SectionKind::ScanSplitIndex) => Ok(()),
+            _ => Ok(()),
+        };
+        layout_result(result, entry, optional_pushdown_policy, feature_use)?;
+    }
+
+    Ok(())
+}
+
+struct LayoutAuthority {
+    catalog: TableCatalog,
+    segments: TableSegmentIndex,
+}
+
+fn load_layout_authority(
+    data: &[u8],
+    report: &ValidationReport,
+) -> Result<Option<LayoutAuthority>, CoveError> {
+    let catalog_entries = report
+        .validated
+        .footer
+        .sections
+        .iter()
+        .filter(|entry| entry.section_kind == SectionKind::TableCatalog as u16)
+        .collect::<Vec<_>>();
+    let segment_entries = report
+        .validated
+        .footer
+        .sections
+        .iter()
+        .filter(|entry| entry.section_kind == SectionKind::TableSegmentIndex as u16)
+        .collect::<Vec<_>>();
+    if catalog_entries.is_empty() && segment_entries.is_empty() {
+        return Ok(None);
+    }
+    if catalog_entries.len() != 1 || segment_entries.len() != 1 {
+        return Err(CoveError::BadLayoutPlan);
+    }
+    let catalog = layout_payload(data, catalog_entries[0])
+        .and_then(|payload| TableCatalog::parse(&payload))?;
+    let segments = layout_payload(data, segment_entries[0])
+        .and_then(|payload| TableSegmentIndex::parse(&payload))?;
+    Ok(Some(LayoutAuthority { catalog, segments }))
+}
+
+fn layout_payload(data: &[u8], entry: &CoveSectionEntryV1) -> Result<Vec<u8>, CoveError> {
+    compression::section_payload(data, entry).map(|payload| payload.into_owned())
+}
+
+fn first_non_fail_open_layout_error(
+    entries: &[&CoveSectionEntryV1],
+    optional_pushdown_policy: OptionalPushdownPolicy,
+    feature_use: Option<&FeatureUseRequestV2>,
+    error: CoveError,
+) -> Result<(), CoveError> {
+    if entries
+        .iter()
+        .all(|entry| can_fail_open(entry, optional_pushdown_policy, feature_use))
+    {
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
+
+fn required_runtime_hints_supported(
+    hints: &[RuntimeCompatibilityHintV2],
+    runtime_session: &RuntimeSession,
+) -> bool {
+    runtime_session.unsupported_required_hints(hints).is_empty()
+}
+
+fn layout_result<T>(
+    result: Result<T, CoveError>,
+    entry: &CoveSectionEntryV1,
+    optional_pushdown_policy: OptionalPushdownPolicy,
+    feature_use: Option<&FeatureUseRequestV2>,
+) -> Result<Option<T>, CoveError> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(_error) if can_fail_open(entry, optional_pushdown_policy, feature_use) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn validate_against_any_table(
+    catalog: &TableCatalog,
+    mut validate: impl FnMut(&TableEntry) -> Result<(), CoveError>,
+) -> Result<(), CoveError> {
+    for table in &catalog.tables {
+        if validate(table).is_ok() {
+            return Ok(());
+        }
+    }
+    Err(CoveError::BadLayoutPlan)
+}
+
+fn validate_scan_split_for_any_authority(
+    index: ScanSplitIndexV2,
+    catalog: &TableCatalog,
+    segments: &[cove_core::segment::TableSegmentIndexEntryV1],
+    page_clusters: &[PageClusterDirectoryV2],
+) -> Result<ScanSplitIndexV2, CoveError> {
+    for table in &catalog.tables {
+        if ValidatedScanSplitIndexV2::validate(index.clone(), table, segments, None).is_ok() {
+            return Ok(index);
+        }
+        for clusters in page_clusters {
+            if ValidatedScanSplitIndexV2::validate(index.clone(), table, segments, Some(clusters))
+                .is_ok()
+            {
+                return Ok(index);
+            }
+        }
+    }
+    Err(CoveError::BadLayoutPlan)
+}
+
+fn validate_layout_plan_for_any_authority(
+    plan: LayoutPlanV2,
+    footer: &cove_core::footer::CoveFooter,
+    catalog: &TableCatalog,
+    segments: &[cove_core::segment::TableSegmentIndexEntryV1],
+    page_clusters: &[PageClusterDirectoryV2],
+    scan_splits: &[ScanSplitIndexV2],
+) -> Result<LayoutPlanV2, CoveError> {
+    for table in &catalog.tables {
+        if ValidatedLayoutPlanV2::validate(plan.clone(), footer, table, segments, None, None)
+            .is_ok()
+        {
+            return Ok(plan);
+        }
+        for clusters in page_clusters.iter().map(Some).chain(std::iter::once(None)) {
+            for splits in scan_splits.iter().map(Some).chain(std::iter::once(None)) {
+                if ValidatedLayoutPlanV2::validate(
+                    plan.clone(),
+                    footer,
+                    table,
+                    segments,
+                    clusters,
+                    splits,
+                )
+                .is_ok()
+                {
+                    return Ok(plan);
+                }
+            }
+        }
+    }
+    Err(CoveError::BadLayoutPlan)
 }
 
 fn can_fail_open(
@@ -206,4 +541,75 @@ fn is_coverage_section(kind: SectionKind) -> bool {
             | SectionKind::PredicateNormalForm
             | SectionKind::CoverageProofRecord
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cove_runtime::RuntimeHintKindV2;
+
+    #[test]
+    fn supported_required_runtime_hints_are_accepted() {
+        let hints = vec![RuntimeCompatibilityHintV2 {
+            hint_id: 1,
+            hint_kind: RuntimeHintKindV2::EngineAdapter,
+            required: true,
+            flags: 0,
+            namespace: "org.cove".into(),
+            name: "datafusion".into(),
+            version_major: 1,
+            version_minor: 0,
+            payload_ref: u32::MAX,
+            checksum: 0,
+        }];
+
+        assert!(required_runtime_hints_supported(
+            &hints,
+            &RuntimeSession::default_builtins()
+        ));
+    }
+
+    #[test]
+    fn required_runtime_hints_use_the_supplied_session() {
+        let hints = vec![RuntimeCompatibilityHintV2 {
+            hint_id: 1,
+            hint_kind: RuntimeHintKindV2::EngineAdapter,
+            required: true,
+            flags: 0,
+            namespace: "org.cove".into(),
+            name: "datafusion".into(),
+            version_major: 1,
+            version_minor: 0,
+            payload_ref: u32::MAX,
+            checksum: 0,
+        }];
+        let mut custom = RuntimeSession::empty();
+        assert!(!required_runtime_hints_supported(&hints, &custom));
+        custom
+            .engine_profiles
+            .register("org.cove", "datafusion", 1, 0)
+            .unwrap();
+        assert!(required_runtime_hints_supported(&hints, &custom));
+    }
+
+    #[test]
+    fn unsupported_required_runtime_hints_are_rejected() {
+        let hints = vec![RuntimeCompatibilityHintV2 {
+            hint_id: 1,
+            hint_kind: RuntimeHintKindV2::EngineAdapter,
+            required: true,
+            flags: 0,
+            namespace: "example.invalid".into(),
+            name: "not-registered".into(),
+            version_major: 1,
+            version_minor: 0,
+            payload_ref: u32::MAX,
+            checksum: 0,
+        }];
+
+        assert!(!required_runtime_hints_supported(
+            &hints,
+            &RuntimeSession::default_builtins()
+        ));
+    }
 }
