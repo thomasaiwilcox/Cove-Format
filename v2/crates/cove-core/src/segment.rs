@@ -170,6 +170,9 @@ impl TableSegmentIndex {
         if needed > bytes.len() {
             return Err(CoveError::BufferTooShort);
         }
+        if needed < bytes.len() {
+            return Err(CoveError::SegmentCorrupt);
+        }
         let mut entries = Vec::with_capacity(count);
         let mut pos = 8usize;
         for _ in 0..count {
@@ -758,6 +761,20 @@ mod tests {
         let bytes = idx.serialize().unwrap();
         let parsed = TableSegmentIndex::parse(&bytes).unwrap();
         assert_eq!(parsed.entries.len(), 2);
+    }
+
+    #[test]
+    fn segment_index_rejects_trailing_bytes() {
+        let idx = TableSegmentIndex {
+            flags: 0,
+            entries: vec![entry(1, 0, 0, 100, 1), entry(1, 1, 100, 50, 1)],
+        };
+        let mut bytes = idx.serialize().unwrap();
+        bytes.push(0);
+        assert_eq!(
+            TableSegmentIndex::parse(&bytes),
+            Err(CoveError::SegmentCorrupt)
+        );
     }
 
     #[test]

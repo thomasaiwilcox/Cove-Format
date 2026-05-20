@@ -280,6 +280,11 @@ impl TableCatalog {
             pos = pos.checked_add(used).ok_or(CoveError::ArithOverflow)?;
             tables.push(t);
         }
+        if pos != bytes.len() {
+            return Err(CoveError::BadSchema(
+                "table catalog has trailing bytes".into(),
+            ));
+        }
         let cat = Self { flags, tables };
         cat.validate()?;
         Ok(cat)
@@ -417,6 +422,17 @@ mod tests {
         assert_eq!(cat2.tables[0].row_count, 1000);
         assert_eq!(cat2.tables[0].primary_sort_key_count, 1);
         assert_eq!(cat2.tables[0].columns[0].sort_order, 1);
+    }
+
+    #[test]
+    fn rejects_trailing_bytes() {
+        let cat = sample_catalog();
+        let mut bytes = cat.serialize().unwrap();
+        bytes.push(0);
+        assert!(matches!(
+            TableCatalog::parse(&bytes),
+            Err(CoveError::BadSchema(_))
+        ));
     }
 
     #[test]

@@ -10,6 +10,7 @@ use crate::{
         FEATURE_EXTENDED_FEATURE_SET, FEATURE_HARBOR_PROFILE, FEATURE_LAYOUT_PLAN,
         FEATURE_OBJECT_PROFILE, FEATURE_RUNTIME_COMPATIBILITY_HINTS,
         FEATURE_SECONDARY_INDEX_ARTIFACT, FEATURE_SEMANTIC_MAP, FEATURE_TABLE_PROFILE,
+        KNOWN_FEATURE_BITS_MASK,
     },
     feature_binding::SectionFeatureBindingSectionV2,
     feature_scope::{ExtendedFeatureSetV2, FeatureScopeTable, ProfileCapabilityMatrixV2},
@@ -112,6 +113,7 @@ fn validate_sections(
             entry.profile,
             header.required_features | header.optional_features,
         )?;
+        validate_section_required_features(header, entry)?;
         validate_section_required_feature_advertisement(header, entry)?;
         validate_codec_feature_advertisement(entry.compression, header, entry)?;
 
@@ -341,6 +343,27 @@ fn validate_section_required_feature_advertisement(
     Ok(())
 }
 
+fn validate_section_required_features(
+    header: &CoveHeaderV1,
+    entry: &crate::footer::CoveSectionEntryV1,
+) -> Result<(), CoveError> {
+    let unknown_required = entry.required_features & !KNOWN_FEATURE_BITS_MASK;
+    if unknown_required != 0 {
+        return Err(CoveError::UnknownRequiredFeature(unknown_required));
+    }
+
+    let file_advertised = header.required_features | header.optional_features;
+    let missing_advertisement = entry.required_features & !file_advertised;
+    if missing_advertisement != 0 {
+        return Err(CoveError::BadSection(format!(
+            "section {} requires feature bits not advertised by file header: 0x{missing_advertisement:016x}",
+            entry.section_id
+        )));
+    }
+
+    Ok(())
+}
+
 fn validate_section_profile_feature_bit(profile: u8, file_features: u64) -> Result<(), CoveError> {
     let required_profile_bit = match profile {
         0 => return Ok(()),
@@ -530,6 +553,7 @@ mod tests {
             FeatureUseRequestV2, ProfileCapabilityEntryV2, ProfileCapabilityMatrixHeaderV2,
             ProfileCapabilityMatrixV2,
         },
+        footer::FOOTER_HEADER_SIZE,
         postscript::POSTSCRIPT_TOTAL_SIZE,
         segment::TableSegmentPayloadV1,
         table::{ColumnEntry, TableCatalog, TableEntry},
@@ -589,6 +613,23 @@ mod tests {
     fn rewrite_postscript(bytes: &mut [u8], postscript: CovePostscriptV1) {
         let tail_start = bytes.len() - POSTSCRIPT_TOTAL_SIZE;
         bytes[tail_start..].copy_from_slice(&postscript.serialize_tail());
+    }
+
+    fn rewrite_footer_crc(bytes: &mut [u8], postscript: CovePostscriptV1) {
+        let footer_start = postscript.footer.offset as usize;
+        let footer_len = postscript.footer.length as usize;
+        let mut fixed_postscript = postscript;
+        fixed_postscript.footer.crc32c =
+            checksum::crc32c(&bytes[footer_start..footer_start + footer_len]);
+        rewrite_postscript(bytes, fixed_postscript);
+    }
+
+    fn set_first_section_required_features(bytes: &mut [u8], required_features: u64) {
+        let postscript = CovePostscriptV1::parse_from_tail(bytes).unwrap();
+        let required_features_offset = postscript.footer.offset as usize + FOOTER_HEADER_SIZE + 52;
+        bytes[required_features_offset..required_features_offset + 8]
+            .copy_from_slice(&required_features.to_le_bytes());
+        rewrite_footer_crc(bytes, postscript);
     }
 
     fn required_unknown_extension_registry_payload() -> Vec<u8> {
@@ -1091,6 +1132,54 @@ mod tests {
         let bytes = writer.write().unwrap();
         assert!(matches!(
             validate_bytes(&bytes),
+            Err(CoveError::BadSection(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_unknown_section_required_feature_bits() {
+        let mut writer = MinimalCoveWriter::new();
+        writer.sections.push(SectionPayload {
+            section_kind: SectionKind::TableCatalog as u16,
+            profile: PrimaryProfile::TableScan as u8,
+            flags: 0,
+            item_count: 0,
+            row_count: 0,
+            compression: 0,
+            alignment_log2: 0,
+            required_features: 0,
+            optional_features: 0,
+            data: TableCatalog::default().serialize().unwrap(),
+        });
+        let mut bytes = writer.write().unwrap();
+        let unknown_required = 1u64 << 63;
+        assert_eq!(unknown_required & KNOWN_FEATURE_BITS_MASK, 0);
+        set_first_section_required_features(&mut bytes, unknown_required);
+
+        assert!(matches!(
+            validate_bytes(&bytes),
+            Err(CoveError::UnknownRequiredFeature(bits)) if bits == unknown_required
+        ));
+    }
+
+    #[test]
+    fn rejects_section_required_feature_missing_from_header_advertisement() {
+        let mut writer = MinimalCoveWriter::new();
+        writer.sections.push(SectionPayload {
+            section_kind: SectionKind::TableCatalog as u16,
+            profile: PrimaryProfile::TableScan as u8,
+            flags: 0,
+            item_count: 0,
+            row_count: 0,
+            compression: 0,
+            alignment_log2: 0,
+            required_features: FEATURE_FILE_DICTIONARY,
+            optional_features: 0,
+            data: TableCatalog::default().serialize().unwrap(),
+        });
+
+        assert!(matches!(
+            validate_bytes(&writer.write().unwrap()),
             Err(CoveError::BadSection(_))
         ));
     }

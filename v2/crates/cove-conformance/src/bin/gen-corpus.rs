@@ -3602,6 +3602,21 @@ fn main() {
         bad_pair_table_catalog().serialize().unwrap(),
     );
 
+    let mut table_catalog_trailing = valid_table_catalog().serialize().unwrap();
+    table_catalog_trailing.push(0);
+    write_fixture(
+        &root,
+        &mut entries,
+        fixture(
+            "reject/table_catalog_trailing.bin",
+            "table_catalog",
+            "reject",
+            Some("COVE_E_BAD_SCHEMA"),
+            &["§24", "§76"],
+        ),
+        table_catalog_trailing,
+    );
+
     write_fixture(
         &root,
         &mut entries,
@@ -3613,6 +3628,21 @@ fn main() {
             &["§25", "§76"],
         ),
         gap_table_segment_index().serialize().unwrap(),
+    );
+
+    let mut table_segment_index_trailing = valid_table_segment_index().serialize().unwrap();
+    table_segment_index_trailing.push(0);
+    write_fixture(
+        &root,
+        &mut entries,
+        fixture(
+            "reject/table_segment_index_trailing.bin",
+            "table_segment_index",
+            "reject",
+            Some("COVE_E_SEGMENT_CORRUPT"),
+            &["§25", "§76"],
+        ),
+        table_segment_index_trailing,
     );
 
     let mut bad_segment_header = valid_table_segment_header().serialize().to_vec();
@@ -4501,6 +4531,19 @@ fn main() {
             &["§74", "§77", "§76"],
         ),
         cove_with_unknown_required_feature(),
+    );
+
+    write_fixture(
+        &root,
+        &mut entries,
+        fixture(
+            "reject/cove_unknown_section_required_feature.cove",
+            "cove",
+            "reject",
+            Some("COVE_E_UNKNOWN_REQUIRED_FEATURE"),
+            &["§11", "§13", "§74", "§77", "§76"],
+        ),
+        cove_with_unknown_section_required_feature(),
     );
 
     write_fixture(
@@ -5424,6 +5467,17 @@ fn cove_with_unknown_required_feature() -> Vec<u8> {
     let mut bytes = writer.write().unwrap();
     rewrite_cove_feature_bits(&mut bytes, FEATURE_TABLE_PROFILE | (1u64 << 63), 0);
     bytes
+}
+
+fn cove_with_unknown_section_required_feature() -> Vec<u8> {
+    let bytes = cove_file_with_section(
+        FEATURE_TABLE_PROFILE,
+        SectionKind::TableCatalog,
+        PrimaryProfile::TableScan,
+        0,
+        valid_table_catalog().serialize().unwrap(),
+    );
+    rewrite_first_section_required_features(bytes, SectionKind::TableCatalog, 1u64 << 63)
 }
 
 fn feature_scope_use_fixture(
@@ -12965,6 +13019,36 @@ fn rewrite_first_section_kind(mut bytes: Vec<u8>, from: SectionKind, to: Section
             section_entry.required_features = 0;
             section_entry.optional_features = 0;
         }
+        bytes[entry_start..entry_start + SECTION_ENTRY_SIZE]
+            .copy_from_slice(&section_entry.serialize());
+
+        let footer_end = footer_start + postscript.footer.length as usize;
+        postscript.footer.crc32c = checksum::crc32c(&bytes[footer_start..footer_end]);
+        let tail_start = bytes.len() - POSTSCRIPT_TOTAL_SIZE;
+        bytes[tail_start..].copy_from_slice(&postscript.serialize_tail());
+        return bytes;
+    }
+    panic!("generated COVE file did not contain requested section kind");
+}
+
+fn rewrite_first_section_required_features(
+    mut bytes: Vec<u8>,
+    section_kind: SectionKind,
+    required_features: u64,
+) -> Vec<u8> {
+    let mut postscript = CovePostscriptV1::parse_from_tail(&bytes).unwrap();
+    let footer_start = postscript.footer.offset as usize;
+    let footer_header = CoveFooterHeaderV1::parse(&bytes[footer_start..]).unwrap();
+    let entries_start = footer_start + FOOTER_HEADER_SIZE;
+    for index in 0..footer_header.section_count as usize {
+        let entry_start = entries_start + index * SECTION_ENTRY_SIZE;
+        let mut section_entry =
+            CoveSectionEntryV1::parse(&bytes[entry_start..entry_start + SECTION_ENTRY_SIZE])
+                .unwrap();
+        if section_entry.section_kind != section_kind as u16 {
+            continue;
+        }
+        section_entry.required_features = required_features;
         bytes[entry_start..entry_start + SECTION_ENTRY_SIZE]
             .copy_from_slice(&section_entry.serialize());
 
