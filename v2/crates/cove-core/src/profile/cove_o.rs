@@ -374,20 +374,19 @@ mod tests {
     }
 
     #[test]
-    fn temporal_property_all_non_null_stats_only_requires_validated_stats() {
+    fn temporal_property_all_non_null_stats_only_parse_checks_envelope_only() {
         let bytes = temporal_segment_with_stats_only_property_page(
             &[temporal_row(10, 1)],
             1,
             0,
             PAGE_FLAG_STATS_ONLY_CONSTANT | PAGE_FLAG_ALL_NON_NULL,
         );
-        assert_eq!(
-            TemporalSegmentData::parse_with_required_features(
-                &bytes,
-                FEATURE_OBJECT_PROFILE | FEATURE_PAGE_PAYLOAD_ELISION
-            ),
-            Err(CoveError::PageCorrupt)
-        );
+        let parsed = TemporalSegmentData::parse_with_required_features(
+            &bytes,
+            FEATURE_OBJECT_PROFILE | FEATURE_PAGE_PAYLOAD_ELISION,
+        )
+        .unwrap();
+        assert!(parsed.property_columns[0].pages[0].payload.is_none());
     }
 
     #[test]

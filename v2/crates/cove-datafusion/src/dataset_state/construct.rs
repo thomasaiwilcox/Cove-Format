@@ -465,6 +465,11 @@ impl FileTable {
 }
 
 fn pruning_from_bytes(bytes: &[u8], mounted: &MountedCoveFile) -> PruningMetadata {
+    let zone_stats = mounted.zone_stats.clone();
+    let zone_stats_entries = zone_stats
+        .iter()
+        .flat_map(|section| section.entries.iter().cloned())
+        .collect::<Vec<_>>();
     PruningMetadata {
         nested_schemas: Arc::new(mounted.nested_schemas.clone()),
         codec_descriptors: Arc::new(parse_codec_descriptors_from_sections(
@@ -472,7 +477,8 @@ fn pruning_from_bytes(bytes: &[u8], mounted: &MountedCoveFile) -> PruningMetadat
             &mounted.footer,
         )),
         column_domains: Arc::new(mounted.column_domains.clone()),
-        zone_stats: Arc::new(mounted.zone_stats.clone()),
+        zone_stats: Arc::new(zone_stats),
+        zone_stats_entries: Arc::new(zone_stats_entries),
         exact_sets: Arc::new(parse_exact_sets_from_sections(bytes, &mounted.footer)),
         blooms: Arc::new(parse_blooms_from_sections(bytes, &mounted.footer)),
         lookups: Arc::new(parse_lookups_from_sections(bytes, &mounted.footer)),

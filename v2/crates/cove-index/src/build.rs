@@ -1,4 +1,4 @@
-use std::{cmp::Ordering, collections::BTreeMap};
+use std::{borrow::Cow, cmp::Ordering, collections::BTreeMap};
 
 use crate::{
     execution::{compare_key_bytes_for_order, CoviAggregateKindV2, CoviLookupComparatorContextV2},
@@ -18,6 +18,7 @@ use cove_core::{
     constants::{CoveLogicalType, CovePhysicalKind, DigestAlgorithm, SectionKind, ValueTag},
     dictionary::DictionaryValue,
     digest::compute_digest,
+    materialize_stats_only_constant_page_payload,
     mount::{mount_cove_file, MountOptions, MountedCoveFile, OutputRepresentation},
     page::{page_uses_payload_elision, ColumnPageIndex},
     page_payload::{ColumnPagePayloadV1, PageBufferKind},
@@ -26,7 +27,7 @@ use cove_core::{
     table::{ColumnEntry, TableEntry},
     types,
     validity::ValidityBitmap,
-    wire, CoveError,
+    wire, CoveError, StatsOnlyPageMaterializationContext,
 };
 use cove_coverage::{CoverageExactnessV2, CoverageGranularityV2, CoverageProofStrengthV2};
 
@@ -446,6 +447,11 @@ fn build_column_index(
     let mut keys: BTreeMap<Vec<u8>, Vec<CoviRowRangePostingV2>> = BTreeMap::new();
     let mut null_count = 0u64;
     let mut rows_seen = 0u64;
+    let zone_stats_entries = mounted
+        .zone_stats
+        .iter()
+        .flat_map(|section| section.entries.iter().cloned())
+        .collect::<Vec<_>>();
 
     for section in mounted
         .footer
@@ -477,12 +483,8 @@ fn build_column_index(
             .ok_or(CoveError::ArithOverflow)?;
         let page_index = ColumnPageIndex::parse(&segment_bytes[page_index_start..page_index_end])?;
         for page in page_index.entries {
-            let morsel = segment
-                .morsels
-                .entries
-                .get(page.morsel_id as usize)
-                .ok_or(CoveError::SegmentCorrupt)?;
-            if page_uses_payload_elision(page.flags) && page.page_length == 0 {
+            let morsel = segment.morsels.morsel_by_id(page.morsel_id)?;
+            let decoded_page = if page_uses_payload_elision(page.flags) && page.page_length == 0 {
                 if page.null_count == page.row_count {
                     null_count = null_count
                         .checked_add(u64::from(page.row_count))
@@ -492,17 +494,32 @@ fn build_column_index(
                         .ok_or(CoveError::ArithOverflow)?;
                     continue;
                 }
-                return Err(CoveError::BadCovi);
-            }
-            let page_start =
-                usize::try_from(page.page_offset).map_err(|_| CoveError::OffsetRange)?;
-            let page_len = usize::try_from(page.page_length).map_err(|_| CoveError::OffsetRange)?;
-            let page_end = page_start
-                .checked_add(page_len)
-                .ok_or(CoveError::ArithOverflow)?;
-            let page_wire = &segment_bytes[page_start..page_end];
-            let decoded_page = column_page_payload(page_wire, &page)?;
-            let payload = ColumnPagePayloadV1::parse(&decoded_page)?;
+                Cow::Owned(
+                    materialize_stats_only_constant_page_payload(
+                        StatsOnlyPageMaterializationContext {
+                            table_id: Some(table.table_id),
+                            segment_id: Some(segment.header.segment_id),
+                            column_id: column.column_id,
+                            logical_type: column.logical,
+                            physical_kind: column.physical,
+                            zone_stats: &zone_stats_entries,
+                        },
+                        &page,
+                    )
+                    .map_err(|_| CoveError::BadCovi)?,
+                )
+            } else {
+                let page_start =
+                    usize::try_from(page.page_offset).map_err(|_| CoveError::OffsetRange)?;
+                let page_len =
+                    usize::try_from(page.page_length).map_err(|_| CoveError::OffsetRange)?;
+                let page_end = page_start
+                    .checked_add(page_len)
+                    .ok_or(CoveError::ArithOverflow)?;
+                let page_wire = &segment_bytes[page_start..page_end];
+                column_page_payload(page_wire, &page)?
+            };
+            let payload = ColumnPagePayloadV1::parse(decoded_page.as_ref())?;
             let root = payload.root_node()?;
             let values = payload.buffer_bytes(PageBufferKind::Values)?.unwrap_or(&[]);
             let validity = payload
@@ -1279,6 +1296,17 @@ fn derived_snapshot_id(bytes: &[u8], footer_crc32c: u32) -> [u8; 16] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cove_core::{
+        compression,
+        constants::{CoveEncodingKind, CoveLogicalType, CovePhysicalKind, SectionKind},
+        page::{ColumnPageIndexEntryV1, COLUMN_PAGE_INDEX_ENTRY_LEN},
+        reader,
+        segment::{RowMorselEntryV1, TableSegmentHeaderV1, ROW_MORSEL_ENTRY_LEN},
+        table::{ColumnEntry, TableCatalog, TableEntry},
+        writer::{
+            MinimalCoveWriter, ScanPageSpec, ScanProfileCoveWriter, ScanSegment, SectionPayload,
+        },
+    };
 
     fn row_range() -> CoviRowRangePostingV2 {
         CoviRowRangePostingV2 {
@@ -1295,6 +1323,124 @@ mod tests {
 
     fn signed_key(value: i64) -> Vec<u8> {
         key_from_i64(CoveLogicalType::Int64, value).unwrap()
+    }
+
+    fn one_column_two_morsel_scan_file() -> Vec<u8> {
+        let catalog = TableCatalog {
+            flags: 0,
+            tables: vec![TableEntry {
+                table_id: 1,
+                namespace: "public".into(),
+                name: "events".into(),
+                row_count: 2,
+                primary_sort_key_count: 0,
+                clustering_key_count: 0,
+                flags: 0,
+                columns: vec![ColumnEntry {
+                    column_id: 1,
+                    name: "id".into(),
+                    logical: CoveLogicalType::Int64,
+                    physical: CovePhysicalKind::NumCode,
+                    nullable: false,
+                    sort_order: 0,
+                    collation_id: 0,
+                    precision: 0,
+                    scale: 0,
+                    flags: 0,
+                }],
+            }],
+        };
+        let mut segment = ScanSegment::new(1, 0, 0, 2, 1);
+        segment.morsel_row_count = 1;
+        segment.set_column_pages(
+            1,
+            vec![
+                ScanPageSpec::new(1, 1u64.to_le_bytes().to_vec())
+                    .with_encoding_root(CoveEncodingKind::NumCode as u32),
+                ScanPageSpec::new(1, 2u64.to_le_bytes().to_vec())
+                    .with_encoding_root(CoveEncodingKind::NumCode as u32),
+            ],
+        );
+        let mut writer = ScanProfileCoveWriter::new(catalog);
+        writer.push_segment(segment);
+        writer.write().unwrap()
+    }
+
+    fn rewrite_first_segment_data<F>(bytes: Vec<u8>, mut mutate: F) -> Vec<u8>
+    where
+        F: FnMut(&mut Vec<u8>),
+    {
+        let validated = reader::validate_bytes(&bytes).unwrap();
+        let mut writer = MinimalCoveWriter::new();
+        writer.created_at_us = validated.header.created_at_us;
+        writer.file_id = validated.header.file_id;
+        writer.producer_scope_id = validated.header.producer_scope_id;
+        writer.producer_scope_kind = validated.header.producer_scope_kind;
+        writer.primary_profile = validated.header.primary_profile;
+        writer.required_features = validated.header.required_features;
+        writer.optional_features = validated.header.optional_features;
+        writer.metadata_json = validated.footer.metadata_json.clone();
+
+        let mut mutated = false;
+        for entry in &validated.footer.sections {
+            let mut data = compression::section_payload(&bytes, entry)
+                .unwrap()
+                .into_owned();
+            if !mutated && entry.section_kind == SectionKind::TableSegmentData as u16 {
+                mutate(&mut data);
+                mutated = true;
+            }
+            writer.sections.push(SectionPayload {
+                section_kind: entry.section_kind,
+                profile: entry.profile,
+                flags: entry.flags,
+                item_count: entry.item_count,
+                row_count: entry.row_count,
+                compression: entry.compression,
+                alignment_log2: entry.alignment_log2,
+                required_features: entry.required_features,
+                optional_features: entry.optional_features,
+                data,
+            });
+        }
+        assert!(
+            mutated,
+            "fixture should contain a table segment data section"
+        );
+        writer.write().unwrap()
+    }
+
+    fn set_morsel_and_page_ids(segment_data: &mut [u8], ids: &[u32]) {
+        let header = TableSegmentHeaderV1::parse(segment_data).unwrap();
+        assert_eq!(header.morsel_count as usize, ids.len());
+        let morsel_dir = header.morsel_directory_offset as usize;
+        for (index, morsel_id) in ids.iter().copied().enumerate() {
+            let offset = morsel_dir + index * ROW_MORSEL_ENTRY_LEN;
+            let mut entry = RowMorselEntryV1::parse(&segment_data[offset..]).unwrap();
+            entry.morsel_id = morsel_id;
+            segment_data[offset..offset + ROW_MORSEL_ENTRY_LEN].copy_from_slice(&entry.serialize());
+        }
+        let page_index = header.page_index_offset as usize;
+        for (index, morsel_id) in ids.iter().copied().enumerate() {
+            let offset = page_index + index * COLUMN_PAGE_INDEX_ENTRY_LEN;
+            let mut page = ColumnPageIndexEntryV1::parse(&segment_data[offset..]).unwrap();
+            page.morsel_id = morsel_id;
+            segment_data[offset..offset + COLUMN_PAGE_INDEX_ENTRY_LEN]
+                .copy_from_slice(&page.serialize());
+        }
+    }
+
+    fn all_row_range_postings(artifact: &CoviArtifactV2) -> Vec<CoviRowRangePostingV2> {
+        artifact
+            .postings_blocks
+            .iter()
+            .flat_map(|block| {
+                block.postings.iter().flat_map(|posting| {
+                    crate::parse_covi_row_range_postings(block.posting_payload(posting).unwrap())
+                        .unwrap()
+                })
+            })
+            .collect()
     }
 
     #[test]
@@ -1456,5 +1602,52 @@ mod tests {
             vec![row_range()],
         );
         assert!(canonical_float_keys_contain_nan(CoveLogicalType::Float32, &keys).unwrap());
+    }
+
+    #[test]
+    fn build_covi_accepts_stats_only_all_non_null_constant_pages() {
+        let bytes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../conformance/accept/cove_t_payload_elision_stats_only_all_non_null_valid.cove"
+        ));
+
+        let built = build_covi_from_cove_bytes(
+            bytes,
+            &CoviBuildOptions {
+                all_columns: true,
+                ..CoviBuildOptions::default()
+            },
+        )
+        .unwrap();
+        let artifact = CoviArtifactV2::parse(&built).unwrap();
+
+        assert_eq!(artifact.index_roots.len(), 1);
+        assert_eq!(artifact.index_roots[0].value_count, 6);
+        assert_eq!(artifact.index_roots[0].null_count, 0);
+    }
+
+    #[test]
+    fn build_covi_uses_sparse_morsel_ids_as_identifiers() {
+        let bytes = rewrite_first_segment_data(one_column_two_morsel_scan_file(), |data| {
+            set_morsel_and_page_ids(data, &[10, 20]);
+        });
+
+        let built = build_covi_from_cove_bytes(
+            &bytes,
+            &CoviBuildOptions {
+                all_columns: true,
+                ..CoviBuildOptions::default()
+            },
+        )
+        .unwrap();
+        let artifact = CoviArtifactV2::parse(&built).unwrap();
+        let mut rows = all_row_range_postings(&artifact);
+        rows.sort_by_key(|row| row.row_start);
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].morsel_id, 10);
+        assert_eq!(rows[0].row_start, 0);
+        assert_eq!(rows[1].morsel_id, 20);
+        assert_eq!(rows[1].row_start, 1);
     }
 }

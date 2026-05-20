@@ -25,7 +25,7 @@ use cove_core::{
     },
     segment::TableSegmentIndex,
     table::TableCatalog,
-    zone_stats::ZoneStatsSection,
+    zone_stats::{ZoneStatsEntry, ZoneStatsSection},
     CoveError,
 };
 use cove_coverage::{
@@ -199,6 +199,17 @@ pub(super) async fn parse_pruning_metadata<R: CoveRangeReader + ?Sized>(
     reader: &R,
     footer: &CoveFooter,
 ) -> Result<PruningMetadata, CoveError> {
+    let zone_stats = parse_optional_sections(
+        reader,
+        footer,
+        SectionKind::ZoneStats,
+        ZoneStatsSection::parse,
+    )
+    .await;
+    let zone_stats_entries = zone_stats
+        .iter()
+        .flat_map(|section| section.entries.iter().cloned())
+        .collect::<Vec<ZoneStatsEntry>>();
     Ok(PruningMetadata {
         nested_schemas: Arc::new(
             parse_optional_sections(
@@ -227,15 +238,8 @@ pub(super) async fn parse_pruning_metadata<R: CoveRangeReader + ?Sized>(
             )
             .await,
         ),
-        zone_stats: Arc::new(
-            parse_optional_sections(
-                reader,
-                footer,
-                SectionKind::ZoneStats,
-                ZoneStatsSection::parse,
-            )
-            .await,
-        ),
+        zone_stats: Arc::new(zone_stats),
+        zone_stats_entries: Arc::new(zone_stats_entries),
         exact_sets: Arc::new(
             parse_optional_sections(
                 reader,

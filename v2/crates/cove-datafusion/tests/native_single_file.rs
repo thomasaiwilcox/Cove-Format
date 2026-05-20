@@ -57,6 +57,7 @@ use cove_core::{
         },
         topn::{TopNDirection, TopNSummary, TOPN_ZONE_SUMMARY_LEN},
     },
+    page::{PAGE_FLAG_ALL_NON_NULL, PAGE_FLAG_STATS_ONLY_CONSTANT},
     page_payload::ColumnPagePayloadV1,
     profile::cove_e::{
         EngineMountPolicyV1, EngineProfileEntryV1, EngineProfileRegistry,
@@ -69,7 +70,9 @@ use cove_core::{
     table::{ColumnEntry, TableCatalog, TableEntry},
     wire,
     writer::{ScanPageSpec, ScanProfileCoveWriter, ScanSegment, SectionPayload},
-    zone_stats::{ZoneStatFlags, ZoneStats, ZoneStatsEntry, ZoneStatsSection},
+    zone_stats::{
+        StatKind, StatScalar, ZoneScope, ZoneStatFlags, ZoneStats, ZoneStatsEntry, ZoneStatsSection,
+    },
     CoveError,
 };
 use cove_coverage::{
@@ -115,8 +118,8 @@ use datafusion::object_store::{
 use datafusion::{
     arrow::{
         array::{
-            Array, BinaryArray, BinaryViewArray, DictionaryArray, Int32Array, ListArray,
-            StringArray, StringViewArray,
+            Array, BinaryArray, BinaryViewArray, DictionaryArray, Float32Array, Int32Array,
+            ListArray, StringArray, StringViewArray,
         },
         datatypes::UInt32Type,
         util::pretty::pretty_format_batches,
@@ -1563,6 +1566,88 @@ async fn float_numcode_filters_compare_logical_values() {
 
     let expected = ["+----+", "| id |", "+----+", "| 2  |", "+----+"];
     assert_batches_eq!(expected, &batches);
+    fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn stats_only_constant_int_and_uint_pages_scan_repeated_values() {
+    let path = write_temp_cove("stats_only_numeric", stats_only_numeric_metrics_file(true));
+    let ctx = SessionContext::new();
+    register_cove_file(&ctx, "metrics", &path).unwrap();
+
+    let batches = ctx
+        .sql("SELECT signed, unsigned FROM metrics ORDER BY signed, unsigned")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let expected = [
+        "+--------+----------+",
+        "| signed | unsigned |",
+        "+--------+----------+",
+        "| -42    | 42       |",
+        "| -42    | 42       |",
+        "| -42    | 42       |",
+        "+--------+----------+",
+    ];
+    assert_batches_eq!(expected, &batches);
+    fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn stats_only_constant_float32_page_preserves_numcode_bits() {
+    let nan_bits = 0x7fc1_2345u32;
+    let path = write_temp_cove("stats_only_float32", stats_only_float32_file(nan_bits));
+    let ctx = SessionContext::new();
+    register_cove_file(&ctx, "metrics", &path).unwrap();
+
+    let batches = ctx
+        .sql("SELECT f32 FROM metrics")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(batches.len(), 1);
+    let values = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Float32Array>()
+        .unwrap();
+    assert_eq!(values.len(), 3);
+    for row in 0..values.len() {
+        assert_eq!(values.value(row).to_bits(), nan_bits);
+    }
+    fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn stats_only_constant_page_without_required_stats_fails_closed() {
+    let bytes = stats_only_numeric_metrics_file(false);
+    assert!(
+        matches!(
+            bootstrap_bytes("stats_only_missing_stats", bytes.clone()),
+            Err(CoveError::PageCorrupt)
+        ),
+        "stats-only all-non-null pages must require validated stats"
+    );
+
+    let path = write_temp_cove("stats_only_missing_stats", bytes);
+    let ctx = SessionContext::new();
+    register_cove_file(&ctx, "metrics", &path).unwrap();
+    let err = ctx
+        .sql("SELECT signed FROM metrics")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("PAGE_CORRUPT"),
+        "unexpected error: {err}"
+    );
     fs::remove_file(path).unwrap();
 }
 
@@ -3373,6 +3458,139 @@ fn float_metrics_file() -> Vec<u8> {
     let mut writer = ScanProfileCoveWriter::new(catalog);
     writer.push_segment(segment);
     writer.write().unwrap()
+}
+
+fn stats_only_numeric_metrics_file(include_stats: bool) -> Vec<u8> {
+    let catalog = TableCatalog {
+        flags: 0,
+        tables: vec![TableEntry {
+            table_id: 1,
+            namespace: "public".into(),
+            name: "metrics".into(),
+            row_count: 3,
+            primary_sort_key_count: 0,
+            clustering_key_count: 0,
+            flags: 0,
+            columns: vec![
+                column(
+                    1,
+                    "signed",
+                    CoveLogicalType::Int64,
+                    CovePhysicalKind::NumCode,
+                    false,
+                ),
+                column(
+                    2,
+                    "unsigned",
+                    CoveLogicalType::UInt64,
+                    CovePhysicalKind::NumCode,
+                    false,
+                ),
+            ],
+        }],
+    };
+    let mut segment = ScanSegment::new(1, 0, 0, 3, 2);
+    segment.set_column_pages(1, vec![stats_only_constant_page(3, 0)]);
+    segment.set_column_pages(2, vec![stats_only_constant_page(3, 1)]);
+
+    let mut writer = ScanProfileCoveWriter::new(catalog);
+    if include_stats {
+        writer
+            .push_zone_stats(&ZoneStatsSection {
+                entries: vec![
+                    stats_only_entry(1, 0, 1, 3, StatKind::Int64, (-42i64).to_le_bytes().to_vec()),
+                    stats_only_entry(1, 0, 2, 3, StatKind::UInt64, 42u64.to_le_bytes().to_vec()),
+                ],
+            })
+            .unwrap();
+    }
+    writer.push_segment(segment);
+    writer.write().unwrap()
+}
+
+fn stats_only_float32_file(bits: u32) -> Vec<u8> {
+    let catalog = TableCatalog {
+        flags: 0,
+        tables: vec![TableEntry {
+            table_id: 1,
+            namespace: "public".into(),
+            name: "metrics".into(),
+            row_count: 3,
+            primary_sort_key_count: 0,
+            clustering_key_count: 0,
+            flags: 0,
+            columns: vec![column(
+                1,
+                "f32",
+                CoveLogicalType::Float32,
+                CovePhysicalKind::NumCode,
+                false,
+            )],
+        }],
+    };
+    let mut segment = ScanSegment::new(1, 0, 0, 3, 1);
+    segment.set_column_pages(1, vec![stats_only_constant_page(3, 0)]);
+
+    let mut writer = ScanProfileCoveWriter::new(catalog);
+    writer
+        .push_zone_stats(&ZoneStatsSection {
+            entries: vec![stats_only_entry(
+                1,
+                0,
+                1,
+                3,
+                StatKind::FixedBytes,
+                bits.to_le_bytes().to_vec(),
+            )],
+        })
+        .unwrap();
+    writer.push_segment(segment);
+    writer.write().unwrap()
+}
+
+fn stats_only_constant_page(row_count: u32, stats_ref: u32) -> ScanPageSpec {
+    let mut page = ScanPageSpec::new(row_count, Vec::new())
+        .with_counts(row_count, 0)
+        .with_encoding_root(u32::MAX)
+        .with_flags(PAGE_FLAG_STATS_ONLY_CONSTANT | PAGE_FLAG_ALL_NON_NULL);
+    page.stats_ref = stats_ref;
+    page
+}
+
+fn stats_only_entry(
+    table_id: u32,
+    segment_id: u32,
+    column_id: u32,
+    row_count: u32,
+    kind: StatKind,
+    bytes: Vec<u8>,
+) -> ZoneStatsEntry {
+    let scalar = StatScalar {
+        kind,
+        bytes,
+        truncated: false,
+    };
+    ZoneStatsEntry {
+        table_id,
+        segment_id,
+        morsel_id: 0,
+        column_id,
+        non_null_count: row_count,
+        distinct_count: 1,
+        run_count: 1,
+        stats: ZoneStats {
+            scope: ZoneScope::Morsel,
+            row_count: u64::from(row_count),
+            null_count: 0,
+            min: Some(scalar.clone()),
+            max: Some(scalar),
+            flags: ZoneStatFlags::HAS_MIN_MAX | ZoneStatFlags::CONSTANT,
+        },
+        min_domain_rank: 0,
+        max_domain_rank: 0,
+        exact_set_ref: u32::MAX,
+        bloom_ref: u32::MAX,
+    }
 }
 
 fn primitive_events_file_with_name_gamma_coverage(bad_checksum: bool) -> Vec<u8> {

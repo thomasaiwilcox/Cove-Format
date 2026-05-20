@@ -2703,7 +2703,8 @@ struct ColumnPageIndexEntryV2 {
 - PAGE_FLAG_STATS_ONLY_CONSTANT requires either PAGE_FLAG_ALL_NULL or PAGE_FLAG_ALL_NON_NULL. Mixed null/non-null constant pages still need a null-position representation and therefore MUST NOT be stats-only.
 - For all-null stats-only pages, null_count MUST equal row_count and non_null_count MUST be zero.
 - For all-non-null stats-only pages, non_null_count MUST equal row_count, null_count MUST be zero, and stats_ref MUST reference a validated page-level ZoneStatsEntry with IS_CONSTANT and min_value == max_value under the declared logical type and collation rules.
-- For Float32 and Float64 stats-only constant pages, the stats entry MUST preserve the exact raw IEEE value bits needed for reconstruction. If exact bits are not represented, including NaN payloads or signed-zero distinctions, the constant value MUST be stored in Constant parameters instead of stats-only storage.
+- For Float32 stats-only constant pages, the stats entry MUST preserve the exact raw IEEE value bits needed for reconstruction. Because v2 has no `StatKind::Float32Bits`, decode-required Float32 stats-only constants MUST use `StatKind::FixedBytes` with exactly 4 little-endian raw IEEE bytes; ordinary advisory Float32 pruning min/max may remain approximate or normalized where permitted by the statistics rules, but those advisory values MUST NOT be used as the reconstruction source for a stats-only constant page. If exact Float32 bits are not represented, including NaN payloads or signed-zero distinctions, the constant value MUST be stored in Constant parameters instead of stats-only storage.
+- For Float64 stats-only constant pages, `StatKind::Float64Bits` may be used only for non-NaN values because ZoneStats Float64 min/max scalars MUST NOT contain NaN. Float64 NaN constants, including payload-preserving NaNs, MUST use a payload-backed Constant or value-stream representation rather than stats-only reconstruction.
 - When PAGE_FLAG_STATS_ONLY_CONSTANT is set on an all-non-null page, the referenced stats entry is decode-required canonical data for that page, not optional pushdown metadata. A reader that cannot validate it MUST reject the page rather than fail open.
 - A stats-only constant page MUST declare or imply `PageReconstructionSource::StatsConstant` and MUST NOT be treated as a normal optional statistics optimisation.
 - A stats-only constant page MUST NOT use truncated `StatScalar` values for reconstruction. Truncated min/max may remain advisory pruning metadata, but they cannot be the only source of a decoded constant value.
@@ -2870,6 +2871,7 @@ Float64 min/max scalars MUST NOT contain NaN. If a zone contains NaN values, wri
 | HAS_BOTTOM_N_SUMMARY | bottom summary available. |
 
 **Rules:**
+- `ZoneStatsEntryV2` has no explicit scope field. Segment-level entries are encoded by `morsel_id == u32::MAX`; morsel-level entries use the concrete morsel id. Page-level use is contextual: a page-level stats entry is proven only when a referencing page selects it by `stats_ref` and the entry matches the page's table, segment, morsel, column, row_count, null_count, and non_null_count metadata.
 - For NumCode columns, min/max are interpreted by logical_type.
 - For FileCode columns, range stats use domain ranks.
 - Raw FileCode min/max MUST NOT be used for logical range pruning.
@@ -6040,6 +6042,7 @@ Object property columns use the same physical and encoded-array machinery as COV
 - Nulls are represented only by null bitmaps.
 - FileCodes resolve through the file dictionary.
 - NumCodes are interpreted by declared logical type.
+- Stats-only property pages follow the same constant reconstruction rules as COVE-T pages in §27.2. All-non-null stats-only property pages MUST reference validated contextual page stats; readers MUST reject them if the stats entry is missing or does not match the property page metadata.
 - Property columns SHOULD be page/morsel aligned with system columns.
 
 ---

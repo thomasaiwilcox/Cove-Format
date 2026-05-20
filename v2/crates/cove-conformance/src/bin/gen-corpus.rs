@@ -50,7 +50,7 @@ use cove_core::{
         FEATURE_TRUST_CHAIN, FEATURE_ZERO_COPY_BUFFER_MAP, MAGIC_COVI, POSTSCRIPT_VERSION_V1,
         VERSION_MAJOR_V1,
     },
-    dictionary::{FileDictionaryHeaderV1, FileDictionaryIndexEntryV1},
+    dictionary::{FileDictionary, FileDictionaryHeaderV1, FileDictionaryIndexEntryV1},
     digest::{compute_digest, DigestEntry, DigestManifest, DigestScope, DigestTargetKind},
     domain::{ColumnDomain, ColumnDomainHeaderV1, COLUMN_DOMAIN_HEADER_LEN},
     encoding::{
@@ -355,6 +355,71 @@ fn main() {
         &root,
         &mut entries,
         fixture(
+            "accept/cove_t_plain_varint_filecode_valid.cove",
+            "cove",
+            "accept",
+            None,
+            &["§20.3", "§73"],
+        ),
+        cove_t_plain_varint_filecode_file(0),
+    );
+
+    write_fixture(
+        &root,
+        &mut entries,
+        fixture(
+            "reject/cove_t_plain_varint_filecode_bad_code.cove",
+            "cove",
+            "reject",
+            Some("COVE_E_BAD_FILECODE"),
+            &["§20.3", "§73", "§76"],
+        ),
+        cove_t_plain_varint_filecode_file(1),
+    );
+
+    write_fixture(
+        &root,
+        &mut entries,
+        fixture(
+            "reject/cove_t_plain_varint_bool_numcode_invalid_value.cove",
+            "cove",
+            "reject",
+            Some("COVE_E_PAGE_CORRUPT"),
+            &["§20.3", "§73", "§76"],
+        ),
+        cove_t_plain_varint_bool_numcode_invalid_value_file(),
+    );
+
+    write_fixture(
+        &root,
+        &mut entries,
+        fixture(
+            "accept/cove_t_constant_filecode_valid.cove",
+            "cove",
+            "accept",
+            None,
+            &["§20.3", "§73"],
+        ),
+        cove_t_constant_filecode_file(0),
+    );
+
+    write_fixture(
+        &root,
+        &mut entries,
+        fixture(
+            "reject/cove_t_constant_filecode_bad_code.cove",
+            "cove",
+            "reject",
+            Some("COVE_E_BAD_FILECODE"),
+            &["§20.3", "§73", "§76"],
+        ),
+        cove_t_constant_filecode_file(1),
+    );
+
+    write_fixture(
+        &root,
+        &mut entries,
+        fixture(
             "accept/cove_t_payload_elision_stats_only_all_null_valid.cove",
             "cove",
             "accept",
@@ -522,6 +587,19 @@ fn main() {
             &["§20", "§25", "§27", "§66", "§72.3"],
         ),
         cove_t_local_codebook_lz4_file(),
+    );
+
+    write_fixture(
+        &root,
+        &mut entries,
+        fixture(
+            "accept/cove_t_explicit_zero_null_bitmap.cove",
+            "cove",
+            "accept",
+            None,
+            &["§25", "§27", "§52", "§72.3"],
+        ),
+        cove_t_explicit_zero_null_bitmap_file(),
     );
 
     write_fixture(
@@ -3515,6 +3593,32 @@ fn main() {
         &root,
         &mut entries,
         fixture(
+            "reject/cove_t_lz4_page_codec_missing_file_feature.cove",
+            "cove",
+            "reject",
+            Some("COVE_E_BAD_SECTION"),
+            &["§27", "§66", "§73", "§76"],
+        ),
+        cove_t_page_codec_missing_file_feature_file(CompressionCodec::Lz4),
+    );
+
+    write_fixture(
+        &root,
+        &mut entries,
+        fixture(
+            "reject/cove_t_zstd_page_codec_missing_section_feature.cove",
+            "cove",
+            "reject",
+            Some("COVE_E_BAD_SECTION"),
+            &["§27", "§66", "§73", "§76"],
+        ),
+        cove_t_page_codec_missing_section_feature_file(CompressionCodec::Zstd),
+    );
+
+    write_fixture(
+        &root,
+        &mut entries,
+        fixture(
             "reject/cove_t_nested_missing_schema.cove",
             "cove",
             "reject",
@@ -3672,6 +3776,20 @@ fn main() {
         &mut entries,
         with_morsel_count(row_morsel_gap, 2),
         gap_row_morsel_directory().serialize(),
+    );
+
+    let row_morsel_nonzero_first = fixture(
+        "reject/row_morsel_directory_nonzero_first.bin",
+        "row_morsel_directory",
+        "reject",
+        Some("COVE_E_SEGMENT_CORRUPT"),
+        &["§26", "§76"],
+    );
+    write_fixture(
+        &root,
+        &mut entries,
+        with_morsel_count(row_morsel_nonzero_first, 1),
+        nonzero_first_row_morsel_directory().serialize(),
     );
 
     let mut bad_sort_key = valid_sort_key().serialize().to_vec();
@@ -4725,6 +4843,29 @@ fn main() {
         &root,
         &mut entries,
         fixture(
+            "accept/cove_o_property_stats_only_all_non_null_valid.cove",
+            "cove",
+            "accept",
+            None,
+            &["§27", "§61", "§76"],
+        ),
+        cove_o_property_stats_only_file_with_property(
+            FEATURE_OBJECT_PROFILE | FEATURE_TABLE_PROFILE | FEATURE_PAGE_PAYLOAD_ELISION,
+            PAGE_FLAG_STATS_ONLY_CONSTANT | PAGE_FLAG_ALL_NON_NULL,
+            valid_temporal_rows.len() as u32,
+            0,
+            CoveLogicalType::Int64,
+            CovePhysicalKind::NumCode,
+            Some(cove_o_zone_stats_payload(vec![
+                cove_o_property_constant_stats(),
+            ])),
+        ),
+    );
+
+    write_fixture(
+        &root,
+        &mut entries,
+        fixture(
             "reject/cove_o_property_elision_missing_feature.cove",
             "cove",
             "reject",
@@ -4754,6 +4895,50 @@ fn main() {
             PAGE_FLAG_STATS_ONLY_CONSTANT | PAGE_FLAG_ALL_NON_NULL,
             valid_temporal_rows.len() as u32,
             0,
+        ),
+    );
+
+    let mut wrong_scope_stats = cove_o_property_constant_stats();
+    wrong_scope_stats.morsel_id = u32::MAX;
+    write_fixture(
+        &root,
+        &mut entries,
+        fixture(
+            "reject/cove_o_property_stats_only_all_non_null_wrong_scope.cove",
+            "cove",
+            "reject",
+            Some("COVE_E_PAGE_CORRUPT"),
+            &["§27", "§28", "§61", "§76"],
+        ),
+        cove_o_property_stats_only_file_with_property(
+            FEATURE_OBJECT_PROFILE | FEATURE_TABLE_PROFILE | FEATURE_PAGE_PAYLOAD_ELISION,
+            PAGE_FLAG_STATS_ONLY_CONSTANT | PAGE_FLAG_ALL_NON_NULL,
+            valid_temporal_rows.len() as u32,
+            0,
+            CoveLogicalType::Int64,
+            CovePhysicalKind::NumCode,
+            Some(cove_o_zone_stats_payload(vec![wrong_scope_stats])),
+        ),
+    );
+
+    write_fixture(
+        &root,
+        &mut entries,
+        fixture(
+            "reject/cove_o_property_stats_only_float64_nan_stats.cove",
+            "cove",
+            "reject",
+            Some("COVE_E_BAD_STATS"),
+            &["§27", "§28", "§61", "§76"],
+        ),
+        cove_o_property_stats_only_file_with_property(
+            FEATURE_OBJECT_PROFILE | FEATURE_TABLE_PROFILE | FEATURE_PAGE_PAYLOAD_ELISION,
+            PAGE_FLAG_STATS_ONLY_CONSTANT | PAGE_FLAG_ALL_NON_NULL,
+            valid_temporal_rows.len() as u32,
+            0,
+            CoveLogicalType::Float64,
+            CovePhysicalKind::NumCode,
+            Some(cove_o_float64_nan_stats_payload()),
         ),
     );
 
@@ -10720,6 +10905,13 @@ fn invalid_harbor_mount_hints_payload() -> Vec<u8> {
 }
 
 fn valid_object_catalog() -> ObjectTypeCatalog {
+    object_catalog_with_property(CoveLogicalType::Bool, CovePhysicalKind::Boolean)
+}
+
+fn object_catalog_with_property(
+    logical_type: CoveLogicalType,
+    physical_kind: CovePhysicalKind,
+) -> ObjectTypeCatalog {
     ObjectTypeCatalog {
         flags: 0,
         types: vec![ObjectTypeEntryV1 {
@@ -10729,8 +10921,8 @@ fn valid_object_catalog() -> ObjectTypeCatalog {
             properties: vec![PropertyEntryV1 {
                 property_id: 1,
                 property_name: "active".into(),
-                logical_type: CoveLogicalType::Bool,
-                physical_kind: CovePhysicalKind::Boolean,
+                logical_type,
+                physical_kind,
                 nullable: false,
                 collation_id: 0,
                 flags: 0,
@@ -10765,7 +10957,14 @@ fn valid_temporal_segment_index() -> TemporalSegmentIndex {
 }
 
 fn cove_o_object_catalog_section() -> SectionPayload {
-    let catalog = valid_object_catalog();
+    cove_o_object_catalog_section_for_property(CoveLogicalType::Bool, CovePhysicalKind::Boolean)
+}
+
+fn cove_o_object_catalog_section_for_property(
+    logical_type: CoveLogicalType,
+    physical_kind: CovePhysicalKind,
+) -> SectionPayload {
+    let catalog = object_catalog_with_property(logical_type, physical_kind);
     SectionPayload {
         section_kind: SectionKind::ObjectTypeCatalog as u16,
         profile: PrimaryProfile::ObjectTemporal as u8,
@@ -10828,6 +11027,26 @@ fn cove_o_property_stats_only_file(
     non_null_count: u32,
     null_count: u32,
 ) -> Vec<u8> {
+    cove_o_property_stats_only_file_with_property(
+        required_features,
+        page_flags,
+        non_null_count,
+        null_count,
+        CoveLogicalType::Bool,
+        CovePhysicalKind::Boolean,
+        None,
+    )
+}
+
+fn cove_o_property_stats_only_file_with_property(
+    required_features: u64,
+    page_flags: u32,
+    non_null_count: u32,
+    null_count: u32,
+    logical_type: CoveLogicalType,
+    physical_kind: CovePhysicalKind,
+    zone_stats_payload: Option<Vec<u8>>,
+) -> Vec<u8> {
     let rows = valid_temporal_rows();
     let segment_payload = temporal_segment_data_payload_with_property_stats_only(
         5,
@@ -10835,6 +11054,8 @@ fn cove_o_property_stats_only_file(
         page_flags,
         non_null_count,
         null_count,
+        logical_type,
+        physical_kind,
     );
     let mut index_entry = temporal_segment_entry_for_rows(5, &rows);
     index_entry.length = segment_payload.len() as u64;
@@ -10842,38 +11063,118 @@ fn cove_o_property_stats_only_file(
         flags: 0,
         entries: vec![index_entry],
     };
+    let mut sections = vec![
+        cove_o_object_catalog_section_for_property(logical_type, physical_kind),
+        SectionPayload {
+            section_kind: SectionKind::TemporalSegmentIndex as u16,
+            profile: PrimaryProfile::ObjectTemporal as u8,
+            flags: 0,
+            item_count: 1,
+            row_count: rows.len() as u64,
+            compression: 0,
+            alignment_log2: 0,
+            required_features: FEATURE_OBJECT_PROFILE,
+            optional_features: 0,
+            data: index.serialize().unwrap(),
+        },
+        SectionPayload {
+            section_kind: SectionKind::TemporalSegmentData as u16,
+            profile: PrimaryProfile::ObjectTemporal as u8,
+            flags: 0,
+            item_count: 1,
+            row_count: rows.len() as u64,
+            compression: 0,
+            alignment_log2: 0,
+            required_features: FEATURE_OBJECT_PROFILE | FEATURE_PAGE_PAYLOAD_ELISION,
+            optional_features: 0,
+            data: segment_payload,
+        },
+    ];
+    if let Some(data) = zone_stats_payload {
+        sections.push(SectionPayload {
+            section_kind: SectionKind::ZoneStats as u16,
+            profile: PrimaryProfile::TableScan as u8,
+            flags: 0,
+            item_count: (data.len() / ZONE_STATS_ENTRY_LEN) as u64,
+            row_count: 0,
+            compression: 0,
+            alignment_log2: 0,
+            required_features: 0,
+            optional_features: 0,
+            data,
+        });
+    }
     semantic_profile_cove_file(
         PrimaryProfile::ObjectTemporal,
         required_features,
         0,
-        vec![
-            cove_o_object_catalog_section(),
-            SectionPayload {
-                section_kind: SectionKind::TemporalSegmentIndex as u16,
-                profile: PrimaryProfile::ObjectTemporal as u8,
-                flags: 0,
-                item_count: 1,
-                row_count: rows.len() as u64,
-                compression: 0,
-                alignment_log2: 0,
-                required_features: FEATURE_OBJECT_PROFILE,
-                optional_features: 0,
-                data: index.serialize().unwrap(),
-            },
-            SectionPayload {
-                section_kind: SectionKind::TemporalSegmentData as u16,
-                profile: PrimaryProfile::ObjectTemporal as u8,
-                flags: 0,
-                item_count: 1,
-                row_count: rows.len() as u64,
-                compression: 0,
-                alignment_log2: 0,
-                required_features: FEATURE_OBJECT_PROFILE | FEATURE_PAGE_PAYLOAD_ELISION,
-                optional_features: 0,
-                data: segment_payload,
-            },
-        ],
+        sections,
     )
+}
+
+fn cove_o_property_constant_stats() -> ZoneStatsEntry {
+    let scalar = StatScalar {
+        kind: StatKind::Int64,
+        bytes: 42i64.to_le_bytes().to_vec(),
+        truncated: false,
+    };
+    ZoneStatsEntry {
+        table_id: 0,
+        segment_id: 5,
+        morsel_id: 0,
+        column_id: 1,
+        non_null_count: valid_temporal_rows().len() as u32,
+        distinct_count: 1,
+        run_count: 1,
+        stats: ZoneStats {
+            scope: ZoneScope::Morsel,
+            row_count: valid_temporal_rows().len() as u64,
+            null_count: 0,
+            min: Some(scalar.clone()),
+            max: Some(scalar),
+            flags: ZoneStatFlags::HAS_MIN_MAX | ZoneStatFlags::CONSTANT,
+        },
+        min_domain_rank: 0,
+        max_domain_rank: 0,
+        exact_set_ref: u32::MAX,
+        bloom_ref: u32::MAX,
+    }
+}
+
+fn cove_o_zone_stats_payload(entries: Vec<ZoneStatsEntry>) -> Vec<u8> {
+    ZoneStatsSection { entries }.serialize().unwrap()
+}
+
+fn cove_o_float64_nan_stats_payload() -> Vec<u8> {
+    let scalar = stat_scalar_raw(StatKind::Float64Bits, &f64::NAN.to_bits().to_le_bytes());
+    let mut out = [0u8; ZONE_STATS_ENTRY_LEN];
+    out[0..4].copy_from_slice(&0u32.to_le_bytes());
+    out[4..8].copy_from_slice(&5u32.to_le_bytes());
+    out[8..12].copy_from_slice(&0u32.to_le_bytes());
+    out[12..16].copy_from_slice(&1u32.to_le_bytes());
+    out[16..20].copy_from_slice(&(valid_temporal_rows().len() as u32).to_le_bytes());
+    out[20..24].copy_from_slice(&0u32.to_le_bytes());
+    out[24..28].copy_from_slice(&(valid_temporal_rows().len() as u32).to_le_bytes());
+    out[28..32].copy_from_slice(&1u32.to_le_bytes());
+    out[32..36].copy_from_slice(&1u32.to_le_bytes());
+    out[36..40].copy_from_slice(
+        &(ZoneStatFlags::HAS_MIN_MAX | ZoneStatFlags::CONSTANT | ZoneStatFlags::HAS_NAN)
+            .bits()
+            .to_le_bytes(),
+    );
+    out[40..60].copy_from_slice(&scalar);
+    out[60..80].copy_from_slice(&scalar);
+    out[88..92].copy_from_slice(&u32::MAX.to_le_bytes());
+    out[92..96].copy_from_slice(&u32::MAX.to_le_bytes());
+    out.to_vec()
+}
+
+fn stat_scalar_raw(kind: StatKind, value: &[u8]) -> [u8; STAT_SCALAR_ENCODED_LEN] {
+    let mut out = [0u8; STAT_SCALAR_ENCODED_LEN];
+    out[0] = kind as u8;
+    out[2..4].copy_from_slice(&(value.len() as u16).to_le_bytes());
+    out[4..4 + value.len()].copy_from_slice(value);
+    out
 }
 
 fn valid_temporal_rows() -> Vec<TemporalRowEntryV1> {
@@ -10946,6 +11247,8 @@ fn temporal_segment_data_payload_with_property_stats_only(
     page_flags: u32,
     non_null_count: u32,
     null_count: u32,
+    logical_type: CoveLogicalType,
+    physical_kind: CovePhysicalKind,
 ) -> Vec<u8> {
     let row_directory_offset = TEMPORAL_SEGMENT_HEADER_LEN as u64;
     let row_bytes = (rows.len() * TEMPORAL_ROW_ENTRY_LEN) as u64;
@@ -10978,8 +11281,8 @@ fn temporal_segment_data_payload_with_property_stats_only(
     };
     let directory = TableColumnDirectoryEntryV1 {
         column_id: 1,
-        logical_type: CoveLogicalType::Bool,
-        physical_kind: CovePhysicalKind::Boolean,
+        logical_type,
+        physical_kind,
         flags: 0,
         page_index_offset,
         page_index_length,
@@ -11342,6 +11645,93 @@ fn cove_t_constant_numcode_high_bits_file() -> Vec<u8> {
     let mut writer = ScanProfileCoveWriter::new(catalog);
     writer.push_segment(segment);
     writer.write().unwrap()
+}
+
+fn filecode_typed_page_catalog(row_count: u64) -> TableCatalog {
+    TableCatalog {
+        flags: 0,
+        tables: vec![TableEntry {
+            table_id: 1,
+            namespace: "public".into(),
+            name: "labels".into(),
+            row_count,
+            primary_sort_key_count: 0,
+            clustering_key_count: 0,
+            flags: 0,
+            columns: vec![ColumnEntry {
+                column_id: 1,
+                name: "label".into(),
+                logical: CoveLogicalType::Utf8,
+                physical: CovePhysicalKind::FileCode,
+                nullable: false,
+                sort_order: 0,
+                collation_id: 0,
+                precision: 0,
+                scale: 0,
+                flags: 0,
+            }],
+        }],
+    }
+}
+
+fn single_entry_file_dictionary() -> FileDictionary {
+    let (index, payload) = dictionary_fixture_index_and_payload(&[DictionaryFixtureEntry {
+        value_tag: ValueTag::Utf8,
+        storage_class: StorageClass::Inline,
+        canonical_bytes: CanonicalValue::Utf8("alpha").encode().unwrap(),
+    }]);
+    FileDictionary::parse(&index, &payload).unwrap()
+}
+
+fn cove_t_filecode_typed_page_file(
+    encoding: CoveEncodingKind,
+    values: Vec<u8>,
+    row_count: u64,
+) -> Vec<u8> {
+    let row_count_u32 = u32::try_from(row_count).unwrap();
+    let mut segment = ScanSegment::new(1, 0, 0, row_count_u32, 1);
+    segment.set_column_pages(
+        1,
+        vec![ScanPageSpec::new(row_count_u32, values)
+            .with_counts(row_count_u32, 0)
+            .with_encoding_root(encoding as u32)],
+    );
+    let mut writer = ScanProfileCoveWriter::new(filecode_typed_page_catalog(row_count));
+    let dictionary = single_entry_file_dictionary();
+    writer.push_file_dictionary(&dictionary);
+    writer.push_segment(segment);
+    writer.write().unwrap()
+}
+
+fn cove_t_plain_varint_filecode_file(code: u64) -> Vec<u8> {
+    cove_t_filecode_typed_page_file(
+        CoveEncodingKind::PlainVarint,
+        cove_core::wire::encode_u64_leb128(code),
+        1,
+    )
+}
+
+fn cove_t_plain_varint_bool_numcode_invalid_value_file() -> Vec<u8> {
+    let mut segment = ScanSegment::new(1, 0, 0, 1, 1);
+    segment.set_column_pages(
+        1,
+        vec![ScanPageSpec::new(1, cove_core::wire::encode_u64_leb128(2))
+            .with_counts(1, 0)
+            .with_encoding_root(CoveEncodingKind::PlainVarint as u32)],
+    );
+    let mut writer = ScanProfileCoveWriter::new(bool_numcode_catalog(1));
+    writer.push_segment(segment);
+    writer.write().unwrap()
+}
+
+fn cove_t_constant_filecode_file(code: i64) -> Vec<u8> {
+    let payload = ConstantPayload {
+        value: code,
+        row_count: 1,
+    }
+    .encode()
+    .to_vec();
+    cove_t_filecode_typed_page_file(CoveEncodingKind::Constant, payload, 1)
 }
 
 fn cove_t_payload_elision_stats_only_all_null_file() -> Vec<u8> {
@@ -12910,6 +13300,18 @@ fn clear_required_feature(mut bytes: Vec<u8>, feature: u64) -> Vec<u8> {
     bytes
 }
 
+fn clear_optional_feature(mut bytes: Vec<u8>, feature: u64) -> Vec<u8> {
+    let mut header = CoveHeaderV1::parse(&bytes).unwrap();
+    header.optional_features &= !feature;
+    bytes[..HEADER_SIZE].copy_from_slice(&header.serialize());
+
+    let mut postscript = CovePostscriptV1::parse_from_tail(&bytes).unwrap();
+    postscript.optional_features &= !feature;
+    let tail_start = bytes.len() - POSTSCRIPT_TOTAL_SIZE;
+    bytes[tail_start..].copy_from_slice(&postscript.serialize_tail());
+    bytes
+}
+
 fn rewrite_first_segment_page(
     mut bytes: Vec<u8>,
     mutate: impl FnOnce(&mut ColumnPageIndexEntryV1),
@@ -13061,7 +13463,65 @@ fn rewrite_first_section_required_features(
     panic!("generated COVE file did not contain requested section kind");
 }
 
+fn rewrite_first_section_optional_features(
+    mut bytes: Vec<u8>,
+    section_kind: SectionKind,
+    optional_features: u64,
+) -> Vec<u8> {
+    let mut postscript = CovePostscriptV1::parse_from_tail(&bytes).unwrap();
+    let footer_start = postscript.footer.offset as usize;
+    let footer_header = CoveFooterHeaderV1::parse(&bytes[footer_start..]).unwrap();
+    let entries_start = footer_start + FOOTER_HEADER_SIZE;
+    for index in 0..footer_header.section_count as usize {
+        let entry_start = entries_start + index * SECTION_ENTRY_SIZE;
+        let mut section_entry =
+            CoveSectionEntryV1::parse(&bytes[entry_start..entry_start + SECTION_ENTRY_SIZE])
+                .unwrap();
+        if section_entry.section_kind != section_kind as u16 {
+            continue;
+        }
+        section_entry.optional_features = optional_features;
+        bytes[entry_start..entry_start + SECTION_ENTRY_SIZE]
+            .copy_from_slice(&section_entry.serialize());
+
+        let footer_end = footer_start + postscript.footer.length as usize;
+        postscript.footer.crc32c = checksum::crc32c(&bytes[footer_start..footer_end]);
+        let tail_start = bytes.len() - POSTSCRIPT_TOTAL_SIZE;
+        bytes[tail_start..].copy_from_slice(&postscript.serialize_tail());
+        return bytes;
+    }
+    panic!("generated COVE file did not contain requested section kind");
+}
+
 fn cove_t_local_codebook_lz4_file() -> Vec<u8> {
+    cove_t_local_codebook_page_codec_file(CompressionCodec::Lz4)
+}
+
+fn cove_t_page_codec_missing_file_feature_file(codec: CompressionCodec) -> Vec<u8> {
+    clear_optional_feature(
+        cove_t_local_codebook_page_codec_file(codec),
+        page_codec_feature_bit(codec),
+    )
+}
+
+fn cove_t_page_codec_missing_section_feature_file(codec: CompressionCodec) -> Vec<u8> {
+    rewrite_first_section_optional_features(
+        cove_t_local_codebook_page_codec_file(codec),
+        SectionKind::TableSegmentData,
+        0,
+    )
+}
+
+fn page_codec_feature_bit(codec: CompressionCodec) -> u64 {
+    match codec {
+        CompressionCodec::None => 0,
+        CompressionCodec::Lz4 => FEATURE_CODEC_LZ4,
+        CompressionCodec::Zstd => FEATURE_CODEC_ZSTD,
+        _ => 0,
+    }
+}
+
+fn cove_t_local_codebook_page_codec_file(codec: CompressionCodec) -> Vec<u8> {
     let catalog = TableCatalog {
         flags: 0,
         tables: vec![TableEntry {
@@ -13096,7 +13556,7 @@ fn cove_t_local_codebook_lz4_file() -> Vec<u8> {
     segment.set_column_pages(
         1,
         vec![ScanPageSpec::new(6, payload.encode())
-            .with_compression(CompressionCodec::Lz4)
+            .with_compression(codec)
             .with_encoding_root(CoveEncodingKind::LocalCodebook as u32)],
     );
     let mut writer = ScanProfileCoveWriter::new(catalog);
@@ -13334,6 +13794,54 @@ fn nested_list_payload(child_row_count: u32) -> Vec<u8> {
     .unwrap()
 }
 
+fn nested_list_payload_with_root_null_bitmap(
+    null_bitmap: Vec<u8>,
+    child_row_count: u32,
+) -> Vec<u8> {
+    ColumnPagePayloadV1::build_tree(
+        3,
+        0,
+        vec![
+            nested_encoding_node(
+                0,
+                CoveEncodingKind::Canonical,
+                CoveLogicalType::List,
+                CovePhysicalKind::List,
+                3,
+                1,
+                2,
+            ),
+            nested_encoding_node(
+                1,
+                CoveEncodingKind::NumCode,
+                CoveLogicalType::Int32,
+                CovePhysicalKind::NumCode,
+                child_row_count,
+                0,
+                1,
+            ),
+        ],
+        vec![
+            (PageBufferKind::NullBitmap, null_bitmap),
+            (
+                PageBufferKind::ChildLayout,
+                ListLayoutPayload {
+                    layout: ListLayout {
+                        offsets: vec![0, 2, 2, 5],
+                    },
+                    child_row_count,
+                }
+                .encode(),
+            ),
+            (
+                PageBufferKind::Values,
+                nested_numcode_values(&[100, 101, 102, 103, 104][..child_row_count as usize]),
+            ),
+        ],
+    )
+    .unwrap()
+}
+
 fn nested_struct_payload(parent_null_handling_declared: bool) -> Vec<u8> {
     ColumnPagePayloadV1::build_tree(
         3,
@@ -13454,6 +13962,17 @@ fn cove_t_nested_list_valid_file() -> Vec<u8> {
         3,
         list_nested_schema(),
         nested_list_payload(5),
+    )
+}
+
+fn cove_t_explicit_zero_null_bitmap_file() -> Vec<u8> {
+    nested_column_cove_file(
+        "tags",
+        CoveLogicalType::List,
+        CovePhysicalKind::List,
+        3,
+        list_nested_schema(),
+        nested_list_payload_with_root_null_bitmap(vec![0], 5),
     )
 }
 
@@ -13656,6 +14175,12 @@ fn valid_row_morsel_directory() -> RowMorselDirectory {
 fn gap_row_morsel_directory() -> RowMorselDirectory {
     RowMorselDirectory {
         entries: vec![row_morsel(0, 0, 10), row_morsel(1, 20, 5)],
+    }
+}
+
+fn nonzero_first_row_morsel_directory() -> RowMorselDirectory {
+    RowMorselDirectory {
+        entries: vec![row_morsel(0, 5, 10)],
     }
 }
 

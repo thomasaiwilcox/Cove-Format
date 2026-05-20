@@ -1,10 +1,15 @@
 use cove_core::{
-    checksum,
+    checksum, compression,
     constants::{
-        PrimaryProfile, SectionKind, FEATURE_COLUMN_DOMAINS, FEATURE_ENGINE_PROFILE,
-        FEATURE_FILE_DICTIONARY, FEATURE_HARBOR_PROFILE, FEATURE_OBJECT_PROFILE,
-        FEATURE_REDACTIONS, FEATURE_TABLE_PROFILE, FEATURE_TRUST_CHAIN,
+        CoveEncodingKind, CoveLogicalType, CovePhysicalKind, PrimaryProfile, SectionKind,
+        FEATURE_COLUMN_DOMAINS, FEATURE_ENGINE_PROFILE, FEATURE_FILE_DICTIONARY,
+        FEATURE_HARBOR_PROFILE, FEATURE_OBJECT_PROFILE, FEATURE_REDACTIONS, FEATURE_TABLE_PROFILE,
+        FEATURE_TRUST_CHAIN,
     },
+    page::{ColumnPageIndexEntryV1, COLUMN_PAGE_INDEX_ENTRY_LEN},
+    reader,
+    segment::{RowMorselEntryV1, TableSegmentHeaderV1, ROW_MORSEL_ENTRY_LEN},
+    table::{ColumnEntry, TableCatalog, TableEntry},
     writer::{MinimalCoveWriter, ScanProfileCoveWriter, ScanSegment, SectionPayload},
 };
 use std::io::Write;
@@ -64,6 +69,123 @@ fn run_validate_with_args(path: &std::path::Path, args: &[&str]) -> std::process
         cmd.arg(arg);
     }
     cmd.arg("--json").arg(path).output().unwrap()
+}
+
+fn one_column_two_morsel_scan_file() -> Vec<u8> {
+    let catalog = TableCatalog {
+        flags: 0,
+        tables: vec![TableEntry {
+            table_id: 1,
+            namespace: "public".into(),
+            name: "events".into(),
+            row_count: 2,
+            primary_sort_key_count: 0,
+            clustering_key_count: 0,
+            flags: 0,
+            columns: vec![ColumnEntry {
+                column_id: 1,
+                name: "id".into(),
+                logical: CoveLogicalType::Int64,
+                physical: CovePhysicalKind::NumCode,
+                nullable: false,
+                sort_order: 0,
+                collation_id: 0,
+                precision: 0,
+                scale: 0,
+                flags: 0,
+            }],
+        }],
+    };
+    let mut segment = ScanSegment::new(1, 0, 0, 2, 1);
+    segment.morsel_row_count = 1;
+    segment.set_column_pages(
+        1,
+        vec![
+            cove_core::writer::ScanPageSpec::new(1, 1u64.to_le_bytes().to_vec())
+                .with_encoding_root(CoveEncodingKind::NumCode as u32),
+            cove_core::writer::ScanPageSpec::new(1, 2u64.to_le_bytes().to_vec())
+                .with_encoding_root(CoveEncodingKind::NumCode as u32),
+        ],
+    );
+    let mut writer = ScanProfileCoveWriter::new(catalog);
+    writer.push_segment(segment);
+    writer.write().unwrap()
+}
+
+fn rewrite_first_segment_data<F>(bytes: Vec<u8>, mut mutate: F) -> Vec<u8>
+where
+    F: FnMut(&mut Vec<u8>),
+{
+    let validated = reader::validate_bytes(&bytes).unwrap();
+    let mut writer = MinimalCoveWriter::new();
+    writer.created_at_us = validated.header.created_at_us;
+    writer.file_id = validated.header.file_id;
+    writer.producer_scope_id = validated.header.producer_scope_id;
+    writer.producer_scope_kind = validated.header.producer_scope_kind;
+    writer.primary_profile = validated.header.primary_profile;
+    writer.required_features = validated.header.required_features;
+    writer.optional_features = validated.header.optional_features;
+    writer.metadata_json = validated.footer.metadata_json.clone();
+
+    let mut mutated = false;
+    for entry in &validated.footer.sections {
+        let mut data = compression::section_payload(&bytes, entry)
+            .unwrap()
+            .into_owned();
+        if !mutated && entry.section_kind == SectionKind::TableSegmentData as u16 {
+            mutate(&mut data);
+            mutated = true;
+        }
+        writer.sections.push(SectionPayload {
+            section_kind: entry.section_kind,
+            profile: entry.profile,
+            flags: entry.flags,
+            item_count: entry.item_count,
+            row_count: entry.row_count,
+            compression: entry.compression,
+            alignment_log2: entry.alignment_log2,
+            required_features: entry.required_features,
+            optional_features: entry.optional_features,
+            data,
+        });
+    }
+    assert!(
+        mutated,
+        "fixture should contain a table segment data section"
+    );
+    writer.write().unwrap()
+}
+
+fn set_morsel_and_page_ids(segment_data: &mut [u8], ids: &[u32]) {
+    let header = TableSegmentHeaderV1::parse(segment_data).unwrap();
+    assert_eq!(header.morsel_count as usize, ids.len());
+    let morsel_dir = header.morsel_directory_offset as usize;
+    for (index, morsel_id) in ids.iter().copied().enumerate() {
+        let offset = morsel_dir + index * ROW_MORSEL_ENTRY_LEN;
+        let mut entry = RowMorselEntryV1::parse(&segment_data[offset..]).unwrap();
+        entry.morsel_id = morsel_id;
+        segment_data[offset..offset + ROW_MORSEL_ENTRY_LEN].copy_from_slice(&entry.serialize());
+    }
+    let page_index = header.page_index_offset as usize;
+    for (index, morsel_id) in ids.iter().copied().enumerate() {
+        let offset = page_index + index * COLUMN_PAGE_INDEX_ENTRY_LEN;
+        let mut page = ColumnPageIndexEntryV1::parse(&segment_data[offset..]).unwrap();
+        page.morsel_id = morsel_id;
+        segment_data[offset..offset + COLUMN_PAGE_INDEX_ENTRY_LEN]
+            .copy_from_slice(&page.serialize());
+    }
+}
+
+fn duplicate_second_page_morsel_ref(segment_data: &mut [u8]) {
+    let header = TableSegmentHeaderV1::parse(segment_data).unwrap();
+    assert!(header.morsel_count >= 2);
+    let page_index = header.page_index_offset as usize;
+    let first = ColumnPageIndexEntryV1::parse(&segment_data[page_index..]).unwrap();
+    let second_offset = page_index + COLUMN_PAGE_INDEX_ENTRY_LEN;
+    let mut second = ColumnPageIndexEntryV1::parse(&segment_data[second_offset..]).unwrap();
+    second.morsel_id = first.morsel_id;
+    segment_data[second_offset..second_offset + COLUMN_PAGE_INDEX_ENTRY_LEN]
+        .copy_from_slice(&second.serialize());
 }
 
 fn dictionary_index_bytes(redacted: bool) -> Vec<u8> {
@@ -451,6 +573,32 @@ fn semantic_cli_accepts_scan_profile_writer_file() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success(), "{stdout}");
     assert!(stdout.contains("\"ok\":true"));
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn semantic_cli_accepts_sparse_morsel_ids_with_exact_page_coverage() {
+    let bytes = rewrite_first_segment_data(one_column_two_morsel_scan_file(), |data| {
+        set_morsel_and_page_ids(data, &[10, 20]);
+    });
+    let path = write_temp_file("sparse_morsel_ids", &bytes);
+    let output = run_validate(&path, true);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+    assert!(stdout.contains("\"ok\":true"));
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn semantic_cli_rejects_duplicate_page_morsel_refs() {
+    let bytes = rewrite_first_segment_data(one_column_two_morsel_scan_file(), |data| {
+        duplicate_second_page_morsel_ref(data);
+    });
+    let path = write_temp_file("duplicate_page_morsel_refs", &bytes);
+    let output = run_validate(&path, true);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!output.status.success(), "{stdout}");
+    assert!(stdout.contains("\"ok\":false"), "{stdout}");
     let _ = std::fs::remove_file(&path);
 }
 

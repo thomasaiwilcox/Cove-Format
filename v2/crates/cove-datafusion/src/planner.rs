@@ -658,6 +658,7 @@ fn validate_filter_shapes(state: &DatasetState, filters: &[FilterPlan]) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "covi")]
     use cove_core::wire;
 
     #[test]

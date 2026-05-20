@@ -31,7 +31,9 @@ use crate::{
     checksum,
     constants::{CoveLogicalType, CovePhysicalKind, FEATURE_PAGE_PAYLOAD_ELISION},
     page::{page_uses_payload_elision, ColumnPageIndex, PAGE_FLAG_STATS_ONLY_CONSTANT},
-    page_validation::{validate_column_page_wire, PageValidationContext},
+    page_validation::{
+        validate_column_page_wire, validate_page_codec_feature_advertisement, PageValidationContext,
+    },
     types::{validate_logical_physical_pair_with_options, LogicalPhysicalOptions},
     CoveError,
 };
@@ -407,17 +409,36 @@ impl TableSegmentHeaderV1 {
 
 impl TableSegmentPayloadV1 {
     pub fn parse(bytes: &[u8]) -> Result<Self, CoveError> {
-        Self::parse_inner(bytes, None)
+        Self::parse_inner(bytes, None, None, None)
     }
 
     pub fn parse_with_required_features(
         bytes: &[u8],
         required_features: u64,
     ) -> Result<Self, CoveError> {
-        Self::parse_inner(bytes, Some(required_features))
+        Self::parse_inner(bytes, Some(required_features), None, None)
     }
 
-    fn parse_inner(bytes: &[u8], required_features: Option<u64>) -> Result<Self, CoveError> {
+    pub(crate) fn parse_with_feature_advertisement(
+        bytes: &[u8],
+        required_features: u64,
+        file_advertised_features: u64,
+        section_advertised_features: u64,
+    ) -> Result<Self, CoveError> {
+        Self::parse_inner(
+            bytes,
+            Some(required_features),
+            Some(file_advertised_features),
+            Some(section_advertised_features),
+        )
+    }
+
+    fn parse_inner(
+        bytes: &[u8],
+        required_features: Option<u64>,
+        file_advertised_features: Option<u64>,
+        section_advertised_features: Option<u64>,
+    ) -> Result<Self, CoveError> {
         let header = TableSegmentHeaderV1::parse(bytes)?;
         if header.row_count == 0 && header.morsel_count != 0 {
             return Err(CoveError::SegmentCorrupt);
@@ -505,14 +526,12 @@ impl TableSegmentPayloadV1 {
 
             let page_index =
                 ColumnPageIndex::parse(&bytes[column_page_index_offset..column_page_index_end])?;
+            morsels.validate_page_index_coverage(&page_index)?;
             for page in page_index.entries {
                 if page.column_id != column.column_id {
                     return Err(CoveError::PageCorrupt);
                 }
-                let morsel = morsels
-                    .entries
-                    .get(page.morsel_id as usize)
-                    .ok_or(CoveError::SegmentCorrupt)?;
+                let morsel = morsels.morsel_by_id(page.morsel_id)?;
                 if page.row_count != morsel.row_count {
                     return Err(CoveError::PageCorrupt);
                 }
@@ -525,6 +544,11 @@ impl TableSegmentPayloadV1 {
                             .into(),
                     ));
                 }
+                validate_page_codec_feature_advertisement(
+                    &page,
+                    file_advertised_features,
+                    section_advertised_features,
+                )?;
                 let stats_only_constant = page.flags & PAGE_FLAG_STATS_ONLY_CONSTANT != 0;
                 if stats_only_constant {
                     if page.page_offset != 0 || page.page_length != 0 {
@@ -680,12 +704,12 @@ impl RowMorselDirectory {
     /// * Every morsel except possibly the last has `row_count > 0`; an
     ///   empty morsel anywhere is a corruption.
     pub fn validate(&self) -> Result<(), CoveError> {
-        let mut next_row = self
-            .entries
-            .first()
-            .map(|e| e.first_row_in_segment)
-            .unwrap_or(0);
+        let mut next_row = 0u32;
+        let mut seen_ids = std::collections::BTreeSet::new();
         for e in &self.entries {
+            if !seen_ids.insert(e.morsel_id) {
+                return Err(CoveError::SegmentCorrupt);
+            }
             if e.row_count == 0 {
                 return Err(CoveError::SegmentCorrupt);
             }
@@ -699,6 +723,38 @@ impl RowMorselDirectory {
         Ok(())
     }
 
+    pub fn morsel_by_id(&self, morsel_id: u32) -> Result<&RowMorselEntryV1, CoveError> {
+        self.entries
+            .iter()
+            .find(|entry| entry.morsel_id == morsel_id)
+            .ok_or(CoveError::SegmentCorrupt)
+    }
+
+    pub fn validate_page_index_coverage(
+        &self,
+        page_index: &ColumnPageIndex,
+    ) -> Result<(), CoveError> {
+        if page_index.entries.len() != self.entries.len() {
+            return Err(CoveError::PageCorrupt);
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for page in &page_index.entries {
+            if !seen.insert(page.morsel_id) {
+                return Err(CoveError::PageCorrupt);
+            }
+            let morsel = self.morsel_by_id(page.morsel_id)?;
+            if page.row_count != morsel.row_count {
+                return Err(CoveError::PageCorrupt);
+            }
+        }
+        for morsel in &self.entries {
+            if !seen.contains(&morsel.morsel_id) {
+                return Err(CoveError::PageCorrupt);
+            }
+        }
+        Ok(())
+    }
+
     /// Sum of `row_count` over all entries.
     pub fn sum_rows(&self) -> u64 {
         self.entries.iter().map(|e| e.row_count as u64).sum()
@@ -708,7 +764,12 @@ impl RowMorselDirectory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{page::ColumnPageIndexEntryV1, page_payload::ColumnPagePayloadV1};
+    use crate::{
+        compression::encode_page_payload,
+        constants::{CompressionCodec, CoveEncodingKind, FEATURE_CODEC_LZ4},
+        page::ColumnPageIndexEntryV1,
+        page_payload::ColumnPagePayloadV1,
+    };
 
     fn entry(
         table: u32,
@@ -894,6 +955,68 @@ mod tests {
         }
     }
 
+    fn single_page_segment_bytes(codec: CompressionCodec) -> Vec<u8> {
+        let column_offset = TABLE_SEGMENT_HEADER_LEN + ROW_MORSEL_ENTRY_LEN;
+        let page_index_offset = column_offset + TABLE_COLUMN_DIRECTORY_ENTRY_LEN;
+        let data_offset = page_index_offset + crate::page::COLUMN_PAGE_INDEX_ENTRY_LEN;
+        let decoded_payload = ColumnPagePayloadV1::build_single_node(
+            2,
+            CoveEncodingKind::NumCode,
+            CoveLogicalType::Int64,
+            CovePhysicalKind::NumCode,
+            None,
+            [1u64.to_le_bytes(), 2u64.to_le_bytes()].concat(),
+        )
+        .unwrap();
+        let page_wire = encode_page_payload(&decoded_payload, codec).unwrap();
+        let header = TableSegmentHeaderV1 {
+            table_id: 1,
+            segment_id: 0,
+            row_start: 0,
+            row_count: 2,
+            morsel_count: 1,
+            morsel_row_count: 4096,
+            column_count: 1,
+            morsel_directory_offset: TABLE_SEGMENT_HEADER_LEN as u64,
+            column_directory_offset: column_offset as u64,
+            page_index_offset: page_index_offset as u64,
+            data_offset: data_offset as u64,
+            flags: 0,
+            checksum: 0,
+        };
+        let dir = RowMorselDirectory {
+            entries: vec![morsel(0, 0, 2)],
+        };
+        let column = column(
+            7,
+            page_index_offset as u64,
+            crate::page::COLUMN_PAGE_INDEX_ENTRY_LEN as u64,
+            data_offset as u64,
+            page_wire.len() as u64,
+        );
+        let page = ColumnPageIndexEntryV1 {
+            column_id: 7,
+            morsel_id: 0,
+            row_count: 2,
+            non_null_count: 2,
+            null_count: 0,
+            encoding_root: CoveEncodingKind::NumCode as u32,
+            page_offset: data_offset as u64,
+            page_length: page_wire.len() as u64,
+            uncompressed_length: decoded_payload.len() as u64,
+            stats_ref: 0,
+            flags: codec as u32,
+            checksum: checksum::crc32c(&page_wire),
+        };
+
+        let mut bytes = header.serialize().to_vec();
+        bytes.extend_from_slice(&dir.serialize());
+        bytes.extend_from_slice(&column.serialize());
+        bytes.extend_from_slice(&page.serialize());
+        bytes.extend_from_slice(&page_wire);
+        bytes
+    }
+
     #[test]
     fn morsel_directory_roundtrip_and_validation() {
         let dir = RowMorselDirectory {
@@ -926,6 +1049,113 @@ mod tests {
         assert_eq!(
             RowMorselDirectory::parse(&bytes, 2),
             Err(CoveError::SegmentCorrupt)
+        );
+    }
+
+    #[test]
+    fn morsel_directory_rejects_nonzero_first_row() {
+        let dir = RowMorselDirectory {
+            entries: vec![morsel(0, 5, 100)],
+        };
+        let bytes = dir.serialize();
+        assert_eq!(
+            RowMorselDirectory::parse(&bytes, 1),
+            Err(CoveError::SegmentCorrupt)
+        );
+    }
+
+    #[test]
+    fn morsel_directory_rejects_duplicate_morsel_id() {
+        let dir = RowMorselDirectory {
+            entries: vec![morsel(7, 0, 100), morsel(7, 100, 100)],
+        };
+        let bytes = dir.serialize();
+        assert_eq!(
+            RowMorselDirectory::parse(&bytes, 2),
+            Err(CoveError::SegmentCorrupt)
+        );
+    }
+
+    #[test]
+    fn page_index_coverage_accepts_sparse_morsel_ids() {
+        let dir = RowMorselDirectory {
+            entries: vec![morsel(3, 0, 4), morsel(9, 4, 1)],
+        };
+        let page_index = ColumnPageIndex {
+            entries: vec![
+                ColumnPageIndexEntryV1 {
+                    column_id: 7,
+                    morsel_id: 3,
+                    row_count: 4,
+                    non_null_count: 4,
+                    null_count: 0,
+                    encoding_root: CoveEncodingKind::NumCode as u32,
+                    page_offset: 0,
+                    page_length: 1,
+                    uncompressed_length: 1,
+                    stats_ref: 0,
+                    flags: 0,
+                    checksum: 0,
+                },
+                ColumnPageIndexEntryV1 {
+                    column_id: 7,
+                    morsel_id: 9,
+                    row_count: 1,
+                    non_null_count: 1,
+                    null_count: 0,
+                    encoding_root: CoveEncodingKind::NumCode as u32,
+                    page_offset: 1,
+                    page_length: 1,
+                    uncompressed_length: 1,
+                    stats_ref: 0,
+                    flags: 0,
+                    checksum: 0,
+                },
+            ],
+        };
+        assert_eq!(dir.validate_page_index_coverage(&page_index), Ok(()));
+    }
+
+    #[test]
+    fn page_index_coverage_rejects_duplicate_and_missing_morsel_refs() {
+        let dir = RowMorselDirectory {
+            entries: vec![morsel(3, 0, 4), morsel(9, 4, 1)],
+        };
+        let page_index = ColumnPageIndex {
+            entries: vec![
+                ColumnPageIndexEntryV1 {
+                    column_id: 7,
+                    morsel_id: 3,
+                    row_count: 4,
+                    non_null_count: 4,
+                    null_count: 0,
+                    encoding_root: CoveEncodingKind::NumCode as u32,
+                    page_offset: 0,
+                    page_length: 1,
+                    uncompressed_length: 1,
+                    stats_ref: 0,
+                    flags: 0,
+                    checksum: 0,
+                },
+                ColumnPageIndexEntryV1 {
+                    column_id: 7,
+                    morsel_id: 3,
+                    row_count: 4,
+                    non_null_count: 4,
+                    null_count: 0,
+                    encoding_root: CoveEncodingKind::NumCode as u32,
+                    page_offset: 1,
+                    page_length: 1,
+                    uncompressed_length: 1,
+                    stats_ref: 0,
+                    flags: 0,
+                    checksum: 0,
+                },
+            ],
+        };
+        assert_eq!(
+            dir.validate_page_index_coverage(&page_index),
+            Err(CoveError::PageCorrupt)
         );
     }
 
@@ -1076,6 +1306,55 @@ mod tests {
         let payload = TableSegmentPayloadV1::parse(&bytes).unwrap();
         assert_eq!(payload.columns.len(), 1);
         assert_eq!(payload.columns[0].column_id, 7);
+    }
+
+    #[test]
+    fn table_segment_payload_accepts_page_codec_when_features_are_advertised() {
+        let bytes = single_page_segment_bytes(CompressionCodec::Lz4);
+        let payload = TableSegmentPayloadV1::parse_with_feature_advertisement(
+            &bytes,
+            0,
+            FEATURE_CODEC_LZ4,
+            FEATURE_CODEC_LZ4,
+        )
+        .unwrap();
+        assert_eq!(payload.columns.len(), 1);
+    }
+
+    #[test]
+    fn table_segment_payload_rejects_page_codec_missing_file_feature() {
+        let bytes = single_page_segment_bytes(CompressionCodec::Lz4);
+        assert!(matches!(
+            TableSegmentPayloadV1::parse_with_feature_advertisement(
+                &bytes,
+                0,
+                0,
+                FEATURE_CODEC_LZ4,
+            ),
+            Err(CoveError::BadSection(_))
+        ));
+    }
+
+    #[test]
+    fn table_segment_payload_rejects_page_codec_missing_section_feature() {
+        let bytes = single_page_segment_bytes(CompressionCodec::Lz4);
+        assert!(matches!(
+            TableSegmentPayloadV1::parse_with_feature_advertisement(
+                &bytes,
+                0,
+                FEATURE_CODEC_LZ4,
+                0,
+            ),
+            Err(CoveError::BadSection(_))
+        ));
+    }
+
+    #[test]
+    fn table_segment_payload_does_not_require_codec_feature_for_uncompressed_page() {
+        let bytes = single_page_segment_bytes(CompressionCodec::None);
+        let payload =
+            TableSegmentPayloadV1::parse_with_feature_advertisement(&bytes, 0, 0, 0).unwrap();
+        assert_eq!(payload.columns.len(), 1);
     }
 
     #[test]

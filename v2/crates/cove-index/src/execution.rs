@@ -2981,13 +2981,10 @@ mod tests {
                 .unwrap()
         );
         entry.key_hash64 = 8;
-        assert!(!entry_hash64_may_match_request(
-            &hash64_root,
-            &hash64_request,
-            &entry,
-            &canonical
-        )
-        .unwrap());
+        assert!(
+            !entry_hash64_may_match_request(&hash64_root, &hash64_request, &entry, &canonical)
+                .unwrap()
+        );
         assert!(key_equals(&hash64_root, &hash64_request, &[], &canonical).is_err());
 
         let canonical_bytes_root = root_with(
@@ -3060,11 +3057,12 @@ mod tests {
             vec![root.clone()],
             vec![capability(1, 1, 0, 1, IndexCapabilityExactnessV2::Exact)],
         );
-        let (key_block, mut entry_block, _) =
-            entry_blocks_for_keys(&root, vec![canonical.clone()]);
+        let (key_block, mut entry_block, _) = entry_blocks_for_keys(&root, vec![canonical.clone()]);
         entry_block.entries[0].key_hash64 = 0xdead_beef_dead_beef;
         entry_block.entries[0].postings_ref = 0;
-        artifact.key_blocks.insert(root.key_block_section_id, key_block);
+        artifact
+            .key_blocks
+            .insert(root.key_block_section_id, key_block);
         artifact
             .entry_blocks
             .insert(root.entry_block_section_id, entry_block);

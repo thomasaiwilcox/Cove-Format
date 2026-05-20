@@ -28,10 +28,11 @@ use cove_core::{
     compression,
     constants::{CoveEncodingKind, CoveLogicalType, CovePhysicalKind},
     index::{lookup::LookupKeyKind, topn::TopNDirection},
+    materialize_stats_only_constant_page_payload,
     nested_schema::NestedSchemaNodeV1,
     page::{
-        page_uses_payload_elision, ColumnPageIndex, ColumnPageIndexEntryV1, PAGE_FLAG_ALL_NON_NULL,
-        PAGE_FLAG_ALL_NULL, PAGE_FLAG_STATS_ONLY_CONSTANT,
+        page_uses_payload_elision, ColumnPageIndex, ColumnPageIndexEntryV1,
+        PAGE_FLAG_STATS_ONLY_CONSTANT,
     },
     page_payload::{ColumnPagePayloadV1, PageBufferKind, RetainedColumnPagePayloadV1},
     retained_bytes::RetainedBytes,
@@ -42,7 +43,7 @@ use cove_core::{
     },
     table::ColumnEntry,
     validity::ValidityBitmap,
-    wire, CoveError,
+    wire, CoveError, StatsOnlyPageMaterializationContext,
 };
 use cove_layout::{ZeroCopyCompatibilityV2, ZeroCopyMaterializationReasonV2};
 
@@ -513,8 +514,11 @@ pub(crate) fn decode_scan_to_sink<S: DecodeSink + ?Sized>(
                 state.reject_table_scan_page_feature_use(segment_ref, page)?;
                 let payload = materialize_page_payload(
                     segment_bytes,
+                    segment_ref.table_id,
+                    segment_ref.segment_id,
                     column,
                     page,
+                    state.pruning().zone_stats_entries.as_slice(),
                     state.pruning().codec_descriptors.as_slice(),
                     state
                         .mounted()
@@ -859,9 +863,12 @@ async fn decode_scan_with_reader_to_sink_cached<
             for ((column, page), slot) in columns.iter().zip(page_indexes.iter()).zip(range_slots) {
                 let wire = slot.and_then(|index| wire_slots[index].take());
                 page_payloads.push(materialize_page_payload_from_wire(
+                    segment_ref.table_id,
+                    segment_ref.segment_id,
                     column,
                     page,
                     wire,
+                    state.pruning().zone_stats_entries.as_slice(),
                     state.pruning().codec_descriptors.as_slice(),
                     state
                         .mounted()
@@ -1132,9 +1139,12 @@ async fn decode_scan_with_reader_tasks_to_sink_cached<
             for ((column, page), slot) in columns.iter().zip(page_indexes.iter()).zip(range_slots) {
                 let wire = slot.and_then(|index| wire_slots[index].take());
                 page_payloads.push(materialize_page_payload_from_wire(
+                    segment_ref.table_id,
+                    segment_ref.segment_id,
                     column,
                     page,
                     wire,
+                    state.pruning().zone_stats_entries.as_slice(),
                     state.pruning().codec_descriptors.as_slice(),
                     state
                         .mounted()
@@ -1702,9 +1712,12 @@ mod tests {
         let page = bool_test_page(&payload, wrong_checksum);
 
         assert!(materialize_page_payload_from_wire(
+            1,
+            1,
             &column,
             &page,
             Some(RetainedBytes::from_vec(payload.clone())),
+            &[],
             &[],
             None,
             PagePayloadValidationPolicy::Trusted,
@@ -1712,9 +1725,12 @@ mod tests {
         .is_ok());
         assert!(matches!(
             materialize_page_payload_from_wire(
+                1,
+                1,
                 &column,
                 &page,
                 Some(RetainedBytes::from_vec(payload)),
+                &[],
                 &[],
                 None,
                 PagePayloadValidationPolicy::Strict,
@@ -1733,9 +1749,12 @@ mod tests {
         let page = bool_test_page(&payload, checksum::crc32c(&payload));
 
         assert!(materialize_page_payload_from_wire(
+            1,
+            1,
             &column,
             &page,
             Some(RetainedBytes::from_vec(payload.clone())),
+            &[],
             &[],
             None,
             PagePayloadValidationPolicy::Trusted,
@@ -1743,9 +1762,12 @@ mod tests {
         .is_ok());
         assert!(matches!(
             materialize_page_payload_from_wire(
+                1,
+                1,
                 &column,
                 &page,
                 Some(RetainedBytes::from_vec(payload)),
+                &[],
                 &[],
                 None,
                 PagePayloadValidationPolicy::Strict,

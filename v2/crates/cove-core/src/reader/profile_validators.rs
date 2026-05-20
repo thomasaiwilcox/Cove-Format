@@ -367,9 +367,11 @@ pub(super) fn validate_cove_t_semantics(
                 segment_payloads.push((
                     entry.section_id,
                     entry.offset,
-                    TableSegmentPayloadV1::parse_with_required_features(
+                    TableSegmentPayloadV1::parse_with_feature_advertisement(
                         &payload,
                         validated.header.required_features,
+                        validated.header.required_features | validated.header.optional_features,
+                        entry.required_features | entry.optional_features,
                     )?,
                     payload.into_owned(),
                 ));
@@ -963,9 +965,7 @@ fn validate_column_pages_against_catalog(
     )
     .map_err(|_| CoveError::OffsetRange)?;
     let page_index = ColumnPageIndex::parse(&segment_bytes[page_index_start..page_index_end])?;
-    if page_index.entries.len() != segment.morsels.entries.len() {
-        return Err(CoveError::PageCorrupt);
-    }
+    segment.morsels.validate_page_index_coverage(&page_index)?;
     for page in &page_index.entries {
         if !column.nullable && page.null_count != 0 {
             return Err(CoveError::BadSchema(format!(
@@ -1013,6 +1013,7 @@ pub(super) fn validate_cove_o_semantics(
     let mut temporal_indexes = Vec::new();
     let mut temporal_segments = Vec::new();
     let mut trust_manifests = Vec::new();
+    let mut zone_stats_entries = Vec::new();
     let dictionary = parse_validation_dictionary(data, &validated.footer)?;
     for entry in &validated.footer.sections {
         let kind = SectionKind::from_u16(entry.section_kind).ok_or_else(|| {
@@ -1033,9 +1034,11 @@ pub(super) fn validate_cove_o_semantics(
             }
             SectionKind::TemporalSegmentData => {
                 let payload = compression::section_payload(data, entry)?;
-                TemporalSegmentData::parse_with_required_features(
+                TemporalSegmentData::parse_with_feature_advertisement(
                     &payload,
                     validated.header.required_features,
+                    validated.header.required_features | validated.header.optional_features,
+                    entry.required_features | entry.optional_features,
                 )
                 .map(|segment| {
                     temporal_segments.push((entry.offset, payload.into_owned(), segment));
@@ -1049,6 +1052,12 @@ pub(super) fn validate_cove_o_semantics(
                 let payload = compression::section_payload(data, entry)?;
                 TrustManifest::parse(&payload).map(|manifest| {
                     trust_manifests.push(manifest);
+                })
+            }
+            SectionKind::ZoneStats => {
+                let payload = compression::section_payload(data, entry)?;
+                ZoneStatsSection::parse(&payload).map(|section| {
+                    zone_stats_entries.extend(section.entries);
                 })
             }
             _ => continue,
@@ -1066,6 +1075,7 @@ pub(super) fn validate_cove_o_semantics(
         &temporal_segments,
         &trust_manifests,
         dictionary.as_ref(),
+        &zone_stats_entries,
         validated.header.required_features,
     )?;
     push_stage(
@@ -1083,6 +1093,7 @@ fn validate_cove_o_cross_sections(
     segments: &[(u64, Vec<u8>, TemporalSegmentData)],
     trust_manifests: &[TrustManifest],
     dictionary: Option<&FileDictionaryView<'_>>,
+    zone_stats: &[ZoneStatsEntry],
     required_features: u64,
 ) -> Result<(), CoveError> {
     if catalogs.is_empty()
@@ -1170,7 +1181,13 @@ fn validate_cove_o_cross_sections(
         }
         let index_entry = index_entries.get(&key).ok_or(CoveError::SegmentCorrupt)?;
         validate_temporal_segment_against_index(index_entry, *section_offset, bytes, segment)?;
-        validate_temporal_property_columns(object_type, segment, dictionary, required_features)?;
+        validate_temporal_property_columns(
+            object_type,
+            segment,
+            dictionary,
+            zone_stats,
+            required_features,
+        )?;
     }
     if payloads_by_key.len() != index.entries.len() {
         return Err(CoveError::SegmentCorrupt);
@@ -1242,6 +1259,7 @@ fn validate_temporal_property_columns(
     object_type: &crate::profile::cove_o::ObjectTypeEntryV1,
     segment: &TemporalSegmentData,
     dictionary: Option<&FileDictionaryView<'_>>,
+    zone_stats: &[ZoneStatsEntry],
     required_features: u64,
 ) -> Result<(), CoveError> {
     let properties = object_type
@@ -1273,7 +1291,14 @@ fn validate_temporal_property_columns(
         {
             return Err(CoveError::PageCorrupt);
         }
-        validate_temporal_property_pages(property, segment, column, dictionary, required_features)?;
+        validate_temporal_property_pages(
+            property,
+            segment,
+            column,
+            dictionary,
+            zone_stats,
+            required_features,
+        )?;
     }
     if segment.header.column_count as usize != segment.property_columns.len() {
         return Err(CoveError::SegmentCorrupt);
@@ -1286,6 +1311,7 @@ fn validate_temporal_property_pages(
     segment: &TemporalSegmentData,
     column: &TemporalPropertyColumn,
     dictionary: Option<&FileDictionaryView<'_>>,
+    zone_stats: &[ZoneStatsEntry],
     required_features: u64,
 ) -> Result<(), CoveError> {
     if column.page_index.entries.len() != expected_temporal_morsel_count(segment)? {
@@ -1321,7 +1347,7 @@ fn validate_temporal_property_pages(
             logical_type: property.logical_type,
             physical_kind: property.physical_kind,
             dictionary,
-            zone_stats: None,
+            zone_stats: Some(zone_stats),
             codec_descriptors: &[],
             nested_schema: None,
         };

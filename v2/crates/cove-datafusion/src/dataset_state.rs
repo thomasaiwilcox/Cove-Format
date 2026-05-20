@@ -31,7 +31,7 @@ use cove_core::{
     page::{page_flag_codec, ColumnPageIndexEntryV1},
     segment::TableSegmentIndexEntryV1,
     table::{ColumnEntry, TableEntry},
-    zone_stats::ZoneStatsSection,
+    zone_stats::{ZoneStatsEntry, ZoneStatsSection},
     CoveError,
 };
 use cove_coverage::{
@@ -173,6 +173,7 @@ pub struct PruningMetadata {
     pub codec_descriptors: Arc<Vec<CodecExtensionDescriptorV2>>,
     pub column_domains: Arc<Vec<ColumnDomain>>,
     pub zone_stats: Arc<Vec<ZoneStatsSection>>,
+    pub zone_stats_entries: Arc<Vec<ZoneStatsEntry>>,
     pub exact_sets: Arc<Vec<ExactSetIndex>>,
     pub blooms: Arc<Vec<BloomFilterIndex>>,
     pub lookups: Arc<Vec<LookupIndex>>,

@@ -5,7 +5,10 @@ use crate::{
         StableRegisteredCodecResolver,
     },
     compression,
-    constants::{CompressionCodec, CoveEncodingKind, CoveLogicalType, CovePhysicalKind},
+    constants::{
+        CompressionCodec, CoveEncodingKind, CoveLogicalType, CovePhysicalKind, FEATURE_CODEC_LZ4,
+        FEATURE_CODEC_ZSTD,
+    },
     dictionary::FileDictionaryView,
     encoding::{
         bit_packed::{BitPacked, BitPackedPayload},
@@ -26,7 +29,7 @@ use crate::{
     },
     page_payload::{ColumnPagePayloadV1, PageBufferKind, PagePayloadTreeNode},
     wire,
-    zone_stats::{StatKind, ZoneStatFlags, ZoneStatsEntry},
+    zone_stats::{StatKind, StatScalar, ZoneStatFlags, ZoneStatsEntry},
     CoveError,
 };
 
@@ -40,6 +43,43 @@ pub(crate) struct PageValidationContext<'a> {
     pub zone_stats: Option<&'a [ZoneStatsEntry]>,
     pub codec_descriptors: &'a [CodecExtensionDescriptorV2],
     pub nested_schema: Option<&'a NestedSchemaNodeV1>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct StatsOnlyPageMaterializationContext<'a> {
+    pub table_id: Option<u32>,
+    pub segment_id: Option<u32>,
+    pub column_id: u32,
+    pub logical_type: CoveLogicalType,
+    pub physical_kind: CovePhysicalKind,
+    pub zone_stats: &'a [ZoneStatsEntry],
+}
+
+pub(crate) fn page_codec_feature_bit(codec: CompressionCodec) -> u64 {
+    match codec {
+        CompressionCodec::None => 0,
+        CompressionCodec::Lz4 => FEATURE_CODEC_LZ4,
+        CompressionCodec::Zstd => FEATURE_CODEC_ZSTD,
+    }
+}
+
+pub(crate) fn validate_page_codec_feature_advertisement(
+    page: &ColumnPageIndexEntryV1,
+    file_advertised_features: Option<u64>,
+    section_advertised_features: Option<u64>,
+) -> Result<(), CoveError> {
+    let required_feature = page_codec_feature_bit(page_flag_codec(page.flags)?);
+    if required_feature == 0 {
+        return Ok(());
+    }
+    if file_advertised_features.is_some_and(|features| features & required_feature == 0)
+        || section_advertised_features.is_some_and(|features| features & required_feature == 0)
+    {
+        return Err(CoveError::BadSection(format!(
+            "page codec requires missing feature bit 0x{required_feature:016x}"
+        )));
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_column_page_wire(
@@ -333,7 +373,76 @@ pub(crate) fn validate_stats_only_constant_page(
     let Some(zone_stats) = context.zone_stats else {
         return Ok(());
     };
-    let entry = zone_stats
+    validate_stats_only_constant_stat(
+        StatsOnlyPageMaterializationContext {
+            table_id: context.table_id,
+            segment_id: context.segment_id,
+            column_id: context.column_id,
+            logical_type: context.logical_type,
+            physical_kind: context.physical_kind,
+            zone_stats,
+        },
+        page,
+    )?;
+    Ok(())
+}
+
+pub fn materialize_stats_only_constant_page_payload(
+    context: StatsOnlyPageMaterializationContext<'_>,
+    page: &ColumnPageIndexEntryV1,
+) -> Result<Vec<u8>, CoveError> {
+    if page_flag_codec(page.flags)? != CompressionCodec::None
+        || page.page_offset != 0
+        || page.page_length != 0
+        || page.uncompressed_length != 0
+        || page.encoding_root != u32::MAX
+        || page.checksum != checksum::crc32c(&[])
+    {
+        return Err(CoveError::PageCorrupt);
+    }
+
+    if page.flags & PAGE_FLAG_ALL_NON_NULL != 0 {
+        let scalar = validate_stats_only_constant_stat(context, page)?;
+        let values = stats_only_constant_values(context, page, scalar)?;
+        return ColumnPagePayloadV1::build_single_node(
+            page.row_count,
+            stats_only_materialized_encoding(context.physical_kind),
+            context.logical_type,
+            context.physical_kind,
+            None,
+            values,
+        );
+    }
+
+    if page.flags & crate::page::PAGE_FLAG_ALL_NULL != 0 {
+        let bitmap_len = bitmap_len(page.row_count)?;
+        let mut bitmap = vec![0xff; bitmap_len];
+        if !page.row_count.is_multiple_of(8) && !bitmap.is_empty() {
+            let valid_bits = page.row_count % 8;
+            bitmap[bitmap_len - 1] = (1u8 << valid_bits) - 1;
+        }
+        return ColumnPagePayloadV1::build_single_node(
+            page.row_count,
+            stats_only_materialized_encoding(context.physical_kind),
+            context.logical_type,
+            context.physical_kind,
+            Some(bitmap),
+            Vec::new(),
+        );
+    }
+
+    Err(CoveError::PageCorrupt)
+}
+
+fn validate_stats_only_constant_stat<'a>(
+    context: StatsOnlyPageMaterializationContext<'a>,
+    page: &ColumnPageIndexEntryV1,
+) -> Result<&'a StatScalar, CoveError> {
+    // ZoneStatsEntry has no encoded page scope. A stats entry becomes
+    // decode-required page data only through this stats_ref selection plus the
+    // table/segment/morsel/column/count checks below.
+    let entry = context
+        .zone_stats
         .get(usize::try_from(page.stats_ref).map_err(|_| CoveError::ArithOverflow)?)
         .ok_or(CoveError::PageCorrupt)?;
     if let Some(table_id) = context.table_id {
@@ -368,10 +477,109 @@ pub(crate) fn validate_stats_only_constant_page(
     if min.truncated || max.truncated || min != max {
         return Err(CoveError::PageCorrupt);
     }
-    if !stat_kind_matches_logical(context.logical_type, min.kind) {
+    if !stat_scalar_matches_logical(context.logical_type, min) {
         return Err(CoveError::PageCorrupt);
     }
-    Ok(())
+    Ok(min)
+}
+
+fn stats_only_constant_values(
+    context: StatsOnlyPageMaterializationContext<'_>,
+    page: &ColumnPageIndexEntryV1,
+    scalar: &StatScalar,
+) -> Result<Vec<u8>, CoveError> {
+    match context.physical_kind {
+        CovePhysicalKind::NumCode => {
+            let raw = stats_only_numcode_bits(context.logical_type, scalar)?;
+            let payload = ConstantPayload {
+                value: i64::from_le_bytes(raw.to_le_bytes()),
+                row_count: u64::from(page.row_count),
+            };
+            Ok(payload.encode().to_vec())
+        }
+        CovePhysicalKind::FixedBytes => {
+            let width = fixed_width_for(context.logical_type, context.physical_kind)?;
+            if scalar.bytes.len() != width {
+                return Err(CoveError::PageCorrupt);
+            }
+            let row_count =
+                usize::try_from(page.row_count).map_err(|_| CoveError::ArithOverflow)?;
+            let mut values = Vec::with_capacity(
+                row_count
+                    .checked_mul(width)
+                    .ok_or(CoveError::ArithOverflow)?,
+            );
+            for _ in 0..row_count {
+                values.extend_from_slice(&scalar.bytes);
+            }
+            Ok(values)
+        }
+        _ => Err(CoveError::PageCorrupt),
+    }
+}
+
+fn stats_only_numcode_bits(
+    logical_type: CoveLogicalType,
+    scalar: &StatScalar,
+) -> Result<u64, CoveError> {
+    match (logical_type, scalar.kind) {
+        (
+            CoveLogicalType::Int8
+            | CoveLogicalType::Int16
+            | CoveLogicalType::Int32
+            | CoveLogicalType::Int64
+            | CoveLogicalType::Decimal64,
+            StatKind::Int64,
+        )
+        | (CoveLogicalType::TimestampMicros, StatKind::TimestampMicros)
+        | (CoveLogicalType::TimestampNanos, StatKind::TimestampNanos) => {
+            if scalar.bytes.len() != 8 {
+                return Err(CoveError::PageCorrupt);
+            }
+            Ok(u64::from_le_bytes(scalar.bytes[..8].try_into().unwrap()))
+        }
+        (
+            CoveLogicalType::UInt8
+            | CoveLogicalType::UInt16
+            | CoveLogicalType::UInt32
+            | CoveLogicalType::UInt64,
+            StatKind::UInt64,
+        )
+        | (CoveLogicalType::Float64, StatKind::Float64Bits) => {
+            if scalar.bytes.len() != 8 {
+                return Err(CoveError::PageCorrupt);
+            }
+            Ok(u64::from_le_bytes(scalar.bytes[..8].try_into().unwrap()))
+        }
+        (CoveLogicalType::Float32, StatKind::FixedBytes) => {
+            if scalar.bytes.len() != 4 {
+                return Err(CoveError::PageCorrupt);
+            }
+            Ok(u64::from(u32::from_le_bytes(
+                scalar.bytes[..4].try_into().unwrap(),
+            )))
+        }
+        (CoveLogicalType::DateDays, StatKind::DateDays) => {
+            if scalar.bytes.len() != 4 {
+                return Err(CoveError::PageCorrupt);
+            }
+            let value = i32::from_le_bytes(scalar.bytes[..4].try_into().unwrap());
+            Ok(value as u64)
+        }
+        _ => Err(CoveError::PageCorrupt),
+    }
+}
+
+fn stats_only_materialized_encoding(physical_kind: CovePhysicalKind) -> CoveEncodingKind {
+    match physical_kind {
+        CovePhysicalKind::FileCode => CoveEncodingKind::FileCode,
+        CovePhysicalKind::NumCode => CoveEncodingKind::Constant,
+        CovePhysicalKind::Boolean | CovePhysicalKind::FixedBytes => CoveEncodingKind::PlainFixed,
+        CovePhysicalKind::VarBytes => CoveEncodingKind::VarBytes,
+        CovePhysicalKind::List | CovePhysicalKind::Struct | CovePhysicalKind::Map => {
+            CoveEncodingKind::Canonical
+        }
+    }
 }
 
 fn validate_tree_null_bitmap(
@@ -381,9 +589,6 @@ fn validate_tree_null_bitmap(
     expected_null_count: Option<u32>,
 ) -> Result<(), CoveError> {
     let null_bitmap = tree_buffer_bytes(payload, tree, PageBufferKind::NullBitmap)?;
-    if expected_null_count == Some(0) && null_bitmap.is_some() {
-        return Err(CoveError::PageCorrupt);
-    }
     if expected_null_count.is_some_and(|count| count != 0) && null_bitmap.is_none() {
         return Err(CoveError::PageCorrupt);
     }
@@ -446,7 +651,9 @@ fn validate_values_buffer(
             Ok(())
         }
         CoveEncodingKind::VarBytes => validate_length_prefixed_u32_rows(values, row_count),
-        CoveEncodingKind::PlainVarint => validate_varint_rows(values, row_count),
+        CoveEncodingKind::PlainVarint => {
+            validate_plain_varint_values(logical_type, physical_kind, values, row_count, dictionary)
+        }
         CoveEncodingKind::Canonical => validate_canonical_rows(values, logical_type, row_count),
         CoveEncodingKind::Constant => {
             require_len(values.len(), ConstantPayload::ENCODED_LEN)?;
@@ -456,6 +663,10 @@ fn validate_values_buffer(
             }
             if physical_kind == CovePhysicalKind::Boolean && !matches!(payload.value, 0 | 1) {
                 return Err(CoveError::PageCorrupt);
+            }
+            if physical_kind == CovePhysicalKind::FileCode {
+                let code = u32::try_from(payload.value).map_err(|_| CoveError::PageCorrupt)?;
+                validate_filecode_value(code, dictionary)?;
             }
             if physical_kind == CovePhysicalKind::NumCode {
                 validate_numcode(logical_type, physical_kind, payload.raw_value_bits())?;
@@ -605,12 +816,20 @@ fn validate_filecodes(
     dictionary: Option<&FileDictionaryView<'_>>,
 ) -> Result<(), CoveError> {
     require_len(values.len(), fixed_rows_len(row_count, 4)?)?;
+    for chunk in values.chunks_exact(4) {
+        let code = u32::from_le_bytes(chunk.try_into().unwrap());
+        validate_filecode_value(code, dictionary)?;
+    }
+    Ok(())
+}
+
+fn validate_filecode_value(
+    code: u32,
+    dictionary: Option<&FileDictionaryView<'_>>,
+) -> Result<(), CoveError> {
     if let Some(dictionary) = dictionary {
-        for chunk in values.chunks_exact(4) {
-            let code = u32::from_le_bytes(chunk.try_into().unwrap());
-            if code >= dictionary.len() {
-                return Err(CoveError::BadFileCode);
-            }
+        if code >= dictionary.len() {
+            return Err(CoveError::BadFileCode);
         }
     }
     Ok(())
@@ -662,13 +881,9 @@ fn validate_i64_values(
         }
         CovePhysicalKind::Boolean => {}
         CovePhysicalKind::FileCode => {
-            if let Some(dictionary) = dictionary {
-                for value in &values {
-                    let code = u32::try_from(*value).map_err(|_| CoveError::PageCorrupt)?;
-                    if code >= dictionary.len() {
-                        return Err(CoveError::BadFileCode);
-                    }
-                }
+            for value in &values {
+                let code = u32::try_from(*value).map_err(|_| CoveError::PageCorrupt)?;
+                validate_filecode_value(code, dictionary)?;
             }
         }
         CovePhysicalKind::NumCode => {
@@ -691,11 +906,7 @@ fn validate_local_codebook_values(
     for value in values {
         match (physical_kind, value) {
             (CovePhysicalKind::FileCode, LocalCodebookValue::FileCode(code)) => {
-                if let Some(dictionary) = dictionary {
-                    if *code >= dictionary.len() {
-                        return Err(CoveError::BadFileCode);
-                    }
-                }
+                validate_filecode_value(*code, dictionary)?;
             }
             (CovePhysicalKind::NumCode, LocalCodebookValue::NumCode(code)) => {
                 validate_numcode(logical_type, physical_kind, *code)?;
@@ -724,11 +935,27 @@ fn validate_length_prefixed_u32_rows(values: &[u8], row_count: u32) -> Result<()
     require_len(pos, values.len())
 }
 
-fn validate_varint_rows(values: &[u8], row_count: u32) -> Result<(), CoveError> {
+fn validate_plain_varint_values(
+    logical_type: CoveLogicalType,
+    physical_kind: CovePhysicalKind,
+    values: &[u8],
+    row_count: u32,
+    dictionary: Option<&FileDictionaryView<'_>>,
+) -> Result<(), CoveError> {
     let mut pos = 0usize;
     for _ in 0..row_count {
-        let (_, consumed) = wire::decode_u64_leb128(&values[pos..])?;
+        let (value, consumed) = wire::decode_u64_leb128(&values[pos..])?;
         pos = pos.checked_add(consumed).ok_or(CoveError::ArithOverflow)?;
+        match physical_kind {
+            CovePhysicalKind::FileCode => {
+                let code = u32::try_from(value).map_err(|_| CoveError::PageCorrupt)?;
+                validate_filecode_value(code, dictionary)?;
+            }
+            CovePhysicalKind::NumCode => {
+                validate_numcode(logical_type, physical_kind, value)?;
+            }
+            _ => {}
+        }
     }
     require_len(pos, values.len())
 }
@@ -828,7 +1055,8 @@ fn require_len(actual: usize, expected: usize) -> Result<(), CoveError> {
     }
 }
 
-fn stat_kind_matches_logical(logical_type: CoveLogicalType, kind: StatKind) -> bool {
+fn stat_scalar_matches_logical(logical_type: CoveLogicalType, scalar: &StatScalar) -> bool {
+    let kind = scalar.kind;
     match logical_type {
         CoveLogicalType::Int8
         | CoveLogicalType::Int16
@@ -839,7 +1067,7 @@ fn stat_kind_matches_logical(logical_type: CoveLogicalType, kind: StatKind) -> b
         | CoveLogicalType::UInt16
         | CoveLogicalType::UInt32
         | CoveLogicalType::UInt64 => kind == StatKind::UInt64,
-        CoveLogicalType::Float32 => false,
+        CoveLogicalType::Float32 => kind == StatKind::FixedBytes && scalar.bytes.len() == 4,
         CoveLogicalType::Float64 => kind == StatKind::Float64Bits,
         CoveLogicalType::Decimal128 => kind == StatKind::Decimal128,
         CoveLogicalType::DateDays => kind == StatKind::DateDays,
@@ -854,13 +1082,14 @@ fn stat_kind_matches_logical(logical_type: CoveLogicalType, kind: StatKind) -> b
 mod tests {
     use super::*;
     use crate::{
-        constants::CoveEncodingKind,
+        constants::{CoveEncodingKind, StorageClass, ValueTag},
+        dictionary::{FileDictionaryHeaderV1, FileDictionaryIndexEntryV1},
         encoding::local_codebook::{LocalCodebookValues, LocalIndexPayload},
         page::{
             PAGE_FLAG_ALL_NON_NULL, PAGE_FLAG_STATS_ONLY_CONSTANT, PAGE_FLAG_VALUE_STREAM_ELIDED,
         },
         page_payload::ColumnPagePayloadV1,
-        zone_stats::{StatScalar, ZoneScope, ZoneStats},
+        zone_stats::{StatKind, StatScalar, ZoneScope, ZoneStats},
     };
 
     fn base_page(row_count: u32, encoding: CoveEncodingKind) -> ColumnPageIndexEntryV1 {
@@ -898,6 +1127,52 @@ mod tests {
         }
     }
 
+    fn context_with_dictionary<'a>(
+        logical_type: CoveLogicalType,
+        physical_kind: CovePhysicalKind,
+        dictionary: &'a FileDictionaryView<'a>,
+    ) -> PageValidationContext<'a> {
+        PageValidationContext {
+            dictionary: Some(dictionary),
+            ..context(logical_type, physical_kind, None)
+        }
+    }
+
+    fn one_entry_dictionary_bytes() -> (Vec<u8>, Vec<u8>) {
+        let header = FileDictionaryHeaderV1 {
+            entry_count: 1,
+            flags: 0,
+            index_entry_len: FileDictionaryHeaderV1::INDEX_ENTRY_LEN,
+            value_hash_algorithm: 0,
+            payload_length: 0,
+            reserved: [0; 24],
+        };
+        let entry = FileDictionaryIndexEntryV1 {
+            value_tag: ValueTag::Utf8 as u16,
+            storage_class: StorageClass::Inline as u8,
+            flags: 0,
+            inline_len: 5,
+            reserved0: [0; 3],
+            inline_data: {
+                let mut data = [0u8; 16];
+                data[..5].copy_from_slice(b"alpha");
+                data
+            },
+            payload_offset: 0,
+            payload_length: 0,
+            canonical_hash64: 0,
+            reserved1: 0,
+        };
+        let mut index = Vec::new();
+        index.extend_from_slice(&header.serialize());
+        index.extend_from_slice(&entry.serialize());
+        (index, Vec::new())
+    }
+
+    fn one_entry_dictionary_view<'a>(index: &'a [u8], payload: &'a [u8]) -> FileDictionaryView<'a> {
+        FileDictionaryView::borrowed(index, payload).unwrap()
+    }
+
     fn constant_numcode_payload(
         logical_type: CoveLogicalType,
         raw_value_bits: u64,
@@ -919,6 +1194,92 @@ mod tests {
         )
         .unwrap();
         ColumnPagePayloadV1::parse(&payload).unwrap()
+    }
+
+    #[test]
+    fn rejects_plain_varint_filecode_dictionary_miss() {
+        let (index, dictionary_payload) = one_entry_dictionary_bytes();
+        let dictionary = one_entry_dictionary_view(&index, &dictionary_payload);
+        let values = crate::wire::encode_u64_leb128(1);
+        let payload = ColumnPagePayloadV1::build_single_node(
+            1,
+            CoveEncodingKind::PlainVarint,
+            CoveLogicalType::Utf8,
+            CovePhysicalKind::FileCode,
+            None,
+            values,
+        )
+        .unwrap();
+        let payload = ColumnPagePayloadV1::parse(&payload).unwrap();
+        assert_eq!(
+            validate_column_page_payload(
+                &context_with_dictionary(
+                    CoveLogicalType::Utf8,
+                    CovePhysicalKind::FileCode,
+                    &dictionary,
+                ),
+                &base_page(1, CoveEncodingKind::PlainVarint),
+                &payload,
+            ),
+            Err(CoveError::BadFileCode)
+        );
+    }
+
+    #[test]
+    fn rejects_plain_varint_bool_numcode_invalid_value() {
+        let values = crate::wire::encode_u64_leb128(2);
+        let payload = ColumnPagePayloadV1::build_single_node(
+            1,
+            CoveEncodingKind::PlainVarint,
+            CoveLogicalType::Bool,
+            CovePhysicalKind::NumCode,
+            None,
+            values,
+        )
+        .unwrap();
+        let payload = ColumnPagePayloadV1::parse(&payload).unwrap();
+        assert_eq!(
+            validate_column_page_payload(
+                &context(CoveLogicalType::Bool, CovePhysicalKind::NumCode, None),
+                &base_page(1, CoveEncodingKind::PlainVarint),
+                &payload,
+            ),
+            Err(CoveError::PageCorrupt)
+        );
+    }
+
+    #[test]
+    fn rejects_constant_filecode_dictionary_miss() {
+        let (index, dictionary_payload) = one_entry_dictionary_bytes();
+        let dictionary = one_entry_dictionary_view(&index, &dictionary_payload);
+        let values = ConstantPayload {
+            value: 1,
+            row_count: 1,
+        }
+        .encode()
+        .to_vec();
+        let payload = ColumnPagePayloadV1::build_single_node(
+            1,
+            CoveEncodingKind::Constant,
+            CoveLogicalType::Utf8,
+            CovePhysicalKind::FileCode,
+            None,
+            values,
+        )
+        .unwrap();
+        let payload = ColumnPagePayloadV1::parse(&payload).unwrap();
+        assert_eq!(
+            validate_column_page_payload(
+                &context_with_dictionary(
+                    CoveLogicalType::Utf8,
+                    CovePhysicalKind::FileCode,
+                    &dictionary,
+                ),
+                &base_page(1, CoveEncodingKind::Constant),
+                &payload,
+            ),
+            Err(CoveError::BadFileCode)
+        );
     }
 
     #[test]
@@ -1096,6 +1457,114 @@ mod tests {
             &payload,
         );
         assert_eq!(err, Err(CoveError::PageCorrupt));
+    }
+
+    #[test]
+    fn accepts_explicit_all_zero_null_bitmap_when_null_count_is_zero() {
+        let payload = ColumnPagePayloadV1::build_single_node(
+            8,
+            CoveEncodingKind::PlainFixed,
+            CoveLogicalType::Bool,
+            CovePhysicalKind::Boolean,
+            Some(vec![0]),
+            vec![0; 8],
+        )
+        .unwrap();
+        let payload = ColumnPagePayloadV1::parse(&payload).unwrap();
+        let page = base_page(8, CoveEncodingKind::PlainFixed);
+        assert_eq!(
+            validate_column_page_payload(
+                &context(CoveLogicalType::Bool, CovePhysicalKind::Boolean, None),
+                &page,
+                &payload,
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn rejects_explicit_null_bitmap_with_set_bit_when_null_count_is_zero() {
+        let payload = ColumnPagePayloadV1::build_single_node(
+            8,
+            CoveEncodingKind::PlainFixed,
+            CoveLogicalType::Bool,
+            CovePhysicalKind::Boolean,
+            Some(vec![0b0000_0001]),
+            vec![0; 8],
+        )
+        .unwrap();
+        let payload = ColumnPagePayloadV1::parse(&payload).unwrap();
+        let page = base_page(8, CoveEncodingKind::PlainFixed);
+        assert_eq!(
+            validate_column_page_payload(
+                &context(CoveLogicalType::Bool, CovePhysicalKind::Boolean, None),
+                &page,
+                &payload,
+            ),
+            Err(CoveError::PageCorrupt)
+        );
+    }
+
+    #[test]
+    fn rejects_explicit_zero_null_count_bitmap_with_unused_high_bits() {
+        let payload = ColumnPagePayloadV1::build_single_node(
+            1,
+            CoveEncodingKind::PlainFixed,
+            CoveLogicalType::Bool,
+            CovePhysicalKind::Boolean,
+            Some(vec![0b1000_0000]),
+            vec![0],
+        )
+        .unwrap();
+        let payload = ColumnPagePayloadV1::parse(&payload).unwrap();
+        let page = base_page(1, CoveEncodingKind::PlainFixed);
+        assert_eq!(
+            validate_column_page_payload(
+                &context(CoveLogicalType::Bool, CovePhysicalKind::Boolean, None),
+                &page,
+                &payload,
+            ),
+            Err(CoveError::PageCorrupt)
+        );
+    }
+
+    #[test]
+    fn validates_page_codec_feature_advertisement() {
+        let none_page = base_page(1, CoveEncodingKind::NumCode);
+        assert_eq!(
+            validate_page_codec_feature_advertisement(&none_page, Some(0), Some(0)),
+            Ok(())
+        );
+
+        let mut lz4_page = base_page(1, CoveEncodingKind::NumCode);
+        lz4_page.flags = CompressionCodec::Lz4 as u32;
+        assert_eq!(
+            validate_page_codec_feature_advertisement(
+                &lz4_page,
+                Some(FEATURE_CODEC_LZ4),
+                Some(FEATURE_CODEC_LZ4),
+            ),
+            Ok(())
+        );
+        assert!(matches!(
+            validate_page_codec_feature_advertisement(&lz4_page, Some(0), Some(FEATURE_CODEC_LZ4)),
+            Err(CoveError::BadSection(_))
+        ));
+        assert!(matches!(
+            validate_page_codec_feature_advertisement(&lz4_page, Some(FEATURE_CODEC_LZ4), Some(0)),
+            Err(CoveError::BadSection(_))
+        ));
+
+        let mut zstd_page = base_page(1, CoveEncodingKind::NumCode);
+        zstd_page.flags = CompressionCodec::Zstd as u32;
+        assert_eq!(
+            validate_page_codec_feature_advertisement(
+                &zstd_page,
+                Some(FEATURE_CODEC_ZSTD),
+                Some(FEATURE_CODEC_ZSTD),
+            ),
+            Ok(())
+        );
     }
 
     #[test]
@@ -1292,5 +1761,195 @@ mod tests {
             ),
             Err(CoveError::PageCorrupt)
         );
+    }
+
+    #[test]
+    fn stats_only_page_stats_are_contextual() {
+        let scalar = StatScalar {
+            kind: StatKind::Int64,
+            bytes: 9i64.to_le_bytes().to_vec(),
+            truncated: false,
+        };
+        let valid = ZoneStatsEntry {
+            table_id: 3,
+            segment_id: 5,
+            morsel_id: 0,
+            column_id: 7,
+            non_null_count: 2,
+            distinct_count: 1,
+            run_count: 1,
+            stats: ZoneStats {
+                scope: ZoneScope::Morsel,
+                row_count: 2,
+                null_count: 0,
+                min: Some(scalar.clone()),
+                max: Some(scalar),
+                flags: ZoneStatFlags::HAS_MIN_MAX | ZoneStatFlags::CONSTANT,
+            },
+            min_domain_rank: 0,
+            max_domain_rank: 0,
+            exact_set_ref: u32::MAX,
+            bloom_ref: u32::MAX,
+        };
+        let mut page = base_page(2, CoveEncodingKind::NumCode);
+        page.encoding_root = u32::MAX;
+        page.page_length = 0;
+        page.uncompressed_length = 0;
+        page.flags = PAGE_FLAG_STATS_ONLY_CONSTANT | PAGE_FLAG_ALL_NON_NULL;
+        page.checksum = checksum::crc32c(&[]);
+
+        assert_eq!(
+            validate_stats_only_constant_page(
+                &context(
+                    CoveLogicalType::Int64,
+                    CovePhysicalKind::NumCode,
+                    Some(&[valid.clone()])
+                ),
+                &page,
+            ),
+            Ok(())
+        );
+
+        let mut bad_entries = Vec::new();
+        let mut bad = valid.clone();
+        bad.table_id = 4;
+        bad_entries.push(bad);
+        let mut bad = valid.clone();
+        bad.segment_id = 6;
+        bad_entries.push(bad);
+        let mut bad = valid.clone();
+        bad.morsel_id = u32::MAX;
+        bad_entries.push(bad);
+        let mut bad = valid.clone();
+        bad.column_id = 8;
+        bad_entries.push(bad);
+        let mut bad = valid;
+        bad.stats.row_count = 3;
+        bad.non_null_count = 3;
+        bad_entries.push(bad);
+
+        for bad in bad_entries {
+            assert_eq!(
+                validate_stats_only_constant_page(
+                    &context(
+                        CoveLogicalType::Int64,
+                        CovePhysicalKind::NumCode,
+                        Some(&[bad])
+                    ),
+                    &page,
+                ),
+                Err(CoveError::PageCorrupt)
+            );
+        }
+    }
+
+    #[test]
+    fn validates_and_materializes_float32_stats_only_fixedbytes_constant() {
+        let bits = (-0.0f32).to_bits();
+        let scalar = StatScalar {
+            kind: StatKind::FixedBytes,
+            bytes: bits.to_le_bytes().to_vec(),
+            truncated: false,
+        };
+        let stats = [ZoneStatsEntry {
+            table_id: 3,
+            segment_id: 5,
+            morsel_id: 0,
+            column_id: 7,
+            non_null_count: 2,
+            distinct_count: 1,
+            run_count: 1,
+            stats: ZoneStats {
+                scope: ZoneScope::Morsel,
+                row_count: 2,
+                null_count: 0,
+                min: Some(scalar.clone()),
+                max: Some(scalar),
+                flags: ZoneStatFlags::HAS_MIN_MAX | ZoneStatFlags::CONSTANT,
+            },
+            min_domain_rank: 0,
+            max_domain_rank: 0,
+            exact_set_ref: u32::MAX,
+            bloom_ref: u32::MAX,
+        }];
+        let mut page = base_page(2, CoveEncodingKind::NumCode);
+        page.encoding_root = u32::MAX;
+        page.page_length = 0;
+        page.uncompressed_length = 0;
+        page.flags = PAGE_FLAG_STATS_ONLY_CONSTANT | PAGE_FLAG_ALL_NON_NULL;
+        page.checksum = checksum::crc32c(&[]);
+
+        let context = StatsOnlyPageMaterializationContext {
+            table_id: Some(3),
+            segment_id: Some(5),
+            column_id: 7,
+            logical_type: CoveLogicalType::Float32,
+            physical_kind: CovePhysicalKind::NumCode,
+            zone_stats: &stats,
+        };
+        let payload = materialize_stats_only_constant_page_payload(context, &page).unwrap();
+        let payload = ColumnPagePayloadV1::parse(&payload).unwrap();
+        let values = tree_buffer_bytes(&payload, &payload.tree().unwrap(), PageBufferKind::Values)
+            .unwrap()
+            .unwrap();
+        let constant = ConstantPayload::parse(values).unwrap();
+        assert_eq!(constant.raw_value_bits(), u64::from(bits));
+    }
+
+    #[test]
+    fn rejects_float32_stats_only_wrong_stat_shapes() {
+        let mut page = base_page(1, CoveEncodingKind::NumCode);
+        page.encoding_root = u32::MAX;
+        page.page_length = 0;
+        page.uncompressed_length = 0;
+        page.flags = PAGE_FLAG_STATS_ONLY_CONSTANT | PAGE_FLAG_ALL_NON_NULL;
+        page.checksum = checksum::crc32c(&[]);
+
+        for scalar in [
+            StatScalar {
+                kind: StatKind::FixedBytes,
+                bytes: vec![0; 3],
+                truncated: false,
+            },
+            StatScalar {
+                kind: StatKind::Float64Bits,
+                bytes: 0f64.to_bits().to_le_bytes().to_vec(),
+                truncated: false,
+            },
+        ] {
+            let stats = [ZoneStatsEntry {
+                table_id: 3,
+                segment_id: 5,
+                morsel_id: 0,
+                column_id: 7,
+                non_null_count: 1,
+                distinct_count: 1,
+                run_count: 1,
+                stats: ZoneStats {
+                    scope: ZoneScope::Morsel,
+                    row_count: 1,
+                    null_count: 0,
+                    min: Some(scalar.clone()),
+                    max: Some(scalar),
+                    flags: ZoneStatFlags::HAS_MIN_MAX | ZoneStatFlags::CONSTANT,
+                },
+                min_domain_rank: 0,
+                max_domain_rank: 0,
+                exact_set_ref: u32::MAX,
+                bloom_ref: u32::MAX,
+            }];
+            let context = StatsOnlyPageMaterializationContext {
+                table_id: Some(3),
+                segment_id: Some(5),
+                column_id: 7,
+                logical_type: CoveLogicalType::Float32,
+                physical_kind: CovePhysicalKind::NumCode,
+                zone_stats: &stats,
+            };
+            assert_eq!(
+                materialize_stats_only_constant_page_payload(context, &page),
+                Err(CoveError::PageCorrupt)
+            );
+        }
     }
 }
