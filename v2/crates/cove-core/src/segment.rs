@@ -28,9 +28,10 @@
 //!   entries are recomputed and verified.
 
 use crate::{
-    checksum,
+    checksum, compression,
     constants::{CoveLogicalType, CovePhysicalKind, FEATURE_PAGE_PAYLOAD_ELISION},
     page::{page_uses_payload_elision, ColumnPageIndex, PAGE_FLAG_STATS_ONLY_CONSTANT},
+    page_payload::ColumnPagePayloadV1,
     page_validation::{
         validate_column_page_wire, validate_page_codec_feature_advertisement, PageValidationContext,
     },
@@ -572,18 +573,24 @@ impl TableSegmentPayloadV1 {
                     if checksum::crc32c(page_wire) != page.checksum {
                         return Err(CoveError::ChecksumMismatch);
                     }
-                    let context = PageValidationContext {
-                        table_id: Some(header.table_id),
-                        segment_id: Some(header.segment_id),
-                        column_id: column.column_id,
-                        logical_type: column.logical_type,
-                        physical_kind: column.physical_kind,
-                        dictionary: None,
-                        zone_stats: None,
-                        codec_descriptors: &[],
-                        nested_schema: None,
-                    };
-                    validate_column_page_wire(&context, &page, page_wire)?;
+                    if page.encoding_root
+                        == crate::constants::CoveEncodingKind::RegisteredEncoding as u32
+                    {
+                        validate_registered_page_wire_without_descriptor(column, &page, page_wire)?;
+                    } else {
+                        let context = PageValidationContext {
+                            table_id: Some(header.table_id),
+                            segment_id: Some(header.segment_id),
+                            column_id: column.column_id,
+                            logical_type: column.logical_type,
+                            physical_kind: column.physical_kind,
+                            dictionary: None,
+                            zone_stats: None,
+                            codec_descriptors: &[],
+                            nested_schema: None,
+                        };
+                        validate_column_page_wire(&context, &page, page_wire)?;
+                    }
                 }
             }
         }
@@ -594,6 +601,29 @@ impl TableSegmentPayloadV1 {
             columns,
         })
     }
+}
+
+pub(crate) fn validate_registered_page_wire_without_descriptor(
+    column: &TableColumnDirectoryEntryV1,
+    page: &crate::page::ColumnPageIndexEntryV1,
+    page_wire: &[u8],
+) -> Result<(), CoveError> {
+    let payload = compression::column_page_payload(page_wire, page)?;
+    let parsed = ColumnPagePayloadV1::parse(payload.as_ref())?;
+    let root = parsed.root_node()?;
+    if root.encoding_kind != crate::constants::CoveEncodingKind::RegisteredEncoding
+        || root.logical_type != column.logical_type
+        || root.physical_kind != column.physical_kind
+        || root.logical_len != page.row_count
+    {
+        return Err(CoveError::PageCorrupt);
+    }
+    let envelope = crate::codec::registered_envelope_from_root(&parsed)?;
+    crate::codec::validate_registered_envelope_payload_ranges(&parsed, &envelope)?;
+    if envelope.logical_len != page.row_count || envelope.non_null_count != page.non_null_count {
+        return Err(CoveError::BadCodecExtension);
+    }
+    Ok(())
 }
 
 // ── RowMorselEntryV1 (Spec §26) ──────────────────────────────────────────────

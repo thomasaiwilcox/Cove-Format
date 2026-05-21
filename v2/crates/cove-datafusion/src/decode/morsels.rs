@@ -62,7 +62,7 @@ fn topn_score(summary: &cove_core::index::topn::TopNSummary) -> Option<u64> {
 #[derive(Debug)]
 pub(super) struct SegmentMetadata {
     morsels: RowMorselDirectory,
-    morsel_positions_by_id: Vec<Option<usize>>,
+    morsel_positions_by_id: HashMap<u32, usize>,
     columns: Vec<PreparedSegmentColumn>,
     column_positions: Vec<(u32, usize)>,
 }
@@ -70,7 +70,7 @@ pub(super) struct SegmentMetadata {
 #[derive(Debug)]
 pub(super) struct PreparedSegmentColumn {
     page_index: ColumnPageIndex,
-    page_positions_by_morsel: Vec<Option<usize>>,
+    page_positions_by_morsel: HashMap<u32, usize>,
 }
 
 impl SegmentMetadata {
@@ -82,16 +82,12 @@ impl SegmentMetadata {
         if columns.len() != page_indexes.len() {
             return Err(CoveError::SegmentCorrupt);
         }
-        let max_morsel_id = morsels
-            .entries
-            .iter()
-            .map(|entry| entry.morsel_id as usize)
-            .max()
-            .unwrap_or(0);
-        let mut morsel_positions_by_id = vec![None; max_morsel_id.saturating_add(1)];
+        let mut morsel_positions_by_id = HashMap::with_capacity(morsels.entries.len());
         for (position, morsel) in morsels.entries.iter().enumerate() {
-            let slot = morsel.morsel_id as usize;
-            if morsel_positions_by_id[slot].replace(position).is_some() {
+            if morsel_positions_by_id
+                .insert(morsel.morsel_id, position)
+                .is_some()
+            {
                 return Err(CoveError::SegmentCorrupt);
             }
         }
@@ -100,18 +96,18 @@ impl SegmentMetadata {
         let mut column_positions = Vec::with_capacity(columns.len());
         for (position, (directory, page_index)) in columns.into_iter().zip(page_indexes).enumerate()
         {
-            let mut page_positions_by_morsel = vec![None; morsel_positions_by_id.len()];
+            let mut page_positions_by_morsel = HashMap::with_capacity(page_index.entries.len());
             for (page_position, page) in page_index.entries.iter().enumerate() {
-                let Some(&Some(morsel_position)) =
-                    morsel_positions_by_id.get(page.morsel_id as usize)
-                else {
+                let Some(&morsel_position) = morsel_positions_by_id.get(&page.morsel_id) else {
                     return Err(CoveError::PageCorrupt);
                 };
                 if morsels.entries[morsel_position].row_count != page.row_count {
                     return Err(CoveError::PageCorrupt);
                 }
-                let slot = &mut page_positions_by_morsel[page.morsel_id as usize];
-                if slot.replace(page_position).is_some() {
+                if page_positions_by_morsel
+                    .insert(page.morsel_id, page_position)
+                    .is_some()
+                {
                     return Err(CoveError::PageCorrupt);
                 }
             }
@@ -141,7 +137,7 @@ impl SegmentMetadata {
 
     #[inline]
     pub(super) fn morsel(&self, morsel_id: u32) -> Result<&RowMorselEntryV1, CoveError> {
-        let Some(&Some(position)) = self.morsel_positions_by_id.get(morsel_id as usize) else {
+        let Some(&position) = self.morsel_positions_by_id.get(&morsel_id) else {
             return Err(CoveError::SegmentCorrupt);
         };
         self.morsels
@@ -167,8 +163,7 @@ impl SegmentMetadata {
         column: &'a PreparedSegmentColumn,
         morsel_id: u32,
     ) -> Result<&'a ColumnPageIndexEntryV1, CoveError> {
-        let Some(&Some(page_position)) = column.page_positions_by_morsel.get(morsel_id as usize)
-        else {
+        let Some(&page_position) = column.page_positions_by_morsel.get(&morsel_id) else {
             return Err(CoveError::PageCorrupt);
         };
         column
@@ -184,8 +179,7 @@ impl SegmentMetadata {
         column: &PreparedSegmentColumn,
         morsel_id: u32,
     ) -> Result<u32, CoveError> {
-        let Some(&Some(page_position)) = column.page_positions_by_morsel.get(morsel_id as usize)
-        else {
+        let Some(&page_position) = column.page_positions_by_morsel.get(&morsel_id) else {
             return Err(CoveError::PageCorrupt);
         };
         u32::try_from(page_position + 1).map_err(|_| CoveError::ArithOverflow)
@@ -408,7 +402,7 @@ mod tests {
                     checksum: 0,
                 },
                 RowMorselEntryV1 {
-                    morsel_id: 9,
+                    morsel_id: u32::MAX,
                     first_row_in_segment: 4,
                     row_count: 1,
                     flags: 0,
@@ -446,7 +440,7 @@ mod tests {
         };
         let second_page = ColumnPageIndexEntryV1 {
             column_id: 11,
-            morsel_id: 9,
+            morsel_id: u32::MAX,
             row_count: 1,
             non_null_count: 1,
             null_count: 0,
@@ -468,7 +462,7 @@ mod tests {
         let metadata = parse_segment_metadata(&bytes, bytes.len() as u64, 0).unwrap();
 
         assert_eq!(metadata.morsel_entries()[0].morsel_id, 3);
-        assert_eq!(metadata.morsel(9).unwrap().row_count, 1);
+        assert_eq!(metadata.morsel(u32::MAX).unwrap().row_count, 1);
         assert_eq!(
             metadata
                 .page_for_morsel(metadata.column(11).unwrap(), 3)

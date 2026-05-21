@@ -239,6 +239,7 @@ pub fn plan_cost(
 ) -> Result<PlanCostReport, CoveError> {
     let planned = plan_local_file(path, options)?;
     let observed = if execute {
+        reject_residual_required(&planned.plan)?;
         Some(decode_local_dataset_scan(&planned.state, &planned.plan)?.stats)
     } else {
         None
@@ -247,7 +248,18 @@ pub fn plan_cost(
 }
 
 pub fn execute_planned_scan(planned: &PlannedScan) -> Result<DecodedScan, CoveError> {
+    reject_residual_required(&planned.plan)?;
     decode_local_dataset_scan(&planned.state, &planned.plan)
+}
+
+fn reject_residual_required(plan: &ScanPlan) -> Result<(), CoveError> {
+    if plan.scan_program.inexact_filters == 0 {
+        return Ok(());
+    }
+    Err(CoveError::UnsupportedEncoding(
+        "planned scan contains residual-required filters; execute through DataFusion or use exact native predicates"
+            .into(),
+    ))
 }
 
 pub fn pruning_report(planned: &PlannedScan) -> PruningExplainReport {
@@ -989,6 +1001,7 @@ impl Default for CoalescedRangeStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_schema::{Schema, SchemaRef};
 
     #[test]
     fn parses_filter_dsl() {
@@ -1001,5 +1014,32 @@ mod tests {
     #[test]
     fn parses_hex_byte_literal() {
         assert_eq!(parse_bytes_literal("0x0aFF").unwrap(), vec![10, 255]);
+    }
+
+    #[test]
+    fn direct_execution_rejects_residual_required_filters() {
+        let schema: SchemaRef = Arc::new(Schema::empty());
+        let plan = ScanPlan {
+            scan_projection: Vec::new(),
+            output_schema: Arc::clone(&schema),
+            filters: Vec::new(),
+            predicate_columns: Vec::new(),
+            column_plan: crate::planner::ColumnPlan {
+                output_columns: Vec::new(),
+                predicate_columns: Vec::new(),
+                materialization_columns: Vec::new(),
+            },
+            topn_hint: None,
+            coverage_expr: None,
+            scan_program: crate::scan_program::CoveScanProgram {
+                inexact_filters: 1,
+                ..crate::scan_program::CoveScanProgram::default()
+            },
+            covi_candidates: None,
+        };
+        assert!(matches!(
+            reject_residual_required(&plan),
+            Err(CoveError::UnsupportedEncoding(_))
+        ));
     }
 }

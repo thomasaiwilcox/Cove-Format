@@ -3,11 +3,17 @@ use std::sync::Arc;
 use cove_arrow::arrow::ArrowStringValidationPolicy;
 use cove_core::{
     compression::section_payload_from_raw,
-    constants::SectionKind,
+    constants::{SectionKind, FEATURE_ENGINE_PROFILE},
+    dictionary::FileDictionary,
     feature_scope::FeatureScopeTable,
-    mount::{mount_cove_file, EngineMetadata, MountOptions, OutputRepresentation},
+    mount::EngineMetadata,
     postscript::CovePostscriptV1,
-    reader,
+    profile::cove_e::{
+        CodeSpaceDescriptorV1, EngineMountPolicyV1, EngineProfileRegistry,
+        ExecutionCodeDescriptorV1, ExecutionScopeDescriptorV1,
+    },
+    reader::{self, OptionalPushdownPolicy, ValidationOptions},
+    table::TableCatalog,
 };
 use cove_layout::{
     validate_fast_metadata_authority, validate_page_cluster_authority, FastMetadataIndexV2,
@@ -106,30 +112,53 @@ impl DatasetState {
     ) -> Result<Self, CoveError> {
         let source = source.into();
         let postscript = CovePostscriptV1::parse_from_tail(&bytes)?;
-        let validated = reader::validate_bytes(&bytes)?;
-        let feature_scope_table = reader::feature_scope_table_for(&bytes, &validated)?;
-        feature_scope_table.reject_unknowns_for_request(
-            &ordinary_table_scan_feature_use_request(&validated.footer),
-        )?;
-        let mounted = mount_cove_file(
+        let preliminary = reader::validate_bytes_with_options(
             &bytes,
-            MountOptions {
-                representation: OutputRepresentation::DecodeToValue,
-                ..MountOptions::default()
+            ValidationOptions {
+                semantic: false,
+                verify_digests: false,
+                allow_unknown_optional_extensions: true,
+                optional_pushdown_policy: OptionalPushdownPolicy::FailOpen,
             },
-            None,
         )?;
+        let request = ordinary_table_scan_feature_use_request(&preliminary.validated.footer);
+        let validation = reader::validate_bytes_for_ordinary_table_scan(
+            &bytes,
+            ValidationOptions {
+                semantic: true,
+                verify_digests: false,
+                allow_unknown_optional_extensions: true,
+                optional_pushdown_policy: OptionalPushdownPolicy::FailOpen,
+            },
+            request,
+        )?;
+        let validated = &validation.validated;
+        let feature_scope_table = reader::feature_scope_table_for(&bytes, &validated)?;
         let file_len = u64::try_from(bytes.len()).map_err(|_| CoveError::ArithOverflow)?;
-        let table_catalog = mounted.table_catalog.as_ref().ok_or_else(|| {
-            CoveError::BadSchema(
-                "COVE DataFusion native path requires a COVE-T table catalog".into(),
-            )
-        })?;
-        let table = select_table(table_catalog, table_selection.as_ref())?;
+        let table_catalog = parse_table_catalog_from_sections(&bytes, &validated.footer)?;
+        let table = select_table(&table_catalog, table_selection.as_ref())?;
+        let dictionary = parse_dictionary_from_sections(&bytes, &validated.footer)?;
+        let engine_metadata = parse_engine_metadata_from_sections(
+            &bytes,
+            &validated.footer,
+            execution_code_policy == ExecutionCodePolicy::RequireSupported
+                || validated.header.required_features & FEATURE_ENGINE_PROFILE != 0,
+        )?;
+        let mut mounted = mounted_from_metadata(
+            validated.header.clone(),
+            validated.footer.clone(),
+            table.clone(),
+            dictionary,
+            engine_metadata,
+        )?;
+        mounted.column_domains = parse_column_domains_from_sections(&bytes, &mounted.footer);
+        mounted.zone_stats = parse_zone_stats_from_sections(&bytes, &mounted.footer);
+        mounted.nested_schemas = parse_nested_schemas_from_sections(&bytes, &mounted.footer);
+        let pruning = pruning_from_bytes(&bytes, &mounted);
         let schema = Arc::new(schema_for_table(
             &table,
             mounted.dictionary.is_some(),
-            mounted.nested_schemas.as_slice(),
+            pruning.nested_schemas.as_slice(),
             arrow_export_options,
         )?);
         let segment_index = parse_segment_index(&bytes, &mounted)?;
@@ -462,6 +491,168 @@ impl FileTable {
         }
         Ok(table)
     }
+}
+
+fn parse_table_catalog_from_sections(
+    bytes: &[u8],
+    footer: &cove_core::footer::CoveFooter,
+) -> Result<TableCatalog, CoveError> {
+    let entries = footer
+        .sections
+        .iter()
+        .filter(|entry| entry.section_kind == SectionKind::TableCatalog as u16)
+        .collect::<Vec<_>>();
+    if entries.len() != 1 {
+        return Err(CoveError::BadSchema(format!(
+            "COVE DataFusion v2 requires exactly one table catalog section, found {}",
+            entries.len()
+        )));
+    }
+    let payload = section_payload_from_entry(bytes, entries[0])?;
+    TableCatalog::parse(&payload)
+}
+
+fn parse_dictionary_from_sections(
+    bytes: &[u8],
+    footer: &cove_core::footer::CoveFooter,
+) -> Result<Option<FileDictionary>, CoveError> {
+    let Some(index_entry) = footer
+        .sections
+        .iter()
+        .find(|entry| entry.section_kind == SectionKind::FileDictionaryIndex as u16)
+    else {
+        return Ok(None);
+    };
+    let index_payload = section_payload_from_entry(bytes, index_entry)?;
+    let payload = footer
+        .sections
+        .iter()
+        .find(|entry| entry.section_kind == SectionKind::FileDictionaryPayload as u16)
+        .map(|entry| section_payload_from_entry(bytes, entry))
+        .transpose()?
+        .unwrap_or_default();
+    FileDictionary::parse(&index_payload, &payload).map(Some)
+}
+
+fn parse_engine_metadata_from_sections(
+    bytes: &[u8],
+    footer: &cove_core::footer::CoveFooter,
+    strict: bool,
+) -> Result<EngineMetadata, CoveError> {
+    let required = footer
+        .sections
+        .iter()
+        .any(|entry| entry.required_features & FEATURE_ENGINE_PROFILE != 0);
+    if strict || required {
+        return Ok(EngineMetadata {
+            engine_profile_registries: parse_required_sections(
+                bytes,
+                footer,
+                SectionKind::EngineProfileRegistry,
+                EngineProfileRegistry::parse,
+            )?,
+            execution_descriptors: parse_required_sections(
+                bytes,
+                footer,
+                SectionKind::ExecutionCodeDescriptor,
+                ExecutionCodeDescriptorV1::parse,
+            )?,
+            execution_scopes: parse_required_sections(
+                bytes,
+                footer,
+                SectionKind::ExecutionScopeDescriptor,
+                ExecutionScopeDescriptorV1::parse,
+            )?,
+            code_spaces: parse_required_sections(
+                bytes,
+                footer,
+                SectionKind::CodeSpaceDescriptor,
+                CodeSpaceDescriptorV1::parse,
+            )?,
+            engine_mount_policies: parse_required_sections(
+                bytes,
+                footer,
+                SectionKind::EngineMountPolicy,
+                EngineMountPolicyV1::parse,
+            )?,
+        });
+    }
+    Ok(EngineMetadata {
+        engine_profile_registries: parse_optional_sections_from_bytes(
+            bytes,
+            footer,
+            SectionKind::EngineProfileRegistry,
+            EngineProfileRegistry::parse,
+        ),
+        execution_descriptors: parse_optional_sections_from_bytes(
+            bytes,
+            footer,
+            SectionKind::ExecutionCodeDescriptor,
+            ExecutionCodeDescriptorV1::parse,
+        ),
+        execution_scopes: parse_optional_sections_from_bytes(
+            bytes,
+            footer,
+            SectionKind::ExecutionScopeDescriptor,
+            ExecutionScopeDescriptorV1::parse,
+        ),
+        code_spaces: parse_optional_sections_from_bytes(
+            bytes,
+            footer,
+            SectionKind::CodeSpaceDescriptor,
+            CodeSpaceDescriptorV1::parse,
+        ),
+        engine_mount_policies: parse_optional_sections_from_bytes(
+            bytes,
+            footer,
+            SectionKind::EngineMountPolicy,
+            EngineMountPolicyV1::parse,
+        ),
+    })
+}
+
+fn parse_nested_schemas_from_sections(
+    bytes: &[u8],
+    footer: &cove_core::footer::CoveFooter,
+) -> Vec<NestedSchemaSectionV1> {
+    parse_optional_sections_from_bytes(bytes, footer, SectionKind::NestedSchema, |payload| {
+        NestedSchemaSectionV1::parse(payload)
+    })
+}
+
+fn parse_required_sections<T, F>(
+    bytes: &[u8],
+    footer: &cove_core::footer::CoveFooter,
+    kind: SectionKind,
+    mut parse: F,
+) -> Result<Vec<T>, CoveError>
+where
+    F: FnMut(&[u8]) -> Result<T, CoveError>,
+{
+    footer
+        .sections
+        .iter()
+        .filter(|entry| entry.section_kind == kind as u16)
+        .map(|entry| section_payload_from_entry(bytes, entry).and_then(|payload| parse(&payload)))
+        .collect()
+}
+
+fn parse_optional_sections_from_bytes<T, F>(
+    bytes: &[u8],
+    footer: &cove_core::footer::CoveFooter,
+    kind: SectionKind,
+    mut parse: F,
+) -> Vec<T>
+where
+    F: FnMut(&[u8]) -> Result<T, CoveError>,
+{
+    footer
+        .sections
+        .iter()
+        .filter(|entry| entry.section_kind == kind as u16)
+        .filter_map(|entry| section_payload_from_entry(bytes, entry).ok())
+        .filter_map(|payload| parse(&payload).ok())
+        .collect()
 }
 
 fn pruning_from_bytes(bytes: &[u8], mounted: &MountedCoveFile) -> PruningMetadata {

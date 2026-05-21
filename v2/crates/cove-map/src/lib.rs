@@ -3944,6 +3944,119 @@ mod tests {
     }
 
     #[test]
+    fn projection_rejects_undeclared_runtime_function() {
+        let mut file = association_readback_map();
+        file.sections.push(test_section(
+            SectionKind::MapProjectionCatalog,
+            json!({
+                "mapping_id": "people-map",
+                "mapping_version": "test/v1",
+                "projections": [{
+                    "projection_id": "person_objects.v1",
+                    "output_table": "person_objects",
+                    "row_grain": "one_row_per_object",
+                    "anchor": {"object_type": "Person"},
+                    "temporal_mode": {"as_of": "latest_committed"},
+                    "multi_value_policy": "reject",
+                    "columns": [
+                        {"name": "normalized_type", "value": "lower(object.type)"}
+                    ],
+                    "output_modes": ["json"]
+                }]
+            }),
+        ));
+        let rows = vec![SourceRow {
+            source_id: "people".into(),
+            row_index: 0,
+            values: BTreeMap::from([
+                ("person_id".into(), json!("p1")),
+                ("team_id".into(), json!("t1")),
+                ("valid_from".into(), json!("2026-01-01")),
+                ("valid_to".into(), json!("2026-12-31")),
+            ]),
+        }];
+
+        let err = project_rows(&file, &rows).unwrap_err();
+        assert!(err.contains("undeclared projection function 'lower'"));
+    }
+
+    #[test]
+    fn projection_rejects_undeclared_function_inside_predicate_argument() {
+        let mut file = association_readback_map();
+        file.sections.push(test_section(
+            SectionKind::MapProjectionCatalog,
+            json!({
+                "mapping_id": "people-map",
+                "mapping_version": "test/v1",
+                "projections": [{
+                    "projection_id": "person_objects.v1",
+                    "output_table": "person_objects",
+                    "row_grain": "one_row_per_object",
+                    "anchor": {"object_type": "Person"},
+                    "temporal_mode": {"as_of": "latest_committed"},
+                    "multi_value_policy": "reject",
+                    "columns": [
+                        {"name": "label", "value": "if(unknown(object.type) == \"Person\", object.type, \"Other\")"}
+                    ],
+                    "output_modes": ["json"]
+                }]
+            }),
+        ));
+        let rows = vec![SourceRow {
+            source_id: "people".into(),
+            row_index: 0,
+            values: BTreeMap::from([
+                ("person_id".into(), json!("p1")),
+                ("team_id".into(), json!("t1")),
+                ("valid_from".into(), json!("2026-01-01")),
+                ("valid_to".into(), json!("2026-12-31")),
+            ]),
+        }];
+
+        let err = project_rows(&file, &rows).unwrap_err();
+        assert!(err.contains("undeclared projection function 'unknown'"));
+    }
+
+    #[test]
+    fn projection_rejects_aggregate_without_aggregate_policy() {
+        let mut file = association_readback_map();
+        file.sections.push(test_section(
+            SectionKind::MapProjectionCatalog,
+            json!({
+                "mapping_id": "people-map",
+                "mapping_version": "test/v1",
+                "projections": [{
+                    "projection_id": "person_memberships.v1",
+                    "output_table": "person_memberships",
+                    "row_grain": "one_row_per_object",
+                    "anchor": {"object_type": "Person"},
+                    "temporal_mode": {"as_of": "latest_committed"},
+                    "multi_value_policy": "reject",
+                    "columns": [
+                        {"name": "membership_count", "value": "count(association(member_of))"}
+                    ],
+                    "output_modes": ["json"]
+                }]
+            }),
+        ));
+        let rows = vec![SourceRow {
+            source_id: "people".into(),
+            row_index: 0,
+            values: BTreeMap::from([
+                ("person_id".into(), json!("p1")),
+                ("team_id".into(), json!("t1")),
+                ("valid_from".into(), json!("2026-01-01")),
+                ("valid_to".into(), json!("2026-12-31")),
+            ]),
+        }];
+
+        let err = project_rows(&file, &rows).unwrap_err();
+        assert!(err.contains(
+            "projection 'person_memberships.v1' aggregate 'count' requires multi_value_policy='aggregate'"
+        ));
+    }
+
+    #[test]
     fn projection_cove_o_output_materializes_projected_objects() {
         let mut file = association_readback_map();
         file.sections.push(test_section(

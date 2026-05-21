@@ -631,6 +631,25 @@ pub fn registered_envelope_from_root(
     Ok(envelope)
 }
 
+pub(crate) fn validate_registered_envelope_payload_ranges(
+    payload: &ColumnPagePayloadV1,
+    envelope: &RegisteredEncodingEnvelopeV2,
+) -> Result<(), CoveError> {
+    envelope_range(
+        payload,
+        envelope.encoded_payload_offset,
+        envelope.encoded_payload_length,
+    )?;
+    if envelope.fallback_payload_length != 0 {
+        envelope_range(
+            payload,
+            envelope.fallback_payload_offset,
+            envelope.fallback_payload_length,
+        )?;
+    }
+    Ok(())
+}
+
 fn validate_envelope_against_page(
     envelope: &RegisteredEncodingEnvelopeV2,
     page: &ColumnPageIndexEntryV1,

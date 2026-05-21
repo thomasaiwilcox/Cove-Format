@@ -1927,7 +1927,19 @@ fn coverage_cache_fixture() -> Result<CoverageCacheFixture, String> {
 
 fn primitive_events_file_with_name_gamma_coverage(bad_checksum: bool) -> Vec<u8> {
     let mut writer = primitive_events_writer();
-    for section in name_gamma_coverage_sections(bad_checksum) {
+    for section in name_gamma_coverage_sections(1, bad_checksum) {
+        writer.push_extra_section(section);
+    }
+    let placeholder = writer.write().unwrap();
+    let placeholder_state =
+        cove_datafusion::bootstrap::bootstrap_bytes("synthetic-cache", placeholder).unwrap();
+    let snapshot_validity_ref = placeholder_state
+        .pruning()
+        .selected_coverage_snapshot_validity_ref
+        .expect("coverage fixture has embedded coverage metadata");
+
+    let mut writer = primitive_events_writer();
+    for section in name_gamma_coverage_sections(snapshot_validity_ref, bad_checksum) {
         writer.push_extra_section(section);
     }
     writer.write().unwrap()
@@ -1992,11 +2004,13 @@ fn column(
     }
 }
 
-fn name_gamma_coverage_sections(bad_checksum: bool) -> Vec<SectionPayload> {
+fn name_gamma_coverage_sections(
+    snapshot_validity_ref: u32,
+    bad_checksum: bool,
+) -> Vec<SectionPayload> {
     let predicate_form_ref = 1;
     let provider_id = 1;
     let coverage_set_id = 1;
-    let snapshot_validity_ref = 1;
     let predicate_form_section =
         predicate_normal_form_ast_section(predicate_form_ref, 1, name_eq_gamma_ast_payload());
 

@@ -501,16 +501,29 @@ fn section_is_required_for_feature_use(
 
 fn operation_requires_section(operation: OperationKindV2, kind: SectionKind) -> bool {
     match operation {
+        OperationKindV2::OrdinaryTableScan => is_table_scan_section(kind),
         OperationKindV2::CoveragePlanning => is_coverage_section(kind),
         OperationKindV2::IndexOnlyAnswer => kind == SectionKind::IndexOnlyCapability,
         OperationKindV2::ZeroCopyExport => kind == SectionKind::ZeroCopyBufferMap,
         OperationKindV2::RuntimeAdapterSelection => kind == SectionKind::RuntimeCompatibilityHints,
+        OperationKindV2::EngineExecutionMapping => is_engine_execution_section(kind),
+        OperationKindV2::ObjectReconstruction => is_object_section(kind),
+        OperationKindV2::TrustVerification => kind == SectionKind::TrustManifest,
+        OperationKindV2::RedactionPolicyEvaluation => kind == SectionKind::RedactionManifest,
+        OperationKindV2::MappingReplay
+        | OperationKindV2::MappingExplanation
+        | OperationKindV2::ProjectionReadback => is_map_section(kind),
+        OperationKindV2::HarborMount => is_harbor_section(kind),
         _ => false,
     }
 }
 
 fn profile_requires_section(profile: u8, kind: SectionKind) -> bool {
     match PrimaryProfile::from_u8(profile) {
+        Some(PrimaryProfile::ObjectTemporal) => is_object_section(kind),
+        Some(PrimaryProfile::EngineExecution) => is_engine_execution_section(kind),
+        Some(PrimaryProfile::HarborExecution) => is_harbor_section(kind),
+        Some(PrimaryProfile::SemanticMapping) => is_map_section(kind),
         Some(PrimaryProfile::LayoutPlanning) => is_layout_section(kind),
         Some(PrimaryProfile::RuntimeCompatibility) => {
             kind == SectionKind::RuntimeCompatibilityHints
@@ -532,6 +545,20 @@ fn is_layout_section(kind: SectionKind) -> bool {
     )
 }
 
+fn is_table_scan_section(kind: SectionKind) -> bool {
+    matches!(
+        kind,
+        SectionKind::TableCatalog
+            | SectionKind::TableSegmentIndex
+            | SectionKind::TableSegmentData
+            | SectionKind::FileDictionaryIndex
+            | SectionKind::FileDictionaryPayload
+            | SectionKind::NestedSchema
+            | SectionKind::ZoneStats
+            | SectionKind::CodecExtensionRegistry
+    )
+}
+
 fn is_coverage_section(kind: SectionKind) -> bool {
     matches!(
         kind,
@@ -540,6 +567,47 @@ fn is_coverage_section(kind: SectionKind) -> bool {
             | SectionKind::CoveragePlanCandidate
             | SectionKind::PredicateNormalForm
             | SectionKind::CoverageProofRecord
+    )
+}
+
+fn is_engine_execution_section(kind: SectionKind) -> bool {
+    matches!(
+        kind,
+        SectionKind::EngineProfileRegistry
+            | SectionKind::ExecutionCodeDescriptor
+            | SectionKind::ExecutionScopeDescriptor
+            | SectionKind::CodeSpaceDescriptor
+            | SectionKind::EngineMountPolicy
+    )
+}
+
+fn is_object_section(kind: SectionKind) -> bool {
+    matches!(
+        kind,
+        SectionKind::ObjectTypeCatalog
+            | SectionKind::TemporalSegmentIndex
+            | SectionKind::TemporalSegmentData
+            | SectionKind::TemporalBloomIndex
+            | SectionKind::TrustManifest
+    )
+}
+
+fn is_harbor_section(kind: SectionKind) -> bool {
+    kind == SectionKind::HarborMountHints
+}
+
+fn is_map_section(kind: SectionKind) -> bool {
+    matches!(
+        kind,
+        SectionKind::MapSourceCatalog
+            | SectionKind::MapFunctionRegistry
+            | SectionKind::MapIdentityRuleCatalog
+            | SectionKind::MapRowSemanticsCatalog
+            | SectionKind::MapAssertionLog
+            | SectionKind::MapIdentityEquivalenceIndex
+            | SectionKind::MapEvidenceIndex
+            | SectionKind::MapConversionReport
+            | SectionKind::MapProjectionCatalog
     )
 }
 
@@ -610,6 +678,53 @@ mod tests {
         assert!(!required_runtime_hints_supported(
             &hints,
             &RuntimeSession::default_builtins()
+        ));
+    }
+
+    #[test]
+    fn ordinary_table_scan_operation_requires_all_cove_t_scan_sections() {
+        for kind in [
+            SectionKind::TableCatalog,
+            SectionKind::TableSegmentIndex,
+            SectionKind::TableSegmentData,
+            SectionKind::FileDictionaryIndex,
+            SectionKind::FileDictionaryPayload,
+            SectionKind::NestedSchema,
+            SectionKind::ZoneStats,
+            SectionKind::CodecExtensionRegistry,
+        ] {
+            assert!(
+                operation_requires_section(OperationKindV2::OrdinaryTableScan, kind),
+                "{kind:?} should be required for ordinary table scans"
+            );
+        }
+    }
+
+    #[test]
+    fn engine_execution_operation_requires_cove_e_sections() {
+        for kind in [
+            SectionKind::EngineProfileRegistry,
+            SectionKind::ExecutionCodeDescriptor,
+            SectionKind::ExecutionScopeDescriptor,
+            SectionKind::CodeSpaceDescriptor,
+            SectionKind::EngineMountPolicy,
+        ] {
+            assert!(
+                operation_requires_section(OperationKindV2::EngineExecutionMapping, kind),
+                "{kind:?} should be required for engine execution mapping"
+            );
+        }
+    }
+
+    #[test]
+    fn policy_operations_require_policy_sections() {
+        assert!(operation_requires_section(
+            OperationKindV2::TrustVerification,
+            SectionKind::TrustManifest
+        ));
+        assert!(operation_requires_section(
+            OperationKindV2::RedactionPolicyEvaluation,
+            SectionKind::RedactionManifest
         ));
     }
 }

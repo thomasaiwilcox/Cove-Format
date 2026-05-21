@@ -264,6 +264,19 @@ fn main() {
         &root,
         &mut entries,
         fixture(
+            "accept/cove_t_registered_stable_codec_no_fallback_valid.cove",
+            "cove",
+            "accept",
+            None,
+            &["§20.8", "§20.9", "§72.2", "§73"],
+        ),
+        cove_t_registered_codec_file(RegisteredFixtureKind::SupportedStableNoFallback),
+    );
+
+    write_fixture(
+        &root,
+        &mut entries,
+        fixture(
             "accept/cove_t_registered_unsupported_with_fallback.cove",
             "cove",
             "accept",
@@ -3343,7 +3356,7 @@ fn main() {
             "cove",
             "reject",
             Some("COVE_E_MAP_FUNCTION_UNDECLARED"),
-            &["§70", "§73.6"],
+            &["§70.5", "§70.13", "§73.6", "§76"],
         ),
         cove_map_function_undeclared_file(),
     );
@@ -3356,7 +3369,7 @@ fn main() {
             "cove",
             "reject",
             Some("COVE_E_MAP_IDENTITY_CONFLICT"),
-            &["§70", "§73.6"],
+            &["§70.6", "§73.6", "§76"],
         ),
         cove_map_identity_conflict_file(),
     );
@@ -3382,7 +3395,7 @@ fn main() {
             "cove",
             "reject",
             Some("COVE_E_MAP_EVIDENCE_INVALID"),
-            &["§70", "§73.6"],
+            &["§70.12", "§73.6", "§76"],
         ),
         cove_map_evidence_invalid_file(),
     );
@@ -4654,12 +4667,28 @@ fn main() {
     write_fixture(
         &root,
         &mut entries,
-        fixture(
-            "reject/cove_unknown_section_required_feature.cove",
-            "cove",
+        feature_scope_use_fixture(
+            "feature-scope/section_entry_unknown_unneeded_accept.cove",
+            "accept",
+            None,
+            None,
+            None,
+            &[],
+            &[],
+        ),
+        cove_with_unknown_section_required_feature(),
+    );
+    write_fixture(
+        &root,
+        &mut entries,
+        feature_scope_use_fixture(
+            "feature-scope/section_entry_unknown_needed_reject.cove",
             "reject",
             Some("COVE_E_UNKNOWN_REQUIRED_FEATURE"),
-            &["§11", "§13", "§74", "§77", "§76"],
+            None,
+            None,
+            &[1],
+            &[],
         ),
         cove_with_unknown_section_required_feature(),
     );
@@ -5656,13 +5685,13 @@ fn cove_with_unknown_required_feature() -> Vec<u8> {
 
 fn cove_with_unknown_section_required_feature() -> Vec<u8> {
     let bytes = cove_file_with_section(
-        FEATURE_TABLE_PROFILE,
-        SectionKind::TableCatalog,
-        PrimaryProfile::TableScan,
         0,
-        valid_table_catalog().serialize().unwrap(),
+        SectionKind::VendorExtension,
+        PrimaryProfile::Mixed,
+        0,
+        Vec::new(),
     );
-    rewrite_first_section_required_features(bytes, SectionKind::TableCatalog, 1u64 << 63)
+    rewrite_first_section_required_features(bytes, SectionKind::VendorExtension, 1u64 << 63)
 }
 
 fn feature_scope_use_fixture(
@@ -6707,6 +6736,18 @@ fn write_v2_profile_fixtures(root: &Path, entries: &mut Vec<Value>) {
             &["§11.3"],
         ),
         feature_binding_bad_payload_ref_payload(),
+    );
+    write_fixture(
+        root,
+        entries,
+        fixture(
+            "feature-scope/section_feature_binding_empty_payload_contract.bin",
+            "section_feature_binding",
+            "reject",
+            Some("COVE_E_BAD_SECTION"),
+            &["§11.3"],
+        ),
+        feature_binding_empty_payload_contract_payload(),
     );
     write_fixture(
         root,
@@ -9327,11 +9368,11 @@ fn feature_binding_section() -> SectionFeatureBindingSectionV2 {
             flags: 0,
             reserved: 0,
             payload_offset: 0,
-            payload_length: 0,
+            payload_length: 4,
             checksum: 0,
         }],
         feature_words: vec![1],
-        payload_data: Vec::new(),
+        payload_data: b"SFB!".to_vec(),
     }
 }
 
@@ -9350,10 +9391,32 @@ fn feature_binding_bad_payload_ref_payload() -> Vec<u8> {
     bytes
 }
 
+fn feature_binding_empty_payload_contract_payload() -> Vec<u8> {
+    let mut section = feature_binding_section();
+    section.payload_refs[0].payload_length = 0;
+    serialize_invalid_feature_binding_section(&section)
+}
+
 fn feature_binding_bad_scope_payload() -> Vec<u8> {
     let mut bytes = feature_binding_section_payload();
     let binding_start = SectionFeatureBindingSectionHeaderV2::LEN;
     bytes[binding_start + 8] = 99;
+    bytes
+}
+
+fn serialize_invalid_feature_binding_section(section: &SectionFeatureBindingSectionV2) -> Vec<u8> {
+    let invalid_payload_length = section.payload_refs[0].payload_length;
+    let mut valid = section.clone();
+    valid.payload_refs[0].payload_length = 4;
+    let mut bytes = valid.serialize().unwrap();
+    let payload_ref_start =
+        SectionFeatureBindingSectionHeaderV2::LEN + SectionFeatureBindingV2::LEN;
+    bytes[payload_ref_start + 20..payload_ref_start + 28]
+        .copy_from_slice(&invalid_payload_length.to_le_bytes());
+    rewrite_fixed_record_checksum(
+        &mut bytes[payload_ref_start..payload_ref_start + SectionFeatureBindingPayloadRefV2::LEN],
+        28,
+    );
     bytes
 }
 
@@ -11423,6 +11486,7 @@ fn cove_t_scan_table_file() -> Vec<u8> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RegisteredFixtureKind {
     SupportedStable,
+    SupportedStableNoFallback,
     UnsupportedWithFallback,
     UnsupportedNoFallback,
     FallbackMismatch,
@@ -11458,7 +11522,12 @@ fn cove_t_registered_codec_file(kind: RegisteredFixtureKind) -> Vec<u8> {
         RegisteredFixtureKind::FallbackMismatch => [&b"alpha"[..], &b"wrong"[..], &b"gamma"[..]],
         _ => [&b"alpha"[..], &b"beta"[..], &b"gamma"[..]],
     };
-    let fallback = (!matches!(kind, RegisteredFixtureKind::UnsupportedNoFallback)).then(|| {
+    let fallback = (!matches!(
+        kind,
+        RegisteredFixtureKind::SupportedStableNoFallback
+            | RegisteredFixtureKind::UnsupportedNoFallback
+    ))
+    .then(|| {
         ColumnPagePayloadV1::build_single_node(
             3,
             CoveEncodingKind::VarBytes,
@@ -11473,7 +11542,9 @@ fn cove_t_registered_codec_file(kind: RegisteredFixtureKind) -> Vec<u8> {
         RegisteredFixtureKind::UnsupportedWithFallback
         | RegisteredFixtureKind::UnsupportedNoFallback
         | RegisteredFixtureKind::MalformedEnvelope => 9001,
-        RegisteredFixtureKind::SupportedStable | RegisteredFixtureKind::FallbackMismatch => 1,
+        RegisteredFixtureKind::SupportedStable
+        | RegisteredFixtureKind::SupportedStableNoFallback
+        | RegisteredFixtureKind::FallbackMismatch => 1,
     };
     let mut registered_payload = ColumnPagePayloadV1::build_registered_single_node(
         3,
@@ -11499,7 +11570,9 @@ fn cove_t_registered_codec_file(kind: RegisteredFixtureKind) -> Vec<u8> {
     let mut writer = ScanProfileCoveWriter::new(catalog);
     if matches!(
         kind,
-        RegisteredFixtureKind::SupportedStable | RegisteredFixtureKind::FallbackMismatch
+        RegisteredFixtureKind::SupportedStable
+            | RegisteredFixtureKind::SupportedStableNoFallback
+            | RegisteredFixtureKind::FallbackMismatch
     ) {
         writer.push_extra_section(SectionPayload {
             section_kind: SectionKind::CodecExtensionRegistry as u16,
@@ -12171,6 +12244,19 @@ fn write_cove_map_execution_cases(root: &Path, entries: &mut Vec<Value>) {
         cove_map_invalid_row_semantics_file(),
     );
 
+    write_fixture(
+        root,
+        entries,
+        fixture(
+            "reject/cove_map_association_bad_endpoint.covemap",
+            "covemap",
+            "reject",
+            Some("COVE_E_MAP_INVALID"),
+            &["§70.9", "§76"],
+        ),
+        cove_map_association_bad_endpoint_file(),
+    );
+
     let missing_policy_map_path = "reject/cove_map_projection_missing_policy.covemap";
     write_fixture(
         root,
@@ -12265,6 +12351,51 @@ fn write_cove_map_execution_cases(root: &Path, entries: &mut Vec<Value>) {
                 {"format": "cove-t", "projection_id": "person_projection"}
             ],
             "expected_projected_rows": projected["rows"],
+        })),
+    );
+
+    let undeclared_projection_function_map_path =
+        "accept/cove_map_projection_undeclared_function.covemap";
+    write_auxiliary_file(
+        root,
+        undeclared_projection_function_map_path,
+        &cove_map_projection_undeclared_function_file(),
+    );
+    write_fixture(
+        root,
+        entries,
+        fixture(
+            "reject/cove_map_projection_undeclared_function_case.json",
+            "cove_map_project_case",
+            "reject",
+            Some("COVE_E_MAP_INVALID"),
+            &["§70.10", "§70.13", "§76"],
+        ),
+        suite_contract_fixture_bytes(json!({
+            "mapping": undeclared_projection_function_map_path,
+            "sources": [source_path],
+        })),
+    );
+
+    let aggregate_without_policy_map_path = "accept/cove_map_projection_aggregate_policy.covemap";
+    write_auxiliary_file(
+        root,
+        aggregate_without_policy_map_path,
+        &cove_map_projection_aggregate_policy_file(),
+    );
+    write_fixture(
+        root,
+        entries,
+        fixture(
+            "reject/cove_map_projection_aggregate_policy_case.json",
+            "cove_map_project_case",
+            "reject",
+            Some("COVE_E_MAP_INVALID"),
+            &["§70.10", "§76"],
+        ),
+        suite_contract_fixture_bytes(json!({
+            "mapping": aggregate_without_policy_map_path,
+            "sources": [source_path],
         })),
     );
 
@@ -12803,6 +12934,39 @@ fn cove_map_invalid_row_semantics_file() -> Vec<u8> {
     cove_map_file_with_sections([0x57; 16], sections)
 }
 
+fn cove_map_association_bad_endpoint_file() -> Vec<u8> {
+    let mut sections = cove_map_execution_sections();
+    sections[3] = covemap_section(
+        SectionKind::MapRowSemanticsCatalog,
+        json!({
+            "mapping_id": "people-map",
+            "mapping_version": "2026.05",
+            "rules": [{
+                "rule_id": "bad_association",
+                "source_id": "people",
+                "identity_rule_id": "person_by_id",
+                "row_semantics_kind": "AssociationOnly",
+                "assertion_kinds": ["association", "evidence"],
+                "function_ids": ["identity"],
+                "output_assertion_ids": ["member_of_assertion"],
+                "association_endpoints": ["missing_team_by_id"],
+                "association_bindings": [{
+                    "assertion_id": "member_of_assertion",
+                    "association_type": "member_of",
+                    "target_identity_rule_id": "missing_team_by_id",
+                    "source_endpoint_expression": "source.goid",
+                    "target_endpoint_expression": "identity(missing_team_by_id)",
+                    "source_role": "member",
+                    "target_role": "team",
+                    "cardinality_policy": "many_to_one",
+                    "missing_policy": "reject"
+                }]
+            }]
+        }),
+    );
+    cove_map_file_with_sections([0x58; 16], sections)
+}
+
 fn cove_map_projection_missing_policy_file() -> Vec<u8> {
     let mut sections = cove_map_execution_sections();
     sections[4] = covemap_section(
@@ -12824,7 +12988,55 @@ fn cove_map_projection_missing_policy_file() -> Vec<u8> {
             }]
         }),
     );
-    cove_map_file_with_sections([0x58; 16], sections)
+    cove_map_file_with_sections([0x59; 16], sections)
+}
+
+fn cove_map_projection_undeclared_function_file() -> Vec<u8> {
+    let mut sections = cove_map_execution_sections();
+    sections[4] = covemap_section(
+        SectionKind::MapProjectionCatalog,
+        json!({
+            "mapping_id": "people-map",
+            "mapping_version": "2026.05",
+            "projections": [{
+                "projection_id": "person_projection",
+                "output_table": "people_projection",
+                "row_grain": "one_row_per_object",
+                "anchor": {"object_type": "Person"},
+                "temporal_mode": {"as_of": "latest_committed"},
+                "multi_value_policy": "reject",
+                "columns": [
+                    {"name": "normalized_type", "value": "lower(object.type)", "logical_type": "utf8"}
+                ],
+                "output_modes": ["json"]
+            }]
+        }),
+    );
+    cove_map_file_with_sections([0x5a; 16], sections)
+}
+
+fn cove_map_projection_aggregate_policy_file() -> Vec<u8> {
+    let mut sections = cove_map_execution_sections();
+    sections[4] = covemap_section(
+        SectionKind::MapProjectionCatalog,
+        json!({
+            "mapping_id": "people-map",
+            "mapping_version": "2026.05",
+            "projections": [{
+                "projection_id": "person_projection",
+                "output_table": "people_projection",
+                "row_grain": "one_row_per_object",
+                "anchor": {"object_type": "Person"},
+                "temporal_mode": {"as_of": "latest_committed"},
+                "multi_value_policy": "reject",
+                "columns": [
+                    {"name": "membership_count", "value": "count(association(member_of))", "logical_type": "uint64"}
+                ],
+                "output_modes": ["json"]
+            }]
+        }),
+    );
+    cove_map_file_with_sections([0x5b; 16], sections)
 }
 
 fn covemap_section(section_kind: SectionKind, value: Value) -> CovemapSection {

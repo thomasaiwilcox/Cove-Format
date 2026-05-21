@@ -10,7 +10,6 @@ use crate::{
         FEATURE_EXTENDED_FEATURE_SET, FEATURE_HARBOR_PROFILE, FEATURE_LAYOUT_PLAN,
         FEATURE_OBJECT_PROFILE, FEATURE_RUNTIME_COMPATIBILITY_HINTS,
         FEATURE_SECONDARY_INDEX_ARTIFACT, FEATURE_SEMANTIC_MAP, FEATURE_TABLE_PROFILE,
-        KNOWN_FEATURE_BITS_MASK,
     },
     feature_binding::SectionFeatureBindingSectionV2,
     feature_scope::{ExtendedFeatureSetV2, FeatureScopeTable, ProfileCapabilityMatrixV2},
@@ -27,9 +26,9 @@ mod reports;
 
 pub use reports::{
     validate_bytes_for_feature_use, validate_bytes_for_feature_use_with_optional_profile_validator,
-    validate_bytes_with_options, IgnoredOptionalSection, OptionalProfilePayloadValidator,
-    OptionalPushdownPolicy, ValidationOptions, ValidationReport, ValidationStage,
-    ValidationStageReport, ValidationStageStatus,
+    validate_bytes_for_ordinary_table_scan, validate_bytes_with_options, IgnoredOptionalSection,
+    OptionalProfilePayloadValidator, OptionalPushdownPolicy, ValidationOptions, ValidationReport,
+    ValidationStage, ValidationStageReport, ValidationStageStatus,
 };
 #[path = "reader/bootstrap.rs"]
 mod bootstrap;
@@ -113,7 +112,6 @@ fn validate_sections(
             entry.profile,
             header.required_features | header.optional_features,
         )?;
-        validate_section_required_features(header, entry)?;
         validate_section_required_feature_advertisement(header, entry)?;
         validate_codec_feature_advertisement(entry.compression, header, entry)?;
 
@@ -170,6 +168,19 @@ pub fn feature_scope_table_for(
     Ok(parse_scoped_feature_metadata(data, &validated.header, &validated.footer)?.scope_table)
 }
 
+pub fn feature_scope_table_for_feature_use(
+    data: &[u8],
+    validated: &ValidatedCoveFile,
+) -> Result<FeatureScopeTable, CoveError> {
+    Ok(parse_scoped_feature_metadata_with_options(
+        data,
+        &validated.header,
+        &validated.footer,
+        true,
+    )?
+    .scope_table)
+}
+
 fn validate_scoped_feature_metadata(
     data: &[u8],
     header: &CoveHeaderV1,
@@ -185,24 +196,42 @@ fn parse_scoped_feature_metadata(
     header: &CoveHeaderV1,
     footer: &CoveFooter,
 ) -> Result<ScopedFeatureMetadata, CoveError> {
+    parse_scoped_feature_metadata_with_options(data, header, footer, false)
+}
+
+fn parse_scoped_feature_metadata_with_options(
+    data: &[u8],
+    header: &CoveHeaderV1,
+    footer: &CoveFooter,
+    strict_profile_matrix: bool,
+) -> Result<ScopedFeatureMetadata, CoveError> {
     let extended_entry = resolve_header_section_id(
         footer,
         header.feature_set_section_id,
         SectionKind::ExtendedFeatureSet,
         "feature_set_section_id",
-    )?;
+    )
+    .or_else(|err| {
+        optional_header_section_absent_or_required(header, err, FEATURE_EXTENDED_FEATURE_SET)
+    })?;
     let profile_matrix_entry = resolve_header_section_id(
         footer,
         header.profile_capability_section_id,
         SectionKind::ProfileCapabilityMatrix,
         "profile_capability_section_id",
-    )?;
-    resolve_header_section_id(
+    );
+    let profile_matrix_entry = if strict_profile_matrix {
+        profile_matrix_entry?
+    } else {
+        profile_matrix_entry.unwrap_or(None)
+    };
+    let _fast_metadata_entry = resolve_header_section_id(
         footer,
         header.fast_metadata_section_id,
         SectionKind::FastMetadataIndex,
         "fast_metadata_section_id",
-    )?;
+    )
+    .unwrap_or(None);
 
     if header.required_features & FEATURE_EXTENDED_FEATURE_SET != 0 && extended_entry.is_none() {
         return Err(CoveError::BadSection(
@@ -217,14 +246,22 @@ fn parse_scoped_feature_metadata(
             set.validate_against_low_words(header.required_features, header.optional_features)?;
             Ok::<ExtendedFeatureSetV2, CoveError>(set)
         })
-        .transpose()?;
+        .transpose()
+        .or_else(|err| {
+            optional_header_section_absent_or_required(header, err, FEATURE_EXTENDED_FEATURE_SET)
+        })?;
 
     let profile_matrix = profile_matrix_entry
         .map(|entry| {
             let payload = compression::section_payload(data, entry)?;
             ProfileCapabilityMatrixV2::parse(&payload)
         })
-        .transpose()?;
+        .transpose();
+    let profile_matrix = if strict_profile_matrix {
+        profile_matrix?
+    } else {
+        profile_matrix.unwrap_or(None)
+    };
 
     let mut section_bindings = Vec::<SectionFeatureBindingSectionV2>::new();
     for entry in footer
@@ -276,6 +313,18 @@ fn parse_scoped_feature_metadata(
         section_bindings,
         scope_table,
     })
+}
+
+fn optional_header_section_absent_or_required<T>(
+    header: &CoveHeaderV1,
+    err: CoveError,
+    required_feature: u64,
+) -> Result<Option<T>, CoveError> {
+    if header.required_features & required_feature != 0 {
+        Err(err)
+    } else {
+        Ok(None)
+    }
 }
 
 fn resolve_header_section_id<'a>(
@@ -340,27 +389,6 @@ fn validate_section_required_feature_advertisement(
             entry.section_id, info.wire_name
         )));
     }
-    Ok(())
-}
-
-fn validate_section_required_features(
-    header: &CoveHeaderV1,
-    entry: &crate::footer::CoveSectionEntryV1,
-) -> Result<(), CoveError> {
-    let unknown_required = entry.required_features & !KNOWN_FEATURE_BITS_MASK;
-    if unknown_required != 0 {
-        return Err(CoveError::UnknownRequiredFeature(unknown_required));
-    }
-
-    let file_advertised = header.required_features | header.optional_features;
-    let missing_advertisement = entry.required_features & !file_advertised;
-    if missing_advertisement != 0 {
-        return Err(CoveError::BadSection(format!(
-            "section {} requires feature bits not advertised by file header: 0x{missing_advertisement:016x}",
-            entry.section_id
-        )));
-    }
-
     Ok(())
 }
 
@@ -543,7 +571,7 @@ mod tests {
             FEATURE_ENGINE_PROFILE, FEATURE_EXTENDED_FEATURE_SET, FEATURE_EXTENSION_REGISTRY,
             FEATURE_FILE_DICTIONARY, FEATURE_HARBOR_PROFILE, FEATURE_INDEX_ONLY_CAPABILITY,
             FEATURE_LAYOUT_PLAN, FEATURE_OBJECT_PROFILE, FEATURE_RUNTIME_COMPATIBILITY_HINTS,
-            FEATURE_SECONDARY_INDEX_ARTIFACT, FEATURE_TABLE_PROFILE,
+            FEATURE_SECONDARY_INDEX_ARTIFACT, FEATURE_SEMANTIC_MAP, FEATURE_TABLE_PROFILE,
         },
         digest::{DigestEntry, DigestManifest, DigestScope, DigestTargetKind},
         extensions::{ExtensionKind, ExtensionRegistry, ExtensionRegistryEntry},
@@ -806,6 +834,12 @@ mod tests {
         bytes[..HEADER_SIZE].copy_from_slice(&header.serialize());
     }
 
+    fn set_header_fast_metadata_section(bytes: &mut [u8], fast_metadata_section_id: u32) {
+        let mut header = CoveHeaderV1::parse(bytes).unwrap();
+        header.fast_metadata_section_id = fast_metadata_section_id;
+        bytes[..HEADER_SIZE].copy_from_slice(&header.serialize());
+    }
+
     #[test]
     fn validates_empty_file() {
         let bytes = MinimalCoveWriter::write_empty_file().unwrap();
@@ -999,6 +1033,48 @@ mod tests {
     }
 
     #[test]
+    fn section_required_unknown_low_word_is_rejected_only_when_section_is_needed() {
+        let mut writer = MinimalCoveWriter::new();
+        writer.sections.push(SectionPayload {
+            section_kind: SectionKind::VendorExtension as u16,
+            profile: 0,
+            flags: 0,
+            item_count: 0,
+            row_count: 0,
+            compression: 0,
+            alignment_log2: 0,
+            required_features: 0,
+            optional_features: 0,
+            data: Vec::new(),
+        });
+        let mut bytes = writer.write().unwrap();
+        let unknown_required = 1u64 << 63;
+        set_first_section_required_features(&mut bytes, unknown_required);
+
+        validate_bytes(&bytes).expect("unused section-scoped unknown should pass bootstrap");
+
+        let opts = ValidationOptions {
+            semantic: false,
+            verify_digests: false,
+            allow_unknown_optional_extensions: true,
+            optional_pushdown_policy: OptionalPushdownPolicy::Strict,
+        };
+        assert!(
+            validate_bytes_for_feature_use(&bytes, opts.clone(), FeatureUseRequestV2::new())
+                .is_ok()
+        );
+        assert_eq!(
+            validate_bytes_for_feature_use(
+                &bytes,
+                opts,
+                FeatureUseRequestV2::new().with_section(1),
+            )
+            .map(|_| ()),
+            Err(CoveError::UnknownRequiredFeature(unknown_required))
+        );
+    }
+
+    #[test]
     fn rejects_non_utf8_metadata_written_by_external_source() {
         let mut writer = MinimalCoveWriter::new();
         writer.metadata_json = b"{}".to_vec();
@@ -1137,7 +1213,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_section_required_feature_bits() {
+    fn accepts_unknown_section_required_feature_bits_during_bootstrap() {
         let mut writer = MinimalCoveWriter::new();
         writer.sections.push(SectionPayload {
             section_kind: SectionKind::TableCatalog as u16,
@@ -1153,17 +1229,13 @@ mod tests {
         });
         let mut bytes = writer.write().unwrap();
         let unknown_required = 1u64 << 63;
-        assert_eq!(unknown_required & KNOWN_FEATURE_BITS_MASK, 0);
         set_first_section_required_features(&mut bytes, unknown_required);
 
-        assert!(matches!(
-            validate_bytes(&bytes),
-            Err(CoveError::UnknownRequiredFeature(bits)) if bits == unknown_required
-        ));
+        validate_bytes(&bytes).expect("section-scoped unknown must not reject at bootstrap");
     }
 
     #[test]
-    fn rejects_section_required_feature_missing_from_header_advertisement() {
+    fn accepts_section_required_feature_missing_from_header_advertisement() {
         let mut writer = MinimalCoveWriter::new();
         writer.sections.push(SectionPayload {
             section_kind: SectionKind::TableCatalog as u16,
@@ -1178,10 +1250,8 @@ mod tests {
             data: TableCatalog::default().serialize().unwrap(),
         });
 
-        assert!(matches!(
-            validate_bytes(&writer.write().unwrap()),
-            Err(CoveError::BadSection(_))
-        ));
+        validate_bytes(&writer.write().unwrap())
+            .expect("section-scoped required bits need not be file-header-advertised");
     }
 
     #[cfg(feature = "compression-lz4")]
@@ -1838,6 +1908,54 @@ mod tests {
     }
 
     #[test]
+    fn optional_header_metadata_refs_fall_back_when_absent() {
+        let mut bytes = MinimalCoveWriter::write_empty_file().unwrap();
+        set_header_scoped_feature_sections(&mut bytes, 999, 998);
+        set_header_fast_metadata_section(&mut bytes, 997);
+
+        validate_bytes(&bytes).expect("optional header metadata refs should fail open");
+    }
+
+    #[test]
+    fn requested_feature_use_rejects_bad_profile_matrix_ref() {
+        let mut bytes = scoped_feature_file(Vec::new(), 0, 0);
+        set_header_scoped_feature_sections(&mut bytes, 1, 999);
+
+        validate_bytes(&bytes).expect("optional profile matrix ref should fail open at bootstrap");
+        assert!(matches!(
+            validate_bytes_for_feature_use(
+                &bytes,
+                ValidationOptions {
+                    semantic: false,
+                    verify_digests: false,
+                    allow_unknown_optional_extensions: true,
+                    ..ValidationOptions::default()
+                },
+                FeatureUseRequestV2::new().with_operation(OperationKindV2::CoveragePlanning),
+            ),
+            Err(CoveError::BadSection(_))
+        ));
+    }
+
+    #[test]
+    fn optional_header_extended_feature_payload_falls_back_when_corrupt() {
+        let mut bytes = unscoped_extended_feature_file();
+        let mut header = CoveHeaderV1::parse(&bytes).unwrap();
+        header.required_features &= !FEATURE_EXTENDED_FEATURE_SET;
+        bytes[..HEADER_SIZE].copy_from_slice(&header.serialize());
+        let mut postscript = CovePostscriptV1::parse_from_tail(&bytes).unwrap();
+        postscript.required_features = header.required_features;
+        rewrite_postscript(&mut bytes, postscript);
+
+        let validated =
+            validate_bytes(&bytes).expect("optional corrupt extended set should ignore");
+        assert_eq!(
+            validated.header.required_features & FEATURE_EXTENDED_FEATURE_SET,
+            0
+        );
+    }
+
+    #[test]
     fn scoped_extended_required_feature_does_not_reject_bootstrap() {
         let bytes = scoped_feature_file(
             vec![scoped_feature_entry(
@@ -2150,6 +2268,74 @@ mod tests {
         );
     }
 
+    #[test]
+    fn feature_use_rejects_requested_optional_cove_e_profile_error() {
+        let mut writer = MinimalCoveWriter::new();
+        writer.primary_profile = PrimaryProfile::Mixed as u8;
+        writer.required_features = 0;
+        writer.optional_features = FEATURE_ENGINE_PROFILE;
+        writer.sections.push(SectionPayload {
+            section_kind: SectionKind::ExecutionCodeDescriptor as u16,
+            profile: 4,
+            flags: 0,
+            item_count: 1,
+            row_count: 0,
+            compression: 0,
+            alignment_log2: 0,
+            required_features: 0,
+            optional_features: FEATURE_ENGINE_PROFILE,
+            data: invalid_execution_descriptor_payload(),
+        });
+        assert_eq!(
+            validate_bytes_for_feature_use(
+                &writer.write().unwrap(),
+                ValidationOptions {
+                    semantic: true,
+                    verify_digests: false,
+                    allow_unknown_optional_extensions: true,
+                    ..ValidationOptions::default()
+                },
+                FeatureUseRequestV2::new().with_profile(PrimaryProfile::EngineExecution as u8),
+            )
+            .unwrap_err(),
+            CoveError::BadEngineProfile
+        );
+    }
+
+    #[test]
+    fn feature_use_rejects_requested_optional_cove_e_profile_error_without_semantic_flag() {
+        let mut writer = MinimalCoveWriter::new();
+        writer.primary_profile = PrimaryProfile::Mixed as u8;
+        writer.required_features = 0;
+        writer.optional_features = FEATURE_ENGINE_PROFILE;
+        writer.sections.push(SectionPayload {
+            section_kind: SectionKind::ExecutionCodeDescriptor as u16,
+            profile: 4,
+            flags: 0,
+            item_count: 1,
+            row_count: 0,
+            compression: 0,
+            alignment_log2: 0,
+            required_features: 0,
+            optional_features: FEATURE_ENGINE_PROFILE,
+            data: invalid_execution_descriptor_payload(),
+        });
+        assert_eq!(
+            validate_bytes_for_feature_use(
+                &writer.write().unwrap(),
+                ValidationOptions {
+                    semantic: false,
+                    verify_digests: false,
+                    allow_unknown_optional_extensions: true,
+                    ..ValidationOptions::default()
+                },
+                FeatureUseRequestV2::new().with_operation(OperationKindV2::EngineExecutionMapping),
+            )
+            .unwrap_err(),
+            CoveError::BadEngineProfile
+        );
+    }
+
     fn valid_engine_profile_registry_payload(
         execution_descriptor_ref: u32,
         mount_policy_ref: u32,
@@ -2376,6 +2562,78 @@ mod tests {
     }
 
     #[test]
+    fn feature_use_rejects_requested_optional_cove_e_missing_scope_reference() {
+        let mut writer = MinimalCoveWriter::new();
+        writer.primary_profile = PrimaryProfile::Mixed as u8;
+        writer.required_features = 0;
+        writer.optional_features = FEATURE_ENGINE_PROFILE;
+        writer.sections.extend([
+            SectionPayload {
+                section_kind: SectionKind::EngineProfileRegistry as u16,
+                profile: 4,
+                flags: 0,
+                item_count: 1,
+                row_count: 0,
+                compression: 0,
+                alignment_log2: 0,
+                required_features: 0,
+                optional_features: FEATURE_ENGINE_PROFILE,
+                data: valid_engine_profile_registry_payload(11, 21),
+            },
+            SectionPayload {
+                section_kind: SectionKind::ExecutionCodeDescriptor as u16,
+                profile: 4,
+                flags: 0,
+                item_count: 1,
+                row_count: 0,
+                compression: 0,
+                alignment_log2: 0,
+                required_features: 0,
+                optional_features: FEATURE_ENGINE_PROFILE,
+                data: valid_execution_descriptor_payload_with_refs(11, 31, 41),
+            },
+            SectionPayload {
+                section_kind: SectionKind::CodeSpaceDescriptor as u16,
+                profile: 4,
+                flags: 0,
+                item_count: 1,
+                row_count: 0,
+                compression: 0,
+                alignment_log2: 0,
+                required_features: 0,
+                optional_features: FEATURE_ENGINE_PROFILE,
+                data: valid_code_space_descriptor_payload(41),
+            },
+            SectionPayload {
+                section_kind: SectionKind::EngineMountPolicy as u16,
+                profile: 4,
+                flags: 0,
+                item_count: 1,
+                row_count: 0,
+                compression: 0,
+                alignment_log2: 0,
+                required_features: 0,
+                optional_features: FEATURE_ENGINE_PROFILE,
+                data: valid_mount_policy_payload_with_refs(21, 41),
+            },
+        ]);
+        assert_eq!(
+            validate_bytes_for_feature_use(
+                &writer.write().unwrap(),
+                ValidationOptions {
+                    semantic: true,
+                    verify_digests: false,
+                    allow_unknown_optional_extensions: true,
+                    ..ValidationOptions::default()
+                },
+                FeatureUseRequestV2::new().with_operation(OperationKindV2::EngineExecutionMapping),
+            )
+            .unwrap_err(),
+            CoveError::BadEngineProfile
+        );
+    }
+
+    #[test]
     fn semantic_validation_rejects_required_cove_o_object_catalog_error() {
         let mut writer = MinimalCoveWriter::new();
         writer.primary_profile = PrimaryProfile::ObjectTemporal as u8;
@@ -2426,6 +2684,113 @@ mod tests {
     }
 
     #[test]
+    fn semantic_validation_ignores_optional_cove_o_cross_section_error() {
+        let mut writer = MinimalCoveWriter::new();
+        writer.primary_profile = PrimaryProfile::Mixed as u8;
+        writer.optional_features = FEATURE_OBJECT_PROFILE;
+        writer
+            .sections
+            .push(optional_temporal_index_without_catalog(0));
+        assert!(validate_bytes_with_options(
+            &writer.write().unwrap(),
+            ValidationOptions {
+                semantic: true,
+                verify_digests: false,
+                allow_unknown_optional_extensions: true,
+                ..ValidationOptions::default()
+            },
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn feature_use_rejects_requested_optional_cove_o_cross_section_error() {
+        let mut writer = MinimalCoveWriter::new();
+        writer.primary_profile = PrimaryProfile::Mixed as u8;
+        writer.optional_features = FEATURE_OBJECT_PROFILE;
+        writer
+            .sections
+            .push(optional_temporal_index_without_catalog(0));
+        assert!(matches!(
+            validate_bytes_for_feature_use(
+                &writer.write().unwrap(),
+                ValidationOptions {
+                    semantic: true,
+                    verify_digests: false,
+                    allow_unknown_optional_extensions: true,
+                    ..ValidationOptions::default()
+                },
+                FeatureUseRequestV2::new().with_operation(OperationKindV2::ObjectReconstruction),
+            ),
+            Err(CoveError::BadSchema(_))
+        ));
+    }
+
+    #[test]
+    fn semantic_validation_rejects_required_cove_o_cross_section_error() {
+        let mut writer = MinimalCoveWriter::new();
+        writer.primary_profile = PrimaryProfile::ObjectTemporal as u8;
+        writer.required_features = FEATURE_OBJECT_PROFILE;
+        writer
+            .sections
+            .push(optional_temporal_index_without_catalog(
+                FEATURE_OBJECT_PROFILE,
+            ));
+        assert!(matches!(
+            validate_bytes_with_options(
+                &writer.write().unwrap(),
+                ValidationOptions {
+                    semantic: true,
+                    verify_digests: false,
+                    allow_unknown_optional_extensions: true,
+                    ..ValidationOptions::default()
+                },
+            ),
+            Err(CoveError::BadSchema(_))
+        ));
+    }
+
+    fn optional_temporal_index_without_catalog(required_features: u64) -> SectionPayload {
+        let index = crate::profile::cove_o::TemporalSegmentIndex {
+            flags: 0,
+            entries: vec![crate::profile::cove_o::TemporalSegmentIndexEntryV1 {
+                segment_id: 1,
+                object_type_id: 1,
+                time_range_start_us: 0,
+                time_range_end_us: 0,
+                csn_min: 1,
+                csn_max: 1,
+                row_count: 1,
+                delta_count: 1,
+                snapshot_count: 0,
+                baseline_count: 0,
+                tombstone_count: 0,
+                min_goid: [1; 16],
+                max_goid: [1; 16],
+                offset: 0,
+                length: 1,
+                checksum: 0,
+            }],
+        };
+        SectionPayload {
+            section_kind: SectionKind::TemporalSegmentIndex as u16,
+            profile: 1,
+            flags: 0,
+            item_count: 1,
+            row_count: 1,
+            compression: 0,
+            alignment_log2: 0,
+            required_features,
+            optional_features: if required_features == 0 {
+                FEATURE_OBJECT_PROFILE
+            } else {
+                0
+            },
+            data: index.serialize().unwrap(),
+        }
+    }
+
+    #[test]
     fn semantic_validation_ignores_optional_harbor_hint_error() {
         let mut writer = MinimalCoveWriter::new();
         writer.primary_profile = PrimaryProfile::Mixed as u8;
@@ -2469,6 +2834,124 @@ mod tests {
             },
         )
         .is_ok());
+    }
+
+    fn optional_bad_harbor_hint_file() -> Vec<u8> {
+        let mut writer = MinimalCoveWriter::new();
+        writer.primary_profile = PrimaryProfile::Mixed as u8;
+        writer.required_features = 0;
+        writer.optional_features = FEATURE_HARBOR_PROFILE;
+        let mut data = crate::profile::cove_h::HarborMountHintsV1 {
+            harbor_profile_version_major: 1,
+            harbor_profile_version_minor: 0,
+            tenant_scope_ref: 1,
+            code_space_ref: 2,
+            lease_epoch: 3,
+            dictionary_digest_ref: 0,
+            catalog_digest_ref: 0,
+            mount_cache_policy: 0,
+            reserved: [0; 7],
+            private_payload_ref: 0,
+            checksum: 0,
+        }
+        .serialize()
+        .to_vec();
+        data[29] = 1;
+        writer.sections.push(SectionPayload {
+            section_kind: SectionKind::HarborMountHints as u16,
+            profile: 5,
+            flags: 0,
+            item_count: 1,
+            row_count: 0,
+            compression: 0,
+            alignment_log2: 0,
+            required_features: 0,
+            optional_features: FEATURE_HARBOR_PROFILE,
+            data,
+        });
+        writer.write().unwrap()
+    }
+
+    #[test]
+    fn feature_use_rejects_requested_optional_harbor_mount_error() {
+        assert_eq!(
+            validate_bytes_for_feature_use(
+                &optional_bad_harbor_hint_file(),
+                ValidationOptions {
+                    semantic: true,
+                    verify_digests: false,
+                    allow_unknown_optional_extensions: true,
+                    ..ValidationOptions::default()
+                },
+                FeatureUseRequestV2::new().with_operation(OperationKindV2::HarborMount),
+            )
+            .unwrap_err(),
+            CoveError::ReservedNotZero
+        );
+    }
+
+    #[test]
+    fn feature_use_rejects_requested_harbor_profile_error_without_semantic_flag() {
+        assert_eq!(
+            validate_bytes_for_feature_use(
+                &optional_bad_harbor_hint_file(),
+                ValidationOptions {
+                    semantic: false,
+                    verify_digests: false,
+                    allow_unknown_optional_extensions: true,
+                    ..ValidationOptions::default()
+                },
+                FeatureUseRequestV2::new().with_profile(PrimaryProfile::HarborExecution as u8),
+            )
+            .unwrap_err(),
+            CoveError::ReservedNotZero
+        );
+    }
+
+    #[test]
+    fn feature_use_rejects_requested_optional_map_error() {
+        let mut writer = MinimalCoveWriter::new();
+        writer.primary_profile = PrimaryProfile::Mixed as u8;
+        writer.required_features = 0;
+        writer.optional_features = FEATURE_SEMANTIC_MAP;
+        writer.sections.push(SectionPayload {
+            section_kind: SectionKind::MapSourceCatalog as u16,
+            profile: PrimaryProfile::SemanticMapping as u8,
+            flags: 0,
+            item_count: 1,
+            row_count: 0,
+            compression: 0,
+            alignment_log2: 0,
+            required_features: 0,
+            optional_features: FEATURE_SEMANTIC_MAP,
+            data: b"not json".to_vec(),
+        });
+
+        assert!(validate_bytes_with_options(
+            &writer.write().unwrap(),
+            ValidationOptions {
+                semantic: true,
+                verify_digests: false,
+                allow_unknown_optional_extensions: true,
+                ..ValidationOptions::default()
+            },
+        )
+        .is_ok());
+        assert!(matches!(
+            validate_bytes_for_feature_use(
+                &writer.write().unwrap(),
+                ValidationOptions {
+                    semantic: false,
+                    verify_digests: false,
+                    allow_unknown_optional_extensions: true,
+                    ..ValidationOptions::default()
+                },
+                FeatureUseRequestV2::new().with_operation(OperationKindV2::MappingReplay),
+            ),
+            Err(CoveError::MapInvalid)
+                | Err(CoveError::BadSection(_))
+                | Err(CoveError::BadSchema(_))
+        ));
     }
 
     #[test]
@@ -2625,6 +3108,49 @@ mod tests {
         let bytes = writer.write().unwrap();
         let opts = ValidationOptions {
             semantic: true,
+            verify_digests: true,
+            allow_unknown_optional_extensions: true,
+            ..ValidationOptions::default()
+        };
+        assert!(matches!(
+            validate_bytes_with_options(&bytes, opts),
+            Err(CoveError::BadSection(_))
+        ));
+    }
+
+    #[test]
+    fn verify_digests_runs_without_semantic_validation() {
+        let mut writer = MinimalCoveWriter::new();
+        let digest = DigestManifest {
+            algorithm: crate::constants::DigestAlgorithm::Sha256,
+            scope: DigestScope::Section,
+            root_digest: [0; 32],
+            entries: vec![DigestEntry {
+                target_kind: DigestTargetKind::Section,
+                section_id: 99,
+                local_id: 0,
+                offset: 0,
+                length: 0,
+                digest: vec![0; 32],
+            }],
+        }
+        .serialize()
+        .unwrap();
+        writer.sections.push(SectionPayload {
+            section_kind: SectionKind::DigestManifest as u16,
+            profile: 0,
+            flags: 0,
+            item_count: 1,
+            row_count: 0,
+            compression: 0,
+            alignment_log2: 0,
+            required_features: 0,
+            optional_features: 0,
+            data: digest,
+        });
+        let bytes = writer.write().unwrap();
+        let opts = ValidationOptions {
+            semantic: false,
             verify_digests: true,
             allow_unknown_optional_extensions: true,
             ..ValidationOptions::default()

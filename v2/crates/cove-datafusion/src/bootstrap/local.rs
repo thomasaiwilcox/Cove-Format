@@ -1,7 +1,14 @@
 use std::{fs, path::Path, path::PathBuf, sync::Arc};
 
 use cove_cache::CoverageCacheV2;
-use cove_core::{constants::DigestAlgorithm, digest::compute_digest, CoveError};
+use cove_core::{
+    constants::DigestAlgorithm,
+    digest::compute_digest,
+    feature_binding::OperationKindV2,
+    feature_scope::FeatureUseRequestV2,
+    reader::{self, OptionalPushdownPolicy, ValidationOptions},
+    CoveError,
+};
 
 #[cfg(feature = "covi")]
 use crate::bootstrap::covi::validate_covi_for_file;
@@ -18,8 +25,8 @@ use crate::{
         ordinary_table_scan_feature_use_request, CoverageCacheMetadata, DatasetBootstrapStats,
         DatasetState, FileIdentity,
     },
-    options::{select_table, CoveTableOptions, CoverageCacheDiscovery},
-    range_reader::{CoveRangeReader, LocalFileRangeReader},
+    options::{select_table, CoveTableOptions, CoverageCacheDiscovery, ExecutionCodePolicy},
+    range_reader::{CoveRangeReader, LocalFileRangeReader, RangeReadKind},
 };
 
 /// Load a local COVE file into immutable single-file dataset state.
@@ -125,16 +132,14 @@ pub async fn bootstrap_range_reader_with_options<R: CoveRangeReader + ?Sized>(
 ) -> Result<Arc<DatasetState>, CoveError> {
     let source = source.into();
     let (header, postscript, footer) = bootstrap_header_footer(file_len, reader).await?;
-    let feature_scope_table = parse_feature_scope_table(reader, &header, &footer).await?;
-    feature_scope_table
-        .reject_unknowns_for_request(&ordinary_table_scan_feature_use_request(&footer))?;
-
     let provisional_key = CoveMetadataCacheKey {
         source: Arc::clone(&source),
         file_id: header.file_id,
+        header_bytes: header.serialize(),
         file_len,
         footer_crc32c: postscript.footer.crc32c,
         table_selection: options.table_selection().cloned(),
+        options_fingerprint: options.cache_fingerprint(),
     };
     if let Some(cache) = cache {
         if let Some(cached) = cache.get(&provisional_key) {
@@ -142,10 +147,23 @@ pub async fn bootstrap_range_reader_with_options<R: CoveRangeReader + ?Sized>(
         }
     }
 
+    let feature_scope_table = parse_feature_scope_table(reader, &header, &footer).await?;
+    feature_scope_table
+        .reject_unknowns_for_request(&ordinary_table_scan_feature_use_request(&footer))?;
+    if options.execution_code_policy() == ExecutionCodePolicy::RequireSupported {
+        validate_required_engine_execution_semantics(file_len, reader).await?;
+    }
+
     let table_catalog = parse_table_catalog(reader, &footer).await?;
     let table = select_table(&table_catalog, options.table_selection())?;
     let dictionary = parse_dictionary(reader, &footer).await?;
-    let engine_metadata = parse_engine_metadata(reader, &footer).await?;
+    let engine_metadata = parse_engine_metadata(
+        reader,
+        &footer,
+        options.execution_code_policy() == ExecutionCodePolicy::RequireSupported
+            || header.required_features & cove_core::constants::FEATURE_ENGINE_PROFILE != 0,
+    )
+    .await?;
     let segment_index = parse_segment_index(reader, &footer).await?;
     let segments = segment_index
         .entries
@@ -180,6 +198,26 @@ pub async fn bootstrap_range_reader_with_options<R: CoveRangeReader + ?Sized>(
         cache.insert(provisional_key, Arc::clone(&state));
     }
     Ok(state)
+}
+
+async fn validate_required_engine_execution_semantics<R: CoveRangeReader + ?Sized>(
+    file_len: u64,
+    reader: &R,
+) -> Result<(), CoveError> {
+    let bytes = reader
+        .read_range(0..file_len, RangeReadKind::Metadata)
+        .await?;
+    reader::validate_bytes_for_feature_use(
+        &bytes,
+        ValidationOptions {
+            semantic: true,
+            verify_digests: false,
+            allow_unknown_optional_extensions: true,
+            optional_pushdown_policy: OptionalPushdownPolicy::FailOpen,
+        },
+        FeatureUseRequestV2::new().with_operation(OperationKindV2::EngineExecutionMapping),
+    )?;
+    Ok(())
 }
 
 pub(super) async fn bootstrap_local_path_with_options(

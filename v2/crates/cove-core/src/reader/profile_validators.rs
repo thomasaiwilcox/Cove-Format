@@ -17,7 +17,7 @@ use crate::{
     domain::ColumnDomain,
     extensions::{ExtensionRegistry, ExtensionValidationContext},
     feature_binding::OperationKindV2,
-    feature_scope::FeatureUseRequestV2,
+    feature_scope::{FeatureTargetRefV2, FeatureUseRequestV2},
     footer::CoveSectionEntryV1,
     header::CoveHeaderV1,
     index::{
@@ -333,6 +333,24 @@ pub(super) fn validate_cove_t_semantics(
     stages: &mut Vec<ValidationStageReport>,
     ignored_optional_sections: &mut Vec<IgnoredOptionalSection>,
 ) -> Result<(), CoveError> {
+    validate_cove_t_semantics_with_registered_page_scope(
+        data,
+        validated,
+        opts,
+        stages,
+        ignored_optional_sections,
+        RegisteredPageValidationScope::All,
+    )
+}
+
+pub(super) fn validate_cove_t_semantics_with_registered_page_scope(
+    data: &[u8],
+    validated: &ValidatedCoveFile,
+    opts: &ValidationOptions,
+    stages: &mut Vec<ValidationStageReport>,
+    ignored_optional_sections: &mut Vec<IgnoredOptionalSection>,
+    registered_page_scope: RegisteredPageValidationScope<'_>,
+) -> Result<(), CoveError> {
     let mut checked = 0u32;
     let mut catalogs = Vec::new();
     let mut nested_schemas = Vec::new();
@@ -602,6 +620,7 @@ pub(super) fn validate_cove_t_semantics(
         dictionary.as_ref(),
         &zone_stats_entries,
         &codec_descriptors,
+        registered_page_scope,
     )?;
     push_stage(
         stages,
@@ -712,16 +731,29 @@ fn section_kind_required_for_feature_use(kind: SectionKind, request: &FeatureUse
 
 fn operation_requires_section(operation: OperationKindV2, kind: SectionKind) -> bool {
     match operation {
+        OperationKindV2::OrdinaryTableScan => is_table_scan_section(kind),
         OperationKindV2::CoveragePlanning => is_coverage_section(kind),
         OperationKindV2::IndexOnlyAnswer => kind == SectionKind::IndexOnlyCapability,
         OperationKindV2::ZeroCopyExport => kind == SectionKind::ZeroCopyBufferMap,
         OperationKindV2::RuntimeAdapterSelection => kind == SectionKind::RuntimeCompatibilityHints,
+        OperationKindV2::EngineExecutionMapping => is_engine_execution_section(kind),
+        OperationKindV2::ObjectReconstruction => is_object_section(kind),
+        OperationKindV2::TrustVerification => kind == SectionKind::TrustManifest,
+        OperationKindV2::RedactionPolicyEvaluation => kind == SectionKind::RedactionManifest,
+        OperationKindV2::MappingReplay
+        | OperationKindV2::MappingExplanation
+        | OperationKindV2::ProjectionReadback => is_map_section(kind),
+        OperationKindV2::HarborMount => is_harbor_section(kind),
         _ => false,
     }
 }
 
 fn profile_requires_section(profile: u8, kind: SectionKind) -> bool {
     match PrimaryProfile::from_u8(profile) {
+        Some(PrimaryProfile::ObjectTemporal) => is_object_section(kind),
+        Some(PrimaryProfile::EngineExecution) => is_engine_execution_section(kind),
+        Some(PrimaryProfile::HarborExecution) => is_harbor_section(kind),
+        Some(PrimaryProfile::SemanticMapping) => is_map_section(kind),
         Some(PrimaryProfile::LayoutPlanning) => is_layout_section(kind),
         Some(PrimaryProfile::RuntimeCompatibility) => {
             kind == SectionKind::RuntimeCompatibilityHints
@@ -769,6 +801,20 @@ fn is_layout_section(kind: SectionKind) -> bool {
     )
 }
 
+fn is_table_scan_section(kind: SectionKind) -> bool {
+    matches!(
+        kind,
+        SectionKind::TableCatalog
+            | SectionKind::TableSegmentIndex
+            | SectionKind::TableSegmentData
+            | SectionKind::FileDictionaryIndex
+            | SectionKind::FileDictionaryPayload
+            | SectionKind::NestedSchema
+            | SectionKind::ZoneStats
+            | SectionKind::CodecExtensionRegistry
+    )
+}
+
 fn is_coverage_section(kind: SectionKind) -> bool {
     matches!(
         kind,
@@ -780,6 +826,47 @@ fn is_coverage_section(kind: SectionKind) -> bool {
     )
 }
 
+fn is_engine_execution_section(kind: SectionKind) -> bool {
+    matches!(
+        kind,
+        SectionKind::EngineProfileRegistry
+            | SectionKind::ExecutionCodeDescriptor
+            | SectionKind::ExecutionScopeDescriptor
+            | SectionKind::CodeSpaceDescriptor
+            | SectionKind::EngineMountPolicy
+    )
+}
+
+fn is_object_section(kind: SectionKind) -> bool {
+    matches!(
+        kind,
+        SectionKind::ObjectTypeCatalog
+            | SectionKind::TemporalSegmentIndex
+            | SectionKind::TemporalSegmentData
+            | SectionKind::TemporalBloomIndex
+            | SectionKind::TrustManifest
+    )
+}
+
+fn is_harbor_section(kind: SectionKind) -> bool {
+    kind == SectionKind::HarborMountHints
+}
+
+fn is_map_section(kind: SectionKind) -> bool {
+    matches!(
+        kind,
+        SectionKind::MapSourceCatalog
+            | SectionKind::MapFunctionRegistry
+            | SectionKind::MapIdentityRuleCatalog
+            | SectionKind::MapRowSemanticsCatalog
+            | SectionKind::MapAssertionLog
+            | SectionKind::MapIdentityEquivalenceIndex
+            | SectionKind::MapEvidenceIndex
+            | SectionKind::MapConversionReport
+            | SectionKind::MapProjectionCatalog
+    )
+}
+
 fn validate_cove_t_cross_sections(
     catalogs: &[(u32, TableCatalog)],
     nested_schemas: &[(u32, NestedSchemaSectionV1)],
@@ -788,6 +875,7 @@ fn validate_cove_t_cross_sections(
     dictionary: Option<&FileDictionaryView<'_>>,
     zone_stats: &[ZoneStatsEntry],
     codec_descriptors: &[CodecExtensionDescriptorV2],
+    registered_page_scope: RegisteredPageValidationScope<'_>,
 ) -> Result<(), CoveError> {
     if catalogs.is_empty() && segment_indexes.is_empty() && segment_payloads.is_empty() {
         return Ok(());
@@ -839,11 +927,11 @@ fn validate_cove_t_cross_sections(
         .map(|table| (table.table_id, table))
         .collect::<BTreeMap<_, _>>();
     let mut payloads_by_key = BTreeMap::new();
-    for (_section_id, file_offset, payload, bytes) in segment_payloads {
+    for (section_id, file_offset, payload, bytes) in segment_payloads {
         if payloads_by_key
             .insert(
                 (payload.header.table_id, payload.header.segment_id),
-                (*file_offset, payload, bytes),
+                (*section_id, *file_offset, payload, bytes),
             )
             .is_some()
         {
@@ -861,7 +949,7 @@ fn validate_cove_t_cross_sections(
         if entry.column_count != table.columns.len() as u32 {
             return Err(CoveError::SegmentCorrupt);
         }
-        let Some((file_offset, payload, bytes)) =
+        let Some((section_id, file_offset, payload, bytes)) =
             payloads_by_key.get(&(entry.table_id, entry.segment_id))
         else {
             return Err(CoveError::SegmentCorrupt);
@@ -881,6 +969,7 @@ fn validate_cove_t_cross_sections(
         *rows_by_table.entry(entry.table_id).or_default() += u64::from(entry.row_count);
         validate_segment_against_catalog(
             table,
+            *section_id,
             payload,
             bytes,
             SegmentValidationRefs {
@@ -888,6 +977,7 @@ fn validate_cove_t_cross_sections(
                 zone_stats,
                 codec_descriptors,
                 nested_schema,
+                registered_page_scope,
             },
         )?;
     }
@@ -903,15 +993,43 @@ fn validate_cove_t_cross_sections(
 }
 
 #[derive(Clone, Copy)]
+pub(super) enum RegisteredPageValidationScope<'a> {
+    All,
+    RequestedPages(&'a FeatureUseRequestV2),
+}
+
+impl RegisteredPageValidationScope<'_> {
+    fn should_materialize_registered_page(
+        &self,
+        section_id: u32,
+        column_id: u32,
+        morsel_id: u32,
+    ) -> bool {
+        match self {
+            Self::All => true,
+            Self::RequestedPages(request) => {
+                request
+                    .needed_page_refs
+                    .contains(&FeatureTargetRefV2::cove_t_column_page(
+                        section_id, column_id, morsel_id,
+                    ))
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
 struct SegmentValidationRefs<'a, 'data> {
     dictionary: Option<&'a FileDictionaryView<'data>>,
     zone_stats: &'a [ZoneStatsEntry],
     codec_descriptors: &'a [CodecExtensionDescriptorV2],
     nested_schema: Option<&'a NestedSchemaSectionV1>,
+    registered_page_scope: RegisteredPageValidationScope<'a>,
 }
 
 fn validate_segment_against_catalog(
     table: &TableEntry,
+    segment_section_id: u32,
     segment: &TableSegmentPayloadV1,
     segment_bytes: &[u8],
     refs: SegmentValidationRefs<'_, '_>,
@@ -943,7 +1061,14 @@ fn validate_segment_against_catalog(
         {
             return Err(CoveError::PageCorrupt);
         }
-        validate_column_pages_against_catalog(column, column_dir, segment, segment_bytes, refs)?;
+        validate_column_pages_against_catalog(
+            column,
+            column_dir,
+            segment_section_id,
+            segment,
+            segment_bytes,
+            refs,
+        )?;
     }
     Ok(())
 }
@@ -951,6 +1076,7 @@ fn validate_segment_against_catalog(
 fn validate_column_pages_against_catalog(
     column: &ColumnEntry,
     column_dir: &TableColumnDirectoryEntryV1,
+    segment_section_id: u32,
     segment: &TableSegmentPayloadV1,
     segment_bytes: &[u8],
     refs: SegmentValidationRefs<'_, '_>,
@@ -998,7 +1124,22 @@ fn validate_column_pages_against_catalog(
                 .ok_or(CoveError::ArithOverflow)?,
         )
         .map_err(|_| CoveError::OffsetRange)?;
-        validate_column_page_wire(&context, page, &segment_bytes[start..end])?;
+        let page_wire = &segment_bytes[start..end];
+        if page.encoding_root == crate::constants::CoveEncodingKind::RegisteredEncoding as u32
+            && !refs
+                .registered_page_scope
+                .should_materialize_registered_page(
+                    segment_section_id,
+                    column.column_id,
+                    page.morsel_id,
+                )
+        {
+            crate::segment::validate_registered_page_wire_without_descriptor(
+                column_dir, page, page_wire,
+            )?;
+        } else {
+            validate_column_page_wire(&context, page, page_wire)?;
+        }
     }
     Ok(())
 }
@@ -1007,6 +1148,7 @@ pub(super) fn validate_cove_o_semantics(
     data: &[u8],
     validated: &ValidatedCoveFile,
     stages: &mut Vec<ValidationStageReport>,
+    request: Option<&FeatureUseRequestV2>,
 ) -> Result<(), CoveError> {
     let mut checked = 0u32;
     let mut object_catalogs = Vec::new();
@@ -1064,12 +1206,16 @@ pub(super) fn validate_cove_o_semantics(
         };
         checked += 1;
         if let Err(err) = result {
-            if profile_error_is_fatal(&validated.header, entry, FEATURE_OBJECT_PROFILE) {
+            if profile_error_is_fatal(&validated.header, entry, FEATURE_OBJECT_PROFILE)
+                || request
+                    .map(request_requires_object_profile)
+                    .unwrap_or(false)
+            {
                 return Err(err);
             }
         }
     }
-    validate_cove_o_cross_sections(
+    if let Err(err) = validate_cove_o_cross_sections(
         &object_catalogs,
         &temporal_indexes,
         &temporal_segments,
@@ -1077,7 +1223,11 @@ pub(super) fn validate_cove_o_semantics(
         dictionary.as_ref(),
         &zone_stats_entries,
         validated.header.required_features,
-    )?;
+    ) {
+        if cove_o_profile_required(validated, request) {
+            return Err(err);
+        }
+    }
     push_stage(
         stages,
         ValidationStage::CoveObject,
@@ -1487,6 +1637,7 @@ pub(super) fn validate_cove_e_semantics(
     data: &[u8],
     validated: &ValidatedCoveFile,
     stages: &mut Vec<ValidationStageReport>,
+    request: Option<&FeatureUseRequestV2>,
 ) -> Result<(), CoveError> {
     let mut checked = 0u32;
     let mut registries = Vec::new();
@@ -1533,7 +1684,11 @@ pub(super) fn validate_cove_e_semantics(
         };
         checked += 1;
         if let Err(err) = result {
-            if profile_error_is_fatal(&validated.header, entry, FEATURE_ENGINE_PROFILE) {
+            if profile_error_is_fatal(&validated.header, entry, FEATURE_ENGINE_PROFILE)
+                || request
+                    .map(request_requires_engine_profile)
+                    .unwrap_or(false)
+            {
                 return Err(err);
             }
         }
@@ -1545,13 +1700,7 @@ pub(super) fn validate_cove_e_semantics(
         &code_space_descriptors,
         &mount_policies,
     ) {
-        let engine_required = validated.header.required_features & FEATURE_ENGINE_PROFILE != 0
-            || validated
-                .footer
-                .sections
-                .iter()
-                .any(|entry| entry.required_features & FEATURE_ENGINE_PROFILE != 0);
-        if engine_required {
+        if cove_e_profile_required(validated, request) {
             return Err(err);
         }
     }
@@ -1636,6 +1785,7 @@ pub(super) fn validate_cove_h_semantics(
     data: &[u8],
     validated: &ValidatedCoveFile,
     stages: &mut Vec<ValidationStageReport>,
+    request: Option<&FeatureUseRequestV2>,
 ) -> Result<(), CoveError> {
     let mut checked = 0u32;
     for entry in &validated.footer.sections {
@@ -1651,7 +1801,11 @@ pub(super) fn validate_cove_h_semantics(
         };
         checked += 1;
         if let Err(err) = result {
-            if profile_error_is_fatal(&validated.header, entry, FEATURE_HARBOR_PROFILE) {
+            if profile_error_is_fatal(&validated.header, entry, FEATURE_HARBOR_PROFILE)
+                || request
+                    .map(request_requires_harbor_profile)
+                    .unwrap_or(false)
+            {
                 return Err(err);
             }
         }
@@ -1669,6 +1823,7 @@ pub(super) fn validate_cove_map_semantics(
     data: &[u8],
     validated: &ValidatedCoveFile,
     stages: &mut Vec<ValidationStageReport>,
+    request: Option<&FeatureUseRequestV2>,
 ) -> Result<(), CoveError> {
     let mut checked = 0u32;
     let mut map_sections = Vec::<EmbeddedMapSection>::new();
@@ -1695,7 +1850,9 @@ pub(super) fn validate_cove_map_semantics(
         };
         checked += 1;
         if let Err(err) = result {
-            if profile_error_is_fatal(&validated.header, entry, FEATURE_SEMANTIC_MAP) {
+            if profile_error_is_fatal(&validated.header, entry, FEATURE_SEMANTIC_MAP)
+                || request.map(request_requires_map_profile).unwrap_or(false)
+            {
                 return Err(err);
             }
         }
@@ -1707,7 +1864,7 @@ pub(super) fn validate_cove_map_semantics(
                 .sections
                 .iter()
                 .any(|entry| entry.required_features & FEATURE_SEMANTIC_MAP != 0);
-        if map_required {
+        if map_required || request.map(request_requires_map_profile).unwrap_or(false) {
             return Err(err);
         }
     }
@@ -1722,4 +1879,122 @@ pub(super) fn validate_cove_map_semantics(
 
 fn profile_error_is_fatal(header: &CoveHeaderV1, entry: &CoveSectionEntryV1, feature: u64) -> bool {
     header.required_features & feature != 0 || entry.required_features & feature != 0
+}
+
+fn cove_o_profile_required(
+    validated: &ValidatedCoveFile,
+    request: Option<&FeatureUseRequestV2>,
+) -> bool {
+    validated.header.required_features & FEATURE_OBJECT_PROFILE != 0
+        || validated
+            .footer
+            .sections
+            .iter()
+            .any(|entry| entry.required_features & FEATURE_OBJECT_PROFILE != 0)
+        || request
+            .map(request_requires_object_profile)
+            .unwrap_or(false)
+}
+
+fn cove_e_profile_required(
+    validated: &ValidatedCoveFile,
+    request: Option<&FeatureUseRequestV2>,
+) -> bool {
+    validated.header.required_features & FEATURE_ENGINE_PROFILE != 0
+        || validated
+            .footer
+            .sections
+            .iter()
+            .any(|entry| entry.required_features & FEATURE_ENGINE_PROFILE != 0)
+        || request
+            .map(request_requires_engine_profile)
+            .unwrap_or(false)
+}
+
+pub(super) fn request_requires_object_profile(request: &FeatureUseRequestV2) -> bool {
+    request.requested_profile == Some(PrimaryProfile::ObjectTemporal as u8)
+        || matches!(
+            request.requested_operation,
+            Some(OperationKindV2::ObjectReconstruction)
+        )
+}
+
+pub(super) fn request_requires_engine_profile(request: &FeatureUseRequestV2) -> bool {
+    request.requested_profile == Some(PrimaryProfile::EngineExecution as u8)
+        || matches!(
+            request.requested_operation,
+            Some(OperationKindV2::EngineExecutionMapping)
+        )
+}
+
+pub(super) fn request_requires_harbor_profile(request: &FeatureUseRequestV2) -> bool {
+    request.requested_profile == Some(PrimaryProfile::HarborExecution as u8)
+        || matches!(
+            request.requested_operation,
+            Some(OperationKindV2::HarborMount)
+        )
+}
+
+pub(super) fn request_requires_map_profile(request: &FeatureUseRequestV2) -> bool {
+    request.requested_profile == Some(PrimaryProfile::SemanticMapping as u8)
+        || matches!(
+            request.requested_operation,
+            Some(
+                OperationKindV2::MappingReplay
+                    | OperationKindV2::MappingExplanation
+                    | OperationKindV2::ProjectionReadback
+            )
+        )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ordinary_table_scan_operation_requires_all_cove_t_scan_sections() {
+        for kind in [
+            SectionKind::TableCatalog,
+            SectionKind::TableSegmentIndex,
+            SectionKind::TableSegmentData,
+            SectionKind::FileDictionaryIndex,
+            SectionKind::FileDictionaryPayload,
+            SectionKind::NestedSchema,
+            SectionKind::ZoneStats,
+            SectionKind::CodecExtensionRegistry,
+        ] {
+            assert!(
+                operation_requires_section(OperationKindV2::OrdinaryTableScan, kind),
+                "{kind:?} should be required for ordinary table scans"
+            );
+        }
+    }
+
+    #[test]
+    fn engine_execution_operation_requires_cove_e_sections() {
+        for kind in [
+            SectionKind::EngineProfileRegistry,
+            SectionKind::ExecutionCodeDescriptor,
+            SectionKind::ExecutionScopeDescriptor,
+            SectionKind::CodeSpaceDescriptor,
+            SectionKind::EngineMountPolicy,
+        ] {
+            assert!(
+                operation_requires_section(OperationKindV2::EngineExecutionMapping, kind),
+                "{kind:?} should be required for engine execution mapping"
+            );
+        }
+    }
+
+    #[test]
+    fn policy_operations_require_policy_sections() {
+        assert!(operation_requires_section(
+            OperationKindV2::TrustVerification,
+            SectionKind::TrustManifest
+        ));
+        assert!(operation_requires_section(
+            OperationKindV2::RedactionPolicyEvaluation,
+            SectionKind::RedactionManifest
+        ));
+    }
 }

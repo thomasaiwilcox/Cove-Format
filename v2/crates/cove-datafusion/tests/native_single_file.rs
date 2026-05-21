@@ -253,6 +253,34 @@ async fn registered_utf8_page_scans_through_core_fallback_without_descriptor() {
 }
 
 #[tokio::test]
+async fn registered_required_unprojected_page_does_not_block_count_scan() {
+    let path = write_temp_cove(
+        "registered_utf8_required_unprojected",
+        registered_names_file(false, false),
+    );
+    let ctx = SessionContext::new();
+    register_cove_file(&ctx, "names", &path).unwrap();
+
+    let batches = ctx
+        .sql("SELECT COUNT(*) FROM names")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let expected = [
+        "+----------+",
+        "| count(*) |",
+        "+----------+",
+        "| 3        |",
+        "+----------+",
+    ];
+    assert_batches_eq!(expected, &batches);
+    fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
 async fn native_limit_pushdown_materializes_only_requested_rows() {
     let path = write_temp_cove("events_limit", primitive_events_file());
     let ctx = SessionContext::new();
@@ -1639,8 +1667,9 @@ async fn stats_only_constant_page_without_required_stats_fails_closed() {
     let path = write_temp_cove("stats_only_missing_stats", bytes);
     let ctx = SessionContext::new();
     register_cove_file(&ctx, "metrics", &path).unwrap();
+
     let err = ctx
-        .sql("SELECT signed FROM metrics")
+        .sql("SELECT signed, unsigned FROM metrics")
         .await
         .unwrap()
         .collect()

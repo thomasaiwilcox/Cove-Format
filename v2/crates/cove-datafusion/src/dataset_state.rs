@@ -849,6 +849,9 @@ pub(crate) fn ordinary_table_scan_feature_use_request(footer: &CoveFooter) -> Fe
                 | SectionKind::TableSegmentData
                 | SectionKind::FileDictionaryIndex
                 | SectionKind::FileDictionaryPayload
+                | SectionKind::NestedSchema
+                | SectionKind::ZoneStats
+                | SectionKind::CodecExtensionRegistry
         ) {
             request.needed_section_ids.insert(section.section_id);
         }

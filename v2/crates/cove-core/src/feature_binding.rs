@@ -472,6 +472,17 @@ impl SectionFeatureBindingSectionV2 {
             if end > self.payload_data.len() as u64 {
                 return Err(CoveError::OffsetRange);
             }
+            if payload_ref.payload_kind == SectionFeatureBindingPayloadKindV2::None {
+                return Err(CoveError::BadSection(
+                    "SECTION_FEATURE_BINDING payload ref requires a payload kind".into(),
+                ));
+            }
+            if payload_ref.payload_length == 0 {
+                return Err(CoveError::BadSection(
+                    "SECTION_FEATURE_BINDING payload ref requires a non-empty contract payload"
+                        .into(),
+                ));
+            }
             if payload_ref.operation_kind != OperationKindV2::None
                 && payload_ref.payload_kind
                     != SectionFeatureBindingPayloadKindV2::OperationRequirement
@@ -481,8 +492,65 @@ impl SectionFeatureBindingSectionV2 {
                 ));
             }
         }
+        for binding in &self.bindings {
+            if binding.binding_payload_ref == 0 {
+                continue;
+            }
+            let payload_ref = &self.payload_refs[binding.binding_payload_ref as usize - 1];
+            validate_binding_contract_payload(binding, payload_ref)?;
+        }
         Ok(())
     }
+}
+
+fn validate_binding_contract_payload(
+    binding: &SectionFeatureBindingV2,
+    payload_ref: &SectionFeatureBindingPayloadRefV2,
+) -> Result<(), CoveError> {
+    match binding.scope {
+        FeatureScopeV2::OperationRequired => {
+            if payload_ref.payload_kind != SectionFeatureBindingPayloadKindV2::OperationRequirement
+                || payload_ref.operation_kind != binding.operation_kind
+                || (payload_ref.profile != 0 && payload_ref.profile != binding.profile)
+            {
+                return Err(CoveError::BadSection(
+                    "OperationRequired binding payload does not match binding contract".into(),
+                ));
+            }
+        }
+        FeatureScopeV2::ProfileRequired => {
+            if payload_ref.payload_kind != SectionFeatureBindingPayloadKindV2::ProfileRequirement
+                || payload_ref.operation_kind != OperationKindV2::None
+                || payload_ref.profile != binding.profile
+            {
+                return Err(CoveError::BadSection(
+                    "ProfileRequired binding payload does not match binding contract".into(),
+                ));
+            }
+        }
+        FeatureScopeV2::PageRequired => {
+            if payload_ref.payload_kind != SectionFeatureBindingPayloadKindV2::PageRequirement
+                || payload_ref.operation_kind != OperationKindV2::None
+            {
+                return Err(CoveError::BadSection(
+                    "PageRequired binding payload does not match binding contract".into(),
+                ));
+            }
+        }
+        FeatureScopeV2::FileRequired
+        | FeatureScopeV2::SectionRequired
+        | FeatureScopeV2::AdvisoryOnly => {
+            if payload_ref.operation_kind != OperationKindV2::None
+                && payload_ref.payload_kind
+                    != SectionFeatureBindingPayloadKindV2::OperationRequirement
+            {
+                return Err(CoveError::BadSection(
+                    "non-operation binding payload carries operation_kind".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_binding(
@@ -702,11 +770,11 @@ mod tests {
                 flags: 0,
                 reserved: 0,
                 payload_offset: 0,
-                payload_length: 0,
+                payload_length: 4,
                 checksum: 0,
             }],
             feature_words: vec![1],
-            payload_data: Vec::new(),
+            payload_data: b"SFB!".to_vec(),
         }
     }
 
@@ -725,6 +793,20 @@ mod tests {
     fn invalid_payload_ref_is_rejected() {
         let mut section = valid_section();
         section.bindings[0].binding_payload_ref = 2;
+        assert!(matches!(section.serialize(), Err(CoveError::BadSection(_))));
+    }
+
+    #[test]
+    fn empty_contract_payload_is_rejected() {
+        let mut section = valid_section();
+        section.payload_refs[0].payload_length = 0;
+        assert!(matches!(section.serialize(), Err(CoveError::BadSection(_))));
+    }
+
+    #[test]
+    fn mismatched_operation_contract_is_rejected() {
+        let mut section = valid_section();
+        section.payload_refs[0].operation_kind = OperationKindV2::IndexOnlyAnswer;
         assert!(matches!(section.serialize(), Err(CoveError::BadSection(_))));
     }
 

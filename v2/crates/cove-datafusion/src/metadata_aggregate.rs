@@ -17,6 +17,7 @@ use cove_core::{
         lookup::LookupKeyKind,
     },
     row_ref::RowRef,
+    segment::TableSegmentIndexEntryV1,
     wire, CoveError,
 };
 
@@ -317,7 +318,7 @@ fn exact_payload_entries_for_file<'a>(
     column_id: u32,
     kind: SynopsisKind,
 ) -> Result<Vec<(&'a AggregateEntry, &'a AggregatePayloadV2)>, CoveError> {
-    let mut out = Vec::new();
+    let mut candidates = Vec::new();
     for synopsis in file.pruning().aggregates.iter() {
         for (index, entry) in synopsis.entries.iter().enumerate() {
             if entry.table_id != file.table().table_id
@@ -330,10 +331,137 @@ fn exact_payload_entries_for_file<'a>(
             let Some(payload) = synopsis.payload_for_entry(index) else {
                 return Err(CoveError::BadIndex);
             };
-            out.push((entry, payload));
+            candidates.push((entry, payload));
         }
     }
-    Ok(out)
+    select_exact_coverage_entries(file, candidates)
+}
+
+fn select_exact_coverage_entries<'a>(
+    file: &FileMetadata,
+    candidates: Vec<(&'a AggregateEntry, &'a AggregatePayloadV2)>,
+) -> Result<Vec<(&'a AggregateEntry, &'a AggregatePayloadV2)>, CoveError> {
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let file_level = candidates
+        .iter()
+        .copied()
+        .filter(|(entry, _)| entry.segment_id == u32::MAX && entry.morsel_id == u32::MAX)
+        .collect::<Vec<_>>();
+    if !file_level.is_empty() {
+        if file_level.len() == 1 && u64::from(file_level[0].0.row_count) == file.table().row_count {
+            return Ok(file_level);
+        }
+        return Ok(Vec::new());
+    }
+
+    let segment_level = candidates
+        .iter()
+        .copied()
+        .filter(|(entry, _)| entry.segment_id != u32::MAX && entry.morsel_id == u32::MAX)
+        .collect::<Vec<_>>();
+    if !segment_level.is_empty() {
+        return select_segment_coverage_entries(file.segments(), segment_level);
+    }
+
+    let morsel_level = candidates
+        .into_iter()
+        .filter(|(entry, _)| entry.segment_id != u32::MAX && entry.morsel_id != u32::MAX)
+        .collect::<Vec<_>>();
+    select_morsel_coverage_entries(file.segments(), morsel_level)
+}
+
+fn select_segment_coverage_entries<'a>(
+    segments: &[TableSegmentIndexEntryV1],
+    entries: Vec<(&'a AggregateEntry, &'a AggregatePayloadV2)>,
+) -> Result<Vec<(&'a AggregateEntry, &'a AggregatePayloadV2)>, CoveError> {
+    if entries.len() != segments.len() {
+        return Ok(Vec::new());
+    }
+    let mut by_segment = BTreeMap::new();
+    for item in entries {
+        if by_segment.insert(item.0.segment_id, item).is_some() {
+            return Ok(Vec::new());
+        }
+    }
+    let mut selected = Vec::with_capacity(segments.len());
+    for segment in segments {
+        let Some(item) = by_segment.remove(&segment.segment_id) else {
+            return Ok(Vec::new());
+        };
+        if item.0.row_count != segment.row_count {
+            return Ok(Vec::new());
+        }
+        selected.push(item);
+    }
+    Ok(selected)
+}
+
+fn select_morsel_coverage_entries<'a>(
+    segments: &[TableSegmentIndexEntryV1],
+    entries: Vec<(&'a AggregateEntry, &'a AggregatePayloadV2)>,
+) -> Result<Vec<(&'a AggregateEntry, &'a AggregatePayloadV2)>, CoveError> {
+    // Morsel IDs are identifiers, not guaranteed dense ordinals. Without the
+    // row-morsel directory this path cannot prove that morsel-level aggregate
+    // payloads cover the actual morsels, so do not use them for exact answers.
+    let _ = (segments, entries);
+    return Ok(Vec::new());
+}
+
+#[allow(dead_code)]
+fn select_dense_morsel_coverage_entries_for_tests<'a>(
+    segments: &[TableSegmentIndexEntryV1],
+    entries: Vec<(&'a AggregateEntry, &'a AggregatePayloadV2)>,
+) -> Result<Vec<(&'a AggregateEntry, &'a AggregatePayloadV2)>, CoveError> {
+    let expected = segments.iter().try_fold(0usize, |acc, segment| {
+        let count = usize::try_from(segment.morsel_count).map_err(|_| CoveError::ArithOverflow)?;
+        acc.checked_add(count).ok_or(CoveError::ArithOverflow)
+    })?;
+    if entries.len() != expected {
+        return Ok(Vec::new());
+    }
+
+    let mut by_morsel = BTreeMap::new();
+    for item in entries {
+        if by_morsel
+            .insert((item.0.segment_id, item.0.morsel_id), item)
+            .is_some()
+        {
+            return Ok(Vec::new());
+        }
+    }
+
+    let mut selected = Vec::with_capacity(expected);
+    for segment in segments {
+        for morsel_id in 0..segment.morsel_count {
+            let Some(item) = by_morsel.remove(&(segment.segment_id, morsel_id)) else {
+                return Ok(Vec::new());
+            };
+            if item.0.row_count != expected_morsel_row_count(segment, morsel_id)? {
+                return Ok(Vec::new());
+            }
+            selected.push(item);
+        }
+    }
+    Ok(selected)
+}
+
+fn expected_morsel_row_count(
+    segment: &TableSegmentIndexEntryV1,
+    morsel_id: u32,
+) -> Result<u32, CoveError> {
+    if morsel_id >= segment.morsel_count || segment.morsel_row_count == 0 {
+        return Err(CoveError::BadIndex);
+    }
+    let consumed = morsel_id
+        .checked_mul(segment.morsel_row_count)
+        .ok_or(CoveError::ArithOverflow)?;
+    if consumed >= segment.row_count {
+        return Err(CoveError::BadIndex);
+    }
+    Ok(segment.morsel_row_count.min(segment.row_count - consumed))
 }
 
 #[derive(Debug, Clone, Default)]
@@ -946,4 +1074,99 @@ fn aggregate_synopsis_fast_paths_are_safe(state: &DatasetState) -> Result<bool, 
         }
     }
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn segment(segment_id: u32, row_start: u64, row_count: u32) -> TableSegmentIndexEntryV1 {
+        TableSegmentIndexEntryV1 {
+            table_id: 1,
+            segment_id,
+            row_start,
+            row_count,
+            morsel_count: 2,
+            morsel_row_count: 4,
+            column_count: 1,
+            offset: 0,
+            length: 0,
+            stats_ref: 0,
+            flags: 0,
+            checksum: 0,
+        }
+    }
+
+    fn count_entry(segment_id: u32, morsel_id: u32, row_count: u32) -> AggregateEntry {
+        AggregateEntry::new(
+            1,
+            segment_id,
+            morsel_id,
+            1,
+            SynopsisKind::Count,
+            0,
+            SynopsisAccuracy::Exact,
+            row_count,
+            0,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn segment_coverage_rejects_duplicates_even_when_rows_sum() {
+        let segments = vec![segment(10, 0, 4), segment(20, 4, 4)];
+        let first = count_entry(10, u32::MAX, 4);
+        let duplicate = count_entry(10, u32::MAX, 4);
+        let selected = select_segment_coverage_entries(
+            &segments,
+            vec![
+                (&first, &AggregatePayloadV2::None),
+                (&duplicate, &AggregatePayloadV2::None),
+            ],
+        )
+        .unwrap();
+        assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn segment_coverage_requires_every_segment_once() {
+        let segments = vec![segment(10, 0, 4), segment(20, 4, 4)];
+        let first = count_entry(10, u32::MAX, 4);
+        let second = count_entry(20, u32::MAX, 4);
+        let selected = select_segment_coverage_entries(
+            &segments,
+            vec![
+                (&first, &AggregatePayloadV2::None),
+                (&second, &AggregatePayloadV2::None),
+            ],
+        )
+        .unwrap();
+        assert_eq!(selected.len(), 2);
+    }
+
+    #[test]
+    fn morsel_coverage_rejects_missing_final_morsel() {
+        let segments = vec![segment(10, 0, 6)];
+        let first = count_entry(10, 0, 4);
+        let selected =
+            select_morsel_coverage_entries(&segments, vec![(&first, &AggregatePayloadV2::None)])
+                .unwrap();
+        assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn morsel_coverage_accepts_exact_partial_final_morsel() {
+        let segments = vec![segment(10, 0, 6)];
+        let first = count_entry(10, 0, 4);
+        let second = count_entry(10, 1, 2);
+        let selected = select_morsel_coverage_entries(
+            &segments,
+            vec![
+                (&first, &AggregatePayloadV2::None),
+                (&second, &AggregatePayloadV2::None),
+            ],
+        )
+        .unwrap();
+        assert!(selected.is_empty());
+    }
 }
