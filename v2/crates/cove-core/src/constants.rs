@@ -313,6 +313,7 @@ pub enum SectionKind {
     SectionFeatureBinding = 45,
     CoverageProofRecord = 46,
     NestedSchema = 47,
+    RuntimeCompatibilityHints = 48,
 
     // COVE-H sections (profile = 5)
     HarborMountHints = 50,
@@ -382,6 +383,7 @@ impl SectionKind {
             45 => Some(Self::SectionFeatureBinding),
             46 => Some(Self::CoverageProofRecord),
             47 => Some(Self::NestedSchema),
+            48 => Some(Self::RuntimeCompatibilityHints),
             50 => Some(Self::HarborMountHints),
             60 => Some(Self::MapSourceCatalog),
             61 => Some(Self::MapFunctionRegistry),
@@ -886,6 +888,14 @@ mod tests {
             Some(SectionKind::KernelCapabilities)
         );
         assert_eq!(SectionKind::from_u16(47), Some(SectionKind::NestedSchema));
+    }
+
+    #[test]
+    fn section_kind_from_u16_cove_r_sections() {
+        assert_eq!(
+            SectionKind::from_u16(48),
+            Some(SectionKind::RuntimeCompatibilityHints)
+        );
     }
 
     #[test]

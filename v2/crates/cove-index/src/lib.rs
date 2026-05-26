@@ -8,12 +8,12 @@ use std::collections::BTreeSet;
 use cove_core::{
     checksum,
     constants::{
-        CompressionCodec, DigestAlgorithm, KNOWN_FEATURE_BITS_MASK, MAGIC_COVI,
-        POSTSCRIPT_VERSION_V1, VERSION_MAJOR_V1,
+        CompressionCodec, CoveLogicalType, CovePhysicalKind, DigestAlgorithm,
+        KNOWN_FEATURE_BITS_MASK, MAGIC_COVI, POSTSCRIPT_VERSION_V1, VERSION_MAJOR_V1,
     },
     CoveError,
 };
-use cove_coverage::CoverageProofStrengthV2;
+use cove_coverage::{CoverageExactnessV2, CoverageGranularityV2, CoverageProofStrengthV2};
 
 pub const COVI_POSTSCRIPT_LEN: usize = 44;
 pub const COVI_TAIL_LEN: usize = COVI_POSTSCRIPT_LEN + 2 + 2 + 4;
@@ -537,7 +537,7 @@ impl IndexOnlyCapabilityV2 {
 
     pub fn validate(&self) -> Result<(), CoveError> {
         validate_bool(self.predicate_supported)?;
-        if self.aggregate_kind > 7 {
+        if crate::execution::CoviAggregateKindV2::from_u16(self.aggregate_kind).is_none() {
             return Err(CoveError::BadCovi);
         }
         Ok(())
@@ -841,6 +841,34 @@ impl CoviIndexRootV2 {
     }
 
     pub fn validate(&self) -> Result<(), CoveError> {
+        if matches!(
+            self.indexed_target_kind,
+            CoviIndexedTargetKindV2::ExternalTarget
+        ) || matches!(self.index_kind, CoviIndexKindV2::Extension)
+        {
+            return Err(CoveError::BadCovi);
+        }
+        if matches!(
+            CoverageGranularityV2::from_u8(self.coverage_granularity),
+            None | Some(CoverageGranularityV2::ExternalFragment)
+        ) || CoverageProofStrengthV2::from_u8(self.proof_strength).is_none()
+            || matches!(
+                CoverageExactnessV2::from_u8(self.exactness),
+                None | Some(CoverageExactnessV2::Unknown)
+            )
+            || CoveLogicalType::from_u16(self.logical_type).is_none()
+            || CovePhysicalKind::from_u8(self.physical_kind).is_none()
+            || matches!(
+                CoviKeyEncodingKindV2::from_u8(self.key_encoding_kind),
+                None | Some(CoviKeyEncodingKindV2::Extension)
+            )
+            || matches!(
+                CoviComparatorKindV2::from_u16(self.comparator_kind),
+                None | Some(CoviComparatorKindV2::ExtensionRequired)
+            )
+        {
+            return Err(CoveError::BadCovi);
+        }
         if self.null_count > self.value_count || self.distinct_count > self.value_count {
             return Err(CoveError::BadCovi);
         }
@@ -2610,6 +2638,20 @@ pub struct CoviAggregateAnswerV2 {
 impl CoviAggregateAnswerV2 {
     pub const LEN: usize = 54;
 
+    pub(crate) fn validate_counts(&self) -> Result<(), CoveError> {
+        if self.null_count > self.row_count || self.non_null_count > self.row_count {
+            return Err(CoveError::BadCovi);
+        }
+        let accounted = self
+            .null_count
+            .checked_add(self.non_null_count)
+            .ok_or(CoveError::ArithOverflow)?;
+        if accounted != self.row_count {
+            return Err(CoveError::BadCovi);
+        }
+        Ok(())
+    }
+
     pub fn parse(bytes: &[u8]) -> Result<Self, CoveError> {
         if bytes.len() < Self::LEN {
             return Err(CoveError::BufferTooShort);
@@ -2630,9 +2672,7 @@ impl CoviAggregateAnswerV2 {
             checksum: read_u32(bytes, 50)?,
         };
         verify_crc(&bytes[..Self::LEN], 50, item.checksum)?;
-        if item.null_count > item.row_count || item.non_null_count > item.row_count {
-            return Err(CoveError::BadCovi);
-        }
+        item.validate_counts()?;
         Ok(item)
     }
 
@@ -3236,9 +3276,11 @@ fn parse_section_directory(
     if end > section_limit {
         return Err(CoveError::OffsetRange);
     }
-    let mut sections = Vec::new();
+    let directory = &bytes[start..end];
+    let mut sections = Vec::with_capacity(header.section_count as usize);
     let mut ids = BTreeSet::new();
-    for chunk in bytes[start..end].chunks_exact(COVI_SECTION_ENTRY_LEN) {
+    let mut chunks = directory.chunks_exact(COVI_SECTION_ENTRY_LEN);
+    for chunk in &mut chunks {
         let entry = CoviSectionEntryV2::parse(chunk)?;
         if !ids.insert(entry.section_id) {
             return Err(CoveError::BadCovi);
@@ -3251,6 +3293,12 @@ fn parse_section_directory(
             return Err(CoveError::ChecksumMismatch);
         }
         sections.push(entry);
+    }
+    if !chunks.remainder().is_empty() {
+        return Err(CoveError::BadCovi);
+    }
+    if sections.len() != header.section_count as usize {
+        return Err(CoveError::BadCovi);
     }
     Ok(sections)
 }
@@ -3483,6 +3531,7 @@ fn read_array<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N], Co
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cove_core::constants::{CoveLogicalType, ValueTag};
 
     fn index_capability(capability_id: u32) -> IndexCapabilityV2 {
         IndexCapabilityV2 {
@@ -3572,7 +3621,7 @@ mod tests {
             property_id: u32::MAX,
             path_ref: u32::MAX,
             semantic_dimension_ref: u32::MAX,
-            logical_type: 1,
+            logical_type: CoveLogicalType::Utf8 as u16,
             physical_kind: 1,
             key_encoding_kind: CoviKeyEncodingKindV2::CanonicalValueBytes as u8,
             comparator_kind: CoviComparatorKindV2::CanonicalOrdering as u16,
@@ -3593,6 +3642,59 @@ mod tests {
             snapshot_validity_ref: 0,
             checksum: 0,
         }
+    }
+
+    fn section_directory_header(section_count: u32, section_directory_length: u64) -> CoviHeaderV2 {
+        CoviHeaderV2 {
+            magic: *b"COVI",
+            header_len: COVI_HEADER_LEN,
+            version_major: 2,
+            version_minor: 0,
+            flags: 0,
+            index_artifact_id: [0; 16],
+            dataset_id: [0; 16],
+            snapshot_id: [0; 16],
+            section_count,
+            referenced_file_count: 0,
+            snapshot_validity_count: 0,
+            index_root_count: 0,
+            capability_count: 0,
+            section_directory_offset: 0,
+            section_directory_length,
+            referenced_files_offset: 0,
+            snapshot_validity_offset: 0,
+            index_roots_offset: 0,
+            capabilities_offset: 0,
+            string_table_section_ref: ABSENT_U32,
+            created_at_us: 0,
+            reserved: [0; 24],
+            checksum: 0,
+        }
+    }
+
+    fn valid_section_directory_bytes() -> Vec<u8> {
+        let payload = b"abc";
+        let mut bytes = vec![0; COVI_SECTION_ENTRY_LEN];
+        bytes.extend_from_slice(payload);
+        let entry = CoviSectionEntryV2 {
+            section_id: 0,
+            section_kind: CoviSectionKindV2::StringTable,
+            flags: 0,
+            offset: COVI_SECTION_ENTRY_LEN as u64,
+            length: payload.len() as u64,
+            uncompressed_length: payload.len() as u64,
+            item_count: 1,
+            compression: CompressionCodec::None as u8,
+            encryption: 0,
+            alignment_log2: 0,
+            reserved0: 0,
+            required_features: 0,
+            optional_features: 0,
+            crc32c: checksum::crc32c(payload),
+            checksum: 0,
+        };
+        bytes[..COVI_SECTION_ENTRY_LEN].copy_from_slice(&entry.serialize().unwrap());
+        bytes
     }
 
     #[test]
@@ -3617,6 +3719,44 @@ mod tests {
         let parsed = IndexOnlyCapabilityV2::parse(&bytes).unwrap();
         assert_eq!(parsed.capability_id, 1);
         assert_eq!(parsed.aggregate_kind, 0);
+    }
+
+    #[test]
+    fn index_only_capability_accepts_sum_and_avg_wire_values() {
+        let mut capability = index_only_capability(1);
+        capability.aggregate_kind = crate::execution::CoviAggregateKindV2::Sum as u16;
+        assert!(capability.serialize().is_ok());
+        capability.aggregate_kind = crate::execution::CoviAggregateKindV2::Avg as u16;
+        assert!(capability.serialize().is_ok());
+        capability.aggregate_kind = 8;
+        assert!(matches!(capability.serialize(), Err(CoveError::BadCovi)));
+    }
+
+    #[test]
+    fn index_root_rejects_invalid_typed_metadata() {
+        let mut root = index_root(1);
+        assert!(root.validate().is_ok());
+
+        root.coverage_granularity = 254;
+        assert!(matches!(root.validate(), Err(CoveError::BadCovi)));
+        root = index_root(1);
+        root.proof_strength = 254;
+        assert!(matches!(root.validate(), Err(CoveError::BadCovi)));
+        root = index_root(1);
+        root.exactness = 254;
+        assert!(matches!(root.validate(), Err(CoveError::BadCovi)));
+        root = index_root(1);
+        root.logical_type = 254;
+        assert!(matches!(root.validate(), Err(CoveError::BadCovi)));
+        root = index_root(1);
+        root.physical_kind = 254;
+        assert!(matches!(root.validate(), Err(CoveError::BadCovi)));
+        root = index_root(1);
+        root.key_encoding_kind = 254;
+        assert!(matches!(root.validate(), Err(CoveError::BadCovi)));
+        root = index_root(1);
+        root.comparator_kind = 254;
+        assert!(matches!(root.validate(), Err(CoveError::BadCovi)));
     }
 
     #[test]
@@ -3663,7 +3803,7 @@ mod tests {
 
     #[test]
     fn full_covi_sections_round_trip_index_blocks() {
-        let key_data = vec![2, 0, 4, 0, 0, 0, b't', b'e', b's', b't'];
+        let key_data = vec![ValueTag::Utf8 as u8, 4, b't', b'e', b's', b't'];
         let key_block = CoviKeyBlockV2 {
             header: CoviKeyBlockHeaderV2 {
                 magic: [0; 4],
@@ -3973,6 +4113,30 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_answer_rejects_inconsistent_null_accounting() {
+        let answer = CoviAggregateAnswerV2 {
+            aggregate_answer_ref: 0,
+            index_root_id: 0,
+            aggregate_kind: crate::execution::CoviAggregateKindV2::Count as u16,
+            exactness: IndexCapabilityExactnessV2::Exact as u8,
+            null_semantics: 0,
+            flags: 0,
+            row_count: 42,
+            null_count: 2,
+            non_null_count: 41,
+            value_ref: u32::MAX,
+            predicate_form_ref: u32::MAX,
+            snapshot_validity_ref: 0,
+            checksum: 0,
+        };
+        let bytes = answer.serialize();
+        assert!(matches!(
+            CoviAggregateAnswerV2::parse(&bytes),
+            Err(CoveError::BadCovi)
+        ));
+    }
+
+    #[test]
     fn bad_tail_magic_rejected() {
         let artifact = CoviArtifactV2::new_empty([0u8; 16], [0u8; 16]);
         let mut bytes = artifact.serialize_empty().unwrap();
@@ -4000,6 +4164,33 @@ mod tests {
             CoviSectionKindV2::StringTable
         );
         assert_eq!(parsed.sections[0].length, 9);
+    }
+
+    #[test]
+    fn parse_section_directory_enforces_declared_section_count() {
+        let bytes = valid_section_directory_bytes();
+        let header = section_directory_header(1, COVI_SECTION_ENTRY_LEN as u64);
+
+        let sections = parse_section_directory(&bytes, &header, bytes.len()).unwrap();
+        assert_eq!(sections.len(), 1);
+
+        let count_mismatch = section_directory_header(2, COVI_SECTION_ENTRY_LEN as u64);
+        assert!(matches!(
+            parse_section_directory(&bytes, &count_mismatch, bytes.len()),
+            Err(CoveError::BadCovi)
+        ));
+    }
+
+    #[test]
+    fn parse_section_directory_rejects_trailing_directory_bytes() {
+        let mut bytes = valid_section_directory_bytes();
+        bytes.insert(COVI_SECTION_ENTRY_LEN, 0);
+        let header = section_directory_header(1, COVI_SECTION_ENTRY_LEN as u64 + 1);
+
+        assert!(matches!(
+            parse_section_directory(&bytes, &header, bytes.len()),
+            Err(CoveError::BadCovi)
+        ));
     }
 
     #[test]

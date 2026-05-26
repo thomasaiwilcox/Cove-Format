@@ -1,0 +1,6 @@
+{
+  "needles": [
+    "cargo run -p missing-cli --bin missing-cli"
+  ],
+  "op": "release_gate_contains"
+}

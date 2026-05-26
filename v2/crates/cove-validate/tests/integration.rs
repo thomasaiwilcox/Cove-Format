@@ -1,12 +1,19 @@
 use cove_core::{
-    checksum,
+    checksum, compression,
     constants::{
-        PrimaryProfile, SectionKind, FEATURE_COLUMN_DOMAINS, FEATURE_ENGINE_PROFILE,
-        FEATURE_FILE_DICTIONARY, FEATURE_HARBOR_PROFILE, FEATURE_OBJECT_PROFILE,
-        FEATURE_REDACTIONS, FEATURE_TABLE_PROFILE, FEATURE_TRUST_CHAIN,
+        CoveEncodingKind, CoveLogicalType, CovePhysicalKind, PrimaryProfile, SectionKind,
+        FEATURE_COLUMN_DOMAINS, FEATURE_ENGINE_PROFILE, FEATURE_FILE_DICTIONARY,
+        FEATURE_HARBOR_PROFILE, FEATURE_LAYOUT_PLAN, FEATURE_OBJECT_PROFILE, FEATURE_REDACTIONS,
+        FEATURE_RUNTIME_COMPATIBILITY_HINTS, FEATURE_TABLE_PROFILE, FEATURE_TRUST_CHAIN,
     },
+    page::{ColumnPageIndexEntryV1, COLUMN_PAGE_INDEX_ENTRY_LEN},
+    reader,
+    segment::{RowMorselEntryV1, TableSegmentHeaderV1, ROW_MORSEL_ENTRY_LEN},
+    table::{ColumnEntry, TableCatalog, TableEntry},
     writer::{MinimalCoveWriter, ScanProfileCoveWriter, ScanSegment, SectionPayload},
 };
+use cove_layout::{LayoutPlanHeaderV2, LayoutPlanNodeV2, LayoutPlanV2};
+use cove_runtime::{RuntimeCompatibilityHintV2, RuntimeHintKindV2};
 use std::io::Write;
 
 fn write_temp_file(name: &str, bytes: &[u8]) -> std::path::PathBuf {
@@ -32,6 +39,12 @@ fn reject_fixture(name: &str) -> std::path::PathBuf {
         .join(name)
 }
 
+fn runtime_fixture(name: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../conformance/runtime")
+        .join(name)
+}
+
 fn run_validate(path: &std::path::Path, semantic: bool) -> std::process::Output {
     let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_cove-validate"));
     if semantic {
@@ -50,6 +63,131 @@ fn run_validate_json_explain(path: &std::path::Path, semantic: bool) -> std::pro
         .arg(path)
         .output()
         .unwrap()
+}
+
+fn run_validate_with_args(path: &std::path::Path, args: &[&str]) -> std::process::Output {
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_cove-validate"));
+    for arg in args {
+        cmd.arg(arg);
+    }
+    cmd.arg("--json").arg(path).output().unwrap()
+}
+
+fn one_column_two_morsel_scan_file() -> Vec<u8> {
+    let catalog = TableCatalog {
+        flags: 0,
+        tables: vec![TableEntry {
+            table_id: 1,
+            namespace: "public".into(),
+            name: "events".into(),
+            row_count: 2,
+            primary_sort_key_count: 0,
+            clustering_key_count: 0,
+            flags: 0,
+            columns: vec![ColumnEntry {
+                column_id: 1,
+                name: "id".into(),
+                logical: CoveLogicalType::Int64,
+                physical: CovePhysicalKind::NumCode,
+                nullable: false,
+                sort_order: 0,
+                collation_id: 0,
+                precision: 0,
+                scale: 0,
+                flags: 0,
+            }],
+        }],
+    };
+    let mut segment = ScanSegment::new(1, 0, 0, 2, 1);
+    segment.morsel_row_count = 1;
+    segment.set_column_pages(
+        1,
+        vec![
+            cove_core::writer::ScanPageSpec::new(1, 1u64.to_le_bytes().to_vec())
+                .with_encoding_root(CoveEncodingKind::NumCode as u32),
+            cove_core::writer::ScanPageSpec::new(1, 2u64.to_le_bytes().to_vec())
+                .with_encoding_root(CoveEncodingKind::NumCode as u32),
+        ],
+    );
+    let mut writer = ScanProfileCoveWriter::new(catalog);
+    writer.push_segment(segment);
+    writer.write().unwrap()
+}
+
+fn rewrite_first_segment_data<F>(bytes: Vec<u8>, mut mutate: F) -> Vec<u8>
+where
+    F: FnMut(&mut Vec<u8>),
+{
+    let validated = reader::validate_bytes(&bytes).unwrap();
+    let mut writer = MinimalCoveWriter::new();
+    writer.created_at_us = validated.header.created_at_us;
+    writer.file_id = validated.header.file_id;
+    writer.producer_scope_id = validated.header.producer_scope_id;
+    writer.producer_scope_kind = validated.header.producer_scope_kind;
+    writer.primary_profile = validated.header.primary_profile;
+    writer.required_features = validated.header.required_features;
+    writer.optional_features = validated.header.optional_features;
+    writer.metadata_json = validated.footer.metadata_json.clone();
+
+    let mut mutated = false;
+    for entry in &validated.footer.sections {
+        let mut data = compression::section_payload(&bytes, entry)
+            .unwrap()
+            .into_owned();
+        if !mutated && entry.section_kind == SectionKind::TableSegmentData as u16 {
+            mutate(&mut data);
+            mutated = true;
+        }
+        writer.sections.push(SectionPayload {
+            section_kind: entry.section_kind,
+            profile: entry.profile,
+            flags: entry.flags,
+            item_count: entry.item_count,
+            row_count: entry.row_count,
+            compression: entry.compression,
+            alignment_log2: entry.alignment_log2,
+            required_features: entry.required_features,
+            optional_features: entry.optional_features,
+            data,
+        });
+    }
+    assert!(
+        mutated,
+        "fixture should contain a table segment data section"
+    );
+    writer.write().unwrap()
+}
+
+fn set_morsel_and_page_ids(segment_data: &mut [u8], ids: &[u32]) {
+    let header = TableSegmentHeaderV1::parse(segment_data).unwrap();
+    assert_eq!(header.morsel_count as usize, ids.len());
+    let morsel_dir = header.morsel_directory_offset as usize;
+    for (index, morsel_id) in ids.iter().copied().enumerate() {
+        let offset = morsel_dir + index * ROW_MORSEL_ENTRY_LEN;
+        let mut entry = RowMorselEntryV1::parse(&segment_data[offset..]).unwrap();
+        entry.morsel_id = morsel_id;
+        segment_data[offset..offset + ROW_MORSEL_ENTRY_LEN].copy_from_slice(&entry.serialize());
+    }
+    let page_index = header.page_index_offset as usize;
+    for (index, morsel_id) in ids.iter().copied().enumerate() {
+        let offset = page_index + index * COLUMN_PAGE_INDEX_ENTRY_LEN;
+        let mut page = ColumnPageIndexEntryV1::parse(&segment_data[offset..]).unwrap();
+        page.morsel_id = morsel_id;
+        segment_data[offset..offset + COLUMN_PAGE_INDEX_ENTRY_LEN]
+            .copy_from_slice(&page.serialize());
+    }
+}
+
+fn duplicate_second_page_morsel_ref(segment_data: &mut [u8]) {
+    let header = TableSegmentHeaderV1::parse(segment_data).unwrap();
+    assert!(header.morsel_count >= 2);
+    let page_index = header.page_index_offset as usize;
+    let first = ColumnPageIndexEntryV1::parse(&segment_data[page_index..]).unwrap();
+    let second_offset = page_index + COLUMN_PAGE_INDEX_ENTRY_LEN;
+    let mut second = ColumnPageIndexEntryV1::parse(&segment_data[second_offset..]).unwrap();
+    second.morsel_id = first.morsel_id;
+    segment_data[second_offset..second_offset + COLUMN_PAGE_INDEX_ENTRY_LEN]
+        .copy_from_slice(&second.serialize());
 }
 
 fn dictionary_index_bytes(redacted: bool) -> Vec<u8> {
@@ -437,6 +575,32 @@ fn semantic_cli_accepts_scan_profile_writer_file() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success(), "{stdout}");
     assert!(stdout.contains("\"ok\":true"));
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn semantic_cli_accepts_sparse_morsel_ids_with_exact_page_coverage() {
+    let bytes = rewrite_first_segment_data(one_column_two_morsel_scan_file(), |data| {
+        set_morsel_and_page_ids(data, &[10, 20]);
+    });
+    let path = write_temp_file("sparse_morsel_ids", &bytes);
+    let output = run_validate(&path, true);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+    assert!(stdout.contains("\"ok\":true"));
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn semantic_cli_rejects_duplicate_page_morsel_refs() {
+    let bytes = rewrite_first_segment_data(one_column_two_morsel_scan_file(), |data| {
+        duplicate_second_page_morsel_ref(data);
+    });
+    let path = write_temp_file("duplicate_page_morsel_refs", &bytes);
+    let output = run_validate(&path, true);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!output.status.success(), "{stdout}");
+    assert!(stdout.contains("\"ok\":false"), "{stdout}");
     let _ = std::fs::remove_file(&path);
 }
 
@@ -852,5 +1016,235 @@ fn semantic_cli_rejects_bad_table_segment_payload() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(!output.status.success());
     assert!(stdout.contains("COVE_E_SEGMENT_CORRUPT"));
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn requested_layout_profile_rejects_bad_layout_authority() {
+    let path = write_temp_file(
+        "bad_layout_authority",
+        &scan_file_with_bad_layout_authority(),
+    );
+    let requested_profile = (PrimaryProfile::LayoutPlanning as u8).to_string();
+    let output = run_validate_with_args(&path, &["--requested-profile", &requested_profile]);
+    assert!(!output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("COVE_E_BAD_LAYOUT_PLAN"));
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn requested_runtime_operation_accepts_supported_required_hint_without_semantic_flag() {
+    let path = write_temp_file(
+        "runtime_required_supported",
+        &cove_with_required_runtime_hint("org.cove", "datafusion"),
+    );
+    let output = run_validate_with_args(
+        &path,
+        &["--requested-operation", "runtime_adapter_selection"],
+    );
+    assert!(output.status.success());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn requested_runtime_operation_rejects_unsupported_required_hint_without_semantic_flag() {
+    let path = write_temp_file(
+        "runtime_required_unsupported",
+        &cove_with_required_runtime_hint("example.invalid", "not-registered"),
+    );
+    let output = run_validate_with_args(
+        &path,
+        &["--requested-operation", "runtime_adapter_selection"],
+    );
+    assert!(!output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("COVE_E_RUNTIME_HINT_UNSUPPORTED"));
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn requested_table_scan_rejects_cove_t_semantic_error_without_semantic_flag() {
+    let path = reject_fixture("cove_t_filecode_missing_dictionary.cove");
+    let output = run_validate_with_args(&path, &["--requested-operation", "table_scan"]);
+    assert!(!output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("COVE_E_BAD_FILECODE"), "{stdout}");
+}
+
+#[test]
+fn structural_validation_still_ignores_required_runtime_hint() {
+    let path = runtime_fixture("runtime_hints_embedded_required_unsupported_reject.cove");
+    let output = run_validate(&path, false);
+    assert!(output.status.success());
+}
+
+fn scan_file_with_bad_layout_authority() -> Vec<u8> {
+    let catalog = TableCatalog {
+        flags: 0,
+        tables: vec![TableEntry {
+            table_id: 1,
+            namespace: "public".into(),
+            name: "events".into(),
+            row_count: 2,
+            primary_sort_key_count: 0,
+            clustering_key_count: 0,
+            flags: 0,
+            columns: vec![ColumnEntry {
+                column_id: 1,
+                name: "id".into(),
+                logical: CoveLogicalType::Int64,
+                physical: CovePhysicalKind::NumCode,
+                nullable: false,
+                sort_order: 0,
+                collation_id: 0,
+                precision: 0,
+                scale: 0,
+                flags: 0,
+            }],
+        }],
+    };
+    let mut segment = ScanSegment::new(1, 0, 0, 2, 1);
+    segment.morsel_row_count = 1;
+    segment.set_column_pages(
+        1,
+        vec![
+            cove_core::writer::ScanPageSpec::new(1, 1u64.to_le_bytes().to_vec())
+                .with_encoding_root(CoveEncodingKind::NumCode as u32),
+            cove_core::writer::ScanPageSpec::new(1, 2u64.to_le_bytes().to_vec())
+                .with_encoding_root(CoveEncodingKind::NumCode as u32),
+        ],
+    );
+    let mut writer = ScanProfileCoveWriter::new(catalog);
+    writer.push_segment(segment);
+    writer.push_extra_section(SectionPayload {
+        section_kind: SectionKind::LayoutPlan as u16,
+        profile: PrimaryProfile::LayoutPlanning as u8,
+        flags: 0,
+        item_count: 1,
+        row_count: 0,
+        compression: 0,
+        alignment_log2: 0,
+        required_features: 0,
+        optional_features: FEATURE_LAYOUT_PLAN,
+        data: bad_layout_authority_payload(),
+    });
+    writer.write().unwrap()
+}
+
+fn bad_layout_authority_payload() -> Vec<u8> {
+    LayoutPlanV2 {
+        header: LayoutPlanHeaderV2 {
+            layout_id: 1,
+            node_count: 2,
+            root_node_id: 1,
+            flags: 0,
+            checksum: 0,
+        },
+        nodes: vec![
+            LayoutPlanNodeV2 {
+                node_id: 1,
+                parent_node_id: u32::MAX,
+                node_kind: 0,
+                flags: 0,
+                table_id: u32::MAX,
+                column_id: u32::MAX,
+                segment_id: u32::MAX,
+                first_morsel_id: 0,
+                morsel_count: 0,
+                row_start: 0,
+                row_count: 2,
+                section_id: 0,
+                cluster_id: 0,
+                first_child_index: 1,
+                child_count: 1,
+                stats_ref: u32::MAX,
+                split_ref: u32::MAX,
+                checksum: 0,
+            },
+            LayoutPlanNodeV2 {
+                node_id: 2,
+                parent_node_id: 1,
+                node_kind: 1,
+                flags: 0,
+                table_id: 99,
+                column_id: u32::MAX,
+                segment_id: u32::MAX,
+                first_morsel_id: 0,
+                morsel_count: 0,
+                row_start: 0,
+                row_count: 2,
+                section_id: 0,
+                cluster_id: 0,
+                first_child_index: 0,
+                child_count: 0,
+                stats_ref: u32::MAX,
+                split_ref: u32::MAX,
+                checksum: 0,
+            },
+        ],
+    }
+    .serialize()
+    .unwrap()
+}
+
+fn cove_with_required_runtime_hint(namespace: &str, name: &str) -> Vec<u8> {
+    let mut writer = MinimalCoveWriter::new();
+    writer.required_features = FEATURE_TABLE_PROFILE;
+    writer.optional_features = FEATURE_RUNTIME_COMPATIBILITY_HINTS;
+    writer.sections.push(SectionPayload {
+        section_kind: SectionKind::RuntimeCompatibilityHints as u16,
+        profile: PrimaryProfile::RuntimeCompatibility as u8,
+        flags: 0,
+        item_count: 1,
+        row_count: 0,
+        compression: 0,
+        alignment_log2: 0,
+        required_features: 0,
+        optional_features: FEATURE_RUNTIME_COMPATIBILITY_HINTS,
+        data: RuntimeCompatibilityHintV2 {
+            hint_id: 1,
+            hint_kind: RuntimeHintKindV2::EngineAdapter,
+            required: true,
+            flags: 0,
+            namespace: namespace.into(),
+            name: name.into(),
+            version_major: 1,
+            version_minor: 0,
+            payload_ref: u32::MAX,
+            checksum: 0,
+        }
+        .serialize()
+        .unwrap(),
+    });
+    writer.write().unwrap()
+}
+
+#[test]
+fn requested_runtime_operation_skips_unrelated_optional_sections_without_semantic_flag() {
+    let mut writer = MinimalCoveWriter::new();
+    writer.primary_profile = PrimaryProfile::Mixed as u8;
+    writer.optional_features = FEATURE_ENGINE_PROFILE;
+    writer.sections.push(SectionPayload {
+        section_kind: SectionKind::ExecutionCodeDescriptor as u16,
+        profile: 4,
+        flags: 0,
+        item_count: 1,
+        row_count: 0,
+        compression: 0,
+        alignment_log2: 0,
+        required_features: 0,
+        optional_features: FEATURE_ENGINE_PROFILE,
+        data: invalid_execution_descriptor_payload(),
+    });
+    let path = write_temp_file(
+        "runtime_request_unrelated_optional_bad",
+        &writer.write().unwrap(),
+    );
+    let output = run_validate_with_args(
+        &path,
+        &["--requested-operation", "runtime_adapter_selection"],
+    );
+    assert!(output.status.success());
     let _ = std::fs::remove_file(&path);
 }

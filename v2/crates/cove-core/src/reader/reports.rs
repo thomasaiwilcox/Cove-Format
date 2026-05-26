@@ -1,4 +1,4 @@
-use crate::{feature_scope::FeatureUseRequestV2, CoveError};
+use crate::{feature_binding::OperationKindV2, feature_scope::FeatureUseRequestV2, CoveError};
 
 /// Options controlling the depth of validation.
 #[derive(Debug, Clone)]
@@ -86,6 +86,22 @@ pub struct ValidationReport {
     pub ignored_optional_sections: Vec<IgnoredOptionalSection>,
 }
 
+/// Optional-profile payload validator used by feature-use validation.
+///
+/// `cove-core` can identify when requested feature use depends on embedded
+/// optional profile sections, but it intentionally does not depend on the
+/// layout, coverage, runtime, or COVE-I crates that parse those payloads.
+pub trait OptionalProfilePayloadValidator {
+    fn validate_optional_profile_sections(
+        &self,
+        data: &[u8],
+        report: &ValidationReport,
+        optional_pushdown_policy: OptionalPushdownPolicy,
+        feature_use: Option<&FeatureUseRequestV2>,
+        only_required_for_feature_use: bool,
+    ) -> Result<(), CoveError>;
+}
+
 /// Validate a COVE file with configurable options.
 ///
 /// Always performs structural validation (equivalent to [`super::validate_bytes`]).
@@ -95,6 +111,14 @@ pub struct ValidationReport {
 pub fn validate_bytes_with_options(
     data: &[u8],
     opts: ValidationOptions,
+) -> Result<ValidationReport, CoveError> {
+    validate_bytes_with_options_inner(data, opts, None)
+}
+
+fn validate_bytes_with_options_inner(
+    data: &[u8],
+    opts: ValidationOptions,
+    request: Option<&FeatureUseRequestV2>,
 ) -> Result<ValidationReport, CoveError> {
     let (validated, mut ignored_optional_sections) =
         super::validate_bytes_with_optional_pushdown_policy(data, opts.optional_pushdown_policy)?;
@@ -112,7 +136,37 @@ pub fn validate_bytes_with_options(
     ];
 
     if !opts.semantic {
-        push_skipped_semantic_stages(&mut stages, opts.verify_digests);
+        push_stage(
+            &mut stages,
+            ValidationStage::SharedSemantic,
+            ValidationStageStatus::Skipped,
+            0,
+        );
+        if opts.verify_digests {
+            let checked = super::digest_verification::verify_digest_manifests(
+                data,
+                &validated.footer,
+                &ignored_optional_sections,
+            )?;
+            push_stage(
+                &mut stages,
+                ValidationStage::DigestVerification,
+                ValidationStageStatus::Checked,
+                checked,
+            );
+        } else {
+            push_stage(
+                &mut stages,
+                ValidationStage::DigestVerification,
+                ValidationStageStatus::Skipped,
+                0,
+            );
+        }
+        if let Some(request) = request {
+            push_requested_profile_stages(data, &validated, &mut stages, request)?;
+        } else {
+            push_skipped_profile_stages(&mut stages);
+        }
         return Ok(ValidationReport {
             validated,
             semantic_checked: false,
@@ -158,10 +212,10 @@ pub fn validate_bytes_with_options(
         &mut stages,
         &mut ignored_optional_sections,
     )?;
-    super::profile_validators::validate_cove_o_semantics(data, &validated, &mut stages)?;
-    super::profile_validators::validate_cove_e_semantics(data, &validated, &mut stages)?;
-    super::profile_validators::validate_cove_h_semantics(data, &validated, &mut stages)?;
-    super::profile_validators::validate_cove_map_semantics(data, &validated, &mut stages)?;
+    super::profile_validators::validate_cove_o_semantics(data, &validated, &mut stages, request)?;
+    super::profile_validators::validate_cove_e_semantics(data, &validated, &mut stages, request)?;
+    super::profile_validators::validate_cove_h_semantics(data, &validated, &mut stages, request)?;
+    super::profile_validators::validate_cove_map_semantics(data, &validated, &mut stages, request)?;
 
     Ok(ValidationReport {
         validated,
@@ -177,10 +231,184 @@ pub fn validate_bytes_for_feature_use(
     opts: ValidationOptions,
     request: FeatureUseRequestV2,
 ) -> Result<ValidationReport, CoveError> {
-    let report = validate_bytes_with_options(data, opts)?;
+    if request_is_ordinary_table_scan(&request) {
+        return validate_bytes_for_ordinary_table_scan(data, opts, request);
+    }
+    let optional_pushdown_policy = opts.optional_pushdown_policy;
+    let report = validate_bytes_with_options_inner(data, opts, Some(&request))?;
+    for ignored in &report.ignored_optional_sections {
+        if super::profile_validators::ignored_section_required_for_feature_use(ignored, &request) {
+            return Err(CoveError::ChecksumMismatch);
+        }
+    }
+    let scope_table = super::feature_scope_table_for_feature_use(data, &report.validated)?;
+    scope_table.reject_unknowns_for_request(&request)?;
+    fail_closed_required_optional_profile_sections(&report, optional_pushdown_policy, &request)?;
+    Ok(report)
+}
+
+pub fn validate_bytes_for_ordinary_table_scan(
+    data: &[u8],
+    opts: ValidationOptions,
+    request: FeatureUseRequestV2,
+) -> Result<ValidationReport, CoveError> {
+    let optional_pushdown_policy = opts.optional_pushdown_policy;
+    let (validated, mut ignored_optional_sections) =
+        super::validate_bytes_with_optional_pushdown_policy(data, opts.optional_pushdown_policy)?;
+    let mut stages = vec![
+        ValidationStageReport {
+            stage: ValidationStage::Bootstrap,
+            status: ValidationStageStatus::Checked,
+            sections_checked: 0,
+        },
+        ValidationStageReport {
+            stage: ValidationStage::Structural,
+            status: ValidationStageStatus::Checked,
+            sections_checked: validated.footer.sections.len() as u32,
+        },
+    ];
+
+    let mut dict_entry_count: Option<u32> = None;
+    super::profile_validators::validate_shared_semantics(
+        data,
+        &validated,
+        &opts,
+        &mut dict_entry_count,
+        &mut stages,
+        &mut ignored_optional_sections,
+    )?;
+    if opts.verify_digests {
+        let checked = super::digest_verification::verify_digest_manifests(
+            data,
+            &validated.footer,
+            &ignored_optional_sections,
+        )?;
+        push_stage(
+            &mut stages,
+            ValidationStage::DigestVerification,
+            ValidationStageStatus::Checked,
+            checked,
+        );
+    } else {
+        push_stage(
+            &mut stages,
+            ValidationStage::DigestVerification,
+            ValidationStageStatus::Skipped,
+            0,
+        );
+    }
+    super::profile_validators::validate_cove_t_semantics_with_registered_page_scope(
+        data,
+        &validated,
+        &opts,
+        &mut stages,
+        &mut ignored_optional_sections,
+        super::profile_validators::RegisteredPageValidationScope::RequestedPages(&request),
+    )?;
+    super::profile_validators::validate_cove_o_semantics(
+        data,
+        &validated,
+        &mut stages,
+        Some(&request),
+    )?;
+    super::profile_validators::validate_cove_e_semantics(
+        data,
+        &validated,
+        &mut stages,
+        Some(&request),
+    )?;
+    super::profile_validators::validate_cove_h_semantics(
+        data,
+        &validated,
+        &mut stages,
+        Some(&request),
+    )?;
+    super::profile_validators::validate_cove_map_semantics(
+        data,
+        &validated,
+        &mut stages,
+        Some(&request),
+    )?;
+
+    let report = ValidationReport {
+        validated,
+        semantic_checked: true,
+        dict_entry_count,
+        stages,
+        ignored_optional_sections,
+    };
+    for ignored in &report.ignored_optional_sections {
+        if super::profile_validators::ignored_section_required_for_feature_use(ignored, &request) {
+            return Err(CoveError::ChecksumMismatch);
+        }
+    }
     let scope_table = super::feature_scope_table_for(data, &report.validated)?;
     scope_table.reject_unknowns_for_request(&request)?;
+    fail_closed_required_optional_profile_sections(&report, optional_pushdown_policy, &request)?;
     Ok(report)
+}
+
+pub fn validate_bytes_for_feature_use_with_optional_profile_validator<V>(
+    data: &[u8],
+    opts: ValidationOptions,
+    request: FeatureUseRequestV2,
+    validator: &V,
+) -> Result<ValidationReport, CoveError>
+where
+    V: OptionalProfilePayloadValidator + ?Sized,
+{
+    let optional_pushdown_policy = opts.optional_pushdown_policy;
+    if request_is_ordinary_table_scan(&request) {
+        let report = validate_bytes_for_ordinary_table_scan(data, opts, request.clone())?;
+        validator.validate_optional_profile_sections(
+            data,
+            &report,
+            optional_pushdown_policy,
+            Some(&request),
+            !report.semantic_checked,
+        )?;
+        return Ok(report);
+    }
+    let report = validate_bytes_with_options_inner(data, opts, Some(&request))?;
+    for ignored in &report.ignored_optional_sections {
+        if super::profile_validators::ignored_section_required_for_feature_use(ignored, &request) {
+            return Err(CoveError::ChecksumMismatch);
+        }
+    }
+    let scope_table = super::feature_scope_table_for_feature_use(data, &report.validated)?;
+    scope_table.reject_unknowns_for_request(&request)?;
+    validator.validate_optional_profile_sections(
+        data,
+        &report,
+        optional_pushdown_policy,
+        Some(&request),
+        !report.semantic_checked,
+    )?;
+    Ok(report)
+}
+
+fn request_is_ordinary_table_scan(request: &FeatureUseRequestV2) -> bool {
+    request.requested_operation == Some(OperationKindV2::OrdinaryTableScan)
+}
+
+fn fail_closed_required_optional_profile_sections(
+    report: &ValidationReport,
+    _optional_pushdown_policy: OptionalPushdownPolicy,
+    request: &FeatureUseRequestV2,
+) -> Result<(), CoveError> {
+    for entry in &report.validated.footer.sections {
+        let Some(kind) = crate::constants::SectionKind::from_u16(entry.section_kind) else {
+            continue;
+        };
+        if super::profile_validators::is_embedded_optional_profile_section(kind)
+            && super::profile_validators::section_entry_required_for_feature_use(entry, request)
+        {
+            return Err(CoveError::UnsupportedEncoding(
+                "requested optional profile payload requires a semantic validator".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn push_stage(
@@ -196,23 +424,7 @@ pub(super) fn push_stage(
     });
 }
 
-fn push_skipped_semantic_stages(stages: &mut Vec<ValidationStageReport>, verify_digests: bool) {
-    push_stage(
-        stages,
-        ValidationStage::SharedSemantic,
-        ValidationStageStatus::Skipped,
-        0,
-    );
-    push_stage(
-        stages,
-        ValidationStage::DigestVerification,
-        if verify_digests {
-            ValidationStageStatus::Checked
-        } else {
-            ValidationStageStatus::Skipped
-        },
-        0,
-    );
+fn push_skipped_profile_stages(stages: &mut Vec<ValidationStageReport>) {
     for stage in [
         ValidationStage::CoveTable,
         ValidationStage::CoveObject,
@@ -222,4 +434,79 @@ fn push_skipped_semantic_stages(stages: &mut Vec<ValidationStageReport>, verify_
     ] {
         push_stage(stages, stage, ValidationStageStatus::Skipped, 0);
     }
+}
+
+fn push_requested_profile_stages(
+    data: &[u8],
+    validated: &super::ValidatedCoveFile,
+    stages: &mut Vec<ValidationStageReport>,
+    request: &FeatureUseRequestV2,
+) -> Result<(), CoveError> {
+    push_stage(
+        stages,
+        ValidationStage::CoveTable,
+        ValidationStageStatus::Skipped,
+        0,
+    );
+    if super::profile_validators::request_requires_object_profile(request) {
+        super::profile_validators::validate_cove_o_semantics(
+            data,
+            validated,
+            stages,
+            Some(request),
+        )?;
+    } else {
+        push_stage(
+            stages,
+            ValidationStage::CoveObject,
+            ValidationStageStatus::Skipped,
+            0,
+        );
+    }
+    if super::profile_validators::request_requires_engine_profile(request) {
+        super::profile_validators::validate_cove_e_semantics(
+            data,
+            validated,
+            stages,
+            Some(request),
+        )?;
+    } else {
+        push_stage(
+            stages,
+            ValidationStage::CoveEngine,
+            ValidationStageStatus::Skipped,
+            0,
+        );
+    }
+    if super::profile_validators::request_requires_harbor_profile(request) {
+        super::profile_validators::validate_cove_h_semantics(
+            data,
+            validated,
+            stages,
+            Some(request),
+        )?;
+    } else {
+        push_stage(
+            stages,
+            ValidationStage::CoveHarbor,
+            ValidationStageStatus::Skipped,
+            0,
+        );
+    }
+    if super::profile_validators::request_requires_map_profile(request) {
+        super::profile_validators::validate_cove_map_semantics(
+            data,
+            validated,
+            stages,
+            Some(request),
+        )?;
+    } else {
+        push_stage(
+            stages,
+            ValidationStage::CoveMap,
+            ValidationStageStatus::Skipped,
+            0,
+        );
+    }
+    Ok(())
 }

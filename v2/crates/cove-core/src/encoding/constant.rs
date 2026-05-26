@@ -35,6 +35,10 @@ impl ConstantPayload {
         out[8..16].copy_from_slice(&self.row_count.to_le_bytes());
         out
     }
+
+    pub fn raw_value_bits(&self) -> u64 {
+        u64::from_le_bytes(self.value.to_le_bytes())
+    }
 }
 
 pub struct Constant;

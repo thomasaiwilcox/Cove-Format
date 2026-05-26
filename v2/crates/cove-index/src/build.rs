@@ -1,9 +1,10 @@
-use std::collections::BTreeMap;
+use std::{borrow::Cow, cmp::Ordering, collections::BTreeMap};
 
 use crate::{
-    execution::CoviAggregateKindV2, CoviAggregateAnswerBlockHeaderV2, CoviAggregateAnswerBlockV2,
-    CoviAggregateAnswerV2, CoviArtifactV2, CoviComparatorKindV2, CoviEntryBlockHeaderV2,
-    CoviEntryBlockV2, CoviIndexEntryV2, CoviIndexKindV2, CoviIndexRootV2, CoviIndexedTargetKindV2,
+    execution::{compare_key_bytes_for_order, CoviAggregateKindV2, CoviLookupComparatorContextV2},
+    CoviAggregateAnswerBlockHeaderV2, CoviAggregateAnswerBlockV2, CoviAggregateAnswerV2,
+    CoviArtifactV2, CoviComparatorKindV2, CoviEntryBlockHeaderV2, CoviEntryBlockV2,
+    CoviIndexEntryV2, CoviIndexKindV2, CoviIndexRootV2, CoviIndexedTargetKindV2,
     CoviKeyBlockHeaderV2, CoviKeyBlockV2, CoviKeyEncodingKindV2, CoviPostingRepresentationV2,
     CoviPostingsBlockHeaderV2, CoviPostingsBlockV2, CoviPostingsHeaderV2, CoviReferencedFileV2,
     CoviRowRangePostingV2, CoviSectionKindV2, CoviSectionPayloadV2, CoviSnapshotValidityV2,
@@ -14,9 +15,10 @@ use cove_core::{
     canonical::CanonicalValue,
     checksum,
     compression::{column_page_payload, section_payload},
-    constants::{CoveLogicalType, CovePhysicalKind, DigestAlgorithm, SectionKind},
+    constants::{CoveLogicalType, CovePhysicalKind, DigestAlgorithm, SectionKind, ValueTag},
     dictionary::DictionaryValue,
     digest::compute_digest,
+    materialize_stats_only_constant_page_payload,
     mount::{mount_cove_file, MountOptions, MountedCoveFile, OutputRepresentation},
     page::{page_uses_payload_elision, ColumnPageIndex},
     page_payload::{ColumnPagePayloadV1, PageBufferKind},
@@ -25,7 +27,7 @@ use cove_core::{
     table::{ColumnEntry, TableEntry},
     types,
     validity::ValidityBitmap,
-    CoveError,
+    wire, CoveError, StatsOnlyPageMaterializationContext,
 };
 use cove_coverage::{CoverageExactnessV2, CoverageGranularityV2, CoverageProofStrengthV2};
 
@@ -70,6 +72,34 @@ struct IndexedTargetMetadata {
     property_id: u32,
     path_ref: u32,
     semantic_dimension_ref: u32,
+}
+
+type KeyPostingMap = BTreeMap<Vec<u8>, Vec<CoviRowRangePostingV2>>;
+type OrderedKeyPostings = Vec<(Vec<u8>, Vec<CoviRowRangePostingV2>)>;
+
+#[derive(Clone, Copy)]
+struct BuildBlocksParams {
+    root_id: u32,
+    logical_type: CoveLogicalType,
+    index_kind: CoviIndexKindV2,
+    key_encoding_kind: CoviKeyEncodingKindV2,
+    comparator_kind: CoviComparatorKindV2,
+    supports_range: bool,
+    null_count: u64,
+    aggregate_block_id: Option<u32>,
+}
+
+#[derive(Clone, Copy)]
+struct AggregateAnswerBlockParams<'a> {
+    root_id: u32,
+    row_count: u64,
+    null_count: u64,
+    distinct_count: u64,
+    logical_type: CoveLogicalType,
+    options: &'a CoviBuildOptions,
+    include_min_max_answers: bool,
+    min_key: Option<&'a [u8]>,
+    max_key: Option<&'a [u8]>,
 }
 
 pub fn build_covi_from_cove_bytes(
@@ -152,7 +182,7 @@ pub fn build_covi_from_cove_bytes(
     }];
     for (root_index, column) in columns.iter().enumerate() {
         let root_id = u32::try_from(root_index).map_err(|_| CoveError::ArithOverflow)?;
-        let built_index = build_column_index(
+        let mut built_index = build_column_index(
             root_id,
             input,
             &mounted,
@@ -164,8 +194,13 @@ pub fn build_covi_from_cove_bytes(
         let entry_section_id = key_section_id + 1;
         let postings_section_id = key_section_id + 2;
         let aggregate_section_id = key_section_id + 3;
+        let include_min_max_answers = options.include_index_only_min_max
+            && built_index.supports_range
+            && aggregate_min_max_answer_supported(column.logical)
+            && built_index.min_key.is_some()
+            && built_index.max_key.is_some();
         let include_aggregate_block = options.include_index_only_counts
-            || options.include_index_only_min_max
+            || include_min_max_answers
             || options.include_index_only_distinct_count
             || options.include_index_only_exists;
         let aggregate_block_section_id = if include_aggregate_block {
@@ -173,11 +208,15 @@ pub fn build_covi_from_cove_bytes(
         } else {
             u32::MAX
         };
+        if include_aggregate_block {
+            built_index.entry_block =
+                entry_block_with_aggregate_block_id(&built_index.entry_block, root_id)?;
+        }
         let target = indexed_target_metadata(options.target, table.table_id, column.column_id);
         roots.push(CoviIndexRootV2 {
             index_root_id: root_id,
             indexed_target_kind: target.indexed_target_kind,
-            index_kind: CoviIndexKindV2::Sorted,
+            index_kind: built_index.index_kind,
             coverage_granularity: CoverageGranularityV2::Morsel as u8,
             proof_strength: CoverageProofStrengthV2::ExactConservative as u8,
             exactness: CoverageExactnessV2::Exact as u8,
@@ -221,8 +260,8 @@ pub fn build_covi_from_cove_bytes(
             supports_count: u8::from(
                 options.include_index_only_counts || options.include_index_only_exists,
             ),
-            supports_min: u8::from(options.include_index_only_min_max),
-            supports_max: u8::from(options.include_index_only_min_max),
+            supports_min: u8::from(include_min_max_answers),
+            supports_max: u8::from(include_min_max_answers),
             supports_sum: 0,
             supports_distinct_count: u8::from(options.include_index_only_distinct_count),
             supports_join_coverage: 0,
@@ -262,15 +301,17 @@ pub fn build_covi_from_cove_bytes(
             },
         ]);
         if include_aggregate_block {
-            let aggregate_block = aggregate_answer_block(
+            let aggregate_block = aggregate_answer_block(AggregateAnswerBlockParams {
                 root_id,
-                table.row_count,
-                built_index.null_count,
-                built_index.distinct_count,
+                row_count: table.row_count,
+                null_count: built_index.null_count,
+                distinct_count: built_index.distinct_count,
+                logical_type: column.logical,
                 options,
-                built_index.min_key.as_deref(),
-                built_index.max_key.as_deref(),
-            )?;
+                include_min_max_answers,
+                min_key: built_index.min_key.as_deref(),
+                max_key: built_index.max_key.as_deref(),
+            })?;
             section_payloads.push(CoviSectionPayloadV2 {
                 section_id: aggregate_section_id,
                 section_kind: CoviSectionKindV2::AggregateAnswerBlock,
@@ -394,6 +435,7 @@ struct BuiltColumnIndex {
     key_block: Vec<u8>,
     entry_block: Vec<u8>,
     postings_block: Vec<u8>,
+    index_kind: CoviIndexKindV2,
     key_encoding_kind: CoviKeyEncodingKindV2,
     comparator_kind: CoviComparatorKindV2,
     supports_range: bool,
@@ -415,20 +457,30 @@ fn build_column_index(
 ) -> Result<BuiltColumnIndex, CoveError> {
     let raw_filecode_mode =
         column.physical == CovePhysicalKind::FileCode && mounted.dictionary.is_none();
-    let key_encoding_kind = if raw_filecode_mode {
+    let mut key_encoding_kind = if raw_filecode_mode {
         CoviKeyEncodingKindV2::FileCode
     } else {
         CoviKeyEncodingKindV2::CanonicalValueBytes
     };
-    let comparator_kind = if raw_filecode_mode {
+    let mut comparator_kind = if raw_filecode_mode {
         CoviComparatorKindV2::DomainRankOrdering
     } else {
         CoviComparatorKindV2::CanonicalOrdering
     };
-    let supports_range = !raw_filecode_mode;
-    let mut keys: BTreeMap<Vec<u8>, Vec<CoviRowRangePostingV2>> = BTreeMap::new();
+    let mut index_kind = if raw_filecode_mode {
+        CoviIndexKindV2::Hash
+    } else {
+        CoviIndexKindV2::Sorted
+    };
+    let mut supports_range = !raw_filecode_mode;
+    let mut keys: KeyPostingMap = BTreeMap::new();
     let mut null_count = 0u64;
     let mut rows_seen = 0u64;
+    let zone_stats_entries = mounted
+        .zone_stats
+        .iter()
+        .flat_map(|section| section.entries.iter().cloned())
+        .collect::<Vec<_>>();
 
     for section in mounted
         .footer
@@ -460,12 +512,8 @@ fn build_column_index(
             .ok_or(CoveError::ArithOverflow)?;
         let page_index = ColumnPageIndex::parse(&segment_bytes[page_index_start..page_index_end])?;
         for page in page_index.entries {
-            let morsel = segment
-                .morsels
-                .entries
-                .get(page.morsel_id as usize)
-                .ok_or(CoveError::SegmentCorrupt)?;
-            if page_uses_payload_elision(page.flags) && page.page_length == 0 {
+            let morsel = segment.morsels.morsel_by_id(page.morsel_id)?;
+            let decoded_page = if page_uses_payload_elision(page.flags) && page.page_length == 0 {
                 if page.null_count == page.row_count {
                     null_count = null_count
                         .checked_add(u64::from(page.row_count))
@@ -475,17 +523,36 @@ fn build_column_index(
                         .ok_or(CoveError::ArithOverflow)?;
                     continue;
                 }
-                return Err(CoveError::BadCovi);
-            }
-            let page_start =
-                usize::try_from(page.page_offset).map_err(|_| CoveError::OffsetRange)?;
-            let page_len = usize::try_from(page.page_length).map_err(|_| CoveError::OffsetRange)?;
-            let page_end = page_start
-                .checked_add(page_len)
-                .ok_or(CoveError::ArithOverflow)?;
-            let page_wire = &segment_bytes[page_start..page_end];
-            let decoded_page = column_page_payload(page_wire, &page)?;
-            let payload = ColumnPagePayloadV1::parse(&decoded_page)?;
+                Cow::Owned(
+                    materialize_stats_only_constant_page_payload(
+                        StatsOnlyPageMaterializationContext {
+                            table_id: Some(table.table_id),
+                            segment_id: Some(segment.header.segment_id),
+                            column_id: column.column_id,
+                            logical_type: column.logical,
+                            physical_kind: column.physical,
+                            dictionary_len: mounted
+                                .dictionary
+                                .as_ref()
+                                .map(|dictionary| dictionary.len()),
+                            zone_stats: &zone_stats_entries,
+                        },
+                        &page,
+                    )
+                    .map_err(|_| CoveError::BadCovi)?,
+                )
+            } else {
+                let page_start =
+                    usize::try_from(page.page_offset).map_err(|_| CoveError::OffsetRange)?;
+                let page_len =
+                    usize::try_from(page.page_length).map_err(|_| CoveError::OffsetRange)?;
+                let page_end = page_start
+                    .checked_add(page_len)
+                    .ok_or(CoveError::ArithOverflow)?;
+                let page_wire = &segment_bytes[page_start..page_end];
+                column_page_payload(page_wire, &page)?
+            };
+            let payload = ColumnPagePayloadV1::parse(decoded_page.as_ref())?;
             let root = payload.root_node()?;
             let values = payload.buffer_bytes(PageBufferKind::Values)?.unwrap_or(&[]);
             let validity = payload
@@ -539,29 +606,49 @@ fn build_column_index(
     if rows_seen != table.row_count {
         return Err(CoveError::BadCovi);
     }
+    if canonical_float_keys_contain_nan(column.logical, &keys)? {
+        key_encoding_kind = CoviKeyEncodingKindV2::CanonicalValueBytes;
+        comparator_kind = CoviComparatorKindV2::CanonicalEquality;
+        index_kind = CoviIndexKindV2::Hash;
+        supports_range = false;
+    }
     build_blocks_from_keys(
-        root_id,
         keys,
+        BuildBlocksParams {
+            root_id,
+            logical_type: column.logical,
+            index_kind,
+            key_encoding_kind,
+            comparator_kind,
+            supports_range,
+            null_count,
+            aggregate_block_id,
+        },
+    )
+}
+
+fn build_blocks_from_keys(
+    keys: KeyPostingMap,
+    params: BuildBlocksParams,
+) -> Result<BuiltColumnIndex, CoveError> {
+    let BuildBlocksParams {
+        root_id,
+        logical_type,
+        index_kind,
         key_encoding_kind,
         comparator_kind,
         supports_range,
         null_count,
         aggregate_block_id,
-    )
-}
-
-fn build_blocks_from_keys(
-    root_id: u32,
-    keys: BTreeMap<Vec<u8>, Vec<CoviRowRangePostingV2>>,
-    key_encoding_kind: CoviKeyEncodingKindV2,
-    comparator_kind: CoviComparatorKindV2,
-    supports_range: bool,
-    null_count: u64,
-    aggregate_block_id: Option<u32>,
-) -> Result<BuiltColumnIndex, CoveError> {
+    } = params;
     let distinct_count = u64::try_from(keys.len()).map_err(|_| CoveError::ArithOverflow)?;
-    let min_key = keys.keys().next().cloned();
-    let max_key = keys.keys().next_back().cloned();
+    let keys = order_key_items(keys, logical_type, index_kind, comparator_kind)?;
+    let min_key = supports_range
+        .then(|| keys.first().map(|(key, _)| key.clone()))
+        .flatten();
+    let max_key = supports_range
+        .then(|| keys.last().map(|(key, _)| key.clone()))
+        .flatten();
     let mut key_data = Vec::new();
     let mut entries = Vec::new();
     let mut postings = Vec::new();
@@ -676,7 +763,7 @@ fn build_blocks_from_keys(
         payload: postings_payload,
     }
     .serialize()?;
-    let max_key_ref = if distinct_count == 0 {
+    let max_key_ref = if distinct_count == 0 || !supports_range {
         u32::MAX
     } else {
         u32::try_from(distinct_count - 1).map_err(|_| CoveError::ArithOverflow)?
@@ -685,27 +772,110 @@ fn build_blocks_from_keys(
         key_block,
         entry_block,
         postings_block,
+        index_kind,
         key_encoding_kind,
         comparator_kind,
         supports_range,
         distinct_count,
         null_count,
-        min_key_ref: if distinct_count == 0 { u32::MAX } else { 0 },
+        min_key_ref: if distinct_count == 0 || !supports_range {
+            u32::MAX
+        } else {
+            0
+        },
         max_key_ref,
         min_key,
         max_key,
     })
 }
 
-fn aggregate_answer_block(
-    root_id: u32,
-    row_count: u64,
-    null_count: u64,
-    distinct_count: u64,
-    options: &CoviBuildOptions,
-    min_key: Option<&[u8]>,
-    max_key: Option<&[u8]>,
-) -> Result<Vec<u8>, CoveError> {
+fn canonical_float_keys_contain_nan(
+    logical_type: CoveLogicalType,
+    keys: &KeyPostingMap,
+) -> Result<bool, CoveError> {
+    if !matches!(
+        logical_type,
+        CoveLogicalType::Float32 | CoveLogicalType::Float64
+    ) {
+        return Ok(false);
+    }
+    for key in keys.keys() {
+        if canonical_float_key_is_nan(logical_type, key)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn canonical_float_key_is_nan(
+    logical_type: CoveLogicalType,
+    key: &[u8],
+) -> Result<bool, CoveError> {
+    let (tag, consumed) = wire::decode_u64_leb128(key)?;
+    let tag = u16::try_from(tag)
+        .ok()
+        .and_then(ValueTag::from_u16)
+        .ok_or(CoveError::BadCovi)?;
+    let payload = &key[consumed..];
+    match (logical_type, tag, payload.len()) {
+        (CoveLogicalType::Float32, ValueTag::Float32Bits, 4) => {
+            let bits = u32::from_le_bytes(payload.try_into().unwrap());
+            Ok(f32::from_bits(bits).is_nan())
+        }
+        (CoveLogicalType::Float64, ValueTag::Float64Bits, 8) => {
+            let bits = u64::from_le_bytes(payload.try_into().unwrap());
+            Ok(f64::from_bits(bits).is_nan())
+        }
+        _ => Err(CoveError::BadCovi),
+    }
+}
+
+fn order_key_items(
+    keys: KeyPostingMap,
+    logical_type: CoveLogicalType,
+    index_kind: CoviIndexKindV2,
+    comparator_kind: CoviComparatorKindV2,
+) -> Result<OrderedKeyPostings, CoveError> {
+    let items = keys.into_iter().collect::<Vec<_>>();
+    if !matches!(
+        index_kind,
+        CoviIndexKindV2::Sorted | CoviIndexKindV2::SparseSorted
+    ) {
+        return Ok(items);
+    }
+    let context = CoviLookupComparatorContextV2::default();
+    let mut sorted = OrderedKeyPostings::with_capacity(items.len());
+    'items: for item in items {
+        for index in 0..sorted.len() {
+            if compare_key_bytes_for_order(
+                comparator_kind as u16,
+                Some(logical_type),
+                &context,
+                &item.0,
+                &sorted[index].0,
+            )? == Ordering::Less
+            {
+                sorted.insert(index, item);
+                continue 'items;
+            }
+        }
+        sorted.push(item);
+    }
+    Ok(sorted)
+}
+
+fn aggregate_answer_block(params: AggregateAnswerBlockParams<'_>) -> Result<Vec<u8>, CoveError> {
+    let AggregateAnswerBlockParams {
+        root_id,
+        row_count,
+        null_count,
+        distinct_count,
+        logical_type,
+        options,
+        include_min_max_answers,
+        min_key,
+        max_key,
+    } = params;
     let non_null_count = row_count
         .checked_sub(null_count)
         .ok_or(CoveError::ArithOverflow)?;
@@ -735,7 +905,13 @@ fn aggregate_answer_block(
             None,
         )?;
     }
-    if options.include_index_only_min_max {
+    if include_min_max_answers {
+        let min_payload = min_key
+            .map(|key| canonical_payload_for_min_max_answer(logical_type, key))
+            .transpose()?;
+        let max_payload = max_key
+            .map(|key| canonical_payload_for_min_max_answer(logical_type, key))
+            .transpose()?;
         push_aggregate_answer(
             &mut answers,
             &mut payload,
@@ -744,7 +920,7 @@ fn aggregate_answer_block(
             row_count,
             null_count,
             non_null_count,
-            min_key,
+            min_payload.as_deref(),
         )?;
         push_aggregate_answer(
             &mut answers,
@@ -754,19 +930,20 @@ fn aggregate_answer_block(
             row_count,
             null_count,
             non_null_count,
-            max_key,
+            max_payload.as_deref(),
         )?;
     }
     if options.include_index_only_distinct_count {
+        let distinct_payload = distinct_count.to_le_bytes();
         push_aggregate_answer(
             &mut answers,
             &mut payload,
             root_id,
             CoviAggregateKindV2::DistinctCount,
-            distinct_count,
-            0,
-            distinct_count,
-            None,
+            row_count,
+            null_count,
+            non_null_count,
+            Some(&distinct_payload),
         )?;
     }
     CoviAggregateAnswerBlockV2 {
@@ -789,6 +966,67 @@ fn aggregate_answer_block(
         payload,
     }
     .serialize()
+}
+
+fn aggregate_min_max_answer_supported(logical_type: CoveLogicalType) -> bool {
+    !matches!(
+        logical_type,
+        CoveLogicalType::Null
+            | CoveLogicalType::Bool
+            | CoveLogicalType::List
+            | CoveLogicalType::Struct
+            | CoveLogicalType::Map
+    )
+}
+
+fn entry_block_with_aggregate_block_id(
+    entry_block: &[u8],
+    aggregate_block_id: u32,
+) -> Result<Vec<u8>, CoveError> {
+    let mut block = CoviEntryBlockV2::parse(entry_block)?;
+    block.header.aggregate_block_id = aggregate_block_id;
+    block.serialize()
+}
+
+fn canonical_payload_for_min_max_answer(
+    logical_type: CoveLogicalType,
+    key: &[u8],
+) -> Result<Vec<u8>, CoveError> {
+    let (tag, consumed) = wire::decode_u64_leb128(key)?;
+    let tag = u16::try_from(tag)
+        .ok()
+        .and_then(ValueTag::from_u16)
+        .ok_or(CoveError::BadCovi)?;
+    if !value_tag_matches_logical(logical_type, tag) {
+        return Err(CoveError::BadCovi);
+    }
+    Ok(key[consumed..].to_vec())
+}
+
+fn value_tag_matches_logical(logical_type: CoveLogicalType, tag: ValueTag) -> bool {
+    match logical_type {
+        CoveLogicalType::Bool => matches!(tag, ValueTag::BoolFalse | ValueTag::BoolTrue),
+        CoveLogicalType::Int8
+        | CoveLogicalType::Int16
+        | CoveLogicalType::Int32
+        | CoveLogicalType::Int64 => tag == ValueTag::Int64,
+        CoveLogicalType::UInt8
+        | CoveLogicalType::UInt16
+        | CoveLogicalType::UInt32
+        | CoveLogicalType::UInt64 => tag == ValueTag::UInt64,
+        CoveLogicalType::Float32 => tag == ValueTag::Float32Bits,
+        CoveLogicalType::Float64 => tag == ValueTag::Float64Bits,
+        CoveLogicalType::Decimal64 => tag == ValueTag::Decimal64,
+        CoveLogicalType::Decimal128 => tag == ValueTag::Decimal128,
+        CoveLogicalType::DateDays => tag == ValueTag::DateDays,
+        CoveLogicalType::TimestampMicros => tag == ValueTag::TimestampMicros,
+        CoveLogicalType::TimestampNanos => tag == ValueTag::TimestampNanos,
+        CoveLogicalType::Utf8 => tag == ValueTag::Utf8,
+        CoveLogicalType::Binary => tag == ValueTag::Binary,
+        CoveLogicalType::Uuid => tag == ValueTag::Uuid,
+        CoveLogicalType::Json => tag == ValueTag::Json,
+        _ => false,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -914,7 +1152,11 @@ fn key_for_value(
 
 fn key_from_numcode(logical: CoveLogicalType, code: u64) -> Result<Vec<u8>, CoveError> {
     let value = match logical {
-        CoveLogicalType::Bool => CanonicalValue::Bool(code != 0),
+        CoveLogicalType::Bool => match code {
+            0 => CanonicalValue::Bool(false),
+            1 => CanonicalValue::Bool(true),
+            _ => return Err(CoveError::BadCovi),
+        },
         CoveLogicalType::Int8 => CanonicalValue::Int {
             width: 1,
             value: i128::from(types::numcode_as_i8(code)),
@@ -1078,7 +1320,7 @@ fn tagged_canonical(value: CanonicalValue<'_>) -> Result<Vec<u8>, CoveError> {
 
 fn tagged_key(value_tag: u16, payload: Vec<u8>) -> Vec<u8> {
     let mut key = Vec::with_capacity(2 + payload.len());
-    key.extend_from_slice(&value_tag.to_le_bytes());
+    cove_core::wire::append_u64_leb128(&mut key, u64::from(value_tag));
     key.extend_from_slice(&payload);
     key
 }
@@ -1098,4 +1340,452 @@ fn derived_snapshot_id(bytes: &[u8], footer_crc32c: u32) -> [u8; 16] {
     snapshot_id[4..8].copy_from_slice(&footer_crc32c.to_le_bytes());
     snapshot_id[8..16].copy_from_slice(&(bytes.len() as u64).to_le_bytes());
     snapshot_id
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cove_core::{
+        compression,
+        constants::{CoveEncodingKind, CoveLogicalType, CovePhysicalKind, SectionKind},
+        page::{ColumnPageIndexEntryV1, COLUMN_PAGE_INDEX_ENTRY_LEN},
+        reader,
+        segment::{RowMorselEntryV1, TableSegmentHeaderV1, ROW_MORSEL_ENTRY_LEN},
+        table::{ColumnEntry, TableCatalog, TableEntry},
+        writer::{
+            MinimalCoveWriter, ScanPageSpec, ScanProfileCoveWriter, ScanSegment, SectionPayload,
+        },
+    };
+
+    fn row_range() -> CoviRowRangePostingV2 {
+        CoviRowRangePostingV2 {
+            file_ref: 0,
+            table_id: 1,
+            segment_id: 0,
+            morsel_id: 0,
+            row_start: 0,
+            row_count: 1,
+            flags: 0,
+            checksum: 0,
+        }
+    }
+
+    fn signed_key(value: i64) -> Vec<u8> {
+        key_from_i64(CoveLogicalType::Int64, value).unwrap()
+    }
+
+    fn one_column_two_morsel_scan_file() -> Vec<u8> {
+        let catalog = TableCatalog {
+            flags: 0,
+            tables: vec![TableEntry {
+                table_id: 1,
+                namespace: "public".into(),
+                name: "events".into(),
+                row_count: 2,
+                primary_sort_key_count: 0,
+                clustering_key_count: 0,
+                flags: 0,
+                columns: vec![ColumnEntry {
+                    column_id: 1,
+                    name: "id".into(),
+                    logical: CoveLogicalType::Int64,
+                    physical: CovePhysicalKind::NumCode,
+                    nullable: false,
+                    sort_order: 0,
+                    collation_id: 0,
+                    precision: 0,
+                    scale: 0,
+                    flags: 0,
+                }],
+            }],
+        };
+        let mut segment = ScanSegment::new(1, 0, 0, 2, 1);
+        segment.morsel_row_count = 1;
+        segment.set_column_pages(
+            1,
+            vec![
+                ScanPageSpec::new(1, 1u64.to_le_bytes().to_vec())
+                    .with_encoding_root(CoveEncodingKind::NumCode as u32),
+                ScanPageSpec::new(1, 2u64.to_le_bytes().to_vec())
+                    .with_encoding_root(CoveEncodingKind::NumCode as u32),
+            ],
+        );
+        let mut writer = ScanProfileCoveWriter::new(catalog);
+        writer.push_segment(segment);
+        writer.write().unwrap()
+    }
+
+    fn bool_scan_file() -> Vec<u8> {
+        let catalog = TableCatalog {
+            flags: 0,
+            tables: vec![TableEntry {
+                table_id: 1,
+                namespace: "public".into(),
+                name: "events".into(),
+                row_count: 2,
+                primary_sort_key_count: 0,
+                clustering_key_count: 0,
+                flags: 0,
+                columns: vec![ColumnEntry {
+                    column_id: 1,
+                    name: "active".into(),
+                    logical: CoveLogicalType::Bool,
+                    physical: CovePhysicalKind::Boolean,
+                    nullable: false,
+                    sort_order: 0,
+                    collation_id: 0,
+                    precision: 0,
+                    scale: 0,
+                    flags: 0,
+                }],
+            }],
+        };
+        let mut writer = ScanProfileCoveWriter::new(catalog);
+        writer.push_segment(ScanSegment::new(1, 0, 0, 2, 1));
+        writer.write().unwrap()
+    }
+
+    fn rewrite_first_segment_data<F>(bytes: Vec<u8>, mut mutate: F) -> Vec<u8>
+    where
+        F: FnMut(&mut Vec<u8>),
+    {
+        let validated = reader::validate_bytes(&bytes).unwrap();
+        let mut writer = MinimalCoveWriter::new();
+        writer.created_at_us = validated.header.created_at_us;
+        writer.file_id = validated.header.file_id;
+        writer.producer_scope_id = validated.header.producer_scope_id;
+        writer.producer_scope_kind = validated.header.producer_scope_kind;
+        writer.primary_profile = validated.header.primary_profile;
+        writer.required_features = validated.header.required_features;
+        writer.optional_features = validated.header.optional_features;
+        writer.metadata_json = validated.footer.metadata_json.clone();
+
+        let mut mutated = false;
+        for entry in &validated.footer.sections {
+            let mut data = compression::section_payload(&bytes, entry)
+                .unwrap()
+                .into_owned();
+            if !mutated && entry.section_kind == SectionKind::TableSegmentData as u16 {
+                mutate(&mut data);
+                mutated = true;
+            }
+            writer.sections.push(SectionPayload {
+                section_kind: entry.section_kind,
+                profile: entry.profile,
+                flags: entry.flags,
+                item_count: entry.item_count,
+                row_count: entry.row_count,
+                compression: entry.compression,
+                alignment_log2: entry.alignment_log2,
+                required_features: entry.required_features,
+                optional_features: entry.optional_features,
+                data,
+            });
+        }
+        assert!(
+            mutated,
+            "fixture should contain a table segment data section"
+        );
+        writer.write().unwrap()
+    }
+
+    fn set_morsel_and_page_ids(segment_data: &mut [u8], ids: &[u32]) {
+        let header = TableSegmentHeaderV1::parse(segment_data).unwrap();
+        assert_eq!(header.morsel_count as usize, ids.len());
+        let morsel_dir = header.morsel_directory_offset as usize;
+        for (index, morsel_id) in ids.iter().copied().enumerate() {
+            let offset = morsel_dir + index * ROW_MORSEL_ENTRY_LEN;
+            let mut entry = RowMorselEntryV1::parse(&segment_data[offset..]).unwrap();
+            entry.morsel_id = morsel_id;
+            segment_data[offset..offset + ROW_MORSEL_ENTRY_LEN].copy_from_slice(&entry.serialize());
+        }
+        let page_index = header.page_index_offset as usize;
+        for (index, morsel_id) in ids.iter().copied().enumerate() {
+            let offset = page_index + index * COLUMN_PAGE_INDEX_ENTRY_LEN;
+            let mut page = ColumnPageIndexEntryV1::parse(&segment_data[offset..]).unwrap();
+            page.morsel_id = morsel_id;
+            segment_data[offset..offset + COLUMN_PAGE_INDEX_ENTRY_LEN]
+                .copy_from_slice(&page.serialize());
+        }
+    }
+
+    fn all_row_range_postings(artifact: &CoviArtifactV2) -> Vec<CoviRowRangePostingV2> {
+        artifact
+            .postings_blocks
+            .iter()
+            .flat_map(|block| {
+                block.postings.iter().flat_map(|posting| {
+                    crate::parse_covi_row_range_postings(block.posting_payload(posting).unwrap())
+                        .unwrap()
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn sorted_build_order_uses_declared_comparator_not_raw_bytes() {
+        let mut keys = BTreeMap::new();
+        for value in [-10, -5, 0, 5] {
+            keys.insert(signed_key(value), vec![row_range()]);
+        }
+        let sorted = order_key_items(
+            keys,
+            CoveLogicalType::Int64,
+            CoviIndexKindV2::Sorted,
+            CoviComparatorKindV2::CanonicalOrdering,
+        )
+        .unwrap();
+        let sorted_values = sorted
+            .iter()
+            .map(|(key, _)| i64::from_le_bytes(key[1..9].try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(sorted_values, vec![-10, -5, 0, 5]);
+    }
+
+    #[test]
+    fn build_blocks_compute_min_max_after_comparator_sorting() {
+        let mut keys = BTreeMap::new();
+        for value in [-10, -5, 0, 5] {
+            keys.insert(signed_key(value), vec![row_range()]);
+        }
+        let built = build_blocks_from_keys(
+            keys,
+            BuildBlocksParams {
+                root_id: 1,
+                logical_type: CoveLogicalType::Int64,
+                index_kind: CoviIndexKindV2::Sorted,
+                key_encoding_kind: CoviKeyEncodingKindV2::CanonicalValueBytes,
+                comparator_kind: CoviComparatorKindV2::CanonicalOrdering,
+                supports_range: true,
+                null_count: 0,
+                aggregate_block_id: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(built.min_key_ref, 0);
+        assert_eq!(built.max_key_ref, 3);
+        assert_eq!(built.min_key.as_deref(), Some(signed_key(-10).as_slice()));
+        assert_eq!(built.max_key.as_deref(), Some(signed_key(5).as_slice()));
+    }
+
+    #[test]
+    fn index_only_min_max_answers_store_canonical_payload_not_full_key() {
+        let min_key = signed_key(-10);
+        let max_key = signed_key(5);
+        let bytes = aggregate_answer_block(AggregateAnswerBlockParams {
+            root_id: 1,
+            row_count: 4,
+            null_count: 0,
+            distinct_count: 4,
+            logical_type: CoveLogicalType::Int64,
+            options: &CoviBuildOptions {
+                include_index_only_min_max: true,
+                ..CoviBuildOptions::default()
+            },
+            include_min_max_answers: true,
+            min_key: Some(&min_key),
+            max_key: Some(&max_key),
+        })
+        .unwrap();
+        let block = CoviAggregateAnswerBlockV2::parse(&bytes).unwrap();
+        let min = block
+            .answers
+            .iter()
+            .find(|answer| {
+                CoviAggregateKindV2::from_u16(answer.aggregate_kind)
+                    == Some(CoviAggregateKindV2::Min)
+            })
+            .unwrap();
+        let max = block
+            .answers
+            .iter()
+            .find(|answer| {
+                CoviAggregateKindV2::from_u16(answer.aggregate_kind)
+                    == Some(CoviAggregateKindV2::Max)
+            })
+            .unwrap();
+        assert_eq!(min.value_ref, 0);
+        assert_eq!(max.value_ref, 8);
+        assert_eq!(&block.payload[0..8], &(-10i64).to_le_bytes());
+        assert_eq!(&block.payload[8..16], &5i64.to_le_bytes());
+    }
+
+    #[test]
+    fn index_only_distinct_count_answer_uses_payload_for_result_count() {
+        let bytes = aggregate_answer_block(AggregateAnswerBlockParams {
+            root_id: 1,
+            row_count: 5,
+            null_count: 2,
+            distinct_count: 2,
+            logical_type: CoveLogicalType::Int64,
+            options: &CoviBuildOptions {
+                include_index_only_distinct_count: true,
+                ..CoviBuildOptions::default()
+            },
+            include_min_max_answers: false,
+            min_key: None,
+            max_key: None,
+        })
+        .unwrap();
+        let block = CoviAggregateAnswerBlockV2::parse(&bytes).unwrap();
+        let answer = block
+            .answers
+            .iter()
+            .find(|answer| {
+                CoviAggregateKindV2::from_u16(answer.aggregate_kind)
+                    == Some(CoviAggregateKindV2::DistinctCount)
+            })
+            .unwrap();
+
+        assert_eq!(answer.row_count, 5);
+        assert_eq!(answer.null_count, 2);
+        assert_eq!(answer.non_null_count, 3);
+        assert_eq!(answer.value_ref, 0);
+        assert_eq!(block.payload, 2u64.to_le_bytes());
+    }
+
+    #[test]
+    fn build_covi_does_not_emit_ambiguous_bool_min_max_answers() {
+        let built = build_covi_from_cove_bytes(
+            &bool_scan_file(),
+            &CoviBuildOptions {
+                all_columns: true,
+                include_index_only_min_max: true,
+                ..CoviBuildOptions::default()
+            },
+        )
+        .unwrap();
+        let artifact = CoviArtifactV2::parse(&built).unwrap();
+
+        assert!(artifact.aggregate_answer_blocks.is_empty());
+        assert_eq!(artifact.capabilities[0].supports_min, 0);
+        assert_eq!(artifact.capabilities[0].supports_max, 0);
+        assert_eq!(artifact.capabilities[0].supports_index_only, 0);
+    }
+
+    #[test]
+    fn raw_file_code_blocks_do_not_emit_range_min_max_refs() {
+        let mut keys = BTreeMap::new();
+        keys.insert(10u32.to_le_bytes().to_vec(), vec![row_range()]);
+        keys.insert(20u32.to_le_bytes().to_vec(), vec![row_range()]);
+        let built = build_blocks_from_keys(
+            keys,
+            BuildBlocksParams {
+                root_id: 1,
+                logical_type: CoveLogicalType::Utf8,
+                index_kind: CoviIndexKindV2::Hash,
+                key_encoding_kind: CoviKeyEncodingKindV2::FileCode,
+                comparator_kind: CoviComparatorKindV2::DomainRankOrdering,
+                supports_range: false,
+                null_count: 0,
+                aggregate_block_id: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(built.index_kind, CoviIndexKindV2::Hash);
+        assert_eq!(built.min_key_ref, u32::MAX);
+        assert_eq!(built.max_key_ref, u32::MAX);
+        assert!(built.min_key.is_none());
+        assert!(built.max_key.is_none());
+        assert!(!built.supports_range);
+    }
+
+    #[test]
+    fn float_nan_keys_disable_range_min_max_refs() {
+        let mut keys = BTreeMap::new();
+        keys.insert(
+            tagged_canonical(CanonicalValue::Float64(f64::NAN)).unwrap(),
+            vec![row_range()],
+        );
+        keys.insert(
+            tagged_canonical(CanonicalValue::Float64(1.0)).unwrap(),
+            vec![row_range()],
+        );
+        assert!(canonical_float_keys_contain_nan(CoveLogicalType::Float64, &keys).unwrap());
+        let built = build_blocks_from_keys(
+            keys,
+            BuildBlocksParams {
+                root_id: 1,
+                logical_type: CoveLogicalType::Float64,
+                index_kind: CoviIndexKindV2::Hash,
+                key_encoding_kind: CoviKeyEncodingKindV2::CanonicalValueBytes,
+                comparator_kind: CoviComparatorKindV2::CanonicalEquality,
+                supports_range: false,
+                null_count: 0,
+                aggregate_block_id: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(built.index_kind, CoviIndexKindV2::Hash);
+        assert_eq!(
+            built.comparator_kind,
+            CoviComparatorKindV2::CanonicalEquality
+        );
+        assert_eq!(built.min_key_ref, u32::MAX);
+        assert_eq!(built.max_key_ref, u32::MAX);
+        assert!(built.min_key.is_none());
+        assert!(built.max_key.is_none());
+        assert!(!built.supports_range);
+    }
+
+    #[test]
+    fn float_nan_detection_handles_float32_signaling_bits() {
+        let mut keys = BTreeMap::new();
+        keys.insert(
+            tagged_canonical(CanonicalValue::Float32(f32::from_bits(0x7fc0_0001))).unwrap(),
+            vec![row_range()],
+        );
+        keys.insert(
+            tagged_canonical(CanonicalValue::Float32(f32::from_bits(0xffc0_0001))).unwrap(),
+            vec![row_range()],
+        );
+        assert!(canonical_float_keys_contain_nan(CoveLogicalType::Float32, &keys).unwrap());
+    }
+
+    #[test]
+    fn build_covi_accepts_stats_only_all_non_null_constant_pages() {
+        let bytes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../conformance/accept/cove_t_payload_elision_stats_only_all_non_null_valid.cove"
+        ));
+
+        let built = build_covi_from_cove_bytes(
+            bytes,
+            &CoviBuildOptions {
+                all_columns: true,
+                ..CoviBuildOptions::default()
+            },
+        )
+        .unwrap();
+        let artifact = CoviArtifactV2::parse(&built).unwrap();
+
+        assert_eq!(artifact.index_roots.len(), 1);
+        assert_eq!(artifact.index_roots[0].value_count, 6);
+        assert_eq!(artifact.index_roots[0].null_count, 0);
+    }
+
+    #[test]
+    fn build_covi_uses_sparse_morsel_ids_as_identifiers() {
+        let bytes = rewrite_first_segment_data(one_column_two_morsel_scan_file(), |data| {
+            set_morsel_and_page_ids(data, &[10, 20]);
+        });
+
+        let built = build_covi_from_cove_bytes(
+            &bytes,
+            &CoviBuildOptions {
+                all_columns: true,
+                ..CoviBuildOptions::default()
+            },
+        )
+        .unwrap();
+        let artifact = CoviArtifactV2::parse(&built).unwrap();
+        let mut rows = all_row_range_postings(&artifact);
+        rows.sort_by_key(|row| row.row_start);
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].morsel_id, 10);
+        assert_eq!(rows[0].row_start, 0);
+        assert_eq!(rows[1].morsel_id, 20);
+        assert_eq!(rows[1].row_start, 1);
+    }
 }

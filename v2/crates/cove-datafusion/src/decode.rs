@@ -28,10 +28,11 @@ use cove_core::{
     compression,
     constants::{CoveEncodingKind, CoveLogicalType, CovePhysicalKind},
     index::{lookup::LookupKeyKind, topn::TopNDirection},
+    materialize_stats_only_constant_page_payload,
     nested_schema::NestedSchemaNodeV1,
     page::{
-        page_uses_payload_elision, ColumnPageIndex, ColumnPageIndexEntryV1, PAGE_FLAG_ALL_NON_NULL,
-        PAGE_FLAG_ALL_NULL, PAGE_FLAG_STATS_ONLY_CONSTANT,
+        page_uses_payload_elision, ColumnPageIndex, ColumnPageIndexEntryV1,
+        PAGE_FLAG_STATS_ONLY_CONSTANT,
     },
     page_payload::{ColumnPagePayloadV1, PageBufferKind, RetainedColumnPagePayloadV1},
     retained_bytes::RetainedBytes,
@@ -42,7 +43,7 @@ use cove_core::{
     },
     table::ColumnEntry,
     validity::ValidityBitmap,
-    wire, CoveError,
+    wire, CoveError, StatsOnlyPageMaterializationContext,
 };
 use cove_layout::{ZeroCopyCompatibilityV2, ZeroCopyMaterializationReasonV2};
 
@@ -74,7 +75,7 @@ use materialize::{
 use morsels::{ordered_morsels, prepare_segment_payload, read_segment_metadata};
 #[cfg(test)]
 use predicates::apply_predicate_to_selection;
-pub(crate) use predicates::numeric_lookup_key;
+pub(crate) use predicates::numeric_lookup_keys;
 use predicates::{plan_has_exact_row_predicate, plan_has_residual};
 use pruning::{
     apply_overlay_to_selection, covi_morsel_pruned, selected_rows_for_morsel,
@@ -505,16 +506,22 @@ pub(crate) fn decode_scan_to_sink<S: DecodeSink + ?Sized>(
 
             let mut page_payloads = Vec::with_capacity(plan.scan_projection.len());
             let mut page_indexes = Vec::with_capacity(plan.scan_projection.len());
+            let mut page_refs = Vec::with_capacity(plan.scan_projection.len());
             let mut columns = Vec::with_capacity(plan.scan_projection.len());
             for projection_index in &plan.scan_projection {
                 let column = &state.table().columns[*projection_index];
                 let segment_column = prepared_segment.column(column.column_id)?;
                 let page = prepared_segment.page_for_morsel(segment_column, morsel.morsel_id)?;
+                let page_ref =
+                    prepared_segment.page_ref_for_morsel(segment_column, morsel.morsel_id)?;
                 state.reject_table_scan_page_feature_use(segment_ref, page)?;
                 let payload = materialize_page_payload(
                     segment_bytes,
+                    segment_ref.table_id,
+                    segment_ref.segment_id,
                     column,
                     page,
+                    state.pruning().zone_stats_entries.as_slice(),
                     state.pruning().codec_descriptors.as_slice(),
                     state
                         .mounted()
@@ -532,6 +539,7 @@ pub(crate) fn decode_scan_to_sink<S: DecodeSink + ?Sized>(
                     .ok_or(CoveError::ArithOverflow)?;
                 page_payloads.push(payload);
                 page_indexes.push(page.clone());
+                page_refs.push(page_ref);
                 columns.push(column);
             }
 
@@ -553,6 +561,7 @@ pub(crate) fn decode_scan_to_sink<S: DecodeSink + ?Sized>(
                 &columns,
                 &encoded_columns,
                 &page_indexes,
+                &page_refs,
                 &page_payloads,
                 arrow_options,
             );
@@ -786,6 +795,7 @@ async fn decode_scan_with_reader_to_sink_cached<
             }
 
             let mut page_indexes = Vec::with_capacity(plan.scan_projection.len());
+            let mut page_refs = Vec::with_capacity(plan.scan_projection.len());
             let mut columns = Vec::with_capacity(plan.scan_projection.len());
             let mut ranges = Vec::new();
             let mut range_hints = Vec::new();
@@ -794,6 +804,7 @@ async fn decode_scan_with_reader_to_sink_cached<
                 let column = &state.table().columns[*projection_index];
                 let segment_column = segment.column(column.column_id)?;
                 let page = segment.page_for_morsel(segment_column, morsel.morsel_id)?;
+                let page_ref = segment.page_ref_for_morsel(segment_column, morsel.morsel_id)?;
                 state.reject_table_scan_page_feature_use(segment_ref, page)?;
                 if page.page_length == 0 {
                     range_slots.push(None);
@@ -816,6 +827,7 @@ async fn decode_scan_with_reader_to_sink_cached<
                 }
                 stats.pages_decoded += usize::from(page.page_length != 0);
                 page_indexes.push(page.clone());
+                page_refs.push(page_ref);
                 columns.push(column);
             }
 
@@ -859,9 +871,12 @@ async fn decode_scan_with_reader_to_sink_cached<
             for ((column, page), slot) in columns.iter().zip(page_indexes.iter()).zip(range_slots) {
                 let wire = slot.and_then(|index| wire_slots[index].take());
                 page_payloads.push(materialize_page_payload_from_wire(
+                    segment_ref.table_id,
+                    segment_ref.segment_id,
                     column,
                     page,
                     wire,
+                    state.pruning().zone_stats_entries.as_slice(),
                     state.pruning().codec_descriptors.as_slice(),
                     state
                         .mounted()
@@ -890,6 +905,7 @@ async fn decode_scan_with_reader_to_sink_cached<
                 &columns,
                 &encoded_columns,
                 &page_indexes,
+                &page_refs,
                 &page_payloads,
                 arrow_options,
             );
@@ -1059,6 +1075,7 @@ async fn decode_scan_with_reader_tasks_to_sink_cached<
             }
 
             let mut page_indexes = Vec::with_capacity(plan.scan_projection.len());
+            let mut page_refs = Vec::with_capacity(plan.scan_projection.len());
             let mut columns = Vec::with_capacity(plan.scan_projection.len());
             let mut ranges = Vec::new();
             let mut range_hints = Vec::new();
@@ -1067,6 +1084,7 @@ async fn decode_scan_with_reader_tasks_to_sink_cached<
                 let column = &state.table().columns[*projection_index];
                 let segment_column = segment.column(column.column_id)?;
                 let page = segment.page_for_morsel(segment_column, morsel.morsel_id)?;
+                let page_ref = segment.page_ref_for_morsel(segment_column, morsel.morsel_id)?;
                 state.reject_table_scan_page_feature_use(segment_ref, page)?;
                 if page.page_length == 0 {
                     range_slots.push(None);
@@ -1089,6 +1107,7 @@ async fn decode_scan_with_reader_tasks_to_sink_cached<
                 }
                 stats.pages_decoded += usize::from(page.page_length != 0);
                 page_indexes.push(page.clone());
+                page_refs.push(page_ref);
                 columns.push(column);
             }
 
@@ -1132,9 +1151,12 @@ async fn decode_scan_with_reader_tasks_to_sink_cached<
             for ((column, page), slot) in columns.iter().zip(page_indexes.iter()).zip(range_slots) {
                 let wire = slot.and_then(|index| wire_slots[index].take());
                 page_payloads.push(materialize_page_payload_from_wire(
+                    segment_ref.table_id,
+                    segment_ref.segment_id,
                     column,
                     page,
                     wire,
+                    state.pruning().zone_stats_entries.as_slice(),
                     state.pruning().codec_descriptors.as_slice(),
                     state
                         .mounted()
@@ -1163,6 +1185,7 @@ async fn decode_scan_with_reader_tasks_to_sink_cached<
                 &columns,
                 &encoded_columns,
                 &page_indexes,
+                &page_refs,
                 &page_payloads,
                 arrow_options,
             );
@@ -1311,6 +1334,27 @@ mod tests {
         values
             .iter()
             .flat_map(|value| (*value as u64).to_le_bytes())
+            .collect()
+    }
+
+    fn numcode_i32(values: &[i32]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| (*value as i64 as u64).to_le_bytes())
+            .collect()
+    }
+
+    fn numcode_f32(values: &[f32]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| u64::from(value.to_bits()).to_le_bytes())
+            .collect()
+    }
+
+    fn numcode_f64(values: &[f64]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| value.to_bits().to_le_bytes())
             .collect()
     }
 
@@ -1681,9 +1725,12 @@ mod tests {
         let page = bool_test_page(&payload, wrong_checksum);
 
         assert!(materialize_page_payload_from_wire(
+            1,
+            1,
             &column,
             &page,
             Some(RetainedBytes::from_vec(payload.clone())),
+            &[],
             &[],
             None,
             PagePayloadValidationPolicy::Trusted,
@@ -1691,9 +1738,12 @@ mod tests {
         .is_ok());
         assert!(matches!(
             materialize_page_payload_from_wire(
+                1,
+                1,
                 &column,
                 &page,
                 Some(RetainedBytes::from_vec(payload)),
+                &[],
                 &[],
                 None,
                 PagePayloadValidationPolicy::Strict,
@@ -1712,9 +1762,12 @@ mod tests {
         let page = bool_test_page(&payload, checksum::crc32c(&payload));
 
         assert!(materialize_page_payload_from_wire(
+            1,
+            1,
             &column,
             &page,
             Some(RetainedBytes::from_vec(payload.clone())),
+            &[],
             &[],
             None,
             PagePayloadValidationPolicy::Trusted,
@@ -1722,9 +1775,12 @@ mod tests {
         .is_ok());
         assert!(matches!(
             materialize_page_payload_from_wire(
+                1,
+                1,
                 &column,
                 &page,
                 Some(RetainedBytes::from_vec(payload)),
+                &[],
                 &[],
                 None,
                 PagePayloadValidationPolicy::Strict,
@@ -1825,6 +1881,237 @@ mod tests {
         let mut rows = Vec::new();
         selected.write_selected_rows(&mut rows).unwrap();
         assert_eq!(rows, vec![1, 2]);
+    }
+
+    #[test]
+    fn numeric_predicate_filters_signed_numcode_by_logical_type() {
+        let bytes = numcode_i32(&[-8, -1, 3]);
+        let array = EncodedArray::new(
+            CoveLogicalType::Int32,
+            CovePhysicalKind::NumCode,
+            3,
+            CoveEncodingKind::NumCode,
+            None,
+            &bytes,
+            None,
+        );
+        let prepared = array.prepare().unwrap();
+        let predicate = CovePredicate::Numeric {
+            column_index: 0,
+            op: NumericPredicateOp::Lt,
+            literal: PredicateLiteral::Int64(0),
+        };
+        let mut selected = SelectionMask::default();
+        selected.fill_all(3);
+        let mut scratch = SelectionMask::default();
+        assert!(
+            apply_predicate_to_selection(&predicate, &prepared, &mut selected, &mut scratch)
+                .unwrap()
+        );
+
+        let mut rows = Vec::new();
+        selected.write_selected_rows(&mut rows).unwrap();
+        assert_eq!(rows, vec![0, 1]);
+    }
+
+    #[test]
+    fn numeric_predicate_filters_temporal_and_decimal_numcode_by_logical_type() {
+        for logical in [
+            CoveLogicalType::Decimal64,
+            CoveLogicalType::TimestampMicros,
+            CoveLogicalType::TimestampNanos,
+        ] {
+            let bytes = numcode_i64(&[-20, -1, 10]);
+            let array = EncodedArray::new(
+                logical,
+                CovePhysicalKind::NumCode,
+                3,
+                CoveEncodingKind::NumCode,
+                None,
+                &bytes,
+                None,
+            );
+            let prepared = array.prepare().unwrap();
+            let predicate = CovePredicate::Numeric {
+                column_index: 0,
+                op: NumericPredicateOp::GtEq,
+                literal: PredicateLiteral::Int64(-1),
+            };
+            let mut selected = SelectionMask::default();
+            selected.fill_all(3);
+            let mut scratch = SelectionMask::default();
+            assert!(apply_predicate_to_selection(
+                &predicate,
+                &prepared,
+                &mut selected,
+                &mut scratch
+            )
+            .unwrap());
+
+            let mut rows = Vec::new();
+            selected.write_selected_rows(&mut rows).unwrap();
+            assert_eq!(rows, vec![1, 2]);
+        }
+
+        let bytes = numcode_i32(&[-2, 0, 4]);
+        let array = EncodedArray::new(
+            CoveLogicalType::DateDays,
+            CovePhysicalKind::NumCode,
+            3,
+            CoveEncodingKind::NumCode,
+            None,
+            &bytes,
+            None,
+        );
+        let prepared = array.prepare().unwrap();
+        let predicate = CovePredicate::Numeric {
+            column_index: 0,
+            op: NumericPredicateOp::Eq,
+            literal: PredicateLiteral::Int64(-2),
+        };
+        let mut selected = SelectionMask::default();
+        selected.fill_all(3);
+        let mut scratch = SelectionMask::default();
+        assert!(
+            apply_predicate_to_selection(&predicate, &prepared, &mut selected, &mut scratch)
+                .unwrap()
+        );
+
+        let mut rows = Vec::new();
+        selected.write_selected_rows(&mut rows).unwrap();
+        assert_eq!(rows, vec![0]);
+    }
+
+    #[test]
+    fn numeric_predicate_filters_float_numcode_rows_by_value() {
+        let bytes = numcode_f64(&[1.5, 2.25, -3.0]);
+        let array = EncodedArray::new(
+            CoveLogicalType::Float64,
+            CovePhysicalKind::NumCode,
+            3,
+            CoveEncodingKind::NumCode,
+            None,
+            &bytes,
+            None,
+        );
+        let prepared = array.prepare().unwrap();
+        let predicate = CovePredicate::Numeric {
+            column_index: 0,
+            op: NumericPredicateOp::Gt,
+            literal: PredicateLiteral::Float64(2.0),
+        };
+        let mut selected = SelectionMask::default();
+        selected.fill_all(3);
+        let mut scratch = SelectionMask::default();
+        assert!(
+            apply_predicate_to_selection(&predicate, &prepared, &mut selected, &mut scratch)
+                .unwrap()
+        );
+
+        let mut rows = Vec::new();
+        selected.write_selected_rows(&mut rows).unwrap();
+        assert_eq!(rows, vec![1]);
+    }
+
+    #[test]
+    fn numeric_predicate_filters_float32_numcode_rows_by_value() {
+        let bytes = numcode_f32(&[1.5, 2.25, -3.0]);
+        let array = EncodedArray::new(
+            CoveLogicalType::Float32,
+            CovePhysicalKind::NumCode,
+            3,
+            CoveEncodingKind::NumCode,
+            None,
+            &bytes,
+            None,
+        );
+        let prepared = array.prepare().unwrap();
+        let predicate = CovePredicate::Numeric {
+            column_index: 0,
+            op: NumericPredicateOp::Eq,
+            literal: PredicateLiteral::Float64(2.25),
+        };
+        let mut selected = SelectionMask::default();
+        selected.fill_all(3);
+        let mut scratch = SelectionMask::default();
+        assert!(
+            apply_predicate_to_selection(&predicate, &prepared, &mut selected, &mut scratch)
+                .unwrap()
+        );
+
+        let mut rows = Vec::new();
+        selected.write_selected_rows(&mut rows).unwrap();
+        assert_eq!(rows, vec![1]);
+    }
+
+    #[test]
+    fn numeric_lookup_keys_use_logical_numcode_bits() {
+        assert_eq!(
+            numeric_lookup_keys(CoveLogicalType::Float64, PredicateLiteral::Float64(2.25)),
+            vec![2.25f64.to_bits()]
+        );
+        assert_eq!(
+            numeric_lookup_keys(CoveLogicalType::Float32, PredicateLiteral::Float64(2.25)),
+            vec![u64::from(2.25f32.to_bits())]
+        );
+        assert!(
+            numeric_lookup_keys(CoveLogicalType::Float32, PredicateLiteral::Float64(0.1))
+                .is_empty()
+        );
+        assert_eq!(
+            numeric_lookup_keys(CoveLogicalType::Float64, PredicateLiteral::Float64(0.0)),
+            vec![0.0f64.to_bits(), (-0.0f64).to_bits()]
+        );
+        assert_eq!(
+            numeric_lookup_keys(CoveLogicalType::Bool, PredicateLiteral::Int64(0)),
+            vec![0]
+        );
+        assert_eq!(
+            numeric_lookup_keys(CoveLogicalType::Bool, PredicateLiteral::UInt64(1)),
+            vec![1]
+        );
+        assert!(numeric_lookup_keys(CoveLogicalType::Bool, PredicateLiteral::Int64(2)).is_empty());
+        assert_eq!(
+            numeric_lookup_keys(CoveLogicalType::Int64, PredicateLiteral::Int64(-2)),
+            vec![(-2i64) as u64]
+        );
+        assert_eq!(
+            numeric_lookup_keys(CoveLogicalType::UInt64, PredicateLiteral::Float64(2.0)),
+            vec![2]
+        );
+    }
+
+    #[test]
+    fn numeric_predicate_filters_bool_numcode_rows_by_numeric_value() {
+        let bytes = [0u64.to_le_bytes(), 1u64.to_le_bytes(), 1u64.to_le_bytes()].concat();
+        let array = EncodedArray::new(
+            CoveLogicalType::Bool,
+            CovePhysicalKind::NumCode,
+            3,
+            CoveEncodingKind::NumCode,
+            None,
+            &bytes,
+            None,
+        );
+        let prepared = array.prepare().unwrap();
+        let mut selected = SelectionMask::default();
+        selected.fill_all(3);
+        let mut scratch = SelectionMask::default();
+        assert!(apply_predicate_to_selection(
+            &CovePredicate::Numeric {
+                column_index: 0,
+                op: NumericPredicateOp::Lt,
+                literal: PredicateLiteral::Int64(1),
+            },
+            &prepared,
+            &mut selected,
+            &mut scratch,
+        )
+        .unwrap());
+
+        let mut rows = Vec::new();
+        selected.write_selected_rows(&mut rows).unwrap();
+        assert_eq!(rows, vec![0]);
     }
 
     #[test]

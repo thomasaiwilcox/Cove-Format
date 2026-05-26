@@ -16,9 +16,8 @@ pub struct DumpRowsOptions {
 }
 
 pub fn validate_file(path: impl AsRef<Path>) -> Result<reader::ValidationReport, CoveError> {
-    let data = fs::read(path)?;
-    reader::validate_bytes_with_options(
-        &data,
+    validate_file_with_options(
+        path,
         reader::ValidationOptions {
             semantic: true,
             verify_digests: false,
@@ -26,6 +25,14 @@ pub fn validate_file(path: impl AsRef<Path>) -> Result<reader::ValidationReport,
             ..reader::ValidationOptions::default()
         },
     )
+}
+
+pub fn validate_file_with_options(
+    path: impl AsRef<Path>,
+    options: reader::ValidationOptions,
+) -> Result<reader::ValidationReport, CoveError> {
+    let data = fs::read(path)?;
+    reader::validate_bytes_with_options(&data, options)
 }
 
 pub fn inspect_file(path: impl AsRef<Path>) -> Result<mount::MountedCoveFile, CoveError> {
@@ -57,4 +64,36 @@ pub fn dump_rows(
         },
     )?;
     Ok(cove_datafusion::explain::execute_planned_scan(&planned)?.batches)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_file_with_options_exposes_digest_verification() {
+        let path = std::env::temp_dir().join(format!(
+            "cove_reader_validate_options_{}.cove",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            cove_core::writer::MinimalCoveWriter::write_empty_file().unwrap(),
+        )
+        .unwrap();
+
+        let report = validate_file_with_options(
+            &path,
+            reader::ValidationOptions {
+                semantic: true,
+                verify_digests: true,
+                allow_unknown_optional_extensions: true,
+                ..reader::ValidationOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(report.semantic_checked);
+
+        let _ = std::fs::remove_file(path);
+    }
 }

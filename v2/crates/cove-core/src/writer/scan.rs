@@ -86,7 +86,12 @@ impl ScanSegment {
         Ok(count)
     }
 
-    fn payload(&self, columns: &[ColumnEntry]) -> Result<Vec<u8>, CoveError> {
+    fn payload(
+        &self,
+        columns: &[ColumnEntry],
+        dictionary: Option<&FileDictionaryView<'_>>,
+        zone_stats: &[ZoneStatsEntry],
+    ) -> Result<Vec<u8>, CoveError> {
         let morsel_count = self.morsel_count()?;
         let morsel_dir_len = (morsel_count as usize)
             .checked_mul(ROW_MORSEL_ENTRY_LEN)
@@ -249,6 +254,23 @@ impl ScanSegment {
                         flags: spec.flags | spec.compression as u32,
                         checksum: page_checksum,
                     };
+                    let context = PageValidationContext {
+                        table_id: Some(self.table_id),
+                        segment_id: Some(self.segment_id),
+                        column_id: column.column_id,
+                        logical_type: column.logical,
+                        physical_kind: column.physical,
+                        dictionary,
+                        zone_stats: Some(zone_stats),
+                        codec_descriptors: &[],
+                        nested_schema: None,
+                    };
+                    if stats_only_constant {
+                        validate_stats_only_constant_page(&context, &page)?;
+                    } else if column.physical == CovePhysicalKind::FileCode {
+                        let payload = ColumnPagePayloadV1::parse(&encoded_payload)?;
+                        validate_column_page_payload(&context, &page, &payload)?;
+                    }
                     page_index_bytes.extend_from_slice(&page.serialize());
                     if page_length != 0 {
                         page_payload_bytes.extend_from_slice(&wire_payload);
@@ -284,6 +306,21 @@ impl ScanSegment {
                         flags: 0,
                         checksum: page_checksum,
                     };
+                    if column.physical == CovePhysicalKind::FileCode {
+                        let context = PageValidationContext {
+                            table_id: Some(self.table_id),
+                            segment_id: Some(self.segment_id),
+                            column_id: column.column_id,
+                            logical_type: column.logical,
+                            physical_kind: column.physical,
+                            dictionary,
+                            zone_stats: Some(zone_stats),
+                            codec_descriptors: &[],
+                            nested_schema: None,
+                        };
+                        let payload = ColumnPagePayloadV1::parse(&payload)?;
+                        validate_column_page_payload(&context, &page, &payload)?;
+                    }
                     page_index_bytes.extend_from_slice(&page.serialize());
                     if page_length != 0 {
                         page_payload_bytes.extend_from_slice(&payload);
@@ -818,13 +855,20 @@ impl ScanProfileCoveWriter {
     }
 
     pub fn write_to<W: Write + Seek>(&self, writer: &mut W) -> Result<(), CoveError> {
-        let inner = self.prepare_inner_writer()?;
-        inner.write_to(writer)
+        if writer.stream_position()? != 0 {
+            return Err(CoveError::BadSection(
+                "ScanProfileCoveWriter::write_to requires a writer positioned at byte 0".into(),
+            ));
+        }
+        let bytes = self.write()?;
+        writer.write_all(&bytes)?;
+        Ok(())
     }
 
     pub fn write(&self) -> Result<Vec<u8>, CoveError> {
         let mut cursor = Cursor::new(Vec::new());
-        self.write_to(&mut cursor)?;
+        let inner = self.prepare_inner_writer()?;
+        inner.write_to(&mut cursor)?;
         Ok(cursor.into_inner())
     }
 
@@ -839,6 +883,8 @@ impl ScanProfileCoveWriter {
             .iter()
             .map(|table| (table.table_id, table))
             .collect::<std::collections::BTreeMap<_, _>>();
+        let dictionary = self.file_dictionary_view()?;
+        let zone_stats = self.zone_stats_entries()?;
 
         let table_catalog_payload = self.table_catalog.serialize()?;
         let table_catalog_section = SectionPayload {
@@ -871,7 +917,7 @@ impl ScanProfileCoveWriter {
                         segment.table_id
                     ))
                 })?;
-                segment.payload(&table.columns)
+                segment.payload(&table.columns, dictionary.as_ref(), &zone_stats)
             })
             .collect::<Result<Vec<_>, _>>()?;
         let table_catalog_len = section_encoded_len(&table_catalog_section)?;
@@ -988,6 +1034,16 @@ impl ScanProfileCoveWriter {
         use std::collections::BTreeMap;
 
         let mut tables = BTreeMap::new();
+        let uses_file_dictionary = self.table_catalog.tables.iter().any(|table| {
+            table
+                .columns
+                .iter()
+                .any(|column| column.physical == CovePhysicalKind::FileCode)
+        });
+        if uses_file_dictionary && !self.has_file_dictionary_index_section() {
+            return Err(CoveError::BadFileCode);
+        }
+
         for table in &self.table_catalog.tables {
             tables.insert(
                 table.table_id,
@@ -1020,6 +1076,41 @@ impl ScanProfileCoveWriter {
             }
         }
         Ok(())
+    }
+
+    fn has_file_dictionary_index_section(&self) -> bool {
+        self.extra_sections.iter().any(|section| {
+            SectionKind::from_u16(section.section_kind) == Some(SectionKind::FileDictionaryIndex)
+        })
+    }
+
+    fn file_dictionary_view(&self) -> Result<Option<FileDictionaryView<'_>>, CoveError> {
+        let index = self.extra_sections.iter().find(|section| {
+            SectionKind::from_u16(section.section_kind) == Some(SectionKind::FileDictionaryIndex)
+        });
+        let Some(index) = index else {
+            return Ok(None);
+        };
+        let payload = self.extra_sections.iter().find(|section| {
+            SectionKind::from_u16(section.section_kind) == Some(SectionKind::FileDictionaryPayload)
+        });
+        FileDictionaryView::borrowed(
+            &index.data,
+            payload
+                .map(|section| section.data.as_slice())
+                .unwrap_or(&[]),
+        )
+        .map(Some)
+    }
+
+    fn zone_stats_entries(&self) -> Result<Vec<ZoneStatsEntry>, CoveError> {
+        let mut entries = Vec::new();
+        for section in self.extra_sections.iter().filter(|section| {
+            SectionKind::from_u16(section.section_kind) == Some(SectionKind::ZoneStats)
+        }) {
+            entries.extend(ZoneStatsSection::parse(&section.data)?.entries);
+        }
+        Ok(entries)
     }
 
     fn validate_nested_schema_sections(&self) -> Result<(), CoveError> {

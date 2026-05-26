@@ -41,6 +41,7 @@ use cove_core::{
         cove_column_page_target_ref, ExtendedFeatureSetHeaderV2, ExtendedFeatureSetV2,
         ProfileCapabilityEntryV2, ProfileCapabilityMatrixHeaderV2, ProfileCapabilityMatrixV2,
     },
+    footer::{CoveFooterHeaderV1, CoveSectionEntryV1, FOOTER_HEADER_SIZE, SECTION_ENTRY_SIZE},
     header::HEADER_SIZE,
     index::{
         aggregate::{AggregateEntry, AggregateSynopsis, SynopsisAccuracy, SynopsisKind},
@@ -57,19 +58,28 @@ use cove_core::{
         },
         topn::{TopNDirection, TopNSummary, TOPN_ZONE_SUMMARY_LEN},
     },
+    page::{
+        ColumnPageIndexEntryV1, PAGE_FLAG_ALL_NON_NULL, PAGE_FLAG_ALL_NULL,
+        PAGE_FLAG_STATS_ONLY_CONSTANT,
+    },
     page_payload::ColumnPagePayloadV1,
+    postscript::{CovePostscriptV1, POSTSCRIPT_TOTAL_SIZE},
     profile::cove_e::{
         EngineMountPolicyV1, EngineProfileEntryV1, EngineProfileRegistry,
         ExecutionCodeCanonicality, ExecutionCodeComparisonScope, ExecutionCodeDescriptorV1,
         ExecutionCodeKind, ExecutionCodeLifetime, FileCodeMappingKind, MissingValuePolicy,
         NullCodePolicy, ReverseLookupPolicy, StaleMappingPolicy,
     },
+    reader,
     redaction::{RedactionEntry, RedactionManifest},
     row_ref::RowRef,
+    segment::TableSegmentPayloadV1,
     table::{ColumnEntry, TableCatalog, TableEntry},
     wire,
     writer::{ScanPageSpec, ScanProfileCoveWriter, ScanSegment, SectionPayload},
-    zone_stats::{ZoneStatFlags, ZoneStats, ZoneStatsEntry, ZoneStatsSection},
+    zone_stats::{
+        StatKind, StatScalar, ZoneScope, ZoneStatFlags, ZoneStats, ZoneStatsEntry, ZoneStatsSection,
+    },
     CoveError,
 };
 use cove_coverage::{
@@ -81,11 +91,17 @@ use cove_coverage::{
 };
 #[cfg(feature = "covm")]
 use cove_datafusion::register::{cove_table_from_covm_path, register_cove_covm};
+#[cfg(feature = "covi")]
+use cove_datafusion::{
+    bootstrap::bootstrap_bytes_with_covi_artifacts,
+    metadata_aggregate::exact_covi_unfiltered_min_max,
+};
 use cove_datafusion::{
     bootstrap::{
         bootstrap_bytes, bootstrap_bytes_with_options, bootstrap_local_file,
         bootstrap_local_file_async, bootstrap_range_reader_with_options, CoveMetadataCache,
     },
+    dataset_state::embedded_coverage_snapshot_validity_ref,
     decode::{decode_local_dataset_scan_tasks, decode_scan},
     expr_lowering::{lower_filter, LowerExpr, LowerLiteral, LowerOperator},
     overlay::{CoveOverlaySnapshot, OverlayFile, OverlayFileIdentity, RowRange, RowVisibility},
@@ -110,8 +126,8 @@ use datafusion::object_store::{
 use datafusion::{
     arrow::{
         array::{
-            Array, BinaryArray, BinaryViewArray, DictionaryArray, Int32Array, ListArray,
-            StringArray, StringViewArray,
+            Array, BinaryArray, BinaryViewArray, DictionaryArray, Float32Array, Int32Array,
+            ListArray, StringArray, StringViewArray,
         },
         datatypes::UInt32Type,
         util::pretty::pretty_format_batches,
@@ -237,6 +253,34 @@ async fn registered_utf8_page_scans_through_core_fallback_without_descriptor() {
         "| beta  |",
         "| gamma |",
         "+-------+",
+    ];
+    assert_batches_eq!(expected, &batches);
+    fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn registered_required_unprojected_page_does_not_block_count_scan() {
+    let path = write_temp_cove(
+        "registered_utf8_required_unprojected",
+        registered_names_file(false, false),
+    );
+    let ctx = SessionContext::new();
+    register_cove_file(&ctx, "names", &path).unwrap();
+
+    let batches = ctx
+        .sql("SELECT COUNT(*) FROM names")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let expected = [
+        "+----------+",
+        "| count(*) |",
+        "+----------+",
+        "| 3        |",
+        "+----------+",
     ];
     assert_batches_eq!(expected, &batches);
     fs::remove_file(path).unwrap();
@@ -1532,6 +1576,142 @@ async fn projection_order_and_exact_filter_are_correct() {
 }
 
 #[tokio::test]
+async fn float_numcode_filters_compare_logical_values() {
+    let path = write_temp_cove("float_metrics", float_metrics_file());
+    let ctx = SessionContext::new();
+    register_cove_file(&ctx, "metrics", &path).unwrap();
+
+    let batches = ctx
+        .sql("SELECT id FROM metrics WHERE f64 > 2.0 ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let expected = ["+----+", "| id |", "+----+", "| 2  |", "+----+"];
+    assert_batches_eq!(expected, &batches);
+
+    let batches = ctx
+        .sql("SELECT id FROM metrics WHERE f32 = CAST(2.25 AS REAL) ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let expected = ["+----+", "| id |", "+----+", "| 2  |", "+----+"];
+    assert_batches_eq!(expected, &batches);
+    fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn stats_only_constant_int_and_uint_pages_scan_repeated_values() {
+    let path = write_temp_cove("stats_only_numeric", stats_only_numeric_metrics_file(true));
+    let ctx = SessionContext::new();
+    register_cove_file(&ctx, "metrics", &path).unwrap();
+
+    let batches = ctx
+        .sql("SELECT signed, unsigned FROM metrics ORDER BY signed, unsigned")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let expected = [
+        "+--------+----------+",
+        "| signed | unsigned |",
+        "+--------+----------+",
+        "| -42    | 42       |",
+        "| -42    | 42       |",
+        "| -42    | 42       |",
+        "+--------+----------+",
+    ];
+    assert_batches_eq!(expected, &batches);
+    fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn stats_only_constant_float32_page_preserves_numcode_bits() {
+    let nan_bits = 0x7fc1_2345u32;
+    let path = write_temp_cove("stats_only_float32", stats_only_float32_file(nan_bits));
+    let ctx = SessionContext::new();
+    register_cove_file(&ctx, "metrics", &path).unwrap();
+
+    let batches = ctx
+        .sql("SELECT f32 FROM metrics")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(batches.len(), 1);
+    let values = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Float32Array>()
+        .unwrap();
+    assert_eq!(values.len(), 3);
+    for row in 0..values.len() {
+        assert_eq!(values.value(row).to_bits(), nan_bits);
+    }
+    fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn stats_only_constant_page_without_required_stats_fails_closed() {
+    let bytes = stats_only_numeric_metrics_file(false);
+    assert!(
+        matches!(
+            bootstrap_bytes("stats_only_missing_stats", bytes.clone()),
+            Err(CoveError::PageCorrupt)
+        ),
+        "stats-only all-non-null pages must require validated stats"
+    );
+
+    let path = write_temp_cove("stats_only_missing_stats", bytes);
+    let ctx = SessionContext::new();
+    let err = register_cove_file(&ctx, "metrics", &path).unwrap_err();
+    assert!(
+        err.to_string().contains("PAGE_CORRUPT"),
+        "unexpected error: {err}"
+    );
+    fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn stats_only_all_null_page_scans_without_value_stream() {
+    let path = write_temp_cove(
+        "stats_only_all_null",
+        include_bytes!(
+            "../../../conformance/accept/cove_t_payload_elision_stats_only_all_null_valid.cove"
+        )
+        .to_vec(),
+    );
+    let ctx = SessionContext::new();
+    register_cove_file(&ctx, "events", &path).unwrap();
+
+    let batches = ctx
+        .sql("SELECT COUNT(*) AS rows, COUNT(status_code) AS non_nulls FROM events")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let expected = [
+        "+------+-----------+",
+        "| rows | non_nulls |",
+        "+------+-----------+",
+        "| 6    | 0         |",
+        "+------+-----------+",
+    ];
+    assert_batches_eq!(expected, &batches);
+    fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
 async fn between_filter_uses_inclusive_lower_and_upper_bounds() {
     let path = write_temp_cove("events_between", primitive_events_file());
     let ctx = SessionContext::new();
@@ -1684,6 +1864,46 @@ async fn coverage_metadata_bad_checksum_fails_open() {
     assert_eq!(decoded.stats.morsels_pruned, 0);
 
     let path = write_temp_cove("coverage_sql_bad_checksum", bytes);
+    let ctx = SessionContext::new();
+    register_cove_file(&ctx, "events", &path).unwrap();
+
+    let (batches, morsels_pruned) = collect_sql_with_cove_metric(
+        &ctx,
+        "SELECT id, name FROM events WHERE name = 'gamma'",
+        "cove_morsels_pruned",
+    )
+    .await;
+
+    let expected = [
+        "+----+-------+",
+        "| id | name  |",
+        "+----+-------+",
+        "| 3  | gamma |",
+        "+----+-------+",
+    ];
+    assert_batches_eq!(expected, &batches);
+    assert_eq!(morsels_pruned, 0);
+    fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn coverage_metadata_stale_snapshot_fails_open() {
+    let bytes = primitive_events_file_with_name_gamma_coverage_snapshot(false, 2);
+    let state = bootstrap_bytes("coverage_sql_stale_snapshot", bytes.clone()).unwrap();
+    let filter = lower_filter(
+        &state,
+        &LowerExpr::Binary {
+            left: Box::new(LowerExpr::Column("name".into())),
+            op: LowerOperator::Eq,
+            right: Box::new(LowerExpr::Literal(LowerLiteral::Utf8("gamma".into()))),
+        },
+        "name = 'gamma'",
+    );
+    let plan = plan_scan(&state, Some(&vec![0, 1]), vec![filter]).unwrap();
+    let decoded = decode_scan(&state, &plan).unwrap();
+    assert_eq!(decoded.stats.morsels_pruned, 0);
+
+    let path = write_temp_cove("coverage_sql_stale_snapshot", bytes);
     let ctx = SessionContext::new();
     register_cove_file(&ctx, "events", &path).unwrap();
 
@@ -2072,6 +2292,118 @@ fn lookup_numcode_equality_uses_exact_key_conversion() {
     assert_batches_eq!(expected, &decoded.batches);
     assert_eq!(decoded.stats.lookup_index_hits, 1);
     assert_eq!(decoded.stats.pages_decoded, 1);
+}
+
+#[test]
+fn lookup_float_zero_equality_uses_both_signed_zero_keys() {
+    let state = bootstrap_bytes("metrics", float_zero_lookup_file()).unwrap();
+    let projection = vec![0];
+    let filter = FilterPlan::pruning_numeric(
+        1,
+        NumericPredicateOp::Eq,
+        PredicateLiteral::Float64(0.0),
+        "f64 = 0.0",
+    );
+    let plan = plan_scan(&state, Some(&projection), vec![filter]).unwrap();
+
+    let decoded = decode_scan(&state, &plan).unwrap();
+
+    let expected = ["+----+", "| id |", "+----+", "| 1  |", "| 2  |", "+----+"];
+    assert_batches_eq!(expected, &decoded.batches);
+    assert_eq!(decoded.stats.lookup_index_hits, 2);
+    assert_eq!(decoded.stats.index_rows_selected, 2);
+}
+
+#[cfg(feature = "covi")]
+#[test]
+fn generated_covi_filecode_utf8_filters_match_sidecar_keys() {
+    let bytes = dictionary_items_file_with_lookup_index();
+    let covi = cove_index::build::build_covi_from_cove_bytes(
+        &bytes,
+        &cove_index::build::CoviBuildOptions {
+            all_columns: true,
+            ..cove_index::build::CoviBuildOptions::default()
+        },
+    )
+    .unwrap();
+    let state = bootstrap_bytes_with_covi_artifacts(
+        "items",
+        bytes,
+        vec![covi],
+        CoveTableOptions::default(),
+    )
+    .unwrap();
+    let projection = vec![1];
+    let filter = lower_filter(
+        &state,
+        &LowerExpr::InList {
+            expr: Box::new(LowerExpr::Column("name".into())),
+            list: vec![LowerExpr::Literal(LowerLiteral::Utf8("red".into()))],
+            negated: false,
+        },
+        "name IN ('red')",
+    );
+    let plan = plan_scan(&state, Some(&projection), vec![filter]).unwrap();
+    assert_eq!(plan.covi_candidates.as_ref().map(Vec::len), Some(1));
+
+    let decoded = decode_scan(&state, &plan).unwrap();
+
+    let expected = [
+        "+---------+",
+        "| payload |",
+        "+---------+",
+        "| first   |",
+        "+---------+",
+    ];
+    assert_batches_eq!(expected, &decoded.batches);
+}
+
+#[cfg(feature = "covi")]
+#[test]
+fn generated_covi_min_max_answers_feed_datafusion_metadata_path() {
+    let bytes = dictionary_items_file_with_lookup_index();
+    let covi = cove_index::build::build_covi_from_cove_bytes(
+        &bytes,
+        &cove_index::build::CoviBuildOptions {
+            all_columns: true,
+            include_index_only_min_max: true,
+            ..cove_index::build::CoviBuildOptions::default()
+        },
+    )
+    .unwrap();
+    let plain_state = bootstrap_bytes("items_plain", bytes.clone()).unwrap();
+    let identity = plain_state.file(0).unwrap().identity();
+    let digest =
+        cove_core::digest::compute_digest(cove_core::constants::DigestAlgorithm::Sha256, &bytes)
+            .expect("sha256 digest");
+    let context = cove_index::execution::CoviValidationContextV2::for_file(
+        identity.file_id,
+        identity.file_len,
+        identity.footer_crc32c,
+    )
+    .with_dataset_id(identity.file_id)
+    .with_file_code_keys(true)
+    .with_file_digest(cove_core::constants::DigestAlgorithm::Sha256, digest);
+    cove_index::execution::ValidatedCoviArtifactV2::parse_and_validate(&covi, context).unwrap();
+    let state = bootstrap_bytes_with_covi_artifacts(
+        "items",
+        bytes,
+        vec![covi],
+        CoveTableOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(state.bootstrap_stats().covi_sidecars_loaded, 1);
+
+    let plan = exact_covi_unfiltered_min_max(
+        &state,
+        &[
+            (0, cove_index::execution::CoviAggregateKindV2::Min),
+            (0, cove_index::execution::CoviAggregateKindV2::Max),
+        ],
+    )
+    .unwrap();
+
+    assert!(plan.is_some());
 }
 
 #[tokio::test]
@@ -2468,22 +2800,22 @@ async fn redacted_filecode_count_column_does_not_use_metadata_fast_path() {
 }
 
 #[tokio::test]
-async fn filecode_zero_without_dictionary_is_not_null() {
-    let path = write_temp_cove("filecode_zero", filecode_without_dictionary_file());
+async fn filecode_without_dictionary_is_rejected_at_registration() {
+    let bytes =
+        include_bytes!("../../../conformance/reject/cove_t_filecode_missing_dictionary.cove");
+    assert!(
+        matches!(
+            bootstrap_bytes("filecode_missing_dictionary", bytes.to_vec()),
+            Err(CoveError::BadFileCode)
+        ),
+        "missing FileCode dictionary must fail ordinary table scan validation"
+    );
+
+    let path = write_temp_cove("filecode_missing_dictionary", bytes.to_vec());
     let ctx = SessionContext::new();
-    register_cove_file(&ctx, "items", &path).unwrap();
+    let err = register_cove_file(&ctx, "items", &path).unwrap_err();
 
-    let err = ctx
-        .sql("SELECT name FROM items")
-        .await
-        .unwrap()
-        .collect()
-        .await
-        .unwrap_err()
-        .to_string();
-
-    assert!(err.contains("FileCode(0)"), "{err}");
-    assert!(!err.to_ascii_lowercase().contains("null"), "{err}");
+    assert!(err.to_string().contains("BAD_FILECODE"), "{err}");
     fs::remove_file(path).unwrap();
 }
 
@@ -3182,9 +3514,270 @@ fn primitive_events_file() -> Vec<u8> {
     primitive_events_writer().write().unwrap()
 }
 
+fn float_metrics_file() -> Vec<u8> {
+    let catalog = TableCatalog {
+        flags: 0,
+        tables: vec![TableEntry {
+            table_id: 1,
+            namespace: "public".into(),
+            name: "metrics".into(),
+            row_count: 3,
+            primary_sort_key_count: 0,
+            clustering_key_count: 0,
+            flags: 0,
+            columns: vec![
+                column(
+                    1,
+                    "id",
+                    CoveLogicalType::Int64,
+                    CovePhysicalKind::NumCode,
+                    false,
+                ),
+                column(
+                    2,
+                    "f32",
+                    CoveLogicalType::Float32,
+                    CovePhysicalKind::NumCode,
+                    false,
+                ),
+                column(
+                    3,
+                    "f64",
+                    CoveLogicalType::Float64,
+                    CovePhysicalKind::NumCode,
+                    false,
+                ),
+            ],
+        }],
+    };
+    let mut segment = ScanSegment::new(1, 0, 0, 3, 3);
+    segment.set_column_pages(1, vec![numcode_page(3, numcode_i64(&[1, 2, 3]))]);
+    segment.set_column_pages(2, vec![numcode_page(3, numcode_f32(&[1.5, 2.25, -3.0]))]);
+    segment.set_column_pages(3, vec![numcode_page(3, numcode_f64(&[1.5, 2.25, -3.0]))]);
+
+    let mut writer = ScanProfileCoveWriter::new(catalog);
+    writer.push_segment(segment);
+    writer.write().unwrap()
+}
+
+fn stats_only_numeric_metrics_file(include_stats: bool) -> Vec<u8> {
+    let catalog = TableCatalog {
+        flags: 0,
+        tables: vec![TableEntry {
+            table_id: 1,
+            namespace: "public".into(),
+            name: "metrics".into(),
+            row_count: 3,
+            primary_sort_key_count: 0,
+            clustering_key_count: 0,
+            flags: 0,
+            columns: vec![
+                column(
+                    1,
+                    "signed",
+                    CoveLogicalType::Int64,
+                    CovePhysicalKind::NumCode,
+                    false,
+                ),
+                column(
+                    2,
+                    "unsigned",
+                    CoveLogicalType::UInt64,
+                    CovePhysicalKind::NumCode,
+                    false,
+                ),
+            ],
+        }],
+    };
+    let mut segment = ScanSegment::new(1, 0, 0, 3, 2);
+    if include_stats {
+        segment.set_column_pages(1, vec![stats_only_constant_page(3, 0)]);
+        segment.set_column_pages(2, vec![stats_only_constant_page(3, 1)]);
+    } else {
+        segment.set_column_pages(1, vec![stats_only_all_null_page(3, 0)]);
+        segment.set_column_pages(2, vec![stats_only_all_null_page(3, 1)]);
+    }
+
+    let mut writer = ScanProfileCoveWriter::new(catalog);
+    if include_stats {
+        writer
+            .push_zone_stats(&ZoneStatsSection {
+                entries: vec![
+                    stats_only_entry(1, 0, 1, 3, StatKind::Int64, (-42i64).to_le_bytes().to_vec()),
+                    stats_only_entry(1, 0, 2, 3, StatKind::UInt64, 42u64.to_le_bytes().to_vec()),
+                ],
+            })
+            .unwrap();
+    }
+    writer.push_segment(segment);
+    let bytes = writer.write().unwrap();
+    if include_stats {
+        bytes
+    } else {
+        rewrite_first_segment_pages(bytes, |page| {
+            page.non_null_count = page.row_count;
+            page.null_count = 0;
+            page.flags = (page.flags & !PAGE_FLAG_ALL_NULL) | PAGE_FLAG_ALL_NON_NULL;
+        })
+    }
+}
+
+fn stats_only_float32_file(bits: u32) -> Vec<u8> {
+    let catalog = TableCatalog {
+        flags: 0,
+        tables: vec![TableEntry {
+            table_id: 1,
+            namespace: "public".into(),
+            name: "metrics".into(),
+            row_count: 3,
+            primary_sort_key_count: 0,
+            clustering_key_count: 0,
+            flags: 0,
+            columns: vec![column(
+                1,
+                "f32",
+                CoveLogicalType::Float32,
+                CovePhysicalKind::NumCode,
+                false,
+            )],
+        }],
+    };
+    let mut segment = ScanSegment::new(1, 0, 0, 3, 1);
+    segment.set_column_pages(1, vec![stats_only_constant_page(3, 0)]);
+
+    let mut writer = ScanProfileCoveWriter::new(catalog);
+    writer
+        .push_zone_stats(&ZoneStatsSection {
+            entries: vec![stats_only_entry(
+                1,
+                0,
+                1,
+                3,
+                StatKind::FixedBytes,
+                bits.to_le_bytes().to_vec(),
+            )],
+        })
+        .unwrap();
+    writer.push_segment(segment);
+    writer.write().unwrap()
+}
+
+fn stats_only_constant_page(row_count: u32, stats_ref: u32) -> ScanPageSpec {
+    let mut page = ScanPageSpec::new(row_count, Vec::new())
+        .with_counts(row_count, 0)
+        .with_encoding_root(u32::MAX)
+        .with_flags(PAGE_FLAG_STATS_ONLY_CONSTANT | PAGE_FLAG_ALL_NON_NULL);
+    page.stats_ref = stats_ref;
+    page
+}
+
+fn stats_only_all_null_page(row_count: u32, stats_ref: u32) -> ScanPageSpec {
+    let mut page = ScanPageSpec::new(row_count, Vec::new())
+        .with_counts(0, row_count)
+        .with_encoding_root(u32::MAX)
+        .with_flags(PAGE_FLAG_STATS_ONLY_CONSTANT | PAGE_FLAG_ALL_NULL);
+    page.stats_ref = stats_ref;
+    page
+}
+
+fn rewrite_first_segment_pages(
+    mut bytes: Vec<u8>,
+    mut mutate: impl FnMut(&mut ColumnPageIndexEntryV1),
+) -> Vec<u8> {
+    let mut postscript = CovePostscriptV1::parse_from_tail(&bytes).unwrap();
+    let footer_start = postscript.footer.offset as usize;
+    let footer_header = CoveFooterHeaderV1::parse(&bytes[footer_start..]).unwrap();
+    let entries_start = footer_start + FOOTER_HEADER_SIZE;
+    for index in 0..footer_header.section_count as usize {
+        let entry_start = entries_start + index * SECTION_ENTRY_SIZE;
+        let mut section_entry =
+            CoveSectionEntryV1::parse(&bytes[entry_start..entry_start + SECTION_ENTRY_SIZE])
+                .unwrap();
+        if section_entry.section_kind != SectionKind::TableSegmentData as u16 {
+            continue;
+        }
+        let segment_start = section_entry.offset as usize;
+        let segment_end = segment_start + section_entry.length as usize;
+        let segment = TableSegmentPayloadV1::parse(&bytes[segment_start..segment_end]).unwrap();
+        for column in &segment.columns {
+            let page_count = column.page_index_length as usize / 60;
+            for page_index in 0..page_count {
+                let page_start =
+                    segment_start + column.page_index_offset as usize + page_index * 60;
+                let mut page =
+                    ColumnPageIndexEntryV1::parse(&bytes[page_start..page_start + 60]).unwrap();
+                mutate(&mut page);
+                bytes[page_start..page_start + 60].copy_from_slice(&page.serialize());
+            }
+        }
+        section_entry.crc32c = checksum::crc32c(&bytes[segment_start..segment_end]);
+        bytes[entry_start..entry_start + SECTION_ENTRY_SIZE]
+            .copy_from_slice(&section_entry.serialize());
+
+        let footer_end = footer_start + postscript.footer.length as usize;
+        postscript.footer.crc32c = checksum::crc32c(&bytes[footer_start..footer_end]);
+        let tail_start = bytes.len() - POSTSCRIPT_TOTAL_SIZE;
+        bytes[tail_start..].copy_from_slice(&postscript.serialize_tail());
+        return bytes;
+    }
+    panic!("generated COVE-T file did not contain TABLE_SEGMENT_DATA");
+}
+
+fn stats_only_entry(
+    table_id: u32,
+    segment_id: u32,
+    column_id: u32,
+    row_count: u32,
+    kind: StatKind,
+    bytes: Vec<u8>,
+) -> ZoneStatsEntry {
+    let scalar = StatScalar {
+        kind,
+        bytes,
+        truncated: false,
+    };
+    ZoneStatsEntry {
+        table_id,
+        segment_id,
+        morsel_id: 0,
+        column_id,
+        non_null_count: row_count,
+        distinct_count: 1,
+        run_count: 1,
+        stats: ZoneStats {
+            scope: ZoneScope::Morsel,
+            row_count: u64::from(row_count),
+            null_count: 0,
+            min: Some(scalar.clone()),
+            max: Some(scalar),
+            flags: ZoneStatFlags::HAS_MIN_MAX | ZoneStatFlags::CONSTANT,
+        },
+        min_domain_rank: 0,
+        max_domain_rank: 0,
+        exact_set_ref: u32::MAX,
+        bloom_ref: u32::MAX,
+    }
+}
+
 fn primitive_events_file_with_name_gamma_coverage(bad_checksum: bool) -> Vec<u8> {
+    let placeholder = primitive_events_file_with_name_gamma_coverage_snapshot(bad_checksum, 0);
+    let placeholder_footer = reader::validate_bytes(&placeholder).unwrap().footer;
+    primitive_events_file_with_name_gamma_coverage_snapshot(
+        bad_checksum,
+        embedded_coverage_snapshot_validity_ref(
+            &placeholder_footer,
+            &[0; 16],
+            placeholder.len() as u64,
+        ),
+    )
+}
+
+fn primitive_events_file_with_name_gamma_coverage_snapshot(
+    bad_checksum: bool,
+    snapshot_validity_ref: u32,
+) -> Vec<u8> {
     let mut writer = primitive_events_writer();
-    for section in name_gamma_coverage_sections(bad_checksum) {
+    for section in name_gamma_coverage_sections(bad_checksum, snapshot_validity_ref) {
         writer.push_extra_section(section);
     }
     writer.write().unwrap()
@@ -3239,11 +3832,13 @@ fn coverage_cache_bytes_for_state(state: &cove_datafusion::dataset_state::Datase
     .unwrap()
 }
 
-fn name_gamma_coverage_sections(bad_checksum: bool) -> Vec<SectionPayload> {
+fn name_gamma_coverage_sections(
+    bad_checksum: bool,
+    snapshot_validity_ref: u32,
+) -> Vec<SectionPayload> {
     let predicate_form_ref = 1;
     let provider_id = 1;
     let coverage_set_id = 1;
-    let snapshot_validity_ref = 1;
     let predicate_form_section =
         predicate_normal_form_ast_section(predicate_form_ref, 1, name_eq_gamma_ast_payload());
 
@@ -4065,6 +4660,96 @@ fn numeric_lookup_events_file() -> Vec<u8> {
     writer.write().unwrap()
 }
 
+fn float_zero_lookup_file() -> Vec<u8> {
+    let catalog = TableCatalog {
+        flags: 0,
+        tables: vec![TableEntry {
+            table_id: 9,
+            namespace: "public".into(),
+            name: "metrics".into(),
+            row_count: 3,
+            primary_sort_key_count: 0,
+            clustering_key_count: 0,
+            flags: 0,
+            columns: vec![
+                column(
+                    1,
+                    "id",
+                    CoveLogicalType::Int64,
+                    CovePhysicalKind::NumCode,
+                    false,
+                ),
+                column(
+                    2,
+                    "f64",
+                    CoveLogicalType::Float64,
+                    CovePhysicalKind::NumCode,
+                    false,
+                ),
+            ],
+        }],
+    };
+    let mut segment = ScanSegment::new(9, 0, 0, 3, 2);
+    segment.set_column_pages(1, vec![numcode_page(3, numcode_i64(&[1, 2, 3]))]);
+    segment.set_column_pages(2, vec![numcode_page(3, numcode_f64(&[0.0, -0.0, 1.0]))]);
+
+    let mut writer = ScanProfileCoveWriter::new(catalog);
+    writer.push_extra_section(float_zero_lookup_index_section());
+    writer.push_segment(segment);
+    writer.write().unwrap()
+}
+
+fn float_zero_lookup_index_section() -> SectionPayload {
+    let index = LookupIndex {
+        header: LookupIndexHeaderV1 {
+            table_id: 9,
+            column_id: 2,
+            key_kind: LookupKeyKind::NumCode,
+            index_kind: LookupIndexKind::SparseSorted,
+            uniqueness: LookupUniqueness::NonUnique,
+            flags: 0,
+            entry_count: 0,
+            entries_offset: 0,
+            entries_length: 0,
+            rowref_offset: 0,
+            rowref_length: 0,
+            checksum: 0,
+        },
+        entries: vec![
+            LookupEntry {
+                key: 0.0f64.to_bits(),
+                rows: vec![RowRef {
+                    table_id: 9,
+                    segment_id: 0,
+                    morsel_id: 0,
+                    row_in_morsel: 0,
+                }],
+            },
+            LookupEntry {
+                key: (-0.0f64).to_bits(),
+                rows: vec![RowRef {
+                    table_id: 9,
+                    segment_id: 0,
+                    morsel_id: 0,
+                    row_in_morsel: 1,
+                }],
+            },
+        ],
+    };
+    SectionPayload {
+        section_kind: SectionKind::LookupIndex as u16,
+        profile: PrimaryProfile::ArchiveAcceleration as u8,
+        flags: 0,
+        item_count: 1,
+        row_count: 3,
+        compression: 0,
+        alignment_log2: 0,
+        required_features: 0,
+        optional_features: 0,
+        data: index.serialize().unwrap(),
+    }
+}
+
 fn dictionary_items_payload_catalog() -> TableCatalog {
     TableCatalog {
         flags: 0,
@@ -4094,33 +4779,6 @@ fn dictionary_items_payload_catalog() -> TableCatalog {
             ],
         }],
     }
-}
-
-fn filecode_without_dictionary_file() -> Vec<u8> {
-    let catalog = TableCatalog {
-        flags: 0,
-        tables: vec![TableEntry {
-            table_id: 7,
-            namespace: "public".into(),
-            name: "items".into(),
-            row_count: 1,
-            primary_sort_key_count: 0,
-            clustering_key_count: 0,
-            flags: 0,
-            columns: vec![column(
-                1,
-                "name",
-                CoveLogicalType::Utf8,
-                CovePhysicalKind::FileCode,
-                false,
-            )],
-        }],
-    };
-    let mut segment = ScanSegment::new(7, 0, 0, 1, 1);
-    segment.set_column_pages(1, vec![filecode_page(1, filecodes(&[0]))]);
-    let mut writer = ScanProfileCoveWriter::new(catalog);
-    writer.push_segment(segment);
-    writer.write().unwrap()
 }
 
 fn multiple_tables_file() -> Vec<u8> {
@@ -4632,6 +5290,20 @@ fn numcode_i64(values: &[i64]) -> Vec<u8> {
     values
         .iter()
         .flat_map(|value| (*value as u64).to_le_bytes())
+        .collect()
+}
+
+fn numcode_f32(values: &[f32]) -> Vec<u8> {
+    values
+        .iter()
+        .flat_map(|value| u64::from(value.to_bits()).to_le_bytes())
+        .collect()
+}
+
+fn numcode_f64(values: &[f64]) -> Vec<u8> {
+    values
+        .iter()
+        .flat_map(|value| value.to_bits().to_le_bytes())
         .collect()
 }
 

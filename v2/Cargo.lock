@@ -731,6 +731,7 @@ dependencies = [
  "cove-index",
  "cove-layout",
  "cove-map",
+ "cove-profile-validation",
  "cove-runtime",
  "parquet",
  "serde_json",
@@ -902,6 +903,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "cove-profile-validation"
+version = "0.1.0"
+dependencies = [
+ "cove-core",
+ "cove-coverage",
+ "cove-index",
+ "cove-layout",
+ "cove-runtime",
+]
+
+[[package]]
 name = "cove-reader"
 version = "0.1.0"
 dependencies = [
@@ -922,6 +934,9 @@ name = "cove-validate"
 version = "0.1.0"
 dependencies = [
  "cove-core",
+ "cove-layout",
+ "cove-profile-validation",
+ "cove-runtime",
 ]
 
 [[package]]

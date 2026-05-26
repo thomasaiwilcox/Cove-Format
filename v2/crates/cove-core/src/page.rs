@@ -48,12 +48,7 @@ pub fn page_flag_codec(flags: u32) -> Result<CompressionCodec, CoveError> {
 }
 
 pub fn page_uses_payload_elision(flags: u32) -> bool {
-    flags
-        & (PAGE_FLAG_STATS_ONLY_CONSTANT
-            | PAGE_FLAG_ALL_NULL
-            | PAGE_FLAG_ALL_NON_NULL
-            | PAGE_FLAG_VALUE_STREAM_ELIDED)
-        != 0
+    flags & (PAGE_FLAG_STATS_ONLY_CONSTANT | PAGE_FLAG_VALUE_STREAM_ELIDED) != 0
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -297,6 +292,9 @@ impl PageIndex {
         if required_len > bytes.len() {
             return Err(CoveError::BufferTooShort);
         }
+        if required_len != bytes.len() {
+            return Err(CoveError::PageCorrupt);
+        }
         let mut entries = Vec::with_capacity(count);
         let mut pos = 4usize;
         for _ in 0..count {
@@ -395,6 +393,13 @@ mod tests {
     fn rejects_oversized_entry_count_before_allocating() {
         let bytes = u32::MAX.to_le_bytes().to_vec();
         assert_eq!(PageIndex::parse(&bytes), Err(CoveError::BufferTooShort));
+    }
+
+    #[test]
+    fn rejects_trailing_page_index_bytes() {
+        let mut bytes = make_page_bytes(&[(0, 0, 4, 1, 0, 8, 0, 0)]);
+        bytes.push(0);
+        assert_eq!(PageIndex::parse(&bytes), Err(CoveError::PageCorrupt));
     }
 
     #[test]
@@ -516,7 +521,9 @@ mod tests {
     #[test]
     fn page_payload_elision_flag_helper_detects_usage() {
         assert!(!page_uses_payload_elision(CompressionCodec::None as u32));
-        assert!(page_uses_payload_elision(PAGE_FLAG_ALL_NULL));
+        assert!(!page_uses_payload_elision(PAGE_FLAG_ALL_NULL));
+        assert!(!page_uses_payload_elision(PAGE_FLAG_ALL_NON_NULL));
+        assert!(page_uses_payload_elision(PAGE_FLAG_VALUE_STREAM_ELIDED));
         assert!(page_uses_payload_elision(
             PAGE_FLAG_STATS_ONLY_CONSTANT | PAGE_FLAG_ALL_NON_NULL
         ));

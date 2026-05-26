@@ -62,8 +62,7 @@ pub fn write_table(
     path: impl AsRef<Path>,
     writer: &ScanProfileCoveWriter,
 ) -> Result<(), CoveError> {
-    let bytes = writer.write()?;
-    fs::write(path, bytes).map_err(CoveError::from)
+    writer.publish_durable(path.as_ref()).map(|_| ())
 }
 
 pub fn convert_file(
@@ -112,6 +111,47 @@ mod tests {
         assert_eq!(validated.header.version_major, 2);
         let inspection = inspect_file(&path).unwrap();
         assert_eq!(inspection.section_count, 0);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn write_table_publishes_readable_file() {
+        let path =
+            std::env::temp_dir().join(format!("cove_io_write_table_{}.cove", std::process::id()));
+        let catalog = table::TableCatalog {
+            flags: 0,
+            tables: vec![table::TableEntry {
+                table_id: 1,
+                namespace: "public".into(),
+                name: "events".into(),
+                row_count: 1,
+                primary_sort_key_count: 0,
+                clustering_key_count: 0,
+                flags: 0,
+                columns: vec![table::ColumnEntry {
+                    column_id: 1,
+                    name: "active".into(),
+                    logical: constants::CoveLogicalType::Bool,
+                    physical: constants::CovePhysicalKind::Boolean,
+                    nullable: false,
+                    sort_order: 0,
+                    collation_id: 0,
+                    precision: 0,
+                    scale: 0,
+                    flags: 0,
+                }],
+            }],
+        };
+        let mut writer = ScanProfileCoveWriter::new(catalog);
+        writer.push_segment(writer::ScanSegment::new(1, 0, 0, 1, 1));
+
+        write_table(&path, &writer).unwrap();
+
+        let validated = validate_file(&path).unwrap();
+        assert_eq!(validated.header.version_major, 2);
+        let mounted = read_table(&path).unwrap();
+        assert_eq!(mounted.tables.len(), 1);
+
         let _ = std::fs::remove_file(path);
     }
 

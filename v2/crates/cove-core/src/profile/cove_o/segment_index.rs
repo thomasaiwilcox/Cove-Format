@@ -73,7 +73,7 @@ impl TemporalSegmentIndex {
     pub fn validate(&self) -> Result<(), CoveError> {
         let mut seen = std::collections::HashSet::new();
         for entry in &self.entries {
-            if !seen.insert((entry.object_type_id, entry.segment_id)) {
+            if !seen.insert(entry.segment_id) {
                 return Err(CoveError::RefInvalid);
             }
             entry.validate()?;
@@ -178,5 +178,40 @@ impl TemporalSegmentIndexEntryV1 {
             ));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid_entry(segment_id: u32, object_type_id: u32) -> TemporalSegmentIndexEntryV1 {
+        TemporalSegmentIndexEntryV1 {
+            segment_id,
+            object_type_id,
+            time_range_start_us: 0,
+            time_range_end_us: 0,
+            csn_min: 0,
+            csn_max: 0,
+            row_count: 0,
+            delta_count: 0,
+            snapshot_count: 0,
+            baseline_count: 0,
+            tombstone_count: 0,
+            min_goid: [0; 16],
+            max_goid: [0; 16],
+            offset: 0,
+            length: 0,
+            checksum: 0,
+        }
+    }
+
+    #[test]
+    fn temporal_segment_ids_are_file_unique_across_object_types() {
+        let index = TemporalSegmentIndex {
+            flags: 0,
+            entries: vec![valid_entry(7, 1), valid_entry(7, 2)],
+        };
+        assert_eq!(index.validate(), Err(CoveError::RefInvalid));
     }
 }

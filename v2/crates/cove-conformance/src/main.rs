@@ -125,7 +125,7 @@ use cove_core::{
         explain_is_null, explain_lookup_index_point, explain_numcode_range,
         explain_resolved_domain_rank_range, PruningEvidence, PruningExplanation,
     },
-    reader::{self, ValidationOptions},
+    reader::{self, OptionalPushdownPolicy, ValidationOptions},
     redaction::RedactionManifest,
     row_ref::RowRef,
     segment::{RowMorselDirectory, TableSegmentHeaderV1, TableSegmentIndex, TableSegmentPayloadV1},
@@ -157,6 +157,7 @@ use cove_layout::{
     ZeroCopyMaterializationReasonV2,
 };
 use cove_map::ProjectionFormat;
+use cove_profile_validation::EmbeddedOptionalProfileValidator;
 use cove_runtime::{
     unsupported_required_hints, validate_hints, RuntimeCompatibilityHintV2, RuntimeHintKindV2,
 };
@@ -182,16 +183,7 @@ fn main() {
 
 fn validate_fixture(entry: &Entry, corpus: &Path, bytes: &[u8]) -> Result<(), CoveError> {
     match entry.kind.as_str() {
-        "cove" => reader::validate_bytes_with_options(
-            bytes,
-            ValidationOptions {
-                semantic: true,
-                verify_digests: false,
-                allow_unknown_optional_extensions: true,
-                ..ValidationOptions::default()
-            },
-        )
-        .map(|_| ()),
+        "cove" => validate_cove_fixture(bytes),
         "covemap" => CovemapFile::parse(bytes).and_then(|file| file.validate_map_sections()),
         "covx" => CovxFile::parse(bytes).map(|_| ()),
         "covm" => CovmFile::parse(bytes).map(|_| ()),
@@ -207,7 +199,10 @@ fn validate_fixture(entry: &Entry, corpus: &Path, bytes: &[u8]) -> Result<(), Co
         "cove_layout_scan_split" => ScanSplitIndexV2::parse(bytes).map(|_| ()),
         "zero_copy_map" => ZeroCopyBufferMapV2::parse(bytes).map(|_| ()),
         "zero_copy_compat_case" => validate_zero_copy_compat_fixture(bytes),
-        "cove_runtime_hints" => RuntimeCompatibilityHintV2::parse_many(bytes).map(|_| ()),
+        "cove_runtime_hints" => {
+            let hints = RuntimeCompatibilityHintV2::parse_many(bytes)?;
+            validate_hints(&hints)
+        }
         "runtime_operation_case" => validate_runtime_operation_fixture(bytes),
         "cove_coverage_providers" => CoverageProviderDescriptorV2::parse_many(bytes).map(|_| ()),
         "cove_coverage_set" => CoverageSetV2::parse(bytes).map(|_| ()),
@@ -287,6 +282,26 @@ fn validate_fixture(entry: &Entry, corpus: &Path, bytes: &[u8]) -> Result<(), Co
     }
 }
 
+fn validate_cove_fixture(bytes: &[u8]) -> Result<(), CoveError> {
+    let report = reader::validate_bytes_with_options(
+        bytes,
+        ValidationOptions {
+            semantic: true,
+            verify_digests: false,
+            allow_unknown_optional_extensions: true,
+            optional_pushdown_policy: OptionalPushdownPolicy::FailOpen,
+        },
+    )?;
+    EmbeddedOptionalProfileValidator::default_builtins()
+        .validate_embedded_optional_profile_sections(
+            bytes,
+            &report,
+            OptionalPushdownPolicy::FailOpen,
+            None,
+            false,
+        )
+}
+
 fn validate_feature_scope_use_fixture(entry: &Entry, bytes: &[u8]) -> Result<(), CoveError> {
     let mut request = FeatureUseRequestV2::new();
     if let Some(profile) = entry.raw.get("requested_profile").and_then(Value::as_u64) {
@@ -343,17 +358,25 @@ fn validate_feature_scope_use_fixture(entry: &Entry, bytes: &[u8]) -> Result<(),
                 ));
         }
     }
-    reader::validate_bytes_for_feature_use(
+    let validator = EmbeddedOptionalProfileValidator::default_builtins();
+    let report = reader::validate_bytes_for_feature_use_with_optional_profile_validator(
         bytes,
         ValidationOptions {
             semantic: true,
             verify_digests: false,
             allow_unknown_optional_extensions: true,
-            ..ValidationOptions::default()
+            optional_pushdown_policy: OptionalPushdownPolicy::FailOpen,
         },
-        request,
+        request.clone(),
+        &validator,
+    )?;
+    validator.validate_embedded_optional_profile_sections(
+        bytes,
+        &report,
+        OptionalPushdownPolicy::FailOpen,
+        Some(&request),
+        false,
     )
-    .map(|_| ())
 }
 
 fn validate_extension_registry_fixture(bytes: &[u8]) -> Result<(), CoveError> {
@@ -692,6 +715,8 @@ fn validate_covi_validation_fixture(bytes: &[u8]) -> Result<(), CoveError> {
                 "min" => CoviAggregateKindV2::Min,
                 "max" => CoviAggregateKindV2::Max,
                 "exists" => CoviAggregateKindV2::Exists,
+                "sum" => CoviAggregateKindV2::Sum,
+                "avg" => CoviAggregateKindV2::Avg,
                 other => {
                     return Err(CoveError::BadSection(format!(
                         "unsupported aggregate_kind {other}"
@@ -1420,6 +1445,7 @@ fn validate_release_gate_contract(corpus: &Path, value: &Value) -> Result<(), Co
         CoveError::BadSection("cannot locate repository root from conformance corpus".into())
     })?;
     let gate_path = repo_root.join("scripts/release-gates.sh");
+    validate_script_executable(&gate_path)?;
     let contents = std::fs::read_to_string(&gate_path).map_err(|error| {
         CoveError::BadSection(format!(
             "cannot read release-gate script {}: {error}",
@@ -1433,6 +1459,30 @@ fn validate_release_gate_contract(corpus: &Path, value: &Value) -> Result<(), Co
             )));
         }
     }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_script_executable(path: &Path) -> Result<(), CoveError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let metadata = std::fs::metadata(path).map_err(|error| {
+        CoveError::BadSection(format!(
+            "cannot stat release-gate script {}: {error}",
+            path.display()
+        ))
+    })?;
+    if metadata.permissions().mode() & 0o111 == 0 {
+        return Err(CoveError::BadSection(format!(
+            "release-gate script {} is not executable",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_script_executable(_path: &Path) -> Result<(), CoveError> {
     Ok(())
 }
 

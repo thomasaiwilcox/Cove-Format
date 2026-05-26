@@ -6,9 +6,13 @@ mod pruning_sections;
 mod schema;
 mod segment;
 
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc,
+use std::{
+    borrow::Cow,
+    path::Path,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
 };
 
 use arrow_schema::SchemaRef;
@@ -29,9 +33,13 @@ use cove_core::{
     mount::MountedCoveFile,
     nested_schema::{NestedSchemaNodeV1, NestedSchemaSectionV1},
     page::{page_flag_codec, ColumnPageIndexEntryV1},
-    segment::TableSegmentIndexEntryV1,
+    segment::{
+        RowMorselDirectory, RowMorselEntryV1, TableSegmentHeaderV1, TableSegmentIndexEntryV1,
+        ROW_MORSEL_ENTRY_LEN, TABLE_SEGMENT_HEADER_LEN,
+    },
     table::{ColumnEntry, TableEntry},
-    zone_stats::ZoneStatsSection,
+    wire,
+    zone_stats::{ZoneStatsEntry, ZoneStatsSection},
     CoveError,
 };
 use cove_coverage::{
@@ -59,14 +67,15 @@ use crate::{
 };
 
 pub use pruning_sections::{
-    parse_aggregates_from_sections, parse_blooms_from_sections,
-    parse_codec_descriptors_from_sections, parse_column_domains_from_sections,
-    parse_composites_from_sections, parse_coverage_plan_candidates_from_sections,
-    parse_coverage_proofs_from_sections, parse_coverage_providers_from_sections,
-    parse_coverage_sets_from_sections, parse_exact_sets_from_sections,
-    parse_inverted_from_sections, parse_lookups_from_sections, parse_predicate_forms_from_sections,
-    parse_predicate_forms_with_payloads_from_sections, parse_topn_from_sections,
-    parse_zone_stats_from_sections,
+    embedded_coverage_snapshot_validity_ref, parse_aggregates_from_sections,
+    parse_blooms_from_sections, parse_codec_descriptors_from_sections,
+    parse_column_domains_from_sections, parse_composites_from_sections,
+    parse_coverage_plan_candidates_from_sections, parse_coverage_proofs_from_sections,
+    parse_coverage_providers_from_sections, parse_coverage_sets_from_sections,
+    parse_exact_sets_from_sections, parse_inverted_from_sections, parse_lookups_from_sections,
+    parse_predicate_forms_from_sections, parse_predicate_forms_with_payloads_from_sections,
+    parse_topn_from_sections, parse_zone_stats_from_sections,
+    selected_coverage_snapshot_validity_ref,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -169,10 +178,12 @@ impl Default for CoverageCacheMetadata {
 
 #[derive(Debug, Clone, Default)]
 pub struct PruningMetadata {
+    pub selected_coverage_snapshot_validity_ref: Option<u32>,
     pub nested_schemas: Arc<Vec<NestedSchemaSectionV1>>,
     pub codec_descriptors: Arc<Vec<CodecExtensionDescriptorV2>>,
     pub column_domains: Arc<Vec<ColumnDomain>>,
     pub zone_stats: Arc<Vec<ZoneStatsSection>>,
+    pub zone_stats_entries: Arc<Vec<ZoneStatsEntry>>,
     pub exact_sets: Arc<Vec<ExactSetIndex>>,
     pub blooms: Arc<Vec<BloomFilterIndex>>,
     pub lookups: Arc<Vec<LookupIndex>>,
@@ -519,6 +530,7 @@ impl DatasetState {
         segment_id: u32,
         column: &ColumnEntry,
         page: &ColumnPageIndexEntryV1,
+        page_ref: u32,
     ) -> Option<ZeroCopyCompatibilityV2> {
         let dictionary_semantics = match column.physical {
             CovePhysicalKind::FileCode => ZeroCopyDictionarySemanticsV2::FileCodeDictionary,
@@ -546,6 +558,7 @@ impl DatasetState {
                         && entry.column_id == column.column_id
                         && entry.segment_id == segment_id
                         && entry.morsel_id == page.morsel_id
+                        && entry.page_ref == page_ref
                 })
                 .map(|entry| {
                     if page_compressed && entry.compression_required_none != 0 {
@@ -764,6 +777,81 @@ impl FileMetadata {
         self.segments.as_slice()
     }
 
+    pub(crate) fn row_morsels_for_segment(
+        &self,
+        segment: &TableSegmentIndexEntryV1,
+    ) -> Result<Vec<RowMorselEntryV1>, CoveError> {
+        let file_bytes = if let Some(bytes) = self.full_file_bytes() {
+            Cow::Borrowed(bytes)
+        } else if Path::new(self.source()).is_file() {
+            Cow::Owned(std::fs::read(self.source())?)
+        } else {
+            return Err(CoveError::BadSection(
+                "row-morsel directory requires local file bytes".into(),
+            ));
+        };
+        let segment_start = usize::try_from(segment.offset).map_err(|_| CoveError::OffsetRange)?;
+        let segment_len = usize::try_from(segment.length).map_err(|_| CoveError::OffsetRange)?;
+        let segment_bytes =
+            wire::read_range_checked(file_bytes.as_ref(), segment_start, segment_len)?;
+        let header = TableSegmentHeaderV1::parse(segment_bytes)?;
+        if header.table_id != segment.table_id
+            || header.segment_id != segment.segment_id
+            || header.row_start != segment.row_start
+            || header.row_count != segment.row_count
+            || header.morsel_count != segment.morsel_count
+            || header.morsel_row_count != segment.morsel_row_count
+            || header.column_count != segment.column_count
+        {
+            return Err(CoveError::SegmentCorrupt);
+        }
+        let morsel_offset =
+            usize::try_from(header.morsel_directory_offset).map_err(|_| CoveError::OffsetRange)?;
+        if morsel_offset < TABLE_SEGMENT_HEADER_LEN || morsel_offset > segment_bytes.len() {
+            return Err(CoveError::SegmentCorrupt);
+        }
+        let morsel_len = (header.morsel_count as usize)
+            .checked_mul(ROW_MORSEL_ENTRY_LEN)
+            .ok_or(CoveError::ArithOverflow)?;
+        let morsel_end = morsel_offset
+            .checked_add(morsel_len)
+            .ok_or(CoveError::ArithOverflow)?;
+        if morsel_end > segment_bytes.len() {
+            return Err(CoveError::SegmentCorrupt);
+        }
+        let directory = RowMorselDirectory::parse(
+            &segment_bytes[morsel_offset..morsel_end],
+            header.morsel_count,
+        )?;
+        if directory.sum_rows() != u64::from(header.row_count) {
+            return Err(CoveError::SegmentCorrupt);
+        }
+        Ok(directory.entries)
+    }
+
+    #[cfg(feature = "covi")]
+    pub(crate) fn covi_row_range_scopes(
+        &self,
+    ) -> Result<Vec<cove_index::execution::CoviRowRangeScopeV2>, CoveError> {
+        let mut scopes = Vec::new();
+        for segment in self.segments() {
+            for morsel in self.row_morsels_for_segment(segment)? {
+                scopes.push(cove_index::execution::CoviRowRangeScopeV2 {
+                    file_ref: 0,
+                    table_id: segment.table_id,
+                    segment_id: segment.segment_id,
+                    morsel_id: morsel.morsel_id,
+                    row_start: segment
+                        .row_start
+                        .checked_add(u64::from(morsel.first_row_in_segment))
+                        .ok_or(CoveError::ArithOverflow)?,
+                    row_count: u64::from(morsel.row_count),
+                });
+            }
+        }
+        Ok(scopes)
+    }
+
     pub fn pruning(&self) -> &PruningMetadata {
         &self.pruning
     }
@@ -844,6 +932,9 @@ pub(crate) fn ordinary_table_scan_feature_use_request(footer: &CoveFooter) -> Fe
                 | SectionKind::TableSegmentData
                 | SectionKind::FileDictionaryIndex
                 | SectionKind::FileDictionaryPayload
+                | SectionKind::NestedSchema
+                | SectionKind::ZoneStats
+                | SectionKind::CodecExtensionRegistry
         ) {
             request.needed_section_ids.insert(section.section_id);
         }

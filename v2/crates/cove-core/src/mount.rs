@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use crate::{
     artifact::{covm::CovmFile, covx::CovxFile},
     checksum, compression,
-    constants::{DigestAlgorithm, SectionKind, ValueTag},
+    constants::{DigestAlgorithm, SectionKind, ValueTag, FEATURE_ENGINE_PROFILE},
     dictionary::{DictionaryValue, FileDictionary},
     digest::verify_digest,
     domain::ColumnDomain,
@@ -226,7 +226,12 @@ pub fn mount_cove_file(
     let table_catalog = parse_table_catalog(data, &footer)?;
     let dictionary = parse_dictionary(data, &footer)?;
     let reverse_lookup = dictionary.as_ref().map(build_reverse_lookup).transpose()?;
-    let engine_metadata = parse_engine_metadata(data, &footer)?;
+    let engine_metadata = parse_engine_metadata_with_policy(
+        data,
+        &footer,
+        options.representation == OutputRepresentation::MapToExecutionCode
+            || engine_profile_required(&header, &footer),
+    )?;
     let execution_code_map = if options.representation == OutputRepresentation::MapToExecutionCode {
         let dictionary = dictionary.as_ref().ok_or(CoveError::ExecutionCodeMap)?;
         Some(build_execution_code_map(
@@ -590,6 +595,48 @@ pub fn parse_engine_metadata(
     data: &[u8],
     footer: &CoveFooter,
 ) -> Result<EngineMetadata, CoveError> {
+    parse_engine_metadata_with_policy(data, footer, true)
+}
+
+fn parse_engine_metadata_with_policy(
+    data: &[u8],
+    footer: &CoveFooter,
+    strict: bool,
+) -> Result<EngineMetadata, CoveError> {
+    if !strict {
+        return Ok(EngineMetadata {
+            engine_profile_registries: parse_optional_engine_sections(
+                data,
+                footer,
+                SectionKind::EngineProfileRegistry,
+                EngineProfileRegistry::parse,
+            ),
+            execution_descriptors: parse_optional_engine_sections(
+                data,
+                footer,
+                SectionKind::ExecutionCodeDescriptor,
+                ExecutionCodeDescriptorV1::parse,
+            ),
+            execution_scopes: parse_optional_engine_sections(
+                data,
+                footer,
+                SectionKind::ExecutionScopeDescriptor,
+                ExecutionScopeDescriptorV1::parse,
+            ),
+            code_spaces: parse_optional_engine_sections(
+                data,
+                footer,
+                SectionKind::CodeSpaceDescriptor,
+                CodeSpaceDescriptorV1::parse,
+            ),
+            engine_mount_policies: parse_optional_engine_sections(
+                data,
+                footer,
+                SectionKind::EngineMountPolicy,
+                EngineMountPolicyV1::parse,
+            ),
+        });
+    }
     Ok(EngineMetadata {
         engine_profile_registries: parse_engine_profile_registries(data, footer)?,
         execution_descriptors: parse_execution_descriptors(data, footer)?,
@@ -597,6 +644,30 @@ pub fn parse_engine_metadata(
         code_spaces: parse_code_spaces(data, footer)?,
         engine_mount_policies: parse_engine_mount_policies(data, footer)?,
     })
+}
+
+fn engine_profile_required(header: &CoveHeaderV1, footer: &CoveFooter) -> bool {
+    header.required_features & FEATURE_ENGINE_PROFILE != 0
+        || footer
+            .sections
+            .iter()
+            .any(|entry| entry.required_features & FEATURE_ENGINE_PROFILE != 0)
+}
+
+fn parse_optional_engine_sections<T, F>(
+    data: &[u8],
+    footer: &CoveFooter,
+    kind: SectionKind,
+    mut parse: F,
+) -> Vec<T>
+where
+    F: FnMut(&[u8]) -> Result<T, CoveError>,
+{
+    find_sections(footer, kind)
+        .into_iter()
+        .filter_map(|entry| compression::section_payload(data, entry).ok())
+        .filter_map(|payload| parse(&payload).ok())
+        .collect()
 }
 
 fn parse_engine_profile_registries(
@@ -873,6 +944,30 @@ mod tests {
         assert_eq!(mounted.tables.len(), 1);
         assert_eq!(mounted.tables[0].columns[0].name, "name");
         assert_eq!(mounted.representation, OutputRepresentation::DecodeToValue);
+    }
+
+    #[test]
+    fn decoded_mount_ignores_optional_bad_engine_profile() {
+        let bytes =
+            include_bytes!("../../../conformance/accept/cove_e_optional_bad_descriptor.cove");
+        let mounted = mount_cove_file(bytes, MountOptions::default(), None).unwrap();
+        assert!(mounted.engine_metadata.execution_descriptors.is_empty());
+    }
+
+    #[test]
+    fn execution_code_mount_rejects_optional_bad_engine_profile() {
+        let bytes =
+            include_bytes!("../../../conformance/accept/cove_e_optional_bad_descriptor.cove");
+        let err = mount_cove_file(
+            bytes,
+            MountOptions {
+                representation: OutputRepresentation::MapToExecutionCode,
+                ..MountOptions::default()
+            },
+            Some(&TestResolver),
+        )
+        .unwrap_err();
+        assert_eq!(err, CoveError::BadEngineProfile);
     }
 
     #[test]

@@ -4,18 +4,21 @@ use std::{
 };
 
 use crate::{
+    array::{CoveArrayValue, EncodedArray},
     codec::CodecExtensionDescriptorV2,
     collation::CollationRegistry,
     compression,
     constants::{
-        SectionKind, StorageClass, FEATURE_ENGINE_PROFILE, FEATURE_EXTENSION_REGISTRY,
-        FEATURE_FILE_DICTIONARY, FEATURE_HARBOR_PROFILE, FEATURE_OBJECT_PROFILE,
-        FEATURE_SEMANTIC_MAP,
+        CoveEncodingKind, CoveLogicalType, CovePhysicalKind, PrimaryProfile, SectionKind,
+        StorageClass, FEATURE_ENGINE_PROFILE, FEATURE_EXTENSION_REGISTRY, FEATURE_FILE_DICTIONARY,
+        FEATURE_HARBOR_PROFILE, FEATURE_OBJECT_PROFILE, FEATURE_SEMANTIC_MAP,
     },
     dictionary::FileDictionaryView,
     digest::DigestManifest,
     domain::ColumnDomain,
     extensions::{ExtensionRegistry, ExtensionValidationContext},
+    feature_binding::OperationKindV2,
+    feature_scope::{FeatureTargetRefV2, FeatureUseRequestV2},
     footer::CoveSectionEntryV1,
     header::CoveHeaderV1,
     index::{
@@ -26,10 +29,12 @@ use crate::{
     interop::lakehouse::LakehouseHints,
     kernel::KernelCapabilities,
     nested_schema::NestedSchemaSectionV1,
-    page::ColumnPageIndex,
+    page::{ColumnPageIndex, PAGE_FLAG_STATS_ONLY_CONSTANT},
+    page_payload::{ColumnPagePayloadV1, PageBufferKind},
     page_validation::{
-        validate_column_page_payload, validate_column_page_wire, validate_stats_only_constant_page,
-        PageValidationContext,
+        materialize_stats_only_constant_page_payload, validate_column_page_payload,
+        validate_column_page_wire, validate_stats_only_constant_page, PageValidationContext,
+        StatsOnlyPageMaterializationContext,
     },
     profile::{
         cove_e::{
@@ -52,6 +57,12 @@ use crate::{
         SEGMENT_COLUMN_FLAG_BOOL_DECLARED_NUMERIC,
     },
     table::{ColumnEntry, TableCatalog, TableEntry, COLUMN_FLAG_BOOL_DECLARED_NUMERIC},
+    types::{
+        numcode_as_date_days, numcode_as_decimal64, numcode_as_f32, numcode_as_f64, numcode_as_i16,
+        numcode_as_i32, numcode_as_i64, numcode_as_i8, numcode_as_timestamp_micros,
+        numcode_as_timestamp_nanos, numcode_as_u16, numcode_as_u32, numcode_as_u64, numcode_as_u8,
+    },
+    validity::ValidityBitmap,
     zone_stats::{ZoneStatsEntry, ZoneStatsSection},
     CoveError,
 };
@@ -196,6 +207,7 @@ pub(super) fn validate_shared_semantics(
             | SectionKind::ProfileCapabilityMatrix
             | SectionKind::ExtendedFeatureSet
             | SectionKind::CodecExtensionRegistry
+            | SectionKind::RuntimeCompatibilityHints
             | SectionKind::LayoutPlan
             | SectionKind::ScanSplitIndex
             | SectionKind::PageClusterDirectory
@@ -242,7 +254,7 @@ pub(super) fn validate_shared_semantics(
             | SectionKind::MapEvidenceIndex
             | SectionKind::MapConversionReport
             | SectionKind::MapProjectionCatalog => {
-                if is_optional_pushdown_section(kind)
+                if is_optional_advisory_section(kind)
                     && opts.optional_pushdown_policy == OptionalPushdownPolicy::FailOpen
                 {
                     let _ = optional_section_payload(
@@ -330,6 +342,24 @@ pub(super) fn validate_cove_t_semantics(
     stages: &mut Vec<ValidationStageReport>,
     ignored_optional_sections: &mut Vec<IgnoredOptionalSection>,
 ) -> Result<(), CoveError> {
+    validate_cove_t_semantics_with_registered_page_scope(
+        data,
+        validated,
+        opts,
+        stages,
+        ignored_optional_sections,
+        RegisteredPageValidationScope::All,
+    )
+}
+
+pub(super) fn validate_cove_t_semantics_with_registered_page_scope(
+    data: &[u8],
+    validated: &ValidatedCoveFile,
+    opts: &ValidationOptions,
+    stages: &mut Vec<ValidationStageReport>,
+    ignored_optional_sections: &mut Vec<IgnoredOptionalSection>,
+    registered_page_scope: RegisteredPageValidationScope<'_>,
+) -> Result<(), CoveError> {
     let mut checked = 0u32;
     let mut catalogs = Vec::new();
     let mut nested_schemas = Vec::new();
@@ -364,9 +394,11 @@ pub(super) fn validate_cove_t_semantics(
                 segment_payloads.push((
                     entry.section_id,
                     entry.offset,
-                    TableSegmentPayloadV1::parse_with_required_features(
+                    TableSegmentPayloadV1::parse_with_feature_advertisement(
                         &payload,
                         validated.header.required_features,
+                        validated.header.required_features | validated.header.optional_features,
+                        entry.required_features | entry.optional_features,
                     )?,
                     payload.into_owned(),
                 ));
@@ -570,6 +602,7 @@ pub(super) fn validate_cove_t_semantics(
             | SectionKind::ExecutionScopeDescriptor
             | SectionKind::CodeSpaceDescriptor
             | SectionKind::EngineMountPolicy
+            | SectionKind::RuntimeCompatibilityHints
             | SectionKind::ObjectTypeCatalog
             | SectionKind::TemporalSegmentIndex
             | SectionKind::TemporalSegmentData
@@ -593,9 +626,12 @@ pub(super) fn validate_cove_t_semantics(
         &nested_schemas,
         &segment_indexes,
         &segment_payloads,
-        dictionary.as_ref(),
-        &zone_stats_entries,
-        &codec_descriptors,
+        CoveTCrossSectionRefs {
+            dictionary: dictionary.as_ref(),
+            zone_stats: &zone_stats_entries,
+            codec_descriptors: &codec_descriptors,
+            registered_page_scope,
+        },
     )?;
     push_stage(
         stages,
@@ -627,7 +663,7 @@ fn optional_section_parse_error(
     ignored_optional_sections: &mut Vec<IgnoredOptionalSection>,
     error: CoveError,
 ) -> Result<(), CoveError> {
-    if policy == OptionalPushdownPolicy::FailOpen && is_optional_pushdown_entry(entry) {
+    if policy == OptionalPushdownPolicy::FailOpen && is_optional_advisory_entry(entry) {
         if ignored_optional_sections
             .iter()
             .any(|ignored| ignored.section_id == entry.section_id)
@@ -644,14 +680,102 @@ fn optional_section_parse_error(
     Err(error)
 }
 
-pub(super) fn is_optional_pushdown_entry(entry: &CoveSectionEntryV1) -> bool {
+pub(super) fn is_optional_advisory_entry(entry: &CoveSectionEntryV1) -> bool {
     entry.required_features == 0
         && SectionKind::from_u16(entry.section_kind)
-            .map(is_optional_pushdown_section)
+            .map(is_optional_advisory_section)
             .unwrap_or(false)
 }
 
-fn is_optional_pushdown_section(kind: SectionKind) -> bool {
+pub(super) fn ignored_section_required_for_feature_use(
+    ignored: &IgnoredOptionalSection,
+    request: &FeatureUseRequestV2,
+) -> bool {
+    if request.needed_section_ids.contains(&ignored.section_id) {
+        return true;
+    }
+    if request
+        .needed_page_refs
+        .iter()
+        .any(|target| target.section_id == ignored.section_id)
+    {
+        return true;
+    }
+    SectionKind::from_u16(ignored.section_kind)
+        .map(|kind| section_kind_required_for_feature_use(kind, request))
+        .unwrap_or(false)
+}
+
+pub(super) fn section_entry_required_for_feature_use(
+    entry: &CoveSectionEntryV1,
+    request: &FeatureUseRequestV2,
+) -> bool {
+    request.needed_section_ids.contains(&entry.section_id)
+        || request
+            .needed_page_refs
+            .iter()
+            .any(|target| target.section_id == entry.section_id)
+        || SectionKind::from_u16(entry.section_kind)
+            .map(|kind| section_kind_required_for_feature_use(kind, request))
+            .unwrap_or(false)
+}
+
+pub(super) fn is_embedded_optional_profile_section(kind: SectionKind) -> bool {
+    is_layout_section(kind)
+        || is_coverage_section(kind)
+        || matches!(
+            kind,
+            SectionKind::IndexOnlyCapability | SectionKind::RuntimeCompatibilityHints
+        )
+}
+
+fn section_kind_required_for_feature_use(kind: SectionKind, request: &FeatureUseRequestV2) -> bool {
+    request
+        .requested_operation
+        .map(|operation| operation_requires_section(operation, kind))
+        .unwrap_or(false)
+        || request
+            .requested_profile
+            .map(|profile| profile_requires_section(profile, kind))
+            .unwrap_or(false)
+}
+
+fn operation_requires_section(operation: OperationKindV2, kind: SectionKind) -> bool {
+    match operation {
+        OperationKindV2::OrdinaryTableScan => is_table_scan_section(kind),
+        OperationKindV2::CoveragePlanning => is_coverage_section(kind),
+        OperationKindV2::IndexOnlyAnswer => kind == SectionKind::IndexOnlyCapability,
+        OperationKindV2::ZeroCopyExport => kind == SectionKind::ZeroCopyBufferMap,
+        OperationKindV2::RuntimeAdapterSelection => kind == SectionKind::RuntimeCompatibilityHints,
+        OperationKindV2::EngineExecutionMapping => is_engine_execution_section(kind),
+        OperationKindV2::ObjectReconstruction => is_object_section(kind),
+        OperationKindV2::TrustVerification => kind == SectionKind::TrustManifest,
+        OperationKindV2::RedactionPolicyEvaluation => kind == SectionKind::RedactionManifest,
+        OperationKindV2::MappingReplay
+        | OperationKindV2::MappingExplanation
+        | OperationKindV2::ProjectionReadback => is_map_section(kind),
+        OperationKindV2::HarborMount => is_harbor_section(kind),
+        _ => false,
+    }
+}
+
+fn profile_requires_section(profile: u8, kind: SectionKind) -> bool {
+    match PrimaryProfile::from_u8(profile) {
+        Some(PrimaryProfile::ObjectTemporal) => is_object_section(kind),
+        Some(PrimaryProfile::EngineExecution) => is_engine_execution_section(kind),
+        Some(PrimaryProfile::HarborExecution) => is_harbor_section(kind),
+        Some(PrimaryProfile::SemanticMapping) => is_map_section(kind),
+        Some(PrimaryProfile::LayoutPlanning) => is_layout_section(kind),
+        Some(PrimaryProfile::RuntimeCompatibility) => {
+            kind == SectionKind::RuntimeCompatibilityHints
+        }
+        Some(PrimaryProfile::CoverageMetadata) => is_coverage_section(kind),
+        Some(PrimaryProfile::SecondaryIndex) => kind == SectionKind::IndexOnlyCapability,
+        _ => false,
+    }
+}
+
+fn is_optional_advisory_section(kind: SectionKind) -> bool {
     matches!(
         kind,
         SectionKind::ColumnDomain
@@ -662,7 +786,104 @@ fn is_optional_pushdown_section(kind: SectionKind) -> bool {
             | SectionKind::AggregateSynopsis
             | SectionKind::CompositeZoneIndex
             | SectionKind::TopNZoneSummary
+            | SectionKind::LayoutPlan
+            | SectionKind::ScanSplitIndex
+            | SectionKind::PageClusterDirectory
+            | SectionKind::ZeroCopyBufferMap
+            | SectionKind::FastMetadataIndex
+            | SectionKind::CoverageProviderRegistry
+            | SectionKind::CoverageSet
+            | SectionKind::CoveragePlanCandidate
+            | SectionKind::PredicateNormalForm
+            | SectionKind::CoverageProofRecord
+            | SectionKind::IndexOnlyCapability
+            | SectionKind::RuntimeCompatibilityHints
     )
+}
+
+fn is_layout_section(kind: SectionKind) -> bool {
+    matches!(
+        kind,
+        SectionKind::LayoutPlan
+            | SectionKind::ScanSplitIndex
+            | SectionKind::PageClusterDirectory
+            | SectionKind::ZeroCopyBufferMap
+            | SectionKind::FastMetadataIndex
+    )
+}
+
+fn is_table_scan_section(kind: SectionKind) -> bool {
+    matches!(
+        kind,
+        SectionKind::TableCatalog
+            | SectionKind::TableSegmentIndex
+            | SectionKind::TableSegmentData
+            | SectionKind::FileDictionaryIndex
+            | SectionKind::FileDictionaryPayload
+            | SectionKind::NestedSchema
+            | SectionKind::ZoneStats
+            | SectionKind::CodecExtensionRegistry
+    )
+}
+
+fn is_coverage_section(kind: SectionKind) -> bool {
+    matches!(
+        kind,
+        SectionKind::CoverageProviderRegistry
+            | SectionKind::CoverageSet
+            | SectionKind::CoveragePlanCandidate
+            | SectionKind::PredicateNormalForm
+            | SectionKind::CoverageProofRecord
+    )
+}
+
+fn is_engine_execution_section(kind: SectionKind) -> bool {
+    matches!(
+        kind,
+        SectionKind::EngineProfileRegistry
+            | SectionKind::ExecutionCodeDescriptor
+            | SectionKind::ExecutionScopeDescriptor
+            | SectionKind::CodeSpaceDescriptor
+            | SectionKind::EngineMountPolicy
+    )
+}
+
+fn is_object_section(kind: SectionKind) -> bool {
+    matches!(
+        kind,
+        SectionKind::ObjectTypeCatalog
+            | SectionKind::TemporalSegmentIndex
+            | SectionKind::TemporalSegmentData
+            | SectionKind::TemporalBloomIndex
+            | SectionKind::TrustManifest
+    )
+}
+
+fn is_harbor_section(kind: SectionKind) -> bool {
+    kind == SectionKind::HarborMountHints
+}
+
+fn is_map_section(kind: SectionKind) -> bool {
+    matches!(
+        kind,
+        SectionKind::MapSourceCatalog
+            | SectionKind::MapFunctionRegistry
+            | SectionKind::MapIdentityRuleCatalog
+            | SectionKind::MapRowSemanticsCatalog
+            | SectionKind::MapAssertionLog
+            | SectionKind::MapIdentityEquivalenceIndex
+            | SectionKind::MapEvidenceIndex
+            | SectionKind::MapConversionReport
+            | SectionKind::MapProjectionCatalog
+    )
+}
+
+#[derive(Clone, Copy)]
+struct CoveTCrossSectionRefs<'a, 'data> {
+    dictionary: Option<&'a FileDictionaryView<'data>>,
+    zone_stats: &'a [ZoneStatsEntry],
+    codec_descriptors: &'a [CodecExtensionDescriptorV2],
+    registered_page_scope: RegisteredPageValidationScope<'a>,
 }
 
 fn validate_cove_t_cross_sections(
@@ -670,9 +891,7 @@ fn validate_cove_t_cross_sections(
     nested_schemas: &[(u32, NestedSchemaSectionV1)],
     segment_indexes: &[(u32, TableSegmentIndex)],
     segment_payloads: &[(u32, u64, TableSegmentPayloadV1, Vec<u8>)],
-    dictionary: Option<&FileDictionaryView<'_>>,
-    zone_stats: &[ZoneStatsEntry],
-    codec_descriptors: &[CodecExtensionDescriptorV2],
+    refs: CoveTCrossSectionRefs<'_, '_>,
 ) -> Result<(), CoveError> {
     if catalogs.is_empty() && segment_indexes.is_empty() && segment_payloads.is_empty() {
         return Ok(());
@@ -724,11 +943,11 @@ fn validate_cove_t_cross_sections(
         .map(|table| (table.table_id, table))
         .collect::<BTreeMap<_, _>>();
     let mut payloads_by_key = BTreeMap::new();
-    for (_section_id, file_offset, payload, bytes) in segment_payloads {
+    for (section_id, file_offset, payload, bytes) in segment_payloads {
         if payloads_by_key
             .insert(
                 (payload.header.table_id, payload.header.segment_id),
-                (*file_offset, payload, bytes),
+                (*section_id, *file_offset, payload, bytes),
             )
             .is_some()
         {
@@ -746,7 +965,7 @@ fn validate_cove_t_cross_sections(
         if entry.column_count != table.columns.len() as u32 {
             return Err(CoveError::SegmentCorrupt);
         }
-        let Some((file_offset, payload, bytes)) =
+        let Some((section_id, file_offset, payload, bytes)) =
             payloads_by_key.get(&(entry.table_id, entry.segment_id))
         else {
             return Err(CoveError::SegmentCorrupt);
@@ -766,13 +985,15 @@ fn validate_cove_t_cross_sections(
         *rows_by_table.entry(entry.table_id).or_default() += u64::from(entry.row_count);
         validate_segment_against_catalog(
             table,
+            *section_id,
             payload,
             bytes,
             SegmentValidationRefs {
-                dictionary,
-                zone_stats,
-                codec_descriptors,
+                dictionary: refs.dictionary,
+                zone_stats: refs.zone_stats,
+                codec_descriptors: refs.codec_descriptors,
                 nested_schema,
+                registered_page_scope: refs.registered_page_scope,
             },
         )?;
     }
@@ -780,11 +1001,344 @@ fn validate_cove_t_cross_sections(
         if rows_by_table.get(&table.table_id).copied().unwrap_or(0) != table.row_count {
             return Err(CoveError::SegmentCorrupt);
         }
+        validate_declared_primary_sort_order(
+            table,
+            segment_index,
+            &payloads_by_key,
+            refs.zone_stats,
+        )?;
     }
     if payloads_by_key.len() != segment_index.entries.len() {
         return Err(CoveError::SegmentCorrupt);
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum SortValue {
+    Null,
+    Bool(bool),
+    I64(i64),
+    U64(u64),
+    F32(f32),
+    F64(f64),
+    Bytes(Vec<u8>),
+}
+
+impl SortValue {
+    fn cmp_total(&self, other: &Self) -> Result<std::cmp::Ordering, CoveError> {
+        use std::cmp::Ordering;
+        match (self, other) {
+            (Self::Null, Self::Null) => Ok(Ordering::Equal),
+            (Self::Null, _) => Ok(Ordering::Less),
+            (_, Self::Null) => Ok(Ordering::Greater),
+            (Self::Bool(a), Self::Bool(b)) => Ok(a.cmp(b)),
+            (Self::I64(a), Self::I64(b)) => Ok(a.cmp(b)),
+            (Self::U64(a), Self::U64(b)) => Ok(a.cmp(b)),
+            (Self::F32(a), Self::F32(b)) => Ok(a.total_cmp(b)),
+            (Self::F64(a), Self::F64(b)) => Ok(a.total_cmp(b)),
+            (Self::Bytes(a), Self::Bytes(b)) => Ok(a.cmp(b)),
+            _ => Err(CoveError::BadSchema(
+                "sort key value kinds do not match declared column type".into(),
+            )),
+        }
+    }
+}
+
+type SegmentPayloadByKey<'a> =
+    BTreeMap<(u32, u32), (u32, u64, &'a TableSegmentPayloadV1, &'a Vec<u8>)>;
+
+fn validate_declared_primary_sort_order(
+    table: &TableEntry,
+    segment_index: &TableSegmentIndex,
+    payloads_by_key: &SegmentPayloadByKey<'_>,
+    zone_stats: &[ZoneStatsEntry],
+) -> Result<(), CoveError> {
+    if table.primary_sort_key_count == 0 {
+        return Ok(());
+    }
+    let mut sort_columns = table
+        .columns
+        .iter()
+        .filter(|column| column.sort_order != 0)
+        .collect::<Vec<_>>();
+    sort_columns.sort_by_key(|column| column.sort_order);
+    if sort_columns.len() != usize::from(table.primary_sort_key_count) {
+        return Err(CoveError::BadSchema(
+            "primary sort key count does not match column sort declarations".into(),
+        ));
+    }
+    if let Some(column) = sort_columns
+        .iter()
+        .find(|column| !can_validate_table_sort_column(column))
+    {
+        return Err(unsupported_sort_claim(column));
+    }
+
+    let mut segment_entries = segment_index
+        .entries
+        .iter()
+        .filter(|entry| entry.table_id == table.table_id)
+        .collect::<Vec<_>>();
+    segment_entries.sort_by_key(|entry| entry.row_start);
+
+    let mut previous_key = None::<Vec<SortValue>>;
+    for segment_entry in segment_entries {
+        let (_, _, segment, segment_bytes) = payloads_by_key
+            .get(&(segment_entry.table_id, segment_entry.segment_id))
+            .ok_or(CoveError::SegmentCorrupt)?;
+        let mut page_sets = Vec::with_capacity(sort_columns.len());
+        for column in &sort_columns {
+            let pages = load_sort_column_pages(column, segment, segment_bytes, zone_stats)?;
+            page_sets.push(pages);
+        }
+        let mut morsels = segment.morsels.entries.iter().collect::<Vec<_>>();
+        morsels.sort_by_key(|morsel| morsel.first_row_in_segment);
+        for morsel in morsels {
+            for local_row in 0..morsel.row_count {
+                let mut key = Vec::with_capacity(sort_columns.len());
+                for (column_index, _column) in sort_columns.iter().enumerate() {
+                    let (page, values) = page_sets[column_index]
+                        .iter()
+                        .find(|(page, _)| page.morsel_id == morsel.morsel_id)
+                        .ok_or(CoveError::PageCorrupt)?;
+                    if local_row >= page.row_count {
+                        return Err(CoveError::PageCorrupt);
+                    }
+                    key.push(
+                        values
+                            .get(usize::try_from(local_row).map_err(|_| CoveError::ArithOverflow)?)
+                            .ok_or(CoveError::PageCorrupt)?
+                            .clone(),
+                    );
+                }
+                if let Some(previous) = &previous_key {
+                    if compare_sort_keys(previous, &key)? == std::cmp::Ordering::Greater {
+                        return Err(CoveError::BadSchema(
+                            "declared primary sort order does not match row data".into(),
+                        ));
+                    }
+                }
+                previous_key = Some(key);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn unsupported_sort_claim(column: &ColumnEntry) -> CoveError {
+    CoveError::UnsupportedEncoding(format!(
+        "declared primary sort key column {} uses unsupported validation semantics",
+        column.column_id
+    ))
+}
+
+fn can_validate_table_sort_column(column: &ColumnEntry) -> bool {
+    if column.collation_id != 0 {
+        return false;
+    }
+    !matches!(
+        column.physical,
+        CovePhysicalKind::FileCode
+            | CovePhysicalKind::List
+            | CovePhysicalKind::Struct
+            | CovePhysicalKind::Map
+    )
+}
+
+fn load_sort_column_pages(
+    column: &ColumnEntry,
+    segment: &TableSegmentPayloadV1,
+    segment_bytes: &[u8],
+    zone_stats: &[ZoneStatsEntry],
+) -> Result<Vec<(crate::page::ColumnPageIndexEntryV1, Vec<SortValue>)>, CoveError> {
+    let column_dir = segment
+        .columns
+        .iter()
+        .find(|candidate| candidate.column_id == column.column_id)
+        .ok_or(CoveError::SegmentCorrupt)?;
+    let page_index_start =
+        usize::try_from(column_dir.page_index_offset).map_err(|_| CoveError::OffsetRange)?;
+    let page_index_end = usize::try_from(
+        column_dir
+            .page_index_offset
+            .checked_add(column_dir.page_index_length)
+            .ok_or(CoveError::ArithOverflow)?,
+    )
+    .map_err(|_| CoveError::OffsetRange)?;
+    let page_index = ColumnPageIndex::parse(&segment_bytes[page_index_start..page_index_end])?;
+    let mut pages = Vec::with_capacity(page_index.entries.len());
+    for page in page_index.entries {
+        let payload_owner = if page.flags & PAGE_FLAG_STATS_ONLY_CONSTANT != 0 {
+            materialize_stats_only_constant_page_payload(
+                StatsOnlyPageMaterializationContext {
+                    table_id: Some(segment.header.table_id),
+                    segment_id: Some(segment.header.segment_id),
+                    column_id: column.column_id,
+                    logical_type: column.logical,
+                    physical_kind: column.physical,
+                    dictionary_len: None,
+                    zone_stats,
+                },
+                &page,
+            )?
+        } else {
+            let start = usize::try_from(page.page_offset).map_err(|_| CoveError::OffsetRange)?;
+            let end = usize::try_from(
+                page.page_offset
+                    .checked_add(page.page_length)
+                    .ok_or(CoveError::ArithOverflow)?,
+            )
+            .map_err(|_| CoveError::OffsetRange)?;
+            let page_wire = &segment_bytes[start..end];
+            compression::column_page_payload(page_wire, &page)?.into_owned()
+        };
+        let payload = ColumnPagePayloadV1::parse(&payload_owner)?;
+        let root = payload.root_node()?;
+        if root.encoding_kind == CoveEncodingKind::RegisteredEncoding {
+            return Err(unsupported_sort_claim(column));
+        }
+        let null_bitmap = payload.buffer_bytes(PageBufferKind::NullBitmap)?;
+        let validity =
+            null_bitmap.map(|bytes| ValidityBitmap::new(bytes, u64::from(page.row_count)));
+        let values = payload.buffer_bytes(PageBufferKind::Values)?.unwrap_or(&[]);
+        let array = EncodedArray::new(
+            column.logical,
+            column.physical,
+            u64::from(page.row_count),
+            root.encoding_kind,
+            validity,
+            values,
+            None,
+        );
+        let prepared = array.prepare()?;
+        let values = (0..page.row_count)
+            .map(|row| {
+                sort_value_from_array(
+                    column.logical,
+                    column.physical,
+                    prepared.decode_row(u64::from(row))?,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        pages.push((page, values));
+    }
+    Ok(pages)
+}
+
+fn compare_sort_keys(
+    left: &[SortValue],
+    right: &[SortValue],
+) -> Result<std::cmp::Ordering, CoveError> {
+    for (left, right) in left.iter().zip(right) {
+        let ordering = left.cmp_total(right)?;
+        if ordering != std::cmp::Ordering::Equal {
+            return Ok(ordering);
+        }
+    }
+    Ok(std::cmp::Ordering::Equal)
+}
+
+fn sort_value_from_array(
+    logical: CoveLogicalType,
+    physical: CovePhysicalKind,
+    value: CoveArrayValue<'_>,
+) -> Result<SortValue, CoveError> {
+    match value {
+        CoveArrayValue::Null => Ok(SortValue::Null),
+        CoveArrayValue::Boolean(value) | CoveArrayValue::ValidityBit(value) => {
+            Ok(SortValue::Bool(value))
+        }
+        CoveArrayValue::NumCode(value) | CoveArrayValue::Varint(value) => {
+            sort_value_from_numcode(logical, value)
+        }
+        CoveArrayValue::Int64(value) => Ok(SortValue::I64(value)),
+        CoveArrayValue::Bytes(bytes) => sort_value_from_bytes(logical, physical, bytes),
+        CoveArrayValue::OwnedBytes(bytes) => sort_value_from_bytes(logical, physical, &bytes),
+        CoveArrayValue::FileCode(_) | CoveArrayValue::DictValue(_) => Err(CoveError::BadSchema(
+            "declared sort keys over FileCode require domain-aware validation".into(),
+        )),
+    }
+}
+
+fn sort_value_from_numcode(logical: CoveLogicalType, value: u64) -> Result<SortValue, CoveError> {
+    match logical {
+        CoveLogicalType::Bool => match value {
+            0 => Ok(SortValue::Bool(false)),
+            1 => Ok(SortValue::Bool(true)),
+            _ => Err(CoveError::PageCorrupt),
+        },
+        CoveLogicalType::Int8 => Ok(SortValue::I64(i64::from(numcode_as_i8(value)))),
+        CoveLogicalType::Int16 => Ok(SortValue::I64(i64::from(numcode_as_i16(value)))),
+        CoveLogicalType::Int32 => Ok(SortValue::I64(i64::from(numcode_as_i32(value)))),
+        CoveLogicalType::Int64 => Ok(SortValue::I64(numcode_as_i64(value))),
+        CoveLogicalType::UInt8 => Ok(SortValue::U64(u64::from(numcode_as_u8(value)))),
+        CoveLogicalType::UInt16 => Ok(SortValue::U64(u64::from(numcode_as_u16(value)))),
+        CoveLogicalType::UInt32 => Ok(SortValue::U64(u64::from(numcode_as_u32(value)))),
+        CoveLogicalType::UInt64 => Ok(SortValue::U64(numcode_as_u64(value))),
+        CoveLogicalType::Float32 => Ok(SortValue::F32(numcode_as_f32(value))),
+        CoveLogicalType::Float64 => Ok(SortValue::F64(numcode_as_f64(value))),
+        CoveLogicalType::Decimal64 => Ok(SortValue::I64(numcode_as_decimal64(value))),
+        CoveLogicalType::DateDays => Ok(SortValue::I64(i64::from(numcode_as_date_days(value)))),
+        CoveLogicalType::TimestampMicros => Ok(SortValue::I64(numcode_as_timestamp_micros(value))),
+        CoveLogicalType::TimestampNanos => Ok(SortValue::I64(numcode_as_timestamp_nanos(value))),
+        _ => Err(CoveError::BadSchema(
+            "declared sort key logical type is not NumCode-comparable".into(),
+        )),
+    }
+}
+
+fn sort_value_from_bytes(
+    logical: CoveLogicalType,
+    physical: CovePhysicalKind,
+    bytes: &[u8],
+) -> Result<SortValue, CoveError> {
+    match physical {
+        CovePhysicalKind::Boolean => match bytes {
+            [0] => Ok(SortValue::Bool(false)),
+            [1] => Ok(SortValue::Bool(true)),
+            _ => Err(CoveError::PageCorrupt),
+        },
+        CovePhysicalKind::FixedBytes | CovePhysicalKind::VarBytes => {
+            if logical == CoveLogicalType::Utf8 {
+                std::str::from_utf8(bytes).map_err(|_| CoveError::PageCorrupt)?;
+            }
+            if logical == CoveLogicalType::Json {
+                serde_json::from_slice::<serde_json::Value>(bytes)
+                    .map_err(|_| CoveError::PageCorrupt)?;
+            }
+            Ok(SortValue::Bytes(bytes.to_vec()))
+        }
+        _ => Err(CoveError::BadSchema(
+            "declared sort key physical kind is not directly byte-comparable".into(),
+        )),
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum RegisteredPageValidationScope<'a> {
+    All,
+    RequestedPages(&'a FeatureUseRequestV2),
+}
+
+impl RegisteredPageValidationScope<'_> {
+    fn should_materialize_registered_page(
+        &self,
+        section_id: u32,
+        column_id: u32,
+        morsel_id: u32,
+    ) -> bool {
+        match self {
+            Self::All => true,
+            Self::RequestedPages(request) => {
+                request
+                    .needed_page_refs
+                    .contains(&FeatureTargetRefV2::cove_t_column_page(
+                        section_id, column_id, morsel_id,
+                    ))
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -793,10 +1347,12 @@ struct SegmentValidationRefs<'a, 'data> {
     zone_stats: &'a [ZoneStatsEntry],
     codec_descriptors: &'a [CodecExtensionDescriptorV2],
     nested_schema: Option<&'a NestedSchemaSectionV1>,
+    registered_page_scope: RegisteredPageValidationScope<'a>,
 }
 
 fn validate_segment_against_catalog(
     table: &TableEntry,
+    segment_section_id: u32,
     segment: &TableSegmentPayloadV1,
     segment_bytes: &[u8],
     refs: SegmentValidationRefs<'_, '_>,
@@ -828,7 +1384,14 @@ fn validate_segment_against_catalog(
         {
             return Err(CoveError::PageCorrupt);
         }
-        validate_column_pages_against_catalog(column, column_dir, segment, segment_bytes, refs)?;
+        validate_column_pages_against_catalog(
+            column,
+            column_dir,
+            segment_section_id,
+            segment,
+            segment_bytes,
+            refs,
+        )?;
     }
     Ok(())
 }
@@ -836,10 +1399,14 @@ fn validate_segment_against_catalog(
 fn validate_column_pages_against_catalog(
     column: &ColumnEntry,
     column_dir: &TableColumnDirectoryEntryV1,
+    segment_section_id: u32,
     segment: &TableSegmentPayloadV1,
     segment_bytes: &[u8],
     refs: SegmentValidationRefs<'_, '_>,
 ) -> Result<(), CoveError> {
+    if column.physical == CovePhysicalKind::FileCode && refs.dictionary.is_none() {
+        return Err(CoveError::BadFileCode);
+    }
     let page_index_start =
         usize::try_from(column_dir.page_index_offset).map_err(|_| CoveError::OffsetRange)?;
     let page_index_end = usize::try_from(
@@ -850,9 +1417,7 @@ fn validate_column_pages_against_catalog(
     )
     .map_err(|_| CoveError::OffsetRange)?;
     let page_index = ColumnPageIndex::parse(&segment_bytes[page_index_start..page_index_end])?;
-    if page_index.entries.len() != segment.morsels.entries.len() {
-        return Err(CoveError::PageCorrupt);
-    }
+    segment.morsels.validate_page_index_coverage(&page_index)?;
     for page in &page_index.entries {
         if !column.nullable && page.null_count != 0 {
             return Err(CoveError::BadSchema(format!(
@@ -885,7 +1450,22 @@ fn validate_column_pages_against_catalog(
                 .ok_or(CoveError::ArithOverflow)?,
         )
         .map_err(|_| CoveError::OffsetRange)?;
-        validate_column_page_wire(&context, page, &segment_bytes[start..end])?;
+        let page_wire = &segment_bytes[start..end];
+        if page.encoding_root == crate::constants::CoveEncodingKind::RegisteredEncoding as u32
+            && !refs
+                .registered_page_scope
+                .should_materialize_registered_page(
+                    segment_section_id,
+                    column.column_id,
+                    page.morsel_id,
+                )
+        {
+            crate::segment::validate_registered_page_wire_without_descriptor(
+                column_dir, page, page_wire,
+            )?;
+        } else {
+            validate_column_page_wire(&context, page, page_wire)?;
+        }
     }
     Ok(())
 }
@@ -894,12 +1474,15 @@ pub(super) fn validate_cove_o_semantics(
     data: &[u8],
     validated: &ValidatedCoveFile,
     stages: &mut Vec<ValidationStageReport>,
+    request: Option<&FeatureUseRequestV2>,
 ) -> Result<(), CoveError> {
     let mut checked = 0u32;
     let mut object_catalogs = Vec::new();
     let mut temporal_indexes = Vec::new();
-    let mut temporal_segments = Vec::new();
+    let mut temporal_segment_payloads = Vec::new();
     let mut trust_manifests = Vec::new();
+    let mut zone_stats_entries = Vec::new();
+    let mut codec_descriptors = Vec::new();
     let dictionary = parse_validation_dictionary(data, &validated.footer)?;
     for entry in &validated.footer.sections {
         let kind = SectionKind::from_u16(entry.section_kind).ok_or_else(|| {
@@ -920,13 +1503,12 @@ pub(super) fn validate_cove_o_semantics(
             }
             SectionKind::TemporalSegmentData => {
                 let payload = compression::section_payload(data, entry)?;
-                TemporalSegmentData::parse_with_required_features(
-                    &payload,
-                    validated.header.required_features,
-                )
-                .map(|segment| {
-                    temporal_segments.push((entry.offset, payload.into_owned(), segment));
-                })
+                temporal_segment_payloads.push((
+                    entry.offset,
+                    payload.into_owned(),
+                    entry.required_features | entry.optional_features,
+                ));
+                Ok(())
             }
             SectionKind::TemporalBloomIndex => {
                 let payload = compression::section_payload(data, entry)?;
@@ -938,23 +1520,63 @@ pub(super) fn validate_cove_o_semantics(
                     trust_manifests.push(manifest);
                 })
             }
+            SectionKind::ZoneStats => {
+                let payload = compression::section_payload(data, entry)?;
+                ZoneStatsSection::parse(&payload).map(|section| {
+                    zone_stats_entries.extend(section.entries);
+                })
+            }
+            SectionKind::CodecExtensionRegistry => {
+                let payload = compression::section_payload(data, entry)?;
+                CodecExtensionDescriptorV2::parse_many(&payload).map(|descriptors| {
+                    codec_descriptors.extend(descriptors);
+                })
+            }
             _ => continue,
         };
         checked += 1;
         if let Err(err) = result {
-            if profile_error_is_fatal(&validated.header, entry, FEATURE_OBJECT_PROFILE) {
+            if profile_error_is_fatal(&validated.header, entry, FEATURE_OBJECT_PROFILE)
+                || request
+                    .map(request_requires_object_profile)
+                    .unwrap_or(false)
+            {
                 return Err(err);
             }
         }
     }
-    validate_cove_o_cross_sections(
+    let mut temporal_segments = Vec::with_capacity(temporal_segment_payloads.len());
+    for (section_offset, payload, section_features) in temporal_segment_payloads {
+        let result = TemporalSegmentData::parse_with_feature_advertisement_and_codec_descriptors(
+            &payload,
+            validated.header.required_features,
+            validated.header.required_features | validated.header.optional_features,
+            section_features,
+            &codec_descriptors,
+        );
+        let segment = match result {
+            Ok(segment) => segment,
+            Err(err) if cove_o_profile_required(validated, request) => return Err(err),
+            Err(_) => continue,
+        };
+        temporal_segments.push((section_offset, payload, segment));
+    }
+    if let Err(err) = validate_cove_o_cross_sections(
         &object_catalogs,
         &temporal_indexes,
         &temporal_segments,
         &trust_manifests,
-        dictionary.as_ref(),
-        validated.header.required_features,
-    )?;
+        CoveOCrossSectionRefs {
+            dictionary: dictionary.as_ref(),
+            zone_stats: &zone_stats_entries,
+            codec_descriptors: &codec_descriptors,
+            required_features: validated.header.required_features,
+        },
+    ) {
+        if cove_o_profile_required(validated, request) {
+            return Err(err);
+        }
+    }
     push_stage(
         stages,
         ValidationStage::CoveObject,
@@ -964,13 +1586,20 @@ pub(super) fn validate_cove_o_semantics(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct CoveOCrossSectionRefs<'a, 'data> {
+    dictionary: Option<&'a FileDictionaryView<'data>>,
+    zone_stats: &'a [ZoneStatsEntry],
+    codec_descriptors: &'a [CodecExtensionDescriptorV2],
+    required_features: u64,
+}
+
 fn validate_cove_o_cross_sections(
     catalogs: &[ObjectTypeCatalog],
     indexes: &[TemporalSegmentIndex],
     segments: &[(u64, Vec<u8>, TemporalSegmentData)],
     trust_manifests: &[TrustManifest],
-    dictionary: Option<&FileDictionaryView<'_>>,
-    required_features: u64,
+    refs: CoveOCrossSectionRefs<'_, '_>,
 ) -> Result<(), CoveError> {
     if catalogs.is_empty()
         && indexes.is_empty()
@@ -1014,6 +1643,7 @@ fn validate_cove_o_cross_sections(
         .iter()
         .map(|(_, _, segment)| segment)
         .collect::<Vec<_>>();
+    validate_temporal_segment_ids_file_unique(&segment_refs)?;
     let segment_values = segments
         .iter()
         .map(|(_, _, segment)| segment.clone())
@@ -1057,7 +1687,14 @@ fn validate_cove_o_cross_sections(
         }
         let index_entry = index_entries.get(&key).ok_or(CoveError::SegmentCorrupt)?;
         validate_temporal_segment_against_index(index_entry, *section_offset, bytes, segment)?;
-        validate_temporal_property_columns(object_type, segment, dictionary, required_features)?;
+        validate_temporal_property_columns(
+            object_type,
+            segment,
+            refs.dictionary,
+            refs.zone_stats,
+            refs.codec_descriptors,
+            refs.required_features,
+        )?;
     }
     if payloads_by_key.len() != index.entries.len() {
         return Err(CoveError::SegmentCorrupt);
@@ -1065,7 +1702,23 @@ fn validate_cove_o_cross_sections(
 
     for manifest in trust_manifests {
         validate_trust_manifest_references(manifest, &segment_refs)?;
-        manifest.verify_against(&segment_values)?;
+        manifest.verify_against_with_dictionary(
+            &segment_values,
+            refs.dictionary,
+            refs.zone_stats,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_temporal_segment_ids_file_unique(
+    segments: &[&TemporalSegmentData],
+) -> Result<(), CoveError> {
+    let mut seen = BTreeSet::new();
+    for segment in segments {
+        if !seen.insert(segment.header.segment_id) {
+            return Err(CoveError::RefInvalid);
+        }
     }
     Ok(())
 }
@@ -1129,6 +1782,8 @@ fn validate_temporal_property_columns(
     object_type: &crate::profile::cove_o::ObjectTypeEntryV1,
     segment: &TemporalSegmentData,
     dictionary: Option<&FileDictionaryView<'_>>,
+    zone_stats: &[ZoneStatsEntry],
+    codec_descriptors: &[CodecExtensionDescriptorV2],
     required_features: u64,
 ) -> Result<(), CoveError> {
     let properties = object_type
@@ -1160,7 +1815,15 @@ fn validate_temporal_property_columns(
         {
             return Err(CoveError::PageCorrupt);
         }
-        validate_temporal_property_pages(property, segment, column, dictionary, required_features)?;
+        validate_temporal_property_pages(
+            property,
+            segment,
+            column,
+            dictionary,
+            zone_stats,
+            codec_descriptors,
+            required_features,
+        )?;
     }
     if segment.header.column_count as usize != segment.property_columns.len() {
         return Err(CoveError::SegmentCorrupt);
@@ -1173,8 +1836,13 @@ fn validate_temporal_property_pages(
     segment: &TemporalSegmentData,
     column: &TemporalPropertyColumn,
     dictionary: Option<&FileDictionaryView<'_>>,
+    zone_stats: &[ZoneStatsEntry],
+    codec_descriptors: &[CodecExtensionDescriptorV2],
     required_features: u64,
 ) -> Result<(), CoveError> {
+    if property.physical_kind == CovePhysicalKind::FileCode && dictionary.is_none() {
+        return Err(CoveError::BadFileCode);
+    }
     if column.page_index.entries.len() != expected_temporal_morsel_count(segment)? {
         return Err(CoveError::PageCorrupt);
     }
@@ -1208,8 +1876,8 @@ fn validate_temporal_property_pages(
             logical_type: property.logical_type,
             physical_kind: property.physical_kind,
             dictionary,
-            zone_stats: None,
-            codec_descriptors: &[],
+            zone_stats: Some(zone_stats),
+            codec_descriptors,
             nested_schema: None,
         };
         if let Some(payload) = &page.payload {
@@ -1259,11 +1927,16 @@ fn validate_temporal_chains(segments: &[&TemporalSegmentData]) -> Result<(), Cov
                 .rows
                 .iter()
                 .enumerate()
-                .map(move |(row_index, row)| ((segment.header.segment_id, row_index as u32), row))
+                .map(move |(row_index, row)| {
+                    (
+                        (segment.header.segment_id, row_index as u32),
+                        (segment.header.object_type_id, row),
+                    )
+                })
         })
         .collect::<BTreeMap<_, _>>();
-    for ((segment_id, row_index), row) in &rows {
-        validate_prev_ref_target_kind(row.prev_ref, &rows)?;
+    for ((segment_id, row_index), (object_type_id, row)) in &rows {
+        validate_prev_ref_target_kind((*object_type_id, row), row.prev_ref, &rows)?;
         if matches!(row.record_kind, RecordKind::Delta | RecordKind::Tombstone) {
             let mut seen = BTreeSet::new();
             let mut current = Some((*segment_id, *row_index));
@@ -1272,7 +1945,7 @@ fn validate_temporal_chains(segments: &[&TemporalSegmentData]) -> Result<(), Cov
                 if !seen.insert(key) {
                     return Err(CoveError::RefInvalid);
                 }
-                let current_row = rows.get(&key).ok_or(CoveError::NotSelfContained)?;
+                let (_, current_row) = rows.get(&key).ok_or(CoveError::NotSelfContained)?;
                 if matches!(
                     current_row.record_kind,
                     RecordKind::Baseline | RecordKind::Snapshot
@@ -1297,16 +1970,25 @@ fn validate_temporal_chains(segments: &[&TemporalSegmentData]) -> Result<(), Cov
 }
 
 fn validate_prev_ref_target_kind(
+    current: (u32, &crate::profile::cove_o::TemporalRowEntryV1),
     prev_ref: Option<crate::profile::cove_o::CoveRecordRefV1>,
-    rows: &BTreeMap<(u32, u32), &crate::profile::cove_o::TemporalRowEntryV1>,
+    rows: &BTreeMap<(u32, u32), (u32, &crate::profile::cove_o::TemporalRowEntryV1)>,
 ) -> Result<(), CoveError> {
     let Some(prev_ref) = prev_ref else {
         return Ok(());
     };
-    let target = rows
+    let (current_object_type_id, current_row) = current;
+    let (target_object_type_id, target) = rows
         .get(&(prev_ref.segment_id, prev_ref.row_index))
         .ok_or(CoveError::NotSelfContained)?;
     if prev_ref.target_kind != target_kind_for_record_kind(target.record_kind) {
+        return Err(CoveError::RefInvalid);
+    }
+    if *target_object_type_id != current_object_type_id
+        || target.branch_key != current_row.branch_key
+        || target.goid != current_row.goid
+        || target.row_key().cmp_lex(&current_row.row_key()) != std::cmp::Ordering::Less
+    {
         return Err(CoveError::RefInvalid);
     }
     Ok(())
@@ -1348,6 +2030,7 @@ pub(super) fn validate_cove_e_semantics(
     data: &[u8],
     validated: &ValidatedCoveFile,
     stages: &mut Vec<ValidationStageReport>,
+    request: Option<&FeatureUseRequestV2>,
 ) -> Result<(), CoveError> {
     let mut checked = 0u32;
     let mut registries = Vec::new();
@@ -1394,7 +2077,11 @@ pub(super) fn validate_cove_e_semantics(
         };
         checked += 1;
         if let Err(err) = result {
-            if profile_error_is_fatal(&validated.header, entry, FEATURE_ENGINE_PROFILE) {
+            if profile_error_is_fatal(&validated.header, entry, FEATURE_ENGINE_PROFILE)
+                || request
+                    .map(request_requires_engine_profile)
+                    .unwrap_or(false)
+            {
                 return Err(err);
             }
         }
@@ -1406,13 +2093,7 @@ pub(super) fn validate_cove_e_semantics(
         &code_space_descriptors,
         &mount_policies,
     ) {
-        let engine_required = validated.header.required_features & FEATURE_ENGINE_PROFILE != 0
-            || validated
-                .footer
-                .sections
-                .iter()
-                .any(|entry| entry.required_features & FEATURE_ENGINE_PROFILE != 0);
-        if engine_required {
+        if cove_e_profile_required(validated, request) {
             return Err(err);
         }
     }
@@ -1497,6 +2178,7 @@ pub(super) fn validate_cove_h_semantics(
     data: &[u8],
     validated: &ValidatedCoveFile,
     stages: &mut Vec<ValidationStageReport>,
+    request: Option<&FeatureUseRequestV2>,
 ) -> Result<(), CoveError> {
     let mut checked = 0u32;
     for entry in &validated.footer.sections {
@@ -1512,7 +2194,11 @@ pub(super) fn validate_cove_h_semantics(
         };
         checked += 1;
         if let Err(err) = result {
-            if profile_error_is_fatal(&validated.header, entry, FEATURE_HARBOR_PROFILE) {
+            if profile_error_is_fatal(&validated.header, entry, FEATURE_HARBOR_PROFILE)
+                || request
+                    .map(request_requires_harbor_profile)
+                    .unwrap_or(false)
+            {
                 return Err(err);
             }
         }
@@ -1530,6 +2216,7 @@ pub(super) fn validate_cove_map_semantics(
     data: &[u8],
     validated: &ValidatedCoveFile,
     stages: &mut Vec<ValidationStageReport>,
+    request: Option<&FeatureUseRequestV2>,
 ) -> Result<(), CoveError> {
     let mut checked = 0u32;
     let mut map_sections = Vec::<EmbeddedMapSection>::new();
@@ -1556,7 +2243,9 @@ pub(super) fn validate_cove_map_semantics(
         };
         checked += 1;
         if let Err(err) = result {
-            if profile_error_is_fatal(&validated.header, entry, FEATURE_SEMANTIC_MAP) {
+            if profile_error_is_fatal(&validated.header, entry, FEATURE_SEMANTIC_MAP)
+                || request.map(request_requires_map_profile).unwrap_or(false)
+            {
                 return Err(err);
             }
         }
@@ -1568,7 +2257,7 @@ pub(super) fn validate_cove_map_semantics(
                 .sections
                 .iter()
                 .any(|entry| entry.required_features & FEATURE_SEMANTIC_MAP != 0);
-        if map_required {
+        if map_required || request.map(request_requires_map_profile).unwrap_or(false) {
             return Err(err);
         }
     }
@@ -1583,4 +2272,255 @@ pub(super) fn validate_cove_map_semantics(
 
 fn profile_error_is_fatal(header: &CoveHeaderV1, entry: &CoveSectionEntryV1, feature: u64) -> bool {
     header.required_features & feature != 0 || entry.required_features & feature != 0
+}
+
+fn cove_o_profile_required(
+    validated: &ValidatedCoveFile,
+    request: Option<&FeatureUseRequestV2>,
+) -> bool {
+    validated.header.required_features & FEATURE_OBJECT_PROFILE != 0
+        || validated
+            .footer
+            .sections
+            .iter()
+            .any(|entry| entry.required_features & FEATURE_OBJECT_PROFILE != 0)
+        || request
+            .map(request_requires_object_profile)
+            .unwrap_or(false)
+}
+
+fn cove_e_profile_required(
+    validated: &ValidatedCoveFile,
+    request: Option<&FeatureUseRequestV2>,
+) -> bool {
+    validated.header.required_features & FEATURE_ENGINE_PROFILE != 0
+        || validated
+            .footer
+            .sections
+            .iter()
+            .any(|entry| entry.required_features & FEATURE_ENGINE_PROFILE != 0)
+        || request
+            .map(request_requires_engine_profile)
+            .unwrap_or(false)
+}
+
+pub(super) fn request_requires_object_profile(request: &FeatureUseRequestV2) -> bool {
+    request.requested_profile == Some(PrimaryProfile::ObjectTemporal as u8)
+        || matches!(
+            request.requested_operation,
+            Some(OperationKindV2::ObjectReconstruction)
+        )
+}
+
+pub(super) fn request_requires_engine_profile(request: &FeatureUseRequestV2) -> bool {
+    request.requested_profile == Some(PrimaryProfile::EngineExecution as u8)
+        || matches!(
+            request.requested_operation,
+            Some(OperationKindV2::EngineExecutionMapping)
+        )
+}
+
+pub(super) fn request_requires_harbor_profile(request: &FeatureUseRequestV2) -> bool {
+    request.requested_profile == Some(PrimaryProfile::HarborExecution as u8)
+        || matches!(
+            request.requested_operation,
+            Some(OperationKindV2::HarborMount)
+        )
+}
+
+pub(super) fn request_requires_map_profile(request: &FeatureUseRequestV2) -> bool {
+    request.requested_profile == Some(PrimaryProfile::SemanticMapping as u8)
+        || matches!(
+            request.requested_operation,
+            Some(
+                OperationKindV2::MappingReplay
+                    | OperationKindV2::MappingExplanation
+                    | OperationKindV2::ProjectionReadback
+            )
+        )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ordinary_table_scan_operation_requires_all_cove_t_scan_sections() {
+        for kind in [
+            SectionKind::TableCatalog,
+            SectionKind::TableSegmentIndex,
+            SectionKind::TableSegmentData,
+            SectionKind::FileDictionaryIndex,
+            SectionKind::FileDictionaryPayload,
+            SectionKind::NestedSchema,
+            SectionKind::ZoneStats,
+            SectionKind::CodecExtensionRegistry,
+        ] {
+            assert!(
+                operation_requires_section(OperationKindV2::OrdinaryTableScan, kind),
+                "{kind:?} should be required for ordinary table scans"
+            );
+        }
+    }
+
+    #[test]
+    fn engine_execution_operation_requires_cove_e_sections() {
+        for kind in [
+            SectionKind::EngineProfileRegistry,
+            SectionKind::ExecutionCodeDescriptor,
+            SectionKind::ExecutionScopeDescriptor,
+            SectionKind::CodeSpaceDescriptor,
+            SectionKind::EngineMountPolicy,
+        ] {
+            assert!(
+                operation_requires_section(OperationKindV2::EngineExecutionMapping, kind),
+                "{kind:?} should be required for engine execution mapping"
+            );
+        }
+    }
+
+    #[test]
+    fn policy_operations_require_policy_sections() {
+        assert!(operation_requires_section(
+            OperationKindV2::TrustVerification,
+            SectionKind::TrustManifest
+        ));
+        assert!(operation_requires_section(
+            OperationKindV2::RedactionPolicyEvaluation,
+            SectionKind::RedactionManifest
+        ));
+    }
+
+    #[test]
+    fn table_sort_validation_only_claims_supported_default_semantics() {
+        let mut column = sort_test_column(CoveLogicalType::Int64, CovePhysicalKind::NumCode);
+        assert!(can_validate_table_sort_column(&column));
+
+        column.collation_id = 1;
+        assert!(!can_validate_table_sort_column(&column));
+
+        column.collation_id = 0;
+        column.physical = CovePhysicalKind::FileCode;
+        assert!(!can_validate_table_sort_column(&column));
+
+        column.physical = CovePhysicalKind::List;
+        assert!(!can_validate_table_sort_column(&column));
+    }
+
+    #[test]
+    fn declared_primary_sort_rejects_unverifiable_column_semantics() {
+        let mut column = sort_test_column(CoveLogicalType::Utf8, CovePhysicalKind::VarBytes);
+        column.collation_id = 1;
+        let table = sort_test_table(column);
+        let segment_index = TableSegmentIndex {
+            flags: 0,
+            entries: Vec::new(),
+        };
+        let payloads = std::collections::BTreeMap::new();
+        assert!(matches!(
+            validate_declared_primary_sort_order(&table, &segment_index, &payloads, &[]),
+            Err(CoveError::UnsupportedEncoding(_))
+        ));
+    }
+
+    fn sort_test_table(column: ColumnEntry) -> TableEntry {
+        TableEntry {
+            table_id: 1,
+            namespace: "public".into(),
+            name: "sorted".into(),
+            row_count: 0,
+            primary_sort_key_count: 1,
+            clustering_key_count: 0,
+            flags: 0,
+            columns: vec![column],
+        }
+    }
+
+    fn sort_test_column(logical: CoveLogicalType, physical: CovePhysicalKind) -> ColumnEntry {
+        ColumnEntry {
+            column_id: 1,
+            name: "sort_key".into(),
+            logical,
+            physical,
+            nullable: true,
+            sort_order: 1,
+            collation_id: 0,
+            precision: 0,
+            scale: 0,
+            flags: 0,
+        }
+    }
+
+    #[test]
+    fn temporal_prev_ref_must_stay_on_same_object_chain() {
+        let mut first = temporal_segment_for_chain(1, 0, [1; 16], RecordKind::Baseline, None);
+        let second = temporal_segment_for_chain(
+            2,
+            1,
+            [2; 16],
+            RecordKind::Delta,
+            Some(crate::profile::cove_o::CoveRecordRefV1 {
+                segment_id: 1,
+                row_index: 0,
+                target_kind: 1,
+            }),
+        );
+        assert_eq!(
+            validate_temporal_chains(&[&first, &second]),
+            Err(CoveError::RefInvalid)
+        );
+
+        first.rows[0].goid = [2; 16];
+        assert!(validate_temporal_chains(&[&first, &second]).is_ok());
+    }
+
+    #[test]
+    fn temporal_segment_ids_must_be_file_unique_across_object_types() {
+        let first = temporal_segment_for_chain(1, 0, [1; 16], RecordKind::Baseline, None);
+        let mut second = temporal_segment_for_chain(1, 1, [2; 16], RecordKind::Baseline, None);
+        second.header.object_type_id = 2;
+        assert_eq!(
+            validate_temporal_segment_ids_file_unique(&[&first, &second]),
+            Err(CoveError::RefInvalid)
+        );
+    }
+
+    fn temporal_segment_for_chain(
+        segment_id: u32,
+        csn: u64,
+        goid: [u8; 16],
+        record_kind: RecordKind,
+        prev_ref: Option<crate::profile::cove_o::CoveRecordRefV1>,
+    ) -> TemporalSegmentData {
+        TemporalSegmentData {
+            header: crate::profile::cove_o::TemporalSegmentHeaderV1 {
+                segment_id,
+                object_type_id: 1,
+                time_range_start_us: csn as i64,
+                time_range_end_us: csn as i64,
+                csn_min: csn,
+                csn_max: csn,
+                row_count: 1,
+                morsel_count: 1,
+                morsel_row_count: 1,
+                column_count: 0,
+                row_directory_offset: 0,
+                column_directory_offset: 0,
+                page_index_offset: 0,
+                data_offset: 0,
+                flags: 0,
+                checksum: 0,
+            },
+            rows: vec![crate::profile::cove_o::TemporalRowEntryV1 {
+                timestamp_us: csn as i64,
+                csn,
+                branch_key: 0,
+                goid,
+                record_id: [csn as u8; 16],
+                record_kind,
+                prev_ref,
+            }],
+            property_columns: Vec::new(),
+        }
+    }
 }

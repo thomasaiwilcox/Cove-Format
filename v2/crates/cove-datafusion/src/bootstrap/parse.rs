@@ -4,7 +4,7 @@ use cove_core::{
     checksum,
     codec::CodecExtensionDescriptorV2,
     compression::section_payload_from_raw,
-    constants::{SectionKind, FEATURE_EXTENDED_FEATURE_SET},
+    constants::{SectionKind, FEATURE_ENGINE_PROFILE, FEATURE_EXTENDED_FEATURE_SET},
     dictionary::FileDictionary,
     domain::ColumnDomain,
     feature_binding::SectionFeatureBindingSectionV2,
@@ -25,7 +25,7 @@ use cove_core::{
     },
     segment::TableSegmentIndex,
     table::TableCatalog,
-    zone_stats::ZoneStatsSection,
+    zone_stats::{ZoneStatsEntry, ZoneStatsSection},
     CoveError,
 };
 use cove_coverage::{
@@ -39,7 +39,9 @@ use cove_layout::{
 };
 
 use crate::{
-    dataset_state::{LayoutPlanningMetadataV2, PruningMetadata},
+    dataset_state::{
+        selected_coverage_snapshot_validity_ref, LayoutPlanningMetadataV2, PruningMetadata,
+    },
     range_reader::{CoveRangeReader, RangeReadKind},
 };
 
@@ -140,7 +142,47 @@ pub(super) async fn parse_dictionary<R: CoveRangeReader + ?Sized>(
 pub(super) async fn parse_engine_metadata<R: CoveRangeReader + ?Sized>(
     reader: &R,
     footer: &CoveFooter,
+    strict: bool,
 ) -> Result<EngineMetadata, CoveError> {
+    if !strict && !engine_profile_required(footer) {
+        return Ok(EngineMetadata {
+            engine_profile_registries: parse_optional_sections(
+                reader,
+                footer,
+                SectionKind::EngineProfileRegistry,
+                EngineProfileRegistry::parse,
+            )
+            .await,
+            execution_descriptors: parse_optional_sections(
+                reader,
+                footer,
+                SectionKind::ExecutionCodeDescriptor,
+                ExecutionCodeDescriptorV1::parse,
+            )
+            .await,
+            execution_scopes: parse_optional_sections(
+                reader,
+                footer,
+                SectionKind::ExecutionScopeDescriptor,
+                ExecutionScopeDescriptorV1::parse,
+            )
+            .await,
+            code_spaces: parse_optional_sections(
+                reader,
+                footer,
+                SectionKind::CodeSpaceDescriptor,
+                CodeSpaceDescriptorV1::parse,
+            )
+            .await,
+            engine_mount_policies: parse_optional_sections(
+                reader,
+                footer,
+                SectionKind::EngineMountPolicy,
+                EngineMountPolicyV1::parse,
+            )
+            .await,
+        });
+    }
     Ok(EngineMetadata {
         engine_profile_registries: parse_sections(
             reader,
@@ -180,6 +222,13 @@ pub(super) async fn parse_engine_metadata<R: CoveRangeReader + ?Sized>(
     })
 }
 
+fn engine_profile_required(footer: &CoveFooter) -> bool {
+    footer
+        .sections
+        .iter()
+        .any(|entry| entry.required_features & FEATURE_ENGINE_PROFILE != 0)
+}
+
 pub(super) async fn parse_segment_index<R: CoveRangeReader + ?Sized>(
     reader: &R,
     footer: &CoveFooter,
@@ -197,9 +246,27 @@ pub(super) async fn parse_segment_index<R: CoveRangeReader + ?Sized>(
 
 pub(super) async fn parse_pruning_metadata<R: CoveRangeReader + ?Sized>(
     reader: &R,
+    header: &CoveHeaderV1,
+    file_len: u64,
     footer: &CoveFooter,
 ) -> Result<PruningMetadata, CoveError> {
+    let zone_stats = parse_optional_sections(
+        reader,
+        footer,
+        SectionKind::ZoneStats,
+        ZoneStatsSection::parse,
+    )
+    .await;
+    let zone_stats_entries = zone_stats
+        .iter()
+        .flat_map(|section| section.entries.iter().cloned())
+        .collect::<Vec<ZoneStatsEntry>>();
     Ok(PruningMetadata {
+        selected_coverage_snapshot_validity_ref: selected_coverage_snapshot_validity_ref(
+            footer,
+            &header.file_id,
+            file_len,
+        ),
         nested_schemas: Arc::new(
             parse_optional_sections(
                 reader,
@@ -227,15 +294,8 @@ pub(super) async fn parse_pruning_metadata<R: CoveRangeReader + ?Sized>(
             )
             .await,
         ),
-        zone_stats: Arc::new(
-            parse_optional_sections(
-                reader,
-                footer,
-                SectionKind::ZoneStats,
-                ZoneStatsSection::parse,
-            )
-            .await,
-        ),
+        zone_stats: Arc::new(zone_stats),
+        zone_stats_entries: Arc::new(zone_stats_entries),
         exact_sets: Arc::new(
             parse_optional_sections(
                 reader,
@@ -367,9 +427,9 @@ pub(super) async fn parse_layout_metadata<R: CoveRangeReader + ?Sized>(
         "fast_metadata_section_id",
     ) {
         Ok(Some(entry)) => match read_section_payload(reader, entry).await {
-            Ok(payload) => match FastMetadataIndexV2::parse(&payload)
-                .and_then(|index| validate_fast_metadata_authority(&index, footer).map(|_| index))
-            {
+            Ok(payload) => match FastMetadataIndexV2::parse(&payload).and_then(|index| {
+                validate_fast_metadata_authority(&index, footer, table, segments).map(|_| index)
+            }) {
                 Ok(index) => {
                     layout.record_loaded();
                     Some(Arc::new(index))
@@ -495,19 +555,22 @@ pub(super) async fn parse_feature_scope_table<R: CoveRangeReader + ?Sized>(
         header.feature_set_section_id,
         SectionKind::ExtendedFeatureSet,
         "feature_set_section_id",
-    )?;
+    )
+    .or_else(|err| optional_header_section_absent_or_required(header, err))?;
     let profile_matrix_entry = resolve_header_section_id(
         footer,
         header.profile_capability_section_id,
         SectionKind::ProfileCapabilityMatrix,
         "profile_capability_section_id",
-    )?;
+    )
+    .unwrap_or(None);
     resolve_header_section_id(
         footer,
         header.fast_metadata_section_id,
         SectionKind::FastMetadataIndex,
         "fast_metadata_section_id",
-    )?;
+    )
+    .unwrap_or(None);
     if header.required_features & FEATURE_EXTENDED_FEATURE_SET != 0 && extended_entry.is_none() {
         return Err(CoveError::BadSection(
             "FEATURE_EXTENDED_FEATURE_SET is required but feature_set_section_id is absent".into(),
@@ -515,31 +578,40 @@ pub(super) async fn parse_feature_scope_table<R: CoveRangeReader + ?Sized>(
     }
 
     let extended = match extended_entry {
-        Some(entry) => {
-            let payload = read_section_payload(reader, entry).await?;
-            let set = ExtendedFeatureSetV2::parse(&payload)?;
-            set.validate_against_low_words(header.required_features, header.optional_features)?;
-            Some(set)
-        }
+        Some(entry) => match read_section_payload(reader, entry)
+            .await
+            .and_then(|payload| {
+                let set = ExtendedFeatureSetV2::parse(&payload)?;
+                set.validate_against_low_words(header.required_features, header.optional_features)?;
+                Ok(set)
+            }) {
+            Ok(set) => Some(set),
+            Err(err) => optional_header_section_absent_or_required(header, err)?,
+        },
         None => None,
     };
     let profile_matrix = match profile_matrix_entry {
-        Some(entry) => {
-            let payload = read_section_payload(reader, entry).await?;
-            Some(ProfileCapabilityMatrixV2::parse(&payload)?)
-        }
+        Some(entry) => read_section_payload(reader, entry)
+            .await
+            .and_then(|payload| ProfileCapabilityMatrixV2::parse(&payload))
+            .ok(),
         None => None,
     };
     let mut section_bindings = Vec::<SectionFeatureBindingSectionV2>::new();
     for entry in find_sections(footer, SectionKind::SectionFeatureBinding) {
         let Some(extended) = extended.as_ref() else {
-            return Err(CoveError::BadSection(
-                "SECTION_FEATURE_BINDING requires EXTENDED_FEATURE_SET".into(),
-            ));
+            continue;
         };
-        let payload = read_section_payload(reader, entry).await?;
-        let parsed = SectionFeatureBindingSectionV2::parse(&payload)?;
-        extended.validate_binding_horizon(&parsed)?;
+        let parsed = match read_section_payload(reader, entry)
+            .await
+            .and_then(|payload| SectionFeatureBindingSectionV2::parse(&payload))
+            .and_then(|parsed| {
+                extended.validate_binding_horizon(&parsed)?;
+                Ok(parsed)
+            }) {
+            Ok(parsed) => parsed,
+            Err(_) => continue,
+        };
         section_bindings.push(parsed);
     }
     if let Some(matrix) = profile_matrix.as_ref() {
@@ -570,6 +642,17 @@ pub(super) async fn parse_feature_scope_table<R: CoveRangeReader + ?Sized>(
     )?;
     table.reject_file_required_unknowns()?;
     Ok(table)
+}
+
+fn optional_header_section_absent_or_required<T>(
+    header: &CoveHeaderV1,
+    err: CoveError,
+) -> Result<Option<T>, CoveError> {
+    if header.required_features & FEATURE_EXTENDED_FEATURE_SET != 0 {
+        Err(err)
+    } else {
+        Ok(None)
+    }
 }
 
 fn validate_section_ranges(footer: &CoveFooter, footer_start: u64) -> Result<(), CoveError> {

@@ -17,18 +17,21 @@ pub(super) fn arrow_encoded_columns_for_payloads<'name, 'array, 'data>(
     columns: &[&ColumnEntry],
     encoded_columns: &'array [(&'name str, EncodedArray<'data>)],
     page_indexes: &'array [ColumnPageIndexEntryV1],
+    page_refs: &[u32],
     page_payloads: &'array [RetainedColumnPagePayloadV1],
     _options: ArrowExportOptions,
 ) -> Vec<DecodedArrowColumn<'name, 'array, 'data>> {
     debug_assert_eq!(columns.len(), encoded_columns.len());
     debug_assert_eq!(page_indexes.len(), encoded_columns.len());
+    debug_assert_eq!(page_refs.len(), encoded_columns.len());
     debug_assert_eq!(encoded_columns.len(), page_payloads.len());
     columns
         .iter()
         .zip(encoded_columns.iter())
         .zip(page_indexes.iter())
+        .zip(page_refs.iter())
         .zip(page_payloads.iter())
-        .map(|(((column, (name, array)), page), payload)| {
+        .map(|((((column, (name, array)), page), page_ref), payload)| {
             let nested_schema = state.nested_schema_for_column(column.column_id).cloned();
             let data_owner = if array.physical == CovePhysicalKind::VarBytes {
                 Some(arrow_buffer_owner(payload.data.owner()))
@@ -42,7 +45,8 @@ pub(super) fn arrow_encoded_columns_for_payloads<'name, 'array, 'data>(
                 nested_schema,
                 data_owner,
                 utf8_proof_key: Utf8ProofKey::new(state.identity(), column, page),
-                zero_copy: state.zero_copy_compatibility_for_page(segment_id, column, page),
+                zero_copy: state
+                    .zero_copy_compatibility_for_page(segment_id, column, page, *page_ref),
             }
         })
         .collect()
@@ -400,14 +404,24 @@ fn zero_copy_direct_export_path(path: ArrowExportPath) -> bool {
 
 pub(super) fn materialize_page_payload(
     segment_bytes: &[u8],
+    table_id: u32,
+    segment_id: u32,
     column: &ColumnEntry,
     page: &ColumnPageIndexEntryV1,
+    zone_stats: &[cove_core::zone_stats::ZoneStatsEntry],
     codec_descriptors: &[cove_core::codec::CodecExtensionDescriptorV2],
     dictionary_len: Option<u32>,
     validation_policy: PagePayloadValidationPolicy,
 ) -> Result<RetainedColumnPagePayloadV1, CoveError> {
     if page.flags & PAGE_FLAG_STATS_ONLY_CONSTANT != 0 {
-        return materialize_stats_only_page(column, page);
+        return materialize_stats_only_page(
+            table_id,
+            segment_id,
+            column,
+            page,
+            zone_stats,
+            dictionary_len,
+        );
     }
 
     let start = usize::try_from(page.page_offset).map_err(|_| CoveError::OffsetRange)?;
@@ -436,15 +450,25 @@ pub(super) fn materialize_page_payload(
 }
 
 pub(super) fn materialize_page_payload_from_wire(
+    table_id: u32,
+    segment_id: u32,
     column: &ColumnEntry,
     page: &ColumnPageIndexEntryV1,
     page_wire: Option<RetainedBytes>,
+    zone_stats: &[cove_core::zone_stats::ZoneStatsEntry],
     codec_descriptors: &[cove_core::codec::CodecExtensionDescriptorV2],
     dictionary_len: Option<u32>,
     validation_policy: PagePayloadValidationPolicy,
 ) -> Result<RetainedColumnPagePayloadV1, CoveError> {
     if page.flags & PAGE_FLAG_STATS_ONLY_CONSTANT != 0 {
-        return materialize_stats_only_page(column, page);
+        return materialize_stats_only_page(
+            table_id,
+            segment_id,
+            column,
+            page,
+            zone_stats,
+            dictionary_len,
+        );
     }
     let Some(page_wire) = page_wire else {
         return Err(CoveError::PageCorrupt);
@@ -490,36 +514,26 @@ fn buffer_checksum_validation(
 }
 
 fn materialize_stats_only_page(
+    table_id: u32,
+    segment_id: u32,
     column: &ColumnEntry,
     page: &ColumnPageIndexEntryV1,
+    zone_stats: &[cove_core::zone_stats::ZoneStatsEntry],
+    dictionary_len: Option<u32>,
 ) -> Result<RetainedColumnPagePayloadV1, CoveError> {
-    if page.flags & PAGE_FLAG_ALL_NULL != 0 {
-        let bitmap_len = (page.row_count as usize)
-            .checked_add(7)
-            .ok_or(CoveError::ArithOverflow)?
-            / 8;
-        let mut bitmap = vec![0xff; bitmap_len];
-        if !page.row_count.is_multiple_of(8) && !bitmap.is_empty() {
-            let valid_bits = page.row_count % 8;
-            bitmap[bitmap_len - 1] = (1u8 << valid_bits) - 1;
-        }
-        let payload = ColumnPagePayloadV1::build_single_node(
-            page.row_count,
-            default_encoding_kind(column.physical),
-            column.logical,
-            column.physical,
-            Some(bitmap),
-            Vec::new(),
-        )?;
-        return RetainedColumnPagePayloadV1::parse(RetainedBytes::from_vec(payload));
-    }
-    if page.flags & PAGE_FLAG_ALL_NON_NULL != 0 {
-        return Err(CoveError::UnsupportedEncoding(
-            "native decoder cannot decode stats-only non-null constant pages without materialized values"
-                .into(),
-        ));
-    }
-    Err(CoveError::PageCorrupt)
+    let payload = materialize_stats_only_constant_page_payload(
+        StatsOnlyPageMaterializationContext {
+            table_id: Some(table_id),
+            segment_id: Some(segment_id),
+            column_id: column.column_id,
+            logical_type: column.logical,
+            physical_kind: column.physical,
+            dictionary_len,
+            zone_stats,
+        },
+        page,
+    )?;
+    RetainedColumnPagePayloadV1::parse(RetainedBytes::from_vec(payload))
 }
 
 fn materialize_registered_page_payload_if_needed(
@@ -589,17 +603,4 @@ fn buffer_slice(
     let start = usize::try_from(buffer.offset).map_err(|_| CoveError::OffsetRange)?;
     let len = usize::try_from(buffer.length).map_err(|_| CoveError::OffsetRange)?;
     wire::read_range_checked(payload.data.as_slice(), start, len).map(Some)
-}
-
-fn default_encoding_kind(physical: CovePhysicalKind) -> CoveEncodingKind {
-    match physical {
-        CovePhysicalKind::FileCode => CoveEncodingKind::FileCode,
-        CovePhysicalKind::NumCode => CoveEncodingKind::NumCode,
-        CovePhysicalKind::Boolean | CovePhysicalKind::FixedBytes => CoveEncodingKind::PlainFixed,
-        CovePhysicalKind::VarBytes => CoveEncodingKind::VarBytes,
-        CovePhysicalKind::List | CovePhysicalKind::Struct | CovePhysicalKind::Map => {
-            CoveEncodingKind::Canonical
-        }
-        _ => CoveEncodingKind::Canonical,
-    }
 }

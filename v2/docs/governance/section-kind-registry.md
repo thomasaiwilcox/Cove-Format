@@ -4,6 +4,12 @@ The COVE v2.0 section-kind registry records every stable section identifier, own
 
 Section identifiers are globally stable, but feature-scope rules still apply to optional semantics inside each section. Unknown optional sections are skipped through extension fallback. Unknown required sections fail validation with a structured error.
 
+Current COVE-R embedded section assignment:
+
+| ID | Name | Profile | Required feature |
+| --- | --- | --- | --- |
+| 48 | RUNTIME_COMPATIBILITY_HINTS | COVE-R | FEATURE_RUNTIME_COMPATIBILITY_HINTS |
+
 The registry is checked by the conformance suite through:
 
 ```sh

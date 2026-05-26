@@ -97,6 +97,9 @@ pub mod nested_schema;
 pub mod page;
 pub mod page_payload;
 mod page_validation;
+pub use page_validation::{
+    materialize_stats_only_constant_page_payload, StatsOnlyPageMaterializationContext,
+};
 pub mod postscript;
 pub mod predicate;
 pub mod profile;

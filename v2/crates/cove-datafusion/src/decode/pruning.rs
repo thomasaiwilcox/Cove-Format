@@ -240,8 +240,11 @@ pub(super) fn selected_rows_for_morsel(
         state.reject_table_scan_page_feature_use(segment_ref, page)?;
         let payload = match materialize_page_payload(
             segment_bytes,
+            segment_ref.table_id,
+            segment_ref.segment_id,
             column,
             page,
+            state.pruning().zone_stats_entries.as_slice(),
             state.pruning().codec_descriptors.as_slice(),
             state
                 .mounted()
@@ -420,9 +423,12 @@ pub(super) async fn selected_rows_for_morsel_metadata<R: CoveRangeReader + ?Size
             read_page_wire(reader, state, segment_ref, page, stats, RangeReadKind::Data).await?;
         stats.pages_decoded += usize::from(page.page_length != 0);
         let payload = match materialize_page_payload_from_wire(
+            segment_ref.table_id,
+            segment_ref.segment_id,
             column,
             page,
             page_wire,
+            state.pruning().zone_stats_entries.as_slice(),
             state.pruning().codec_descriptors.as_slice(),
             state
                 .mounted()

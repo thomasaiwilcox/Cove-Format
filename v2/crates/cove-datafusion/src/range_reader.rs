@@ -15,7 +15,7 @@ use cove_core::{
 };
 use memmap2::Mmap;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RangeCoalescingOptions {
     pub max_gap: u64,
     pub max_span: u64,

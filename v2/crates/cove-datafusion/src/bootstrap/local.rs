@@ -1,7 +1,16 @@
 use std::{fs, path::Path, path::PathBuf, sync::Arc};
 
 use cove_cache::CoverageCacheV2;
-use cove_core::{constants::DigestAlgorithm, digest::compute_digest, CoveError};
+use cove_core::{
+    constants::{CovePhysicalKind, DigestAlgorithm},
+    dictionary::FileDictionary,
+    digest::compute_digest,
+    feature_binding::OperationKindV2,
+    feature_scope::FeatureUseRequestV2,
+    reader::{self, OptionalPushdownPolicy, ValidationOptions},
+    table::TableCatalog,
+    CoveError,
+};
 
 #[cfg(feature = "covi")]
 use crate::bootstrap::covi::validate_covi_for_file;
@@ -18,8 +27,8 @@ use crate::{
         ordinary_table_scan_feature_use_request, CoverageCacheMetadata, DatasetBootstrapStats,
         DatasetState, FileIdentity,
     },
-    options::{select_table, CoveTableOptions, CoverageCacheDiscovery},
-    range_reader::{CoveRangeReader, LocalFileRangeReader},
+    options::{select_table, CoveTableOptions, CoverageCacheDiscovery, ExecutionCodePolicy},
+    range_reader::{CoveRangeReader, LocalFileRangeReader, RangeReadKind},
 };
 
 /// Load a local COVE file into immutable single-file dataset state.
@@ -81,22 +90,23 @@ pub fn bootstrap_bytes_with_covi_artifacts(
     covi_artifacts: Vec<Vec<u8>>,
     options: CoveTableOptions,
 ) -> Result<Arc<DatasetState>, CoveError> {
-    use cove_core::{constants::DigestAlgorithm, digest::compute_digest};
-    use cove_index::execution::CoviValidationContextV2;
+    use cove_core::{checksum, constants::DigestAlgorithm, digest::compute_digest};
 
     let file_digest = compute_digest(DigestAlgorithm::Sha256, &bytes).ok();
+    let file_crc32c = checksum::crc32c(&bytes);
+    let file_len = bytes.len() as u64;
     let state = bootstrap_bytes_with_options(source, bytes, options)?;
     let mut stats = crate::dataset_state::DatasetBootstrapStats::default();
     let mut covi = None;
     if let Some(file) = state.files().first() {
         for artifact_bytes in covi_artifacts {
-            let mut context = CoviValidationContextV2::for_file(
-                file.identity().file_id,
-                file.identity().file_len,
+            let snapshot_id = crate::bootstrap::covi::derived_covi_snapshot_id_from_parts(
+                file_crc32c,
                 file.identity().footer_crc32c,
-            )
-            .with_dataset_id(file.identity().file_id)
-            .with_file_code_keys(true);
+                file_len,
+            );
+            let mut context = crate::bootstrap::covi::base_covi_validation_context(file)
+                .with_snapshot_id(snapshot_id);
             if let Some(digest) = file_digest.clone() {
                 context = context.with_file_digest(DigestAlgorithm::Sha256, digest);
             }
@@ -125,16 +135,14 @@ pub async fn bootstrap_range_reader_with_options<R: CoveRangeReader + ?Sized>(
 ) -> Result<Arc<DatasetState>, CoveError> {
     let source = source.into();
     let (header, postscript, footer) = bootstrap_header_footer(file_len, reader).await?;
-    let feature_scope_table = parse_feature_scope_table(reader, &header, &footer).await?;
-    feature_scope_table
-        .reject_unknowns_for_request(&ordinary_table_scan_feature_use_request(&footer))?;
-
     let provisional_key = CoveMetadataCacheKey {
         source: Arc::clone(&source),
         file_id: header.file_id,
+        header_bytes: header.serialize(),
         file_len,
         footer_crc32c: postscript.footer.crc32c,
         table_selection: options.table_selection().cloned(),
+        options_fingerprint: options.cache_fingerprint(),
     };
     if let Some(cache) = cache {
         if let Some(cached) = cache.get(&provisional_key) {
@@ -142,17 +150,32 @@ pub async fn bootstrap_range_reader_with_options<R: CoveRangeReader + ?Sized>(
         }
     }
 
+    let feature_scope_table = parse_feature_scope_table(reader, &header, &footer).await?;
+    feature_scope_table
+        .reject_unknowns_for_request(&ordinary_table_scan_feature_use_request(&footer))?;
+    validate_ordinary_table_scan_semantics(file_len, reader, &footer).await?;
+    if options.execution_code_policy() == ExecutionCodePolicy::RequireSupported {
+        validate_required_engine_execution_semantics(file_len, reader).await?;
+    }
+
     let table_catalog = parse_table_catalog(reader, &footer).await?;
-    let table = select_table(&table_catalog, options.table_selection())?;
     let dictionary = parse_dictionary(reader, &footer).await?;
-    let engine_metadata = parse_engine_metadata(reader, &footer).await?;
+    validate_filecode_dictionary_presence(&table_catalog, dictionary.as_ref())?;
+    let table = select_table(&table_catalog, options.table_selection())?;
+    let engine_metadata = parse_engine_metadata(
+        reader,
+        &footer,
+        options.execution_code_policy() == ExecutionCodePolicy::RequireSupported
+            || header.required_features & cove_core::constants::FEATURE_ENGINE_PROFILE != 0,
+    )
+    .await?;
     let segment_index = parse_segment_index(reader, &footer).await?;
     let segments = segment_index
         .entries
         .into_iter()
         .filter(|segment| segment.table_id == table.table_id)
         .collect::<Vec<_>>();
-    let pruning = parse_pruning_metadata(reader, &footer).await?;
+    let pruning = parse_pruning_metadata(reader, &header, file_len, &footer).await?;
     let layout = parse_layout_metadata(reader, &header, &footer, &table, &segments).await;
 
     let state = Arc::new(DatasetState::from_metadata_with_options_and_feature_scope(
@@ -180,6 +203,63 @@ pub async fn bootstrap_range_reader_with_options<R: CoveRangeReader + ?Sized>(
         cache.insert(provisional_key, Arc::clone(&state));
     }
     Ok(state)
+}
+
+async fn validate_ordinary_table_scan_semantics<R: CoveRangeReader + ?Sized>(
+    file_len: u64,
+    reader: &R,
+    footer: &cove_core::footer::CoveFooter,
+) -> Result<(), CoveError> {
+    let bytes = reader
+        .read_range(0..file_len, RangeReadKind::Metadata)
+        .await?;
+    reader::validate_bytes_for_ordinary_table_scan(
+        &bytes,
+        ValidationOptions {
+            semantic: true,
+            verify_digests: false,
+            allow_unknown_optional_extensions: true,
+            optional_pushdown_policy: OptionalPushdownPolicy::FailOpen,
+        },
+        ordinary_table_scan_feature_use_request(footer),
+    )?;
+    Ok(())
+}
+
+async fn validate_required_engine_execution_semantics<R: CoveRangeReader + ?Sized>(
+    file_len: u64,
+    reader: &R,
+) -> Result<(), CoveError> {
+    let bytes = reader
+        .read_range(0..file_len, RangeReadKind::Metadata)
+        .await?;
+    reader::validate_bytes_for_feature_use(
+        &bytes,
+        ValidationOptions {
+            semantic: true,
+            verify_digests: false,
+            allow_unknown_optional_extensions: true,
+            optional_pushdown_policy: OptionalPushdownPolicy::FailOpen,
+        },
+        FeatureUseRequestV2::new().with_operation(OperationKindV2::EngineExecutionMapping),
+    )?;
+    Ok(())
+}
+
+fn validate_filecode_dictionary_presence(
+    table_catalog: &TableCatalog,
+    dictionary: Option<&FileDictionary>,
+) -> Result<(), CoveError> {
+    let uses_filecode = table_catalog.tables.iter().any(|table| {
+        table
+            .columns
+            .iter()
+            .any(|column| column.physical == CovePhysicalKind::FileCode)
+    });
+    if uses_filecode && dictionary.is_none() {
+        return Err(CoveError::BadFileCode);
+    }
+    Ok(())
 }
 
 pub(super) async fn bootstrap_local_path_with_options(
@@ -286,6 +366,23 @@ fn coverage_cache_entry_usable(
     state: &DatasetState,
     entry: &cove_cache::CoverageCacheEntryV2,
 ) -> bool {
+    const ABSENT_REF: u32 = u32::MAX;
+
+    if entry.interval_normal_form_ref != ABSENT_REF {
+        return false;
+    }
+    if entry.producer_engine_ref != ABSENT_REF && entry.producer_engine_ref != 0 {
+        return false;
+    }
+    let Some(selected_snapshot_ref) = state.pruning().selected_coverage_snapshot_validity_ref
+    else {
+        return false;
+    };
+    if entry.valid_until_snapshot_ref != ABSENT_REF
+        && entry.valid_until_snapshot_ref != selected_snapshot_ref
+    {
+        return false;
+    }
     let predicate_exists = state
         .pruning()
         .predicate_forms
@@ -305,6 +402,7 @@ fn coverage_cache_entry_usable(
             && set.header.granularity == entry.coverage_granularity
             && set.header.proof_strength == entry.proof_strength
             && set.header.exactness == entry.exactness
+            && set.header.snapshot_validity_ref == selected_snapshot_ref
             && !set.header.exactness.may_under_include()
             && set.header.proof_strength.allows_pruning()
     })

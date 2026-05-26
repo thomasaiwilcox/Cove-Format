@@ -43,6 +43,8 @@ mod tests {
         physical_expr::expressions::{lit, BinaryExpr, Column, DynamicFilterPhysicalExpr},
     };
 
+    use crate::planner::CoveFilterUse;
+
     const SCAN_TABLE: &[u8] =
         include_bytes!("../../../../conformance/accept/cove_t_bool_numcode_declared.cove");
 
@@ -72,6 +74,9 @@ mod tests {
         assert_eq!(snapshot.snapshots, 1);
         assert_eq!(snapshot.fallbacks, 0);
         assert_eq!(snapshot.filters.len(), 1);
-        assert_eq!(snapshot.filters[0].use_kind, CoveFilterUse::PruningOnly);
+        assert_eq!(
+            snapshot.filters[0].use_kind,
+            CoveFilterUse::FullRowPredicateExact
+        );
     }
 }

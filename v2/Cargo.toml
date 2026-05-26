@@ -19,6 +19,7 @@ members = [
     "crates/cove-codec",
     "crates/cove-layout",
     "crates/cove-runtime",
+    "crates/cove-profile-validation",
     "crates/cove-coverage",
     "crates/cove-index",
     "crates/cove-cache",

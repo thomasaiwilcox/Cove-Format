@@ -230,6 +230,9 @@ impl ZoneStatsEntry {
             distinct_count,
             run_count,
             stats: ZoneStats {
+                // The v2 wire entry carries no explicit scope enum. Segment
+                // scope is encoded by morsel_id == u32::MAX; page-level use is
+                // contextual and is validated by the referencing page.stats_ref.
                 scope: if morsel_id == u32::MAX {
                     ZoneScope::Segment
                 } else {

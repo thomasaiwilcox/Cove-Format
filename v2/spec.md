@@ -1529,6 +1529,7 @@ struct CoveSectionEntryV2 {
 | 45 | SECTION_FEATURE_BINDING | shared | Section/profile/operation-scoped extended feature requiredness bindings. |
 | 46 | COVERAGE_PROOF_RECORD | COVE-COVERAGE | Proof records binding predicate forms, providers, coverage sets, validity, and proof semantics. |
 | 47 | NESTED_SCHEMA | COVE-T | Authoritative recursive child schema metadata for native List/Struct/Map table columns. |
+| 48 | RUNTIME_COMPATIBILITY_HINTS | COVE-R | Optional runtime/session adapter selection hints. |
 | 30 | ENGINE_PROFILE_REGISTRY | COVE-E | Registered engine execution profiles. |
 | 31 | EXECUTION_CODE_DESCRIPTOR | COVE-E | ExecutionCode description. |
 | 32 | EXECUTION_SCOPE_DESCRIPTOR | COVE-E | Execution scope metadata. |
@@ -2673,8 +2674,8 @@ struct ColumnPageIndexEntryV2 {
 | --- | --- | --- |
 | 0x0000_00FF | PAGE_FLAG_COMPRESSION_CODEC | Page-level `CompressionCodec` value from Section 66. |
 | 0x0000_0100 | PAGE_FLAG_STATS_ONLY_CONSTANT | No page payload exists; the page is reconstructed from page index counts and, for all-non-null pages, a validated page-level ZoneStatsEntry. Requires FEATURE_PAGE_PAYLOAD_ELISION. |
-| 0x0000_0200 | PAGE_FLAG_ALL_NULL | Every row in the page is null. Requires FEATURE_PAGE_PAYLOAD_ELISION when used to omit payload or null-position data. |
-| 0x0000_0400 | PAGE_FLAG_ALL_NON_NULL | Every row in the page is non-null. Requires FEATURE_PAGE_PAYLOAD_ELISION when used to omit payload or null-position data. |
+| 0x0000_0200 | PAGE_FLAG_ALL_NULL | Every row in the page is null. This fact flag does not by itself require FEATURE_PAGE_PAYLOAD_ELISION. |
+| 0x0000_0400 | PAGE_FLAG_ALL_NON_NULL | Every row in the page is non-null. This fact flag does not by itself require FEATURE_PAGE_PAYLOAD_ELISION. |
 | 0x0000_0800 | PAGE_FLAG_VALUE_STREAM_ELIDED | The non-null value stream is elided because the non-null value is constant. A null bitmap may still be present unless ALL_NULL or ALL_NON_NULL is set. Requires FEATURE_PAGE_PAYLOAD_ELISION. |
 | 0xFFFF_F000 | reserved | Reserved for future required page extensions; MUST be zero in v2 unless a required extension defines the bit and the reader supports that extension. |
 
@@ -2688,9 +2689,10 @@ struct ColumnPageIndexEntryV2 {
 - Readers MUST reject unknown page codec values and any non-zero reserved page flag bits unless a required extension defines the bit and the reader supports that extension.
 
 **Page flag consistency:**
-- Page-elision flags are decode-affecting metadata. Writers that use PAGE_FLAG_STATS_ONLY_CONSTANT, PAGE_FLAG_ALL_NULL to omit null-position data, PAGE_FLAG_ALL_NON_NULL to omit null-position data, or PAGE_FLAG_VALUE_STREAM_ELIDED MUST set FEATURE_PAGE_PAYLOAD_ELISION in required_features. A reader that does not support FEATURE_PAGE_PAYLOAD_ELISION MUST reject the file before decoding those pages.
+- PAGE_FLAG_ALL_NULL and PAGE_FLAG_ALL_NON_NULL are exact page facts. They are not feature-gated when the ordinary page payload still carries all decode-required data.
+- Payload-elision flags are decode-affecting metadata. Writers that use PAGE_FLAG_STATS_ONLY_CONSTANT or PAGE_FLAG_VALUE_STREAM_ELIDED MUST set FEATURE_PAGE_PAYLOAD_ELISION in required_features. A reader that does not support FEATURE_PAGE_PAYLOAD_ELISION MUST reject the file before decoding those pages.
 - PAGE_FLAG_ALL_NULL and PAGE_FLAG_ALL_NON_NULL are mutually exclusive.
-- PAGE_FLAG_ALL_NULL requires null_count == row_count and non_null_count == 0. The null bitmap MAY be omitted only when FEATURE_PAGE_PAYLOAD_ELISION is required; any present null bitmap MUST contain only null bits for rows in the page with unused final-byte bits zeroed.
+- PAGE_FLAG_ALL_NULL requires null_count == row_count and non_null_count == 0. The null bitmap MAY be omitted only when PAGE_FLAG_STATS_ONLY_CONSTANT is set and FEATURE_PAGE_PAYLOAD_ELISION is required; any present null bitmap MUST contain only null bits for rows in the page with unused final-byte bits zeroed.
 - PAGE_FLAG_ALL_NON_NULL requires null_count == 0 and non_null_count == row_count. The null bitmap MAY be omitted because every row is non-null; any present null bitmap MUST contain only zero bits with unused final-byte bits zeroed.
 - If neither PAGE_FLAG_ALL_NULL nor PAGE_FLAG_ALL_NON_NULL is set, the counts still determine how much null-position information is required. A mixed null/non-null page MUST include a validated null-position representation; a page with null_count == 0 MAY omit the null bitmap.
 - Page flags MUST be internally consistent with row_count, null_count, non_null_count, page_length, uncompressed_length, encoding_root, checksum, and any referenced stats_ref. A mismatch is page corruption; flags are not hints and MUST NOT override the counts or validated payload metadata.
@@ -2702,7 +2704,8 @@ struct ColumnPageIndexEntryV2 {
 - PAGE_FLAG_STATS_ONLY_CONSTANT requires either PAGE_FLAG_ALL_NULL or PAGE_FLAG_ALL_NON_NULL. Mixed null/non-null constant pages still need a null-position representation and therefore MUST NOT be stats-only.
 - For all-null stats-only pages, null_count MUST equal row_count and non_null_count MUST be zero.
 - For all-non-null stats-only pages, non_null_count MUST equal row_count, null_count MUST be zero, and stats_ref MUST reference a validated page-level ZoneStatsEntry with IS_CONSTANT and min_value == max_value under the declared logical type and collation rules.
-- For Float32 and Float64 stats-only constant pages, the stats entry MUST preserve the exact raw IEEE value bits needed for reconstruction. If exact bits are not represented, including NaN payloads or signed-zero distinctions, the constant value MUST be stored in Constant parameters instead of stats-only storage.
+- For Float32 stats-only constant pages, the stats entry MUST preserve the exact raw IEEE value bits needed for reconstruction. Because v2 has no `StatKind::Float32Bits`, decode-required Float32 stats-only constants MUST use `StatKind::FixedBytes` with exactly 4 little-endian raw IEEE bytes; ordinary advisory Float32 pruning min/max may remain approximate or normalized where permitted by the statistics rules, but those advisory values MUST NOT be used as the reconstruction source for a stats-only constant page. If exact Float32 bits are not represented, including NaN payloads or signed-zero distinctions, the constant value MUST be stored in Constant parameters instead of stats-only storage.
+- For Float64 stats-only constant pages, `StatKind::Float64Bits` may be used only for non-NaN values because ZoneStats Float64 min/max scalars MUST NOT contain NaN. Float64 NaN constants, including payload-preserving NaNs, MUST use a payload-backed Constant or value-stream representation rather than stats-only reconstruction.
 - When PAGE_FLAG_STATS_ONLY_CONSTANT is set on an all-non-null page, the referenced stats entry is decode-required canonical data for that page, not optional pushdown metadata. A reader that cannot validate it MUST reject the page rather than fail open.
 - A stats-only constant page MUST declare or imply `PageReconstructionSource::StatsConstant` and MUST NOT be treated as a normal optional statistics optimisation.
 - A stats-only constant page MUST NOT use truncated `StatScalar` values for reconstruction. Truncated min/max may remain advisory pruning metadata, but they cannot be the only source of a decoded constant value.
@@ -2869,6 +2872,7 @@ Float64 min/max scalars MUST NOT contain NaN. If a zone contains NaN values, wri
 | HAS_BOTTOM_N_SUMMARY | bottom summary available. |
 
 **Rules:**
+- `ZoneStatsEntryV2` has no explicit scope field. Segment-level entries are encoded by `morsel_id == u32::MAX`; morsel-level entries use the concrete morsel id. Page-level use is contextual: a page-level stats entry is proven only when a referencing page selects it by `stats_ref` and the entry matches the page's table, segment, morsel, column, row_count, null_count, and non_null_count metadata.
 - For NumCode columns, min/max are interpreted by logical_type.
 - For FileCode columns, range stats use domain ranks.
 - Raw FileCode min/max MUST NOT be used for logical range pruning.
@@ -6039,6 +6043,7 @@ Object property columns use the same physical and encoded-array machinery as COV
 - Nulls are represented only by null bitmaps.
 - FileCodes resolve through the file dictionary.
 - NumCodes are interpreted by declared logical type.
+- Stats-only property pages follow the same constant reconstruction rules as COVE-T pages in §27.2. All-non-null stats-only property pages MUST reference validated contextual page stats; readers MUST reject them if the stats entry is missing or does not match the property page metadata.
 - Property columns SHOULD be page/morsel aligned with system columns.
 
 ---

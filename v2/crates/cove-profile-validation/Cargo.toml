@@ -1,0 +1,11 @@
+[package]
+name = "cove-profile-validation"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+cove-core = { path = "../cove-core" }
+cove-coverage = { path = "../cove-coverage" }
+cove-index = { path = "../cove-index" }
+cove-layout = { path = "../cove-layout" }
+cove-runtime = { path = "../cove-runtime" }

@@ -1,5 +1,10 @@
 //! Public options for COVE-backed DataFusion table registration.
 
+use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
+};
+
 use cove_arrow::arrow::{
     ArrowDictionaryPolicy, ArrowExportOptions, ArrowStringValidationPolicy,
     ArrowVarBytesExportPolicy,
@@ -11,7 +16,7 @@ use cove_core::{
 
 use crate::range_reader::RangeCoalescingOptions;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CoveTableOptions {
     arrow_export_options: ArrowExportOptions,
     table_selection: Option<CoveTableSelection>,
@@ -39,45 +44,45 @@ pub enum CoveTableSelection {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CovmTrustPolicy {
     Conservative,
     CachedFreshness,
     ExternalCatalogTrusted,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SidecarDigestPolicy {
     RequireFreshFingerprint,
     FullFileDigestOnDemand,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CovxDiscovery {
     Disabled,
     SiblingExtension,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CoviDiscovery {
     Disabled,
     SiblingExtension,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CoverageCacheDiscovery {
     Disabled,
     SiblingDiagnostic,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ExecutionCodePolicy {
     Disabled,
     Opportunistic,
     RequireSupported,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PagePayloadValidationPolicy {
     Trusted,
     Strict,
@@ -121,6 +126,12 @@ impl Default for CoveTableOptions {
 }
 
 impl CoveTableOptions {
+    pub(crate) fn cache_fingerprint(&self) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        self.hash(&mut hasher);
+        hasher.finish()
+    }
+
     pub fn arrow_export_options(&self) -> ArrowExportOptions {
         self.arrow_export_options
     }

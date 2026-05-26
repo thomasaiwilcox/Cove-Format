@@ -2488,11 +2488,13 @@ fn validate_projection_expression(
         }
         return Ok(());
     }
+    if let Some((left, right)) = split_comparison_expression(expression) {
+        validate_projection_expression(model, projection, function_ids, left)?;
+        validate_projection_expression(model, projection, function_ids, right)?;
+        return Ok(());
+    }
     if let Some((function, args)) = parse_function_call(expression) {
-        if !projection_builtin_operator(function)
-            && !function_ids.is_empty()
-            && !function_ids.contains(function)
-        {
+        if !projection_builtin_operator(function) && !function_ids.contains(function) {
             return Err(format!("undeclared projection function '{function}'"));
         }
         if !runtime_projection_function(function) {
@@ -2523,6 +2525,9 @@ fn validate_projection_expression(
                 | "coalesce"
                 | "association"
         ) {
+            if projection_aggregate_operator(function) {
+                validate_projection_aggregate_policy(projection, function)?;
+            }
             if function == "association" {
                 if args.len() != 1 || args[0].trim().is_empty() {
                     return Err("projection function 'association' expects one argument".into());
@@ -2530,14 +2535,37 @@ fn validate_projection_expression(
                 return Ok(());
             }
             for arg in args {
-                if !condition_like_expression(&arg) {
-                    validate_projection_expression(model, projection, function_ids, &arg)?;
-                }
+                validate_projection_expression(model, projection, function_ids, &arg)?;
             }
             return Ok(());
         }
     }
     validate_projection_path(model, projection, expression)
+}
+
+fn validate_projection_aggregate_policy(
+    projection: &MapProjectionEntry,
+    function: &str,
+) -> Result<(), String> {
+    if projection.multi_value_policy.as_deref() != Some("aggregate") {
+        return Err(format!(
+            "projection '{}' aggregate '{function}' requires multi_value_policy='aggregate'",
+            projection.projection_id
+        ));
+    }
+    if projection.temporal_mode.is_none() {
+        return Err(format!(
+            "projection '{}' aggregate '{function}' requires temporal_mode",
+            projection.projection_id
+        ));
+    }
+    if projection.missing_policy.trim().is_empty() {
+        return Err(format!(
+            "projection '{}' aggregate '{function}' requires missing_policy",
+            projection.projection_id
+        ));
+    }
+    Ok(())
 }
 
 fn runtime_projection_function(function: &str) -> bool {
@@ -2563,6 +2591,13 @@ fn runtime_projection_function(function: &str) -> bool {
     )
 }
 
+fn projection_aggregate_operator(function: &str) -> bool {
+    matches!(
+        function,
+        "count" | "min" | "max" | "sum" | "avg" | "distinct_count" | "list"
+    )
+}
+
 fn projection_builtin_operator(function: &str) -> bool {
     matches!(
         function,
@@ -2579,10 +2614,48 @@ fn projection_builtin_operator(function: &str) -> bool {
     )
 }
 
-fn condition_like_expression(expression: &str) -> bool {
-    ["==", "!=", ">=", "<=", ">", "<"]
-        .iter()
-        .any(|op| expression.contains(op))
+fn split_comparison_expression(expression: &str) -> Option<(&str, &str)> {
+    let bytes = expression.as_bytes();
+    let mut depth = 0u32;
+    let mut quote: Option<u8> = None;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if let Some(active) = quote {
+            if byte == b'\\' {
+                index = index.saturating_add(2);
+                continue;
+            }
+            if byte == active {
+                quote = None;
+            }
+            index += 1;
+            continue;
+        }
+        match byte {
+            b'\'' | b'"' => quote = Some(byte),
+            b'(' => depth = depth.saturating_add(1),
+            b')' => depth = depth.saturating_sub(1),
+            b'=' | b'!' | b'>' | b'<' if depth == 0 => {
+                let op_len = if bytes.get(index + 1) == Some(&b'=') {
+                    2
+                } else if matches!(byte, b'>' | b'<') {
+                    1
+                } else {
+                    index += 1;
+                    continue;
+                };
+                let left = expression[..index].trim();
+                let right = expression[index + op_len..].trim();
+                if !left.is_empty() && !right.is_empty() {
+                    return Some((left, right));
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    None
 }
 
 fn known_projection_path(expression: &str) -> bool {

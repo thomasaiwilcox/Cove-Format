@@ -1,0 +1,6 @@
+{
+  "mapping": "accept/cove_map_projection_aggregate_policy.covemap",
+  "sources": [
+    "accept/people.csv"
+  ]
+}

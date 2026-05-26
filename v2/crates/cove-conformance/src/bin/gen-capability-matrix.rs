@@ -128,7 +128,7 @@ fn rows() -> Vec<Row> {
             parsed: "n/a",
             validated: "yes",
             written: "yes",
-            notes: "types.rs validates strict/default pairs plus explicit Bool-as-NumCode declarations through table, segment, and COVE-O property flags; full-file accept/reject corpus covers declared and missing Bool NumCode cases",
+            notes: "types.rs validates strict/default pairs plus explicit Bool-as-NumCode declarations through table, segment, and COVE-O property flags; full-file accept/reject corpus covers declared, missing, and invalid-domain Bool NumCode cases",
         },
         Row {
             section: "§20",
@@ -641,7 +641,7 @@ fn rows() -> Vec<Row> {
             parsed: "yes",
             validated: "yes",
             written: "yes",
-            notes: "cove-runtime parses and serializes runtime compatibility hints, exposes RuntimeSession registries for codecs, layouts, predicate kernels, mapping functions, engine profiles, and FFI adapters, validates uniqueness and required-operation matching, and gates runtime/ binary plus operation fixtures",
+            notes: "cove-runtime parses and serializes runtime compatibility hints, exposes RuntimeSession registries for codecs, layouts, predicate kernels, mapping functions, engine profiles, and FFI adapters, validates uniqueness and runtime-operation matching, and gates standalone plus embedded COVE-R runtime fixtures",
         },
         Row {
             section: "§68",
@@ -704,7 +704,7 @@ fn rows() -> Vec<Row> {
             parsed: "yes",
             validated: "yes",
             written: "yes",
-            notes: "cove-map builds canonical length-delimited join key tuples from declared components/functions; execution corpus covers multi-rule identity planning",
+            notes: "cove-map builds canonical length-delimited join key tuples from declared components/functions; execution corpus covers multi-rule identity planning and rejects undeclared join-key functions",
         },
         Row {
             section: "§70.6",
@@ -713,7 +713,7 @@ fn rows() -> Vec<Row> {
             parsed: "n/a",
             validated: "yes",
             written: "yes",
-            notes: "cove-map resolves deterministic identity components, applies do-not-merge constraints, and emits equivalence/evidence records; conversion corpus executes the path",
+            notes: "cove-map resolves deterministic identity components, applies do-not-merge constraints, and emits equivalence/evidence records; conversion corpus executes the path and rejects do-not-merge/equivalence conflicts",
         },
         Row {
             section: "§70.8",
@@ -731,7 +731,7 @@ fn rows() -> Vec<Row> {
             parsed: "yes",
             validated: "yes",
             written: "yes",
-            notes: "profile/cove_map.rs parses association endpoint roles, cardinality, and validity expressions; cove-map materializes stable association properties and projection readback exposes them",
+            notes: "profile/cove_map.rs parses association endpoint roles, cardinality, and validity expressions; cove-map materializes stable association properties, projection readback exposes them, and corpus rejects unresolved association endpoints",
         },
         Row {
             section: "§70.10",
@@ -749,7 +749,7 @@ fn rows() -> Vec<Row> {
             parsed: "yes",
             validated: "yes",
             written: "yes",
-            notes: "profile/cove_map.rs validates evidence source/rule/assertion references; cove-map materializes evidence indexes and conversion corpus checks generated evidence counts",
+            notes: "profile/cove_map.rs validates evidence source/rule/assertion references; cove-map materializes evidence indexes, conversion corpus checks generated evidence counts, and corpus rejects invalid evidence references",
         },
         Row {
             section: "§70.13",
@@ -758,7 +758,7 @@ fn rows() -> Vec<Row> {
             parsed: "yes",
             validated: "yes",
             written: "yes",
-            notes: "profile/cove_map.rs rejects undeclared or nondeterministic functions; cove-map conversion executes declared built-ins through a deterministic registry (`identity`, `trim`, `ascii_lower`, Unicode-normalisation IDs, `trim_lower`, `concat_delimited`, parsing helpers, `sha256_hex`)",
+            notes: "profile/cove_map.rs rejects undeclared or nondeterministic functions; cove-map conversion and projection execute declared built-ins through a deterministic registry (`identity`, `trim`, `ascii_lower`, Unicode-normalisation IDs, `trim_lower`, `concat_delimited`, parsing helpers, `sha256_hex`) and reject undeclared projection/runtime functions",
         },
         Row {
             section: "§70.14",
@@ -895,31 +895,9 @@ fn corpus_requirement(row: &Row) -> CorpusRequirement {
             "predicate truth-table failures are asserted as expected outcomes inside pruning fixtures",
         ),
         "§37" => Some("fail-open and negative pruning paths are asserted inside pruning fixtures"),
-        "§51" => Some(
-            "conversion fixtures are positive CLI/library conversions without a stable negative corpus surface",
-        ),
         "§61" => Some("property-column coverage is validated through generated COVE-O outputs"),
         "§70.3" => {
             Some("row-semantic failures are covered through referenced MAP validation rows")
-        }
-        "§70.5" => Some(
-            "join-key behavior is validated through deterministic execution fixtures and unit tests",
-        ),
-        "§70.6" => {
-            Some("identity-resolution negative behavior is covered by do-not-merge unit tests")
-        }
-        "§70.9" => Some("association readback is a positive preservation contract"),
-        "§70.10" => Some("projection readback is a positive preservation contract"),
-        "§70.12" => Some("evidence rejection is covered by referenced MAP validation rows"),
-        "§70.13" => Some(
-            "function-registry rejection is covered by COVE_E_MAP_FUNCTION_UNDECLARED fixtures",
-        ),
-        "§75" => Some("durable replace is a positive publication contract"),
-        "§78" => Some("suite requirements are self-checking accept fixtures"),
-        "§79" => Some("open suite packaging is checked by suite-contract accept fixtures"),
-        "§80.2" => Some("utility availability is checked by release-gate suite-contract fixtures"),
-        "§80.3A" => {
-            Some("coverage-centred reporting is checked through positive utility contract fixtures")
         }
         _ => None,
     };
@@ -991,7 +969,7 @@ mod tests {
 
     #[test]
     fn reject_exemptions_are_required_and_rendered() {
-        let row = test_row("§70.9");
+        let row = test_row("§8");
         let requirement = corpus_requirement(&row);
         assert_eq!(requirement.min_reject, 0);
         assert!(requirement.reject_exemption.is_some());
@@ -1015,6 +993,25 @@ mod tests {
             ),
             "yes"
         );
+    }
+
+    #[test]
+    fn positive_only_suite_surfaces_are_not_fully_gated() {
+        for section in ["§51", "§75", "§78", "§79", "§80.2", "§80.3A"] {
+            let row = test_row(section);
+            let requirement = corpus_requirement(&row);
+            assert_eq!(requirement.min_reject, 1);
+            assert_eq!(
+                corpus_status(
+                    CorpusEvidence {
+                        accept: 1,
+                        reject: 0,
+                    },
+                    requirement
+                ),
+                "partial"
+            );
+        }
     }
 }
 

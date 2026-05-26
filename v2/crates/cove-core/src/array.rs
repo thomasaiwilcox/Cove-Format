@@ -8,6 +8,7 @@ use crate::{
     dictionary::{DictionaryValue, FileDictionary},
     encoding::{
         bit_packed::{BitPacked, BitPackedPayload},
+        constant::ConstantPayload,
         delta::{Delta, DeltaPayload},
         frame_of_reference::{ForPayload, FrameOfReference},
         local_codebook::{LocalCodebookPayload, LocalCodebookValue},
@@ -27,7 +28,7 @@ use crate::{
 pub enum CoveArrayValue<'a> {
     /// The row is null.
     Null,
-    /// Raw bytes (PlainFixed, Constant, VarBytes).
+    /// Raw bytes (PlainFixed, VarBytes).
     Bytes(&'a [u8]),
     /// Owned raw bytes decoded from an owned child structure such as LocalCodebook.
     OwnedBytes(Vec<u8>),
@@ -395,14 +396,11 @@ impl<'a> EncodedArray<'a> {
                 Ok(CoveArrayValue::ValidityBit(bit))
             }
             CoveEncodingKind::Constant => {
-                let w = logical_type_fixed_width(self.logical).ok_or_else(|| {
-                    CoveError::UnsupportedEncoding(format!(
-                        "Constant encoding requires fixed-width logical type, got {:?}",
-                        self.logical
-                    ))
-                })?;
-                let slice = wire::read_range_checked(self.data, 0, w)?;
-                Ok(CoveArrayValue::Bytes(slice))
+                let payload = ConstantPayload::parse(self.data)?;
+                if payload.row_count != self.row_count {
+                    return Err(CoveError::PageCorrupt);
+                }
+                self.value_from_constant_payload(&payload)
             }
             CoveEncodingKind::FileCode => {
                 let code = read_u32_le(
@@ -700,6 +698,20 @@ impl<'a> EncodedArray<'a> {
         }
     }
 
+    fn value_from_constant_payload(
+        &self,
+        payload: &ConstantPayload,
+    ) -> Result<CoveArrayValue<'_>, CoveError> {
+        if self.physical == CovePhysicalKind::NumCode {
+            let code = payload.raw_value_bits();
+            if self.logical == CoveLogicalType::Bool && !matches!(code, 0 | 1) {
+                return Err(CoveError::PageCorrupt);
+            }
+            return Ok(CoveArrayValue::NumCode(code));
+        }
+        self.value_from_i64(payload.value)
+    }
+
     fn value_from_local_codebook(
         &self,
         value: &LocalCodebookValue,
@@ -805,9 +817,12 @@ mod tests {
     use super::*;
     use crate::{
         constants::{CoveEncodingKind, CoveLogicalType, CovePhysicalKind},
-        dictionary::{FileDictionary, FileDictionaryHeaderV1, FileDictionaryIndexEntryV1},
+        dictionary::{
+            DictionaryValue, FileDictionary, FileDictionaryHeaderV1, FileDictionaryIndexEntryV1,
+        },
         encoding::{
             bit_packed::BitPackedPayload,
+            constant::ConstantPayload,
             local_codebook::{LocalCodebookPayload, LocalCodebookValues, LocalIndexPayload},
             rle::RlePayload,
         },
@@ -840,6 +855,38 @@ mod tests {
         data: &'a [u8],
     ) -> EncodedArray<'a> {
         EncodedArray::new(logical, physical, row_count, encoding, None, data, None)
+    }
+
+    fn one_entry_dictionary() -> (Vec<u8>, Vec<u8>, FileDictionary) {
+        let entry = FileDictionaryIndexEntryV1 {
+            value_tag: 12,
+            storage_class: 0,
+            flags: 0,
+            inline_len: 4,
+            reserved0: [0; 3],
+            inline_data: {
+                let mut d = [0u8; 16];
+                d[..4].copy_from_slice(&[0x03, b'f', b'o', b'o']);
+                d
+            },
+            payload_offset: 0,
+            payload_length: 0,
+            canonical_hash64: 0,
+            reserved1: 0,
+        };
+        let header = FileDictionaryHeaderV1 {
+            entry_count: 1,
+            flags: 0,
+            index_entry_len: FileDictionaryHeaderV1::INDEX_ENTRY_LEN,
+            value_hash_algorithm: 0,
+            payload_length: 0,
+            reserved: [0; 24],
+        };
+        let mut index_bytes = header.serialize().to_vec();
+        index_bytes.extend_from_slice(&entry.serialize());
+        let payload = Vec::new();
+        let dict = FileDictionary::parse(&index_bytes, &payload).unwrap();
+        (index_bytes, payload, dict)
     }
 
     #[test]
@@ -957,21 +1004,100 @@ mod tests {
 
     #[test]
     fn constant_returns_same_value_for_all_rows() {
-        let val: i32 = 99;
-        let data = val.to_le_bytes();
-        let arr = make_array(
-            CoveLogicalType::Int32,
+        let data = ConstantPayload {
+            value: 99,
+            row_count: 5,
+        }
+        .encode()
+        .to_vec();
+        let arr = make_physical_array(
+            CoveLogicalType::Int64,
+            CovePhysicalKind::NumCode,
             CoveEncodingKind::Constant,
             5,
             &data,
-            None,
         );
         for row in 0..5 {
-            assert_eq!(
-                arr.decode_row(row).unwrap(),
-                CoveArrayValue::Bytes(&val.to_le_bytes())
-            );
+            assert_eq!(arr.decode_row(row).unwrap(), CoveArrayValue::NumCode(99));
         }
+        assert_eq!(
+            arr.decode_all_rows().unwrap(),
+            vec![CoveArrayValue::NumCode(99); 5]
+        );
+        let prepared = arr.prepare().unwrap();
+        assert_eq!(
+            prepared.decode_selected_rows(&[4, 1]).unwrap(),
+            vec![CoveArrayValue::NumCode(99), CoveArrayValue::NumCode(99)]
+        );
+    }
+
+    #[test]
+    fn constant_decodes_high_bit_numcode_from_raw_payload_bits() {
+        let raw = i64::MAX as u64 + 1;
+        let data = ConstantPayload {
+            value: i64::from_le_bytes(raw.to_le_bytes()),
+            row_count: 2,
+        }
+        .encode()
+        .to_vec();
+        let arr = make_physical_array(
+            CoveLogicalType::UInt64,
+            CovePhysicalKind::NumCode,
+            CoveEncodingKind::Constant,
+            2,
+            &data,
+        );
+        assert_eq!(arr.decode_row(0).unwrap(), CoveArrayValue::NumCode(raw));
+        assert_eq!(
+            arr.decode_all_rows().unwrap(),
+            vec![CoveArrayValue::NumCode(raw), CoveArrayValue::NumCode(raw)]
+        );
+    }
+
+    #[test]
+    fn constant_decodes_boolean_typed_value() {
+        let data = ConstantPayload {
+            value: 1,
+            row_count: 2,
+        }
+        .encode()
+        .to_vec();
+        let arr = make_physical_array(
+            CoveLogicalType::Bool,
+            CovePhysicalKind::Boolean,
+            CoveEncodingKind::Constant,
+            2,
+            &data,
+        );
+        assert_eq!(arr.decode_row(0).unwrap(), CoveArrayValue::Boolean(true));
+        assert_eq!(
+            arr.decode_all_rows().unwrap(),
+            vec![CoveArrayValue::Boolean(true), CoveArrayValue::Boolean(true)]
+        );
+    }
+
+    #[test]
+    fn constant_decodes_filecode_with_dictionary() {
+        let (_index, _payload, dict) = one_entry_dictionary();
+        let data = ConstantPayload {
+            value: 0,
+            row_count: 2,
+        }
+        .encode()
+        .to_vec();
+        let arr = EncodedArray::new(
+            CoveLogicalType::Utf8,
+            CovePhysicalKind::FileCode,
+            2,
+            CoveEncodingKind::Constant,
+            None,
+            &data,
+            Some(&dict),
+        );
+        assert_eq!(
+            arr.decode_row(1).unwrap(),
+            CoveArrayValue::DictValue(DictionaryValue::RawBytes(vec![0x03, b'f', b'o', b'o']))
+        );
     }
 
     #[test]
@@ -1290,36 +1416,7 @@ mod tests {
 
     #[test]
     fn filecode_out_of_range_fails() {
-        // Build a minimal dictionary with 1 entry (FileCode 0 only).
-        // Then try to decode FileCode 1 — should fail with BadFileCode.
-        let entry = FileDictionaryIndexEntryV1 {
-            value_tag: 12,    // Utf8
-            storage_class: 0, // Inline
-            flags: 0,
-            inline_len: 4,
-            reserved0: [0; 3],
-            inline_data: {
-                let mut d = [0u8; 16];
-                // Canonical UTF-8 encoding: varint length prefix + bytes.
-                d[..4].copy_from_slice(&[0x03, b'f', b'o', b'o']);
-                d
-            },
-            payload_offset: 0,
-            payload_length: 0,
-            canonical_hash64: 0,
-            reserved1: 0,
-        };
-        let header = FileDictionaryHeaderV1 {
-            entry_count: 1,
-            flags: 0,
-            index_entry_len: FileDictionaryHeaderV1::INDEX_ENTRY_LEN,
-            value_hash_algorithm: 0,
-            payload_length: 0,
-            reserved: [0; 24],
-        };
-        let mut index_bytes = header.serialize().to_vec();
-        index_bytes.extend_from_slice(&entry.serialize());
-        let dict = FileDictionary::parse(&index_bytes, &[]).unwrap();
+        let (_index, _payload, dict) = one_entry_dictionary();
 
         // Two rows: [0, 1] as u32 LE
         let mut data = Vec::new();

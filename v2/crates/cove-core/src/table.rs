@@ -33,12 +33,13 @@
 //! * `logical_type` and `physical_kind` MUST be compatible (Spec §19).
 //! * Top-level columns MUST NOT use logical `Null` (Spec §24.4).
 //! * `nullable` is `0` or `1`; any other value is a schema error.
+//! * Sort declarations must use dense per-column `sort_order` ordinals that
+//!   match `primary_sort_key_count`; clustering-key count is advisory and
+//!   bounded by the number of columns.
 //!
-//! `sort_order` is the per-column sort indicator (`0` = no declared sort,
-//! non-zero values are interpreted in conjunction with the `SortKeyEntryV1`
-//! list of Spec §53). `collation_id` references the collation registry
-//! (Spec §22). `precision`/`scale` apply to decimal logical types and are
-//! ignored otherwise.
+//! `sort_order` is the per-column sort indicator (`0` = no declared sort).
+//! `collation_id` references the collation registry (Spec §22).
+//! `precision`/`scale` apply to decimal logical types and are ignored otherwise.
 
 use crate::{
     constants::{CoveLogicalType, CovePhysicalKind},
@@ -280,6 +281,11 @@ impl TableCatalog {
             pos = pos.checked_add(used).ok_or(CoveError::ArithOverflow)?;
             tables.push(t);
         }
+        if pos != bytes.len() {
+            return Err(CoveError::BadSchema(
+                "table catalog has trailing bytes".into(),
+            ));
+        }
         let cat = Self { flags, tables };
         cat.validate()?;
         Ok(cat)
@@ -299,6 +305,7 @@ impl TableCatalog {
                     t.table_id
                 )));
             }
+            validate_sort_declarations(t)?;
             let mut seen_cols = std::collections::HashSet::new();
             for c in &t.columns {
                 if !seen_cols.insert(c.column_id) {
@@ -328,6 +335,38 @@ impl TableCatalog {
         }
         Ok(())
     }
+}
+
+fn validate_sort_declarations(table: &TableEntry) -> Result<(), CoveError> {
+    if usize::from(table.primary_sort_key_count) > table.columns.len()
+        || usize::from(table.clustering_key_count) > table.columns.len()
+    {
+        return Err(CoveError::BadSchema(
+            "sort/clustering key count exceeds column count".into(),
+        ));
+    }
+
+    let mut ordinals = std::collections::BTreeSet::new();
+    for column in &table.columns {
+        if column.sort_order != 0 && !ordinals.insert(column.sort_order) {
+            return Err(CoveError::BadSchema(
+                "column sort_order values must be unique".into(),
+            ));
+        }
+    }
+    if ordinals.len() != usize::from(table.primary_sort_key_count) {
+        return Err(CoveError::BadSchema(
+            "primary_sort_key_count does not match declared column sort_order values".into(),
+        ));
+    }
+    for expected in 1..=table.primary_sort_key_count {
+        if !ordinals.contains(&expected) {
+            return Err(CoveError::BadSchema(
+                "column sort_order values must be dense starting at 1".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn read_str(bytes: &[u8], pos: &mut usize, what: &str) -> Result<String, CoveError> {
@@ -380,21 +419,17 @@ mod tests {
                 namespace: "public".into(),
                 name: "users".into(),
                 row_count: 1000,
-                primary_sort_key_count: 1,
+                primary_sort_key_count: 0,
                 clustering_key_count: 0,
                 flags: 0,
                 columns: vec![
-                    {
-                        let mut c = col(
-                            10,
-                            "id",
-                            CoveLogicalType::Int64,
-                            CovePhysicalKind::NumCode,
-                            false,
-                        );
-                        c.sort_order = 1;
-                        c
-                    },
+                    col(
+                        10,
+                        "id",
+                        CoveLogicalType::Int64,
+                        CovePhysicalKind::NumCode,
+                        false,
+                    ),
                     col(
                         11,
                         "active",
@@ -415,8 +450,19 @@ mod tests {
         assert_eq!(cat, cat2);
         assert_eq!(cat2.tables[0].namespace, "public");
         assert_eq!(cat2.tables[0].row_count, 1000);
-        assert_eq!(cat2.tables[0].primary_sort_key_count, 1);
-        assert_eq!(cat2.tables[0].columns[0].sort_order, 1);
+        assert_eq!(cat2.tables[0].primary_sort_key_count, 0);
+        assert_eq!(cat2.tables[0].columns[0].sort_order, 0);
+    }
+
+    #[test]
+    fn rejects_trailing_bytes() {
+        let cat = sample_catalog();
+        let mut bytes = cat.serialize().unwrap();
+        bytes.push(0);
+        assert!(matches!(
+            TableCatalog::parse(&bytes),
+            Err(CoveError::BadSchema(_))
+        ));
     }
 
     #[test]
@@ -434,6 +480,35 @@ mod tests {
     fn rejects_duplicate_column_id() {
         let mut cat = sample_catalog();
         cat.tables[0].columns[1].column_id = cat.tables[0].columns[0].column_id;
+        let bytes = cat.serialize().unwrap();
+        assert!(matches!(
+            TableCatalog::parse(&bytes),
+            Err(CoveError::BadSchema(_))
+        ));
+    }
+
+    #[test]
+    fn accepts_structurally_valid_sort_declarations() {
+        let mut cat = sample_catalog();
+        cat.tables[0].primary_sort_key_count = 1;
+        cat.tables[0].columns[0].sort_order = 1;
+        let bytes = cat.serialize().unwrap();
+        assert_eq!(TableCatalog::parse(&bytes).unwrap(), cat);
+    }
+
+    #[test]
+    fn rejects_malformed_sort_declarations() {
+        let mut cat = sample_catalog();
+        cat.tables[0].primary_sort_key_count = 2;
+        cat.tables[0].columns[0].sort_order = 1;
+        let bytes = cat.serialize().unwrap();
+        assert!(matches!(
+            TableCatalog::parse(&bytes),
+            Err(CoveError::BadSchema(_))
+        ));
+
+        cat.tables[0].primary_sort_key_count = 1;
+        cat.tables[0].columns[1].sort_order = 1;
         let bytes = cat.serialize().unwrap();
         assert!(matches!(
             TableCatalog::parse(&bytes),

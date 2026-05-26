@@ -3008,6 +3008,9 @@ fn try_direct_decoded_array(
             if payload.row_count != array.row_count {
                 return Err(CoveError::PageCorrupt);
             }
+            if array.physical == CovePhysicalKind::NumCode {
+                return Ok(None);
+            }
             direct_i64_values_to_arrow(array, selection, data_type, |row| {
                 let _ = row;
                 Ok(payload.value)
@@ -4549,15 +4552,28 @@ fn collect_i128(
 fn value_to_i64(logical: CoveLogicalType, value: &CoveArrayValue<'_>) -> Result<i64, CoveError> {
     match value {
         CoveArrayValue::Int64(value) => Ok(*value),
-        CoveArrayValue::NumCode(value) | CoveArrayValue::Varint(value) => {
-            i64::try_from(*value).map_err(|_| CoveError::PageCorrupt)
-        }
+        CoveArrayValue::NumCode(value) => numcode_to_i64(logical, *value),
+        CoveArrayValue::Varint(value) => i64::try_from(*value).map_err(|_| CoveError::PageCorrupt),
         CoveArrayValue::FileCode(value) => Ok(i64::from(*value)),
         CoveArrayValue::Bytes(bytes) => signed_from_bytes(logical, bytes),
         CoveArrayValue::DictValue(DictionaryValue::RawBytes(bytes)) => {
             signed_from_bytes(logical, bytes)
         }
         other => Err(unexpected_value("signed integer", other)),
+    }
+}
+
+fn numcode_to_i64(logical: CoveLogicalType, value: u64) -> Result<i64, CoveError> {
+    match logical {
+        CoveLogicalType::Int8
+        | CoveLogicalType::Int16
+        | CoveLogicalType::Int32
+        | CoveLogicalType::Int64
+        | CoveLogicalType::Decimal64
+        | CoveLogicalType::DateDays
+        | CoveLogicalType::TimestampMicros
+        | CoveLogicalType::TimestampNanos => Ok(i64::from_le_bytes(value.to_le_bytes())),
+        _ => i64::try_from(value).map_err(|_| CoveError::PageCorrupt),
     }
 }
 
@@ -4586,6 +4602,10 @@ fn value_to_u64(logical: CoveLogicalType, value: &CoveArrayValue<'_>) -> Result<
 }
 
 fn value_to_f32(value: &CoveArrayValue<'_>) -> Result<f32, CoveError> {
+    if let CoveArrayValue::NumCode(value) = value {
+        let bits = u32::try_from(*value).map_err(|_| CoveError::PageCorrupt)?;
+        return Ok(f32::from_bits(bits));
+    }
     let bytes = plain_bytes(value)?;
     if bytes.len() != 4 {
         return Err(CoveError::PageCorrupt);
@@ -4596,6 +4616,9 @@ fn value_to_f32(value: &CoveArrayValue<'_>) -> Result<f32, CoveError> {
 }
 
 fn value_to_f64(value: &CoveArrayValue<'_>) -> Result<f64, CoveError> {
+    if let CoveArrayValue::NumCode(value) = value {
+        return Ok(f64::from_bits(*value));
+    }
     let bytes = plain_bytes(value)?;
     if bytes.len() != 8 {
         return Err(CoveError::PageCorrupt);
@@ -4826,6 +4849,55 @@ mod tests {
         let arrow = encoded_array_to_arrow(&cove).unwrap();
         let ints = arrow.as_any().downcast_ref::<Int64Array>().unwrap();
         assert_eq!(ints.values(), &[42, 42, 42]);
+    }
+
+    #[test]
+    fn exports_constant_numcode_uint64_from_raw_bits() {
+        let raw = i64::MAX as u64 + 1;
+        let payload = ConstantPayload {
+            value: i64::from_le_bytes(raw.to_le_bytes()),
+            row_count: 2,
+        }
+        .encode();
+        let cove = EncodedArray::new(
+            CoveLogicalType::UInt64,
+            CovePhysicalKind::NumCode,
+            2,
+            CoveEncodingKind::Constant,
+            None,
+            &payload,
+            None,
+        );
+
+        let arrow = encoded_array_to_arrow(&cove).unwrap();
+        let uints = arrow.as_any().downcast_ref::<UInt64Array>().unwrap();
+        assert_eq!(uints.values(), &[raw, raw]);
+    }
+
+    #[test]
+    fn exports_constant_numcode_signed_from_raw_bits() {
+        let raw = (-7i64) as u64;
+        let payload = ConstantPayload {
+            value: i64::from_le_bytes(raw.to_le_bytes()),
+            row_count: 2,
+        }
+        .encode();
+        let cove = EncodedArray::new(
+            CoveLogicalType::TimestampNanos,
+            CovePhysicalKind::NumCode,
+            2,
+            CoveEncodingKind::Constant,
+            None,
+            &payload,
+            None,
+        );
+
+        let arrow = encoded_array_to_arrow(&cove).unwrap();
+        let timestamps = arrow
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .unwrap();
+        assert_eq!(timestamps.values(), &[-7, -7]);
     }
 
     #[test]
