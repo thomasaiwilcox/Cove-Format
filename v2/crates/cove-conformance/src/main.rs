@@ -290,7 +290,6 @@ fn validate_cove_fixture(bytes: &[u8]) -> Result<(), CoveError> {
             verify_digests: false,
             allow_unknown_optional_extensions: true,
             optional_pushdown_policy: OptionalPushdownPolicy::FailOpen,
-            ..ValidationOptions::default()
         },
     )?;
     EmbeddedOptionalProfileValidator::default_builtins()
@@ -367,7 +366,6 @@ fn validate_feature_scope_use_fixture(entry: &Entry, bytes: &[u8]) -> Result<(),
             verify_digests: false,
             allow_unknown_optional_extensions: true,
             optional_pushdown_policy: OptionalPushdownPolicy::FailOpen,
-            ..ValidationOptions::default()
         },
         request.clone(),
         &validator,

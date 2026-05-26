@@ -2551,7 +2551,7 @@ mod tests {
                 &context(
                     CoveLogicalType::Int64,
                     CovePhysicalKind::NumCode,
-                    Some(&[valid.clone()])
+                    Some(std::slice::from_ref(&valid))
                 ),
                 &page,
             ),

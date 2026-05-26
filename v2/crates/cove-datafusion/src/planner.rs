@@ -547,8 +547,10 @@ fn validate_covi_candidate_ranges(
             .segments()
             .get(segment_index)
             .ok_or(CoveError::SegmentCorrupt)?;
-        if !morsels_by_segment.contains_key(&segment.segment_id) {
-            morsels_by_segment.insert(segment.segment_id, file.row_morsels_for_segment(segment)?);
+        if let std::collections::btree_map::Entry::Vacant(entry) =
+            morsels_by_segment.entry(segment.segment_id)
+        {
+            entry.insert(file.row_morsels_for_segment(segment)?);
         }
         let morsels = morsels_by_segment
             .get(&segment.segment_id)

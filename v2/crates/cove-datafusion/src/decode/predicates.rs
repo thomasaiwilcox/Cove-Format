@@ -153,9 +153,7 @@ pub(crate) fn numeric_lookup_keys(logical: CoveLogicalType, literal: PredicateLi
                 return Vec::new();
             };
             let value = original as f32;
-            if !value.is_finite() {
-                Vec::new()
-            } else if f64::from(value) != original {
+            if !value.is_finite() || f64::from(value) != original {
                 Vec::new()
             } else if value == 0.0 {
                 vec![u64::from(0.0f32.to_bits()), u64::from((-0.0f32).to_bits())]
@@ -194,8 +192,8 @@ fn bool_numeric_lookup_key(literal: PredicateLiteral) -> Option<u64> {
             1 => Some(1),
             _ => None,
         },
-        PredicateLiteral::Float64(value) if value == 0.0 => Some(0),
-        PredicateLiteral::Float64(value) if value == 1.0 => Some(1),
+        PredicateLiteral::Float64(0.0) => Some(0),
+        PredicateLiteral::Float64(1.0) => Some(1),
         PredicateLiteral::Float64(_) => None,
     }
 }
@@ -232,7 +230,9 @@ fn f64_to_i64_exact(value: f64) -> Option<i64> {
 
 #[inline]
 fn f64_to_u64_exact(value: f64) -> Option<u64> {
-    if !value.is_finite() || value.fract() != 0.0 || value < 0.0 || value >= U64_MAX_PLUS_ONE_AS_F64
+    if !value.is_finite()
+        || value.fract() != 0.0
+        || !(0.0..U64_MAX_PLUS_ONE_AS_F64).contains(&value)
     {
         return None;
     }

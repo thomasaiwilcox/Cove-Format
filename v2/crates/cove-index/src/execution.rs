@@ -971,14 +971,13 @@ impl ValidatedCoviArtifactV2 {
             if capability.supports_index_only == 0 {
                 continue;
             }
-            if request.require_exact {
-                if capability.exactness != IndexCapabilityExactnessV2::Exact
+            if request.require_exact
+                && (capability.exactness != IndexCapabilityExactnessV2::Exact
                     || !capability.proof_strength.supports_exact_covi_use()
-                    || !root_supports_exact_covi_use(root)?
-                {
-                    saw_inexact_candidate = true;
-                    continue;
-                }
+                    || !root_supports_exact_covi_use(root)?)
+            {
+                saw_inexact_candidate = true;
+                continue;
             }
             if root.aggregate_block_section_id == ABSENT_U32 {
                 continue;
@@ -1023,13 +1022,11 @@ impl ValidatedCoviArtifactV2 {
         &self,
         request: &CoviLookupRequestV2,
     ) -> Result<(&CoviIndexRootV2, &IndexCapabilityV2), CoveError> {
-        let mut saw_target = false;
         for root in self
             .roots
             .values()
             .filter(|root| root_matches_target(root, request.target))
         {
-            saw_target = true;
             let Some(capability) = self.capabilities.get(&root.index_root_id) else {
                 continue;
             };
@@ -1050,11 +1047,7 @@ impl ValidatedCoviArtifactV2 {
             }
             return Ok((root, capability));
         }
-        if saw_target {
-            Err(CoveError::BadCovi)
-        } else {
-            Err(CoveError::BadCovi)
-        }
+        Err(CoveError::BadCovi)
     }
 }
 

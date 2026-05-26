@@ -626,10 +626,12 @@ pub(super) fn validate_cove_t_semantics_with_registered_page_scope(
         &nested_schemas,
         &segment_indexes,
         &segment_payloads,
-        dictionary.as_ref(),
-        &zone_stats_entries,
-        &codec_descriptors,
-        registered_page_scope,
+        CoveTCrossSectionRefs {
+            dictionary: dictionary.as_ref(),
+            zone_stats: &zone_stats_entries,
+            codec_descriptors: &codec_descriptors,
+            registered_page_scope,
+        },
     )?;
     push_stage(
         stages,
@@ -876,15 +878,20 @@ fn is_map_section(kind: SectionKind) -> bool {
     )
 }
 
+#[derive(Clone, Copy)]
+struct CoveTCrossSectionRefs<'a, 'data> {
+    dictionary: Option<&'a FileDictionaryView<'data>>,
+    zone_stats: &'a [ZoneStatsEntry],
+    codec_descriptors: &'a [CodecExtensionDescriptorV2],
+    registered_page_scope: RegisteredPageValidationScope<'a>,
+}
+
 fn validate_cove_t_cross_sections(
     catalogs: &[(u32, TableCatalog)],
     nested_schemas: &[(u32, NestedSchemaSectionV1)],
     segment_indexes: &[(u32, TableSegmentIndex)],
     segment_payloads: &[(u32, u64, TableSegmentPayloadV1, Vec<u8>)],
-    dictionary: Option<&FileDictionaryView<'_>>,
-    zone_stats: &[ZoneStatsEntry],
-    codec_descriptors: &[CodecExtensionDescriptorV2],
-    registered_page_scope: RegisteredPageValidationScope<'_>,
+    refs: CoveTCrossSectionRefs<'_, '_>,
 ) -> Result<(), CoveError> {
     if catalogs.is_empty() && segment_indexes.is_empty() && segment_payloads.is_empty() {
         return Ok(());
@@ -982,11 +989,11 @@ fn validate_cove_t_cross_sections(
             payload,
             bytes,
             SegmentValidationRefs {
-                dictionary,
-                zone_stats,
-                codec_descriptors,
+                dictionary: refs.dictionary,
+                zone_stats: refs.zone_stats,
+                codec_descriptors: refs.codec_descriptors,
                 nested_schema,
-                registered_page_scope,
+                registered_page_scope: refs.registered_page_scope,
             },
         )?;
     }
@@ -994,7 +1001,12 @@ fn validate_cove_t_cross_sections(
         if rows_by_table.get(&table.table_id).copied().unwrap_or(0) != table.row_count {
             return Err(CoveError::SegmentCorrupt);
         }
-        validate_declared_primary_sort_order(table, segment_index, &payloads_by_key, zone_stats)?;
+        validate_declared_primary_sort_order(
+            table,
+            segment_index,
+            &payloads_by_key,
+            refs.zone_stats,
+        )?;
     }
     if payloads_by_key.len() != segment_index.entries.len() {
         return Err(CoveError::SegmentCorrupt);
@@ -1134,10 +1146,10 @@ fn can_validate_table_sort_column(column: &ColumnEntry) -> bool {
     )
 }
 
-fn load_sort_column_pages<'a>(
+fn load_sort_column_pages(
     column: &ColumnEntry,
     segment: &TableSegmentPayloadV1,
-    segment_bytes: &'a [u8],
+    segment_bytes: &[u8],
     zone_stats: &[ZoneStatsEntry],
 ) -> Result<Vec<(crate::page::ColumnPageIndexEntryV1, Vec<SortValue>)>, CoveError> {
     let column_dir = segment
@@ -1554,10 +1566,12 @@ pub(super) fn validate_cove_o_semantics(
         &temporal_indexes,
         &temporal_segments,
         &trust_manifests,
-        dictionary.as_ref(),
-        &zone_stats_entries,
-        &codec_descriptors,
-        validated.header.required_features,
+        CoveOCrossSectionRefs {
+            dictionary: dictionary.as_ref(),
+            zone_stats: &zone_stats_entries,
+            codec_descriptors: &codec_descriptors,
+            required_features: validated.header.required_features,
+        },
     ) {
         if cove_o_profile_required(validated, request) {
             return Err(err);
@@ -1572,15 +1586,20 @@ pub(super) fn validate_cove_o_semantics(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct CoveOCrossSectionRefs<'a, 'data> {
+    dictionary: Option<&'a FileDictionaryView<'data>>,
+    zone_stats: &'a [ZoneStatsEntry],
+    codec_descriptors: &'a [CodecExtensionDescriptorV2],
+    required_features: u64,
+}
+
 fn validate_cove_o_cross_sections(
     catalogs: &[ObjectTypeCatalog],
     indexes: &[TemporalSegmentIndex],
     segments: &[(u64, Vec<u8>, TemporalSegmentData)],
     trust_manifests: &[TrustManifest],
-    dictionary: Option<&FileDictionaryView<'_>>,
-    zone_stats: &[ZoneStatsEntry],
-    codec_descriptors: &[CodecExtensionDescriptorV2],
-    required_features: u64,
+    refs: CoveOCrossSectionRefs<'_, '_>,
 ) -> Result<(), CoveError> {
     if catalogs.is_empty()
         && indexes.is_empty()
@@ -1671,10 +1690,10 @@ fn validate_cove_o_cross_sections(
         validate_temporal_property_columns(
             object_type,
             segment,
-            dictionary,
-            zone_stats,
-            codec_descriptors,
-            required_features,
+            refs.dictionary,
+            refs.zone_stats,
+            refs.codec_descriptors,
+            refs.required_features,
         )?;
     }
     if payloads_by_key.len() != index.entries.len() {
@@ -1683,7 +1702,11 @@ fn validate_cove_o_cross_sections(
 
     for manifest in trust_manifests {
         validate_trust_manifest_references(manifest, &segment_refs)?;
-        manifest.verify_against_with_dictionary(&segment_values, dictionary, zone_stats)?;
+        manifest.verify_against_with_dictionary(
+            &segment_values,
+            refs.dictionary,
+            refs.zone_stats,
+        )?;
     }
     Ok(())
 }

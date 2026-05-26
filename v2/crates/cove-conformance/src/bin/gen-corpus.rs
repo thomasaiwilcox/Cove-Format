@@ -8990,12 +8990,14 @@ fn covi_artifact_from_blocks(
         return serialize_covi_artifact_unchecked(
             covi_test_file_id(),
             covi_test_snapshot_id(),
-            &[referenced_file],
-            &[snapshot],
-            &[root],
-            &[capability],
-            &sections,
-            overrides.unchecked_root,
+            UncheckedCoviArtifactRefs {
+                referenced_files: &[referenced_file],
+                snapshot_validity: &[snapshot],
+                index_roots: &[root],
+                capabilities: &[capability],
+                section_payloads: &sections,
+                unchecked_roots: overrides.unchecked_root,
+            },
         );
     }
     CoviArtifactV2::serialize_with_sections(
@@ -9010,16 +9012,28 @@ fn covi_artifact_from_blocks(
     .unwrap()
 }
 
+struct UncheckedCoviArtifactRefs<'a> {
+    referenced_files: &'a [CoviReferencedFileV2],
+    snapshot_validity: &'a [CoviSnapshotValidityV2],
+    index_roots: &'a [CoviIndexRootV2],
+    capabilities: &'a [IndexCapabilityV2],
+    section_payloads: &'a [CoviSectionPayloadV2],
+    unchecked_roots: bool,
+}
+
 fn serialize_covi_artifact_unchecked(
     dataset_id: [u8; 16],
     snapshot_id: [u8; 16],
-    referenced_files: &[CoviReferencedFileV2],
-    snapshot_validity: &[CoviSnapshotValidityV2],
-    index_roots: &[CoviIndexRootV2],
-    capabilities: &[IndexCapabilityV2],
-    section_payloads: &[CoviSectionPayloadV2],
-    unchecked_roots: bool,
+    refs: UncheckedCoviArtifactRefs<'_>,
 ) -> Vec<u8> {
+    let UncheckedCoviArtifactRefs {
+        referenced_files,
+        snapshot_validity,
+        index_roots,
+        capabilities,
+        section_payloads,
+        unchecked_roots,
+    } = refs;
     let section_directory_length = section_payloads.len() * COVI_SECTION_ENTRY_LEN;
     let mut cursor = (COVI_HEADER_LEN as usize) + section_directory_length;
     let mut regions = Vec::new();

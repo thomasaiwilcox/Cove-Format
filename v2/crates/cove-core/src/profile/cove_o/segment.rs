@@ -357,11 +357,13 @@ impl TemporalSegmentData {
             bytes,
             &header,
             column_directory_offset,
-            required_features,
-            file_advertised_features,
-            section_advertised_features,
-            allow_contextual_stats_only,
-            codec_descriptors,
+            TemporalPropertyParseContext {
+                required_features,
+                file_advertised_features,
+                section_advertised_features,
+                allow_contextual_stats_only,
+                codec_descriptors,
+            },
         )?;
         let segment = Self {
             header,
@@ -421,15 +423,20 @@ impl TemporalSegmentData {
     }
 }
 
-fn parse_temporal_property_columns(
-    bytes: &[u8],
-    header: &TemporalSegmentHeaderV1,
-    column_directory_offset: usize,
+#[derive(Clone, Copy)]
+struct TemporalPropertyParseContext<'a> {
     required_features: Option<u64>,
     file_advertised_features: Option<u64>,
     section_advertised_features: Option<u64>,
     allow_contextual_stats_only: bool,
-    codec_descriptors: &[CodecExtensionDescriptorV2],
+    codec_descriptors: &'a [CodecExtensionDescriptorV2],
+}
+
+fn parse_temporal_property_columns(
+    bytes: &[u8],
+    header: &TemporalSegmentHeaderV1,
+    column_directory_offset: usize,
+    context: TemporalPropertyParseContext<'_>,
 ) -> Result<Vec<TemporalPropertyColumn>, CoveError> {
     let page_index_offset =
         usize::try_from(header.page_index_offset).map_err(|_| CoveError::OffsetRange)?;
@@ -474,13 +481,13 @@ fn parse_temporal_property_columns(
             if page.column_id != directory.column_id {
                 return Err(CoveError::PageCorrupt);
             }
-            validate_temporal_property_page_elision_features(page, required_features)?;
+            validate_temporal_property_page_elision_features(page, context.required_features)?;
             validate_page_codec_feature_advertisement(
                 page,
-                file_advertised_features,
-                section_advertised_features,
+                context.file_advertised_features,
+                context.section_advertised_features,
             )?;
-            let context = PageValidationContext {
+            let page_context = PageValidationContext {
                 table_id: None,
                 segment_id: Some(header.segment_id),
                 column_id: directory.column_id,
@@ -488,17 +495,17 @@ fn parse_temporal_property_columns(
                 physical_kind: directory.physical_kind,
                 dictionary: None,
                 zone_stats: None,
-                codec_descriptors,
+                codec_descriptors: context.codec_descriptors,
                 nested_schema: None,
             };
             if page.page_length == 0 {
                 if page.flags & PAGE_FLAG_ALL_NON_NULL != 0 {
                     validate_stats_only_constant_page_envelope(page)?;
-                    if !allow_contextual_stats_only {
+                    if !context.allow_contextual_stats_only {
                         return Err(CoveError::PageCorrupt);
                     }
                 } else {
-                    validate_temporal_property_stats_only_page(&context, page)?;
+                    validate_temporal_property_stats_only_page(&page_context, page)?;
                 }
                 pages.push(TemporalPropertyPage {
                     index_entry: page.clone(),
@@ -519,7 +526,7 @@ fn parse_temporal_property_columns(
             }
             let decoded = compression::column_page_payload(&bytes[page_start..page_end], page)?;
             let payload = ColumnPagePayloadV1::parse(decoded.as_ref())?;
-            validate_column_page_payload(&context, page, &payload)?;
+            validate_column_page_payload(&page_context, page, &payload)?;
             pages.push(TemporalPropertyPage {
                 index_entry: page.clone(),
                 payload: Some(payload),

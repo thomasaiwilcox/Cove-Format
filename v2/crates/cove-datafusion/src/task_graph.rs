@@ -277,9 +277,11 @@ fn build_lookup_rowref_task_graph(
                     .segments()
                     .get(segment_index)
                     .ok_or(CoveError::SegmentCorrupt)?;
-                if !morsels_by_segment.contains_key(&row.segment_id) {
+                if let std::collections::btree_map::Entry::Vacant(entry) =
+                    morsels_by_segment.entry(row.segment_id)
+                {
                     let morsels = segment_morsels_for_task_graph(&file_state, segment)?;
-                    morsels_by_segment.insert(row.segment_id, morsels);
+                    entry.insert(morsels);
                 }
                 let morsels = morsels_by_segment
                     .get(&row.segment_id)

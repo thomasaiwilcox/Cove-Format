@@ -133,7 +133,7 @@ impl DatasetState {
             request,
         )?;
         let validated = &validation.validated;
-        let feature_scope_table = reader::feature_scope_table_for(&bytes, &validated)?;
+        let feature_scope_table = reader::feature_scope_table_for(&bytes, validated)?;
         let file_len = u64::try_from(bytes.len()).map_err(|_| CoveError::ArithOverflow)?;
         let table_catalog = parse_table_catalog_from_sections(&bytes, &validated.footer)?;
         let table = select_table(&table_catalog, table_selection.as_ref())?;

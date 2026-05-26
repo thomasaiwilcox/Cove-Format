@@ -1197,7 +1197,7 @@ mod tests {
         let dictionary =
             FileDictionaryEncoding::from_keys([FileDictionaryKey::from_logical_bytes(
                 CoveLogicalType::Utf8,
-                &CanonicalValue::Utf8("alpha".into()).encode().unwrap(),
+                &CanonicalValue::Utf8("alpha").encode().unwrap(),
             )
             .unwrap()])
             .unwrap()
@@ -1327,7 +1327,7 @@ mod tests {
         let dictionary =
             FileDictionaryEncoding::from_keys([FileDictionaryKey::from_logical_bytes(
                 CoveLogicalType::Utf8,
-                &CanonicalValue::Utf8("alpha".into()).encode().unwrap(),
+                &CanonicalValue::Utf8("alpha").encode().unwrap(),
             )
             .unwrap()])
             .unwrap()

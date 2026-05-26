@@ -114,6 +114,9 @@ impl TrustManifest {
 
 pub trait TrustDictionary {
     fn len(&self) -> u32;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
     fn canonical_entry(&self, file_code: u32) -> Result<(ValueTag, Vec<u8>), CoveError>;
 }
 

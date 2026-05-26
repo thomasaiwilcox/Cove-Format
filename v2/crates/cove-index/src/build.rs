@@ -74,6 +74,34 @@ struct IndexedTargetMetadata {
     semantic_dimension_ref: u32,
 }
 
+type KeyPostingMap = BTreeMap<Vec<u8>, Vec<CoviRowRangePostingV2>>;
+type OrderedKeyPostings = Vec<(Vec<u8>, Vec<CoviRowRangePostingV2>)>;
+
+#[derive(Clone, Copy)]
+struct BuildBlocksParams {
+    root_id: u32,
+    logical_type: CoveLogicalType,
+    index_kind: CoviIndexKindV2,
+    key_encoding_kind: CoviKeyEncodingKindV2,
+    comparator_kind: CoviComparatorKindV2,
+    supports_range: bool,
+    null_count: u64,
+    aggregate_block_id: Option<u32>,
+}
+
+#[derive(Clone, Copy)]
+struct AggregateAnswerBlockParams<'a> {
+    root_id: u32,
+    row_count: u64,
+    null_count: u64,
+    distinct_count: u64,
+    logical_type: CoveLogicalType,
+    options: &'a CoviBuildOptions,
+    include_min_max_answers: bool,
+    min_key: Option<&'a [u8]>,
+    max_key: Option<&'a [u8]>,
+}
+
 pub fn build_covi_from_cove_bytes(
     input: &[u8],
     options: &CoviBuildOptions,
@@ -273,17 +301,17 @@ pub fn build_covi_from_cove_bytes(
             },
         ]);
         if include_aggregate_block {
-            let aggregate_block = aggregate_answer_block(
+            let aggregate_block = aggregate_answer_block(AggregateAnswerBlockParams {
                 root_id,
-                table.row_count,
-                built_index.null_count,
-                built_index.distinct_count,
-                column.logical,
+                row_count: table.row_count,
+                null_count: built_index.null_count,
+                distinct_count: built_index.distinct_count,
+                logical_type: column.logical,
                 options,
                 include_min_max_answers,
-                built_index.min_key.as_deref(),
-                built_index.max_key.as_deref(),
-            )?;
+                min_key: built_index.min_key.as_deref(),
+                max_key: built_index.max_key.as_deref(),
+            })?;
             section_payloads.push(CoviSectionPayloadV2 {
                 section_id: aggregate_section_id,
                 section_kind: CoviSectionKindV2::AggregateAnswerBlock,
@@ -445,7 +473,7 @@ fn build_column_index(
         CoviIndexKindV2::Sorted
     };
     let mut supports_range = !raw_filecode_mode;
-    let mut keys: BTreeMap<Vec<u8>, Vec<CoviRowRangePostingV2>> = BTreeMap::new();
+    let mut keys: KeyPostingMap = BTreeMap::new();
     let mut null_count = 0u64;
     let mut rows_seen = 0u64;
     let zone_stats_entries = mounted
@@ -585,29 +613,34 @@ fn build_column_index(
         supports_range = false;
     }
     build_blocks_from_keys(
-        root_id,
         keys,
-        column.logical,
+        BuildBlocksParams {
+            root_id,
+            logical_type: column.logical,
+            index_kind,
+            key_encoding_kind,
+            comparator_kind,
+            supports_range,
+            null_count,
+            aggregate_block_id,
+        },
+    )
+}
+
+fn build_blocks_from_keys(
+    keys: KeyPostingMap,
+    params: BuildBlocksParams,
+) -> Result<BuiltColumnIndex, CoveError> {
+    let BuildBlocksParams {
+        root_id,
+        logical_type,
         index_kind,
         key_encoding_kind,
         comparator_kind,
         supports_range,
         null_count,
         aggregate_block_id,
-    )
-}
-
-fn build_blocks_from_keys(
-    root_id: u32,
-    keys: BTreeMap<Vec<u8>, Vec<CoviRowRangePostingV2>>,
-    logical_type: CoveLogicalType,
-    index_kind: CoviIndexKindV2,
-    key_encoding_kind: CoviKeyEncodingKindV2,
-    comparator_kind: CoviComparatorKindV2,
-    supports_range: bool,
-    null_count: u64,
-    aggregate_block_id: Option<u32>,
-) -> Result<BuiltColumnIndex, CoveError> {
+    } = params;
     let distinct_count = u64::try_from(keys.len()).map_err(|_| CoveError::ArithOverflow)?;
     let keys = order_key_items(keys, logical_type, index_kind, comparator_kind)?;
     let min_key = supports_range
@@ -730,9 +763,7 @@ fn build_blocks_from_keys(
         payload: postings_payload,
     }
     .serialize()?;
-    let max_key_ref = if distinct_count == 0 {
-        u32::MAX
-    } else if !supports_range {
+    let max_key_ref = if distinct_count == 0 || !supports_range {
         u32::MAX
     } else {
         u32::try_from(distinct_count - 1).map_err(|_| CoveError::ArithOverflow)?
@@ -760,7 +791,7 @@ fn build_blocks_from_keys(
 
 fn canonical_float_keys_contain_nan(
     logical_type: CoveLogicalType,
-    keys: &BTreeMap<Vec<u8>, Vec<CoviRowRangePostingV2>>,
+    keys: &KeyPostingMap,
 ) -> Result<bool, CoveError> {
     if !matches!(
         logical_type,
@@ -800,11 +831,11 @@ fn canonical_float_key_is_nan(
 }
 
 fn order_key_items(
-    keys: BTreeMap<Vec<u8>, Vec<CoviRowRangePostingV2>>,
+    keys: KeyPostingMap,
     logical_type: CoveLogicalType,
     index_kind: CoviIndexKindV2,
     comparator_kind: CoviComparatorKindV2,
-) -> Result<Vec<(Vec<u8>, Vec<CoviRowRangePostingV2>)>, CoveError> {
+) -> Result<OrderedKeyPostings, CoveError> {
     let items = keys.into_iter().collect::<Vec<_>>();
     if !matches!(
         index_kind,
@@ -813,7 +844,7 @@ fn order_key_items(
         return Ok(items);
     }
     let context = CoviLookupComparatorContextV2::default();
-    let mut sorted: Vec<(Vec<u8>, Vec<CoviRowRangePostingV2>)> = Vec::with_capacity(items.len());
+    let mut sorted = OrderedKeyPostings::with_capacity(items.len());
     'items: for item in items {
         for index in 0..sorted.len() {
             if compare_key_bytes_for_order(
@@ -833,17 +864,18 @@ fn order_key_items(
     Ok(sorted)
 }
 
-fn aggregate_answer_block(
-    root_id: u32,
-    row_count: u64,
-    null_count: u64,
-    distinct_count: u64,
-    logical_type: CoveLogicalType,
-    options: &CoviBuildOptions,
-    include_min_max_answers: bool,
-    min_key: Option<&[u8]>,
-    max_key: Option<&[u8]>,
-) -> Result<Vec<u8>, CoveError> {
+fn aggregate_answer_block(params: AggregateAnswerBlockParams<'_>) -> Result<Vec<u8>, CoveError> {
+    let AggregateAnswerBlockParams {
+        root_id,
+        row_count,
+        null_count,
+        distinct_count,
+        logical_type,
+        options,
+        include_min_max_answers,
+        min_key,
+        max_key,
+    } = params;
     let non_null_count = row_count
         .checked_sub(null_count)
         .ok_or(CoveError::ArithOverflow)?;
@@ -1517,15 +1549,17 @@ mod tests {
             keys.insert(signed_key(value), vec![row_range()]);
         }
         let built = build_blocks_from_keys(
-            1,
             keys,
-            CoveLogicalType::Int64,
-            CoviIndexKindV2::Sorted,
-            CoviKeyEncodingKindV2::CanonicalValueBytes,
-            CoviComparatorKindV2::CanonicalOrdering,
-            true,
-            0,
-            None,
+            BuildBlocksParams {
+                root_id: 1,
+                logical_type: CoveLogicalType::Int64,
+                index_kind: CoviIndexKindV2::Sorted,
+                key_encoding_kind: CoviKeyEncodingKindV2::CanonicalValueBytes,
+                comparator_kind: CoviComparatorKindV2::CanonicalOrdering,
+                supports_range: true,
+                null_count: 0,
+                aggregate_block_id: None,
+            },
         )
         .unwrap();
         assert_eq!(built.min_key_ref, 0);
@@ -1538,20 +1572,20 @@ mod tests {
     fn index_only_min_max_answers_store_canonical_payload_not_full_key() {
         let min_key = signed_key(-10);
         let max_key = signed_key(5);
-        let bytes = aggregate_answer_block(
-            1,
-            4,
-            0,
-            4,
-            CoveLogicalType::Int64,
-            &CoviBuildOptions {
+        let bytes = aggregate_answer_block(AggregateAnswerBlockParams {
+            root_id: 1,
+            row_count: 4,
+            null_count: 0,
+            distinct_count: 4,
+            logical_type: CoveLogicalType::Int64,
+            options: &CoviBuildOptions {
                 include_index_only_min_max: true,
                 ..CoviBuildOptions::default()
             },
-            true,
-            Some(&min_key),
-            Some(&max_key),
-        )
+            include_min_max_answers: true,
+            min_key: Some(&min_key),
+            max_key: Some(&max_key),
+        })
         .unwrap();
         let block = CoviAggregateAnswerBlockV2::parse(&bytes).unwrap();
         let min = block
@@ -1578,20 +1612,20 @@ mod tests {
 
     #[test]
     fn index_only_distinct_count_answer_uses_payload_for_result_count() {
-        let bytes = aggregate_answer_block(
-            1,
-            5,
-            2,
-            2,
-            CoveLogicalType::Int64,
-            &CoviBuildOptions {
+        let bytes = aggregate_answer_block(AggregateAnswerBlockParams {
+            root_id: 1,
+            row_count: 5,
+            null_count: 2,
+            distinct_count: 2,
+            logical_type: CoveLogicalType::Int64,
+            options: &CoviBuildOptions {
                 include_index_only_distinct_count: true,
                 ..CoviBuildOptions::default()
             },
-            false,
-            None,
-            None,
-        )
+            include_min_max_answers: false,
+            min_key: None,
+            max_key: None,
+        })
         .unwrap();
         let block = CoviAggregateAnswerBlockV2::parse(&bytes).unwrap();
         let answer = block
@@ -1635,15 +1669,17 @@ mod tests {
         keys.insert(10u32.to_le_bytes().to_vec(), vec![row_range()]);
         keys.insert(20u32.to_le_bytes().to_vec(), vec![row_range()]);
         let built = build_blocks_from_keys(
-            1,
             keys,
-            CoveLogicalType::Utf8,
-            CoviIndexKindV2::Hash,
-            CoviKeyEncodingKindV2::FileCode,
-            CoviComparatorKindV2::DomainRankOrdering,
-            false,
-            0,
-            None,
+            BuildBlocksParams {
+                root_id: 1,
+                logical_type: CoveLogicalType::Utf8,
+                index_kind: CoviIndexKindV2::Hash,
+                key_encoding_kind: CoviKeyEncodingKindV2::FileCode,
+                comparator_kind: CoviComparatorKindV2::DomainRankOrdering,
+                supports_range: false,
+                null_count: 0,
+                aggregate_block_id: None,
+            },
         )
         .unwrap();
         assert_eq!(built.index_kind, CoviIndexKindV2::Hash);
@@ -1667,15 +1703,17 @@ mod tests {
         );
         assert!(canonical_float_keys_contain_nan(CoveLogicalType::Float64, &keys).unwrap());
         let built = build_blocks_from_keys(
-            1,
             keys,
-            CoveLogicalType::Float64,
-            CoviIndexKindV2::Hash,
-            CoviKeyEncodingKindV2::CanonicalValueBytes,
-            CoviComparatorKindV2::CanonicalEquality,
-            false,
-            0,
-            None,
+            BuildBlocksParams {
+                root_id: 1,
+                logical_type: CoveLogicalType::Float64,
+                index_kind: CoviIndexKindV2::Hash,
+                key_encoding_kind: CoviKeyEncodingKindV2::CanonicalValueBytes,
+                comparator_kind: CoviComparatorKindV2::CanonicalEquality,
+                supports_range: false,
+                null_count: 0,
+                aggregate_block_id: None,
+            },
         )
         .unwrap();
         assert_eq!(built.index_kind, CoviIndexKindV2::Hash);

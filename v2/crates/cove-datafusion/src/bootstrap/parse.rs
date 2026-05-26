@@ -591,16 +591,10 @@ pub(super) async fn parse_feature_scope_table<R: CoveRangeReader + ?Sized>(
         None => None,
     };
     let profile_matrix = match profile_matrix_entry {
-        Some(entry) => {
-            let parsed = match read_section_payload(reader, entry)
-                .await
-                .and_then(|payload| ProfileCapabilityMatrixV2::parse(&payload))
-            {
-                Ok(matrix) => Some(matrix),
-                Err(_) => None,
-            };
-            parsed
-        }
+        Some(entry) => read_section_payload(reader, entry)
+            .await
+            .and_then(|payload| ProfileCapabilityMatrixV2::parse(&payload))
+            .ok(),
         None => None,
     };
     let mut section_bindings = Vec::<SectionFeatureBindingSectionV2>::new();
