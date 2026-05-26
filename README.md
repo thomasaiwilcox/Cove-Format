@@ -10,6 +10,24 @@ transaction protocol. The file is a queryable persistent data structure: values,
 encodings, dictionaries, indexes, coverage metadata, checksums, and feature
 declarations are all part of the read contract.
 
+## Long-Term Direction
+
+COVE's long-term goal is to make archived tabular data both physically
+efficient and semantically canonical. Many source tables repeat the same
+real-world values and entities: company names, products, customers, locations,
+instruments, accounts, and other business objects. COVE's object and mapping
+profiles are intended to let those repeated facts be represented once as
+canonical objects and associations, while preserving deterministic metadata
+that can project the data back into table-shaped views compatible with the
+original sources.
+
+In that model, the original tables remain readable, but they are no longer the
+only semantic structure. Source rows become provenance. Objects, properties,
+associations, evidence, and projection rules describe the canonical meaning.
+This can reduce duplicated storage and repeated read work, but the larger goal
+is that data becomes easier for engines and humans to understand consistently
+across fragmented sources.
+
 ## What COVE Is
 
 COVE stores immutable offline data in `.cove` files. The baseline format is
@@ -92,7 +110,9 @@ pruning, metadata-only answers, lookup routing, or index-only access.
 
 COVE works as a table archive without any object layer. For organizations that
 need richer semantics over fragmented sources, v2 also includes optional
-COVE-O and COVE-MAP profiles.
+COVE-O and COVE-MAP profiles. These profiles are the path from ordinary source
+tables toward canonical objects and associations with deterministic table
+readback.
 
 COVE-MAP describes deterministic conversion from source rows into semantic
 objects, properties, associations, evidence, and projection readback metadata.
