@@ -1423,7 +1423,7 @@ mod tests {
             row_count: 10,
             non_null_count: 10,
             null_count: 0,
-            encoding_root: 0,
+            encoding_root: CoveEncodingKind::NumCode as u32,
             page_offset: data_offset as u64,
             page_length: 8,
             uncompressed_length: 8,
@@ -1479,7 +1479,7 @@ mod tests {
             row_count: 9,
             non_null_count: 9,
             null_count: 0,
-            encoding_root: 0,
+            encoding_root: CoveEncodingKind::NumCode as u32,
             page_offset: data_offset as u64,
             page_length: 8,
             uncompressed_length: 8,
@@ -1552,6 +1552,70 @@ mod tests {
             TableSegmentPayloadV1::parse_with_required_features(&bytes, 0),
             Err(CoveError::BadSection(_))
         ));
+    }
+
+    #[test]
+    fn table_segment_payload_accepts_all_non_null_fact_without_elision_feature() {
+        let column_offset = TABLE_SEGMENT_HEADER_LEN + ROW_MORSEL_ENTRY_LEN;
+        let page_index_offset = column_offset + TABLE_COLUMN_DIRECTORY_ENTRY_LEN;
+        let data_offset = page_index_offset + crate::page::COLUMN_PAGE_INDEX_ENTRY_LEN;
+        let payload = ColumnPagePayloadV1::build_single_node(
+            10,
+            CoveEncodingKind::NumCode,
+            CoveLogicalType::Int64,
+            CovePhysicalKind::NumCode,
+            None,
+            vec![0u8; 10 * 8],
+        )
+        .unwrap();
+        let header = TableSegmentHeaderV1 {
+            table_id: 1,
+            segment_id: 0,
+            row_start: 0,
+            row_count: 10,
+            morsel_count: 1,
+            morsel_row_count: 4096,
+            column_count: 1,
+            morsel_directory_offset: TABLE_SEGMENT_HEADER_LEN as u64,
+            column_directory_offset: column_offset as u64,
+            page_index_offset: page_index_offset as u64,
+            data_offset: data_offset as u64,
+            flags: 0,
+            checksum: 0,
+        };
+        let dir = RowMorselDirectory {
+            entries: vec![morsel(0, 0, 10)],
+        };
+        let column = column(
+            7,
+            page_index_offset as u64,
+            crate::page::COLUMN_PAGE_INDEX_ENTRY_LEN as u64,
+            data_offset as u64,
+            payload.len() as u64,
+        );
+        let page = ColumnPageIndexEntryV1 {
+            column_id: 7,
+            morsel_id: 0,
+            row_count: 10,
+            non_null_count: 10,
+            null_count: 0,
+            encoding_root: CoveEncodingKind::NumCode as u32,
+            page_offset: data_offset as u64,
+            page_length: payload.len() as u64,
+            uncompressed_length: payload.len() as u64,
+            stats_ref: 0,
+            flags: crate::page::PAGE_FLAG_ALL_NON_NULL,
+            checksum: checksum::crc32c(&payload),
+        };
+
+        let mut bytes = header.serialize().to_vec();
+        bytes.extend_from_slice(&dir.serialize());
+        bytes.extend_from_slice(&column.serialize());
+        bytes.extend_from_slice(&page.serialize());
+        bytes.extend_from_slice(&payload);
+        let payload = TableSegmentPayloadV1::parse_with_required_features(&bytes, 0).unwrap();
+        assert_eq!(payload.columns.len(), 1);
+        assert_eq!(payload.columns[0].column_id, 7);
     }
 
     #[test]

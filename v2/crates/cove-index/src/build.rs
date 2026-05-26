@@ -168,6 +168,7 @@ pub fn build_covi_from_cove_bytes(
         let aggregate_section_id = key_section_id + 3;
         let include_min_max_answers = options.include_index_only_min_max
             && built_index.supports_range
+            && aggregate_min_max_answer_supported(column.logical)
             && built_index.min_key.is_some()
             && built_index.max_key.is_some();
         let include_aggregate_block = options.include_index_only_counts
@@ -502,6 +503,10 @@ fn build_column_index(
                             column_id: column.column_id,
                             logical_type: column.logical,
                             physical_kind: column.physical,
+                            dictionary_len: mounted
+                                .dictionary
+                                .as_ref()
+                                .map(|dictionary| dictionary.len()),
                             zone_stats: &zone_stats_entries,
                         },
                         &page,
@@ -897,15 +902,16 @@ fn aggregate_answer_block(
         )?;
     }
     if options.include_index_only_distinct_count {
+        let distinct_payload = distinct_count.to_le_bytes();
         push_aggregate_answer(
             &mut answers,
             &mut payload,
             root_id,
             CoviAggregateKindV2::DistinctCount,
-            distinct_count,
-            0,
-            distinct_count,
-            None,
+            row_count,
+            null_count,
+            non_null_count,
+            Some(&distinct_payload),
         )?;
     }
     CoviAggregateAnswerBlockV2 {
@@ -928,6 +934,17 @@ fn aggregate_answer_block(
         payload,
     }
     .serialize()
+}
+
+fn aggregate_min_max_answer_supported(logical_type: CoveLogicalType) -> bool {
+    !matches!(
+        logical_type,
+        CoveLogicalType::Null
+            | CoveLogicalType::Bool
+            | CoveLogicalType::List
+            | CoveLogicalType::Struct
+            | CoveLogicalType::Map
+    )
 }
 
 fn entry_block_with_aggregate_block_id(
@@ -1366,6 +1383,36 @@ mod tests {
         writer.write().unwrap()
     }
 
+    fn bool_scan_file() -> Vec<u8> {
+        let catalog = TableCatalog {
+            flags: 0,
+            tables: vec![TableEntry {
+                table_id: 1,
+                namespace: "public".into(),
+                name: "events".into(),
+                row_count: 2,
+                primary_sort_key_count: 0,
+                clustering_key_count: 0,
+                flags: 0,
+                columns: vec![ColumnEntry {
+                    column_id: 1,
+                    name: "active".into(),
+                    logical: CoveLogicalType::Bool,
+                    physical: CovePhysicalKind::Boolean,
+                    nullable: false,
+                    sort_order: 0,
+                    collation_id: 0,
+                    precision: 0,
+                    scale: 0,
+                    flags: 0,
+                }],
+            }],
+        };
+        let mut writer = ScanProfileCoveWriter::new(catalog);
+        writer.push_segment(ScanSegment::new(1, 0, 0, 2, 1));
+        writer.write().unwrap()
+    }
+
     fn rewrite_first_segment_data<F>(bytes: Vec<u8>, mut mutate: F) -> Vec<u8>
     where
         F: FnMut(&mut Vec<u8>),
@@ -1527,6 +1574,59 @@ mod tests {
         assert_eq!(max.value_ref, 8);
         assert_eq!(&block.payload[0..8], &(-10i64).to_le_bytes());
         assert_eq!(&block.payload[8..16], &5i64.to_le_bytes());
+    }
+
+    #[test]
+    fn index_only_distinct_count_answer_uses_payload_for_result_count() {
+        let bytes = aggregate_answer_block(
+            1,
+            5,
+            2,
+            2,
+            CoveLogicalType::Int64,
+            &CoviBuildOptions {
+                include_index_only_distinct_count: true,
+                ..CoviBuildOptions::default()
+            },
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        let block = CoviAggregateAnswerBlockV2::parse(&bytes).unwrap();
+        let answer = block
+            .answers
+            .iter()
+            .find(|answer| {
+                CoviAggregateKindV2::from_u16(answer.aggregate_kind)
+                    == Some(CoviAggregateKindV2::DistinctCount)
+            })
+            .unwrap();
+
+        assert_eq!(answer.row_count, 5);
+        assert_eq!(answer.null_count, 2);
+        assert_eq!(answer.non_null_count, 3);
+        assert_eq!(answer.value_ref, 0);
+        assert_eq!(block.payload, 2u64.to_le_bytes());
+    }
+
+    #[test]
+    fn build_covi_does_not_emit_ambiguous_bool_min_max_answers() {
+        let built = build_covi_from_cove_bytes(
+            &bool_scan_file(),
+            &CoviBuildOptions {
+                all_columns: true,
+                include_index_only_min_max: true,
+                ..CoviBuildOptions::default()
+            },
+        )
+        .unwrap();
+        let artifact = CoviArtifactV2::parse(&built).unwrap();
+
+        assert!(artifact.aggregate_answer_blocks.is_empty());
+        assert_eq!(artifact.capabilities[0].supports_min, 0);
+        assert_eq!(artifact.capabilities[0].supports_max, 0);
+        assert_eq!(artifact.capabilities[0].supports_index_only, 0);
     }
 
     #[test]

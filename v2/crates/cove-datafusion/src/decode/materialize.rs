@@ -414,7 +414,14 @@ pub(super) fn materialize_page_payload(
     validation_policy: PagePayloadValidationPolicy,
 ) -> Result<RetainedColumnPagePayloadV1, CoveError> {
     if page.flags & PAGE_FLAG_STATS_ONLY_CONSTANT != 0 {
-        return materialize_stats_only_page(table_id, segment_id, column, page, zone_stats);
+        return materialize_stats_only_page(
+            table_id,
+            segment_id,
+            column,
+            page,
+            zone_stats,
+            dictionary_len,
+        );
     }
 
     let start = usize::try_from(page.page_offset).map_err(|_| CoveError::OffsetRange)?;
@@ -454,7 +461,14 @@ pub(super) fn materialize_page_payload_from_wire(
     validation_policy: PagePayloadValidationPolicy,
 ) -> Result<RetainedColumnPagePayloadV1, CoveError> {
     if page.flags & PAGE_FLAG_STATS_ONLY_CONSTANT != 0 {
-        return materialize_stats_only_page(table_id, segment_id, column, page, zone_stats);
+        return materialize_stats_only_page(
+            table_id,
+            segment_id,
+            column,
+            page,
+            zone_stats,
+            dictionary_len,
+        );
     }
     let Some(page_wire) = page_wire else {
         return Err(CoveError::PageCorrupt);
@@ -505,6 +519,7 @@ fn materialize_stats_only_page(
     column: &ColumnEntry,
     page: &ColumnPageIndexEntryV1,
     zone_stats: &[cove_core::zone_stats::ZoneStatsEntry],
+    dictionary_len: Option<u32>,
 ) -> Result<RetainedColumnPagePayloadV1, CoveError> {
     let payload = materialize_stats_only_constant_page_payload(
         StatsOnlyPageMaterializationContext {
@@ -513,6 +528,7 @@ fn materialize_stats_only_page(
             column_id: column.column_id,
             logical_type: column.logical,
             physical_kind: column.physical,
+            dictionary_len,
             zone_stats,
         },
         page,

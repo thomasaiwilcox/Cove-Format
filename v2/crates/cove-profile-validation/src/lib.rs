@@ -1,7 +1,9 @@
 //! Shared semantic validation for embedded optional-profile payloads.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use cove_core::{
-    compression,
+    checksum, compression,
     constants::{PrimaryProfile, SectionKind},
     feature_binding::OperationKindV2,
     feature_scope::FeatureUseRequestV2,
@@ -12,7 +14,8 @@ use cove_core::{
     CoveError,
 };
 use cove_coverage::{
-    CoveragePlanCandidateV2, CoverageProofRecordV2, CoverageProviderDescriptorV2, CoverageSetV2,
+    coverage_set_payload_checksum, CoverageGranularityV2, CoveragePlanCandidateV2,
+    CoverageProofRecordV2, CoverageProviderDescriptorV2, CoverageSetV2,
     PredicateNormalFormWithPayloadV2,
 };
 use cove_index::IndexOnlyCapabilityV2;
@@ -185,6 +188,13 @@ pub fn validate_embedded_optional_profile_sections_with_runtime_session(
         feature_use,
         only_required_for_feature_use,
     )?;
+    validate_coverage_sections_with_authority(
+        data,
+        report,
+        optional_pushdown_policy,
+        feature_use,
+        only_required_for_feature_use,
+    )?;
     Ok(())
 }
 
@@ -323,6 +333,8 @@ struct LayoutAuthority {
     segments: TableSegmentIndex,
 }
 
+const ABSENT_REF: u32 = u32::MAX;
+
 fn load_layout_authority(
     data: &[u8],
     report: &ValidationReport,
@@ -354,8 +366,397 @@ fn load_layout_authority(
     Ok(Some(LayoutAuthority { catalog, segments }))
 }
 
+fn validate_coverage_sections_with_authority(
+    data: &[u8],
+    report: &ValidationReport,
+    optional_pushdown_policy: OptionalPushdownPolicy,
+    feature_use: Option<&FeatureUseRequestV2>,
+    only_required_for_feature_use: bool,
+) -> Result<(), CoveError> {
+    let coverage_entries = report
+        .validated
+        .footer
+        .sections
+        .iter()
+        .filter(|entry| {
+            SectionKind::from_u16(entry.section_kind)
+                .map(is_coverage_section)
+                .unwrap_or(false)
+        })
+        .filter(|entry| {
+            !only_required_for_feature_use
+                || section_is_required_for_feature_use(entry, feature_use)
+        })
+        .collect::<Vec<_>>();
+    if coverage_entries.is_empty() {
+        return Ok(());
+    }
+
+    let Some(authority) = load_layout_authority(data, report)? else {
+        return first_non_fail_open_layout_error(
+            &coverage_entries,
+            optional_pushdown_policy,
+            feature_use,
+            CoveError::BadCoverage,
+        );
+    };
+
+    let mut providers = Vec::new();
+    let mut sets = Vec::new();
+    let mut proofs = Vec::new();
+    let mut candidates = Vec::new();
+    let mut predicate_refs = BTreeSet::new();
+
+    for entry in coverage_entries.iter().copied() {
+        let result = coverage_payload(data, entry).and_then(|payload| {
+            match SectionKind::from_u16(entry.section_kind) {
+                Some(SectionKind::CoverageProviderRegistry) => {
+                    providers.extend(CoverageProviderDescriptorV2::parse_many(&payload)?);
+                }
+                Some(SectionKind::CoverageSet) => {
+                    let checksum = coverage_set_payload_checksum(&payload);
+                    sets.push((CoverageSetV2::parse(&payload)?, checksum));
+                }
+                Some(SectionKind::CoverageProofRecord) => {
+                    proofs.extend(CoverageProofRecordV2::parse_many(&payload)?);
+                }
+                Some(SectionKind::CoveragePlanCandidate) => {
+                    candidates.extend(CoveragePlanCandidateV2::parse_many(&payload)?);
+                }
+                Some(SectionKind::PredicateNormalForm) => {
+                    for form in PredicateNormalFormWithPayloadV2::parse_many(&payload)? {
+                        predicate_refs.insert(form.form.predicate_form_id);
+                    }
+                }
+                _ => {}
+            }
+            Ok(())
+        });
+        layout_result(result, entry, optional_pushdown_policy, feature_use)?;
+    }
+
+    coverage_authority_result(
+        validate_coverage_provider_authority(&providers, &authority)
+            .and_then(|_| {
+                validate_coverage_set_authority(
+                    &sets,
+                    &providers,
+                    &predicate_refs,
+                    &authority,
+                    data,
+                    report,
+                )
+            })
+            .and_then(|_| {
+                validate_coverage_proof_authority(&proofs, &sets, &providers, &predicate_refs)
+            })
+            .and_then(|_| {
+                validate_coverage_plan_authority(&candidates, &providers, &predicate_refs)
+            }),
+        &coverage_entries,
+        optional_pushdown_policy,
+        feature_use,
+    )?;
+    Ok(())
+}
+
+fn validate_coverage_provider_authority(
+    providers: &[CoverageProviderDescriptorV2],
+    authority: &LayoutAuthority,
+) -> Result<(), CoveError> {
+    let mut ids = BTreeSet::new();
+    for provider in providers {
+        if !ids.insert(provider.provider_id) {
+            return Err(CoveError::BadCoverage);
+        }
+        if provider.referenced_table_id == ABSENT_REF {
+            continue;
+        }
+        let table = authority
+            .catalog
+            .tables
+            .iter()
+            .find(|table| table.table_id == provider.referenced_table_id)
+            .ok_or(CoveError::BadCoverage)?;
+        if provider.referenced_column_id != ABSENT_REF {
+            let column = table
+                .columns
+                .iter()
+                .find(|column| column.column_id == provider.referenced_column_id)
+                .ok_or(CoveError::BadCoverage)?;
+            if provider.logical_type != column.logical as u16
+                || provider.collation_id != column.collation_id
+            {
+                return Err(CoveError::BadCoverage);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_coverage_set_authority(
+    sets: &[(CoverageSetV2, u32)],
+    providers: &[CoverageProviderDescriptorV2],
+    predicate_refs: &BTreeSet<u32>,
+    authority: &LayoutAuthority,
+    data: &[u8],
+    report: &ValidationReport,
+) -> Result<(), CoveError> {
+    let providers_by_id = providers
+        .iter()
+        .map(|provider| (provider.provider_id, provider))
+        .collect::<BTreeMap<_, _>>();
+    let selected_snapshot = embedded_coverage_snapshot_validity_ref(report, data)?;
+    let mut ids = BTreeSet::new();
+    for (set, _) in sets {
+        if !ids.insert(set.header.coverage_set_id) {
+            return Err(CoveError::BadCoverage);
+        }
+        let provider = providers_by_id
+            .get(&set.header.provider_id)
+            .ok_or(CoveError::BadCoverage)?;
+        if set.header.granularity != provider.granularity
+            || set.header.proof_strength != provider.proof_strength
+            || set.header.exactness != provider.exactness
+            || set.header.predicate_form_ref != provider.predicate_form_ref
+            || set.header.snapshot_validity_ref != provider.snapshot_validity_ref
+        {
+            return Err(CoveError::BadCoverage);
+        }
+        if set.header.predicate_form_ref != ABSENT_REF
+            && !predicate_refs.is_empty()
+            && !predicate_refs.contains(&set.header.predicate_form_ref)
+        {
+            return Err(CoveError::BadCoverage);
+        }
+        if set.header.snapshot_validity_ref != selected_snapshot {
+            return Err(CoveError::BadCoverage);
+        }
+        for entry in &set.entries {
+            validate_coverage_entry_authority(entry, authority)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_coverage_proof_authority(
+    proofs: &[CoverageProofRecordV2],
+    sets: &[(CoverageSetV2, u32)],
+    providers: &[CoverageProviderDescriptorV2],
+    predicate_refs: &BTreeSet<u32>,
+) -> Result<(), CoveError> {
+    let providers_by_id = providers
+        .iter()
+        .map(|provider| (provider.provider_id, provider))
+        .collect::<BTreeMap<_, _>>();
+    let sets_by_id = sets
+        .iter()
+        .map(|(set, checksum)| (set.header.coverage_set_id, (set, *checksum)))
+        .collect::<BTreeMap<_, _>>();
+    for proof in proofs {
+        providers_by_id
+            .get(&proof.provider_id)
+            .ok_or(CoveError::BadCoverage)?;
+        if proof.predicate_form_ref != ABSENT_REF
+            && !predicate_refs.is_empty()
+            && !predicate_refs.contains(&proof.predicate_form_ref)
+        {
+            return Err(CoveError::BadCoverage);
+        }
+        let (set, checksum) = sets_by_id
+            .get(&proof.coverage_set_id)
+            .ok_or(CoveError::BadCoverage)?;
+        proof.validate_against_coverage_set(set, *checksum)?;
+    }
+    Ok(())
+}
+
+fn validate_coverage_plan_authority(
+    candidates: &[CoveragePlanCandidateV2],
+    providers: &[CoverageProviderDescriptorV2],
+    predicate_refs: &BTreeSet<u32>,
+) -> Result<(), CoveError> {
+    let providers_by_id = providers
+        .iter()
+        .map(|provider| (provider.provider_id, provider.provider_kind))
+        .collect::<BTreeMap<_, _>>();
+    for candidate in candidates {
+        let provider_kind = providers_by_id
+            .get(&candidate.provider_id)
+            .ok_or(CoveError::BadCoverage)?;
+        if candidate.provider_type != *provider_kind {
+            return Err(CoveError::BadCoverage);
+        }
+        if !predicate_refs.is_empty() && !predicate_refs.contains(&candidate.predicate_fragment_ref)
+        {
+            return Err(CoveError::BadCoverage);
+        }
+    }
+    Ok(())
+}
+
+fn validate_coverage_entry_authority(
+    entry: &cove_coverage::CoverageSetEntryV2,
+    authority: &LayoutAuthority,
+) -> Result<(), CoveError> {
+    match entry.target_kind {
+        CoverageGranularityV2::Dataset => Ok(()),
+        CoverageGranularityV2::File => validate_embedded_file_ref(entry.file_ref),
+        CoverageGranularityV2::Segment => {
+            validate_embedded_file_ref(entry.file_ref)?;
+            coverage_segment(entry, authority).map(|_| ())
+        }
+        CoverageGranularityV2::Morsel => {
+            validate_embedded_file_ref(entry.file_ref)?;
+            let segment = coverage_segment(entry, authority)?;
+            if entry.morsel_id >= segment.morsel_count {
+                return Err(CoveError::BadCoverage);
+            }
+            Ok(())
+        }
+        CoverageGranularityV2::Page => {
+            validate_embedded_file_ref(entry.file_ref)?;
+            let segment = coverage_segment(entry, authority)?;
+            let table = coverage_table(entry.table_id, authority)?;
+            let max_page_ref = segment
+                .morsel_count
+                .checked_mul(
+                    u32::try_from(table.columns.len()).map_err(|_| CoveError::ArithOverflow)?,
+                )
+                .ok_or(CoveError::ArithOverflow)?;
+            if entry.page_ref >= max_page_ref {
+                return Err(CoveError::BadCoverage);
+            }
+            Ok(())
+        }
+        CoverageGranularityV2::RowRange => {
+            validate_embedded_file_ref(entry.file_ref)?;
+            let segment = coverage_segment(entry, authority)?;
+            let end = entry
+                .row_start
+                .checked_add(entry.row_count)
+                .ok_or(CoveError::ArithOverflow)?;
+            if end > u64::from(segment.row_count) {
+                return Err(CoveError::BadCoverage);
+            }
+            Ok(())
+        }
+        CoverageGranularityV2::RowOrdinalSet => {
+            validate_embedded_file_ref(entry.file_ref)?;
+            coverage_table(entry.table_id, authority).map(|_| ())
+        }
+        CoverageGranularityV2::ObjectPath => {
+            if entry.path_ref == ABSENT_REF {
+                Err(CoveError::BadCoverage)
+            } else {
+                Ok(())
+            }
+        }
+        CoverageGranularityV2::DimensionalBucket => {
+            if entry.dimensional_bucket_ref == ABSENT_REF {
+                Err(CoveError::BadCoverage)
+            } else {
+                Ok(())
+            }
+        }
+        _ => Ok(()),
+    }
+}
+
+fn coverage_table(table_id: u32, authority: &LayoutAuthority) -> Result<&TableEntry, CoveError> {
+    authority
+        .catalog
+        .tables
+        .iter()
+        .find(|table| table.table_id == table_id)
+        .ok_or(CoveError::BadCoverage)
+}
+
+fn coverage_segment<'a>(
+    entry: &cove_coverage::CoverageSetEntryV2,
+    authority: &'a LayoutAuthority,
+) -> Result<&'a cove_core::segment::TableSegmentIndexEntryV1, CoveError> {
+    coverage_table(entry.table_id, authority)?;
+    authority
+        .segments
+        .entries
+        .iter()
+        .find(|segment| {
+            segment.table_id == entry.table_id && segment.segment_id == entry.segment_id
+        })
+        .ok_or(CoveError::BadCoverage)
+}
+
+fn validate_embedded_file_ref(file_ref: u32) -> Result<(), CoveError> {
+    if file_ref == 0 {
+        Ok(())
+    } else {
+        Err(CoveError::BadCoverage)
+    }
+}
+
+fn embedded_coverage_snapshot_validity_ref(
+    report: &ValidationReport,
+    data: &[u8],
+) -> Result<u32, CoveError> {
+    let mut seed = Vec::new();
+    seed.extend_from_slice(&report.validated.header.file_id);
+    seed.extend_from_slice(
+        &u64::try_from(data.len())
+            .map_err(|_| CoveError::ArithOverflow)?
+            .to_le_bytes(),
+    );
+    for entry in report.validated.footer.sections.iter().filter(|entry| {
+        !matches!(
+            SectionKind::from_u16(entry.section_kind),
+            Some(
+                SectionKind::CoverageProviderRegistry
+                    | SectionKind::CoverageSet
+                    | SectionKind::CoverageProofRecord
+            )
+        )
+    }) {
+        seed.extend_from_slice(&entry.section_id.to_le_bytes());
+        seed.extend_from_slice(&entry.section_kind.to_le_bytes());
+        seed.extend_from_slice(&entry.length.to_le_bytes());
+        seed.extend_from_slice(&entry.uncompressed_length.to_le_bytes());
+        seed.extend_from_slice(&entry.item_count.to_le_bytes());
+        seed.extend_from_slice(&entry.row_count.to_le_bytes());
+        seed.extend_from_slice(&entry.crc32c.to_le_bytes());
+    }
+    let ref_id = checksum::crc32c(&seed);
+    Ok(if ref_id == ABSENT_REF {
+        ABSENT_REF - 1
+    } else {
+        ref_id
+    })
+}
+
 fn layout_payload(data: &[u8], entry: &CoveSectionEntryV1) -> Result<Vec<u8>, CoveError> {
     compression::section_payload(data, entry).map(|payload| payload.into_owned())
+}
+
+fn coverage_payload(data: &[u8], entry: &CoveSectionEntryV1) -> Result<Vec<u8>, CoveError> {
+    layout_payload(data, entry)
+}
+
+fn coverage_authority_result(
+    result: Result<(), CoveError>,
+    entries: &[&CoveSectionEntryV1],
+    optional_pushdown_policy: OptionalPushdownPolicy,
+    feature_use: Option<&FeatureUseRequestV2>,
+) -> Result<(), CoveError> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(_error)
+            if entries
+                .iter()
+                .all(|entry| can_fail_open(entry, optional_pushdown_policy, feature_use)) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn first_non_fail_open_layout_error(
@@ -614,6 +1015,12 @@ fn is_map_section(kind: SectionKind) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cove_core::{
+        constants::{CoveLogicalType, CovePhysicalKind},
+        segment::TableSegmentIndexEntryV1,
+        table::ColumnEntry,
+    };
+    use cove_coverage::CoverageSetEntryV2;
     use cove_runtime::RuntimeHintKindV2;
 
     #[test]
@@ -726,5 +1133,161 @@ mod tests {
             OperationKindV2::RedactionPolicyEvaluation,
             SectionKind::RedactionManifest
         ));
+    }
+
+    #[test]
+    fn coverage_authority_accepts_existing_morsel() {
+        let authority = coverage_authority();
+        let entry = coverage_entry(CoverageGranularityV2::Morsel, 1, 0, 0, 0);
+
+        assert!(validate_coverage_entry_authority(&entry, &authority).is_ok());
+    }
+
+    #[test]
+    fn coverage_authority_rejects_missing_segment_and_row_range_overflow() {
+        let authority = coverage_authority();
+        let missing_segment = coverage_entry(CoverageGranularityV2::Segment, 99, 0, 0, 0);
+        assert!(matches!(
+            validate_coverage_entry_authority(&missing_segment, &authority),
+            Err(CoveError::BadCoverage)
+        ));
+
+        let overflowing_range = coverage_entry(CoverageGranularityV2::RowRange, 1, 0, 1, 8);
+        assert!(matches!(
+            validate_coverage_entry_authority(&overflowing_range, &authority),
+            Err(CoveError::BadCoverage)
+        ));
+    }
+
+    #[test]
+    fn coverage_authority_rejects_page_ref_at_upper_bound() {
+        let authority = coverage_authority();
+        let mut valid = coverage_entry(CoverageGranularityV2::Page, 1, 0, 0, 0);
+        valid.page_ref = 1;
+        assert!(validate_coverage_entry_authority(&valid, &authority).is_ok());
+
+        let mut invalid = valid;
+        invalid.page_ref = 2;
+        assert!(matches!(
+            validate_coverage_entry_authority(&invalid, &authority),
+            Err(CoveError::BadCoverage)
+        ));
+    }
+
+    #[test]
+    fn coverage_authority_errors_fail_open_for_ignorable_optional_sections() {
+        let entry = optional_coverage_section_entry();
+        let entries = [&entry];
+
+        assert!(coverage_authority_result(
+            Err(CoveError::BadCoverage),
+            &entries,
+            OptionalPushdownPolicy::FailOpen,
+            None,
+        )
+        .is_ok());
+        assert!(matches!(
+            coverage_authority_result(
+                Err(CoveError::BadCoverage),
+                &entries,
+                OptionalPushdownPolicy::Strict,
+                None,
+            ),
+            Err(CoveError::BadCoverage)
+        ));
+    }
+
+    fn coverage_authority() -> LayoutAuthority {
+        LayoutAuthority {
+            catalog: TableCatalog {
+                flags: 0,
+                tables: vec![TableEntry {
+                    table_id: 1,
+                    namespace: String::new(),
+                    name: "events".into(),
+                    row_count: 8,
+                    primary_sort_key_count: 0,
+                    clustering_key_count: 0,
+                    flags: 0,
+                    columns: vec![ColumnEntry {
+                        column_id: 1,
+                        name: "value".into(),
+                        logical: CoveLogicalType::Int64,
+                        physical: CovePhysicalKind::NumCode,
+                        nullable: false,
+                        sort_order: 0,
+                        collation_id: 0,
+                        precision: 0,
+                        scale: 0,
+                        flags: 0,
+                    }],
+                }],
+            },
+            segments: TableSegmentIndex {
+                flags: 0,
+                entries: vec![TableSegmentIndexEntryV1 {
+                    table_id: 1,
+                    segment_id: 1,
+                    row_start: 0,
+                    row_count: 8,
+                    morsel_count: 2,
+                    morsel_row_count: 4,
+                    column_count: 1,
+                    offset: 128,
+                    length: 256,
+                    stats_ref: 0,
+                    flags: 0,
+                    checksum: 0,
+                }],
+            },
+        }
+    }
+
+    fn optional_coverage_section_entry() -> CoveSectionEntryV1 {
+        CoveSectionEntryV1 {
+            section_id: 1,
+            section_kind: SectionKind::CoverageSet as u16,
+            profile: PrimaryProfile::CoverageMetadata as u8,
+            flags: 0,
+            offset: 0,
+            length: 0,
+            uncompressed_length: 0,
+            item_count: 0,
+            row_count: 0,
+            compression: 0,
+            encryption: 0,
+            alignment_log2: 0,
+            reserved0: 0,
+            required_features: 0,
+            optional_features: 0,
+            crc32c: 0,
+            reserved1: 0,
+        }
+    }
+
+    fn coverage_entry(
+        target_kind: CoverageGranularityV2,
+        segment_id: u32,
+        morsel_id: u32,
+        row_start: u64,
+        row_count: u64,
+    ) -> CoverageSetEntryV2 {
+        CoverageSetEntryV2 {
+            target_kind,
+            flags: 0,
+            file_ref: 0,
+            table_id: 1,
+            segment_id,
+            morsel_id,
+            page_ref: ABSENT_REF,
+            object_type_id: ABSENT_REF,
+            path_ref: ABSENT_REF,
+            dimensional_bucket_ref: ABSENT_REF,
+            row_start,
+            row_count,
+            row_ordinal_bitmap_ref: ABSENT_REF,
+            byte_range_ref: ABSENT_REF,
+            checksum: 0,
+        }
     }
 }

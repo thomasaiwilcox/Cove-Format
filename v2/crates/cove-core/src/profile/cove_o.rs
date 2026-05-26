@@ -46,7 +46,7 @@ pub use segment::{
 };
 pub use segment_index::{TemporalSegmentIndex, TemporalSegmentIndexEntryV1};
 pub use temporal::{validate_self_contained, validate_temporal_order, RecordKind, TemporalRowKey};
-pub use trust::{TrustManifest, TrustManifestEntryV1};
+pub use trust::{temporal_row_trust_payload, TrustDictionary, TrustManifest, TrustManifestEntryV1};
 
 #[cfg(test)]
 mod tests {
@@ -54,12 +54,14 @@ mod tests {
     use crate::{
         checksum,
         constants::{
-            CoveLogicalType, CovePhysicalKind, FEATURE_OBJECT_PROFILE, FEATURE_PAGE_PAYLOAD_ELISION,
+            CoveEncodingKind, CoveLogicalType, CovePhysicalKind, FEATURE_OBJECT_PROFILE,
+            FEATURE_PAGE_PAYLOAD_ELISION,
         },
         page::{
             ColumnPageIndexEntryV1, PAGE_FLAG_ALL_NON_NULL, PAGE_FLAG_ALL_NULL,
             PAGE_FLAG_STATS_ONLY_CONSTANT,
         },
+        page_payload::ColumnPagePayloadV1,
         segment::{TableColumnDirectoryEntryV1, TABLE_COLUMN_DIRECTORY_ENTRY_LEN},
         trust_chain, CoveError,
     };
@@ -346,6 +348,99 @@ mod tests {
         bytes
     }
 
+    fn temporal_segment_with_bool_property(
+        rows: &[TemporalRowEntryV1],
+        values: &[Option<bool>],
+    ) -> Vec<u8> {
+        let row_directory_offset = TEMPORAL_SEGMENT_HEADER_LEN as u64;
+        let row_bytes = (rows.len() * TEMPORAL_ROW_ENTRY_LEN) as u64;
+        let row_end = row_directory_offset + row_bytes;
+        let column_directory_offset = row_end;
+        let page_index_offset = column_directory_offset + TABLE_COLUMN_DIRECTORY_ENTRY_LEN as u64;
+        let page_index_length = crate::page::COLUMN_PAGE_INDEX_ENTRY_LEN as u64;
+        let data_offset = page_index_offset + page_index_length;
+        let mut null_bitmap = vec![0u8; rows.len().div_ceil(8)];
+        let mut value_bytes = Vec::with_capacity(rows.len());
+        let mut null_count = 0u32;
+        for (index, value) in values.iter().enumerate() {
+            match value {
+                Some(value) => value_bytes.push(u8::from(*value)),
+                None => {
+                    null_count += 1;
+                    null_bitmap[index / 8] |= 1u8 << (index % 8);
+                    value_bytes.push(0);
+                }
+            }
+        }
+        let payload = ColumnPagePayloadV1::build_single_node(
+            rows.len() as u32,
+            CoveEncodingKind::PlainFixed,
+            CoveLogicalType::Bool,
+            CovePhysicalKind::Boolean,
+            (null_count != 0).then_some(null_bitmap),
+            value_bytes,
+        )
+        .unwrap();
+        let header = TemporalSegmentHeaderV1 {
+            segment_id: 7,
+            object_type_id: 1,
+            time_range_start_us: rows.first().map(|row| row.timestamp_us).unwrap_or(0),
+            time_range_end_us: rows.last().map(|row| row.timestamp_us).unwrap_or(0),
+            csn_min: rows.first().map(|row| row.csn).unwrap_or(0),
+            csn_max: rows.last().map(|row| row.csn).unwrap_or(0),
+            row_count: rows.len() as u32,
+            morsel_count: u32::from(!rows.is_empty()),
+            morsel_row_count: if rows.is_empty() {
+                0
+            } else {
+                rows.len() as u32
+            },
+            column_count: 1,
+            row_directory_offset,
+            column_directory_offset,
+            page_index_offset,
+            data_offset,
+            flags: 0,
+            checksum: 0,
+        };
+        let directory = TableColumnDirectoryEntryV1 {
+            column_id: 1,
+            logical_type: CoveLogicalType::Bool,
+            physical_kind: CovePhysicalKind::Boolean,
+            flags: 0,
+            page_index_offset,
+            page_index_length,
+            data_offset,
+            data_length: payload.len() as u64,
+            stats_ref: u32::MAX,
+            domain_ref: u32::MAX,
+            checksum: 0,
+        };
+        let page = ColumnPageIndexEntryV1 {
+            column_id: 1,
+            morsel_id: 0,
+            row_count: rows.len() as u32,
+            non_null_count: rows.len() as u32 - null_count,
+            null_count,
+            encoding_root: CoveEncodingKind::PlainFixed as u32,
+            page_offset: data_offset,
+            page_length: payload.len() as u64,
+            uncompressed_length: payload.len() as u64,
+            stats_ref: u32::MAX,
+            flags: 0,
+            checksum: checksum::crc32c(&payload),
+        };
+
+        let mut bytes = header.serialize().to_vec();
+        for row in rows {
+            bytes.extend_from_slice(&row.serialize());
+        }
+        bytes.extend_from_slice(&directory.serialize());
+        bytes.extend_from_slice(&page.serialize());
+        bytes.extend_from_slice(&payload);
+        bytes
+    }
+
     #[test]
     fn temporal_segment_data_roundtrip_validates() {
         let bytes = temporal_segment_bytes(&[temporal_row(10, 1), temporal_row(20, 2)]);
@@ -374,15 +469,24 @@ mod tests {
     }
 
     #[test]
-    fn temporal_property_all_non_null_stats_only_parse_checks_envelope_only() {
+    fn temporal_property_all_non_null_stats_only_requires_contextual_validation() {
         let bytes = temporal_segment_with_stats_only_property_page(
             &[temporal_row(10, 1)],
             1,
             0,
             PAGE_FLAG_STATS_ONLY_CONSTANT | PAGE_FLAG_ALL_NON_NULL,
         );
-        let parsed = TemporalSegmentData::parse_with_required_features(
+        assert_eq!(
+            TemporalSegmentData::parse_with_required_features(
+                &bytes,
+                FEATURE_OBJECT_PROFILE | FEATURE_PAGE_PAYLOAD_ELISION,
+            ),
+            Err(CoveError::PageCorrupt)
+        );
+        let parsed = TemporalSegmentData::parse_with_feature_advertisement(
             &bytes,
+            FEATURE_OBJECT_PROFILE | FEATURE_PAGE_PAYLOAD_ELISION,
+            FEATURE_OBJECT_PROFILE | FEATURE_PAGE_PAYLOAD_ELISION,
             FEATURE_OBJECT_PROFILE | FEATURE_PAGE_PAYLOAD_ELISION,
         )
         .unwrap();
@@ -470,7 +574,15 @@ mod tests {
         for (row_index, row) in segment.rows.iter().enumerate() {
             bytes.extend_from_slice(&segment.header.segment_id.to_le_bytes());
             bytes.extend_from_slice(&(row_index as u32).to_le_bytes());
-            prev = trust_chain::chain(&prev, &row.trust_payload()).unwrap();
+            let payload = temporal_row_trust_payload(
+                segment,
+                row_index as u32,
+                Option::<&crate::dictionary::FileDictionary>::None,
+                &[],
+            )
+            .unwrap();
+            assert!(payload.starts_with(&row.trust_payload()));
+            prev = trust_chain::chain(&prev, &payload).unwrap();
             bytes.extend_from_slice(&prev);
         }
         bytes
@@ -501,6 +613,27 @@ mod tests {
         let manifest = TrustManifest::parse(&bytes).unwrap();
         assert_eq!(
             manifest.verify_against(&[segment]),
+            Err(CoveError::DigestMismatch)
+        );
+    }
+
+    #[cfg(feature = "digest-sha2")]
+    #[test]
+    fn trust_manifest_hashes_temporal_properties() {
+        let rows = [temporal_row(10, 1), temporal_row(20, 2)];
+        let segment = TemporalSegmentData::parse(&temporal_segment_with_bool_property(
+            &rows,
+            &[Some(true), Some(false)],
+        ))
+        .unwrap();
+        let manifest = TrustManifest::parse(&trust_manifest_bytes(&segment)).unwrap();
+        let tampered = TemporalSegmentData::parse(&temporal_segment_with_bool_property(
+            &rows,
+            &[Some(false), Some(false)],
+        ))
+        .unwrap();
+        assert_eq!(
+            manifest.verify_against(&[tampered]),
             Err(CoveError::DigestMismatch)
         );
     }

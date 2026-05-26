@@ -12,7 +12,7 @@ use cove_core::{
         lookup::LookupIndex,
         topn::TopNSummary,
     },
-    segment::TableSegmentIndexEntryV1,
+    segment::{RowMorselEntryV1, TableSegmentIndexEntryV1},
     zone_stats::ZoneStatsEntry,
     CoveError,
 };
@@ -297,7 +297,7 @@ fn exact_count_for_file_column(
         .into_iter()
         .filter(|entry| entry.segment_id != u32::MAX && entry.morsel_id != u32::MAX)
         .collect::<Vec<_>>();
-    exact_morsel_count(file.segments(), &morsel_level)
+    exact_morsel_count(file, &morsel_level)
 }
 
 fn exact_segment_count(
@@ -331,21 +331,20 @@ fn exact_segment_count(
 }
 
 fn exact_morsel_count(
-    segments: &[TableSegmentIndexEntryV1],
+    file: &FileMetadata,
     entries: &[&AggregateEntry],
 ) -> Result<Option<u64>, CoveError> {
-    // Morsel IDs are identifiers, not guaranteed dense ordinals. The segment
-    // index carries only morsel_count/morsel_row_count, so this metadata path
-    // cannot prove full morsel-level coverage without the row-morsel directory.
-    // Fail closed to segment/file-level aggregate coverage instead.
-    let _ = (segments, entries);
-    return Ok(None);
+    exact_morsel_count_with_directories(file.segments(), entries, |segment| {
+        file.row_morsels_for_segment(segment)
+    })
 }
 
-#[allow(dead_code)]
-fn dense_morsel_count_for_tests(
+fn exact_morsel_count_with_directories(
     segments: &[TableSegmentIndexEntryV1],
     entries: &[&AggregateEntry],
+    mut morsels_for_segment: impl FnMut(
+        &TableSegmentIndexEntryV1,
+    ) -> Result<Vec<RowMorselEntryV1>, CoveError>,
 ) -> Result<Option<u64>, CoveError> {
     let expected = segments.iter().try_fold(0usize, |acc, segment| {
         let count = usize::try_from(segment.morsel_count).map_err(|_| CoveError::ArithOverflow)?;
@@ -367,11 +366,18 @@ fn dense_morsel_count_for_tests(
 
     let mut count = 0u64;
     for segment in segments {
-        for morsel_id in 0..segment.morsel_count {
-            let Some(entry) = by_morsel.remove(&(segment.segment_id, morsel_id)) else {
+        let morsels = match morsels_for_segment(segment) {
+            Ok(morsels) => morsels,
+            Err(_) => return Ok(None),
+        };
+        if morsels.len() != segment.morsel_count as usize {
+            return Ok(None);
+        }
+        for morsel in morsels {
+            let Some(entry) = by_morsel.remove(&(segment.segment_id, morsel.morsel_id)) else {
                 return Ok(None);
             };
-            if entry.row_count != expected_morsel_row_count(segment, morsel_id)? {
+            if entry.row_count != morsel.row_count {
                 return Ok(None);
             }
             count = count
@@ -380,22 +386,6 @@ fn dense_morsel_count_for_tests(
         }
     }
     Ok(Some(count))
-}
-
-fn expected_morsel_row_count(
-    segment: &TableSegmentIndexEntryV1,
-    morsel_id: u32,
-) -> Result<u32, CoveError> {
-    if morsel_id >= segment.morsel_count || segment.morsel_row_count == 0 {
-        return Err(CoveError::BadIndex);
-    }
-    let consumed = morsel_id
-        .checked_mul(segment.morsel_row_count)
-        .ok_or(CoveError::ArithOverflow)?;
-    if consumed >= segment.row_count {
-        return Err(CoveError::BadIndex);
-    }
-    Ok(segment.morsel_row_count.min(segment.row_count - consumed))
 }
 
 fn entry_count(entry: &AggregateEntry) -> Result<u64, CoveError> {
@@ -442,6 +432,17 @@ mod tests {
         .unwrap()
     }
 
+    fn morsel(morsel_id: u32, first_row_in_segment: u32, row_count: u32) -> RowMorselEntryV1 {
+        RowMorselEntryV1 {
+            morsel_id,
+            first_row_in_segment,
+            row_count,
+            flags: 0,
+            stats_ref: 0,
+            checksum: 0,
+        }
+    }
+
     #[test]
     fn count_segment_coverage_rejects_duplicates_even_when_rows_sum() {
         let segments = vec![segment(10, 0, 4), segment(20, 4, 4)];
@@ -464,16 +465,48 @@ mod tests {
     fn count_morsel_coverage_rejects_missing_final_morsel() {
         let segments = vec![segment(10, 0, 6)];
         let first = count_entry(10, 0, 4);
-        let selected = exact_morsel_count(&segments, &[&first]).unwrap();
+        let selected = exact_morsel_count_with_directories(&segments, &[&first], |_| {
+            Ok(vec![morsel(0, 0, 4), morsel(1, 4, 2)])
+        })
+        .unwrap();
         assert_eq!(selected, None);
     }
 
     #[test]
-    fn count_morsel_coverage_fails_closed_without_morsel_directory() {
+    fn count_morsel_coverage_accepts_sparse_morsel_ids_from_directory() {
+        let segments = vec![segment(10, 0, 6)];
+        let first = count_entry(10, 3, 4);
+        let second = count_entry(10, 9, 2);
+        let selected = exact_morsel_count_with_directories(&segments, &[&first, &second], |_| {
+            Ok(vec![morsel(3, 0, 4), morsel(9, 4, 2)])
+        })
+        .unwrap();
+        assert_eq!(selected, Some(4));
+    }
+
+    #[test]
+    fn count_morsel_coverage_rejects_dense_guess_against_sparse_directory() {
         let segments = vec![segment(10, 0, 6)];
         let first = count_entry(10, 0, 4);
         let second = count_entry(10, 1, 2);
-        let selected = exact_morsel_count(&segments, &[&first, &second]).unwrap();
+        let selected = exact_morsel_count_with_directories(&segments, &[&first, &second], |_| {
+            Ok(vec![morsel(3, 0, 4), morsel(9, 4, 2)])
+        })
+        .unwrap();
+        assert_eq!(selected, None);
+    }
+
+    #[test]
+    fn count_morsel_coverage_falls_back_when_directory_is_unavailable() {
+        let segments = vec![segment(10, 0, 6)];
+        let first = count_entry(10, 3, 4);
+        let second = count_entry(10, 9, 2);
+        let selected = exact_morsel_count_with_directories(&segments, &[&first, &second], |_| {
+            Err(CoveError::BadSection(
+                "row-morsel directory requires local file bytes".into(),
+            ))
+        })
+        .unwrap();
         assert_eq!(selected, None);
     }
 }

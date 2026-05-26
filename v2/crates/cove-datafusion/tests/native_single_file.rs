@@ -41,6 +41,7 @@ use cove_core::{
         cove_column_page_target_ref, ExtendedFeatureSetHeaderV2, ExtendedFeatureSetV2,
         ProfileCapabilityEntryV2, ProfileCapabilityMatrixHeaderV2, ProfileCapabilityMatrixV2,
     },
+    footer::{CoveFooterHeaderV1, CoveSectionEntryV1, FOOTER_HEADER_SIZE, SECTION_ENTRY_SIZE},
     header::HEADER_SIZE,
     index::{
         aggregate::{AggregateEntry, AggregateSynopsis, SynopsisAccuracy, SynopsisKind},
@@ -57,8 +58,12 @@ use cove_core::{
         },
         topn::{TopNDirection, TopNSummary, TOPN_ZONE_SUMMARY_LEN},
     },
-    page::{PAGE_FLAG_ALL_NON_NULL, PAGE_FLAG_STATS_ONLY_CONSTANT},
+    page::{
+        ColumnPageIndexEntryV1, PAGE_FLAG_ALL_NON_NULL, PAGE_FLAG_ALL_NULL,
+        PAGE_FLAG_STATS_ONLY_CONSTANT,
+    },
     page_payload::ColumnPagePayloadV1,
+    postscript::{CovePostscriptV1, POSTSCRIPT_TOTAL_SIZE},
     profile::cove_e::{
         EngineMountPolicyV1, EngineProfileEntryV1, EngineProfileRegistry,
         ExecutionCodeCanonicality, ExecutionCodeComparisonScope, ExecutionCodeDescriptorV1,
@@ -68,6 +73,7 @@ use cove_core::{
     reader,
     redaction::{RedactionEntry, RedactionManifest},
     row_ref::RowRef,
+    segment::TableSegmentPayloadV1,
     table::{ColumnEntry, TableCatalog, TableEntry},
     wire,
     writer::{ScanPageSpec, ScanProfileCoveWriter, ScanSegment, SectionPayload},
@@ -1666,19 +1672,42 @@ async fn stats_only_constant_page_without_required_stats_fails_closed() {
 
     let path = write_temp_cove("stats_only_missing_stats", bytes);
     let ctx = SessionContext::new();
-    register_cove_file(&ctx, "metrics", &path).unwrap();
-
-    let err = ctx
-        .sql("SELECT signed, unsigned FROM metrics")
-        .await
-        .unwrap()
-        .collect()
-        .await
-        .unwrap_err();
+    let err = register_cove_file(&ctx, "metrics", &path).unwrap_err();
     assert!(
         err.to_string().contains("PAGE_CORRUPT"),
         "unexpected error: {err}"
     );
+    fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn stats_only_all_null_page_scans_without_value_stream() {
+    let path = write_temp_cove(
+        "stats_only_all_null",
+        include_bytes!(
+            "../../../conformance/accept/cove_t_payload_elision_stats_only_all_null_valid.cove"
+        )
+        .to_vec(),
+    );
+    let ctx = SessionContext::new();
+    register_cove_file(&ctx, "events", &path).unwrap();
+
+    let batches = ctx
+        .sql("SELECT COUNT(*) AS rows, COUNT(status_code) AS non_nulls FROM events")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let expected = [
+        "+------+-----------+",
+        "| rows | non_nulls |",
+        "+------+-----------+",
+        "| 6    | 0         |",
+        "+------+-----------+",
+    ];
+    assert_batches_eq!(expected, &batches);
     fs::remove_file(path).unwrap();
 }
 
@@ -2771,22 +2800,22 @@ async fn redacted_filecode_count_column_does_not_use_metadata_fast_path() {
 }
 
 #[tokio::test]
-async fn filecode_zero_without_dictionary_is_not_null() {
-    let path = write_temp_cove("filecode_zero", filecode_without_dictionary_file());
+async fn filecode_without_dictionary_is_rejected_at_registration() {
+    let bytes =
+        include_bytes!("../../../conformance/reject/cove_t_filecode_missing_dictionary.cove");
+    assert!(
+        matches!(
+            bootstrap_bytes("filecode_missing_dictionary", bytes.to_vec()),
+            Err(CoveError::BadFileCode)
+        ),
+        "missing FileCode dictionary must fail ordinary table scan validation"
+    );
+
+    let path = write_temp_cove("filecode_missing_dictionary", bytes.to_vec());
     let ctx = SessionContext::new();
-    register_cove_file(&ctx, "items", &path).unwrap();
+    let err = register_cove_file(&ctx, "items", &path).unwrap_err();
 
-    let err = ctx
-        .sql("SELECT name FROM items")
-        .await
-        .unwrap()
-        .collect()
-        .await
-        .unwrap_err()
-        .to_string();
-
-    assert!(err.contains("FileCode(0)"), "{err}");
-    assert!(!err.to_ascii_lowercase().contains("null"), "{err}");
+    assert!(err.to_string().contains("BAD_FILECODE"), "{err}");
     fs::remove_file(path).unwrap();
 }
 
@@ -3561,8 +3590,13 @@ fn stats_only_numeric_metrics_file(include_stats: bool) -> Vec<u8> {
         }],
     };
     let mut segment = ScanSegment::new(1, 0, 0, 3, 2);
-    segment.set_column_pages(1, vec![stats_only_constant_page(3, 0)]);
-    segment.set_column_pages(2, vec![stats_only_constant_page(3, 1)]);
+    if include_stats {
+        segment.set_column_pages(1, vec![stats_only_constant_page(3, 0)]);
+        segment.set_column_pages(2, vec![stats_only_constant_page(3, 1)]);
+    } else {
+        segment.set_column_pages(1, vec![stats_only_all_null_page(3, 0)]);
+        segment.set_column_pages(2, vec![stats_only_all_null_page(3, 1)]);
+    }
 
     let mut writer = ScanProfileCoveWriter::new(catalog);
     if include_stats {
@@ -3576,7 +3610,16 @@ fn stats_only_numeric_metrics_file(include_stats: bool) -> Vec<u8> {
             .unwrap();
     }
     writer.push_segment(segment);
-    writer.write().unwrap()
+    let bytes = writer.write().unwrap();
+    if include_stats {
+        bytes
+    } else {
+        rewrite_first_segment_pages(bytes, |page| {
+            page.non_null_count = page.row_count;
+            page.null_count = 0;
+            page.flags = (page.flags & !PAGE_FLAG_ALL_NULL) | PAGE_FLAG_ALL_NON_NULL;
+        })
+    }
 }
 
 fn stats_only_float32_file(bits: u32) -> Vec<u8> {
@@ -3626,6 +3669,58 @@ fn stats_only_constant_page(row_count: u32, stats_ref: u32) -> ScanPageSpec {
         .with_flags(PAGE_FLAG_STATS_ONLY_CONSTANT | PAGE_FLAG_ALL_NON_NULL);
     page.stats_ref = stats_ref;
     page
+}
+
+fn stats_only_all_null_page(row_count: u32, stats_ref: u32) -> ScanPageSpec {
+    let mut page = ScanPageSpec::new(row_count, Vec::new())
+        .with_counts(0, row_count)
+        .with_encoding_root(u32::MAX)
+        .with_flags(PAGE_FLAG_STATS_ONLY_CONSTANT | PAGE_FLAG_ALL_NULL);
+    page.stats_ref = stats_ref;
+    page
+}
+
+fn rewrite_first_segment_pages(
+    mut bytes: Vec<u8>,
+    mut mutate: impl FnMut(&mut ColumnPageIndexEntryV1),
+) -> Vec<u8> {
+    let mut postscript = CovePostscriptV1::parse_from_tail(&bytes).unwrap();
+    let footer_start = postscript.footer.offset as usize;
+    let footer_header = CoveFooterHeaderV1::parse(&bytes[footer_start..]).unwrap();
+    let entries_start = footer_start + FOOTER_HEADER_SIZE;
+    for index in 0..footer_header.section_count as usize {
+        let entry_start = entries_start + index * SECTION_ENTRY_SIZE;
+        let mut section_entry =
+            CoveSectionEntryV1::parse(&bytes[entry_start..entry_start + SECTION_ENTRY_SIZE])
+                .unwrap();
+        if section_entry.section_kind != SectionKind::TableSegmentData as u16 {
+            continue;
+        }
+        let segment_start = section_entry.offset as usize;
+        let segment_end = segment_start + section_entry.length as usize;
+        let segment = TableSegmentPayloadV1::parse(&bytes[segment_start..segment_end]).unwrap();
+        for column in &segment.columns {
+            let page_count = column.page_index_length as usize / 60;
+            for page_index in 0..page_count {
+                let page_start =
+                    segment_start + column.page_index_offset as usize + page_index * 60;
+                let mut page =
+                    ColumnPageIndexEntryV1::parse(&bytes[page_start..page_start + 60]).unwrap();
+                mutate(&mut page);
+                bytes[page_start..page_start + 60].copy_from_slice(&page.serialize());
+            }
+        }
+        section_entry.crc32c = checksum::crc32c(&bytes[segment_start..segment_end]);
+        bytes[entry_start..entry_start + SECTION_ENTRY_SIZE]
+            .copy_from_slice(&section_entry.serialize());
+
+        let footer_end = footer_start + postscript.footer.length as usize;
+        postscript.footer.crc32c = checksum::crc32c(&bytes[footer_start..footer_end]);
+        let tail_start = bytes.len() - POSTSCRIPT_TOTAL_SIZE;
+        bytes[tail_start..].copy_from_slice(&postscript.serialize_tail());
+        return bytes;
+    }
+    panic!("generated COVE-T file did not contain TABLE_SEGMENT_DATA");
 }
 
 fn stats_only_entry(
@@ -4684,33 +4779,6 @@ fn dictionary_items_payload_catalog() -> TableCatalog {
             ],
         }],
     }
-}
-
-fn filecode_without_dictionary_file() -> Vec<u8> {
-    let catalog = TableCatalog {
-        flags: 0,
-        tables: vec![TableEntry {
-            table_id: 7,
-            namespace: "public".into(),
-            name: "items".into(),
-            row_count: 1,
-            primary_sort_key_count: 0,
-            clustering_key_count: 0,
-            flags: 0,
-            columns: vec![column(
-                1,
-                "name",
-                CoveLogicalType::Utf8,
-                CovePhysicalKind::FileCode,
-                false,
-            )],
-        }],
-    };
-    let mut segment = ScanSegment::new(7, 0, 0, 1, 1);
-    segment.set_column_pages(1, vec![filecode_page(1, filecodes(&[0]))]);
-    let mut writer = ScanProfileCoveWriter::new(catalog);
-    writer.push_segment(segment);
-    writer.write().unwrap()
 }
 
 fn multiple_tables_file() -> Vec<u8> {

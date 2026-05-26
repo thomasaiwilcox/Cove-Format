@@ -5,6 +5,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     array::{CoveArrayValue, EncodedArray},
+    codec::CodecExtensionDescriptorV2,
     compression,
     constants::{CoveLogicalType, CovePhysicalKind, SectionKind, ValueTag},
     dictionary::{DictionaryValue, FileDictionary},
@@ -188,6 +189,8 @@ pub fn read_object_surface_from_bytes_with_options(
     let mut dictionary_index = None::<Vec<u8>>;
     let mut dictionary_payload = None::<Vec<u8>>;
     let mut zone_stats = Vec::<ZoneStatsEntry>::new();
+    let mut temporal_segment_payloads = Vec::<Vec<u8>>::new();
+    let mut codec_descriptors = Vec::<CodecExtensionDescriptorV2>::new();
 
     for entry in &report.validated.footer.sections {
         let Some(kind) = SectionKind::from_u16(entry.section_kind) else {
@@ -199,10 +202,7 @@ pub fn read_object_surface_from_bytes_with_options(
                 catalog = Some(ObjectTypeCatalog::parse(payload.as_ref())?);
             }
             SectionKind::TemporalSegmentData => {
-                segments.push(TemporalSegmentData::parse_with_required_features(
-                    payload.as_ref(),
-                    entry.required_features,
-                )?);
+                temporal_segment_payloads.push(payload.as_ref().to_vec());
             }
             SectionKind::FileDictionaryIndex => {
                 dictionary_index = Some(payload.as_ref().to_vec());
@@ -212,6 +212,9 @@ pub fn read_object_surface_from_bytes_with_options(
             }
             SectionKind::ZoneStats => {
                 zone_stats.extend(ZoneStatsSection::parse(payload.as_ref())?.entries);
+            }
+            SectionKind::CodecExtensionRegistry => {
+                codec_descriptors.extend(CodecExtensionDescriptorV2::parse_many(payload.as_ref())?);
             }
             kind if is_map_section(kind) => {
                 let embedded = parse_embedded_section(kind, payload.as_ref())?;
@@ -228,6 +231,15 @@ pub fn read_object_surface_from_bytes_with_options(
             }
             _ => {}
         }
+    }
+    for payload in temporal_segment_payloads {
+        segments.push(
+            TemporalSegmentData::parse_after_semantic_validation_with_codec_descriptors(
+                &payload,
+                report.validated.header.required_features,
+                &codec_descriptors,
+            )?,
+        );
     }
     let dictionary = match dictionary_index {
         Some(index) => Some(FileDictionary::parse(

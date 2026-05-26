@@ -1447,6 +1447,7 @@ fn validate_release_gate_contract(corpus: &Path, value: &Value) -> Result<(), Co
         CoveError::BadSection("cannot locate repository root from conformance corpus".into())
     })?;
     let gate_path = repo_root.join("scripts/release-gates.sh");
+    validate_script_executable(&gate_path)?;
     let contents = std::fs::read_to_string(&gate_path).map_err(|error| {
         CoveError::BadSection(format!(
             "cannot read release-gate script {}: {error}",
@@ -1460,6 +1461,30 @@ fn validate_release_gate_contract(corpus: &Path, value: &Value) -> Result<(), Co
             )));
         }
     }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_script_executable(path: &Path) -> Result<(), CoveError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let metadata = std::fs::metadata(path).map_err(|error| {
+        CoveError::BadSection(format!(
+            "cannot stat release-gate script {}: {error}",
+            path.display()
+        ))
+    })?;
+    if metadata.permissions().mode() & 0o111 == 0 {
+        return Err(CoveError::BadSection(format!(
+            "release-gate script {} is not executable",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_script_executable(_path: &Path) -> Result<(), CoveError> {
     Ok(())
 }
 

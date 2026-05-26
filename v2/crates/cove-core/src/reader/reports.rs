@@ -1,4 +1,4 @@
-use crate::{feature_scope::FeatureUseRequestV2, CoveError};
+use crate::{feature_binding::OperationKindV2, feature_scope::FeatureUseRequestV2, CoveError};
 
 /// Options controlling the depth of validation.
 #[derive(Debug, Clone)]
@@ -231,6 +231,9 @@ pub fn validate_bytes_for_feature_use(
     opts: ValidationOptions,
     request: FeatureUseRequestV2,
 ) -> Result<ValidationReport, CoveError> {
+    if request_is_ordinary_table_scan(&request) {
+        return validate_bytes_for_ordinary_table_scan(data, opts, request);
+    }
     let optional_pushdown_policy = opts.optional_pushdown_policy;
     let report = validate_bytes_with_options_inner(data, opts, Some(&request))?;
     for ignored in &report.ignored_optional_sections {
@@ -355,6 +358,17 @@ where
     V: OptionalProfilePayloadValidator + ?Sized,
 {
     let optional_pushdown_policy = opts.optional_pushdown_policy;
+    if request_is_ordinary_table_scan(&request) {
+        let report = validate_bytes_for_ordinary_table_scan(data, opts, request.clone())?;
+        validator.validate_optional_profile_sections(
+            data,
+            &report,
+            optional_pushdown_policy,
+            Some(&request),
+            !report.semantic_checked,
+        )?;
+        return Ok(report);
+    }
     let report = validate_bytes_with_options_inner(data, opts, Some(&request))?;
     for ignored in &report.ignored_optional_sections {
         if super::profile_validators::ignored_section_required_for_feature_use(ignored, &request) {
@@ -371,6 +385,10 @@ where
         !report.semantic_checked,
     )?;
     Ok(report)
+}
+
+fn request_is_ordinary_table_scan(request: &FeatureUseRequestV2) -> bool {
+    request.requested_operation == Some(OperationKindV2::OrdinaryTableScan)
 }
 
 fn fail_closed_required_optional_profile_sections(

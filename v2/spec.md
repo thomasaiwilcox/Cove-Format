@@ -2674,8 +2674,8 @@ struct ColumnPageIndexEntryV2 {
 | --- | --- | --- |
 | 0x0000_00FF | PAGE_FLAG_COMPRESSION_CODEC | Page-level `CompressionCodec` value from Section 66. |
 | 0x0000_0100 | PAGE_FLAG_STATS_ONLY_CONSTANT | No page payload exists; the page is reconstructed from page index counts and, for all-non-null pages, a validated page-level ZoneStatsEntry. Requires FEATURE_PAGE_PAYLOAD_ELISION. |
-| 0x0000_0200 | PAGE_FLAG_ALL_NULL | Every row in the page is null. Requires FEATURE_PAGE_PAYLOAD_ELISION when used to omit payload or null-position data. |
-| 0x0000_0400 | PAGE_FLAG_ALL_NON_NULL | Every row in the page is non-null. Requires FEATURE_PAGE_PAYLOAD_ELISION when used to omit payload or null-position data. |
+| 0x0000_0200 | PAGE_FLAG_ALL_NULL | Every row in the page is null. This fact flag does not by itself require FEATURE_PAGE_PAYLOAD_ELISION. |
+| 0x0000_0400 | PAGE_FLAG_ALL_NON_NULL | Every row in the page is non-null. This fact flag does not by itself require FEATURE_PAGE_PAYLOAD_ELISION. |
 | 0x0000_0800 | PAGE_FLAG_VALUE_STREAM_ELIDED | The non-null value stream is elided because the non-null value is constant. A null bitmap may still be present unless ALL_NULL or ALL_NON_NULL is set. Requires FEATURE_PAGE_PAYLOAD_ELISION. |
 | 0xFFFF_F000 | reserved | Reserved for future required page extensions; MUST be zero in v2 unless a required extension defines the bit and the reader supports that extension. |
 
@@ -2689,9 +2689,10 @@ struct ColumnPageIndexEntryV2 {
 - Readers MUST reject unknown page codec values and any non-zero reserved page flag bits unless a required extension defines the bit and the reader supports that extension.
 
 **Page flag consistency:**
-- Page-elision flags are decode-affecting metadata. Writers that use PAGE_FLAG_STATS_ONLY_CONSTANT, PAGE_FLAG_ALL_NULL to omit null-position data, PAGE_FLAG_ALL_NON_NULL to omit null-position data, or PAGE_FLAG_VALUE_STREAM_ELIDED MUST set FEATURE_PAGE_PAYLOAD_ELISION in required_features. A reader that does not support FEATURE_PAGE_PAYLOAD_ELISION MUST reject the file before decoding those pages.
+- PAGE_FLAG_ALL_NULL and PAGE_FLAG_ALL_NON_NULL are exact page facts. They are not feature-gated when the ordinary page payload still carries all decode-required data.
+- Payload-elision flags are decode-affecting metadata. Writers that use PAGE_FLAG_STATS_ONLY_CONSTANT or PAGE_FLAG_VALUE_STREAM_ELIDED MUST set FEATURE_PAGE_PAYLOAD_ELISION in required_features. A reader that does not support FEATURE_PAGE_PAYLOAD_ELISION MUST reject the file before decoding those pages.
 - PAGE_FLAG_ALL_NULL and PAGE_FLAG_ALL_NON_NULL are mutually exclusive.
-- PAGE_FLAG_ALL_NULL requires null_count == row_count and non_null_count == 0. The null bitmap MAY be omitted only when FEATURE_PAGE_PAYLOAD_ELISION is required; any present null bitmap MUST contain only null bits for rows in the page with unused final-byte bits zeroed.
+- PAGE_FLAG_ALL_NULL requires null_count == row_count and non_null_count == 0. The null bitmap MAY be omitted only when PAGE_FLAG_STATS_ONLY_CONSTANT is set and FEATURE_PAGE_PAYLOAD_ELISION is required; any present null bitmap MUST contain only null bits for rows in the page with unused final-byte bits zeroed.
 - PAGE_FLAG_ALL_NON_NULL requires null_count == 0 and non_null_count == row_count. The null bitmap MAY be omitted because every row is non-null; any present null bitmap MUST contain only zero bits with unused final-byte bits zeroed.
 - If neither PAGE_FLAG_ALL_NULL nor PAGE_FLAG_ALL_NON_NULL is set, the counts still determine how much null-position information is required. A mixed null/non-null page MUST include a validated null-position representation; a page with null_count == 0 MAY omit the null bitmap.
 - Page flags MUST be internally consistent with row_count, null_count, non_null_count, page_length, uncompressed_length, encoding_root, checksum, and any referenced stats_ref. A mismatch is page corruption; flags are not hints and MUST NOT override the counts or validated payload metadata.

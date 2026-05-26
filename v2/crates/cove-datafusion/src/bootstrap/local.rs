@@ -2,11 +2,13 @@ use std::{fs, path::Path, path::PathBuf, sync::Arc};
 
 use cove_cache::CoverageCacheV2;
 use cove_core::{
-    constants::DigestAlgorithm,
+    constants::{CovePhysicalKind, DigestAlgorithm},
+    dictionary::FileDictionary,
     digest::compute_digest,
     feature_binding::OperationKindV2,
     feature_scope::FeatureUseRequestV2,
     reader::{self, OptionalPushdownPolicy, ValidationOptions},
+    table::TableCatalog,
     CoveError,
 };
 
@@ -88,22 +90,23 @@ pub fn bootstrap_bytes_with_covi_artifacts(
     covi_artifacts: Vec<Vec<u8>>,
     options: CoveTableOptions,
 ) -> Result<Arc<DatasetState>, CoveError> {
-    use cove_core::{constants::DigestAlgorithm, digest::compute_digest};
-    use cove_index::execution::CoviValidationContextV2;
+    use cove_core::{checksum, constants::DigestAlgorithm, digest::compute_digest};
 
     let file_digest = compute_digest(DigestAlgorithm::Sha256, &bytes).ok();
+    let file_crc32c = checksum::crc32c(&bytes);
+    let file_len = bytes.len() as u64;
     let state = bootstrap_bytes_with_options(source, bytes, options)?;
     let mut stats = crate::dataset_state::DatasetBootstrapStats::default();
     let mut covi = None;
     if let Some(file) = state.files().first() {
         for artifact_bytes in covi_artifacts {
-            let mut context = CoviValidationContextV2::for_file(
-                file.identity().file_id,
-                file.identity().file_len,
+            let snapshot_id = crate::bootstrap::covi::derived_covi_snapshot_id_from_parts(
+                file_crc32c,
                 file.identity().footer_crc32c,
-            )
-            .with_dataset_id(file.identity().file_id)
-            .with_file_code_keys(true);
+                file_len,
+            );
+            let mut context = crate::bootstrap::covi::base_covi_validation_context(file)
+                .with_snapshot_id(snapshot_id);
             if let Some(digest) = file_digest.clone() {
                 context = context.with_file_digest(DigestAlgorithm::Sha256, digest);
             }
@@ -150,13 +153,15 @@ pub async fn bootstrap_range_reader_with_options<R: CoveRangeReader + ?Sized>(
     let feature_scope_table = parse_feature_scope_table(reader, &header, &footer).await?;
     feature_scope_table
         .reject_unknowns_for_request(&ordinary_table_scan_feature_use_request(&footer))?;
+    validate_ordinary_table_scan_semantics(file_len, reader, &footer).await?;
     if options.execution_code_policy() == ExecutionCodePolicy::RequireSupported {
         validate_required_engine_execution_semantics(file_len, reader).await?;
     }
 
     let table_catalog = parse_table_catalog(reader, &footer).await?;
-    let table = select_table(&table_catalog, options.table_selection())?;
     let dictionary = parse_dictionary(reader, &footer).await?;
+    validate_filecode_dictionary_presence(&table_catalog, dictionary.as_ref())?;
+    let table = select_table(&table_catalog, options.table_selection())?;
     let engine_metadata = parse_engine_metadata(
         reader,
         &footer,
@@ -200,6 +205,27 @@ pub async fn bootstrap_range_reader_with_options<R: CoveRangeReader + ?Sized>(
     Ok(state)
 }
 
+async fn validate_ordinary_table_scan_semantics<R: CoveRangeReader + ?Sized>(
+    file_len: u64,
+    reader: &R,
+    footer: &cove_core::footer::CoveFooter,
+) -> Result<(), CoveError> {
+    let bytes = reader
+        .read_range(0..file_len, RangeReadKind::Metadata)
+        .await?;
+    reader::validate_bytes_for_ordinary_table_scan(
+        &bytes,
+        ValidationOptions {
+            semantic: true,
+            verify_digests: false,
+            allow_unknown_optional_extensions: true,
+            optional_pushdown_policy: OptionalPushdownPolicy::FailOpen,
+        },
+        ordinary_table_scan_feature_use_request(footer),
+    )?;
+    Ok(())
+}
+
 async fn validate_required_engine_execution_semantics<R: CoveRangeReader + ?Sized>(
     file_len: u64,
     reader: &R,
@@ -217,6 +243,22 @@ async fn validate_required_engine_execution_semantics<R: CoveRangeReader + ?Size
         },
         FeatureUseRequestV2::new().with_operation(OperationKindV2::EngineExecutionMapping),
     )?;
+    Ok(())
+}
+
+fn validate_filecode_dictionary_presence(
+    table_catalog: &TableCatalog,
+    dictionary: Option<&FileDictionary>,
+) -> Result<(), CoveError> {
+    let uses_filecode = table_catalog.tables.iter().any(|table| {
+        table
+            .columns
+            .iter()
+            .any(|column| column.physical == CovePhysicalKind::FileCode)
+    });
+    if uses_filecode && dictionary.is_none() {
+        return Err(CoveError::BadFileCode);
+    }
     Ok(())
 }
 

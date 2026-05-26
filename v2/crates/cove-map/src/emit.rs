@@ -20,7 +20,7 @@ pub(crate) fn build_cove_o_with_source_states(
     let segments =
         build_temporal_segments(&materialized, &nested_shapes, file_dictionary.as_ref())?;
     let segment_index = temporal_segment_index(&segments)?;
-    let trust_manifest = trust_manifest(&segments)?;
+    let trust_manifest = trust_manifest(&segments, file_dictionary.as_ref())?;
 
     let mut writer = MinimalCoveWriter::new();
     writer.primary_profile = PrimaryProfile::ObjectTemporal as u8;

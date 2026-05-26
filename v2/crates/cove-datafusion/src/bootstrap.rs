@@ -146,7 +146,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_bootstrap_skips_full_file_semantic_read() {
+    fn metadata_bootstrap_validates_full_file_once_before_caching() {
         let bytes = cache_test_bytes();
         let full_metadata_reads = Arc::new(AtomicUsize::new(0));
         let reader = CountingRangeReader {
@@ -174,7 +174,24 @@ mod tests {
         .unwrap();
 
         assert!(Arc::ptr_eq(&first, &second));
-        assert_eq!(full_metadata_reads.load(Ordering::Relaxed), 0);
+        assert_eq!(full_metadata_reads.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn metadata_bootstrap_rejects_filecode_column_without_dictionary() {
+        let bytes =
+            include_bytes!("../../../conformance/reject/cove_t_filecode_missing_dictionary.cove")
+                .to_vec();
+        let reader = MemoryRangeReader::new(bytes.clone());
+        let result = futures::executor::block_on(bootstrap_range_reader_with_options(
+            "memory://missing-dictionary",
+            bytes.len() as u64,
+            &reader,
+            CoveTableOptions::default(),
+            None,
+        ));
+
+        assert!(matches!(result, Err(CoveError::BadFileCode)));
     }
 
     #[test]

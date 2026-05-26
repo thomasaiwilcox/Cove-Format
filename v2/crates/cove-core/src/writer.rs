@@ -4,10 +4,8 @@
 //! The produced file satisfies the COVE-Core Minimal Profile (Section 72.1).
 //!
 //! `write()` is a convenience wrapper that buffers the complete file in memory.
-//! `write_to()` streams the file to a `Write + Seek` target, and durable
-//! publication uses that path so it does not require a second full-file buffer;
-//! transient allocation is bounded by the largest section or encoded page that
-//! must be compressed before its footer entry can be written.
+//! `write_to()` streams minimal files directly. The scan-profile writer may
+//! buffer enough state to validate semantic page contracts before publishing.
 //!
 //! # Example
 //!
@@ -38,7 +36,7 @@ use crate::{
         FEATURE_TOPN_SUMMARIES, FOOTER_VERSION_V1, HEADER_LEN_V1, KNOWN_FEATURE_BITS_MASK,
         MAGIC_COVE, MAGIC_COVE_FOOTER, SECTION_ENTRY_LEN, VERSION_MAJOR_V1,
     },
-    dictionary::FileDictionary,
+    dictionary::{FileDictionary, FileDictionaryView},
     domain::ColumnDomain,
     durable,
     footer::{CoveFooterHeaderV1, CoveSectionEntryV1, FOOTER_HEADER_SIZE},
@@ -55,6 +53,9 @@ use crate::{
         PAGE_FLAG_STATS_ONLY_CONSTANT,
     },
     page_payload::ColumnPagePayloadV1,
+    page_validation::{
+        validate_column_page_payload, validate_stats_only_constant_page, PageValidationContext,
+    },
     postscript::{CovePostscriptV1, CoveSectionSpecV1, POSTSCRIPT_SIZE},
     segment::{
         RowMorselDirectory, RowMorselEntryV1, TableColumnDirectoryEntryV1, TableSegmentHeaderV1,
@@ -63,7 +64,7 @@ use crate::{
         TABLE_SEGMENT_HEADER_LEN, TABLE_SEGMENT_INDEX_ENTRY_LEN,
     },
     table::{ColumnEntry, TableCatalog, COLUMN_FLAG_BOOL_DECLARED_NUMERIC},
-    zone_stats::ZoneStatsSection,
+    zone_stats::{ZoneStatsEntry, ZoneStatsSection},
     CoveError,
 };
 
@@ -184,21 +185,27 @@ mod tests {
     #[cfg(feature = "compression-zstd")]
     use crate::constants::FEATURE_CODEC_ZSTD;
     use crate::{
+        canonical::CanonicalValue,
         compression::column_page_payload,
         constants::{
             CoveLogicalType, CovePhysicalKind, FEATURE_NESTED_COLUMNS,
             FEATURE_PAGE_PAYLOAD_ELISION, METADATA_LEN_MAX,
         },
+        dictionary::{FileDictionaryEncoding, FileDictionaryHeaderV1, FileDictionaryKey},
         encoding::nested::{ListLayout, ListLayoutPayload},
         footer::CoveFooter,
         header::CoveHeaderV1,
         nested_schema::{NestedSchemaEntryV1, NestedSchemaNodeV1, NestedSchemaSectionV1},
-        page::{ColumnPageIndex, PAGE_FLAG_ALL_NULL, PAGE_FLAG_STATS_ONLY_CONSTANT},
+        page::{
+            ColumnPageIndex, PAGE_FLAG_ALL_NON_NULL, PAGE_FLAG_ALL_NULL,
+            PAGE_FLAG_STATS_ONLY_CONSTANT,
+        },
         page_payload::{ColumnPagePayloadV1, CoveEncodingNodeV1, PageBufferKind},
         postscript::CovePostscriptV1,
         reader::{validate_bytes_with_options, ValidationOptions},
         segment::TableSegmentPayloadV1,
         table::{ColumnEntry, TableEntry},
+        zone_stats::{StatKind, StatScalar, ZoneScope, ZoneStatFlags, ZoneStats, ZoneStatsEntry},
     };
     #[cfg(any(feature = "compression-lz4", feature = "compression-zstd"))]
     use crate::{
@@ -466,6 +473,60 @@ mod tests {
             .unwrap();
         assert_eq!(segment_index.entries[0].offset, segment_data_entry.offset);
         assert_eq!(segment_index.entries[0].row_count, 10);
+    }
+
+    #[test]
+    fn semantic_validation_rejects_declared_primary_sort_out_of_order() {
+        let catalog = TableCatalog {
+            flags: 0,
+            tables: vec![TableEntry {
+                table_id: 1,
+                namespace: "public".into(),
+                name: "events".into(),
+                row_count: 3,
+                primary_sort_key_count: 1,
+                clustering_key_count: 0,
+                flags: 0,
+                columns: vec![ColumnEntry {
+                    column_id: 1,
+                    name: "id".into(),
+                    logical: CoveLogicalType::Int64,
+                    physical: CovePhysicalKind::NumCode,
+                    nullable: false,
+                    sort_order: 1,
+                    collation_id: 0,
+                    precision: 0,
+                    scale: 0,
+                    flags: 0,
+                }],
+            }],
+        };
+        let mut page_values = Vec::new();
+        for value in [2u64, 1, 3] {
+            page_values.extend_from_slice(&value.to_le_bytes());
+        }
+        let mut segment = ScanSegment::new(1, 0, 0, 3, 1);
+        segment.set_column_pages(
+            1,
+            vec![ScanPageSpec::new(3, page_values)
+                .with_encoding_root(crate::constants::CoveEncodingKind::NumCode as u32)],
+        );
+
+        let mut writer = ScanProfileCoveWriter::new(catalog);
+        writer.push_segment(segment);
+        let bytes = writer.write().unwrap();
+        assert!(matches!(
+            validate_bytes_with_options(
+                &bytes,
+                ValidationOptions {
+                    semantic: true,
+                    verify_digests: false,
+                    allow_unknown_optional_extensions: true,
+                    ..ValidationOptions::default()
+                },
+            ),
+            Err(CoveError::BadSchema(_))
+        ));
     }
 
     #[test]
@@ -1074,5 +1135,268 @@ mod tests {
             .unwrap();
         writer.push_segment(ScanSegment::new(1, 0, 0, 3, 1));
         assert!(matches!(writer.write(), Err(CoveError::BadSection(_))));
+    }
+
+    #[test]
+    fn scan_profile_writer_rejects_filecode_column_without_dictionary() {
+        let catalog = TableCatalog {
+            flags: 0,
+            tables: vec![TableEntry {
+                table_id: 1,
+                namespace: "public".into(),
+                name: "labels".into(),
+                row_count: 1,
+                primary_sort_key_count: 0,
+                clustering_key_count: 0,
+                flags: 0,
+                columns: vec![ColumnEntry {
+                    column_id: 1,
+                    name: "label".into(),
+                    logical: CoveLogicalType::Utf8,
+                    physical: CovePhysicalKind::FileCode,
+                    nullable: false,
+                    sort_order: 0,
+                    collation_id: 0,
+                    precision: 0,
+                    scale: 0,
+                    flags: 0,
+                }],
+            }],
+        };
+        let mut writer = ScanProfileCoveWriter::new(catalog);
+        writer.push_segment(ScanSegment::new(1, 0, 0, 1, 1));
+        assert_eq!(writer.write(), Err(CoveError::BadFileCode));
+    }
+
+    #[test]
+    fn scan_profile_writer_rejects_out_of_range_filecode_page() {
+        let catalog = TableCatalog {
+            flags: 0,
+            tables: vec![TableEntry {
+                table_id: 1,
+                namespace: "public".into(),
+                name: "labels".into(),
+                row_count: 1,
+                primary_sort_key_count: 0,
+                clustering_key_count: 0,
+                flags: 0,
+                columns: vec![ColumnEntry {
+                    column_id: 1,
+                    name: "label".into(),
+                    logical: CoveLogicalType::Utf8,
+                    physical: CovePhysicalKind::FileCode,
+                    nullable: false,
+                    sort_order: 0,
+                    collation_id: 0,
+                    precision: 0,
+                    scale: 0,
+                    flags: 0,
+                }],
+            }],
+        };
+        let dictionary =
+            FileDictionaryEncoding::from_keys([FileDictionaryKey::from_logical_bytes(
+                CoveLogicalType::Utf8,
+                &CanonicalValue::Utf8("alpha".into()).encode().unwrap(),
+            )
+            .unwrap()])
+            .unwrap()
+            .dictionary;
+        let mut segment = ScanSegment::new(1, 0, 0, 1, 1);
+        segment.set_column_pages(
+            1,
+            vec![ScanPageSpec::new(1, 1u32.to_le_bytes().to_vec())
+                .with_counts(1, 0)
+                .with_encoding_root(CoveEncodingKind::FileCode as u32)],
+        );
+        let mut writer = ScanProfileCoveWriter::new(catalog);
+        writer.push_file_dictionary(&dictionary);
+        writer.push_segment(segment);
+        assert_eq!(writer.write(), Err(CoveError::BadFileCode));
+    }
+
+    #[test]
+    fn scan_profile_writer_rejects_default_filecode_page_with_empty_dictionary() {
+        let catalog = TableCatalog {
+            flags: 0,
+            tables: vec![TableEntry {
+                table_id: 1,
+                namespace: "public".into(),
+                name: "labels".into(),
+                row_count: 1,
+                primary_sort_key_count: 0,
+                clustering_key_count: 0,
+                flags: 0,
+                columns: vec![ColumnEntry {
+                    column_id: 1,
+                    name: "label".into(),
+                    logical: CoveLogicalType::Utf8,
+                    physical: CovePhysicalKind::FileCode,
+                    nullable: false,
+                    sort_order: 0,
+                    collation_id: 0,
+                    precision: 0,
+                    scale: 0,
+                    flags: 0,
+                }],
+            }],
+        };
+        let dictionary = FileDictionary {
+            header: FileDictionaryHeaderV1 {
+                entry_count: 0,
+                flags: 0,
+                index_entry_len: FileDictionaryHeaderV1::INDEX_ENTRY_LEN,
+                value_hash_algorithm: 0,
+                payload_length: 0,
+                reserved: [0; 24],
+            },
+            entries: Vec::new(),
+            payload: Vec::new(),
+        };
+        let mut writer = ScanProfileCoveWriter::new(catalog);
+        writer.push_file_dictionary(&dictionary);
+        writer.push_segment(ScanSegment::new(1, 0, 0, 1, 1));
+        assert_eq!(writer.write(), Err(CoveError::BadFileCode));
+    }
+
+    #[test]
+    fn scan_profile_writer_rejects_stats_only_all_non_null_without_stats() {
+        let catalog = TableCatalog {
+            flags: 0,
+            tables: vec![TableEntry {
+                table_id: 1,
+                namespace: "public".into(),
+                name: "numbers".into(),
+                row_count: 2,
+                primary_sort_key_count: 0,
+                clustering_key_count: 0,
+                flags: 0,
+                columns: vec![ColumnEntry {
+                    column_id: 1,
+                    name: "value".into(),
+                    logical: CoveLogicalType::Int64,
+                    physical: CovePhysicalKind::NumCode,
+                    nullable: false,
+                    sort_order: 0,
+                    collation_id: 0,
+                    precision: 0,
+                    scale: 0,
+                    flags: 0,
+                }],
+            }],
+        };
+        let mut segment = ScanSegment::new(1, 0, 0, 2, 1);
+        segment.set_column_pages(
+            1,
+            vec![ScanPageSpec::new(2, Vec::new())
+                .with_counts(2, 0)
+                .with_encoding_root(u32::MAX)
+                .with_flags(PAGE_FLAG_STATS_ONLY_CONSTANT | PAGE_FLAG_ALL_NON_NULL)],
+        );
+        let mut writer = ScanProfileCoveWriter::new(catalog);
+        writer.push_segment(segment);
+        assert_eq!(writer.write(), Err(CoveError::PageCorrupt));
+    }
+
+    #[test]
+    fn scan_profile_writer_accepts_stats_only_filecode_with_exact_stats() {
+        let catalog = TableCatalog {
+            flags: 0,
+            tables: vec![TableEntry {
+                table_id: 1,
+                namespace: "public".into(),
+                name: "labels".into(),
+                row_count: 2,
+                primary_sort_key_count: 0,
+                clustering_key_count: 0,
+                flags: 0,
+                columns: vec![ColumnEntry {
+                    column_id: 1,
+                    name: "label".into(),
+                    logical: CoveLogicalType::Utf8,
+                    physical: CovePhysicalKind::FileCode,
+                    nullable: false,
+                    sort_order: 0,
+                    collation_id: 0,
+                    precision: 0,
+                    scale: 0,
+                    flags: 0,
+                }],
+            }],
+        };
+        let dictionary =
+            FileDictionaryEncoding::from_keys([FileDictionaryKey::from_logical_bytes(
+                CoveLogicalType::Utf8,
+                &CanonicalValue::Utf8("alpha".into()).encode().unwrap(),
+            )
+            .unwrap()])
+            .unwrap()
+            .dictionary;
+        let mut segment = ScanSegment::new(1, 0, 0, 2, 1);
+        segment.set_column_pages(
+            1,
+            vec![ScanPageSpec::new(2, Vec::new())
+                .with_counts(2, 0)
+                .with_encoding_root(u32::MAX)
+                .with_flags(PAGE_FLAG_STATS_ONLY_CONSTANT | PAGE_FLAG_ALL_NON_NULL)],
+        );
+        let scalar = StatScalar {
+            kind: StatKind::UInt64,
+            bytes: 0u64.to_le_bytes().to_vec(),
+            truncated: false,
+        };
+        let zone_stats = ZoneStatsSection {
+            entries: vec![ZoneStatsEntry {
+                table_id: 1,
+                segment_id: 0,
+                morsel_id: 0,
+                column_id: 1,
+                non_null_count: 2,
+                distinct_count: 1,
+                run_count: 1,
+                stats: ZoneStats {
+                    scope: ZoneScope::Morsel,
+                    row_count: 2,
+                    null_count: 0,
+                    min: Some(scalar.clone()),
+                    max: Some(scalar),
+                    flags: ZoneStatFlags::HAS_MIN_MAX | ZoneStatFlags::CONSTANT,
+                },
+                min_domain_rank: 0,
+                max_domain_rank: 0,
+                exact_set_ref: u32::MAX,
+                bloom_ref: u32::MAX,
+            }],
+        };
+        let mut writer = ScanProfileCoveWriter::new(catalog);
+        writer.push_file_dictionary(&dictionary);
+        writer.push_zone_stats(&zone_stats).unwrap();
+        writer.push_segment(segment);
+
+        let bytes = writer.write().unwrap();
+        validate_bytes_with_options(
+            &bytes,
+            ValidationOptions {
+                semantic: true,
+                verify_digests: false,
+                allow_unknown_optional_extensions: true,
+                ..ValidationOptions::default()
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn scan_profile_writer_write_to_requires_start_position() {
+        let writer = ScanProfileCoveWriter::new(TableCatalog {
+            flags: 0,
+            tables: Vec::new(),
+        });
+        let mut cursor = Cursor::new(vec![0]);
+        cursor.seek(SeekFrom::End(0)).unwrap();
+        assert!(matches!(
+            writer.write_to(&mut cursor),
+            Err(CoveError::BadSection(_))
+        ));
     }
 }

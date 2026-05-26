@@ -6,9 +6,13 @@ mod pruning_sections;
 mod schema;
 mod segment;
 
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc,
+use std::{
+    borrow::Cow,
+    path::Path,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
 };
 
 use arrow_schema::SchemaRef;
@@ -29,8 +33,12 @@ use cove_core::{
     mount::MountedCoveFile,
     nested_schema::{NestedSchemaNodeV1, NestedSchemaSectionV1},
     page::{page_flag_codec, ColumnPageIndexEntryV1},
-    segment::TableSegmentIndexEntryV1,
+    segment::{
+        RowMorselDirectory, RowMorselEntryV1, TableSegmentHeaderV1, TableSegmentIndexEntryV1,
+        ROW_MORSEL_ENTRY_LEN, TABLE_SEGMENT_HEADER_LEN,
+    },
     table::{ColumnEntry, TableEntry},
+    wire,
     zone_stats::{ZoneStatsEntry, ZoneStatsSection},
     CoveError,
 };
@@ -767,6 +775,81 @@ impl FileMetadata {
 
     pub fn segments(&self) -> &[TableSegmentIndexEntryV1] {
         self.segments.as_slice()
+    }
+
+    pub(crate) fn row_morsels_for_segment(
+        &self,
+        segment: &TableSegmentIndexEntryV1,
+    ) -> Result<Vec<RowMorselEntryV1>, CoveError> {
+        let file_bytes = if let Some(bytes) = self.full_file_bytes() {
+            Cow::Borrowed(bytes)
+        } else if Path::new(self.source()).is_file() {
+            Cow::Owned(std::fs::read(self.source())?)
+        } else {
+            return Err(CoveError::BadSection(
+                "row-morsel directory requires local file bytes".into(),
+            ));
+        };
+        let segment_start = usize::try_from(segment.offset).map_err(|_| CoveError::OffsetRange)?;
+        let segment_len = usize::try_from(segment.length).map_err(|_| CoveError::OffsetRange)?;
+        let segment_bytes =
+            wire::read_range_checked(file_bytes.as_ref(), segment_start, segment_len)?;
+        let header = TableSegmentHeaderV1::parse(segment_bytes)?;
+        if header.table_id != segment.table_id
+            || header.segment_id != segment.segment_id
+            || header.row_start != segment.row_start
+            || header.row_count != segment.row_count
+            || header.morsel_count != segment.morsel_count
+            || header.morsel_row_count != segment.morsel_row_count
+            || header.column_count != segment.column_count
+        {
+            return Err(CoveError::SegmentCorrupt);
+        }
+        let morsel_offset =
+            usize::try_from(header.morsel_directory_offset).map_err(|_| CoveError::OffsetRange)?;
+        if morsel_offset < TABLE_SEGMENT_HEADER_LEN || morsel_offset > segment_bytes.len() {
+            return Err(CoveError::SegmentCorrupt);
+        }
+        let morsel_len = (header.morsel_count as usize)
+            .checked_mul(ROW_MORSEL_ENTRY_LEN)
+            .ok_or(CoveError::ArithOverflow)?;
+        let morsel_end = morsel_offset
+            .checked_add(morsel_len)
+            .ok_or(CoveError::ArithOverflow)?;
+        if morsel_end > segment_bytes.len() {
+            return Err(CoveError::SegmentCorrupt);
+        }
+        let directory = RowMorselDirectory::parse(
+            &segment_bytes[morsel_offset..morsel_end],
+            header.morsel_count,
+        )?;
+        if directory.sum_rows() != u64::from(header.row_count) {
+            return Err(CoveError::SegmentCorrupt);
+        }
+        Ok(directory.entries)
+    }
+
+    #[cfg(feature = "covi")]
+    pub(crate) fn covi_row_range_scopes(
+        &self,
+    ) -> Result<Vec<cove_index::execution::CoviRowRangeScopeV2>, CoveError> {
+        let mut scopes = Vec::new();
+        for segment in self.segments() {
+            for morsel in self.row_morsels_for_segment(segment)? {
+                scopes.push(cove_index::execution::CoviRowRangeScopeV2 {
+                    file_ref: 0,
+                    table_id: segment.table_id,
+                    segment_id: segment.segment_id,
+                    morsel_id: morsel.morsel_id,
+                    row_start: segment
+                        .row_start
+                        .checked_add(u64::from(morsel.first_row_in_segment))
+                        .ok_or(CoveError::ArithOverflow)?,
+                    row_count: u64::from(morsel.row_count),
+                });
+            }
+        }
+        Ok(scopes)
     }
 
     pub fn pruning(&self) -> &PruningMetadata {

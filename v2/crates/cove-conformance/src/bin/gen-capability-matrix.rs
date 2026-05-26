@@ -895,19 +895,9 @@ fn corpus_requirement(row: &Row) -> CorpusRequirement {
             "predicate truth-table failures are asserted as expected outcomes inside pruning fixtures",
         ),
         "§37" => Some("fail-open and negative pruning paths are asserted inside pruning fixtures"),
-        "§51" => Some(
-            "conversion fixtures are positive CLI/library conversions without a stable negative corpus surface",
-        ),
         "§61" => Some("property-column coverage is validated through generated COVE-O outputs"),
         "§70.3" => {
             Some("row-semantic failures are covered through referenced MAP validation rows")
-        }
-        "§75" => Some("durable replace is a positive publication contract"),
-        "§78" => Some("suite requirements are self-checking accept fixtures"),
-        "§79" => Some("open suite packaging is checked by suite-contract accept fixtures"),
-        "§80.2" => Some("utility availability is checked by release-gate suite-contract fixtures"),
-        "§80.3A" => {
-            Some("coverage-centred reporting is checked through positive utility contract fixtures")
         }
         _ => None,
     };
@@ -979,7 +969,7 @@ mod tests {
 
     #[test]
     fn reject_exemptions_are_required_and_rendered() {
-        let row = test_row("§75");
+        let row = test_row("§8");
         let requirement = corpus_requirement(&row);
         assert_eq!(requirement.min_reject, 0);
         assert!(requirement.reject_exemption.is_some());
@@ -1003,6 +993,25 @@ mod tests {
             ),
             "yes"
         );
+    }
+
+    #[test]
+    fn positive_only_suite_surfaces_are_not_fully_gated() {
+        for section in ["§51", "§75", "§78", "§79", "§80.2", "§80.3A"] {
+            let row = test_row(section);
+            let requirement = corpus_requirement(&row);
+            assert_eq!(requirement.min_reject, 1);
+            assert_eq!(
+                corpus_status(
+                    CorpusEvidence {
+                        accept: 1,
+                        reject: 0,
+                    },
+                    requirement
+                ),
+                "partial"
+            );
+        }
     }
 }
 

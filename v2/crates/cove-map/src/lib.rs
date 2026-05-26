@@ -20,14 +20,14 @@ use cove_core::{
             MapRowSemanticRule, SourceOperationKind,
         },
         cove_o::{
-            CoveRecordRefV1, ObjectTypeCatalog, ObjectTypeEntryV1, PropertyEntryV1, RecordKind,
-            TemporalRowEntryV1, TemporalSegmentHeaderV1, TemporalSegmentIndex,
-            TemporalSegmentIndexEntryV1, TrustManifest, TrustManifestEntryV1,
-            OBJECT_TYPE_FLAG_ASSOCIATION_OBJECT, OBJECT_TYPE_FLAG_ENTITY_OBJECT,
-            OBJECT_TYPE_FLAG_LINK_OBJECT, PROPERTY_FLAG_ASSOCIATION_FROM_GOID,
-            PROPERTY_FLAG_ASSOCIATION_TO_GOID, PROPERTY_FLAG_ASSOCIATION_TYPE,
-            PROPERTY_FLAG_EVIDENCE_REF, PROPERTY_FLAG_MAPPING_RULE_REF, TEMPORAL_ROW_ENTRY_LEN,
-            TEMPORAL_SEGMENT_HEADER_LEN,
+            temporal_row_trust_payload, CoveRecordRefV1, ObjectTypeCatalog, ObjectTypeEntryV1,
+            PropertyEntryV1, RecordKind, TemporalRowEntryV1, TemporalSegmentData,
+            TemporalSegmentHeaderV1, TemporalSegmentIndex, TemporalSegmentIndexEntryV1,
+            TrustManifest, TrustManifestEntryV1, OBJECT_TYPE_FLAG_ASSOCIATION_OBJECT,
+            OBJECT_TYPE_FLAG_ENTITY_OBJECT, OBJECT_TYPE_FLAG_LINK_OBJECT,
+            PROPERTY_FLAG_ASSOCIATION_FROM_GOID, PROPERTY_FLAG_ASSOCIATION_TO_GOID,
+            PROPERTY_FLAG_ASSOCIATION_TYPE, PROPERTY_FLAG_EVIDENCE_REF,
+            PROPERTY_FLAG_MAPPING_RULE_REF, TEMPORAL_ROW_ENTRY_LEN, TEMPORAL_SEGMENT_HEADER_LEN,
         },
     },
     reader::{validate_bytes_with_options, ValidationOptions},
@@ -2155,23 +2155,22 @@ fn temporal_prev_refs(segment_id: u32, rows: &[ObjectRow]) -> Vec<Option<CoveRec
     refs
 }
 
-fn trust_manifest(segments: &[TemporalSegmentBuild]) -> Result<TrustManifest, String> {
+fn trust_manifest(
+    segments: &[TemporalSegmentBuild],
+    dictionary: Option<&FileDictionaryEncoding>,
+) -> Result<TrustManifest, String> {
     let mut previous = [0u8; 32];
     let mut entries = Vec::new();
     for segment in segments {
-        let prev_refs = temporal_prev_refs(segment.segment_id, &segment.rows);
-        for (index, row) in segment.rows.iter().enumerate() {
-            let temporal_row = TemporalRowEntryV1 {
-                timestamp_us: 0,
-                csn: index as u64,
-                branch_key: 0,
-                goid: row.goid,
-                record_id: row.record_id,
-                record_kind: row.record_kind,
-                prev_ref: prev_refs[index],
-            };
-            let expected_hash = trust_chain::chain(&previous, &temporal_row.trust_payload())
-                .map_err(|err| err.to_string())?;
+        let parsed_segment =
+            TemporalSegmentData::parse(&segment.payload).map_err(|err| err.to_string())?;
+        let dictionary = dictionary.map(|encoding| &encoding.dictionary);
+        for index in 0..parsed_segment.rows.len() {
+            let payload =
+                temporal_row_trust_payload(&parsed_segment, index as u32, dictionary, &[])
+                    .map_err(|err| err.to_string())?;
+            let expected_hash =
+                trust_chain::chain(&previous, &payload).map_err(|err| err.to_string())?;
             entries.push(TrustManifestEntryV1 {
                 segment_id: segment.segment_id,
                 row_index: index as u32,

@@ -1,0 +1,6 @@
+{
+  "needles": [
+    "definitely-missing-release-command"
+  ],
+  "op": "release_gate_contains"
+}

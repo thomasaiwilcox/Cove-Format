@@ -1,0 +1,6 @@
+{
+  "needles": [
+    "cove-plan-cost --definitely-missing-coverage-report-mode"
+  ],
+  "op": "release_gate_contains"
+}

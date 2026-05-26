@@ -100,7 +100,15 @@ impl<'a> CanonicalValue<'a> {
                 Ok(v.to_le_bytes().to_vec())
             }
             CanonicalValue::Uuid(uuid) => Ok(uuid.to_vec()),
-            CanonicalValue::Utf8(s) | CanonicalValue::Json(s) => Ok(length_prefixed(s.as_bytes())),
+            CanonicalValue::Utf8(s) => Ok(length_prefixed(s.as_bytes())),
+            CanonicalValue::Json(s) => {
+                serde_json::from_str::<serde_json::Value>(s).map_err(|_| {
+                    CoveError::BadSection(
+                        "Json canonical value must be syntactically valid JSON".into(),
+                    )
+                })?;
+                Ok(length_prefixed(s.as_bytes()))
+            }
             CanonicalValue::Bytes(b) => Ok(length_prefixed(b)),
             CanonicalValue::List(elements) => canonicalize_list(elements),
             CanonicalValue::Struct(fields) => canonicalize_struct(fields),
@@ -455,6 +463,18 @@ mod tests {
         assert_eq!(
             CanonicalValue::Utf8("abc").encode().unwrap(),
             b"\x03abc".to_vec()
+        );
+    }
+
+    #[test]
+    fn spec_17_json_encode_rejects_invalid_json() {
+        assert!(matches!(
+            CanonicalValue::Json("{not json").encode(),
+            Err(CoveError::BadSection(_))
+        ));
+        assert_eq!(
+            CanonicalValue::Json("{\"a\":1}").encode().unwrap(),
+            b"\x07{\"a\":1}".to_vec()
         );
     }
 

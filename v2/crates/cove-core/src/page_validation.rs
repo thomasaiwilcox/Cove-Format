@@ -24,7 +24,7 @@ use crate::{
     },
     nested_schema::NestedSchemaNodeV1,
     page::{
-        page_flag_codec, ColumnPageIndexEntryV1, PAGE_FLAG_ALL_NON_NULL,
+        page_flag_codec, ColumnPageIndexEntryV1, PAGE_FLAG_ALL_NON_NULL, PAGE_FLAG_ALL_NULL,
         PAGE_FLAG_STATS_ONLY_CONSTANT, PAGE_FLAG_VALUE_STREAM_ELIDED,
     },
     page_payload::{ColumnPagePayloadV1, PageBufferKind, PagePayloadTreeNode},
@@ -52,6 +52,7 @@ pub struct StatsOnlyPageMaterializationContext<'a> {
     pub column_id: u32,
     pub logical_type: CoveLogicalType,
     pub physical_kind: CovePhysicalKind,
+    pub dictionary_len: Option<u32>,
     pub zone_stats: &'a [ZoneStatsEntry],
 }
 
@@ -356,6 +357,35 @@ pub(crate) fn validate_stats_only_constant_page(
     context: &PageValidationContext<'_>,
     page: &ColumnPageIndexEntryV1,
 ) -> Result<(), CoveError> {
+    validate_stats_only_constant_page_envelope(page)?;
+
+    if page.flags & PAGE_FLAG_ALL_NULL != 0 {
+        validate_stats_only_all_null_reconstruction_source(context.physical_kind)?;
+        return Ok(());
+    }
+
+    validate_stats_only_all_non_null_reconstruction_source(context.physical_kind)?;
+    let Some(zone_stats) = context.zone_stats else {
+        return Err(CoveError::PageCorrupt);
+    };
+    validate_stats_only_constant_stat(
+        StatsOnlyPageMaterializationContext {
+            table_id: context.table_id,
+            segment_id: context.segment_id,
+            column_id: context.column_id,
+            logical_type: context.logical_type,
+            physical_kind: context.physical_kind,
+            dictionary_len: context.dictionary.map(|dictionary| dictionary.len()),
+            zone_stats,
+        },
+        page,
+    )?;
+    Ok(())
+}
+
+pub(crate) fn validate_stats_only_constant_page_envelope(
+    page: &ColumnPageIndexEntryV1,
+) -> Result<(), CoveError> {
     if page_flag_codec(page.flags)? != CompressionCodec::None
         || page.page_offset != 0
         || page.page_length != 0
@@ -367,23 +397,13 @@ pub(crate) fn validate_stats_only_constant_page(
     }
 
     if page.flags & PAGE_FLAG_ALL_NON_NULL == 0 {
-        return Ok(());
+        return if page.flags & PAGE_FLAG_ALL_NULL != 0 {
+            Ok(())
+        } else {
+            Err(CoveError::PageCorrupt)
+        };
     }
 
-    let Some(zone_stats) = context.zone_stats else {
-        return Ok(());
-    };
-    validate_stats_only_constant_stat(
-        StatsOnlyPageMaterializationContext {
-            table_id: context.table_id,
-            segment_id: context.segment_id,
-            column_id: context.column_id,
-            logical_type: context.logical_type,
-            physical_kind: context.physical_kind,
-            zone_stats,
-        },
-        page,
-    )?;
     Ok(())
 }
 
@@ -402,6 +422,7 @@ pub fn materialize_stats_only_constant_page_payload(
     }
 
     if page.flags & PAGE_FLAG_ALL_NON_NULL != 0 {
+        validate_stats_only_all_non_null_reconstruction_source(context.physical_kind)?;
         let scalar = validate_stats_only_constant_stat(context, page)?;
         let values = stats_only_constant_values(context, page, scalar)?;
         return ColumnPagePayloadV1::build_single_node(
@@ -414,24 +435,53 @@ pub fn materialize_stats_only_constant_page_payload(
         );
     }
 
-    if page.flags & crate::page::PAGE_FLAG_ALL_NULL != 0 {
+    if page.flags & PAGE_FLAG_ALL_NULL != 0 {
         let bitmap_len = bitmap_len(page.row_count)?;
         let mut bitmap = vec![0xff; bitmap_len];
         if !page.row_count.is_multiple_of(8) && !bitmap.is_empty() {
             let valid_bits = page.row_count % 8;
             bitmap[bitmap_len - 1] = (1u8 << valid_bits) - 1;
         }
+        let values = stats_only_all_null_values(context, page)?;
         return ColumnPagePayloadV1::build_single_node(
             page.row_count,
             stats_only_materialized_encoding(context.physical_kind),
             context.logical_type,
             context.physical_kind,
             Some(bitmap),
-            Vec::new(),
+            values,
         );
     }
 
     Err(CoveError::PageCorrupt)
+}
+
+fn validate_stats_only_all_non_null_reconstruction_source(
+    physical_kind: CovePhysicalKind,
+) -> Result<(), CoveError> {
+    match physical_kind {
+        CovePhysicalKind::Boolean
+        | CovePhysicalKind::FileCode
+        | CovePhysicalKind::NumCode
+        | CovePhysicalKind::FixedBytes
+        | CovePhysicalKind::VarBytes => Ok(()),
+        _ => Err(CoveError::PageCorrupt),
+    }
+}
+
+fn validate_stats_only_all_null_reconstruction_source(
+    physical_kind: CovePhysicalKind,
+) -> Result<(), CoveError> {
+    match physical_kind {
+        CovePhysicalKind::Boolean
+        | CovePhysicalKind::FileCode
+        | CovePhysicalKind::NumCode
+        | CovePhysicalKind::FixedBytes
+        | CovePhysicalKind::VarBytes => Ok(()),
+        CovePhysicalKind::List | CovePhysicalKind::Struct | CovePhysicalKind::Map => {
+            Err(CoveError::PageCorrupt)
+        }
+    }
 }
 
 fn validate_stats_only_constant_stat<'a>(
@@ -477,6 +527,24 @@ fn validate_stats_only_constant_stat<'a>(
     if min.truncated || max.truncated || min != max {
         return Err(CoveError::PageCorrupt);
     }
+    if context.physical_kind == CovePhysicalKind::FileCode {
+        validate_stats_only_filecode_scalar(min, context.dictionary_len)?;
+        return Ok(min);
+    }
+    if context.physical_kind == CovePhysicalKind::Boolean {
+        validate_stats_only_boolean_scalar(min)?;
+        return Ok(min);
+    }
+    if context.physical_kind == CovePhysicalKind::VarBytes {
+        validate_stats_only_varbytes_scalar(context.logical_type, min)?;
+        return Ok(min);
+    }
+    if context.physical_kind == CovePhysicalKind::FixedBytes {
+        let width = fixed_width_for(context.logical_type, context.physical_kind)?;
+        if min.bytes.len() != width {
+            return Err(CoveError::PageCorrupt);
+        }
+    }
     if !stat_scalar_matches_logical(context.logical_type, min) {
         return Err(CoveError::PageCorrupt);
     }
@@ -514,7 +582,134 @@ fn stats_only_constant_values(
             }
             Ok(values)
         }
+        CovePhysicalKind::Boolean => {
+            let value = validate_stats_only_boolean_scalar(scalar)?;
+            let row_count =
+                usize::try_from(page.row_count).map_err(|_| CoveError::ArithOverflow)?;
+            Ok(vec![value; row_count])
+        }
+        CovePhysicalKind::VarBytes => {
+            let bytes = validate_stats_only_varbytes_scalar(context.logical_type, scalar)?;
+            let len = u32::try_from(bytes.len()).map_err(|_| CoveError::ArithOverflow)?;
+            let row_count =
+                usize::try_from(page.row_count).map_err(|_| CoveError::ArithOverflow)?;
+            let row_width = 4usize
+                .checked_add(bytes.len())
+                .ok_or(CoveError::ArithOverflow)?;
+            let mut values = Vec::with_capacity(
+                row_count
+                    .checked_mul(row_width)
+                    .ok_or(CoveError::ArithOverflow)?,
+            );
+            for _ in 0..row_count {
+                values.extend_from_slice(&len.to_le_bytes());
+                values.extend_from_slice(bytes);
+            }
+            Ok(values)
+        }
+        CovePhysicalKind::FileCode => {
+            let code = validate_stats_only_filecode_scalar(scalar, context.dictionary_len)?;
+            let row_count =
+                usize::try_from(page.row_count).map_err(|_| CoveError::ArithOverflow)?;
+            let mut values =
+                Vec::with_capacity(row_count.checked_mul(4).ok_or(CoveError::ArithOverflow)?);
+            for _ in 0..row_count {
+                values.extend_from_slice(&code.to_le_bytes());
+            }
+            Ok(values)
+        }
         _ => Err(CoveError::PageCorrupt),
+    }
+}
+
+fn validate_stats_only_boolean_scalar(scalar: &StatScalar) -> Result<u8, CoveError> {
+    if scalar.kind != StatKind::UInt64 || scalar.bytes.len() != 8 {
+        return Err(CoveError::PageCorrupt);
+    }
+    match u64::from_le_bytes(
+        scalar
+            .bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| CoveError::PageCorrupt)?,
+    ) {
+        0 => Ok(0),
+        1 => Ok(1),
+        _ => Err(CoveError::PageCorrupt),
+    }
+}
+
+fn validate_stats_only_varbytes_scalar(
+    logical_type: CoveLogicalType,
+    scalar: &StatScalar,
+) -> Result<&[u8], CoveError> {
+    if scalar.kind != StatKind::FixedBytes {
+        return Err(CoveError::PageCorrupt);
+    }
+    match logical_type {
+        CoveLogicalType::Utf8 | CoveLogicalType::Binary | CoveLogicalType::Json => {
+            validate_varbytes_logical_value(logical_type, &scalar.bytes)?;
+            Ok(&scalar.bytes)
+        }
+        _ => Err(CoveError::PageCorrupt),
+    }
+}
+
+fn validate_stats_only_filecode_scalar(
+    scalar: &StatScalar,
+    dictionary_len: Option<u32>,
+) -> Result<u32, CoveError> {
+    if scalar.kind != StatKind::UInt64 || scalar.bytes.len() != 8 {
+        return Err(CoveError::PageCorrupt);
+    }
+    let raw = u64::from_le_bytes(
+        scalar
+            .bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| CoveError::PageCorrupt)?,
+    );
+    let code = u32::try_from(raw).map_err(|_| CoveError::BadFileCode)?;
+    let Some(dictionary_len) = dictionary_len else {
+        return Err(CoveError::BadFileCode);
+    };
+    if code >= dictionary_len {
+        return Err(CoveError::BadFileCode);
+    }
+    Ok(code)
+}
+
+fn stats_only_all_null_values(
+    context: StatsOnlyPageMaterializationContext<'_>,
+    page: &ColumnPageIndexEntryV1,
+) -> Result<Vec<u8>, CoveError> {
+    let row_count = usize::try_from(page.row_count).map_err(|_| CoveError::ArithOverflow)?;
+    match context.physical_kind {
+        CovePhysicalKind::NumCode => {
+            let payload = ConstantPayload {
+                value: 0,
+                row_count: u64::from(page.row_count),
+            };
+            Ok(payload.encode().to_vec())
+        }
+        CovePhysicalKind::Boolean
+        | CovePhysicalKind::FileCode
+        | CovePhysicalKind::FixedBytes
+        | CovePhysicalKind::VarBytes => {
+            let width = match context.physical_kind {
+                CovePhysicalKind::VarBytes => 4,
+                _ => fixed_width_for(context.logical_type, context.physical_kind)?,
+            };
+            Ok(vec![
+                0;
+                row_count
+                    .checked_mul(width)
+                    .ok_or(CoveError::ArithOverflow)?
+            ])
+        }
+        CovePhysicalKind::List | CovePhysicalKind::Struct | CovePhysicalKind::Map => {
+            Err(CoveError::PageCorrupt)
+        }
     }
 }
 
@@ -650,7 +845,9 @@ fn validate_values_buffer(
             }
             Ok(())
         }
-        CoveEncodingKind::VarBytes => validate_length_prefixed_u32_rows(values, row_count),
+        CoveEncodingKind::VarBytes => {
+            validate_length_prefixed_u32_rows(logical_type, values, row_count)
+        }
         CoveEncodingKind::PlainVarint => {
             validate_plain_varint_values(logical_type, physical_kind, values, row_count, dictionary)
         }
@@ -911,15 +1108,21 @@ fn validate_local_codebook_values(
             (CovePhysicalKind::NumCode, LocalCodebookValue::NumCode(code)) => {
                 validate_numcode(logical_type, physical_kind, *code)?;
             }
-            (CovePhysicalKind::Boolean, LocalCodebookValue::Boolean(_))
-            | (CovePhysicalKind::VarBytes, LocalCodebookValue::VarBytes(_)) => {}
+            (CovePhysicalKind::Boolean, LocalCodebookValue::Boolean(_)) => {}
+            (CovePhysicalKind::VarBytes, LocalCodebookValue::VarBytes(bytes)) => {
+                validate_varbytes_logical_value(logical_type, bytes)?;
+            }
             _ => return Err(CoveError::PageCorrupt),
         }
     }
     Ok(())
 }
 
-fn validate_length_prefixed_u32_rows(values: &[u8], row_count: u32) -> Result<(), CoveError> {
+fn validate_length_prefixed_u32_rows(
+    logical_type: CoveLogicalType,
+    values: &[u8],
+    row_count: u32,
+) -> Result<(), CoveError> {
     let mut pos = 0usize;
     for _ in 0..row_count {
         let len_end = pos.checked_add(4).ok_or(CoveError::ArithOverflow)?;
@@ -927,12 +1130,33 @@ fn validate_length_prefixed_u32_rows(values: &[u8], row_count: u32) -> Result<()
             return Err(CoveError::BufferTooShort);
         }
         let len = u32::from_le_bytes(values[pos..len_end].try_into().unwrap()) as usize;
-        pos = len_end.checked_add(len).ok_or(CoveError::ArithOverflow)?;
-        if pos > values.len() {
+        let value_end = len_end.checked_add(len).ok_or(CoveError::ArithOverflow)?;
+        if value_end > values.len() {
             return Err(CoveError::BufferTooShort);
         }
+        validate_varbytes_logical_value(logical_type, &values[len_end..value_end])?;
+        pos = value_end;
     }
     require_len(pos, values.len())
+}
+
+fn validate_varbytes_logical_value(
+    logical_type: CoveLogicalType,
+    bytes: &[u8],
+) -> Result<(), CoveError> {
+    match logical_type {
+        CoveLogicalType::Utf8 => {
+            std::str::from_utf8(bytes).map_err(|_| CoveError::PageCorrupt)?;
+            Ok(())
+        }
+        CoveLogicalType::Json => {
+            serde_json::from_slice::<serde_json::Value>(bytes)
+                .map_err(|_| CoveError::PageCorrupt)?;
+            Ok(())
+        }
+        CoveLogicalType::Binary => Ok(()),
+        _ => Err(CoveError::PageCorrupt),
+    }
 }
 
 fn validate_plain_varint_values(
@@ -966,12 +1190,16 @@ fn validate_canonical_rows(
     row_count: u32,
 ) -> Result<(), CoveError> {
     match logical_type {
-        CoveLogicalType::Null | CoveLogicalType::Bool => require_len(values.len(), 0),
+        CoveLogicalType::Null => require_len(values.len(), 0),
+        CoveLogicalType::Bool => Err(CoveError::UnsupportedEncoding(
+            "Canonical Bool rows require an explicit value-tag stream".into(),
+        )),
         CoveLogicalType::Utf8 | CoveLogicalType::Binary | CoveLogicalType::Json => {
             let mut pos = 0usize;
             for _ in 0..row_count {
                 let (len, consumed) = wire::decode_u64_leb128(&values[pos..])?;
                 let len = usize::try_from(len).map_err(|_| CoveError::ArithOverflow)?;
+                let value_start = pos.checked_add(consumed).ok_or(CoveError::ArithOverflow)?;
                 pos = pos
                     .checked_add(consumed)
                     .and_then(|value| value.checked_add(len))
@@ -979,6 +1207,7 @@ fn validate_canonical_rows(
                 if pos > values.len() {
                     return Err(CoveError::BufferTooShort);
                 }
+                validate_varbytes_logical_value(logical_type, &values[value_start..pos])?;
             }
             require_len(pos, values.len())
         }
@@ -1058,6 +1287,7 @@ fn require_len(actual: usize, expected: usize) -> Result<(), CoveError> {
 fn stat_scalar_matches_logical(logical_type: CoveLogicalType, scalar: &StatScalar) -> bool {
     let kind = scalar.kind;
     match logical_type {
+        CoveLogicalType::Bool => kind == StatKind::UInt64,
         CoveLogicalType::Int8
         | CoveLogicalType::Int16
         | CoveLogicalType::Int32
@@ -1074,6 +1304,9 @@ fn stat_scalar_matches_logical(logical_type: CoveLogicalType, scalar: &StatScala
         CoveLogicalType::TimestampMicros => kind == StatKind::TimestampMicros,
         CoveLogicalType::TimestampNanos => kind == StatKind::TimestampNanos,
         CoveLogicalType::Uuid => kind == StatKind::FixedBytes,
+        CoveLogicalType::Utf8 | CoveLogicalType::Binary | CoveLogicalType::Json => {
+            kind == StatKind::FixedBytes
+        }
         _ => false,
     }
 }
@@ -1086,7 +1319,8 @@ mod tests {
         dictionary::{FileDictionaryHeaderV1, FileDictionaryIndexEntryV1},
         encoding::local_codebook::{LocalCodebookValues, LocalIndexPayload},
         page::{
-            PAGE_FLAG_ALL_NON_NULL, PAGE_FLAG_STATS_ONLY_CONSTANT, PAGE_FLAG_VALUE_STREAM_ELIDED,
+            PAGE_FLAG_ALL_NON_NULL, PAGE_FLAG_ALL_NULL, PAGE_FLAG_STATS_ONLY_CONSTANT,
+            PAGE_FLAG_VALUE_STREAM_ELIDED,
         },
         page_payload::ColumnPagePayloadV1,
         zone_stats::{StatKind, StatScalar, ZoneScope, ZoneStats},
@@ -1366,6 +1600,139 @@ mod tests {
             &payload,
         );
         assert_eq!(err, Err(CoveError::PageCorrupt));
+    }
+
+    #[test]
+    fn varbytes_utf8_and_json_validate_logical_payloads() {
+        let payload = ColumnPagePayloadV1::build_single_node(
+            1,
+            CoveEncodingKind::VarBytes,
+            CoveLogicalType::Utf8,
+            CovePhysicalKind::VarBytes,
+            None,
+            [1u32.to_le_bytes().as_slice(), &[0xff]].concat(),
+        )
+        .unwrap();
+        let payload = ColumnPagePayloadV1::parse(&payload).unwrap();
+        assert_eq!(
+            validate_column_page_payload(
+                &context(CoveLogicalType::Utf8, CovePhysicalKind::VarBytes, None),
+                &base_page(1, CoveEncodingKind::VarBytes),
+                &payload,
+            ),
+            Err(CoveError::PageCorrupt)
+        );
+
+        let payload = ColumnPagePayloadV1::build_single_node(
+            1,
+            CoveEncodingKind::VarBytes,
+            CoveLogicalType::Json,
+            CovePhysicalKind::VarBytes,
+            None,
+            [3u32.to_le_bytes().as_slice(), b"{x}"].concat(),
+        )
+        .unwrap();
+        let payload = ColumnPagePayloadV1::parse(&payload).unwrap();
+        assert_eq!(
+            validate_column_page_payload(
+                &context(CoveLogicalType::Json, CovePhysicalKind::VarBytes, None),
+                &base_page(1, CoveEncodingKind::VarBytes),
+                &payload,
+            ),
+            Err(CoveError::PageCorrupt)
+        );
+    }
+
+    #[test]
+    fn canonical_utf8_and_json_validate_logical_payloads() {
+        let mut invalid_utf8 = crate::wire::encode_u64_leb128(1);
+        invalid_utf8.push(0xff);
+        let payload = ColumnPagePayloadV1::build_single_node(
+            1,
+            CoveEncodingKind::Canonical,
+            CoveLogicalType::Utf8,
+            CovePhysicalKind::VarBytes,
+            None,
+            invalid_utf8,
+        )
+        .unwrap();
+        let payload = ColumnPagePayloadV1::parse(&payload).unwrap();
+        assert_eq!(
+            validate_column_page_payload(
+                &context(CoveLogicalType::Utf8, CovePhysicalKind::VarBytes, None),
+                &base_page(1, CoveEncodingKind::Canonical),
+                &payload,
+            ),
+            Err(CoveError::PageCorrupt)
+        );
+
+        let mut invalid_json = crate::wire::encode_u64_leb128(3);
+        invalid_json.extend_from_slice(b"{x}");
+        let payload = ColumnPagePayloadV1::build_single_node(
+            1,
+            CoveEncodingKind::Canonical,
+            CoveLogicalType::Json,
+            CovePhysicalKind::VarBytes,
+            None,
+            invalid_json,
+        )
+        .unwrap();
+        let payload = ColumnPagePayloadV1::parse(&payload).unwrap();
+        assert_eq!(
+            validate_column_page_payload(
+                &context(CoveLogicalType::Json, CovePhysicalKind::VarBytes, None),
+                &base_page(1, CoveEncodingKind::Canonical),
+                &payload,
+            ),
+            Err(CoveError::PageCorrupt)
+        );
+    }
+
+    #[test]
+    fn canonical_bool_rows_are_unsupported_without_value_tags() {
+        let payload = ColumnPagePayloadV1::build_single_node(
+            1,
+            CoveEncodingKind::Canonical,
+            CoveLogicalType::Bool,
+            CovePhysicalKind::Boolean,
+            None,
+            Vec::new(),
+        )
+        .unwrap();
+        let payload = ColumnPagePayloadV1::parse(&payload).unwrap();
+        assert!(validate_column_page_payload(
+            &context(CoveLogicalType::Bool, CovePhysicalKind::Boolean, None),
+            &base_page(1, CoveEncodingKind::Canonical),
+            &payload,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn local_codebook_varbytes_validates_logical_payloads() {
+        let values = LocalCodebookPayload {
+            values: LocalCodebookValues::VarBytes(vec![b"{x}".to_vec()]),
+            indexes: LocalIndexPayload::Rle(RlePayload { runs: vec![(0, 1)] }),
+        }
+        .encode();
+        let payload = ColumnPagePayloadV1::build_single_node(
+            1,
+            CoveEncodingKind::LocalCodebook,
+            CoveLogicalType::Json,
+            CovePhysicalKind::VarBytes,
+            None,
+            values,
+        )
+        .unwrap();
+        let payload = ColumnPagePayloadV1::parse(&payload).unwrap();
+        assert_eq!(
+            validate_column_page_payload(
+                &context(CoveLogicalType::Json, CovePhysicalKind::VarBytes, None),
+                &base_page(1, CoveEncodingKind::LocalCodebook),
+                &payload,
+            ),
+            Err(CoveError::PageCorrupt)
+        );
     }
 
     #[test]
@@ -1764,6 +2131,387 @@ mod tests {
     }
 
     #[test]
+    fn validates_stats_only_all_non_null_filecode_reconstruction() {
+        let scalar = StatScalar {
+            kind: StatKind::UInt64,
+            bytes: 0u64.to_le_bytes().to_vec(),
+            truncated: false,
+        };
+        let stats = [ZoneStatsEntry {
+            table_id: 3,
+            segment_id: 5,
+            morsel_id: 0,
+            column_id: 7,
+            non_null_count: 2,
+            distinct_count: 1,
+            run_count: 1,
+            stats: ZoneStats {
+                scope: ZoneScope::Morsel,
+                row_count: 2,
+                null_count: 0,
+                min: Some(scalar.clone()),
+                max: Some(scalar),
+                flags: ZoneStatFlags::HAS_MIN_MAX | ZoneStatFlags::CONSTANT,
+            },
+            min_domain_rank: 0,
+            max_domain_rank: 0,
+            exact_set_ref: u32::MAX,
+            bloom_ref: u32::MAX,
+        }];
+        let mut page = base_page(2, CoveEncodingKind::NumCode);
+        page.encoding_root = u32::MAX;
+        page.page_length = 0;
+        page.uncompressed_length = 0;
+        page.flags = PAGE_FLAG_STATS_ONLY_CONSTANT | PAGE_FLAG_ALL_NON_NULL;
+        page.checksum = checksum::crc32c(&[]);
+
+        let (dictionary_bytes, payload) = one_entry_dictionary_bytes();
+        let dictionary = FileDictionaryView::borrowed(&dictionary_bytes, &payload).unwrap();
+        assert_eq!(
+            validate_stats_only_constant_page(
+                &PageValidationContext {
+                    dictionary: Some(&dictionary),
+                    zone_stats: Some(&stats),
+                    ..context(CoveLogicalType::Utf8, CovePhysicalKind::FileCode, None)
+                },
+                &page,
+            ),
+            Ok(())
+        );
+        let payload = materialize_stats_only_constant_page_payload(
+            StatsOnlyPageMaterializationContext {
+                table_id: Some(3),
+                segment_id: Some(5),
+                column_id: 7,
+                logical_type: CoveLogicalType::Utf8,
+                physical_kind: CovePhysicalKind::FileCode,
+                dictionary_len: Some(dictionary.len()),
+                zone_stats: &stats,
+            },
+            &page,
+        )
+        .unwrap();
+        let payload = ColumnPagePayloadV1::parse(&payload).unwrap();
+        let values = tree_buffer_bytes(&payload, &payload.tree().unwrap(), PageBufferKind::Values)
+            .unwrap()
+            .unwrap();
+        assert_eq!(values, [0u8; 8].as_slice());
+    }
+
+    #[test]
+    fn validates_stats_only_all_null_filecode_without_reconstruction_source() {
+        let mut page = base_page(2, CoveEncodingKind::NumCode);
+        page.non_null_count = 0;
+        page.null_count = 2;
+        page.encoding_root = u32::MAX;
+        page.page_length = 0;
+        page.uncompressed_length = 0;
+        page.flags = PAGE_FLAG_STATS_ONLY_CONSTANT | PAGE_FLAG_ALL_NULL;
+        page.checksum = checksum::crc32c(&[]);
+
+        assert_eq!(
+            validate_stats_only_constant_page(
+                &context(CoveLogicalType::Utf8, CovePhysicalKind::FileCode, None),
+                &page,
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn validates_and_materializes_boolean_stats_only_constant() {
+        let scalar = StatScalar {
+            kind: StatKind::UInt64,
+            bytes: 1u64.to_le_bytes().to_vec(),
+            truncated: false,
+        };
+        let stats = [ZoneStatsEntry {
+            table_id: 3,
+            segment_id: 5,
+            morsel_id: 0,
+            column_id: 7,
+            non_null_count: 3,
+            distinct_count: 1,
+            run_count: 1,
+            stats: ZoneStats {
+                scope: ZoneScope::Morsel,
+                row_count: 3,
+                null_count: 0,
+                min: Some(scalar.clone()),
+                max: Some(scalar),
+                flags: ZoneStatFlags::HAS_MIN_MAX | ZoneStatFlags::CONSTANT,
+            },
+            min_domain_rank: 0,
+            max_domain_rank: 0,
+            exact_set_ref: u32::MAX,
+            bloom_ref: u32::MAX,
+        }];
+        let mut page = base_page(3, CoveEncodingKind::NumCode);
+        page.encoding_root = u32::MAX;
+        page.page_length = 0;
+        page.uncompressed_length = 0;
+        page.flags = PAGE_FLAG_STATS_ONLY_CONSTANT | PAGE_FLAG_ALL_NON_NULL;
+        page.checksum = checksum::crc32c(&[]);
+
+        assert_eq!(
+            validate_stats_only_constant_page(
+                &context(
+                    CoveLogicalType::Bool,
+                    CovePhysicalKind::Boolean,
+                    Some(&stats)
+                ),
+                &page,
+            ),
+            Ok(())
+        );
+        let payload = materialize_stats_only_constant_page_payload(
+            StatsOnlyPageMaterializationContext {
+                table_id: Some(3),
+                segment_id: Some(5),
+                column_id: 7,
+                logical_type: CoveLogicalType::Bool,
+                physical_kind: CovePhysicalKind::Boolean,
+                dictionary_len: None,
+                zone_stats: &stats,
+            },
+            &page,
+        )
+        .unwrap();
+        let payload = ColumnPagePayloadV1::parse(&payload).unwrap();
+        let values = tree_buffer_bytes(&payload, &payload.tree().unwrap(), PageBufferKind::Values)
+            .unwrap()
+            .unwrap();
+        assert_eq!(values, [1, 1, 1].as_slice());
+    }
+
+    #[test]
+    fn validates_and_materializes_varbytes_stats_only_constant() {
+        let bytes = b"alpha".to_vec();
+        let scalar = StatScalar {
+            kind: StatKind::FixedBytes,
+            bytes: bytes.clone(),
+            truncated: false,
+        };
+        let stats = [ZoneStatsEntry {
+            table_id: 3,
+            segment_id: 5,
+            morsel_id: 0,
+            column_id: 7,
+            non_null_count: 2,
+            distinct_count: 1,
+            run_count: 1,
+            stats: ZoneStats {
+                scope: ZoneScope::Morsel,
+                row_count: 2,
+                null_count: 0,
+                min: Some(scalar.clone()),
+                max: Some(scalar),
+                flags: ZoneStatFlags::HAS_MIN_MAX | ZoneStatFlags::CONSTANT,
+            },
+            min_domain_rank: 0,
+            max_domain_rank: 0,
+            exact_set_ref: u32::MAX,
+            bloom_ref: u32::MAX,
+        }];
+        let mut page = base_page(2, CoveEncodingKind::NumCode);
+        page.encoding_root = u32::MAX;
+        page.page_length = 0;
+        page.uncompressed_length = 0;
+        page.flags = PAGE_FLAG_STATS_ONLY_CONSTANT | PAGE_FLAG_ALL_NON_NULL;
+        page.checksum = checksum::crc32c(&[]);
+
+        assert_eq!(
+            validate_stats_only_constant_page(
+                &context(
+                    CoveLogicalType::Utf8,
+                    CovePhysicalKind::VarBytes,
+                    Some(&stats)
+                ),
+                &page,
+            ),
+            Ok(())
+        );
+        let payload = materialize_stats_only_constant_page_payload(
+            StatsOnlyPageMaterializationContext {
+                table_id: Some(3),
+                segment_id: Some(5),
+                column_id: 7,
+                logical_type: CoveLogicalType::Utf8,
+                physical_kind: CovePhysicalKind::VarBytes,
+                dictionary_len: None,
+                zone_stats: &stats,
+            },
+            &page,
+        )
+        .unwrap();
+        let payload = ColumnPagePayloadV1::parse(&payload).unwrap();
+        let values = tree_buffer_bytes(&payload, &payload.tree().unwrap(), PageBufferKind::Values)
+            .unwrap()
+            .unwrap();
+        let expected = [
+            5u32.to_le_bytes().as_slice(),
+            b"alpha",
+            5u32.to_le_bytes().as_slice(),
+            b"alpha",
+        ]
+        .concat();
+        assert_eq!(values, expected.as_slice());
+    }
+
+    #[test]
+    fn rejects_invalid_json_stats_only_varbytes_constant() {
+        let scalar = StatScalar {
+            kind: StatKind::FixedBytes,
+            bytes: b"{x}".to_vec(),
+            truncated: false,
+        };
+        let stats = [ZoneStatsEntry {
+            table_id: 3,
+            segment_id: 5,
+            morsel_id: 0,
+            column_id: 7,
+            non_null_count: 2,
+            distinct_count: 1,
+            run_count: 1,
+            stats: ZoneStats {
+                scope: ZoneScope::Morsel,
+                row_count: 2,
+                null_count: 0,
+                min: Some(scalar.clone()),
+                max: Some(scalar),
+                flags: ZoneStatFlags::HAS_MIN_MAX | ZoneStatFlags::CONSTANT,
+            },
+            min_domain_rank: 0,
+            max_domain_rank: 0,
+            exact_set_ref: u32::MAX,
+            bloom_ref: u32::MAX,
+        }];
+        let mut page = base_page(2, CoveEncodingKind::NumCode);
+        page.encoding_root = u32::MAX;
+        page.page_length = 0;
+        page.uncompressed_length = 0;
+        page.flags = PAGE_FLAG_STATS_ONLY_CONSTANT | PAGE_FLAG_ALL_NON_NULL;
+        page.checksum = checksum::crc32c(&[]);
+
+        assert_eq!(
+            validate_stats_only_constant_page(
+                &context(
+                    CoveLogicalType::Json,
+                    CovePhysicalKind::VarBytes,
+                    Some(&stats)
+                ),
+                &page,
+            ),
+            Err(CoveError::PageCorrupt)
+        );
+    }
+
+    #[test]
+    fn rejects_stats_only_without_null_polarity_fact() {
+        let mut page = base_page(2, CoveEncodingKind::NumCode);
+        page.encoding_root = u32::MAX;
+        page.page_length = 0;
+        page.uncompressed_length = 0;
+        page.flags = PAGE_FLAG_STATS_ONLY_CONSTANT;
+        page.checksum = checksum::crc32c(&[]);
+
+        assert_eq!(
+            validate_stats_only_constant_page(
+                &context(CoveLogicalType::Int64, CovePhysicalKind::NumCode, None),
+                &page,
+            ),
+            Err(CoveError::PageCorrupt)
+        );
+    }
+
+    #[test]
+    fn rejects_stats_only_all_null_nested_without_reconstruction_support() {
+        let mut page = base_page(2, CoveEncodingKind::NumCode);
+        page.non_null_count = 0;
+        page.null_count = 2;
+        page.encoding_root = u32::MAX;
+        page.page_length = 0;
+        page.uncompressed_length = 0;
+        page.flags = PAGE_FLAG_STATS_ONLY_CONSTANT | PAGE_FLAG_ALL_NULL;
+        page.checksum = checksum::crc32c(&[]);
+
+        assert_eq!(
+            validate_stats_only_constant_page(
+                &context(CoveLogicalType::List, CovePhysicalKind::List, None),
+                &page,
+            ),
+            Err(CoveError::PageCorrupt)
+        );
+    }
+
+    #[test]
+    fn validates_and_materializes_uuid_stats_only_fixedbytes_constant() {
+        let bytes = [7u8; 16];
+        let scalar = StatScalar {
+            kind: StatKind::FixedBytes,
+            bytes: bytes.to_vec(),
+            truncated: false,
+        };
+        let stats = [ZoneStatsEntry {
+            table_id: 3,
+            segment_id: 5,
+            morsel_id: 0,
+            column_id: 7,
+            non_null_count: 2,
+            distinct_count: 1,
+            run_count: 1,
+            stats: ZoneStats {
+                scope: ZoneScope::Morsel,
+                row_count: 2,
+                null_count: 0,
+                min: Some(scalar.clone()),
+                max: Some(scalar),
+                flags: ZoneStatFlags::HAS_MIN_MAX | ZoneStatFlags::CONSTANT,
+            },
+            min_domain_rank: 0,
+            max_domain_rank: 0,
+            exact_set_ref: u32::MAX,
+            bloom_ref: u32::MAX,
+        }];
+        let mut page = base_page(2, CoveEncodingKind::NumCode);
+        page.encoding_root = u32::MAX;
+        page.page_length = 0;
+        page.uncompressed_length = 0;
+        page.flags = PAGE_FLAG_STATS_ONLY_CONSTANT | PAGE_FLAG_ALL_NON_NULL;
+        page.checksum = checksum::crc32c(&[]);
+
+        assert_eq!(
+            validate_stats_only_constant_page(
+                &context(
+                    CoveLogicalType::Uuid,
+                    CovePhysicalKind::FixedBytes,
+                    Some(&stats)
+                ),
+                &page,
+            ),
+            Ok(())
+        );
+        let payload = materialize_stats_only_constant_page_payload(
+            StatsOnlyPageMaterializationContext {
+                table_id: Some(3),
+                segment_id: Some(5),
+                column_id: 7,
+                logical_type: CoveLogicalType::Uuid,
+                physical_kind: CovePhysicalKind::FixedBytes,
+                dictionary_len: None,
+                zone_stats: &stats,
+            },
+            &page,
+        )
+        .unwrap();
+        let payload = ColumnPagePayloadV1::parse(&payload).unwrap();
+        let values = tree_buffer_bytes(&payload, &payload.tree().unwrap(), PageBufferKind::Values)
+            .unwrap()
+            .unwrap();
+        assert_eq!(values, [bytes, bytes].concat().as_slice());
+    }
+
+    #[test]
     fn stats_only_page_stats_are_contextual() {
         let scalar = StatScalar {
             kind: StatKind::Int64,
@@ -1885,6 +2633,7 @@ mod tests {
             column_id: 7,
             logical_type: CoveLogicalType::Float32,
             physical_kind: CovePhysicalKind::NumCode,
+            dictionary_len: None,
             zone_stats: &stats,
         };
         let payload = materialize_stats_only_constant_page_payload(context, &page).unwrap();
@@ -1944,6 +2693,7 @@ mod tests {
                 column_id: 7,
                 logical_type: CoveLogicalType::Float32,
                 physical_kind: CovePhysicalKind::NumCode,
+                dictionary_len: None,
                 zone_stats: &stats,
             };
             assert_eq!(

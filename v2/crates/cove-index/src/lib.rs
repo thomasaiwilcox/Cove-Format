@@ -2638,6 +2638,20 @@ pub struct CoviAggregateAnswerV2 {
 impl CoviAggregateAnswerV2 {
     pub const LEN: usize = 54;
 
+    pub(crate) fn validate_counts(&self) -> Result<(), CoveError> {
+        if self.null_count > self.row_count || self.non_null_count > self.row_count {
+            return Err(CoveError::BadCovi);
+        }
+        let accounted = self
+            .null_count
+            .checked_add(self.non_null_count)
+            .ok_or(CoveError::ArithOverflow)?;
+        if accounted != self.row_count {
+            return Err(CoveError::BadCovi);
+        }
+        Ok(())
+    }
+
     pub fn parse(bytes: &[u8]) -> Result<Self, CoveError> {
         if bytes.len() < Self::LEN {
             return Err(CoveError::BufferTooShort);
@@ -2658,9 +2672,7 @@ impl CoviAggregateAnswerV2 {
             checksum: read_u32(bytes, 50)?,
         };
         verify_crc(&bytes[..Self::LEN], 50, item.checksum)?;
-        if item.null_count > item.row_count || item.non_null_count > item.row_count {
-            return Err(CoveError::BadCovi);
-        }
+        item.validate_counts()?;
         Ok(item)
     }
 
@@ -4098,6 +4110,30 @@ mod tests {
         let bytes = block.serialize().unwrap();
         let parsed = CoviAggregateAnswerBlockV2::parse(&bytes).unwrap();
         assert_eq!(parsed.answers[0].row_count, 42);
+    }
+
+    #[test]
+    fn aggregate_answer_rejects_inconsistent_null_accounting() {
+        let answer = CoviAggregateAnswerV2 {
+            aggregate_answer_ref: 0,
+            index_root_id: 0,
+            aggregate_kind: crate::execution::CoviAggregateKindV2::Count as u16,
+            exactness: IndexCapabilityExactnessV2::Exact as u8,
+            null_semantics: 0,
+            flags: 0,
+            row_count: 42,
+            null_count: 2,
+            non_null_count: 41,
+            value_ref: u32::MAX,
+            predicate_form_ref: u32::MAX,
+            snapshot_validity_ref: 0,
+            checksum: 0,
+        };
+        let bytes = answer.serialize();
+        assert!(matches!(
+            CoviAggregateAnswerV2::parse(&bytes),
+            Err(CoveError::BadCovi)
+        ));
     }
 
     #[test]

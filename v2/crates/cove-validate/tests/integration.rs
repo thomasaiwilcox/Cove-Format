@@ -1064,6 +1064,15 @@ fn requested_runtime_operation_rejects_unsupported_required_hint_without_semanti
 }
 
 #[test]
+fn requested_table_scan_rejects_cove_t_semantic_error_without_semantic_flag() {
+    let path = reject_fixture("cove_t_filecode_missing_dictionary.cove");
+    let output = run_validate_with_args(&path, &["--requested-operation", "table_scan"]);
+    assert!(!output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("COVE_E_BAD_FILECODE"), "{stdout}");
+}
+
+#[test]
 fn structural_validation_still_ignores_required_runtime_hint() {
     let path = runtime_fixture("runtime_hints_embedded_required_unsupported_reject.cove");
     let output = run_validate(&path, false);

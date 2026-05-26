@@ -1,11 +1,16 @@
 use crate::{
-    checksum, compression,
+    checksum,
+    codec::CodecExtensionDescriptorV2,
+    compression,
     constants::FEATURE_PAGE_PAYLOAD_ELISION,
-    page::{page_uses_payload_elision, ColumnPageIndex, ColumnPageIndexEntryV1},
+    page::{
+        page_uses_payload_elision, ColumnPageIndex, ColumnPageIndexEntryV1, PAGE_FLAG_ALL_NON_NULL,
+    },
     page_payload::ColumnPagePayloadV1,
     page_validation::{
         validate_column_page_payload, validate_page_codec_feature_advertisement,
-        validate_stats_only_constant_page, PageValidationContext,
+        validate_stats_only_constant_page, validate_stats_only_constant_page_envelope,
+        PageValidationContext,
     },
     segment::{TableColumnDirectoryEntryV1, TABLE_COLUMN_DIRECTORY_ENTRY_LEN},
     CoveError,
@@ -223,27 +228,61 @@ pub struct TemporalPropertyPage {
 
 impl TemporalSegmentData {
     pub fn parse(bytes: &[u8]) -> Result<Self, CoveError> {
-        Self::parse_inner(bytes, None, None, None)
+        Self::parse_inner(bytes, None, None, None, false, &[])
     }
 
     pub fn parse_with_required_features(
         bytes: &[u8],
         required_features: u64,
     ) -> Result<Self, CoveError> {
-        Self::parse_inner(bytes, Some(required_features), None, None)
+        Self::parse_inner(bytes, Some(required_features), None, None, false, &[])
     }
 
+    pub(crate) fn parse_after_semantic_validation_with_codec_descriptors(
+        bytes: &[u8],
+        required_features: u64,
+        codec_descriptors: &[CodecExtensionDescriptorV2],
+    ) -> Result<Self, CoveError> {
+        Self::parse_inner(
+            bytes,
+            Some(required_features),
+            None,
+            None,
+            true,
+            codec_descriptors,
+        )
+    }
+
+    #[allow(dead_code)]
     pub(crate) fn parse_with_feature_advertisement(
         bytes: &[u8],
         required_features: u64,
         file_advertised_features: u64,
         section_advertised_features: u64,
     ) -> Result<Self, CoveError> {
+        Self::parse_with_feature_advertisement_and_codec_descriptors(
+            bytes,
+            required_features,
+            file_advertised_features,
+            section_advertised_features,
+            &[],
+        )
+    }
+
+    pub(crate) fn parse_with_feature_advertisement_and_codec_descriptors(
+        bytes: &[u8],
+        required_features: u64,
+        file_advertised_features: u64,
+        section_advertised_features: u64,
+        codec_descriptors: &[CodecExtensionDescriptorV2],
+    ) -> Result<Self, CoveError> {
         Self::parse_inner(
             bytes,
             Some(required_features),
             Some(file_advertised_features),
             Some(section_advertised_features),
+            true,
+            codec_descriptors,
         )
     }
 
@@ -252,6 +291,8 @@ impl TemporalSegmentData {
         required_features: Option<u64>,
         file_advertised_features: Option<u64>,
         section_advertised_features: Option<u64>,
+        allow_contextual_stats_only: bool,
+        codec_descriptors: &[CodecExtensionDescriptorV2],
     ) -> Result<Self, CoveError> {
         let header = TemporalSegmentHeaderV1::parse(bytes)?;
         if header.row_count == 0 && header.morsel_count != 0 {
@@ -319,6 +360,8 @@ impl TemporalSegmentData {
             required_features,
             file_advertised_features,
             section_advertised_features,
+            allow_contextual_stats_only,
+            codec_descriptors,
         )?;
         let segment = Self {
             header,
@@ -385,6 +428,8 @@ fn parse_temporal_property_columns(
     required_features: Option<u64>,
     file_advertised_features: Option<u64>,
     section_advertised_features: Option<u64>,
+    allow_contextual_stats_only: bool,
+    codec_descriptors: &[CodecExtensionDescriptorV2],
 ) -> Result<Vec<TemporalPropertyColumn>, CoveError> {
     let page_index_offset =
         usize::try_from(header.page_index_offset).map_err(|_| CoveError::OffsetRange)?;
@@ -443,11 +488,18 @@ fn parse_temporal_property_columns(
                 physical_kind: directory.physical_kind,
                 dictionary: None,
                 zone_stats: None,
-                codec_descriptors: &[],
+                codec_descriptors,
                 nested_schema: None,
             };
             if page.page_length == 0 {
-                validate_temporal_property_stats_only_page(&context, page)?;
+                if page.flags & PAGE_FLAG_ALL_NON_NULL != 0 {
+                    validate_stats_only_constant_page_envelope(page)?;
+                    if !allow_contextual_stats_only {
+                        return Err(CoveError::PageCorrupt);
+                    }
+                } else {
+                    validate_temporal_property_stats_only_page(&context, page)?;
+                }
                 pages.push(TemporalPropertyPage {
                     index_entry: page.clone(),
                     payload: None,

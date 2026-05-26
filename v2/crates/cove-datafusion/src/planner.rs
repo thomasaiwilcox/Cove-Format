@@ -425,6 +425,7 @@ pub(crate) fn covi_candidates_for_filters(
                 }),
         );
         normalize_scan_candidate_ranges(&mut rows).ok()?;
+        validate_covi_candidate_ranges(state, &rows).ok()?;
         return Some(rows);
     }
     None
@@ -518,6 +519,61 @@ fn normalize_scan_candidate_ranges(rows: &mut Vec<ScanCandidateRowRange>) -> Res
         out.push(row);
     }
     *rows = out;
+    Ok(())
+}
+
+#[cfg(feature = "covi")]
+fn validate_covi_candidate_ranges(
+    state: &DatasetState,
+    rows: &[ScanCandidateRowRange],
+) -> Result<(), CoveError> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let file = state.file(0)?;
+    let segment_by_id = file
+        .segments()
+        .iter()
+        .enumerate()
+        .map(|(index, segment)| (segment.segment_id, index))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut morsels_by_segment =
+        std::collections::BTreeMap::<u32, Vec<cove_core::segment::RowMorselEntryV1>>::new();
+    for row in rows {
+        let Some(segment_index) = segment_by_id.get(&row.segment_id).copied() else {
+            return Err(CoveError::BadCovi);
+        };
+        let segment = file
+            .segments()
+            .get(segment_index)
+            .ok_or(CoveError::SegmentCorrupt)?;
+        if !morsels_by_segment.contains_key(&segment.segment_id) {
+            morsels_by_segment.insert(segment.segment_id, file.row_morsels_for_segment(segment)?);
+        }
+        let morsels = morsels_by_segment
+            .get(&segment.segment_id)
+            .ok_or(CoveError::SegmentCorrupt)?;
+        let Some(morsel) = morsels
+            .iter()
+            .find(|morsel| morsel.morsel_id == row.morsel_id)
+        else {
+            return Err(CoveError::BadCovi);
+        };
+        let scope_start = segment
+            .row_start
+            .checked_add(u64::from(morsel.first_row_in_segment))
+            .ok_or(CoveError::ArithOverflow)?;
+        let scope_end = scope_start
+            .checked_add(u64::from(morsel.row_count))
+            .ok_or(CoveError::ArithOverflow)?;
+        let row_end = row
+            .row_start
+            .checked_add(row.row_count)
+            .ok_or(CoveError::ArithOverflow)?;
+        if row.row_start < scope_start || row_end > scope_end {
+            return Err(CoveError::BadCovi);
+        }
+    }
     Ok(())
 }
 
