@@ -20,6 +20,7 @@ cove-arrow = { path = "../cove-arrow" }
 cove-cache = { path = "../cove-cache" }
 cove-coverage = { path = "../cove-coverage" }
 cove-core = { path = "../cove-core" }
+cove-map = { path = "../cove-map" }
 cove-index = { path = "../cove-index", optional = true }
 cove-layout = { path = "../cove-layout" }
 arrow-array = "58"

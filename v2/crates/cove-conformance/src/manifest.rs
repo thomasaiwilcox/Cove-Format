@@ -14,7 +14,10 @@ pub(crate) struct Entry {
 }
 
 pub(crate) fn load_manifest(corpus: &Path) -> Result<Vec<Entry>, String> {
-    let manifest = corpus.join("manifest.jsonl");
+    load_manifest_path(&corpus.join("manifest.jsonl"))
+}
+
+pub(crate) fn load_manifest_path(manifest: &Path) -> Result<Vec<Entry>, String> {
     let manifest_bytes = std::fs::read(&manifest)
         .map_err(|err| format!("cannot read manifest {}: {err}", manifest.display()))?;
     let text = String::from_utf8_lossy(&manifest_bytes);

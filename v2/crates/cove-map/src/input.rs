@@ -4,6 +4,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use arrow_array::RecordBatch;
+use arrow_json::writer::{LineDelimited, WriterBuilder};
+use cove_convert::{read_arrow_batches, read_orc_batches, read_parquet_batches};
 use serde_json::Value;
 
 use super::*;
@@ -44,15 +47,14 @@ pub(crate) fn read_source_inputs(paths: &[PathBuf]) -> Result<SourceInputs, Stri
             .to_string();
         let bytes =
             fs::read(path).map_err(|err| format!("cannot read {}: {err}", path.display()))?;
-        let source_kind = match path.extension().and_then(|ext| ext.to_str()) {
-            Some("jsonl") => "jsonl",
-            Some("csv") => "csv",
-            _ => return Err(format!("{} must be .jsonl or .csv", path.display())),
-        };
+        let source_kind = source_kind(path)?;
         let before_len = rows.len();
         match source_kind {
             "jsonl" => rows.extend(read_jsonl(path, &source_id)?),
             "csv" => rows.extend(read_csv(path, &source_id)?),
+            "parquet" => rows.extend(read_parquet(path, &source_id)?),
+            "orc" => rows.extend(read_orc(path, &source_id)?),
+            "arrow-ipc" => rows.extend(read_arrow_ipc(path, &source_id)?),
             _ => unreachable!(),
         }
         let source_rows = &rows[before_len..];
@@ -64,6 +66,20 @@ pub(crate) fn read_source_inputs(paths: &[PathBuf]) -> Result<SourceInputs, Stri
         });
     }
     Ok(SourceInputs { rows, states })
+}
+
+fn source_kind(path: &Path) -> Result<&'static str, String> {
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some("jsonl") => Ok("jsonl"),
+        Some("csv") => Ok("csv"),
+        Some("parquet") => Ok("parquet"),
+        Some("orc") => Ok("orc"),
+        Some("arrow" | "ipc" | "feather") => Ok("arrow-ipc"),
+        _ => Err(format!(
+            "{} must be .jsonl, .csv, .parquet, .orc, .arrow, .ipc, or .feather",
+            path.display()
+        )),
+    }
 }
 
 fn read_jsonl(path: &Path, source_id: &str) -> Result<Vec<SourceRow>, String> {
@@ -89,6 +105,21 @@ fn read_jsonl(path: &Path, source_id: &str) -> Result<Vec<SourceRow>, String> {
             })
         })
         .collect()
+}
+
+fn read_parquet(path: &Path, source_id: &str) -> Result<Vec<SourceRow>, String> {
+    let (_schema, batches) = read_parquet_batches(path)?;
+    source_rows_from_record_batches(path, source_id, batches)
+}
+
+fn read_orc(path: &Path, source_id: &str) -> Result<Vec<SourceRow>, String> {
+    let (_schema, batches) = read_orc_batches(path)?;
+    source_rows_from_record_batches(path, source_id, batches)
+}
+
+fn read_arrow_ipc(path: &Path, source_id: &str) -> Result<Vec<SourceRow>, String> {
+    let (_schema, batches) = read_arrow_batches(path)?;
+    source_rows_from_record_batches(path, source_id, batches)
 }
 
 pub(crate) fn read_csv(path: &Path, source_id: &str) -> Result<Vec<SourceRow>, String> {
@@ -127,6 +158,58 @@ pub(crate) fn read_csv(path: &Path, source_id: &str) -> Result<Vec<SourceRow>, S
                 source_id: source_id.to_string(),
                 row_index: index,
                 values,
+            })
+        })
+        .collect()
+}
+
+fn source_rows_from_record_batches(
+    path: &Path,
+    source_id: &str,
+    batches: Vec<RecordBatch>,
+) -> Result<Vec<SourceRow>, String> {
+    let mut writer = WriterBuilder::new()
+        .with_explicit_nulls(true)
+        .build::<_, LineDelimited>(Vec::new());
+    for batch in &batches {
+        writer
+            .write(batch)
+            .map_err(|err| format!("cannot encode {} rows as JSON: {err}", path.display()))?;
+    }
+    writer.finish().map_err(|err| {
+        format!(
+            "cannot finish JSON conversion for {}: {err}",
+            path.display()
+        )
+    })?;
+    let text = String::from_utf8(writer.into_inner()).map_err(|err| {
+        format!(
+            "JSON conversion for {} was not UTF-8: {err}",
+            path.display()
+        )
+    })?;
+    text.lines()
+        .enumerate()
+        .filter(|(_, line)| !line.trim().is_empty())
+        .map(|(index, line)| {
+            let value: Value = serde_json::from_str(line).map_err(|err| {
+                format!(
+                    "{}:{} invalid converted JSON row: {err}",
+                    path.display(),
+                    index + 1
+                )
+            })?;
+            let object = value.as_object().ok_or_else(|| {
+                format!(
+                    "{}:{} converted row must be an object",
+                    path.display(),
+                    index + 1
+                )
+            })?;
+            Ok(SourceRow {
+                source_id: source_id.to_string(),
+                row_index: index,
+                values: object_to_btree(object),
             })
         })
         .collect()

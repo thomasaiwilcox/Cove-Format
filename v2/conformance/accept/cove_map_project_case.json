@@ -1,4 +1,5 @@
 {
+  "expect_persisted_projection_rows": true,
   "expected_projected_rows": [
     {
       "membership_count": 1,

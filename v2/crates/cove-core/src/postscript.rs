@@ -239,6 +239,43 @@ impl CovePostscriptV1 {
         Self::parse_payload(ps_buf)
     }
 
+    /// Parse the postscript from a standalone 72-byte tail buffer.
+    ///
+    /// This is useful for range readers that fetch only the final
+    /// [`POSTSCRIPT_TOTAL_SIZE`] bytes instead of materializing the whole file.
+    pub fn parse_from_tail_bytes(tail_bytes: &[u8]) -> Result<Self, CoveError> {
+        if tail_bytes.len() < POSTSCRIPT_TOTAL_SIZE {
+            return Err(CoveError::BufferTooShort);
+        }
+        let tail_bytes = &tail_bytes[tail_bytes.len() - POSTSCRIPT_TOTAL_SIZE..];
+        let magic: [u8; 4] = tail_bytes[POSTSCRIPT_SIZE + 4..POSTSCRIPT_SIZE + 8]
+            .try_into()
+            .unwrap();
+        if magic != MAGIC_COVE {
+            return Err(CoveError::BadMagic);
+        }
+        let ps_version = u16::from_le_bytes(
+            tail_bytes[POSTSCRIPT_SIZE..POSTSCRIPT_SIZE + 2]
+                .try_into()
+                .unwrap(),
+        );
+        let ps_len = u16::from_le_bytes(
+            tail_bytes[POSTSCRIPT_SIZE + 2..POSTSCRIPT_SIZE + 4]
+                .try_into()
+                .unwrap(),
+        );
+        if ps_version != POSTSCRIPT_VERSION_V1 {
+            return Err(CoveError::BadVersion);
+        }
+        if ps_len as usize != POSTSCRIPT_SIZE {
+            return Err(CoveError::BadSection(format!(
+                "postscript_len is {}, expected {POSTSCRIPT_SIZE}",
+                ps_len as usize
+            )));
+        }
+        Self::parse_payload(&tail_bytes[..POSTSCRIPT_SIZE])
+    }
+
     /// Parse the 64-byte postscript payload (without the trailing tag).
     fn parse_payload(buf: &[u8]) -> Result<Self, CoveError> {
         if buf.len() < POSTSCRIPT_SIZE {

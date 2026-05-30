@@ -903,9 +903,20 @@ impl MapIdentityEquivalenceIndex {
 
 impl MapEvidenceIndex {
     pub fn parse(bytes: &[u8]) -> Result<Self, CoveError> {
+        Self::parse_with_requested_operation_metadata_keys(bytes, &[])
+    }
+
+    pub fn parse_with_requested_operation_metadata_keys(
+        bytes: &[u8],
+        requested_keys: &[String],
+    ) -> Result<Self, CoveError> {
         let root = parse_root_for_section(SectionKind::MapEvidenceIndex, bytes)?;
         let object = as_object(&root)?;
         let (mapping_id, mapping_version) = parse_mapping_identity(object)?;
+        let requested_keys = requested_keys
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
         let mut entries = Vec::new();
         if let Some(values) = optional_array(object, "entries")? {
             for value in values {
@@ -942,7 +953,10 @@ impl MapEvidenceIndex {
                 )?;
                 let operation_metadata = entry
                     .iter()
-                    .filter(|(key, _)| is_evidence_operation_metadata_key(key))
+                    .filter(|(key, _)| {
+                        is_evidence_operation_metadata_key(key)
+                            && (requested_keys.is_empty() || requested_keys.contains(key.as_str()))
+                    })
                     .map(|(key, value)| (key.clone(), value.clone()))
                     .collect();
                 entries.push(MapEvidenceEntry {

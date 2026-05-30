@@ -35,6 +35,8 @@ mod bootstrap;
 use bootstrap::validate_bytes_with_optional_pushdown_policy;
 #[path = "reader/profile_validators.rs"]
 mod profile_validators;
+#[path = "reader/section_rules.rs"]
+mod section_rules;
 #[path = "reader/shared_semantics.rs"]
 mod shared_semantics;
 
@@ -107,7 +109,7 @@ fn validate_sections(
         }
         last_section_id = Some(entry.section_id);
 
-        validate_section_profile(entry.section_kind, entry.profile)?;
+        section_rules::validate_section_profile(entry.section_kind, entry.profile)?;
         validate_section_profile_feature_bit(
             entry.profile,
             header.required_features | header.optional_features,
@@ -134,7 +136,7 @@ fn validate_sections(
         let section_bytes = &data[entry.offset as usize..section_end as usize];
         if checksum::crc32c(section_bytes) != entry.crc32c {
             if optional_pushdown_policy == OptionalPushdownPolicy::FailOpen
-                && profile_validators::is_optional_advisory_entry(entry)
+                && section_rules::is_optional_advisory_entry(entry)
             {
                 ignored_optional_sections.push(IgnoredOptionalSection {
                     section_id: entry.section_id,
@@ -470,91 +472,6 @@ fn validate_primary_profile_features(header: &CoveHeaderV1) -> Result<(), CoveEr
         return Err(CoveError::BadSection(format!(
             "primary_profile {:?} requires feature bit 0x{required_bit:016x}",
             profile
-        )));
-    }
-    Ok(())
-}
-
-fn validate_section_profile(section_kind: u16, profile: u8) -> Result<(), CoveError> {
-    let section = SectionKind::from_u16(section_kind)
-        .ok_or_else(|| CoveError::BadSection(format!("unknown section_kind {section_kind}")));
-    let allowed: &[u8] = match section? {
-        // shared (profile 0)
-        SectionKind::FileDictionaryIndex
-        | SectionKind::FileDictionaryPayload
-        | SectionKind::CollationRegistry
-        | SectionKind::DigestManifest
-        | SectionKind::RedactionManifest
-        | SectionKind::ArrowInteropHints
-        | SectionKind::LakehouseHints
-        | SectionKind::ExtensionRegistry
-        | SectionKind::ProfileCapabilityMatrix
-        | SectionKind::ExtendedFeatureSet
-        | SectionKind::FastMetadataIndex
-        | SectionKind::SectionFeatureBinding
-        | SectionKind::VendorExtension => &[0],
-        // COVE-R (profile 9)
-        SectionKind::RuntimeCompatibilityHints => &[9],
-        // COVE-T only (profile 2)
-        SectionKind::TableCatalog
-        | SectionKind::NestedSchema
-        | SectionKind::TableSegmentIndex
-        | SectionKind::TableSegmentData
-        | SectionKind::ColumnDomain
-        | SectionKind::ZoneStats => &[2],
-        // COVE-T/COVE-A (profiles 2 or 3)
-        SectionKind::ExactSetIndex
-        | SectionKind::BloomIndex
-        | SectionKind::InvertedMorselIndex
-        | SectionKind::KernelCapabilities => &[2, 3],
-        // COVE-A only (profile 3)
-        SectionKind::LookupIndex
-        | SectionKind::AggregateSynopsis
-        | SectionKind::CompositeZoneIndex
-        | SectionKind::TopNZoneSummary => &[3],
-        // COVE-CX (profile 7)
-        SectionKind::CodecExtensionRegistry => &[7],
-        // COVE-L (profile 8), with zero-copy also allowed as shared metadata.
-        SectionKind::LayoutPlan
-        | SectionKind::ScanSplitIndex
-        | SectionKind::PageClusterDirectory => &[8],
-        SectionKind::ZeroCopyBufferMap => &[0, 8],
-        // COVE-COVERAGE (profile 10)
-        SectionKind::CoverageProviderRegistry
-        | SectionKind::CoverageSet
-        | SectionKind::CoveragePlanCandidate
-        | SectionKind::PredicateNormalForm
-        | SectionKind::CoverageProofRecord => &[10],
-        // COVE-I/COVE-A
-        SectionKind::IndexOnlyCapability => &[3, 11],
-        // COVE-E (profile 4)
-        SectionKind::EngineProfileRegistry
-        | SectionKind::ExecutionCodeDescriptor
-        | SectionKind::ExecutionScopeDescriptor
-        | SectionKind::CodeSpaceDescriptor
-        | SectionKind::EngineMountPolicy => &[4],
-        // COVE-O (profile 1)
-        SectionKind::ObjectTypeCatalog
-        | SectionKind::TemporalSegmentIndex
-        | SectionKind::TemporalSegmentData
-        | SectionKind::TemporalBloomIndex
-        | SectionKind::TrustManifest => &[1],
-        // COVE-H (profile 5)
-        SectionKind::HarborMountHints => &[5],
-        // COVE-MAP (profile 6)
-        SectionKind::MapSourceCatalog
-        | SectionKind::MapFunctionRegistry
-        | SectionKind::MapIdentityRuleCatalog
-        | SectionKind::MapRowSemanticsCatalog
-        | SectionKind::MapAssertionLog
-        | SectionKind::MapIdentityEquivalenceIndex
-        | SectionKind::MapEvidenceIndex
-        | SectionKind::MapConversionReport
-        | SectionKind::MapProjectionCatalog => &[6],
-    };
-    if !allowed.contains(&profile) {
-        return Err(CoveError::BadSection(format!(
-            "section_kind {section_kind} must use one of profiles {allowed:?}, got {profile}"
         )));
     }
     Ok(())

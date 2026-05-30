@@ -9,6 +9,17 @@ that are not always meaningful as standalone COVE files. Run the corpus with:
 cargo run -p cove-conformance --bin cove-conformance -- conformance/
 ```
 
+Run the smaller implementer-kernel subset with:
+
+```sh
+cargo run -p cove-conformance --bin cove-conformance -- \
+  conformance/ --manifest conformance/minimal-reader-manifest.jsonl
+```
+
+The minimal subset reuses fixtures from the generated corpus. It is intended
+for early independent reader development and is not a publication conformance
+claim. The full generated manifest remains the release gate.
+
 Each manifest line is one JSON object:
 - `path`     — relative path from this directory
 - `kind`     — parser to run; omitted means `cove`. Current generated kinds are:

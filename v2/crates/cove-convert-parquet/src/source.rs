@@ -15,6 +15,7 @@ use cove_core::{
     checksum, constants::DigestAlgorithm, digest::compute_digest, utility::hex_encode,
 };
 use orc_rust::ArrowReaderBuilder;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceFormat {
@@ -138,6 +139,14 @@ pub fn read_arrow_batches(
     read_arrow_batches_from_bytes(&bytes)
 }
 
+pub fn read_parquet_batches(
+    path: impl AsRef<Path>,
+) -> Result<(arrow_schema::SchemaRef, Vec<arrow_array::RecordBatch>), String> {
+    let bytes = fs::read(path.as_ref())
+        .map_err(|err| format!("cannot read {}: {err}", path.as_ref().display()))?;
+    read_parquet_batches_from_bytes(&bytes)
+}
+
 pub fn read_csv_batches(
     path: impl AsRef<Path>,
     options: &CsvReadOptions,
@@ -221,6 +230,21 @@ fn read_arrow_batches_from_bytes(
     let batches = reader
         .collect::<Result<Vec<_>, _>>()
         .map_err(|err| format!("cannot read Arrow IPC stream: {err}"))?;
+    Ok((schema, batches))
+}
+
+fn read_parquet_batches_from_bytes(
+    bytes: &[u8],
+) -> Result<(arrow_schema::SchemaRef, Vec<arrow_array::RecordBatch>), String> {
+    let builder = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::copy_from_slice(bytes))
+        .map_err(|err| format!("cannot open parquet source: {err}"))?;
+    let schema = builder.schema().clone();
+    let batches = builder
+        .with_batch_size(4096)
+        .build()
+        .map_err(|err| format!("cannot build parquet reader: {err}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| format!("cannot read parquet batches: {err}"))?;
     Ok((schema, batches))
 }
 

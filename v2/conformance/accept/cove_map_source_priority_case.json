@@ -38,7 +38,7 @@
   },
   "expected_conversion_summary": {
     "evidence_entry_count": 3,
-    "materialized_row_count": 2
+    "materialized_row_count": 1
   },
   "mapping": "accept/cove_map_source_priority.covemap",
   "sources": [

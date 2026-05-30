@@ -3,7 +3,7 @@
 //! Corresponds to Sections 18–19 of the COVE v2.0 specification.
 
 use crate::{
-    constants::{CoveLogicalType, CovePhysicalKind},
+    constants::{CoveEncodingKind, CoveLogicalType, CovePhysicalKind},
     CoveError,
 };
 
@@ -135,6 +135,79 @@ pub fn validate_numcode_logical_type(
         | CoveLogicalType::TimestampMicros
         | CoveLogicalType::TimestampNanos => Ok(()),
         _ => Err(CoveError::BadNumCode),
+    }
+}
+
+pub fn logical_type_name(logical: CoveLogicalType) -> &'static str {
+    match logical {
+        CoveLogicalType::Null => "null",
+        CoveLogicalType::Bool => "bool",
+        CoveLogicalType::Int8 => "int8",
+        CoveLogicalType::Int16 => "int16",
+        CoveLogicalType::Int32 => "int32",
+        CoveLogicalType::Int64 => "int64",
+        CoveLogicalType::UInt8 => "uint8",
+        CoveLogicalType::UInt16 => "uint16",
+        CoveLogicalType::UInt32 => "uint32",
+        CoveLogicalType::UInt64 => "uint64",
+        CoveLogicalType::Float32 => "float32",
+        CoveLogicalType::Float64 => "float64",
+        CoveLogicalType::Decimal64 => "decimal64",
+        CoveLogicalType::Decimal128 => "decimal128",
+        CoveLogicalType::DateDays => "date_days",
+        CoveLogicalType::TimestampMicros => "timestamp_micros",
+        CoveLogicalType::TimestampNanos => "timestamp_nanos",
+        CoveLogicalType::Utf8 => "utf8",
+        CoveLogicalType::Binary => "binary",
+        CoveLogicalType::Uuid => "uuid",
+        CoveLogicalType::Json => "json",
+        CoveLogicalType::List => "list",
+        CoveLogicalType::Struct => "struct",
+        CoveLogicalType::Map => "map",
+    }
+}
+
+pub fn logical_type_from_name(name: &str) -> Result<CoveLogicalType, CoveError> {
+    match name {
+        "null" => Ok(CoveLogicalType::Null),
+        "bool" | "boolean" => Ok(CoveLogicalType::Bool),
+        "int8" => Ok(CoveLogicalType::Int8),
+        "int16" => Ok(CoveLogicalType::Int16),
+        "int32" => Ok(CoveLogicalType::Int32),
+        "int64" | "int" => Ok(CoveLogicalType::Int64),
+        "uint8" => Ok(CoveLogicalType::UInt8),
+        "uint16" => Ok(CoveLogicalType::UInt16),
+        "uint32" => Ok(CoveLogicalType::UInt32),
+        "uint64" | "uint" => Ok(CoveLogicalType::UInt64),
+        "float32" => Ok(CoveLogicalType::Float32),
+        "float64" | "float" => Ok(CoveLogicalType::Float64),
+        "decimal64" => Ok(CoveLogicalType::Decimal64),
+        "decimal128" | "decimal" => Ok(CoveLogicalType::Decimal128),
+        "date_days" | "date32" | "date" => Ok(CoveLogicalType::DateDays),
+        "timestamp_micros" | "timestamp_us" => Ok(CoveLogicalType::TimestampMicros),
+        "timestamp_nanos" | "timestamp_ns" => Ok(CoveLogicalType::TimestampNanos),
+        "utf8" | "string" => Ok(CoveLogicalType::Utf8),
+        "binary" => Ok(CoveLogicalType::Binary),
+        "uuid" => Ok(CoveLogicalType::Uuid),
+        "json" => Ok(CoveLogicalType::Json),
+        "list" => Ok(CoveLogicalType::List),
+        "struct" => Ok(CoveLogicalType::Struct),
+        "map" => Ok(CoveLogicalType::Map),
+        other => Err(CoveError::BadSchema(format!(
+            "unsupported logical type '{other}'"
+        ))),
+    }
+}
+
+pub fn encoding_kind_for_physical(physical: CovePhysicalKind) -> CoveEncodingKind {
+    match physical {
+        CovePhysicalKind::Boolean | CovePhysicalKind::FixedBytes => CoveEncodingKind::PlainFixed,
+        CovePhysicalKind::NumCode => CoveEncodingKind::NumCode,
+        CovePhysicalKind::FileCode => CoveEncodingKind::FileCode,
+        CovePhysicalKind::VarBytes => CoveEncodingKind::VarBytes,
+        CovePhysicalKind::List | CovePhysicalKind::Struct | CovePhysicalKind::Map => {
+            CoveEncodingKind::Canonical
+        }
     }
 }
 

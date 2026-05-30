@@ -14,6 +14,13 @@ use std::{
 
 #[cfg(feature = "parquet-compare")]
 use arrow_array::{ArrayRef, BooleanArray, Int64Array, RecordBatch, StringArray};
+#[cfg(feature = "parquet-compare")]
+use arrow_ipc::reader::{FileReader, StreamReader};
+#[cfg(feature = "parquet-compare")]
+use cove_core::artifact::covemap::{
+    CovemapFile, CovemapHeaderV1, CovemapPayloadEncodingV2, CovemapPostscriptV1, CovemapSection,
+    CovemapSectionEntryV1,
+};
 #[cfg(feature = "covm")]
 use cove_core::artifact::covm::{CovmFile, CovmFileEntryV1, CovmHeaderV1, CovmPostscriptV1};
 #[cfg(feature = "covm")]
@@ -21,7 +28,7 @@ use cove_core::constants::DigestAlgorithm;
 use cove_core::{
     constants::{
         CoveEncodingKind, CoveLogicalType, CovePhysicalKind, PrimaryProfile, SectionKind,
-        StorageClass, ValueTag,
+        StorageClass, ValueTag, FEATURE_SEMANTIC_MAP,
     },
     dictionary::{
         FileDictionary, FileDictionaryEncoding, FileDictionaryHeaderV1, FileDictionaryIndexEntryV1,
@@ -52,9 +59,12 @@ use cove_datafusion::{
     overlay::{CoveOverlaySnapshot, OverlayFile, OverlayFileIdentity, RowRange, RowVisibility},
     planner::{plan_scan, FilterPlan, NumericPredicateOp, PredicateLiteral, TopNScanHint},
     register::{
-        register_cove_file, register_cove_file_with_options, register_cove_overlay_snapshot,
+        register_cove_file, register_cove_file_with_options, register_cove_o_projection,
+        register_cove_overlay_snapshot,
     },
 };
+#[cfg(feature = "parquet-compare")]
+use cove_map::{cove_o_from_paths, projected_output_from_cove_o_path, ProjectionFormat};
 use criterion::{black_box, criterion_group, Criterion};
 #[cfg(feature = "parquet-compare")]
 use datafusion::execution::context::SessionConfig;
@@ -66,7 +76,11 @@ use datafusion::physical_plan::execution_plan::{
 use datafusion::prelude::ParquetReadOptions;
 use datafusion::prelude::SessionContext;
 #[cfg(feature = "parquet-compare")]
+use datafusion::{arrow::util::pretty::pretty_format_batches, common::DataFusionError};
+#[cfg(feature = "parquet-compare")]
 use parquet::{arrow::ArrowWriter, file::properties::WriterProperties};
+#[cfg(feature = "parquet-compare")]
+use serde_json::{json, Value};
 use tokio::runtime::{Builder as RuntimeBuilder, Runtime};
 
 static NEXT_FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
@@ -630,6 +644,146 @@ fn bench_m6_parquet_compare(c: &mut Criterion) {
         &cold_range_cove,
         &cold_range_parquet,
     );
+
+    let showcase_fixture = MappedShowcaseCompareFixture::new(&runtime);
+
+    let showcase_people_mapped = showcase_fixture.prepare_query(
+        &runtime,
+        "SELECT name FROM showcase_people_mapped_cove_o ORDER BY name",
+        2,
+        1,
+    );
+    let showcase_people_covet = showcase_fixture.prepare_query(
+        &runtime,
+        "SELECT name FROM showcase_people_cove_t ORDER BY name",
+        2,
+        1,
+    );
+    let showcase_people_parquet = showcase_fixture.prepare_query(
+        &runtime,
+        "SELECT name FROM showcase_people_parquet ORDER BY name",
+        2,
+        1,
+    );
+    assert_query_result_sets_equal(
+        &runtime,
+        &showcase_fixture.ctx,
+        &showcase_people_mapped,
+        &showcase_people_covet,
+    );
+    assert_query_result_sets_equal(
+        &runtime,
+        &showcase_fixture.ctx,
+        &showcase_people_mapped,
+        &showcase_people_parquet,
+    );
+    bench_query_triplet(
+        c,
+        "mapped_showcase_people_projection",
+        &runtime,
+        &showcase_fixture.ctx,
+        &showcase_people_mapped,
+        &showcase_people_covet,
+        &showcase_people_parquet,
+    );
+
+    let showcase_evidence_mapped = showcase_fixture.prepare_query(
+        &runtime,
+        "SELECT source_id, COUNT(DISTINCT source_row_identity) AS evidence_count \
+         FROM showcase_evidence_mapped_cove_o \
+         GROUP BY source_id ORDER BY source_id",
+        3,
+        2,
+    );
+    let showcase_evidence_covet = showcase_fixture.prepare_query(
+        &runtime,
+        "SELECT source_id, COUNT(DISTINCT source_row_identity) AS evidence_count \
+         FROM showcase_evidence_cove_t \
+         GROUP BY source_id ORDER BY source_id",
+        3,
+        2,
+    );
+    let showcase_evidence_parquet = showcase_fixture.prepare_query(
+        &runtime,
+        "SELECT source_id, COUNT(DISTINCT source_row_identity) AS evidence_count \
+         FROM showcase_evidence_parquet \
+         GROUP BY source_id ORDER BY source_id",
+        3,
+        2,
+    );
+    assert_query_result_sets_equal(
+        &runtime,
+        &showcase_fixture.ctx,
+        &showcase_evidence_mapped,
+        &showcase_evidence_covet,
+    );
+    assert_query_result_sets_equal(
+        &runtime,
+        &showcase_fixture.ctx,
+        &showcase_evidence_mapped,
+        &showcase_evidence_parquet,
+    );
+    bench_query_triplet(
+        c,
+        "mapped_showcase_evidence_aggregate",
+        &runtime,
+        &showcase_fixture.ctx,
+        &showcase_evidence_mapped,
+        &showcase_evidence_covet,
+        &showcase_evidence_parquet,
+    );
+
+    let showcase_join_mapped = showcase_fixture.prepare_query(
+        &runtime,
+        "SELECT DISTINCT p.name, e.source_id, e.source_row_identity \
+         FROM showcase_people_mapped_cove_o p \
+         JOIN showcase_evidence_mapped_cove_o e \
+           ON p.person_goid = e.output_object_id \
+         ORDER BY p.name, e.source_id, e.source_row_identity",
+        6,
+        3,
+    );
+    let showcase_join_covet = showcase_fixture.prepare_query(
+        &runtime,
+        "SELECT DISTINCT p.name, e.source_id, e.source_row_identity \
+         FROM showcase_people_cove_t p \
+         JOIN showcase_evidence_cove_t e \
+           ON p.person_goid = e.output_object_id \
+         ORDER BY p.name, e.source_id, e.source_row_identity",
+        6,
+        3,
+    );
+    let showcase_join_parquet = showcase_fixture.prepare_query(
+        &runtime,
+        "SELECT DISTINCT p.name, e.source_id, e.source_row_identity \
+         FROM showcase_people_parquet p \
+         JOIN showcase_evidence_parquet e \
+           ON p.person_goid = e.output_object_id \
+         ORDER BY p.name, e.source_id, e.source_row_identity",
+        6,
+        3,
+    );
+    assert_query_result_sets_equal(
+        &runtime,
+        &showcase_fixture.ctx,
+        &showcase_join_mapped,
+        &showcase_join_covet,
+    );
+    assert_query_result_sets_equal(
+        &runtime,
+        &showcase_fixture.ctx,
+        &showcase_join_mapped,
+        &showcase_join_parquet,
+    );
+    bench_query_triplet(
+        c,
+        "mapped_showcase_people_evidence_join",
+        &runtime,
+        &showcase_fixture.ctx,
+        &showcase_join_mapped,
+        &showcase_join_covet,
+        &showcase_join_parquet,
+    );
 }
 
 #[cfg(feature = "parquet-compare")]
@@ -644,6 +798,29 @@ fn bench_query_pair(
     let mut group = c.benchmark_group(name);
     group.bench_function("cove", |b| {
         b.iter(|| black_box(execute_prepared_query(runtime, ctx, cove)))
+    });
+    group.bench_function("parquet", |b| {
+        b.iter(|| black_box(execute_prepared_query(runtime, ctx, parquet)))
+    });
+    group.finish();
+}
+
+#[cfg(feature = "parquet-compare")]
+fn bench_query_triplet(
+    c: &mut Criterion,
+    name: &str,
+    runtime: &Runtime,
+    ctx: &SessionContext,
+    mapped_cove_o: &PreparedQuery,
+    cove_t: &PreparedQuery,
+    parquet: &PreparedQuery,
+) {
+    let mut group = c.benchmark_group(name);
+    group.bench_function("mapped_cove_o", |b| {
+        b.iter(|| black_box(execute_prepared_query(runtime, ctx, mapped_cove_o)))
+    });
+    group.bench_function("projected_cove_t", |b| {
+        b.iter(|| black_box(execute_prepared_query(runtime, ctx, cove_t)))
     });
     group.bench_function("parquet", |b| {
         b.iter(|| black_box(execute_prepared_query(runtime, ctx, parquet)))
@@ -807,6 +984,12 @@ struct ParquetCompareFixture {
     _dir: TempFixtureDir,
     ctx: SessionContext,
     large_events: ComparePaths,
+}
+
+#[cfg(feature = "parquet-compare")]
+struct MappedShowcaseCompareFixture {
+    _dir: TempFixtureDir,
+    ctx: SessionContext,
 }
 
 #[cfg(feature = "parquet-compare")]
@@ -1016,6 +1199,157 @@ impl ParquetCompareFixture {
 }
 
 #[cfg(feature = "parquet-compare")]
+impl MappedShowcaseCompareFixture {
+    fn new(runtime: &Runtime) -> Self {
+        let dir = TempFixtureDir::new("m6-mapped-showcase");
+        let mapping_path = dir.path.join("showcase.covemap");
+        fs::write(
+            &mapping_path,
+            showcase_multi_source_covemap()
+                .serialize()
+                .expect("serialize showcase covemap"),
+        )
+        .expect("write showcase mapping");
+
+        let crm_path = dir.path.join("crm.csv");
+        fs::write(&crm_path, b"id,name\np1,Ada CRM\np2,Linus CRM\n").expect("write CRM source");
+
+        let directory_path = dir.path.join("directory.parquet");
+        write_parquet_batches(&directory_path, &[showcase_directory_name_batch()]);
+
+        let subscription_path = dir.path.join("subscription.csv");
+        fs::write(&subscription_path, b"id,name\np1,Ada\np2,Linus\n")
+            .expect("write subscription source");
+
+        let source_paths = vec![crm_path, directory_path, subscription_path];
+        let object_path = dir.path.join("showcase-object.cove");
+        let object_bytes =
+            cove_o_from_paths(&mapping_path, &source_paths).expect("build mapped showcase COVE-O");
+        fs::write(&object_path, object_bytes).expect("write showcase COVE-O");
+
+        let people_cove_t_path = dir.path.join("people_projection.cove");
+        fs::write(
+            &people_cove_t_path,
+            projected_output_from_cove_o_path(
+                &object_path,
+                None,
+                ProjectionFormat::CoveT,
+                Some("person_projection"),
+            )
+            .expect("project people COVE-T"),
+        )
+        .expect("write people COVE-T");
+
+        let evidence_cove_t_path = dir.path.join("evidence_projection.cove");
+        fs::write(
+            &evidence_cove_t_path,
+            projected_output_from_cove_o_path(
+                &object_path,
+                None,
+                ProjectionFormat::CoveT,
+                Some("evidence_projection"),
+            )
+            .expect("project evidence COVE-T"),
+        )
+        .expect("write evidence COVE-T");
+
+        let people_parquet_path = dir.path.join("people_projection.parquet");
+        write_parquet_batches(
+            &people_parquet_path,
+            &decode_projection_arrow(
+                &projected_output_from_cove_o_path(
+                    &object_path,
+                    None,
+                    ProjectionFormat::Arrow,
+                    Some("person_projection"),
+                )
+                .expect("project people Arrow"),
+            )
+            .expect("decode people Arrow projection"),
+        );
+
+        let evidence_parquet_path = dir.path.join("evidence_projection.parquet");
+        write_parquet_batches(
+            &evidence_parquet_path,
+            &decode_projection_arrow(
+                &projected_output_from_cove_o_path(
+                    &object_path,
+                    None,
+                    ProjectionFormat::Arrow,
+                    Some("evidence_projection"),
+                )
+                .expect("project evidence Arrow"),
+            )
+            .expect("decode evidence Arrow projection"),
+        );
+
+        let ctx = SessionContext::new();
+        register_cove_o_projection(
+            &ctx,
+            "showcase_people_mapped_cove_o",
+            &object_path,
+            None,
+            "person_projection",
+        )
+        .expect("register mapped people projection");
+        register_cove_o_projection(
+            &ctx,
+            "showcase_evidence_mapped_cove_o",
+            &object_path,
+            None,
+            "evidence_projection",
+        )
+        .expect("register mapped evidence projection");
+        register_cove_file(&ctx, "showcase_people_cove_t", &people_cove_t_path)
+            .expect("register people COVE-T");
+        register_cove_file(&ctx, "showcase_evidence_cove_t", &evidence_cove_t_path)
+            .expect("register evidence COVE-T");
+        runtime.block_on(async {
+            ctx.register_parquet(
+                "showcase_people_parquet",
+                people_parquet_path
+                    .to_str()
+                    .expect("showcase people parquet path"),
+                ParquetReadOptions::default(),
+            )
+            .await
+            .expect("register people Parquet");
+            ctx.register_parquet(
+                "showcase_evidence_parquet",
+                evidence_parquet_path
+                    .to_str()
+                    .expect("showcase evidence parquet path"),
+                ParquetReadOptions::default(),
+            )
+            .await
+            .expect("register evidence Parquet");
+        });
+
+        Self { _dir: dir, ctx }
+    }
+
+    fn prepare_query(
+        &self,
+        runtime: &Runtime,
+        sql: &str,
+        expected_rows: usize,
+        expected_columns: usize,
+    ) -> PreparedQuery {
+        runtime.block_on(async {
+            let df = self.ctx.sql(sql).await.expect("build showcase SQL plan");
+            df.create_physical_plan()
+                .await
+                .expect("create showcase physical plan");
+            PreparedQuery {
+                sql: Arc::<str>::from(sql),
+                expected_rows,
+                expected_columns,
+            }
+        })
+    }
+}
+
+#[cfg(feature = "parquet-compare")]
 #[derive(Debug, Clone)]
 struct ComparePaths {
     cove: PathBuf,
@@ -1035,23 +1369,46 @@ fn execute_prepared_query(
     ctx: &SessionContext,
     query: &PreparedQuery,
 ) -> (usize, usize) {
+    let batches = collect_prepared_query_batches(runtime, ctx, query);
+    assert_query_batches(&batches, query)
+}
+
+#[cfg(feature = "parquet-compare")]
+fn collect_prepared_query_batches(
+    runtime: &Runtime,
+    ctx: &SessionContext,
+    query: &PreparedQuery,
+) -> Vec<RecordBatch> {
     runtime.block_on(async {
-        let batches = ctx
-            .sql(query.sql.as_ref())
+        ctx.sql(query.sql.as_ref())
             .await
             .expect("build benchmark query")
             .collect()
             .await
-            .expect("execute benchmark query");
-        let rows = batches.iter().map(|batch| batch.num_rows()).sum();
-        let columns = batches
-            .first()
-            .map(|batch| batch.num_columns())
-            .unwrap_or(0);
-        assert_eq!(rows, query.expected_rows);
-        assert_eq!(columns, query.expected_columns);
-        (rows, columns)
+            .expect("execute benchmark query")
     })
+}
+
+#[cfg(feature = "parquet-compare")]
+fn assert_query_result_sets_equal(
+    runtime: &Runtime,
+    ctx: &SessionContext,
+    left: &PreparedQuery,
+    right: &PreparedQuery,
+) {
+    let left_batches = collect_prepared_query_batches(runtime, ctx, left);
+    let right_batches = collect_prepared_query_batches(runtime, ctx, right);
+    let left_formatted = pretty_format_batches(&left_batches)
+        .expect("format left query batches")
+        .to_string();
+    let right_formatted = pretty_format_batches(&right_batches)
+        .expect("format right query batches")
+        .to_string();
+    assert_eq!(
+        left_formatted, right_formatted,
+        "query result mismatch between '{}' and '{}'",
+        left.sql, right.sql
+    );
 }
 
 #[cfg(feature = "parquet-compare")]
@@ -1725,14 +2082,278 @@ fn scan_heavy_wide_events_batch(row_count: usize, payload_columns: usize) -> Rec
 
 #[cfg(feature = "parquet-compare")]
 fn write_parquet_file(path: &Path, batch: &RecordBatch) {
+    write_parquet_batches(path, std::slice::from_ref(batch));
+}
+
+#[cfg(feature = "parquet-compare")]
+fn write_parquet_batches(path: &Path, batches: &[RecordBatch]) {
     let file = std::fs::File::create(path).expect("create parquet fixture");
+    let schema = batches
+        .first()
+        .map(RecordBatch::schema)
+        .expect("parquet fixture must contain at least one batch");
+    let max_row_group_row_count = batches.iter().map(RecordBatch::num_rows).max().unwrap_or(0);
     let properties = WriterProperties::builder()
-        .set_max_row_group_row_count(Some(batch.num_rows()))
+        .set_max_row_group_row_count(Some(max_row_group_row_count))
         .build();
     let mut writer =
-        ArrowWriter::try_new(file, batch.schema(), Some(properties)).expect("open parquet writer");
-    writer.write(batch).expect("write parquet fixture batch");
+        ArrowWriter::try_new(file, schema, Some(properties)).expect("open parquet writer");
+    for batch in batches {
+        writer.write(batch).expect("write parquet fixture batch");
+    }
     writer.close().expect("close parquet writer");
+}
+
+#[cfg(feature = "parquet-compare")]
+fn decode_projection_arrow(bytes: &[u8]) -> Result<Vec<RecordBatch>, DataFusionError> {
+    if let Ok(reader) = FileReader::try_new(std::io::Cursor::new(bytes.to_vec()), None) {
+        return reader
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|err| {
+                DataFusionError::Execution(format!(
+                    "cannot decode Arrow IPC file projection: {err}"
+                ))
+            });
+    }
+
+    let reader =
+        StreamReader::try_new(std::io::Cursor::new(bytes.to_vec()), None).map_err(|err| {
+            DataFusionError::Execution(format!(
+                "cannot decode Arrow IPC projection as file or stream: {err}"
+            ))
+        })?;
+    reader
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|err| {
+            DataFusionError::Execution(format!("cannot decode Arrow IPC stream projection: {err}"))
+        })
+}
+
+#[cfg(feature = "parquet-compare")]
+fn covemap_section(kind: SectionKind, value: Value) -> CovemapSection {
+    let payload = serde_json::to_vec_pretty(&covemap_payload_value(kind, value))
+        .expect("serialize covemap section");
+    CovemapSection {
+        entry: CovemapSectionEntryV1 {
+            section_id: kind as u32,
+            offset: 0,
+            length: payload.len() as u64,
+            uncompressed_length: payload.len() as u64,
+            compression: 0,
+            payload_encoding: CovemapPayloadEncodingV2::CoveMapJsonV2 as u8,
+            required: true,
+            reserved: 0,
+            checksum: 0,
+        },
+        payload,
+    }
+}
+
+#[cfg(feature = "parquet-compare")]
+fn covemap_payload_value(kind: SectionKind, mut value: Value) -> Value {
+    if let Value::Object(object) = &mut value {
+        object.insert(
+            "schema_id".to_string(),
+            Value::String("org.coveformat.covemap.v2".to_string()),
+        );
+        object.insert(
+            "section_id".to_string(),
+            Value::Number((kind as u16).into()),
+        );
+    }
+    value
+}
+
+#[cfg(feature = "parquet-compare")]
+fn showcase_multi_source_covemap() -> CovemapFile {
+    CovemapFile {
+        header: CovemapHeaderV1::new([0x53; 16], 0),
+        mapping_version: "bench/showcase.v1".into(),
+        sections: vec![
+            covemap_section(
+                SectionKind::MapSourceCatalog,
+                json!({
+                    "mapping_id": "showcase-map",
+                    "mapping_version": "bench/showcase.v1",
+                    "sources": [
+                        {"source_id": "crm", "row_identity_rules": ["person_by_id"], "source_priority": 10},
+                        {"source_id": "directory", "row_identity_rules": ["person_by_id"], "source_priority": 20},
+                        {"source_id": "subscription", "row_identity_rules": ["person_by_id"], "source_priority": 1}
+                    ]
+                }),
+            ),
+            covemap_section(
+                SectionKind::MapFunctionRegistry,
+                json!({
+                    "mapping_id": "showcase-map",
+                    "mapping_version": "bench/showcase.v1",
+                    "functions": [{
+                        "function_id": "identity",
+                        "version": "1",
+                        "deterministic": true,
+                        "dependency": "pure"
+                    }]
+                }),
+            ),
+            covemap_section(
+                SectionKind::MapIdentityRuleCatalog,
+                json!({
+                    "mapping_id": "showcase-map",
+                    "mapping_version": "bench/showcase.v1",
+                    "identity_rules": [
+                        {
+                            "rule_id": "person_by_id",
+                            "object_type": "Person",
+                            "semantic_role": "subject",
+                            "confidence_class": "authoritative",
+                            "candidate_only": false,
+                            "property_conflicts_declared": true,
+                            "function_ids": ["identity"],
+                            "join_keys": [{
+                                "role_id": "person_id",
+                                "source_column": "id",
+                                "logical_type": "utf8",
+                                "canonicalization": "identity",
+                                "null_policy": "reject",
+                                "ordering": "declared"
+                            }]
+                        }
+                    ],
+                    "do_not_merge": []
+                }),
+            ),
+            covemap_section(
+                SectionKind::MapRowSemanticsCatalog,
+                json!({
+                    "mapping_id": "showcase-map",
+                    "mapping_version": "bench/showcase.v1",
+                    "rules": [
+                        {
+                            "rule_id": "upsert_person_name_crm",
+                            "source_id": "crm",
+                            "identity_rule_id": "person_by_id",
+                            "row_semantics_kind": "Object",
+                            "assertion_kinds": ["object", "property", "evidence"],
+                            "function_ids": ["identity"],
+                            "output_assertion_ids": ["person_name_assertion_crm"],
+                            "association_endpoints": [],
+                            "property_bindings": [{
+                                "assertion_id": "person_name_assertion_crm",
+                                "property_id": "name",
+                                "property_name": "name",
+                                "source_column": "name",
+                                "logical_type": "utf8",
+                                "nullable": true,
+                                "missing_policy": "reject",
+                                "conflict_policy": "source_priority_wins"
+                            }]
+                        },
+                        {
+                            "rule_id": "upsert_person_name_directory",
+                            "source_id": "directory",
+                            "identity_rule_id": "person_by_id",
+                            "row_semantics_kind": "Object",
+                            "assertion_kinds": ["object", "property", "evidence"],
+                            "function_ids": ["identity"],
+                            "output_assertion_ids": ["person_name_assertion_directory"],
+                            "association_endpoints": [],
+                            "property_bindings": [{
+                                "assertion_id": "person_name_assertion_directory",
+                                "property_id": "name",
+                                "property_name": "name",
+                                "source_column": "name",
+                                "logical_type": "utf8",
+                                "nullable": true,
+                                "missing_policy": "reject",
+                                "conflict_policy": "source_priority_wins"
+                            }]
+                        },
+                        {
+                            "rule_id": "upsert_person_name_subscription",
+                            "source_id": "subscription",
+                            "identity_rule_id": "person_by_id",
+                            "row_semantics_kind": "Object",
+                            "assertion_kinds": ["object", "property", "evidence"],
+                            "function_ids": ["identity"],
+                            "output_assertion_ids": ["person_name_assertion_subscription"],
+                            "association_endpoints": [],
+                            "property_bindings": [{
+                                "assertion_id": "person_name_assertion_subscription",
+                                "property_id": "name",
+                                "property_name": "name",
+                                "source_column": "name",
+                                "logical_type": "utf8",
+                                "nullable": true,
+                                "missing_policy": "reject",
+                                "conflict_policy": "source_priority_wins"
+                            }]
+                        }
+                    ]
+                }),
+            ),
+            covemap_section(
+                SectionKind::MapProjectionCatalog,
+                json!({
+                    "mapping_id": "showcase-map",
+                    "mapping_version": "bench/showcase.v1",
+                    "projections": [
+                        {
+                            "projection_id": "person_projection",
+                            "output_table": "people_projection",
+                            "row_grain": "one_row_per_object",
+                            "anchor": {"object_type": "Person"},
+                            "temporal_mode": {"as_of": "latest_committed"},
+                            "multi_value_policy": "reject",
+                            "missing_policy": "null",
+                            "output_modes": ["json", "arrow", "cove-t", "cove-o"],
+                            "columns": [
+                                {"name": "person_goid", "logical_type": "uuid", "value": "object.goid"},
+                                {"name": "name", "logical_type": "utf8", "value": "name"}
+                            ]
+                        },
+                        {
+                            "projection_id": "evidence_projection",
+                            "output_table": "evidence_projection",
+                            "row_grain": "one_row_per_evidence_assertion",
+                            "anchor": {"object_type": "Person"},
+                            "temporal_mode": {"as_of": "latest_committed"},
+                            "multi_value_policy": "reject",
+                            "missing_policy": "null",
+                            "output_modes": ["json", "arrow", "cove-t", "cove-o"],
+                            "columns": [
+                                {"name": "source_id", "logical_type": "utf8", "value": "evidence.source_id"},
+                                {"name": "source_row_identity", "logical_type": "utf8", "value": "evidence.source_row_identity"},
+                                {"name": "output_object_id", "logical_type": "uuid", "value": "evidence.output_object_id"}
+                            ]
+                        }
+                    ]
+                }),
+            ),
+        ],
+        postscript: CovemapPostscriptV1 {
+            required_features: FEATURE_SEMANTIC_MAP,
+            optional_features: 0,
+            file_len: 0,
+            header_offset: 0,
+            header_length: 0,
+            checksum: 0,
+        },
+    }
+}
+
+#[cfg(feature = "parquet-compare")]
+fn showcase_directory_name_batch() -> RecordBatch {
+    RecordBatch::try_from_iter(vec![
+        (
+            "id",
+            Arc::new(StringArray::from(vec!["p1", "p2"])) as ArrayRef,
+        ),
+        (
+            "name",
+            Arc::new(StringArray::from(vec!["Ada Directory", "Linus Directory"])) as ArrayRef,
+        ),
+    ])
+    .expect("build showcase directory batch")
 }
 
 #[cfg(feature = "parquet-compare")]

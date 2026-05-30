@@ -126,12 +126,14 @@ materialization.
 
 ## Source Fingerprints
 
-For local CSV/JSONL replay checks, the reference CLI recognizes:
+For local CSV, JSONL, Parquet, ORC, and Arrow IPC replay checks, the reference
+CLI recognizes:
 
 - `snapshot_digest`: `sha256:<64 lowercase hex>` over the exact source file
   bytes.
 - `schema_fingerprint`: `cove-map-schema-v1:<64 lowercase hex>` over source
-  kind, sorted field names, and observed JSON primitive kind sets.
+  kind, sorted field names, and observed JSON primitive kind sets after the
+  reference runner's deterministic row normalization step.
 
 When `replay_claimed` is true, both recognized fingerprints are required and
 must match the live source input.
@@ -154,10 +156,10 @@ Required for executable projections:
 - `columns`
 - `output_modes`
 
-Executable projection `output_modes` are `json`, `arrow`, `cove-t`, and
-`sql`. `cove-o` is accepted only as a schema declaration: table-to-object
-projection semantics are not defined by the v2 reference executor, so
-`cove-map project --format cove-o` fails closed with a precise error.
+Executable projection `output_modes` are `json`, `arrow`, `cove-t`, `sql`, and
+`cove-o`. `cove-map project --format cove-o` materializes the selected
+projection as a COVE-O file with embedded projection metadata so persisted
+projection readback can reconstruct the declared table surface.
 
 Supported row grains:
 

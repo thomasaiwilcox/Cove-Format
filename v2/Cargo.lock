@@ -690,6 +690,7 @@ name = "cove-bench"
 version = "0.1.0"
 dependencies = [
  "arrow-array",
+ "arrow-ipc",
  "arrow-schema",
  "cove-arrow",
  "cove-cache",
@@ -723,6 +724,7 @@ name = "cove-conformance"
 version = "0.1.0"
 dependencies = [
  "arrow-array",
+ "arrow-ipc",
  "cove-arrow",
  "cove-cache",
  "cove-codec",
@@ -733,6 +735,7 @@ dependencies = [
  "cove-map",
  "cove-profile-validation",
  "cove-runtime",
+ "orc-rust",
  "parquet",
  "serde_json",
 ]
@@ -741,8 +744,16 @@ dependencies = [
 name = "cove-convert"
 version = "0.1.0"
 dependencies = [
+ "arrow-array",
+ "arrow-csv",
+ "arrow-ipc",
+ "arrow-schema",
+ "bytes",
  "cove-arrow",
- "cove-convert-parquet",
+ "cove-core",
+ "orc-rust",
+ "parquet",
+ "serde_json",
 ]
 
 [[package]]
@@ -802,6 +813,7 @@ dependencies = [
  "cove-coverage",
  "cove-index",
  "cove-layout",
+ "cove-map",
  "criterion",
  "datafusion",
  "datafusion-datasource",
@@ -895,9 +907,12 @@ dependencies = [
  "arrow-ipc",
  "arrow-json",
  "arrow-schema",
+ "cove-convert",
  "cove-core",
  "icu_casemap",
  "icu_normalizer",
+ "orc-rust",
+ "parquet",
  "serde_json",
  "sha2",
 ]

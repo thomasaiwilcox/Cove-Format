@@ -17,12 +17,11 @@ use cove_arrow::parquet::{convert_arrow_record_batches, ParquetConversionOptions
 use cove_cache::{CoveCoverageCacheHeaderV2, CoverageCacheEntryV2, CoverageCacheV2};
 #[cfg(all(feature = "covm", feature = "covx"))]
 use cove_core::artifact::covx::{CovxFile, CovxHeaderV1, CovxPostscriptV1, CovxReferencedFileV1};
-#[cfg(feature = "covm")]
 use cove_core::{
-    artifact::covm::{CovmFile, CovmFileEntryV1, CovmHeaderV1, CovmPostscriptV1},
-    constants::DigestAlgorithm,
-};
-use cove_core::{
+    artifact::covemap::{
+        CovemapFile, CovemapHeaderV1, CovemapPayloadEncodingV2, CovemapPostscriptV1,
+        CovemapSection, CovemapSectionEntryV1,
+    },
     canonical::CanonicalValue,
     checksum,
     codec::{
@@ -32,7 +31,8 @@ use cove_core::{
     constants::{
         CoveEncodingKind, CoveLogicalType, CovePhysicalKind, PrimaryProfile, SectionKind,
         StorageClass, ValueTag, FEATURE_ENGINE_PROFILE, FEATURE_EXTENDED_FEATURE_SET,
-        FEATURE_REDACTIONS, FEATURE_REGISTERED_ENCODINGS, FEATURE_TABLE_PROFILE,
+        FEATURE_REDACTIONS, FEATURE_REGISTERED_ENCODINGS, FEATURE_SEMANTIC_MAP,
+        FEATURE_TABLE_PROFILE,
     },
     dictionary::{FileDictionary, FileDictionaryHeaderV1, FileDictionaryIndexEntryV1},
     domain::ColumnDomain,
@@ -82,6 +82,11 @@ use cove_core::{
     },
     CoveError,
 };
+#[cfg(feature = "covm")]
+use cove_core::{
+    artifact::covm::{CovmFile, CovmFileEntryV1, CovmHeaderV1, CovmPostscriptV1},
+    constants::DigestAlgorithm,
+};
 use cove_coverage::{
     coverage_set_payload_checksum, CoverageExactnessV2, CoverageGranularityV2, CoverageProofKindV2,
     CoverageProofRecordV2, CoverageProofStrengthV2, CoverageProviderDescriptorV2,
@@ -114,11 +119,12 @@ use cove_datafusion::{
         cove_table_from_path, cove_table_from_path_async, register_cove_file,
         register_cove_file_async, register_cove_file_format, register_cove_file_with_options,
         register_cove_listing_table, register_cove_listing_table_with_options,
-        register_cove_overlay_snapshot, CoveTableOptions, ExecutionCodePolicy,
-        FilterResidualPolicy,
+        register_cove_o_projection, register_cove_o_projections, register_cove_overlay_snapshot,
+        CoveTableOptions, ExecutionCodePolicy, FilterResidualPolicy,
     },
     task_graph::build_task_graph,
 };
+use cove_map::cove_o_from_paths;
 use datafusion::object_store::{
     memory::InMemory, path::Path, CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload,
     ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
@@ -140,6 +146,8 @@ use datafusion::{
     prelude::SessionContext,
 };
 use futures::stream::BoxStream;
+use parquet::arrow::ArrowWriter;
+use serde_json::{json, Value};
 use url::Url;
 
 static NEXT_FILE_ID: AtomicU64 = AtomicU64::new(0);
@@ -256,6 +264,352 @@ async fn registered_utf8_page_scans_through_core_fallback_without_descriptor() {
     ];
     assert_batches_eq!(expected, &batches);
     fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn register_cove_o_projections_queries_people_projection() {
+    let object_path = write_temp_mapped_cove(
+        "mapped-people",
+        "cove_map_execution.covemap",
+        &["people.parquet"],
+    );
+    let ctx = SessionContext::new();
+    let registered = register_cove_o_projections(&ctx, &object_path, None, None).unwrap();
+    assert_eq!(registered.len(), 1);
+    assert_eq!(registered[0].table_name, "people_projection");
+    assert_eq!(registered[0].projection_id, "person_projection");
+
+    let batches = ctx
+        .sql("SELECT name, membership_count FROM people_projection ORDER BY name")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let expected = [
+        "+-------+------------------+",
+        "| name  | membership_count |",
+        "+-------+------------------+",
+        "| Ada   | 1                |",
+        "| Linus | 1                |",
+        "+-------+------------------+",
+    ];
+    assert_batches_eq!(expected, &batches);
+    fs::remove_file(object_path).unwrap();
+}
+
+#[tokio::test]
+async fn register_cove_o_projections_uses_cove_projection_exec() {
+    let object_path = write_temp_mapped_cove(
+        "mapped-people-exec",
+        "cove_map_execution.covemap",
+        &["people.parquet"],
+    );
+    let ctx = SessionContext::new();
+    register_cove_o_projections(&ctx, &object_path, None, None).unwrap();
+
+    let (batches, range_requests) = collect_sql_with_cove_metric(
+        &ctx,
+        "SELECT name FROM people_projection ORDER BY name",
+        "cove_range_requests",
+    )
+    .await;
+    let expected = [
+        "+-------+",
+        "| name  |",
+        "+-------+",
+        "| Ada   |",
+        "| Linus |",
+        "+-------+",
+    ];
+    assert_batches_eq!(expected, &batches);
+    assert!(range_requests > 0);
+
+    let explain_batches = ctx
+        .sql("EXPLAIN SELECT name FROM people_projection ORDER BY name")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let explain = pretty_format_batches(&explain_batches).unwrap().to_string();
+    assert!(explain.contains("CoveProjectionExec"));
+    assert!(!explain.contains("MemTableExec"));
+
+    fs::remove_file(object_path).unwrap();
+}
+
+#[tokio::test]
+async fn register_cove_o_projections_uses_sparse_range_plan() {
+    let object_path = write_temp_mapped_cove(
+        "mapped-people-range-plan",
+        "cove_map_execution.covemap",
+        &["people.parquet"],
+    );
+    let ctx = SessionContext::new();
+    register_cove_o_projections(&ctx, &object_path, None, None).unwrap();
+
+    let (batches, sparse_plan_count) = collect_sql_with_cove_metric(
+        &ctx,
+        "SELECT name FROM people_projection ORDER BY name",
+        "cove_range_plan_sparse",
+    )
+    .await;
+    let (_, dense_plan_count) = collect_sql_with_cove_metric(
+        &ctx,
+        "SELECT name FROM people_projection ORDER BY name",
+        "cove_range_plan_dense",
+    )
+    .await;
+    let (_, range_requests) = collect_sql_with_cove_metric(
+        &ctx,
+        "SELECT name FROM people_projection ORDER BY name",
+        "cove_range_requests",
+    )
+    .await;
+
+    let expected = [
+        "+-------+",
+        "| name  |",
+        "+-------+",
+        "| Ada   |",
+        "| Linus |",
+        "+-------+",
+    ];
+    assert_batches_eq!(expected, &batches);
+    assert_eq!(sparse_plan_count, 1);
+    assert_eq!(dense_plan_count, 0);
+    assert!(range_requests > 1);
+
+    fs::remove_file(object_path).unwrap();
+}
+
+#[tokio::test]
+async fn register_cove_o_projections_pushes_exact_scalar_filters() {
+    let object_path = write_temp_mapped_cove(
+        "mapped-people-filter",
+        "cove_map_execution.covemap",
+        &["people.parquet"],
+    );
+    let ctx = SessionContext::new();
+    register_cove_o_projections(&ctx, &object_path, None, None).unwrap();
+
+    let batches = ctx
+        .sql("SELECT membership_count FROM people_projection WHERE name = 'Ada'")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let expected = [
+        "+------------------+",
+        "| membership_count |",
+        "+------------------+",
+        "| 1                |",
+        "+------------------+",
+    ];
+    assert_batches_eq!(expected, &batches);
+
+    let explain_batches = ctx
+        .sql("EXPLAIN SELECT membership_count FROM people_projection WHERE name = 'Ada'")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let explain = pretty_format_batches(&explain_batches).unwrap().to_string();
+    assert!(explain.contains("CoveProjectionExec"));
+    assert!(
+        !explain.contains("FilterExec"),
+        "exact pushed filter should not leave a FilterExec: {explain}"
+    );
+
+    fs::remove_file(object_path).unwrap();
+}
+
+#[tokio::test]
+async fn mapped_cove_o_end_to_end_builds_registers_and_queries_in_datafusion() {
+    let mapping_path = conformance_accept_path("cove_map_execution.covemap");
+    let source_paths = vec![conformance_accept_path("people.parquet")];
+    let object_bytes = cove_o_from_paths(&mapping_path, &source_paths).unwrap();
+    let object_path = write_temp_cove("mapped-e2e", object_bytes);
+
+    let ctx = SessionContext::new();
+    let registered = register_cove_o_projections(&ctx, &object_path, None, Some("demo")).unwrap();
+    assert_eq!(registered.len(), 1);
+    assert_eq!(registered[0].table_name, "demo__people_projection");
+    assert_eq!(registered[0].projection_id, "person_projection");
+
+    let batches = ctx
+        .sql("SELECT name, membership_count FROM demo__people_projection ORDER BY name")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let expected = [
+        "+-------+------------------+",
+        "| name  | membership_count |",
+        "+-------+------------------+",
+        "| Ada   | 1                |",
+        "| Linus | 1                |",
+        "+-------+------------------+",
+    ];
+    assert_batches_eq!(expected, &batches);
+    fs::remove_file(object_path).unwrap();
+}
+
+#[tokio::test]
+async fn mapped_cove_o_showcase_spans_multiple_sources_and_projections_in_datafusion() {
+    let showcase_dir = std::env::temp_dir().join(format!(
+        "cove-datafusion-showcase-{}-{}",
+        std::process::id(),
+        NEXT_FILE_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir_all(&showcase_dir).unwrap();
+    let mapping_path = showcase_dir.join("showcase.covemap");
+    fs::write(
+        &mapping_path,
+        showcase_multi_source_covemap().serialize().unwrap(),
+    )
+    .unwrap();
+    let crm_path = showcase_dir.join("crm.csv");
+    fs::write(&crm_path, b"id,name\np1,Ada CRM\np2,Linus CRM\n").unwrap();
+    let directory_path = showcase_dir.join("directory.parquet");
+    fs::write(
+        &directory_path,
+        write_parquet_batch(showcase_directory_name_batch()),
+    )
+    .unwrap();
+    let subscriptions_path = showcase_dir.join("subscription.csv");
+    fs::write(&subscriptions_path, b"id,name\np1,Ada\np2,Linus\n").unwrap();
+
+    let source_paths = vec![
+        crm_path.clone(),
+        directory_path.clone(),
+        subscriptions_path.clone(),
+    ];
+    let object_bytes = cove_o_from_paths(&mapping_path, &source_paths).unwrap();
+    let object_path = write_temp_cove("mapped-showcase-object", object_bytes);
+
+    let ctx = SessionContext::new();
+    let registered = register_cove_o_projections(&ctx, &object_path, None, Some("demo")).unwrap();
+    assert_eq!(registered.len(), 2);
+    assert_eq!(
+        registered
+            .iter()
+            .map(|projection| projection.table_name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["demo__people_projection", "demo__evidence_projection",]
+    );
+
+    let people_batches = ctx
+        .sql("SELECT name FROM demo__people_projection ORDER BY name")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let expected_people = [
+        "+-------+",
+        "| name  |",
+        "+-------+",
+        "| Ada   |",
+        "| Linus |",
+        "+-------+",
+    ];
+    assert_batches_eq!(expected_people, &people_batches);
+
+    let directory_batches = ctx
+        .sql(
+            "SELECT source_id, COUNT(DISTINCT source_row_identity) AS evidence_count \
+             FROM demo__evidence_projection \
+             GROUP BY source_id ORDER BY source_id",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let expected_directory = [
+        "+--------------+----------------+",
+        "| source_id    | evidence_count |",
+        "+--------------+----------------+",
+        "| crm          | 2              |",
+        "| directory    | 2              |",
+        "| subscription | 2              |",
+        "+--------------+----------------+",
+    ];
+    assert_batches_eq!(expected_directory, &directory_batches);
+
+    let joined_batches = ctx
+        .sql(
+            "SELECT DISTINCT p.name, e.source_id, e.source_row_identity \
+             FROM demo__people_projection p \
+             JOIN demo__evidence_projection e \
+               ON p.person_goid = e.output_object_id \
+             ORDER BY p.name, e.source_id, e.source_row_identity",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let expected_joined = [
+        "+-------+--------------+---------------------+",
+        "| name  | source_id    | source_row_identity |",
+        "+-------+--------------+---------------------+",
+        "| Ada   | crm          | crm:0               |",
+        "| Ada   | directory    | directory:0         |",
+        "| Ada   | subscription | subscription:0      |",
+        "| Linus | crm          | crm:1               |",
+        "| Linus | directory    | directory:1         |",
+        "| Linus | subscription | subscription:1      |",
+        "+-------+--------------+---------------------+",
+    ];
+    assert_batches_eq!(expected_joined, &joined_batches);
+
+    fs::remove_file(object_path).unwrap();
+    fs::remove_dir_all(showcase_dir).unwrap();
+}
+
+#[tokio::test]
+async fn register_cove_o_projection_queries_mixed_format_object_with_mapping_path() {
+    let object_path = write_temp_mapped_cove(
+        "mapped-mixed",
+        "cove_map_source_priority_projectable.covemap",
+        &["cove_map_crm.parquet", "cove_map_support.orc"],
+    );
+    let mapping_path = conformance_accept_path("cove_map_source_priority_projectable.covemap");
+    let ctx = SessionContext::new();
+    register_cove_o_projection(
+        &ctx,
+        "priority_people",
+        &object_path,
+        Some(&mapping_path),
+        "person_projection",
+    )
+    .unwrap();
+
+    let batches = ctx
+        .sql("SELECT name FROM priority_people")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let expected = [
+        "+--------------+",
+        "| name         |",
+        "+--------------+",
+        "| Support Name |",
+        "+--------------+",
+    ];
+    assert_batches_eq!(expected, &batches);
+    fs::remove_file(object_path).unwrap();
 }
 
 #[tokio::test]
@@ -5523,6 +5877,238 @@ fn canonical_utf8(value: &str) -> Vec<u8> {
     canonical
 }
 
+fn covemap_section(kind: SectionKind, value: Value) -> CovemapSection {
+    let payload = serde_json::to_vec_pretty(&covemap_payload_value(kind, value)).unwrap();
+    CovemapSection {
+        entry: CovemapSectionEntryV1 {
+            section_id: kind as u32,
+            offset: 0,
+            length: payload.len() as u64,
+            uncompressed_length: payload.len() as u64,
+            compression: 0,
+            payload_encoding: CovemapPayloadEncodingV2::CoveMapJsonV2 as u8,
+            required: true,
+            reserved: 0,
+            checksum: 0,
+        },
+        payload,
+    }
+}
+
+fn covemap_payload_value(kind: SectionKind, mut value: Value) -> Value {
+    if let Value::Object(object) = &mut value {
+        object.insert(
+            "schema_id".to_string(),
+            Value::String("org.coveformat.covemap.v2".to_string()),
+        );
+        object.insert(
+            "section_id".to_string(),
+            Value::Number((kind as u16).into()),
+        );
+    }
+    value
+}
+
+fn showcase_multi_source_covemap() -> CovemapFile {
+    CovemapFile {
+        header: CovemapHeaderV1::new([0x53; 16], 0),
+        mapping_version: "test/showcase.v1".into(),
+        sections: vec![
+            covemap_section(
+                SectionKind::MapSourceCatalog,
+                json!({
+                    "mapping_id": "showcase-map",
+                    "mapping_version": "test/showcase.v1",
+                    "sources": [
+                        {"source_id": "crm", "row_identity_rules": ["person_by_id"], "source_priority": 10},
+                        {"source_id": "directory", "row_identity_rules": ["person_by_id"], "source_priority": 20},
+                        {"source_id": "subscription", "row_identity_rules": ["person_by_id"], "source_priority": 1}
+                    ]
+                }),
+            ),
+            covemap_section(
+                SectionKind::MapFunctionRegistry,
+                json!({
+                    "mapping_id": "showcase-map",
+                    "mapping_version": "test/showcase.v1",
+                    "functions": [{
+                        "function_id": "identity",
+                        "version": "1",
+                        "deterministic": true,
+                        "dependency": "pure"
+                    }]
+                }),
+            ),
+            covemap_section(
+                SectionKind::MapIdentityRuleCatalog,
+                json!({
+                    "mapping_id": "showcase-map",
+                    "mapping_version": "test/showcase.v1",
+                    "identity_rules": [
+                        {
+                            "rule_id": "person_by_id",
+                            "object_type": "Person",
+                            "semantic_role": "subject",
+                            "confidence_class": "authoritative",
+                            "candidate_only": false,
+                            "property_conflicts_declared": true,
+                            "function_ids": ["identity"],
+                            "join_keys": [{
+                                "role_id": "person_id",
+                                "source_column": "id",
+                                "logical_type": "utf8",
+                                "canonicalization": "identity",
+                                "null_policy": "reject",
+                                "ordering": "declared"
+                            }]
+                        }
+                    ],
+                    "do_not_merge": []
+                }),
+            ),
+            covemap_section(
+                SectionKind::MapRowSemanticsCatalog,
+                json!({
+                    "mapping_id": "showcase-map",
+                    "mapping_version": "test/showcase.v1",
+                    "rules": [
+                        {
+                            "rule_id": "upsert_person_name_crm",
+                            "source_id": "crm",
+                            "identity_rule_id": "person_by_id",
+                            "row_semantics_kind": "Object",
+                            "assertion_kinds": ["object", "property", "evidence"],
+                            "function_ids": ["identity"],
+                            "output_assertion_ids": ["person_name_assertion_crm"],
+                            "association_endpoints": [],
+                            "property_bindings": [{
+                                "assertion_id": "person_name_assertion_crm",
+                                "property_id": "name",
+                                "property_name": "name",
+                                "source_column": "name",
+                                "logical_type": "utf8",
+                                "nullable": true,
+                                "missing_policy": "reject",
+                                "conflict_policy": "source_priority_wins"
+                            }]
+                        },
+                        {
+                            "rule_id": "upsert_person_name_directory",
+                            "source_id": "directory",
+                            "identity_rule_id": "person_by_id",
+                            "row_semantics_kind": "Object",
+                            "assertion_kinds": ["object", "property", "evidence"],
+                            "function_ids": ["identity"],
+                            "output_assertion_ids": ["person_name_assertion_directory"],
+                            "association_endpoints": [],
+                            "property_bindings": [{
+                                "assertion_id": "person_name_assertion_directory",
+                                "property_id": "name",
+                                "property_name": "name",
+                                "source_column": "name",
+                                "logical_type": "utf8",
+                                "nullable": true,
+                                "missing_policy": "reject",
+                                "conflict_policy": "source_priority_wins"
+                            }]
+                        },
+                        {
+                            "rule_id": "upsert_person_name_subscription",
+                            "source_id": "subscription",
+                            "identity_rule_id": "person_by_id",
+                            "row_semantics_kind": "Object",
+                            "assertion_kinds": ["object", "property", "evidence"],
+                            "function_ids": ["identity"],
+                            "output_assertion_ids": ["person_name_assertion_subscription"],
+                            "association_endpoints": [],
+                            "property_bindings": [{
+                                "assertion_id": "person_name_assertion_subscription",
+                                "property_id": "name",
+                                "property_name": "name",
+                                "source_column": "name",
+                                "logical_type": "utf8",
+                                "nullable": true,
+                                "missing_policy": "reject",
+                                "conflict_policy": "source_priority_wins"
+                            }]
+                        }
+                    ]
+                }),
+            ),
+            covemap_section(
+                SectionKind::MapProjectionCatalog,
+                json!({
+                    "mapping_id": "showcase-map",
+                    "mapping_version": "test/showcase.v1",
+                    "projections": [
+                        {
+                            "projection_id": "person_projection",
+                            "output_table": "people_projection",
+                            "row_grain": "one_row_per_object",
+                            "anchor": {"object_type": "Person"},
+                            "temporal_mode": {"as_of": "latest_committed"},
+                            "multi_value_policy": "reject",
+                            "missing_policy": "null",
+                            "output_modes": ["json", "arrow", "cove-t", "cove-o"],
+                            "columns": [
+                                {"name": "person_goid", "logical_type": "uuid", "value": "object.goid"},
+                                {"name": "name", "logical_type": "utf8", "value": "name"}
+                            ]
+                        },
+                        {
+                            "projection_id": "evidence_projection",
+                            "output_table": "evidence_projection",
+                            "row_grain": "one_row_per_evidence_assertion",
+                            "anchor": {"object_type": "Person"},
+                            "temporal_mode": {"as_of": "latest_committed"},
+                            "multi_value_policy": "reject",
+                            "missing_policy": "null",
+                            "output_modes": ["json", "arrow", "cove-t", "cove-o"],
+                            "columns": [
+                                {"name": "source_id", "logical_type": "utf8", "value": "evidence.source_id"},
+                                {"name": "source_row_identity", "logical_type": "utf8", "value": "evidence.source_row_identity"},
+                                {"name": "output_object_id", "logical_type": "uuid", "value": "evidence.output_object_id"}
+                            ]
+                        }
+                    ]
+                }),
+            ),
+        ],
+        postscript: CovemapPostscriptV1 {
+            required_features: FEATURE_SEMANTIC_MAP,
+            optional_features: 0,
+            file_len: 0,
+            header_offset: 0,
+            header_length: 0,
+            checksum: 0,
+        },
+    }
+}
+
+fn showcase_directory_name_batch() -> ArrowRecordBatch {
+    ArrowRecordBatch::try_from_iter(vec![
+        (
+            "id",
+            Arc::new(StringArray::from(vec!["p1", "p2"])) as ArrowArrayRef,
+        ),
+        (
+            "name",
+            Arc::new(StringArray::from(vec!["Ada Directory", "Linus Directory"])) as ArrowArrayRef,
+        ),
+    ])
+    .unwrap()
+}
+
+fn write_parquet_batch(batch: ArrowRecordBatch) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    {
+        let mut writer = ArrowWriter::try_new(&mut bytes, batch.schema(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
+    bytes
+}
+
 fn write_temp_cove(label: &str, bytes: Vec<u8>) -> PathBuf {
     let id = NEXT_FILE_ID.fetch_add(1, Ordering::Relaxed);
     let path = std::env::temp_dir().join(format!(
@@ -5531,6 +6117,22 @@ fn write_temp_cove(label: &str, bytes: Vec<u8>) -> PathBuf {
     ));
     fs::write(&path, bytes).unwrap();
     path
+}
+
+fn conformance_accept_path(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../conformance/accept")
+        .join(name)
+}
+
+fn write_temp_mapped_cove(label: &str, mapping: &str, sources: &[&str]) -> PathBuf {
+    let map_path = conformance_accept_path(mapping);
+    let source_paths = sources
+        .iter()
+        .map(|source| conformance_accept_path(source))
+        .collect::<Vec<_>>();
+    let bytes = cove_o_from_paths(&map_path, &source_paths).unwrap();
+    write_temp_cove(label, bytes)
 }
 
 #[cfg(feature = "covm")]

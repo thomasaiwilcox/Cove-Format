@@ -1,33 +1,38 @@
 use std::{
-    collections::BTreeMap,
+    borrow::Cow,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
     sync::Arc,
 };
 
 use arrow_array::{
-    new_empty_array, Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array,
-    Decimal64Array, FixedSizeBinaryArray, Float32Array, Float64Array, Int16Array, Int32Array,
-    Int64Array, Int8Array, RecordBatch, StringArray, TimestampMicrosecondArray,
-    TimestampNanosecondArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
+    builder::StringBuilder, new_empty_array, Array, ArrayRef, BinaryArray, BooleanArray,
+    Date32Array, Decimal128Array, Decimal64Array, FixedSizeBinaryArray, Float32Array, Float64Array,
+    Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, RecordBatchOptions, StringArray,
+    TimestampMicrosecondArray, TimestampNanosecondArray, UInt16Array, UInt32Array, UInt64Array,
+    UInt8Array,
 };
 use arrow_ipc::writer::FileWriter;
 use arrow_json::ReaderBuilder as JsonReaderBuilder;
-use arrow_schema::{DataType, Field, Fields, Schema, TimeUnit};
+use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef, TimeUnit};
 use cove_core::artifact::covemap::{
     CovemapFile, CovemapHeaderV1, CovemapPayloadEncodingV2, CovemapPostscriptV1, CovemapSection,
     CovemapSectionEntryV1,
 };
 use cove_core::profile::{
-    cove_map::{EmbeddedMapSection, MapEvidenceEntry, MapProjectionColumn},
+    cove_map::{
+        EmbeddedMapSection, MapEvidenceEntry, MapProjectionCatalog, MapProjectionColumn,
+        MapProjectionEntry,
+    },
     cove_o::{
-        read_object_surface_from_bytes_with_options, reconstruct_object_states,
-        CoveObjectReadOptions, CoveObjectRecord, CoveObjectState, CoveObjectSurface, RecordKind,
-        OBJECT_TYPE_FLAG_ASSOCIATION_OBJECT, OBJECT_TYPE_FLAG_LINK_OBJECT,
-        PROPERTY_FLAG_ASSOCIATION_FROM_GOID, PROPERTY_FLAG_ASSOCIATION_OBSERVED_AT,
-        PROPERTY_FLAG_ASSOCIATION_TO_GOID, PROPERTY_FLAG_ASSOCIATION_TYPE,
-        PROPERTY_FLAG_ASSOCIATION_VALID_FROM, PROPERTY_FLAG_ASSOCIATION_VALID_TO,
-        PROPERTY_FLAG_EVIDENCE_REF, PROPERTY_FLAG_MAPPING_RULE_REF,
+        read_object_surface_from_bytes_with_options, CoveObjectReadOptions, CoveObjectRecord,
+        CoveObjectSurface, CoveRecordRefV1, RecordKind, OBJECT_TYPE_FLAG_ASSOCIATION_OBJECT,
+        OBJECT_TYPE_FLAG_LINK_OBJECT, PROPERTY_FLAG_ASSOCIATION_FROM_GOID,
+        PROPERTY_FLAG_ASSOCIATION_OBSERVED_AT, PROPERTY_FLAG_ASSOCIATION_TO_GOID,
+        PROPERTY_FLAG_ASSOCIATION_TYPE, PROPERTY_FLAG_ASSOCIATION_VALID_FROM,
+        PROPERTY_FLAG_ASSOCIATION_VALID_TO, PROPERTY_FLAG_EVIDENCE_REF,
+        PROPERTY_FLAG_MAPPING_RULE_REF,
     },
 };
 use cove_core::{
@@ -44,6 +49,8 @@ use cove_core::{
 use serde_json::{json, Map, Value};
 
 use super::*;
+
+mod encoding;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProjectionFormat {
@@ -66,6 +73,71 @@ impl ProjectionFormat {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct ProjectionBatchOptions {
+    pub max_rows: Option<usize>,
+    pub output_columns: Option<Vec<String>>,
+    pub pushed_filters: Vec<ProjectionFilter>,
+    pub batch_size: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectionFilterOp {
+    Eq,
+    Lt,
+    LtEq,
+    Gt,
+    GtEq,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProjectionFilterLiteral {
+    Null,
+    Boolean(bool),
+    Int64(i64),
+    UInt64(u64),
+    Float64(f64),
+    Utf8(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProjectionFilter {
+    Compare {
+        column: String,
+        op: ProjectionFilterOp,
+        literal: ProjectionFilterLiteral,
+    },
+    InList {
+        column: String,
+        literals: Vec<ProjectionFilterLiteral>,
+    },
+    IsNull {
+        column: String,
+        negated: bool,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct ProjectionAccessPlan {
+    requested_property_names: Vec<String>,
+    requested_object_type_names: Vec<String>,
+    requested_evidence_metadata_keys: Vec<String>,
+    include_association_object_types: bool,
+    include_records: bool,
+    include_evidence_index: bool,
+    needs_reconstructed_rows: bool,
+    needs_history_rows: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectionReadRequirements {
+    pub requested_object_type_names: Vec<String>,
+    pub include_association_object_types: bool,
+    pub include_records: bool,
+}
+
+pub(crate) use encoding::nested_schema_node_from_shape;
+
 #[derive(Debug, Clone)]
 struct ProjectedColumn {
     name: String,
@@ -82,6 +154,8 @@ struct ProjectedTable {
     columns: Vec<ProjectedColumn>,
     rows: Vec<Map<String, Value>>,
 }
+
+const DEFAULT_ARROW_BATCH_SIZE: usize = 1024;
 
 pub(crate) fn diff_maps(left: &CovemapFile, right: &CovemapFile) -> Value {
     let left_sections = section_set(left);
@@ -155,6 +229,7 @@ pub(crate) fn project_rows_with_source_states_output(
         &function_ids,
         projection_id,
         format,
+        &ProjectionBatchOptions::default(),
     )?;
     encode_projection_output(format, &projection_catalog, &tables)
 }
@@ -172,13 +247,147 @@ pub(crate) fn project_cove_o_path_output(
 ) -> Result<Vec<u8>, String> {
     let bytes =
         fs::read(object).map_err(|err| format!("cannot read {}: {err}", object.display()))?;
-    let catalog_surface = read_object_surface_from_bytes_with_options(
+    project_cove_o_bytes_output(
         &bytes,
-        &CoveObjectReadOptions::requested_property_ids([u32::MAX]),
+        mapping,
+        format,
+        projection_id,
+        &object.display().to_string(),
     )
-    .map_err(|err| format!("{}: {err}", object.display()))?;
-    let projection_catalog = match &catalog_surface.projection_catalog {
-        Some(catalog) => catalog.clone(),
+}
+
+pub(crate) fn projection_catalog_from_cove_o_path(
+    object: &Path,
+    mapping: Option<&Path>,
+) -> Result<MapProjectionCatalog, String> {
+    let bytes =
+        fs::read(object).map_err(|err| format!("cannot read {}: {err}", object.display()))?;
+    projection_catalog_from_cove_o_bytes(&bytes, mapping, &object.display().to_string())
+}
+
+pub(crate) fn project_cove_o_bytes_output(
+    bytes: &[u8],
+    mapping: Option<&Path>,
+    format: ProjectionFormat,
+    projection_id: Option<&str>,
+    object_label: &str,
+) -> Result<Vec<u8>, String> {
+    let projection_catalog = projection_catalog_from_cove_o_bytes(bytes, mapping, object_label)?;
+    let execution_options = ProjectionBatchOptions::default();
+    let surface = read_surface_for_projection(
+        bytes,
+        mapping,
+        object_label,
+        &projection_catalog,
+        projection_id,
+        format,
+        &execution_options,
+    )?;
+    let function_ids = projection_function_ids(mapping, &surface)?;
+    let tables = project_tables_from_surface(
+        &surface,
+        &projection_catalog,
+        &function_ids,
+        projection_id,
+        format,
+        &execution_options,
+    )?;
+    encode_projection_output(format, &projection_catalog, &tables)
+}
+
+pub(crate) fn project_cove_o_bytes_record_batch(
+    bytes: &[u8],
+    mapping: Option<&Path>,
+    projection_id: &str,
+    options: &ProjectionBatchOptions,
+    object_label: &str,
+) -> Result<RecordBatch, String> {
+    let projection_catalog = projection_catalog_from_cove_o_bytes(bytes, mapping, object_label)?;
+    let surface = read_surface_for_projection(
+        bytes,
+        mapping,
+        object_label,
+        &projection_catalog,
+        Some(projection_id),
+        ProjectionFormat::Arrow,
+        options,
+    )?;
+    let function_ids = projection_function_ids(mapping, &surface)?;
+    let tables = project_tables_from_surface(
+        &surface,
+        &projection_catalog,
+        &function_ids,
+        Some(projection_id),
+        ProjectionFormat::Arrow,
+        options,
+    )?;
+    let table = single_projection_table(&tables, "Arrow")?;
+    encoding::arrow_record_batch(table)
+}
+
+pub(crate) fn project_cove_o_bytes_record_batches(
+    bytes: &[u8],
+    mapping: Option<&Path>,
+    projection_id: &str,
+    options: &ProjectionBatchOptions,
+    object_label: &str,
+) -> Result<Vec<RecordBatch>, String> {
+    let projection_catalog = projection_catalog_from_cove_o_bytes(bytes, mapping, object_label)?;
+    project_cove_o_bytes_record_batches_with_catalog(
+        bytes,
+        mapping,
+        &projection_catalog,
+        projection_id,
+        options,
+        object_label,
+    )
+}
+
+pub(crate) fn project_cove_o_bytes_record_batches_with_catalog(
+    bytes: &[u8],
+    mapping: Option<&Path>,
+    projection_catalog: &MapProjectionCatalog,
+    projection_id: &str,
+    options: &ProjectionBatchOptions,
+    object_label: &str,
+) -> Result<Vec<RecordBatch>, String> {
+    let surface = read_surface_for_projection(
+        bytes,
+        mapping,
+        object_label,
+        projection_catalog,
+        Some(projection_id),
+        ProjectionFormat::Arrow,
+        options,
+    )?;
+    let function_ids = projection_function_ids(mapping, &surface)?;
+    project_arrow_record_batches_from_surface(
+        &surface,
+        projection_catalog,
+        &function_ids,
+        projection_id,
+        options,
+    )
+}
+
+fn projection_catalog_from_cove_o_bytes(
+    bytes: &[u8],
+    mapping: Option<&Path>,
+    object_label: &str,
+) -> Result<MapProjectionCatalog, String> {
+    let catalog_surface = read_object_surface_from_bytes_with_options(
+        bytes,
+        &CoveObjectReadOptions {
+            include_projection_catalog: true,
+            include_function_registry: false,
+            include_records: false,
+            include_evidence_index: false,
+            ..Default::default()
+        },
+    )
+    .map_err(|err| format!("{object_label}: {err}"))?;
+    match &catalog_surface.projection_catalog {
+        Some(catalog) => Ok(catalog.clone()),
         None => {
             let mapping = mapping.ok_or_else(|| {
                 "project-cove-o requires embedded MAP_PROJECTION_CATALOG or --mapping <mapping.covemap>"
@@ -187,27 +396,53 @@ pub(crate) fn project_cove_o_path_output(
             let file = parse_map(mapping)?;
             projection_catalog(&file)?.ok_or_else(|| {
                 "fallback mapping requires a MAP_PROJECTION_CATALOG section".to_string()
-            })?
+            })
         }
-    };
-    let read_options = CoveObjectReadOptions::requested_property_names(
-        requested_property_names_for_catalog(&projection_catalog),
-    );
-    let surface = read_object_surface_from_bytes_with_options(&bytes, &read_options)
-        .map_err(|err| format!("{}: {err}", object.display()))?;
-    let model = ProjectionModel::from_surface(&surface).map_err(|err| err.to_string())?;
-    let function_ids = match mapping {
-        Some(mapping) => function_registry(&parse_map(mapping)?)?,
-        None => embedded_function_registry(&surface.embedded_map_sections),
-    };
-    let tables = project_tables(
-        &model,
-        &projection_catalog,
-        &function_ids,
-        projection_id,
-        format,
+    }
+}
+
+pub(crate) fn projection_read_requirements(
+    catalog: &MapProjectionCatalog,
+    projection_id: &str,
+    options: &ProjectionBatchOptions,
+) -> Result<ProjectionReadRequirements, String> {
+    let access_plan = compile_projection_access_plan(
+        catalog,
+        Some(projection_id),
+        ProjectionFormat::Arrow,
+        options,
     )?;
-    encode_projection_output(format, &projection_catalog, &tables)
+    Ok(ProjectionReadRequirements {
+        requested_object_type_names: access_plan.requested_object_type_names,
+        include_association_object_types: access_plan.include_association_object_types,
+        include_records: access_plan.include_records,
+    })
+}
+
+fn read_surface_for_projection(
+    bytes: &[u8],
+    mapping: Option<&Path>,
+    object_label: &str,
+    catalog: &MapProjectionCatalog,
+    projection_id: Option<&str>,
+    format: ProjectionFormat,
+    options: &ProjectionBatchOptions,
+) -> Result<CoveObjectSurface, String> {
+    let access_plan = compile_projection_access_plan(catalog, projection_id, format, options)?;
+    let mut read_options = access_plan.read_options();
+    read_options.include_function_registry = mapping.is_none();
+    read_object_surface_from_bytes_with_options(bytes, &read_options)
+        .map_err(|err| format!("{object_label}: {err}"))
+}
+
+fn projection_function_ids(
+    mapping: Option<&Path>,
+    surface: &CoveObjectSurface,
+) -> Result<std::collections::BTreeSet<String>, String> {
+    match mapping {
+        Some(mapping) => function_registry(&parse_map(mapping)?),
+        None => Ok(surface.embedded_function_ids.clone()),
+    }
 }
 
 fn projection_catalog(file: &CovemapFile) -> Result<Option<MapProjectionCatalog>, String> {
@@ -240,13 +475,158 @@ fn embedded_function_registry(
     ids
 }
 
-fn project_tables(
-    model: &ProjectionModel,
+impl ProjectionAccessPlan {
+    fn read_options(&self) -> CoveObjectReadOptions {
+        CoveObjectReadOptions {
+            requested_property_ids: Vec::new(),
+            requested_property_names: self.requested_property_names.clone(),
+            requested_object_type_names: self.requested_object_type_names.clone(),
+            requested_evidence_metadata_keys: self.requested_evidence_metadata_keys.clone(),
+            include_projection_catalog: true,
+            include_function_registry: true,
+            include_association_object_types: self.include_association_object_types,
+            include_records: self.include_records,
+            include_evidence_index: self.include_evidence_index,
+        }
+    }
+}
+
+fn compile_projection_access_plan(
     catalog: &MapProjectionCatalog,
-    function_ids: &std::collections::BTreeSet<String>,
     projection_id: Option<&str>,
     format: ProjectionFormat,
-) -> Result<Vec<ProjectedTable>, String> {
+    options: &ProjectionBatchOptions,
+) -> Result<ProjectionAccessPlan, String> {
+    let selected = select_projections(catalog, projection_id, format)?;
+    let output_columns = options
+        .output_columns
+        .as_ref()
+        .map(|columns| columns.iter().cloned().collect::<BTreeSet<_>>());
+    let mut requested_property_names = BTreeSet::new();
+    let mut requested_object_type_names = BTreeSet::new();
+    let mut requested_evidence_metadata_keys = BTreeSet::new();
+    let mut include_association_object_types = false;
+    let mut can_prune_object_types = true;
+    let mut include_records = false;
+    let mut include_evidence_index = false;
+    let mut needs_reconstructed_rows = false;
+    let mut needs_history_rows = false;
+
+    for projection in &selected {
+        let projection = trim_projection_columns(projection, output_columns.as_ref())?;
+        let row_grain = projection.row_grain.as_deref().unwrap_or_default();
+        let mut uses_association_rows = false;
+        if let Some(object_type) = projection
+            .anchor
+            .as_ref()
+            .and_then(|anchor| anchor.object_type.as_ref())
+        {
+            requested_object_type_names.insert(object_type.clone());
+        } else if projection
+            .anchor
+            .as_ref()
+            .and_then(|anchor| anchor.association_type.as_ref())
+            .is_some()
+        {
+            include_association_object_types = true;
+        } else {
+            can_prune_object_types = false;
+        }
+        for column in &projection.columns {
+            if expression_requires_association_rows(&column.value) {
+                uses_association_rows = true;
+            }
+            collect_projection_expression_requirements(
+                &column.value,
+                &mut requested_property_names,
+                &mut requested_evidence_metadata_keys,
+                &mut include_evidence_index,
+            );
+        }
+        for ordering in &projection.ordering {
+            let expression = ordering_expression(ordering);
+            if expression != "value" {
+                if expression_requires_association_rows(expression) {
+                    uses_association_rows = true;
+                }
+                collect_projection_expression_requirements(
+                    expression,
+                    &mut requested_property_names,
+                    &mut requested_evidence_metadata_keys,
+                    &mut include_evidence_index,
+                );
+            }
+        }
+        if projection
+            .anchor
+            .as_ref()
+            .and_then(|anchor| anchor.association_type.as_ref())
+            .is_some()
+        {
+            include_association_object_types = true;
+            requested_property_names.insert("association_type".into());
+        }
+        if uses_association_rows {
+            include_association_object_types = true;
+            requested_property_names.insert("association_type".into());
+        }
+        match row_grain {
+            "one_row_per_object"
+            | "one_row_per_event_object"
+            | "one_row_per_object_as_of_time"
+            | "one_row_per_association"
+            | "one_row_per_link_object" => {
+                include_records = true;
+                let temporal_mode = projection
+                    .temporal_mode
+                    .as_deref()
+                    .unwrap_or("latest_committed");
+                if matches!(
+                    parse_projection_temporal_mode(temporal_mode),
+                    Some(
+                        ProjectionTemporalMode::LatestCommitted | ProjectionTemporalMode::ValidTime
+                    )
+                ) {
+                    needs_reconstructed_rows = true;
+                } else {
+                    needs_history_rows = true;
+                }
+            }
+            "one_row_per_property_version" => {
+                include_records = true;
+                needs_history_rows = true;
+            }
+            "one_row_per_evidence_assertion" => {
+                include_evidence_index = true;
+            }
+            _ => {
+                include_records = true;
+                needs_reconstructed_rows = true;
+            }
+        }
+    }
+    if !can_prune_object_types {
+        requested_object_type_names.clear();
+        include_association_object_types = false;
+    }
+
+    Ok(ProjectionAccessPlan {
+        requested_property_names: requested_property_names.into_iter().collect(),
+        requested_object_type_names: requested_object_type_names.into_iter().collect(),
+        requested_evidence_metadata_keys: requested_evidence_metadata_keys.into_iter().collect(),
+        include_association_object_types,
+        include_records,
+        include_evidence_index,
+        needs_reconstructed_rows,
+        needs_history_rows,
+    })
+}
+
+fn select_projections<'a>(
+    catalog: &'a MapProjectionCatalog,
+    projection_id: Option<&str>,
+    format: ProjectionFormat,
+) -> Result<Vec<&'a MapProjectionEntry>, String> {
     let selected = catalog
         .projections
         .iter()
@@ -268,15 +648,213 @@ fn project_tables(
     {
         return Err("--projection-id is required for Arrow or COVE-T output when a catalog contains multiple projections".into());
     }
+    Ok(selected)
+}
+
+fn collect_projection_expression_requirements(
+    expression: &str,
+    property_names: &mut BTreeSet<String>,
+    evidence_metadata_keys: &mut BTreeSet<String>,
+    include_evidence_index: &mut bool,
+) {
+    let expression = expression.trim();
+    if expression.is_empty() || literal_value(expression).is_some() {
+        return;
+    }
+    if known_projection_path(expression) {
+        if let Some(property_name) = association_metadata_property_name(expression) {
+            property_names.insert(property_name.to_string());
+        }
+        return;
+    }
+    if expression.starts_with("evidence.") {
+        *include_evidence_index = true;
+        if let Some(key) = expression.strip_prefix("evidence.") {
+            if !is_builtin_evidence_field(key) {
+                evidence_metadata_keys.insert(key.to_string());
+            }
+        }
+        return;
+    }
+    if let Some(traversal) = parse_association_traversal(expression) {
+        add_association_access_requirements(property_names);
+        property_names.insert(traversal.property_name.to_string());
+        return;
+    }
+    if let Some((function, args)) = parse_function_call(expression) {
+        if function == "association" {
+            add_association_access_requirements(property_names);
+        }
+        for arg in args {
+            collect_projection_expression_requirements(
+                &arg,
+                property_names,
+                evidence_metadata_keys,
+                include_evidence_index,
+            );
+        }
+        return;
+    }
+    if let Some((left, right)) = split_comparison_expression(expression) {
+        collect_projection_expression_requirements(
+            left,
+            property_names,
+            evidence_metadata_keys,
+            include_evidence_index,
+        );
+        collect_projection_expression_requirements(
+            right,
+            property_names,
+            evidence_metadata_keys,
+            include_evidence_index,
+        );
+        return;
+    }
+    if let Some(property_name) = expression.rsplit('.').next() {
+        if !property_name.is_empty() {
+            property_names.insert(property_name.to_string());
+        }
+    }
+}
+
+fn is_builtin_evidence_field(key: &str) -> bool {
+    matches!(
+        key,
+        "source_id"
+            | "source_row_identity"
+            | "rule_id"
+            | "assertion_id"
+            | "output_object_id"
+            | "observed_schema_fingerprint"
+            | "observed_snapshot_digest"
+    )
+}
+
+fn add_association_access_requirements(property_names: &mut BTreeSet<String>) {
+    for property_name in [
+        "association_type",
+        "source_goid",
+        "target_goid",
+        "source_role",
+        "target_role",
+    ] {
+        property_names.insert(property_name.to_string());
+    }
+}
+
+fn association_metadata_property_name(expression: &str) -> Option<&'static str> {
+    match expression {
+        "association.source_goid" => Some("source_goid"),
+        "association.target_goid" => Some("target_goid"),
+        "association.association_type" => Some("association_type"),
+        "association.mapping_rule_id" => Some("mapping_rule_id"),
+        "association.source_evidence_id" => Some("source_evidence_id"),
+        "association.source_role" => Some("source_role"),
+        "association.target_role" => Some("target_role"),
+        "association.valid_from" => Some("valid_from"),
+        "association.valid_to" => Some("valid_to"),
+        "association.observed_at" => Some("observed_at"),
+        "association.cardinality_policy" => Some("cardinality_policy"),
+        _ => None,
+    }
+}
+
+fn expression_requires_association_rows(expression: &str) -> bool {
+    let expression = expression.trim();
+    if expression.starts_with("association.") {
+        return true;
+    }
+    if let Some(traversal) = parse_association_traversal(expression) {
+        return !traversal.association_type.is_empty();
+    }
+    if let Some((left, right)) = split_comparison_expression(expression) {
+        return expression_requires_association_rows(left)
+            || expression_requires_association_rows(right);
+    }
+    if let Some((function, args)) = parse_function_call(expression) {
+        return function == "association"
+            || args
+                .iter()
+                .any(|arg| expression_requires_association_rows(arg));
+    }
+    false
+}
+
+fn trim_projection_columns(
+    projection: &MapProjectionEntry,
+    output_columns: Option<&BTreeSet<String>>,
+) -> Result<MapProjectionEntry, String> {
+    let Some(output_columns) = output_columns else {
+        return Ok(projection.clone());
+    };
+    let mut trimmed = projection.clone();
+    trimmed.columns = projection
+        .columns
+        .iter()
+        .filter(|column| output_columns.contains(&column.name))
+        .cloned()
+        .collect();
+    let missing = output_columns
+        .iter()
+        .filter(|name| {
+            !projection
+                .columns
+                .iter()
+                .any(|column| &column.name == *name)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(format!(
+            "projection '{}' does not contain requested columns: {}",
+            projection.projection_id,
+            missing.join(", ")
+        ));
+    }
+    Ok(trimmed)
+}
+
+fn project_tables_from_surface(
+    surface: &CoveObjectSurface,
+    catalog: &MapProjectionCatalog,
+    function_ids: &std::collections::BTreeSet<String>,
+    projection_id: Option<&str>,
+    format: ProjectionFormat,
+    options: &ProjectionBatchOptions,
+) -> Result<Vec<ProjectedTable>, String> {
+    let access_plan = compile_projection_access_plan(catalog, projection_id, format, options)?;
+    let model = ProjectionModel::from_surface_with_access_plan(surface, &access_plan)
+        .map_err(|err| err.to_string())?;
+    project_tables(
+        &model,
+        catalog,
+        function_ids,
+        projection_id,
+        format,
+        options,
+    )
+}
+
+fn project_tables(
+    model: &ProjectionModel,
+    catalog: &MapProjectionCatalog,
+    function_ids: &std::collections::BTreeSet<String>,
+    projection_id: Option<&str>,
+    format: ProjectionFormat,
+    options: &ProjectionBatchOptions,
+) -> Result<Vec<ProjectedTable>, String> {
+    let output_columns = required_projection_columns(options);
+    let selected = select_projections(catalog, projection_id, format)?;
 
     let mut tables = Vec::new();
     for projection in selected {
         validate_executable_projection(projection, model, function_ids)?;
         ensure_projection_declares_format(projection, format)?;
-        let rows = project_one(model, projection)?
+        let projection = trim_projection_columns(projection, output_columns.as_ref())?;
+        let rows = project_one(model, &projection, options)?
             .into_iter()
             .map(|value| match value {
-                Value::Object(row) => Ok(projected_table_row(projection, row)),
+                Value::Object(row) => Ok(projected_table_row(&projection, row)),
                 _ => Err("projection produced a non-object row".to_string()),
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -297,6 +875,686 @@ fn project_tables(
         });
     }
     Ok(tables)
+}
+
+fn required_projection_columns(options: &ProjectionBatchOptions) -> Option<BTreeSet<String>> {
+    let mut columns = options
+        .output_columns
+        .as_ref()
+        .map(|columns| columns.iter().cloned().collect::<BTreeSet<_>>())
+        .unwrap_or_default();
+    for filter in &options.pushed_filters {
+        columns.insert(filter.column_name().to_string());
+    }
+    (!columns.is_empty()).then_some(columns)
+}
+
+fn project_arrow_record_batches_from_surface(
+    surface: &CoveObjectSurface,
+    catalog: &MapProjectionCatalog,
+    function_ids: &std::collections::BTreeSet<String>,
+    projection_id: &str,
+    options: &ProjectionBatchOptions,
+) -> Result<Vec<RecordBatch>, String> {
+    let access_plan = compile_projection_access_plan(
+        catalog,
+        Some(projection_id),
+        ProjectionFormat::Arrow,
+        options,
+    )?;
+    let model = ProjectionModel::from_surface_with_access_plan(surface, &access_plan)
+        .map_err(|err| err.to_string())?;
+    let output_columns = required_projection_columns(options);
+    let selected = select_projections(catalog, Some(projection_id), ProjectionFormat::Arrow)?;
+    let projection = match selected.as_slice() {
+        [projection] => *projection,
+        _ => return Err("Arrow projection output requires exactly one projection".into()),
+    };
+    validate_executable_projection(projection, &model, function_ids)?;
+    ensure_projection_declares_format(projection, ProjectionFormat::Arrow)?;
+    let projection = trim_projection_columns(projection, output_columns.as_ref())?;
+    let projected_columns = projection
+        .columns
+        .iter()
+        .map(projected_column_from_entry)
+        .collect::<Result<Vec<_>, _>>()?;
+    if let Some(accessors) =
+        object_projection_arrow_fast_path_accessors(&projection, &projected_columns, options)
+    {
+        return project_arrow_object_record_batches_fast(
+            &model,
+            &projection,
+            &projected_columns,
+            &accessors,
+            options,
+        );
+    }
+    if evidence_projection_arrow_fast_path_supported(&projection, &projected_columns) {
+        return project_arrow_evidence_record_batches_fast(
+            &model,
+            &projection,
+            &projected_columns,
+            options,
+        );
+    }
+    let mut sink = ArrowRecordBatchSink::new(
+        &catalog.mapping_id,
+        &catalog.mapping_version,
+        &projection,
+        projected_columns,
+        options
+            .batch_size
+            .unwrap_or(DEFAULT_ARROW_BATCH_SIZE)
+            .max(1),
+        options.max_rows,
+    );
+    emit_projection_rows(&model, &projection, options, |row| sink.push(row))?;
+    sink.finish()
+}
+
+#[derive(Debug, Clone)]
+enum ObjectProjectionArrowAccessor {
+    ObjectGoid,
+    Property(String),
+}
+
+fn object_projection_arrow_fast_path_accessors(
+    projection: &MapProjectionEntry,
+    projected_columns: &[ProjectedColumn],
+    options: &ProjectionBatchOptions,
+) -> Option<Vec<ObjectProjectionArrowAccessor>> {
+    if !options.pushed_filters.is_empty()
+        || !projection.ordering.is_empty()
+        || projection.multi_value_policy.as_deref().unwrap_or("reject") != "reject"
+    {
+        return None;
+    }
+    if !matches!(
+        projection.row_grain.as_deref(),
+        Some("one_row_per_object" | "one_row_per_event_object" | "one_row_per_object_as_of_time")
+    ) {
+        return None;
+    }
+    let anchor = projection.anchor.as_ref()?;
+    if anchor.object_type.is_none() || anchor.association_type.is_some() {
+        return None;
+    }
+    projection
+        .columns
+        .iter()
+        .zip(projected_columns.iter())
+        .map(|(column, projected)| match column.value.as_str() {
+            "goid" | "object.goid" | "Object.goid" => matches!(
+                projected.logical,
+                CoveLogicalType::Uuid | CoveLogicalType::Utf8
+            )
+            .then_some(ObjectProjectionArrowAccessor::ObjectGoid),
+            value if direct_object_property_fast_path_supported(value) => {
+                Some(ObjectProjectionArrowAccessor::Property(value.to_string()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn direct_object_property_fast_path_supported(expression: &str) -> bool {
+    !expression.is_empty()
+        && !expression.contains('.')
+        && !expression.contains(char::is_whitespace)
+        && !expression.chars().any(|ch| {
+            matches!(
+                ch,
+                '(' | ')' | '[' | ']' | '{' | '}' | '+' | '-' | '*' | '/' | '?' | ':'
+            )
+        })
+}
+
+fn project_arrow_object_record_batches_fast(
+    model: &ProjectionModel,
+    projection: &MapProjectionEntry,
+    projected_columns: &[ProjectedColumn],
+    accessors: &[ObjectProjectionArrowAccessor],
+    options: &ProjectionBatchOptions,
+) -> Result<Vec<RecordBatch>, String> {
+    let schema = encoding::arrow_schema_from_projected_columns(projected_columns)?;
+    let batch_size = options
+        .batch_size
+        .unwrap_or(DEFAULT_ARROW_BATCH_SIZE)
+        .max(1);
+    let max_rows = options.max_rows.unwrap_or(usize::MAX);
+    let object_type = projection
+        .anchor
+        .as_ref()
+        .and_then(|anchor| anchor.object_type.as_ref())
+        .ok_or_else(|| "object projection anchor object_type is required".to_string())?;
+    let rows = model.rows_for_projection(projection)?;
+    let mut batches = Vec::new();
+    let mut chunk = Vec::new();
+    let mut emitted_rows = 0usize;
+
+    for row in rows.iter() {
+        if emitted_rows >= max_rows {
+            break;
+        }
+        if &row.object_type != object_type {
+            continue;
+        }
+        chunk.push(row);
+        emitted_rows += 1;
+        if chunk.len() >= batch_size {
+            batches.push(build_object_record_batch(
+                &schema,
+                projected_columns,
+                accessors,
+                &chunk,
+            )?);
+            chunk.clear();
+        }
+    }
+
+    if !chunk.is_empty() || batches.is_empty() {
+        batches.push(build_object_record_batch(
+            &schema,
+            projected_columns,
+            accessors,
+            &chunk,
+        )?);
+    }
+
+    Ok(batches)
+}
+
+fn evidence_projection_arrow_fast_path_supported(
+    projection: &MapProjectionEntry,
+    projected_columns: &[ProjectedColumn],
+) -> bool {
+    projection.row_grain.as_deref() == Some("one_row_per_evidence_assertion")
+        && projection.columns.len() == projected_columns.len()
+        && projection.columns.iter().all(|column| {
+            column.value.starts_with("evidence.")
+                && !matches!(
+                    projected_columns
+                        .iter()
+                        .find(|projected| projected.name == column.name)
+                        .map(|projected| projected.logical),
+                    Some(CoveLogicalType::List | CoveLogicalType::Struct | CoveLogicalType::Map)
+                )
+        })
+}
+
+fn project_arrow_evidence_record_batches_fast(
+    model: &ProjectionModel,
+    projection: &MapProjectionEntry,
+    projected_columns: &[ProjectedColumn],
+    options: &ProjectionBatchOptions,
+) -> Result<Vec<RecordBatch>, String> {
+    let schema = encoding::arrow_schema_from_projected_columns(projected_columns)?;
+    let batch_size = options
+        .batch_size
+        .unwrap_or(DEFAULT_ARROW_BATCH_SIZE)
+        .max(1);
+    let filter_keys = projection_filter_evidence_keys(projection, &options.pushed_filters)?;
+    let mut batches = Vec::new();
+    let mut chunk = Vec::new();
+    let max_rows = options.max_rows.unwrap_or(usize::MAX);
+    let mut emitted_rows = 0usize;
+
+    for entry in &model.evidence_entries {
+        if emitted_rows >= max_rows {
+            break;
+        }
+        if !evidence_matches_projection_filters(entry, &filter_keys, &options.pushed_filters) {
+            continue;
+        }
+        chunk.push(entry);
+        emitted_rows += 1;
+        if chunk.len() >= batch_size {
+            batches.push(build_evidence_record_batch(
+                &schema,
+                projected_columns,
+                projection,
+                &chunk,
+            )?);
+            chunk.clear();
+        }
+    }
+
+    if !chunk.is_empty() || batches.is_empty() {
+        batches.push(build_evidence_record_batch(
+            &schema,
+            projected_columns,
+            projection,
+            &chunk,
+        )?);
+    }
+
+    Ok(batches)
+}
+
+fn projection_filter_evidence_keys(
+    projection: &MapProjectionEntry,
+    filters: &[ProjectionFilter],
+) -> Result<BTreeMap<String, String>, String> {
+    let mut out = BTreeMap::new();
+    for filter in filters {
+        let column = filter.column_name();
+        let projection_column = projection
+            .columns
+            .iter()
+            .find(|candidate| candidate.name == column)
+            .ok_or_else(|| {
+                format!(
+                    "evidence projection '{}' is missing filter column '{}'",
+                    projection.projection_id, column
+                )
+            })?;
+        let key = projection_column
+            .value
+            .strip_prefix("evidence.")
+            .ok_or_else(|| {
+                format!(
+                    "evidence projection '{}' uses unsupported filtered expression '{}'",
+                    projection.projection_id, projection_column.value
+                )
+            })?;
+        out.insert(column.to_string(), key.to_string());
+    }
+    Ok(out)
+}
+
+fn evidence_matches_projection_filters(
+    entry: &ProjectionEvidenceEntry,
+    filter_keys: &BTreeMap<String, String>,
+    filters: &[ProjectionFilter],
+) -> bool {
+    if filters.is_empty() {
+        return true;
+    }
+    let row = filter_keys
+        .iter()
+        .map(|(column, key)| (column.clone(), projection_evidence_value(entry, key)))
+        .collect::<Map<_, _>>();
+    row_matches_projection_filters(&row, filters)
+}
+
+fn build_evidence_record_batch(
+    schema: &SchemaRef,
+    projected_columns: &[ProjectedColumn],
+    projection: &MapProjectionEntry,
+    entries: &[&ProjectionEvidenceEntry],
+) -> Result<RecordBatch, String> {
+    let arrays = projection
+        .columns
+        .iter()
+        .zip(projected_columns.iter())
+        .map(|(column, projected)| {
+            let key = column
+                .value
+                .strip_prefix("evidence.")
+                .ok_or_else(|| format!("unsupported evidence expression '{}'", column.value))?;
+            build_evidence_record_batch_column(entries, key, projected)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let options = RecordBatchOptions::new().with_row_count(Some(entries.len()));
+    RecordBatch::try_new_with_options(Arc::clone(schema), arrays, &options)
+        .map_err(|err| format!("cannot build Arrow evidence record batch: {err}"))
+}
+
+fn build_object_record_batch(
+    schema: &SchemaRef,
+    projected_columns: &[ProjectedColumn],
+    accessors: &[ObjectProjectionArrowAccessor],
+    rows: &[&ProjectionRow],
+) -> Result<RecordBatch, String> {
+    let arrays = projected_columns
+        .iter()
+        .zip(accessors.iter())
+        .map(|(projected, accessor)| build_object_record_batch_column(rows, accessor, projected))
+        .collect::<Result<Vec<_>, _>>()?;
+    let options = RecordBatchOptions::new().with_row_count(Some(rows.len()));
+    RecordBatch::try_new_with_options(Arc::clone(schema), arrays, &options)
+        .map_err(|err| format!("cannot build Arrow object record batch: {err}"))
+}
+
+fn build_object_record_batch_column(
+    rows: &[&ProjectionRow],
+    accessor: &ObjectProjectionArrowAccessor,
+    projected: &ProjectedColumn,
+) -> Result<ArrayRef, String> {
+    match accessor {
+        ObjectProjectionArrowAccessor::ObjectGoid => build_object_goid_array(rows, projected),
+        ObjectProjectionArrowAccessor::Property(property_name) => {
+            let null_value = Value::Null;
+            let values = rows
+                .iter()
+                .map(|row| {
+                    projection_property_ref_by_name(row, property_name).unwrap_or(&null_value)
+                })
+                .collect::<Vec<_>>();
+            encoding::encode_arrow_values(&values, projected)
+        }
+    }
+}
+
+fn build_object_goid_array(
+    rows: &[&ProjectionRow],
+    projected: &ProjectedColumn,
+) -> Result<ArrayRef, String> {
+    match projected.logical {
+        CoveLogicalType::Uuid => {
+            let borrowed = rows
+                .iter()
+                .map(|row| Some(row.goid.as_slice()))
+                .collect::<Vec<_>>();
+            Ok(Arc::new(FixedSizeBinaryArray::from(borrowed)) as ArrayRef)
+        }
+        CoveLogicalType::Utf8 => {
+            let mut builder = StringBuilder::new();
+            for row in rows {
+                builder.append_value(hex_encode(&row.goid));
+            }
+            Ok(Arc::new(builder.finish()) as ArrayRef)
+        }
+        logical => Err(format!(
+            "object.goid fast path does not support Arrow logical type {:?}",
+            logical
+        )),
+    }
+}
+
+fn build_evidence_record_batch_column(
+    entries: &[&ProjectionEvidenceEntry],
+    key: &str,
+    projected: &ProjectedColumn,
+) -> Result<ArrayRef, String> {
+    match projected.logical {
+        CoveLogicalType::Utf8 => {
+            let mut builder = StringBuilder::new();
+            for entry in entries {
+                match evidence_utf8_value(entry, key) {
+                    Some(value) => builder.append_value(value.as_ref()),
+                    None => builder.append_null(),
+                }
+            }
+            Ok(Arc::new(builder.finish()) as ArrayRef)
+        }
+        CoveLogicalType::Uuid => {
+            let owned = entries
+                .iter()
+                .map(|entry| evidence_uuid_value(entry, key))
+                .collect::<Result<Vec<_>, _>>()?;
+            let borrowed = owned
+                .iter()
+                .map(|value| value.as_ref().map(|value| value.as_slice()))
+                .collect::<Vec<_>>();
+            Ok(Arc::new(FixedSizeBinaryArray::from(borrowed)) as ArrayRef)
+        }
+        _ => {
+            let owned = entries
+                .iter()
+                .map(|entry| projection_evidence_value(entry, key))
+                .collect::<Vec<_>>();
+            let values = owned.iter().collect::<Vec<_>>();
+            encoding::encode_arrow_values(&values, projected)
+        }
+    }
+}
+
+fn evidence_utf8_value<'a>(entry: &'a ProjectionEvidenceEntry, key: &str) -> Option<Cow<'a, str>> {
+    match entry {
+        ProjectionEvidenceEntry::Json(value) => value
+            .as_object()
+            .and_then(|object| object.get(key))
+            .and_then(encoding::json_value_to_output_cow),
+        ProjectionEvidenceEntry::Parsed(entry) => match key {
+            "source_id" => Some(Cow::Borrowed(entry.source_id.as_str())),
+            "source_row_identity" => Some(Cow::Borrowed(entry.source_row_identity.as_str())),
+            "rule_id" => Some(Cow::Borrowed(entry.rule_id.as_str())),
+            "assertion_id" => Some(Cow::Borrowed(entry.assertion_id.as_str())),
+            "output_object_id" => Some(Cow::Borrowed(entry.output_object_id.as_str())),
+            "observed_schema_fingerprint" => entry
+                .observed_schema_fingerprint
+                .as_deref()
+                .map(Cow::Borrowed),
+            "observed_snapshot_digest" => {
+                entry.observed_snapshot_digest.as_deref().map(Cow::Borrowed)
+            }
+            other => entry
+                .operation_metadata
+                .get(other)
+                .and_then(encoding::json_value_to_output_cow),
+        },
+    }
+}
+
+fn evidence_uuid_value(
+    entry: &ProjectionEvidenceEntry,
+    key: &str,
+) -> Result<Option<[u8; 16]>, String> {
+    let Some(text) = evidence_utf8_value(entry, key) else {
+        return Ok(None);
+    };
+    hex_decode_16(text.as_ref()).map(Some)
+}
+
+struct ArrowRecordBatchSink {
+    mapping_id: String,
+    mapping_version: String,
+    projection_id: String,
+    output_table: String,
+    columns: Vec<ProjectedColumn>,
+    batch_size: usize,
+    max_rows: Option<usize>,
+    emitted_rows: usize,
+    buffered_rows: Vec<Map<String, Value>>,
+    batches: Vec<RecordBatch>,
+}
+
+impl ArrowRecordBatchSink {
+    fn new(
+        mapping_id: &str,
+        mapping_version: &str,
+        projection: &MapProjectionEntry,
+        columns: Vec<ProjectedColumn>,
+        batch_size: usize,
+        max_rows: Option<usize>,
+    ) -> Self {
+        Self {
+            mapping_id: mapping_id.to_string(),
+            mapping_version: mapping_version.to_string(),
+            projection_id: projection.projection_id.clone(),
+            output_table: projection
+                .output_table
+                .clone()
+                .unwrap_or_else(|| projection.projection_id.clone()),
+            columns,
+            batch_size,
+            max_rows,
+            emitted_rows: 0,
+            buffered_rows: Vec::new(),
+            batches: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, row: Map<String, Value>) -> Result<bool, String> {
+        if self
+            .max_rows
+            .is_some_and(|max_rows| self.emitted_rows >= max_rows)
+        {
+            return Ok(false);
+        }
+        self.buffered_rows.push(row);
+        self.emitted_rows += 1;
+        if self.buffered_rows.len() >= self.batch_size {
+            self.flush()?;
+        }
+        Ok(self
+            .max_rows
+            .map(|max_rows| self.emitted_rows < max_rows)
+            .unwrap_or(true))
+    }
+
+    fn finish(mut self) -> Result<Vec<RecordBatch>, String> {
+        if !self.buffered_rows.is_empty() || self.batches.is_empty() {
+            self.flush()?;
+        }
+        Ok(self.batches)
+    }
+
+    fn flush(&mut self) -> Result<(), String> {
+        let table = ProjectedTable {
+            mapping_id: self.mapping_id.clone(),
+            mapping_version: self.mapping_version.clone(),
+            projection_id: self.projection_id.clone(),
+            output_table: self.output_table.clone(),
+            columns: self.columns.clone(),
+            rows: std::mem::take(&mut self.buffered_rows),
+        };
+        self.batches.push(encoding::arrow_record_batch(&table)?);
+        Ok(())
+    }
+}
+
+fn emit_projection_rows<F>(
+    model: &ProjectionModel,
+    projection: &MapProjectionEntry,
+    options: &ProjectionBatchOptions,
+    mut emit: F,
+) -> Result<(), String>
+where
+    F: FnMut(Map<String, Value>) -> Result<bool, String>,
+{
+    let row_grain = projection
+        .row_grain
+        .as_deref()
+        .ok_or_else(|| "projection row_grain is required".to_string())?;
+    match row_grain {
+        "one_row_per_object" | "one_row_per_event_object" | "one_row_per_object_as_of_time" => {
+            emit_object_projection_rows(model, projection, false, options, &mut emit)
+        }
+        "one_row_per_association" | "one_row_per_link_object" => {
+            emit_object_projection_rows(model, projection, true, options, &mut emit)
+        }
+        "one_row_per_property_version" => {
+            emit_property_version_projection_rows(model, projection, options, &mut emit)
+        }
+        "one_row_per_evidence_assertion" => {
+            emit_evidence_projection_rows(model, projection, options, &mut emit)
+        }
+        other => Err(format!("unsupported projection row_grain '{other}'")),
+    }
+}
+
+fn emit_object_projection_rows<F>(
+    model: &ProjectionModel,
+    projection: &MapProjectionEntry,
+    associations: bool,
+    options: &ProjectionBatchOptions,
+    emit: &mut F,
+) -> Result<(), String>
+where
+    F: FnMut(Map<String, Value>) -> Result<bool, String>,
+{
+    let anchor = projection
+        .anchor
+        .as_ref()
+        .ok_or_else(|| "projection anchor is required".to_string())?;
+    let rows = model.rows_for_projection(projection)?;
+    for row in rows.iter() {
+        if associations {
+            let Some(association_type) = &anchor.association_type else {
+                continue;
+            };
+            if !row_matches_association(&row, association_type) {
+                continue;
+            }
+        } else {
+            let Some(object_type) = &anchor.object_type else {
+                continue;
+            };
+            if &row.object_type != object_type {
+                continue;
+            }
+        }
+        let mut base = Map::new();
+        base.insert("projection_id".into(), json!(projection.projection_id));
+        if let Some(output_table) = &projection.output_table {
+            base.insert("output_table".into(), json!(output_table));
+        }
+        for projected in project_columns_for_row(model, projection, &row, base)? {
+            let Value::Object(row) = projected else {
+                return Err("projection produced a non-object row".into());
+            };
+            if !row_matches_projection_filters(&row, &options.pushed_filters) {
+                continue;
+            }
+            if !emit(projected_table_row(projection, row))? {
+                return Ok(());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn emit_property_version_projection_rows<F>(
+    model: &ProjectionModel,
+    projection: &MapProjectionEntry,
+    options: &ProjectionBatchOptions,
+    emit: &mut F,
+) -> Result<(), String>
+where
+    F: FnMut(Map<String, Value>) -> Result<bool, String>,
+{
+    let rows = model.rows_for_projection(projection)?;
+    for row in rows.iter() {
+        for property in &row.properties {
+            let mut out = Map::new();
+            out.insert("projection_id".into(), json!(projection.projection_id));
+            out.insert("object_goid".into(), json!(hex_encode(&row.goid)));
+            out.insert("property_id".into(), json!(property.property_id));
+            out.insert("property_name".into(), json!(property.property_name));
+            out.insert("value".into(), property.value.clone());
+            if !row_matches_projection_filters(&out, &options.pushed_filters) {
+                continue;
+            }
+            if !emit(projected_table_row(projection, out))? {
+                return Ok(());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn emit_evidence_projection_rows<F>(
+    model: &ProjectionModel,
+    projection: &MapProjectionEntry,
+    options: &ProjectionBatchOptions,
+    emit: &mut F,
+) -> Result<(), String>
+where
+    F: FnMut(Map<String, Value>) -> Result<bool, String>,
+{
+    for evidence in &model.evidence_entries {
+        let mut out = Map::new();
+        out.insert("projection_id".into(), json!(projection.projection_id));
+        for column in &projection.columns {
+            let key = column
+                .value
+                .strip_prefix("evidence.")
+                .ok_or_else(|| format!("unsupported evidence expression '{}'", column.value))?;
+            out.insert(
+                column.name.clone(),
+                projection_evidence_value(evidence, key),
+            );
+        }
+        if !row_matches_projection_filters(&out, &options.pushed_filters) {
+            continue;
+        }
+        if !emit(projected_table_row(projection, out))? {
+            return Ok(());
+        }
+    }
+    Ok(())
 }
 
 fn projected_column_from_entry(column: &MapProjectionColumn) -> Result<ProjectedColumn, String> {
@@ -410,14 +1668,14 @@ fn encode_projection_output(
         }))
         .map_err(|err| format!("cannot encode projection JSON: {err}")),
         ProjectionFormat::CoveO => encode_cove_o_projection(tables),
-        ProjectionFormat::Sql => encode_sql_projection(tables),
+        ProjectionFormat::Sql => encoding::encode_sql_projection(tables),
         ProjectionFormat::Arrow => {
             let table = single_projection_table(tables, "Arrow")?;
-            encode_arrow_projection(table)
+            encoding::encode_arrow_projection(table)
         }
         ProjectionFormat::CoveT => {
             let table = single_projection_table(tables, "COVE-T")?;
-            encode_cove_t_projection(table)
+            encoding::encode_cove_t_projection(table)
         }
     }
 }
@@ -676,1381 +1934,14 @@ fn cove_o_projection_logical_name(column: &ProjectedColumn) -> &'static str {
 }
 
 fn projection_logical_type_name(logical: CoveLogicalType) -> &'static str {
-    match logical {
-        CoveLogicalType::Null => "null",
-        CoveLogicalType::Bool => "bool",
-        CoveLogicalType::Int8 => "int8",
-        CoveLogicalType::Int16 => "int16",
-        CoveLogicalType::Int32 => "int32",
-        CoveLogicalType::Int64 => "int64",
-        CoveLogicalType::UInt8 => "uint8",
-        CoveLogicalType::UInt16 => "uint16",
-        CoveLogicalType::UInt32 => "uint32",
-        CoveLogicalType::UInt64 => "uint64",
-        CoveLogicalType::Float32 => "float32",
-        CoveLogicalType::Float64 => "float64",
-        CoveLogicalType::Decimal64 => "decimal64",
-        CoveLogicalType::Decimal128 => "decimal128",
-        CoveLogicalType::DateDays => "date_days",
-        CoveLogicalType::TimestampMicros => "timestamp_micros",
-        CoveLogicalType::TimestampNanos => "timestamp_nanos",
-        CoveLogicalType::Utf8 => "utf8",
-        CoveLogicalType::Binary => "binary",
-        CoveLogicalType::Uuid => "uuid",
-        CoveLogicalType::Json => "json",
-        CoveLogicalType::List => "list",
-        CoveLogicalType::Struct => "struct",
-        CoveLogicalType::Map => "map",
-        _ => "json",
-    }
-}
-
-fn projection_logical_type_from_name(name: &str) -> Result<CoveLogicalType, String> {
-    match name {
-        "null" => Ok(CoveLogicalType::Null),
-        "bool" | "boolean" => Ok(CoveLogicalType::Bool),
-        "int8" => Ok(CoveLogicalType::Int8),
-        "int16" => Ok(CoveLogicalType::Int16),
-        "int32" => Ok(CoveLogicalType::Int32),
-        "int64" | "int" => Ok(CoveLogicalType::Int64),
-        "uint8" => Ok(CoveLogicalType::UInt8),
-        "uint16" => Ok(CoveLogicalType::UInt16),
-        "uint32" => Ok(CoveLogicalType::UInt32),
-        "uint64" | "uint" => Ok(CoveLogicalType::UInt64),
-        "float32" => Ok(CoveLogicalType::Float32),
-        "float64" | "float" => Ok(CoveLogicalType::Float64),
-        "decimal64" => Ok(CoveLogicalType::Decimal64),
-        "decimal128" | "decimal" => Ok(CoveLogicalType::Decimal128),
-        "date_days" | "date32" | "date" => Ok(CoveLogicalType::DateDays),
-        "timestamp_micros" | "timestamp_us" => Ok(CoveLogicalType::TimestampMicros),
-        "timestamp_nanos" | "timestamp_ns" => Ok(CoveLogicalType::TimestampNanos),
-        "utf8" | "string" => Ok(CoveLogicalType::Utf8),
-        "binary" => Ok(CoveLogicalType::Binary),
-        "uuid" => Ok(CoveLogicalType::Uuid),
-        "json" => Ok(CoveLogicalType::Json),
-        "list" => Ok(CoveLogicalType::List),
-        "struct" => Ok(CoveLogicalType::Struct),
-        "map" => Ok(CoveLogicalType::Map),
-        other => Err(format!("unsupported nested_shape logical_type '{other}'")),
-    }
-}
-
-fn encode_arrow_projection(table: &ProjectedTable) -> Result<Vec<u8>, String> {
-    let fields = table
-        .columns
-        .iter()
-        .map(|column| Ok::<Field, String>(Field::new(&column.name, arrow_data_type(column)?, true)))
-        .collect::<Result<Vec<_>, _>>()?;
-    let schema = Arc::new(Schema::new(fields));
-    let arrays = table
-        .columns
-        .iter()
-        .map(|column| encode_arrow_column(table, column))
-        .collect::<Result<Vec<_>, _>>()?;
-    let batch = RecordBatch::try_new(Arc::clone(&schema), arrays)
-        .map_err(|err| format!("cannot build Arrow record batch: {err}"))?;
-    let mut bytes = Vec::new();
-    {
-        let mut writer = FileWriter::try_new(&mut bytes, &schema)
-            .map_err(|err| format!("cannot create Arrow IPC writer: {err}"))?;
-        writer
-            .write(&batch)
-            .map_err(|err| format!("cannot write Arrow IPC batch: {err}"))?;
-        writer
-            .finish()
-            .map_err(|err| format!("cannot finish Arrow IPC file: {err}"))?;
-    }
-    Ok(bytes)
-}
-
-fn arrow_data_type(column: &ProjectedColumn) -> Result<DataType, String> {
-    match column.logical {
-        CoveLogicalType::List | CoveLogicalType::Struct | CoveLogicalType::Map => {
-            nested_arrow_data_type(column)
-        }
-        logical => arrow_data_type_for_logical(logical),
-    }
-}
-
-fn arrow_data_type_for_logical(logical: CoveLogicalType) -> Result<DataType, String> {
-    match logical {
-        CoveLogicalType::Null | CoveLogicalType::Utf8 => Ok(DataType::Utf8),
-        CoveLogicalType::Bool => Ok(DataType::Boolean),
-        CoveLogicalType::Int8 => Ok(DataType::Int8),
-        CoveLogicalType::Int16 => Ok(DataType::Int16),
-        CoveLogicalType::Int32 => Ok(DataType::Int32),
-        CoveLogicalType::Int64 => Ok(DataType::Int64),
-        CoveLogicalType::UInt8 => Ok(DataType::UInt8),
-        CoveLogicalType::UInt16 => Ok(DataType::UInt16),
-        CoveLogicalType::UInt32 => Ok(DataType::UInt32),
-        CoveLogicalType::UInt64 => Ok(DataType::UInt64),
-        CoveLogicalType::Float32 => Ok(DataType::Float32),
-        CoveLogicalType::Float64 => Ok(DataType::Float64),
-        CoveLogicalType::Decimal64 => Ok(DataType::Decimal64(18, 0)),
-        CoveLogicalType::Decimal128 => Ok(DataType::Decimal128(38, 0)),
-        CoveLogicalType::DateDays => Ok(DataType::Date32),
-        CoveLogicalType::TimestampMicros => Ok(DataType::Timestamp(TimeUnit::Microsecond, None)),
-        CoveLogicalType::TimestampNanos => Ok(DataType::Timestamp(TimeUnit::Nanosecond, None)),
-        CoveLogicalType::Binary | CoveLogicalType::Json => Ok(DataType::Binary),
-        CoveLogicalType::Uuid => Ok(DataType::FixedSizeBinary(16)),
-        CoveLogicalType::List | CoveLogicalType::Struct | CoveLogicalType::Map => Err(format!(
-            "nested logical type {logical:?} requires nested_shape"
-        )),
-        _ => Err(format!(
-            "unknown projection logical type {logical:?} is not supported for Arrow output"
-        )),
-    }
-}
-
-fn nested_arrow_data_type(column: &ProjectedColumn) -> Result<DataType, String> {
-    let shape = column
-        .nested_shape
-        .as_deref()
-        .ok_or_else(|| format!("projection column '{}' requires nested_shape", column.name))?;
-    let value: Value = serde_json::from_str(shape).map_err(|err| {
-        format!(
-            "projection column '{}' has invalid nested_shape JSON: {err}",
-            column.name
-        )
-    })?;
-    let data_type = nested_shape_data_type(&value)?;
-    match (&column.logical, &data_type) {
-        (CoveLogicalType::List, DataType::List(_))
-        | (CoveLogicalType::Struct, DataType::Struct(_))
-        | (CoveLogicalType::Map, DataType::Map(_, _)) => Ok(data_type),
-        _ => Err(format!(
-            "projection column '{}' nested_shape does not match logical type {:?}",
-            column.name, column.logical
-        )),
-    }
-}
-
-fn nested_shape_data_type(value: &Value) -> Result<DataType, String> {
-    let object = value
-        .as_object()
-        .ok_or_else(|| "nested_shape must be a JSON object".to_string())?;
-    let kind = object
-        .get("type")
-        .or_else(|| object.get("kind"))
-        .and_then(Value::as_str)
-        .ok_or_else(|| "nested_shape requires type".to_string())?;
-    match kind {
-        "list" => {
-            let item = object
-                .get("item")
-                .or_else(|| object.get("element"))
-                .ok_or_else(|| "list nested_shape requires item".to_string())?;
-            let field = nested_shape_field("item", item, true)?;
-            Ok(DataType::List(Arc::new(field)))
-        }
-        "struct" => {
-            let fields = object
-                .get("fields")
-                .and_then(Value::as_array)
-                .ok_or_else(|| "struct nested_shape requires fields array".to_string())?;
-            let fields = fields
-                .iter()
-                .map(|field| {
-                    let name = field
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| "struct field nested_shape requires name".to_string())?;
-                    nested_shape_field(name, field, true)
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(DataType::Struct(Fields::from(fields)))
-        }
-        "map" => {
-            let key = object
-                .get("key")
-                .ok_or_else(|| "map nested_shape requires key".to_string())?;
-            let value = object
-                .get("value")
-                .ok_or_else(|| "map nested_shape requires value".to_string())?;
-            let key = nested_shape_field("key", key, false)?;
-            let value = nested_shape_field("value", value, true)?;
-            Ok(Field::new_map(
-                "map",
-                "entries",
-                Arc::new(key),
-                Arc::new(value),
-                false,
-                true,
-            )
-            .data_type()
-            .clone())
-        }
-        other => Err(format!("unsupported nested_shape type '{other}'")),
-    }
-}
-
-fn nested_shape_field(name: &str, value: &Value, default_nullable: bool) -> Result<Field, String> {
-    let object = value
-        .as_object()
-        .ok_or_else(|| "nested_shape field must be an object".to_string())?;
-    let nullable = object
-        .get("nullable")
-        .and_then(Value::as_bool)
-        .unwrap_or(default_nullable);
-    let data_type = if object
-        .get("type")
-        .or_else(|| object.get("kind"))
-        .and_then(Value::as_str)
-        .is_some_and(|kind| matches!(kind, "list" | "struct" | "map"))
-    {
-        nested_shape_data_type(value)?
-    } else {
-        let logical = object
-            .get("logical_type")
-            .or_else(|| object.get("logical"))
-            .or_else(|| object.get("type"))
-            .and_then(Value::as_str)
-            .ok_or_else(|| "nested_shape field requires logical_type".to_string())?;
-        arrow_data_type_for_logical(projection_logical_type_from_name(logical)?)?
-    };
-    Ok(Field::new(name, data_type, nullable))
-}
-
-fn encode_arrow_column(
-    table: &ProjectedTable,
-    column: &ProjectedColumn,
-) -> Result<ArrayRef, String> {
-    let values = table
-        .rows
-        .iter()
-        .map(|row| row.get(&column.name).unwrap_or(&Value::Null))
-        .collect::<Vec<_>>();
-    match column.logical {
-        CoveLogicalType::Null | CoveLogicalType::Utf8 => Ok(Arc::new(StringArray::from(
-            values
-                .iter()
-                .map(|value| typed_string_value(value, column.logical))
-                .collect::<Result<Vec<_>, _>>()?,
-        )) as ArrayRef),
-        CoveLogicalType::Bool => Ok(Arc::new(BooleanArray::from(
-            values
-                .iter()
-                .map(|value| typed_bool_value(value))
-                .collect::<Result<Vec<_>, _>>()?,
-        )) as ArrayRef),
-        CoveLogicalType::Int8 => primitive_array::<Int8Array, i8>(&values, column.logical),
-        CoveLogicalType::Int16 => primitive_array::<Int16Array, i16>(&values, column.logical),
-        CoveLogicalType::Int32 => primitive_array::<Int32Array, i32>(&values, column.logical),
-        CoveLogicalType::Int64 => primitive_array::<Int64Array, i64>(&values, column.logical),
-        CoveLogicalType::UInt8 => primitive_array::<UInt8Array, u8>(&values, column.logical),
-        CoveLogicalType::UInt16 => primitive_array::<UInt16Array, u16>(&values, column.logical),
-        CoveLogicalType::UInt32 => primitive_array::<UInt32Array, u32>(&values, column.logical),
-        CoveLogicalType::UInt64 => primitive_array::<UInt64Array, u64>(&values, column.logical),
-        CoveLogicalType::Float32 => Ok(Arc::new(Float32Array::from(
-            values
-                .iter()
-                .map(|value| typed_f64_value(value).map(|value| value.map(|value| value as f32)))
-                .collect::<Result<Vec<_>, _>>()?,
-        )) as ArrayRef),
-        CoveLogicalType::Float64 => Ok(Arc::new(Float64Array::from(
-            values
-                .iter()
-                .map(|value| typed_f64_value(value))
-                .collect::<Result<Vec<_>, _>>()?,
-        )) as ArrayRef),
-        CoveLogicalType::Decimal64 => Ok(Arc::new(
-            Decimal64Array::from(
-                values
-                    .iter()
-                    .map(|value| {
-                        typed_i128_value(value, column.logical).and_then(|value| {
-                            value
-                                .map(|value| {
-                                    i64::try_from(value).map_err(|_| {
-                                        "decimal64 projection value is outside i64 range"
-                                            .to_string()
-                                    })
-                                })
-                                .transpose()
-                        })
-                    })
-                    .collect::<Result<Vec<_>, _>>()?,
-            )
-            .with_precision_and_scale(18, 0)
-            .map_err(|err| format!("cannot assign decimal64 precision/scale: {err}"))?,
-        ) as ArrayRef),
-        CoveLogicalType::Decimal128 => Ok(Arc::new(
-            Decimal128Array::from(
-                values
-                    .iter()
-                    .map(|value| typed_i128_value(value, column.logical))
-                    .collect::<Result<Vec<_>, _>>()?,
-            )
-            .with_precision_and_scale(38, 0)
-            .map_err(|err| format!("cannot assign decimal128 precision/scale: {err}"))?,
-        ) as ArrayRef),
-        CoveLogicalType::DateDays => primitive_array::<Date32Array, i32>(&values, column.logical),
-        CoveLogicalType::TimestampMicros => {
-            primitive_array::<TimestampMicrosecondArray, i64>(&values, column.logical)
-        }
-        CoveLogicalType::TimestampNanos => {
-            primitive_array::<TimestampNanosecondArray, i64>(&values, column.logical)
-        }
-        CoveLogicalType::Binary | CoveLogicalType::Json => {
-            let owned = values
-                .iter()
-                .map(|value| typed_bytes_value(value, column.logical))
-                .collect::<Result<Vec<_>, _>>()?;
-            let borrowed = owned
-                .iter()
-                .map(|value| value.as_deref())
-                .collect::<Vec<_>>();
-            Ok(Arc::new(BinaryArray::from_opt_vec(borrowed)) as ArrayRef)
-        }
-        CoveLogicalType::Uuid => {
-            let owned = values
-                .iter()
-                .map(|value| typed_uuid_value(value).map(|value| value.map(Vec::from)))
-                .collect::<Result<Vec<_>, _>>()?;
-            let borrowed = owned
-                .iter()
-                .map(|value| value.as_deref())
-                .collect::<Vec<_>>();
-            Ok(Arc::new(FixedSizeBinaryArray::from(borrowed)) as ArrayRef)
-        }
-        CoveLogicalType::List | CoveLogicalType::Struct | CoveLogicalType::Map => {
-            encode_arrow_nested_column(table, column, &values)
-        }
-        _ => Err(format!(
-            "unknown projection logical type {:?} is not supported for Arrow output",
-            column.logical
-        )),
-    }
-}
-
-fn encode_arrow_nested_column(
-    _table: &ProjectedTable,
-    column: &ProjectedColumn,
-    values: &[&Value],
-) -> Result<ArrayRef, String> {
-    let data_type = arrow_data_type(column)?;
-    if values.is_empty() {
-        return Ok(new_empty_array(&data_type));
-    }
-    let field = Arc::new(Field::new(&column.name, data_type, true));
-    let mut json_lines = String::new();
-    for value in values {
-        json_lines.push_str(
-            &serde_json::to_string(value)
-                .map_err(|err| format!("cannot encode nested projection JSON value: {err}"))?,
-        );
-        json_lines.push('\n');
-    }
-    let mut reader = JsonReaderBuilder::new_with_field(field)
-        .with_batch_size(values.len().max(1))
-        .build(json_lines.as_bytes())
-        .map_err(|err| format!("cannot build nested Arrow projection decoder: {err}"))?;
-    match reader.next() {
-        Some(Ok(batch)) => Ok(batch.column(0).clone()),
-        Some(Err(err)) => Err(format!(
-            "cannot encode nested Arrow projection column: {err}"
-        )),
-        None => Ok(new_empty_array(&arrow_data_type(column)?)),
-    }
-}
-
-fn primitive_array<A, T>(values: &[&Value], logical: CoveLogicalType) -> Result<ArrayRef, String>
-where
-    A: From<Vec<Option<T>>> + Array + 'static,
-    T: TryFrom<i128>,
-{
-    let converted = values
-        .iter()
-        .map(|value| {
-            typed_i128_value(value, logical).and_then(|value| {
-                value
-                    .map(|value| {
-                        T::try_from(value)
-                            .map_err(|_| format!("projection value is outside {logical:?} range"))
-                    })
-                    .transpose()
-            })
-        })
-        .collect::<Vec<_>>();
-    let converted = converted.into_iter().collect::<Result<Vec<_>, _>>()?;
-    Ok(Arc::new(A::from(converted)) as ArrayRef)
-}
-
-fn encode_cove_t_projection(table: &ProjectedTable) -> Result<Vec<u8>, String> {
-    let columns = table
-        .columns
-        .iter()
-        .enumerate()
-        .map(|(index, column)| {
-            Ok(ColumnEntry {
-                column_id: (index + 1) as u32,
-                name: column.name.clone(),
-                logical: column.logical,
-                physical: projection_physical_kind(column.logical)?,
-                nullable: true,
-                sort_order: 0,
-                collation_id: 0,
-                precision: 0,
-                scale: 0,
-                flags: 0,
-            })
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    let row_count =
-        u32::try_from(table.rows.len()).map_err(|_| "too many projection rows".to_string())?;
-    let catalog = TableCatalog {
-        flags: 0,
-        tables: vec![TableEntry {
-            table_id: 1,
-            namespace: table.mapping_id.clone(),
-            name: table.output_table.clone(),
-            row_count: table.rows.len() as u64,
-            primary_sort_key_count: 0,
-            clustering_key_count: 0,
-            flags: 0,
-            columns,
-        }],
-    };
-    let mut segment = ScanSegment::new(1, 0, 0, row_count, table.columns.len() as u32);
-    segment.morsel_row_count = row_count.max(1);
-    for (index, column) in table.columns.iter().enumerate() {
-        let physical = projection_physical_kind(column.logical)?;
-        let (payload, null_count) = if matches!(
-            physical,
-            CovePhysicalKind::List | CovePhysicalKind::Struct | CovePhysicalKind::Map
-        ) {
-            (
-                projection_nested_payload(table, column, (index + 1) as u32)?,
-                0,
-            )
-        } else {
-            projection_physical_payload(table, column, physical)?
-        };
-        let page = ScanPageSpec::new(row_count, payload)
-            .with_encoding_root(projection_encoding_kind(physical) as u32)
-            .with_counts(row_count.saturating_sub(null_count), null_count);
-        segment.set_column_pages((index + 1) as u32, vec![page]);
-    }
-    let mut writer = ScanProfileCoveWriter::new(catalog);
-    let nested_entries = table
-        .columns
-        .iter()
-        .enumerate()
-        .filter(|(_, column)| {
-            matches!(
-                column.logical,
-                CoveLogicalType::List | CoveLogicalType::Struct | CoveLogicalType::Map
-            )
-        })
-        .map(|(index, column)| {
-            Ok(NestedSchemaEntryV1 {
-                table_id: 1,
-                column_id: (index + 1) as u32,
-                root: nested_schema_node_for_column(column)?,
-            })
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    if !nested_entries.is_empty() {
-        writer
-            .push_nested_schema(&NestedSchemaSectionV1::new(nested_entries))
-            .map_err(|err| err.to_string())?;
-    }
-    writer.metadata_json = serde_json::to_vec(&json!({
-        "projection_id": table.projection_id,
-        "mapping_id": table.mapping_id,
-        "mapping_version": table.mapping_version,
-    }))
-    .map_err(|err| err.to_string())?;
-    writer.push_segment(segment);
-    writer.write().map_err(|err| err.to_string())
-}
-
-fn projection_physical_kind(logical: CoveLogicalType) -> Result<CovePhysicalKind, String> {
-    match logical {
-        CoveLogicalType::Bool => Ok(CovePhysicalKind::Boolean),
-        CoveLogicalType::Int8
-        | CoveLogicalType::Int16
-        | CoveLogicalType::Int32
-        | CoveLogicalType::Int64
-        | CoveLogicalType::UInt8
-        | CoveLogicalType::UInt16
-        | CoveLogicalType::UInt32
-        | CoveLogicalType::UInt64
-        | CoveLogicalType::Float32
-        | CoveLogicalType::Float64
-        | CoveLogicalType::Decimal64
-        | CoveLogicalType::DateDays
-        | CoveLogicalType::TimestampMicros
-        | CoveLogicalType::TimestampNanos => Ok(CovePhysicalKind::NumCode),
-        CoveLogicalType::Decimal128 | CoveLogicalType::Uuid => Ok(CovePhysicalKind::FixedBytes),
-        CoveLogicalType::Utf8 | CoveLogicalType::Binary | CoveLogicalType::Json => {
-            Ok(CovePhysicalKind::VarBytes)
-        }
-        CoveLogicalType::List => Ok(CovePhysicalKind::List),
-        CoveLogicalType::Struct => Ok(CovePhysicalKind::Struct),
-        CoveLogicalType::Map => Ok(CovePhysicalKind::Map),
-        CoveLogicalType::Null => Err(format!(
-            "projection logical type {logical:?} is not supported for COVE-T output"
-        )),
-        _ => Err(format!("unknown projection logical type {logical:?}")),
-    }
-}
-
-fn projection_encoding_kind(physical: CovePhysicalKind) -> CoveEncodingKind {
-    match physical {
-        CovePhysicalKind::Boolean | CovePhysicalKind::FixedBytes => CoveEncodingKind::PlainFixed,
-        CovePhysicalKind::NumCode => CoveEncodingKind::NumCode,
-        CovePhysicalKind::VarBytes => CoveEncodingKind::VarBytes,
-        CovePhysicalKind::FileCode => CoveEncodingKind::FileCode,
-        CovePhysicalKind::List | CovePhysicalKind::Struct | CovePhysicalKind::Map => {
-            CoveEncodingKind::Canonical
-        }
-        _ => CoveEncodingKind::Canonical,
-    }
-}
-
-fn projection_physical_payload(
-    table: &ProjectedTable,
-    column: &ProjectedColumn,
-    physical: CovePhysicalKind,
-) -> Result<(Vec<u8>, u32), String> {
-    let mut null_bitmap = vec![0u8; table.rows.len().div_ceil(8)];
-    let mut values = Vec::new();
-    let mut null_count = 0u32;
-    for (row_index, row) in table.rows.iter().enumerate() {
-        let value = row.get(&column.name).unwrap_or(&Value::Null);
-        if value.is_null() {
-            null_count = null_count
-                .checked_add(1)
-                .ok_or_else(|| "projection null count overflow".to_string())?;
-            null_bitmap[row_index / 8] |= 1u8 << (row_index % 8);
-        }
-        append_projection_physical_value(column.logical, physical, value, &mut values)?;
-    }
-    let mut payload = Vec::new();
-    if null_count != 0 {
-        payload.extend_from_slice(&null_bitmap);
-    }
-    payload.extend_from_slice(&values);
-    Ok((payload, null_count))
-}
-
-struct NestedPayloadBuild {
-    logical_len: u32,
-}
-
-fn projection_nested_payload(
-    table: &ProjectedTable,
-    column: &ProjectedColumn,
-    _column_id: u32,
-) -> Result<Vec<u8>, String> {
-    let schema = nested_schema_node_for_column(column)?;
-    let values = table
-        .rows
-        .iter()
-        .map(|row| row.get(&column.name).unwrap_or(&Value::Null).clone())
-        .collect::<Vec<_>>();
-    let mut nodes = Vec::new();
-    let mut buffers = Vec::new();
-    let mut next_node_id = 0u16;
-    let root = build_nested_payload_node(
-        &schema,
-        &values,
-        &mut next_node_id,
-        &mut nodes,
-        &mut buffers,
-    )?;
-    ColumnPagePayloadV1::build_tree(root.logical_len, 0, nodes, buffers)
-        .map_err(|err| err.to_string())
-}
-
-fn build_nested_payload_node(
-    schema: &NestedSchemaNodeV1,
-    values: &[Value],
-    next_node_id: &mut u16,
-    nodes: &mut Vec<CoveEncodingNodeV1>,
-    buffers: &mut Vec<(PageBufferKind, Vec<u8>)>,
-) -> Result<NestedPayloadBuild, String> {
-    let node_id = *next_node_id;
-    *next_node_id = next_node_id
-        .checked_add(1)
-        .ok_or_else(|| "nested projection node id overflow".to_string())?;
-    match schema.physical {
-        CovePhysicalKind::List => {
-            let child_schema = schema
-                .children
-                .first()
-                .ok_or_else(|| "list nested_shape requires one child".to_string())?;
-            let mut offsets = Vec::with_capacity(values.len() + 1);
-            offsets.push(0u32);
-            let mut child_values = Vec::new();
-            for value in values {
-                if value.is_null() {
-                    offsets.push(child_values.len() as u32);
-                    continue;
-                }
-                let array = value
-                    .as_array()
-                    .ok_or_else(|| "list projection value must be an array".to_string())?;
-                child_values.extend(array.iter().cloned());
-                offsets.push(child_values.len() as u32);
-            }
-            let layout = ListLayoutPayload {
-                layout: ListLayout { offsets },
-                child_row_count: child_values.len() as u32,
-            };
-            nodes.push(CoveEncodingNodeV1 {
-                node_id,
-                encoding_kind: CoveEncodingKind::Canonical,
-                logical_type: schema.logical,
-                physical_kind: schema.physical,
-                flags: 0,
-                logical_len: values.len() as u32,
-                child_count: 1,
-                buffer_count: 1,
-                params_offset: 0,
-                params_length: 0,
-                stats_id: 0,
-                reserved: 0,
-            });
-            buffers.push((PageBufferKind::ChildLayout, layout.encode()));
-            build_nested_payload_node(child_schema, &child_values, next_node_id, nodes, buffers)?;
-            Ok(NestedPayloadBuild {
-                logical_len: values.len() as u32,
-            })
-        }
-        CovePhysicalKind::Struct => {
-            let row_count = values.len() as u64;
-            let layout = StructLayoutPayload {
-                layout: StructLayout {
-                    field_row_counts: vec![row_count; schema.children.len()],
-                },
-                parent_null_handling_declared: true,
-            };
-            nodes.push(CoveEncodingNodeV1 {
-                node_id,
-                encoding_kind: CoveEncodingKind::Canonical,
-                logical_type: schema.logical,
-                physical_kind: schema.physical,
-                flags: 0,
-                logical_len: values.len() as u32,
-                child_count: schema.children.len() as u16,
-                buffer_count: 1,
-                params_offset: 0,
-                params_length: 0,
-                stats_id: 0,
-                reserved: 0,
-            });
-            buffers.push((PageBufferKind::ChildLayout, layout.encode()));
-            for child in &schema.children {
-                let child_values = values
-                    .iter()
-                    .map(|value| {
-                        if value.is_null() {
-                            Value::Null
-                        } else {
-                            value
-                                .as_object()
-                                .and_then(|object| object.get(&child.name))
-                                .cloned()
-                                .unwrap_or(Value::Null)
-                        }
-                    })
-                    .collect::<Vec<_>>();
-                build_nested_payload_node(child, &child_values, next_node_id, nodes, buffers)?;
-            }
-            Ok(NestedPayloadBuild {
-                logical_len: values.len() as u32,
-            })
-        }
-        CovePhysicalKind::Map => {
-            if schema.children.len() != 2 {
-                return Err("map nested_shape requires key and value children".into());
-            }
-            let mut offsets = Vec::with_capacity(values.len() + 1);
-            let mut key_values = Vec::new();
-            let mut value_values = Vec::new();
-            let mut canonical_keys = Vec::new();
-            offsets.push(0u32);
-            for value in values {
-                if value.is_null() {
-                    offsets.push(key_values.len() as u32);
-                    continue;
-                }
-                let object = value
-                    .as_object()
-                    .ok_or_else(|| "map projection value must be a JSON object".to_string())?;
-                for (key, value) in object {
-                    key_values.push(Value::String(key.clone()));
-                    value_values.push(value.clone());
-                    canonical_keys.push(key.as_bytes().to_vec());
-                }
-                offsets.push(key_values.len() as u32);
-            }
-            let layout = MapLayoutPayload {
-                layout: MapLayout {
-                    offsets,
-                    key_row_count: key_values.len() as u32,
-                    value_row_count: value_values.len() as u32,
-                    keys_are_scalar: true,
-                    allow_duplicate_keys: false,
-                    canonical_keys,
-                },
-            };
-            nodes.push(CoveEncodingNodeV1 {
-                node_id,
-                encoding_kind: CoveEncodingKind::Canonical,
-                logical_type: schema.logical,
-                physical_kind: schema.physical,
-                flags: 0,
-                logical_len: values.len() as u32,
-                child_count: 2,
-                buffer_count: 1,
-                params_offset: 0,
-                params_length: 0,
-                stats_id: 0,
-                reserved: 0,
-            });
-            buffers.push((PageBufferKind::ChildLayout, layout.encode()));
-            build_nested_payload_node(
-                &schema.children[0],
-                &key_values,
-                next_node_id,
-                nodes,
-                buffers,
-            )?;
-            build_nested_payload_node(
-                &schema.children[1],
-                &value_values,
-                next_node_id,
-                nodes,
-                buffers,
-            )?;
-            Ok(NestedPayloadBuild {
-                logical_len: values.len() as u32,
-            })
-        }
-        _ => {
-            let mut null_bitmap = vec![0u8; values.len().div_ceil(8)];
-            let mut null_count = 0usize;
-            let mut encoded_values = Vec::new();
-            for (index, value) in values.iter().enumerate() {
-                if value.is_null() {
-                    null_count += 1;
-                    null_bitmap[index / 8] |= 1u8 << (index % 8);
-                }
-                append_projection_physical_value(
-                    schema.logical,
-                    schema.physical,
-                    value,
-                    &mut encoded_values,
-                )?;
-            }
-            let mut direct_buffers = Vec::new();
-            if null_count != 0 {
-                direct_buffers.push((PageBufferKind::NullBitmap, null_bitmap));
-            }
-            if !encoded_values.is_empty() {
-                direct_buffers.push((PageBufferKind::Values, encoded_values));
-            }
-            nodes.push(CoveEncodingNodeV1 {
-                node_id,
-                encoding_kind: projection_encoding_kind(schema.physical),
-                logical_type: schema.logical,
-                physical_kind: schema.physical,
-                flags: 0,
-                logical_len: values.len() as u32,
-                child_count: 0,
-                buffer_count: direct_buffers.len() as u16,
-                params_offset: 0,
-                params_length: 0,
-                stats_id: 0,
-                reserved: 0,
-            });
-            buffers.extend(direct_buffers);
-            Ok(NestedPayloadBuild {
-                logical_len: values.len() as u32,
-            })
-        }
-    }
-}
-
-fn nested_schema_node_for_column(column: &ProjectedColumn) -> Result<NestedSchemaNodeV1, String> {
-    let shape = column
-        .nested_shape
-        .as_deref()
-        .ok_or_else(|| format!("projection column '{}' requires nested_shape", column.name))?;
-    let value: Value = serde_json::from_str(shape).map_err(|err| {
-        format!(
-            "projection column '{}' has invalid nested_shape JSON: {err}",
-            column.name
-        )
-    })?;
-    let mut root = nested_schema_node_from_shape(&column.name, &value, true)?;
-    root.name = column.name.clone();
-    root.logical = column.logical;
-    root.physical = projection_physical_kind(column.logical)?;
-    Ok(root)
-}
-
-pub(crate) fn nested_schema_node_from_shape(
-    fallback_name: &str,
-    value: &Value,
-    default_nullable: bool,
-) -> Result<NestedSchemaNodeV1, String> {
-    let object = value
-        .as_object()
-        .ok_or_else(|| "nested_shape node must be a JSON object".to_string())?;
-    let name = object
-        .get("name")
-        .and_then(Value::as_str)
-        .unwrap_or(fallback_name)
-        .to_string();
-    let nullable = object
-        .get("nullable")
-        .and_then(Value::as_bool)
-        .unwrap_or(default_nullable);
-    let kind = object
-        .get("type")
-        .or_else(|| object.get("kind"))
-        .and_then(Value::as_str)
-        .unwrap_or("scalar");
-    match kind {
-        "list" => {
-            let item = object
-                .get("item")
-                .or_else(|| object.get("element"))
-                .ok_or_else(|| "list nested_shape requires item".to_string())?;
-            Ok(NestedSchemaNodeV1 {
-                name,
-                logical: CoveLogicalType::List,
-                physical: CovePhysicalKind::List,
-                nullable,
-                precision: 0,
-                scale: 0,
-                collation_id: 0,
-                flags: 0,
-                fixed_size_list_len: object
-                    .get("fixed_size_list_len")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0) as u32,
-                children: vec![nested_schema_node_from_shape("item", item, true)?],
-            })
-        }
-        "struct" => {
-            let fields = object
-                .get("fields")
-                .and_then(Value::as_array)
-                .ok_or_else(|| "struct nested_shape requires fields array".to_string())?;
-            let children = fields
-                .iter()
-                .map(|field| {
-                    let name = field
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| "struct field nested_shape requires name".to_string())?;
-                    nested_schema_node_from_shape(name, field, true)
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(NestedSchemaNodeV1 {
-                name,
-                logical: CoveLogicalType::Struct,
-                physical: CovePhysicalKind::Struct,
-                nullable,
-                precision: 0,
-                scale: 0,
-                collation_id: 0,
-                flags: 0,
-                fixed_size_list_len: 0,
-                children,
-            })
-        }
-        "map" => {
-            let key = object
-                .get("key")
-                .ok_or_else(|| "map nested_shape requires key".to_string())?;
-            let value = object
-                .get("value")
-                .ok_or_else(|| "map nested_shape requires value".to_string())?;
-            Ok(NestedSchemaNodeV1 {
-                name,
-                logical: CoveLogicalType::Map,
-                physical: CovePhysicalKind::Map,
-                nullable,
-                precision: 0,
-                scale: 0,
-                collation_id: 0,
-                flags: 0,
-                fixed_size_list_len: 0,
-                children: vec![
-                    nested_schema_node_from_shape("key", key, false)?,
-                    nested_schema_node_from_shape("value", value, true)?,
-                ],
-            })
-        }
-        _ => {
-            let logical = object
-                .get("logical_type")
-                .or_else(|| object.get("logical"))
-                .or_else(|| object.get("type"))
-                .and_then(Value::as_str)
-                .ok_or_else(|| "scalar nested_shape requires logical_type".to_string())
-                .and_then(projection_logical_type_from_name)?;
-            Ok(NestedSchemaNodeV1::scalar(
-                name,
-                logical,
-                projection_physical_kind(logical)?,
-                nullable,
-            ))
-        }
-    }
-}
-
-fn append_projection_physical_value(
-    logical: CoveLogicalType,
-    physical: CovePhysicalKind,
-    value: &Value,
-    out: &mut Vec<u8>,
-) -> Result<(), String> {
-    if value.is_null() {
-        append_projection_null_placeholder(logical, physical, out)?;
-        return Ok(());
-    }
-    match physical {
-        CovePhysicalKind::Boolean => out.push(u8::from(typed_bool_value(value)?.unwrap_or(false))),
-        CovePhysicalKind::NumCode => {
-            out.extend_from_slice(&projection_numcode(logical, value)?.to_le_bytes())
-        }
-        CovePhysicalKind::FixedBytes => {
-            out.extend_from_slice(&projection_fixed_bytes(logical, value)?)
-        }
-        CovePhysicalKind::VarBytes => {
-            let bytes = typed_bytes_value(value, logical)?.unwrap_or_default();
-            let len = u32::try_from(bytes.len())
-                .map_err(|_| "projection value exceeds COVE-T VarBytes limit".to_string())?;
-            out.extend_from_slice(&len.to_le_bytes());
-            out.extend_from_slice(&bytes);
-        }
-        CovePhysicalKind::FileCode
-        | CovePhysicalKind::List
-        | CovePhysicalKind::Struct
-        | CovePhysicalKind::Map => {
-            return Err(format!(
-                "projection physical kind {physical:?} is not supported for COVE-T output"
-            ))
-        }
-        _ => return Err(format!("unknown projection physical kind {physical:?}")),
-    }
-    Ok(())
-}
-
-fn append_projection_null_placeholder(
-    logical: CoveLogicalType,
-    physical: CovePhysicalKind,
-    out: &mut Vec<u8>,
-) -> Result<(), String> {
-    match physical {
-        CovePhysicalKind::Boolean => out.push(0),
-        CovePhysicalKind::NumCode => out.extend_from_slice(&0u64.to_le_bytes()),
-        CovePhysicalKind::FixedBytes => {
-            let width = match logical {
-                CoveLogicalType::Decimal128 | CoveLogicalType::Uuid => 16,
-                _ => {
-                    return Err(format!(
-                        "unsupported fixed-width projection logical type {logical:?}"
-                    ))
-                }
-            };
-            out.resize(out.len() + width, 0);
-        }
-        CovePhysicalKind::VarBytes => out.extend_from_slice(&0u32.to_le_bytes()),
-        CovePhysicalKind::FileCode
-        | CovePhysicalKind::List
-        | CovePhysicalKind::Struct
-        | CovePhysicalKind::Map => {
-            return Err(format!(
-                "projection physical kind {physical:?} is not supported for null placeholders"
-            ))
-        }
-        _ => return Err(format!("unknown projection physical kind {physical:?}")),
-    }
-    Ok(())
-}
-
-fn projection_numcode(logical: CoveLogicalType, value: &Value) -> Result<u64, String> {
-    Ok(match logical {
-        CoveLogicalType::Int8 => i8::try_from(typed_i128_required(value, logical)?)
-            .map_err(|_| "int8 projection value is out of range".to_string())?
-            as u8 as u64,
-        CoveLogicalType::Int16 => i16::try_from(typed_i128_required(value, logical)?)
-            .map_err(|_| "int16 projection value is out of range".to_string())?
-            as u16 as u64,
-        CoveLogicalType::Int32 | CoveLogicalType::DateDays => {
-            i32::try_from(typed_i128_required(value, logical)?)
-                .map_err(|_| format!("{logical:?} projection value is out of range"))?
-                as u32 as u64
-        }
-        CoveLogicalType::Int64
-        | CoveLogicalType::TimestampMicros
-        | CoveLogicalType::TimestampNanos
-        | CoveLogicalType::Decimal64 => i64::try_from(typed_i128_required(value, logical)?)
-            .map_err(|_| format!("{logical:?} projection value is out of range"))?
-            as u64,
-        CoveLogicalType::UInt8 => u8::try_from(typed_i128_required(value, logical)?)
-            .map_err(|_| "uint8 projection value is out of range".to_string())?
-            as u64,
-        CoveLogicalType::UInt16 => u16::try_from(typed_i128_required(value, logical)?)
-            .map_err(|_| "uint16 projection value is out of range".to_string())?
-            as u64,
-        CoveLogicalType::UInt32 => u32::try_from(typed_i128_required(value, logical)?)
-            .map_err(|_| "uint32 projection value is out of range".to_string())?
-            as u64,
-        CoveLogicalType::UInt64 => u64::try_from(typed_i128_required(value, logical)?)
-            .map_err(|_| "uint64 projection value is out of range".to_string())?,
-        CoveLogicalType::Float32 => (typed_f64_value(value)?
-            .ok_or_else(|| "float32 projection value is null".to_string())?
-            as f32)
-            .to_bits() as u64,
-        CoveLogicalType::Float64 => typed_f64_value(value)?
-            .ok_or_else(|| "float64 projection value is null".to_string())?
-            .to_bits(),
-        _ => {
-            return Err(format!(
-                "logical type {logical:?} is not NumCode-backed in projection output"
-            ))
-        }
-    })
-}
-
-fn projection_fixed_bytes(logical: CoveLogicalType, value: &Value) -> Result<Vec<u8>, String> {
-    match logical {
-        CoveLogicalType::Decimal128 => {
-            Ok(typed_i128_required(value, logical)?.to_le_bytes().to_vec())
-        }
-        CoveLogicalType::Uuid => typed_uuid_value(value)?
-            .map(|value| value.to_vec())
-            .ok_or_else(|| "uuid projection value is null".to_string()),
-        _ => Err(format!(
-            "logical type {logical:?} is not fixed-width projection output"
-        )),
-    }
-}
-
-fn typed_i128_required(value: &Value, logical: CoveLogicalType) -> Result<i128, String> {
-    typed_i128_value(value, logical)?.ok_or_else(|| format!("{logical:?} projection value is null"))
-}
-
-fn typed_i128_value(value: &Value, logical: CoveLogicalType) -> Result<Option<i128>, String> {
-    if value.is_null() {
-        return Ok(None);
-    }
-    let parsed = match value {
-        Value::Number(number) => number
-            .as_i64()
-            .map(i128::from)
-            .or_else(|| number.as_u64().map(|value| value as i128))
-            .ok_or_else(|| format!("{logical:?} projection value must be an integer"))?,
-        Value::String(text) => text
-            .parse::<i128>()
-            .map_err(|_| format!("{logical:?} projection value must be an integer"))?,
-        Value::Bool(value) if logical == CoveLogicalType::Bool => i128::from(*value),
-        _ => {
-            return Err(format!(
-                "{logical:?} projection value has incompatible JSON type"
-            ))
-        }
-    };
-    Ok(Some(parsed))
-}
-
-fn typed_f64_value(value: &Value) -> Result<Option<f64>, String> {
-    if value.is_null() {
-        return Ok(None);
-    }
-    let parsed = match value {
-        Value::Number(number) => number
-            .as_f64()
-            .ok_or_else(|| "floating projection value is not finite JSON number".to_string())?,
-        Value::String(text) => text
-            .parse::<f64>()
-            .map_err(|_| "floating projection value must be numeric".to_string())?,
-        _ => return Err("floating projection value has incompatible JSON type".into()),
-    };
-    Ok(Some(parsed))
-}
-
-fn typed_bool_value(value: &Value) -> Result<Option<bool>, String> {
-    if value.is_null() {
-        return Ok(None);
-    }
-    match value {
-        Value::Bool(value) => Ok(Some(*value)),
-        Value::String(text) if text.eq_ignore_ascii_case("true") => Ok(Some(true)),
-        Value::String(text) if text.eq_ignore_ascii_case("false") => Ok(Some(false)),
-        _ => Err("bool projection value must be boolean or true/false string".into()),
-    }
-}
-
-fn typed_string_value(value: &Value, logical: CoveLogicalType) -> Result<Option<String>, String> {
-    if value.is_null() {
-        return Ok(None);
-    }
-    match value {
-        Value::String(value) => Ok(Some(value.clone())),
-        Value::Bool(_) | Value::Number(_) if logical == CoveLogicalType::Utf8 => {
-            Ok(json_value_to_output_string(value))
-        }
-        Value::Array(_) | Value::Object(_) if logical == CoveLogicalType::Utf8 => {
-            Ok(Some(value.to_string()))
-        }
-        _ => Err(format!(
-            "{logical:?} projection value cannot be encoded as string"
-        )),
-    }
-}
-
-fn typed_bytes_value(value: &Value, logical: CoveLogicalType) -> Result<Option<Vec<u8>>, String> {
-    if value.is_null() {
-        return Ok(None);
-    }
-    match logical {
-        CoveLogicalType::Utf8 => Ok(typed_string_value(value, logical)?.map(String::into_bytes)),
-        CoveLogicalType::Json => serde_json::to_vec(value)
-            .map(Some)
-            .map_err(|err| format!("cannot encode projection JSON value: {err}")),
-        CoveLogicalType::Binary => match value {
-            Value::String(text) => Ok(Some(text.as_bytes().to_vec())),
-            Value::Array(values) => values
-                .iter()
-                .map(|value| {
-                    value
-                        .as_u64()
-                        .and_then(|value| u8::try_from(value).ok())
-                        .ok_or_else(|| "binary projection array values must be u8".to_string())
-                })
-                .collect::<Result<Vec<_>, _>>()
-                .map(Some),
-            _ => Err("binary projection value must be string or u8 array".into()),
-        },
-        other => Err(format!("{other:?} projection value is not byte-backed")),
-    }
-}
-
-fn typed_uuid_value(value: &Value) -> Result<Option<[u8; 16]>, String> {
-    if value.is_null() {
-        return Ok(None);
-    }
-    let text = value
-        .as_str()
-        .ok_or_else(|| "uuid projection value must be a 32-character hex string".to_string())?;
-    hex_decode_16(text).map(Some)
-}
-
-fn encode_sql_projection(tables: &[ProjectedTable]) -> Result<Vec<u8>, String> {
-    let mut out = String::new();
-    for table in tables {
-        out.push_str(&format!(
-            "CREATE TABLE {} (\n",
-            quote_sql_identifier(&table.output_table)
-        ));
-        for (index, column) in table.columns.iter().enumerate() {
-            let suffix = if index + 1 == table.columns.len() {
-                "\n"
-            } else {
-                ",\n"
-            };
-            out.push_str(&format!(
-                "  {} {}{}",
-                quote_sql_identifier(&column.name),
-                sql_type_name(column.logical)?,
-                suffix
-            ));
-        }
-        out.push_str(");\n");
-        for row in &table.rows {
-            let values = table
-                .columns
-                .iter()
-                .map(|column| {
-                    let value = row.get(&column.name).unwrap_or(&Value::Null);
-                    sql_literal(value, column.logical)
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            out.push_str(&format!(
-                "INSERT INTO {} ({}) VALUES ({});\n",
-                quote_sql_identifier(&table.output_table),
-                table
-                    .columns
-                    .iter()
-                    .map(|column| quote_sql_identifier(&column.name))
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                values.join(", ")
-            ));
-        }
-    }
-    Ok(out.into_bytes())
-}
-
-fn quote_sql_identifier(value: &str) -> String {
-    format!("\"{}\"", value.replace('"', "\"\""))
-}
-
-fn sql_type_name(logical: CoveLogicalType) -> Result<&'static str, String> {
-    match logical {
-        CoveLogicalType::Bool => Ok("BOOLEAN"),
-        CoveLogicalType::Int8 => Ok("TINYINT"),
-        CoveLogicalType::Int16 => Ok("SMALLINT"),
-        CoveLogicalType::Int32 | CoveLogicalType::DateDays => Ok("INTEGER"),
-        CoveLogicalType::Int64
-        | CoveLogicalType::TimestampMicros
-        | CoveLogicalType::TimestampNanos => Ok("BIGINT"),
-        CoveLogicalType::UInt8 => Ok("UTINYINT"),
-        CoveLogicalType::UInt16 => Ok("USMALLINT"),
-        CoveLogicalType::UInt32 => Ok("UINTEGER"),
-        CoveLogicalType::UInt64 => Ok("UBIGINT"),
-        CoveLogicalType::Float32 => Ok("REAL"),
-        CoveLogicalType::Float64 => Ok("DOUBLE"),
-        CoveLogicalType::Decimal64 => Ok("DECIMAL(18,0)"),
-        CoveLogicalType::Decimal128 => Ok("DECIMAL(38,0)"),
-        CoveLogicalType::Utf8 | CoveLogicalType::Uuid => Ok("TEXT"),
-        CoveLogicalType::Binary => Ok("BLOB"),
-        CoveLogicalType::Json => Ok("JSON"),
-        CoveLogicalType::Null
-        | CoveLogicalType::List
-        | CoveLogicalType::Struct
-        | CoveLogicalType::Map => Err(format!(
-            "projection logical type {logical:?} has no SQL output type"
-        )),
-        _ => Err(format!("unknown projection logical type {logical:?}")),
-    }
-}
-
-fn sql_literal(value: &Value, logical: CoveLogicalType) -> Result<String, String> {
-    if value.is_null() {
-        return Ok("NULL".into());
-    }
-    match logical {
-        CoveLogicalType::Bool => Ok(if typed_bool_value(value)?.unwrap_or(false) {
-            "TRUE".into()
-        } else {
-            "FALSE".into()
-        }),
-        CoveLogicalType::Int8
-        | CoveLogicalType::Int16
-        | CoveLogicalType::Int32
-        | CoveLogicalType::Int64
-        | CoveLogicalType::UInt8
-        | CoveLogicalType::UInt16
-        | CoveLogicalType::UInt32
-        | CoveLogicalType::UInt64
-        | CoveLogicalType::Decimal64
-        | CoveLogicalType::Decimal128
-        | CoveLogicalType::DateDays
-        | CoveLogicalType::TimestampMicros
-        | CoveLogicalType::TimestampNanos => Ok(typed_i128_required(value, logical)?.to_string()),
-        CoveLogicalType::Float32 | CoveLogicalType::Float64 => {
-            let value =
-                typed_f64_value(value)?.ok_or_else(|| "float SQL value is null".to_string())?;
-            if value.is_finite() {
-                Ok(value.to_string())
-            } else {
-                Err("non-finite float projection values cannot be emitted as SQL literals".into())
-            }
-        }
-        CoveLogicalType::Utf8 | CoveLogicalType::Uuid => Ok(quote_sql_string(
-            &typed_string_value(value, CoveLogicalType::Utf8)?.unwrap_or_default(),
-        )),
-        CoveLogicalType::Json => Ok(quote_sql_string(&value.to_string())),
-        CoveLogicalType::Binary => {
-            let bytes = typed_bytes_value(value, logical)?.unwrap_or_default();
-            Ok(format!("X'{}'", hex_encode(&bytes)))
-        }
-        CoveLogicalType::Null
-        | CoveLogicalType::List
-        | CoveLogicalType::Struct
-        | CoveLogicalType::Map => Err(format!(
-            "projection logical type {logical:?} cannot be emitted as SQL"
-        )),
-        _ => Err(format!("unknown projection logical type {logical:?}")),
-    }
-}
-
-fn quote_sql_string(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
-}
-
-fn json_value_to_output_string(value: &Value) -> Option<String> {
-    match value {
-        Value::Null => None,
-        Value::String(value) => Some(value.clone()),
-        Value::Bool(value) => Some(value.to_string()),
-        Value::Number(value) => Some(value.to_string()),
-        Value::Array(_) | Value::Object(_) => Some(value.to_string()),
-    }
-}
-
-fn requested_property_names_for_catalog(catalog: &MapProjectionCatalog) -> Vec<String> {
-    let mut names = std::collections::BTreeSet::from([
-        "source_goid".to_string(),
-        "target_goid".to_string(),
-        "association_type".to_string(),
-        "mapping_rule_id".to_string(),
-        "source_evidence_id".to_string(),
-        "source_role".to_string(),
-        "target_role".to_string(),
-        "valid_from".to_string(),
-        "valid_to".to_string(),
-        "observed_at".to_string(),
-        "cardinality_policy".to_string(),
-    ]);
-    for projection in &catalog.projections {
-        for column in &projection.columns {
-            collect_property_names_from_expression(&column.value, &mut names);
-        }
-        for ordering in &projection.ordering {
-            collect_property_names_from_expression(ordering_expression(ordering), &mut names);
-        }
-    }
-    names.into_iter().collect()
-}
-
-fn collect_property_names_from_expression(
-    expression: &str,
-    names: &mut std::collections::BTreeSet<String>,
-) {
-    let expression = expression.trim();
-    if expression.is_empty()
-        || literal_value(expression).is_some()
-        || known_projection_path(expression)
-        || expression.starts_with("evidence.")
-        || expression == "value"
-    {
-        return;
-    }
-    if let Some(traversal) = parse_association_traversal(expression) {
-        names.insert(traversal.property_name.to_string());
-        return;
-    }
-    if let Some((_function, args)) = parse_function_call(expression) {
-        for arg in args {
-            collect_property_names_from_expression(&arg, names);
-        }
-        return;
-    }
-    if let Some(property_name) = expression.rsplit('.').next() {
-        if !property_name.is_empty() {
-            names.insert(property_name.to_string());
-        }
-    }
+    cove_core::types::logical_type_name(logical)
 }
 
 #[derive(Debug, Clone)]
 struct ProjectionModel {
     rows: Vec<ProjectionRow>,
     reconstructed_rows: Vec<ProjectionRow>,
-    evidence_entries: Vec<Value>,
-    persisted: bool,
+    evidence_entries: Vec<ProjectionEvidenceEntry>,
 }
 
 #[derive(Debug, Clone)]
@@ -2066,6 +1957,7 @@ struct ProjectionRow {
     csn: u64,
     segment_id: u32,
     row_index: u32,
+    prev_ref: Option<CoveRecordRefV1>,
     properties: Vec<ProjectionProperty>,
 }
 
@@ -2077,6 +1969,12 @@ struct ProjectionProperty {
     value: Value,
 }
 
+#[derive(Debug, Clone)]
+enum ProjectionEvidenceEntry {
+    Json(Value),
+    Parsed(MapEvidenceEntry),
+}
+
 impl ProjectionModel {
     fn from_materialized(materialized: &MaterializedModel) -> Self {
         let type_flags = materialized
@@ -2084,7 +1982,7 @@ impl ProjectionModel {
             .iter()
             .map(|ty| (ty.object_type_id, ty.flags))
             .collect::<BTreeMap<_, _>>();
-        let rows: Vec<ProjectionRow> = materialized
+        let mut rows = materialized
             .rows
             .iter()
             .enumerate()
@@ -2103,6 +2001,7 @@ impl ProjectionModel {
                 csn: index as u64,
                 segment_id: 0,
                 row_index: index as u32,
+                prev_ref: None,
                 properties: row
                     .properties
                     .values()
@@ -2114,45 +2013,73 @@ impl ProjectionModel {
                     })
                     .collect(),
             })
-            .collect();
+            .collect::<Vec<_>>();
+        rows.sort_by_key(temporal_sort_key);
+        let reconstructed_rows = reconstruct_projection_rows_at_cut(&rows, |_| true)
+            .expect("materialized projection rows should not contain prev_ref chains");
         Self {
-            reconstructed_rows: rows.clone(),
             rows,
-            evidence_entries: materialized.evidence_entries.clone(),
-            persisted: false,
+            reconstructed_rows,
+            evidence_entries: materialized
+                .evidence_entries
+                .iter()
+                .cloned()
+                .map(ProjectionEvidenceEntry::Json)
+                .collect(),
         }
     }
 
-    fn from_surface(surface: &CoveObjectSurface) -> Result<Self, cove_core::CoveError> {
-        let rows = surface
-            .records
-            .iter()
-            .map(row_from_surface_record)
-            .collect::<Vec<_>>();
-        let reconstructed_rows = reconstruct_object_states(surface, &Default::default())?
-            .iter()
-            .map(row_from_reconstructed_state)
-            .collect::<Vec<_>>();
-        let evidence_entries = surface
-            .evidence_index
-            .as_ref()
-            .map(|index| index.entries.iter().map(evidence_entry_value).collect())
-            .unwrap_or_default();
+    fn from_surface_with_access_plan(
+        surface: &CoveObjectSurface,
+        access_plan: &ProjectionAccessPlan,
+    ) -> Result<Self, cove_core::CoveError> {
+        let mut rows = if access_plan.needs_history_rows || access_plan.needs_reconstructed_rows {
+            surface
+                .records
+                .iter()
+                .map(row_from_surface_record)
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        rows.sort_by_key(temporal_sort_key);
+        let mut reconstructed_rows = if access_plan.needs_reconstructed_rows {
+            reconstruct_projection_rows_at_cut(&rows, |_| true)
+                .map_err(cove_core::CoveError::BadSchema)?
+        } else {
+            Vec::new()
+        };
+        reconstructed_rows.sort_by_key(temporal_sort_key);
+        if !access_plan.needs_history_rows {
+            rows.clear();
+        }
+        let evidence_entries = if access_plan.include_evidence_index {
+            surface
+                .evidence_index
+                .as_ref()
+                .map(|index| {
+                    index
+                        .entries
+                        .iter()
+                        .cloned()
+                        .map(ProjectionEvidenceEntry::Parsed)
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         Ok(Self {
             rows,
             reconstructed_rows,
             evidence_entries,
-            persisted: true,
         })
     }
 
     fn rows_for_projection(
         &self,
         projection: &MapProjectionEntry,
-    ) -> Result<Vec<ProjectionRow>, String> {
-        if !self.persisted {
-            return Ok(self.rows.clone());
-        }
+    ) -> Result<Cow<'_, [ProjectionRow]>, String> {
         match parse_projection_temporal_mode(
             projection
                 .temporal_mode
@@ -2166,15 +2093,9 @@ impl ProjectionModel {
                 projection.temporal_mode.as_deref().unwrap_or_default()
             )
         })? {
-            ProjectionTemporalMode::LatestCommitted => {
-                let mut rows = self.reconstructed_rows.clone();
-                rows.sort_by_key(temporal_sort_key);
-                Ok(rows)
-            }
+            ProjectionTemporalMode::LatestCommitted => Ok(Cow::Borrowed(&self.reconstructed_rows)),
             ProjectionTemporalMode::FullHistory | ProjectionTemporalMode::CommitOrder => {
-                let mut rows = self.rows.clone();
-                rows.sort_by_key(temporal_sort_key);
-                Ok(rows)
+                Ok(Cow::Borrowed(&self.rows))
             }
             ProjectionTemporalMode::ValidTime => {
                 ensure_temporal_surface_fields(
@@ -2183,9 +2104,7 @@ impl ProjectionModel {
                     "valid_from",
                     "valid_time",
                 )?;
-                let mut rows = self.reconstructed_rows.clone();
-                rows.sort_by_key(temporal_sort_key);
-                Ok(rows)
+                Ok(Cow::Borrowed(&self.reconstructed_rows))
             }
             ProjectionTemporalMode::ObservedTime => {
                 ensure_temporal_surface_fields(
@@ -2194,20 +2113,16 @@ impl ProjectionModel {
                     "observed_at",
                     "observed_time",
                 )?;
-                let mut rows = self.reconstructed_rows.clone();
-                rows.sort_by_key(temporal_sort_key);
-                Ok(rows)
+                Ok(Cow::Borrowed(&self.reconstructed_rows))
             }
-            ProjectionTemporalMode::AsOfTimestamp(timestamp_us) => {
-                Ok(reconstruct_projection_rows_at_cut(&self.rows, |row| {
+            ProjectionTemporalMode::AsOfTimestamp(timestamp_us) => Ok(Cow::Owned(
+                reconstruct_projection_rows_at_cut(&self.rows, |row| {
                     row.timestamp_us <= timestamp_us
-                }))
-            }
-            ProjectionTemporalMode::AsOfCsn(csn) => {
-                Ok(reconstruct_projection_rows_at_cut(&self.rows, |row| {
-                    row.csn <= csn
-                }))
-            }
+                })?,
+            )),
+            ProjectionTemporalMode::AsOfCsn(csn) => Ok(Cow::Owned(
+                reconstruct_projection_rows_at_cut(&self.rows, |row| row.csn <= csn)?,
+            )),
         }
     }
 }
@@ -2279,36 +2194,45 @@ fn ensure_temporal_surface_fields(
 fn reconstruct_projection_rows_at_cut(
     rows: &[ProjectionRow],
     visible: impl Fn(&ProjectionRow) -> bool,
-) -> Vec<ProjectionRow> {
-    let mut grouped = BTreeMap::<(u32, u64, [u8; 16]), Vec<ProjectionRow>>::new();
+) -> Result<Vec<ProjectionRow>, String> {
+    let mut current_by_object = BTreeMap::<(u32, u64, [u8; 16]), ProjectionRow>::new();
     for row in rows.iter().filter(|row| visible(row)) {
-        grouped
-            .entry((row.object_type_id, row.branch_key, row.goid))
-            .or_default()
-            .push(row.clone());
-    }
-    let mut out = Vec::new();
-    for (_key, mut group) in grouped {
-        group.sort_by_key(temporal_sort_key);
-        let mut current = None::<ProjectionRow>;
-        for row in group {
-            match row.record_kind {
-                RecordKind::Baseline | RecordKind::Snapshot => current = Some(row),
-                RecordKind::Delta => match current.as_mut() {
-                    Some(state) => apply_projection_delta(state, &row),
-                    None => current = Some(row),
-                },
-                RecordKind::Tombstone => current = None,
-                RecordKind::ReservedLegacyMaterializedDelta => {}
-                _ => {}
+        let key = (row.object_type_id, row.branch_key, row.goid);
+        if let Some(prev_ref) = row.prev_ref {
+            let Some(current) = current_by_object.get(&key) else {
+                return Err(format!(
+                    "projection reconstruction encountered missing prev_ref target {}:{}",
+                    prev_ref.segment_id, prev_ref.row_index
+                ));
+            };
+            if current.segment_id != prev_ref.segment_id || current.row_index != prev_ref.row_index
+            {
+                return Err(format!(
+                    "projection reconstruction encountered mismatched prev_ref target {}:{}",
+                    prev_ref.segment_id, prev_ref.row_index
+                ));
             }
         }
-        if let Some(row) = current {
-            out.push(row);
+        match row.record_kind {
+            RecordKind::Baseline | RecordKind::Snapshot => {
+                current_by_object.insert(key, row.clone());
+            }
+            RecordKind::Delta => match current_by_object.get_mut(&key) {
+                Some(state) => apply_projection_delta(state, row),
+                None => {
+                    current_by_object.insert(key, row.clone());
+                }
+            },
+            RecordKind::Tombstone => {
+                current_by_object.remove(&key);
+            }
+            RecordKind::ReservedLegacyMaterializedDelta => {}
+            _ => {}
         }
     }
+    let mut out = current_by_object.into_values().collect::<Vec<_>>();
     out.sort_by_key(temporal_sort_key);
-    out
+    Ok(out)
 }
 
 fn apply_projection_delta(state: &mut ProjectionRow, delta: &ProjectionRow) {
@@ -2343,6 +2267,7 @@ fn row_from_surface_record(record: &CoveObjectRecord) -> ProjectionRow {
         csn: record.csn,
         segment_id: record.segment_id,
         row_index: record.row_index,
+        prev_ref: record.prev_ref,
         properties: record
             .properties
             .iter()
@@ -2356,48 +2281,36 @@ fn row_from_surface_record(record: &CoveObjectRecord) -> ProjectionRow {
     }
 }
 
-fn row_from_reconstructed_state(state: &CoveObjectState) -> ProjectionRow {
-    ProjectionRow {
-        object_type_id: state.object_type_id,
-        object_type: state.object_type_name.clone(),
-        object_type_flags: state.object_type_flags,
-        goid: state.goid,
-        record_id: state.latest_record_id,
-        branch_key: state.branch_key,
-        record_kind: state.record_kind,
-        timestamp_us: state.timestamp_us,
-        csn: state.csn,
-        segment_id: state.latest_segment_id,
-        row_index: state.latest_row_index,
-        properties: state
-            .properties
-            .iter()
-            .map(|property| ProjectionProperty {
-                property_id: property.property_id,
-                property_name: property.property_name.clone(),
-                flags: property.flags,
-                value: property.value.clone(),
-            })
-            .collect(),
+fn projection_evidence_value(entry: &ProjectionEvidenceEntry, key: &str) -> Value {
+    match entry {
+        ProjectionEvidenceEntry::Json(value) => value
+            .as_object()
+            .and_then(|object| object.get(key))
+            .cloned()
+            .unwrap_or(Value::Null),
+        ProjectionEvidenceEntry::Parsed(entry) => match key {
+            "source_id" => Value::String(entry.source_id.clone()),
+            "source_row_identity" => Value::String(entry.source_row_identity.clone()),
+            "rule_id" => Value::String(entry.rule_id.clone()),
+            "assertion_id" => Value::String(entry.assertion_id.clone()),
+            "output_object_id" => Value::String(entry.output_object_id.clone()),
+            "observed_schema_fingerprint" => entry
+                .observed_schema_fingerprint
+                .clone()
+                .map(Value::String)
+                .unwrap_or(Value::Null),
+            "observed_snapshot_digest" => entry
+                .observed_snapshot_digest
+                .clone()
+                .map(Value::String)
+                .unwrap_or(Value::Null),
+            other => entry
+                .operation_metadata
+                .get(other)
+                .cloned()
+                .unwrap_or(Value::Null),
+        },
     }
-}
-
-fn evidence_entry_value(entry: &MapEvidenceEntry) -> Value {
-    let mut value = json!({
-        "source_id": entry.source_id,
-        "source_row_identity": entry.source_row_identity,
-        "rule_id": entry.rule_id,
-        "assertion_id": entry.assertion_id,
-        "output_object_id": entry.output_object_id,
-        "observed_schema_fingerprint": entry.observed_schema_fingerprint,
-        "observed_snapshot_digest": entry.observed_snapshot_digest,
-    });
-    if let Some(object) = value.as_object_mut() {
-        for (key, metadata_value) in &entry.operation_metadata {
-            object.insert(key.clone(), metadata_value.clone());
-        }
-    }
-    value
 }
 
 fn temporal_sort_key(row: &ProjectionRow) -> (i64, u64, u32, u32, [u8; 16]) {
@@ -2807,21 +2720,22 @@ fn ordering_value(
 fn project_one(
     model: &ProjectionModel,
     projection: &MapProjectionEntry,
+    options: &ProjectionBatchOptions,
 ) -> Result<Vec<Value>, String> {
     let row_grain = projection
         .row_grain
         .as_deref()
         .ok_or_else(|| "projection row_grain is required".to_string())?;
     match row_grain {
-        "one_row_per_object" => project_object_rows(model, projection, false),
+        "one_row_per_object" => project_object_rows(model, projection, false, options),
         "one_row_per_event_object" | "one_row_per_object_as_of_time" => {
-            project_object_rows(model, projection, false)
+            project_object_rows(model, projection, false, options)
         }
         "one_row_per_association" | "one_row_per_link_object" => {
-            project_object_rows(model, projection, true)
+            project_object_rows(model, projection, true, options)
         }
-        "one_row_per_property_version" => project_property_versions(model, projection),
-        "one_row_per_evidence_assertion" => project_evidence_rows(model, projection),
+        "one_row_per_property_version" => project_property_versions(model, projection, options),
+        "one_row_per_evidence_assertion" => project_evidence_rows(model, projection, options),
         other => Err(format!("unsupported projection row_grain '{other}'")),
     }
 }
@@ -2830,13 +2744,15 @@ fn project_object_rows(
     model: &ProjectionModel,
     projection: &MapProjectionEntry,
     associations: bool,
+    options: &ProjectionBatchOptions,
 ) -> Result<Vec<Value>, String> {
     let anchor = projection
         .anchor
         .as_ref()
         .ok_or_else(|| "projection anchor is required".to_string())?;
     let mut rows = Vec::new();
-    for row in model.rows_for_projection(projection)? {
+    let projection_rows = model.rows_for_projection(projection)?;
+    for row in projection_rows.iter() {
         if associations {
             let Some(association_type) = &anchor.association_type else {
                 continue;
@@ -2857,7 +2773,18 @@ fn project_object_rows(
         if let Some(output_table) = &projection.output_table {
             out.insert("output_table".into(), json!(output_table));
         }
-        rows.extend(project_columns_for_row(model, projection, &row, out)?);
+        for projected in project_columns_for_row(model, projection, &row, out)? {
+            let Value::Object(projected_row) = projected else {
+                return Err("projection produced a non-object row".into());
+            };
+            if !row_matches_projection_filters(&projected_row, &options.pushed_filters) {
+                continue;
+            }
+            rows.push(Value::Object(projected_row));
+            if reached_projection_limit(&mut rows, options.max_rows) {
+                return Ok(rows);
+            }
+        }
     }
     Ok(rows)
 }
@@ -2985,9 +2912,11 @@ fn ordered_multi_values(values: &[Value], projection: &MapProjectionEntry) -> Ve
 fn project_property_versions(
     model: &ProjectionModel,
     projection: &MapProjectionEntry,
+    options: &ProjectionBatchOptions,
 ) -> Result<Vec<Value>, String> {
     let mut rows = Vec::new();
-    for row in model.rows_for_projection(projection)? {
+    let projection_rows = model.rows_for_projection(projection)?;
+    for row in projection_rows.iter() {
         for property in &row.properties {
             let mut out = Map::new();
             out.insert("projection_id".into(), json!(projection.projection_id));
@@ -2995,7 +2924,13 @@ fn project_property_versions(
             out.insert("property_id".into(), json!(property.property_id));
             out.insert("property_name".into(), json!(property.property_name));
             out.insert("value".into(), property.value.clone());
+            if !row_matches_projection_filters(&out, &options.pushed_filters) {
+                continue;
+            }
             rows.push(Value::Object(out));
+            if reached_projection_limit(&mut rows, options.max_rows) {
+                return Ok(rows);
+            }
         }
     }
     Ok(rows)
@@ -3004,6 +2939,7 @@ fn project_property_versions(
 fn project_evidence_rows(
     model: &ProjectionModel,
     projection: &MapProjectionEntry,
+    options: &ProjectionBatchOptions,
 ) -> Result<Vec<Value>, String> {
     let mut rows = Vec::new();
     for evidence in &model.evidence_entries {
@@ -3016,12 +2952,133 @@ fn project_evidence_rows(
                 .ok_or_else(|| format!("unsupported evidence expression '{}'", column.value))?;
             out.insert(
                 column.name.clone(),
-                evidence.get(key).cloned().unwrap_or(Value::Null),
+                projection_evidence_value(evidence, key),
             );
         }
+        if !row_matches_projection_filters(&out, &options.pushed_filters) {
+            continue;
+        }
         rows.push(Value::Object(out));
+        if reached_projection_limit(&mut rows, options.max_rows) {
+            return Ok(rows);
+        }
     }
     Ok(rows)
+}
+
+fn row_matches_projection_filters(row: &Map<String, Value>, filters: &[ProjectionFilter]) -> bool {
+    filters.iter().all(|filter| filter.matches(row))
+}
+
+impl ProjectionFilter {
+    fn column_name(&self) -> &str {
+        match self {
+            Self::Compare { column, .. }
+            | Self::InList { column, .. }
+            | Self::IsNull { column, .. } => column,
+        }
+    }
+
+    fn matches(&self, row: &Map<String, Value>) -> bool {
+        match self {
+            Self::Compare {
+                column,
+                op,
+                literal,
+            } => {
+                let value = row.get(column).unwrap_or(&Value::Null);
+                match op {
+                    ProjectionFilterOp::Eq => projection_filter_eq(value, literal),
+                    ProjectionFilterOp::Lt => projection_filter_cmp(value, literal)
+                        .is_some_and(|ordering| ordering.is_lt()),
+                    ProjectionFilterOp::LtEq => projection_filter_cmp(value, literal)
+                        .is_some_and(|ordering| !ordering.is_gt()),
+                    ProjectionFilterOp::Gt => projection_filter_cmp(value, literal)
+                        .is_some_and(|ordering| ordering.is_gt()),
+                    ProjectionFilterOp::GtEq => projection_filter_cmp(value, literal)
+                        .is_some_and(|ordering| !ordering.is_lt()),
+                }
+            }
+            Self::InList { column, literals } => {
+                let value = row.get(column).unwrap_or(&Value::Null);
+                !value.is_null()
+                    && literals
+                        .iter()
+                        .any(|literal| projection_filter_eq(value, literal))
+            }
+            Self::IsNull { column, negated } => {
+                let is_null = row.get(column).unwrap_or(&Value::Null).is_null();
+                if *negated {
+                    !is_null
+                } else {
+                    is_null
+                }
+            }
+        }
+    }
+}
+
+fn projection_filter_eq(value: &Value, literal: &ProjectionFilterLiteral) -> bool {
+    projection_filter_cmp(value, literal).is_some_and(|ordering| ordering.is_eq())
+}
+
+fn projection_filter_cmp(
+    value: &Value,
+    literal: &ProjectionFilterLiteral,
+) -> Option<std::cmp::Ordering> {
+    if value.is_null() {
+        return None;
+    }
+    match literal {
+        ProjectionFilterLiteral::Null => None,
+        ProjectionFilterLiteral::Boolean(literal) => {
+            value.as_bool().map(|value| value.cmp(literal))
+        }
+        ProjectionFilterLiteral::Int64(literal) => value
+            .as_i64()
+            .map(|value| value.cmp(literal))
+            .or_else(|| {
+                value
+                    .as_u64()
+                    .and_then(|value| i64::try_from(value).ok())
+                    .map(|value| value.cmp(literal))
+            })
+            .or_else(|| {
+                value
+                    .as_f64()
+                    .map(|value| value.total_cmp(&(*literal as f64)))
+            }),
+        ProjectionFilterLiteral::UInt64(literal) => value
+            .as_u64()
+            .map(|value| value.cmp(literal))
+            .or_else(|| {
+                value
+                    .as_i64()
+                    .and_then(|value| u64::try_from(value).ok())
+                    .map(|value| value.cmp(literal))
+            })
+            .or_else(|| {
+                value
+                    .as_f64()
+                    .map(|value| value.total_cmp(&(*literal as f64)))
+            }),
+        ProjectionFilterLiteral::Float64(literal) => {
+            value.as_f64().map(|value| value.total_cmp(literal))
+        }
+        ProjectionFilterLiteral::Utf8(literal) => {
+            value.as_str().map(|value| value.cmp(literal.as_str()))
+        }
+    }
+}
+
+fn reached_projection_limit(rows: &mut Vec<Value>, max_rows: Option<usize>) -> bool {
+    let Some(max_rows) = max_rows else {
+        return false;
+    };
+    if rows.len() > max_rows {
+        rows.truncate(max_rows);
+    }
+    rows.len() >= max_rows
 }
 
 fn projection_value(
@@ -3586,9 +3643,6 @@ fn record_kind_name(kind: RecordKind) -> &'static str {
 
 impl ProjectionModel {
     fn rows_for_projection_for_aggregate(&self) -> Result<Vec<ProjectionRow>, String> {
-        if !self.persisted {
-            return Ok(self.rows.clone());
-        }
         Ok(self.reconstructed_rows.clone())
     }
 }
@@ -3608,6 +3662,16 @@ fn projection_property_by_name(row: &ProjectionRow, property_name: &str) -> Valu
         .find(|property| property.property_name == property_name)
         .map(|property| property.value.clone())
         .unwrap_or(Value::Null)
+}
+
+fn projection_property_ref_by_name<'a>(
+    row: &'a ProjectionRow,
+    property_name: &str,
+) -> Option<&'a Value> {
+    row.properties
+        .iter()
+        .find(|property| property.property_name == property_name)
+        .map(|property| &property.value)
 }
 
 fn projection_property_by_flag_or_name(
