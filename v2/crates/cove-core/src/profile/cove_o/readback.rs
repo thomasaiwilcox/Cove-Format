@@ -316,18 +316,12 @@ pub fn read_object_surface_from_bytes_with_options(
                     embedded_map_sections.push(EmbeddedMapSection::EvidenceIndex(index));
                 }
             }
-            kind if matches!(
-                kind,
-                SectionKind::MapSourceCatalog
-                    | SectionKind::MapFunctionRegistry
-                    | SectionKind::MapIdentityRuleCatalog
-                    | SectionKind::MapRowSemanticsCatalog
-                    | SectionKind::MapAssertionLog
-                    | SectionKind::MapIdentityEquivalenceIndex
-                    | SectionKind::MapEvidenceIndex
-                    | SectionKind::MapConversionReport
-                    | SectionKind::MapProjectionCatalog
-            ) => {}
+            SectionKind::MapSourceCatalog
+            | SectionKind::MapIdentityRuleCatalog
+            | SectionKind::MapRowSemanticsCatalog
+            | SectionKind::MapAssertionLog
+            | SectionKind::MapIdentityEquivalenceIndex
+            | SectionKind::MapConversionReport => {}
             _ => {}
         }
     }

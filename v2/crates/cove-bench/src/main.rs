@@ -1793,18 +1793,17 @@ fn run_semantic_showcase_bundle_object_store_case(corpus: &Path) -> Result<Value
     }))
 }
 
+type ColdWarmRangeStats = (
+    OfflineObjectStoreStats,
+    OfflineObjectStoreStats,
+    Vec<Range<u64>>,
+    Vec<Range<u64>>,
+);
+
 fn simulate_object_store_cold_warm(
     key: &str,
     bytes: Vec<u8>,
-) -> Result<
-    (
-        OfflineObjectStoreStats,
-        OfflineObjectStoreStats,
-        Vec<Range<u64>>,
-        Vec<Range<u64>>,
-    ),
-    String,
-> {
+) -> Result<ColdWarmRangeStats, String> {
     let mut harness = OfflineObjectStoreHarness::default();
     harness.put_object(key, bytes.clone());
     let original_ranges = deterministic_object_ranges(bytes.len() as u64);

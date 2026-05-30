@@ -221,14 +221,14 @@ pub(super) fn encode_arrow_values(
                 .map(|value| typed_bool_value(value))
                 .collect::<Result<Vec<_>, _>>()?,
         )) as ArrayRef),
-        CoveLogicalType::Int8 => primitive_array::<Int8Array, i8>(&values, column.logical),
-        CoveLogicalType::Int16 => primitive_array::<Int16Array, i16>(&values, column.logical),
-        CoveLogicalType::Int32 => primitive_array::<Int32Array, i32>(&values, column.logical),
-        CoveLogicalType::Int64 => primitive_array::<Int64Array, i64>(&values, column.logical),
-        CoveLogicalType::UInt8 => primitive_array::<UInt8Array, u8>(&values, column.logical),
-        CoveLogicalType::UInt16 => primitive_array::<UInt16Array, u16>(&values, column.logical),
-        CoveLogicalType::UInt32 => primitive_array::<UInt32Array, u32>(&values, column.logical),
-        CoveLogicalType::UInt64 => primitive_array::<UInt64Array, u64>(&values, column.logical),
+        CoveLogicalType::Int8 => primitive_array::<Int8Array, i8>(values, column.logical),
+        CoveLogicalType::Int16 => primitive_array::<Int16Array, i16>(values, column.logical),
+        CoveLogicalType::Int32 => primitive_array::<Int32Array, i32>(values, column.logical),
+        CoveLogicalType::Int64 => primitive_array::<Int64Array, i64>(values, column.logical),
+        CoveLogicalType::UInt8 => primitive_array::<UInt8Array, u8>(values, column.logical),
+        CoveLogicalType::UInt16 => primitive_array::<UInt16Array, u16>(values, column.logical),
+        CoveLogicalType::UInt32 => primitive_array::<UInt32Array, u32>(values, column.logical),
+        CoveLogicalType::UInt64 => primitive_array::<UInt64Array, u64>(values, column.logical),
         CoveLogicalType::Float32 => Ok(Arc::new(Float32Array::from(
             values
                 .iter()
@@ -272,12 +272,12 @@ pub(super) fn encode_arrow_values(
             .with_precision_and_scale(38, 0)
             .map_err(|err| format!("cannot assign decimal128 precision/scale: {err}"))?,
         ) as ArrayRef),
-        CoveLogicalType::DateDays => primitive_array::<Date32Array, i32>(&values, column.logical),
+        CoveLogicalType::DateDays => primitive_array::<Date32Array, i32>(values, column.logical),
         CoveLogicalType::TimestampMicros => {
-            primitive_array::<TimestampMicrosecondArray, i64>(&values, column.logical)
+            primitive_array::<TimestampMicrosecondArray, i64>(values, column.logical)
         }
         CoveLogicalType::TimestampNanos => {
-            primitive_array::<TimestampNanosecondArray, i64>(&values, column.logical)
+            primitive_array::<TimestampNanosecondArray, i64>(values, column.logical)
         }
         CoveLogicalType::Binary | CoveLogicalType::Json => {
             let owned = values
@@ -302,7 +302,7 @@ pub(super) fn encode_arrow_values(
             Ok(Arc::new(FixedSizeBinaryArray::from(borrowed)) as ArrayRef)
         }
         CoveLogicalType::List | CoveLogicalType::Struct | CoveLogicalType::Map => {
-            encode_arrow_nested_column(column, &values)
+            encode_arrow_nested_column(column, values)
         }
         _ => Err(format!(
             "unknown projection logical type {:?} is not supported for Arrow output",

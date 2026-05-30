@@ -1465,7 +1465,7 @@ where
             let Some(association_type) = &anchor.association_type else {
                 continue;
             };
-            if !row_matches_association(&row, association_type) {
+            if !row_matches_association(row, association_type) {
                 continue;
             }
         } else {
@@ -1481,7 +1481,7 @@ where
         if let Some(output_table) = &projection.output_table {
             base.insert("output_table".into(), json!(output_table));
         }
-        for projected in project_columns_for_row(model, projection, &row, base)? {
+        for projected in project_columns_for_row(model, projection, row, base)? {
             let Value::Object(row) = projected else {
                 return Err("projection produced a non-object row".into());
             };
@@ -2757,7 +2757,7 @@ fn project_object_rows(
             let Some(association_type) = &anchor.association_type else {
                 continue;
             };
-            if !row_matches_association(&row, association_type) {
+            if !row_matches_association(row, association_type) {
                 continue;
             }
         } else {
@@ -2773,7 +2773,7 @@ fn project_object_rows(
         if let Some(output_table) = &projection.output_table {
             out.insert("output_table".into(), json!(output_table));
         }
-        for projected in project_columns_for_row(model, projection, &row, out)? {
+        for projected in project_columns_for_row(model, projection, row, out)? {
             let Value::Object(projected_row) = projected else {
                 return Err("projection produced a non-object row".into());
             };

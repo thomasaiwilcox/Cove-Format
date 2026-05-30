@@ -294,9 +294,7 @@ fn projection_catalog_from_sections_or_mapping(
             let Ok(section_id) = u16::try_from(section.entry.section_id) else {
                 return None;
             };
-            let Some(kind) = SectionKind::from_u16(section_id) else {
-                return None;
-            };
+            let kind = SectionKind::from_u16(section_id)?;
             match parse_embedded_section(kind, section.payload.as_slice()) {
                 Ok(EmbeddedMapSection::ProjectionCatalog(catalog)) => Some(Ok(catalog)),
                 Ok(_) => None,
