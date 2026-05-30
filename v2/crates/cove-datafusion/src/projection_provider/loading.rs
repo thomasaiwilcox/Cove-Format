@@ -1,13 +1,9 @@
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
-    io::Cursor,
     ops::Range,
     path::Path,
 };
 
-use arrow_array::RecordBatch;
-use arrow_ipc::reader::{FileReader, StreamReader};
-use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use cove_core::{
     artifact::covemap::CovemapFile,
@@ -26,8 +22,7 @@ use cove_core::{
     },
 };
 use cove_map::{
-    projected_output_from_cove_o_path, projection_read_requirements_for_catalog,
-    ProjectionBatchOptions, ProjectionDescriptor, ProjectionFormat, ProjectionReadRequirements,
+    projection_read_requirements_for_catalog, ProjectionBatchOptions, ProjectionReadRequirements,
 };
 use datafusion::common::{DataFusionError, Result};
 use futures::executor::block_on;
@@ -86,53 +81,6 @@ where
         self.inner
             .record_coalescing(original_ranges, coalesced_ranges);
     }
-}
-
-pub(super) fn load_projection_arrow(
-    object_path: &Path,
-    mapping_path: Option<&Path>,
-    projection: &ProjectionDescriptor,
-) -> Result<Vec<u8>> {
-    projected_output_from_cove_o_path(
-        object_path,
-        mapping_path,
-        ProjectionFormat::Arrow,
-        Some(&projection.projection_id),
-    )
-    .map_err(|err| {
-        DataFusionError::Execution(format!(
-            "cannot load Arrow projection '{}' from {}: {err}",
-            projection.projection_id,
-            object_path.display()
-        ))
-    })
-}
-
-pub(super) fn decode_projection_arrow(bytes: &[u8]) -> Result<(SchemaRef, Vec<RecordBatch>)> {
-    if let Ok(reader) = FileReader::try_new(Cursor::new(bytes.to_vec()), None) {
-        let schema = reader.schema();
-        let batches = reader
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|err| {
-                DataFusionError::Execution(format!(
-                    "cannot decode Arrow IPC file projection: {err}"
-                ))
-            })?;
-        return Ok((schema, batches));
-    }
-
-    let reader = StreamReader::try_new(Cursor::new(bytes.to_vec()), None).map_err(|err| {
-        DataFusionError::Execution(format!(
-            "cannot decode Arrow IPC projection as file or stream: {err}"
-        ))
-    })?;
-    let schema = reader.schema();
-    let batches = reader
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|err| {
-            DataFusionError::Execution(format!("cannot decode Arrow IPC stream projection: {err}"))
-        })?;
-    Ok((schema, batches))
 }
 
 pub(super) fn load_projection_bytes_via_ranges<R: CoveRangeReader>(

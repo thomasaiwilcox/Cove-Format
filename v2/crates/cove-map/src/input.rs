@@ -6,7 +6,9 @@ use std::{
 
 use arrow_array::RecordBatch;
 use arrow_json::writer::{LineDelimited, WriterBuilder};
-use cove_convert::{read_arrow_batches, read_orc_batches, read_parquet_batches};
+use cove_convert::{
+    read_arrow_batches_from_bytes, read_orc_batches_from_bytes, read_parquet_batches_from_bytes,
+};
 use serde_json::Value;
 
 use super::*;
@@ -50,11 +52,11 @@ pub(crate) fn read_source_inputs(paths: &[PathBuf]) -> Result<SourceInputs, Stri
         let source_kind = source_kind(path)?;
         let before_len = rows.len();
         match source_kind {
-            "jsonl" => rows.extend(read_jsonl(path, &source_id)?),
-            "csv" => rows.extend(read_csv(path, &source_id)?),
-            "parquet" => rows.extend(read_parquet(path, &source_id)?),
-            "orc" => rows.extend(read_orc(path, &source_id)?),
-            "arrow-ipc" => rows.extend(read_arrow_ipc(path, &source_id)?),
+            "jsonl" => rows.extend(read_jsonl(path, &bytes, &source_id)?),
+            "csv" => rows.extend(read_csv_bytes(path, &bytes, &source_id)?),
+            "parquet" => rows.extend(read_parquet(path, &bytes, &source_id)?),
+            "orc" => rows.extend(read_orc(path, &bytes, &source_id)?),
+            "arrow-ipc" => rows.extend(read_arrow_ipc(path, &bytes, &source_id)?),
             _ => unreachable!(),
         }
         let source_rows = &rows[before_len..];
@@ -82,9 +84,8 @@ fn source_kind(path: &Path) -> Result<&'static str, String> {
     }
 }
 
-fn read_jsonl(path: &Path, source_id: &str) -> Result<Vec<SourceRow>, String> {
-    let text =
-        fs::read_to_string(path).map_err(|err| format!("cannot read {}: {err}", path.display()))?;
+fn read_jsonl(path: &Path, bytes: &[u8], source_id: &str) -> Result<Vec<SourceRow>, String> {
+    let text = utf8_source_text(path, bytes, "JSONL")?;
     text.lines()
         .enumerate()
         .filter(|(_, line)| !line.trim().is_empty())
@@ -107,24 +108,29 @@ fn read_jsonl(path: &Path, source_id: &str) -> Result<Vec<SourceRow>, String> {
         .collect()
 }
 
-fn read_parquet(path: &Path, source_id: &str) -> Result<Vec<SourceRow>, String> {
-    let (_schema, batches) = read_parquet_batches(path)?;
+fn read_parquet(path: &Path, bytes: &[u8], source_id: &str) -> Result<Vec<SourceRow>, String> {
+    let (_schema, batches) = read_parquet_batches_from_bytes(bytes)?;
     source_rows_from_record_batches(path, source_id, batches)
 }
 
-fn read_orc(path: &Path, source_id: &str) -> Result<Vec<SourceRow>, String> {
-    let (_schema, batches) = read_orc_batches(path)?;
+fn read_orc(path: &Path, bytes: &[u8], source_id: &str) -> Result<Vec<SourceRow>, String> {
+    let (_schema, batches) = read_orc_batches_from_bytes(bytes)?;
     source_rows_from_record_batches(path, source_id, batches)
 }
 
-fn read_arrow_ipc(path: &Path, source_id: &str) -> Result<Vec<SourceRow>, String> {
-    let (_schema, batches) = read_arrow_batches(path)?;
+fn read_arrow_ipc(path: &Path, bytes: &[u8], source_id: &str) -> Result<Vec<SourceRow>, String> {
+    let (_schema, batches) = read_arrow_batches_from_bytes(bytes)?;
     source_rows_from_record_batches(path, source_id, batches)
 }
 
+#[cfg(test)]
 pub(crate) fn read_csv(path: &Path, source_id: &str) -> Result<Vec<SourceRow>, String> {
-    let text =
-        fs::read_to_string(path).map_err(|err| format!("cannot read {}: {err}", path.display()))?;
+    let bytes = fs::read(path).map_err(|err| format!("cannot read {}: {err}", path.display()))?;
+    read_csv_bytes(path, &bytes, source_id)
+}
+
+fn read_csv_bytes(path: &Path, bytes: &[u8], source_id: &str) -> Result<Vec<SourceRow>, String> {
+    let text = utf8_source_text(path, bytes, "CSV")?;
     let mut lines = text.lines().filter(|line| !line.trim().is_empty());
     let header = lines
         .next()
@@ -161,6 +167,11 @@ pub(crate) fn read_csv(path: &Path, source_id: &str) -> Result<Vec<SourceRow>, S
             })
         })
         .collect()
+}
+
+fn utf8_source_text<'a>(path: &Path, bytes: &'a [u8], format: &str) -> Result<&'a str, String> {
+    std::str::from_utf8(bytes)
+        .map_err(|err| format!("cannot decode {} as {format} UTF-8: {err}", path.display()))
 }
 
 fn source_rows_from_record_batches(

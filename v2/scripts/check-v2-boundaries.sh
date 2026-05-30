@@ -30,5 +30,5 @@ if grep -RInE '^[[:space:]]*datafusion[[:space:]]*=' Cargo.toml crates/*/Cargo.t
 fi
 
 if grep -RInE '(^|[^[:alnum:]_])datafusion::|use[[:space:]]+datafusion(::|[[:space:]])' crates/*/src | grep -vE '^crates/cove-datafusion/src/(adapter_v53/|projection_provider(/|\.rs:)|register\.rs:)'; then
-    fail "DataFusion imports must stay in cove-datafusion adapter_v53 or register"
+    fail "DataFusion imports must stay in cove-datafusion adapter_v53, projection_provider, or register"
 fi

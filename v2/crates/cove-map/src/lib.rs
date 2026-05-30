@@ -54,8 +54,8 @@ pub use api::{
     projected_output_from_paths, projected_record_batch_from_cove_o_bytes,
     projected_record_batches_from_cove_o_bytes,
     projected_record_batches_from_cove_o_bytes_with_catalog, projected_rows_from_cove_o_path,
-    projected_rows_from_paths, projection_descriptors_from_cove_o_path,
-    projection_read_requirements_for_catalog, ProjectionDescriptor,
+    projected_rows_from_paths, projection_arrow_schema, projection_descriptors_from_cove_o_path,
+    projection_read_requirements_for_catalog, ProjectionColumnDescriptor, ProjectionDescriptor,
 };
 pub(crate) use api::{parse_map, plan_keys, preview};
 pub(crate) use context::{mapping_context, MappingContext};

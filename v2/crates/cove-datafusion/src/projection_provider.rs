@@ -4,8 +4,8 @@ use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use cove_map::{
-    projected_record_batches_from_cove_o_bytes_with_catalog, ProjectionBatchOptions,
-    ProjectionDescriptor, ProjectionFilter,
+    projected_record_batches_from_cove_o_bytes_with_catalog, projection_arrow_schema,
+    ProjectionBatchOptions, ProjectionDescriptor, ProjectionFilter,
 };
 use datafusion::{
     catalog::{Session, TableProvider},
@@ -31,10 +31,7 @@ use self::{
         classify_projection_filter, classify_projection_filters, merged_projection_columns,
         project_batch_columns, projected_schema,
     },
-    loading::{
-        decode_projection_arrow, load_projection_arrow, load_projection_bytes_via_ranges,
-        InstrumentedProjectionRangeReader,
-    },
+    loading::{load_projection_bytes_via_ranges, InstrumentedProjectionRangeReader},
 };
 
 #[derive(Debug, Clone)]
@@ -53,9 +50,12 @@ impl CoveProjectionTableProvider {
         mapping_path: Option<PathBuf>,
         projection: ProjectionDescriptor,
     ) -> Result<Self> {
-        let bytes = load_projection_arrow(&object_path, mapping_path.as_deref(), &projection)?;
-        let (schema, batches) = decode_projection_arrow(&bytes)?;
-        let row_count = Some(batches.iter().map(RecordBatch::num_rows).sum());
+        let schema = projection_arrow_schema(&projection).map_err(|err| {
+            DataFusionError::Execution(format!(
+                "cannot derive Arrow schema for projection '{}' from metadata: {err}",
+                projection.projection_id
+            ))
+        })?;
         let object_len = std::fs::metadata(&object_path)
             .map_err(|err| {
                 DataFusionError::Execution(format!(
@@ -70,7 +70,7 @@ impl CoveProjectionTableProvider {
             mapping_path,
             projection,
             schema,
-            row_count,
+            row_count: None,
         })
     }
 

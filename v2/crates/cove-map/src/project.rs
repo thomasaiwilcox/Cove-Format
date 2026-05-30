@@ -192,6 +192,17 @@ pub(crate) fn diff_maps(left: &CovemapFile, right: &CovemapFile) -> Value {
     })
 }
 
+pub(crate) fn projection_schema_from_descriptor(
+    descriptor: &ProjectionDescriptor,
+) -> Result<SchemaRef, String> {
+    let columns = descriptor
+        .columns
+        .iter()
+        .map(projected_column_from_descriptor)
+        .collect::<Result<Vec<_>, _>>()?;
+    encoding::arrow_schema_from_projected_columns(&columns)
+}
+
 pub(crate) fn project_rows(file: &CovemapFile, rows: &[SourceRow]) -> Result<Value, String> {
     project_rows_with_source_states(file, rows, &[])
 }
@@ -1558,32 +1569,49 @@ where
 }
 
 fn projected_column_from_entry(column: &MapProjectionColumn) -> Result<ProjectedColumn, String> {
-    let logical = projection_column_logical_type(column)?;
+    let logical = projection_column_logical_type(column.logical_type.as_deref().unwrap_or("utf8"))
+        .map_err(|err| format!("projection column '{}' declares {err}", column.name))?;
+    projected_column(column.name.clone(), logical, column.nested_shape.clone())
+}
+
+fn projected_column_from_descriptor(
+    column: &ProjectionColumnDescriptor,
+) -> Result<ProjectedColumn, String> {
+    let logical = projection_column_logical_type(&column.logical_type)
+        .map_err(|err| format!("projection column '{}' declares {err}", column.name))?;
+    projected_column(column.name.clone(), logical, column.nested_shape.clone())
+}
+
+fn projected_column(
+    name: String,
+    logical: CoveLogicalType,
+    nested_shape: Option<String>,
+) -> Result<ProjectedColumn, String> {
     if matches!(logical, CoveLogicalType::Null) {
         return Err(format!(
             "projection column '{}' declares null logical type; use a concrete scalar logical_type",
-            column.name
+            name
         ));
     }
     if matches!(
         logical,
         CoveLogicalType::List | CoveLogicalType::Struct | CoveLogicalType::Map
-    ) && column.nested_shape.is_none()
+    ) && nested_shape.is_none()
     {
         return Err(format!(
             "projection column '{}' declares nested logical type {:?} without nested_shape",
-            column.name, logical
+            name, logical
         ));
     }
     Ok(ProjectedColumn {
-        name: column.name.clone(),
+        name,
         logical,
-        nested_shape: column.nested_shape.clone(),
+        nested_shape,
     })
 }
 
-fn projection_column_logical_type(column: &MapProjectionColumn) -> Result<CoveLogicalType, String> {
-    match column.logical_type.as_deref().unwrap_or("utf8") {
+fn projection_column_logical_type(logical_type: &str) -> Result<CoveLogicalType, String> {
+    match logical_type {
         "null" => Ok(CoveLogicalType::Null),
         "bool" | "boolean" => Ok(CoveLogicalType::Bool),
         "int8" => Ok(CoveLogicalType::Int8),
@@ -1608,10 +1636,7 @@ fn projection_column_logical_type(column: &MapProjectionColumn) -> Result<CoveLo
         "list" => Ok(CoveLogicalType::List),
         "struct" => Ok(CoveLogicalType::Struct),
         "map" => Ok(CoveLogicalType::Map),
-        other => Err(format!(
-            "projection column '{}' declares unsupported logical_type '{other}'",
-            column.name
-        )),
+        other => Err(format!("unsupported logical_type '{other}'")),
     }
 }
 

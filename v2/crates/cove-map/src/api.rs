@@ -4,6 +4,7 @@ use std::{
 };
 
 use arrow_array::RecordBatch;
+use arrow_schema::SchemaRef;
 use cove_core::artifact::covemap::CovemapFile;
 use cove_core::profile::cove_map::MapProjectionCatalog;
 use serde_json::{json, Value};
@@ -19,8 +20,8 @@ use crate::{
         project_cove_o_bytes_record_batches, project_cove_o_bytes_record_batches_with_catalog,
         project_cove_o_path, project_cove_o_path_output, project_rows_with_source_states,
         project_rows_with_source_states_output, projection_catalog_from_cove_o_path,
-        projection_read_requirements, ProjectionBatchOptions, ProjectionFormat,
-        ProjectionReadRequirements,
+        projection_read_requirements, projection_schema_from_descriptor, ProjectionBatchOptions,
+        ProjectionFormat, ProjectionReadRequirements,
     },
     section_kind, MaterializedModel,
 };
@@ -30,6 +31,14 @@ pub struct ProjectionDescriptor {
     pub projection_id: String,
     pub output_table: Option<String>,
     pub output_modes: Vec<String>,
+    pub columns: Vec<ProjectionColumnDescriptor>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectionColumnDescriptor {
+    pub name: String,
+    pub logical_type: String,
+    pub nested_shape: Option<String>,
 }
 
 pub fn conversion_report_from_paths(map: &Path, sources: &[PathBuf]) -> Result<Value, String> {
@@ -147,11 +156,24 @@ pub fn projection_descriptors_from_cove_o_path(
         .projections
         .into_iter()
         .map(|projection| ProjectionDescriptor {
+            columns: projection
+                .columns
+                .into_iter()
+                .map(|column| ProjectionColumnDescriptor {
+                    name: column.name,
+                    logical_type: column.logical_type.unwrap_or_else(|| "utf8".to_string()),
+                    nested_shape: column.nested_shape,
+                })
+                .collect(),
             projection_id: projection.projection_id,
             output_table: projection.output_table,
             output_modes: projection.output_modes,
         })
         .collect())
+}
+
+pub fn projection_arrow_schema(descriptor: &ProjectionDescriptor) -> Result<SchemaRef, String> {
+    projection_schema_from_descriptor(descriptor)
 }
 
 pub fn projection_read_requirements_for_catalog(

@@ -213,7 +213,7 @@ fn table_name_from_source(source_id: &str) -> Option<String> {
     }
 }
 
-fn read_arrow_batches_from_bytes(
+pub fn read_arrow_batches_from_bytes(
     bytes: &[u8],
 ) -> Result<(arrow_schema::SchemaRef, Vec<arrow_array::RecordBatch>), String> {
     if let Ok(reader) = FileReader::try_new(Cursor::new(bytes.to_vec()), None) {
@@ -233,7 +233,7 @@ fn read_arrow_batches_from_bytes(
     Ok((schema, batches))
 }
 
-fn read_parquet_batches_from_bytes(
+pub fn read_parquet_batches_from_bytes(
     bytes: &[u8],
 ) -> Result<(arrow_schema::SchemaRef, Vec<arrow_array::RecordBatch>), String> {
     let builder = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::copy_from_slice(bytes))
@@ -275,7 +275,7 @@ fn read_csv_batches_from_bytes(
     Ok((schema, batches))
 }
 
-fn read_orc_batches_from_bytes(
+pub fn read_orc_batches_from_bytes(
     bytes: &[u8],
 ) -> Result<(arrow_schema::SchemaRef, Vec<arrow_array::RecordBatch>), String> {
     let builder = ArrowReaderBuilder::try_new(bytes::Bytes::copy_from_slice(bytes))
