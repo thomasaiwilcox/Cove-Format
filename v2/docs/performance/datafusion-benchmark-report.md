@@ -179,6 +179,132 @@ These are COVE-only internal tracks and do not compare against Parquet.
 | `parquet_compare_cold_context_full_scan` | 663.31 us | 851.29 us | 0.78x |
 | `parquet_compare_cold_context_numeric_range_filter` | 791.14 us | 913.64 us | 0.87x |
 
+## 8.1 M6 Mapped Showcase Snapshot
+
+These tracks were added after the main scan-heavy report above to benchmark the
+multi-source mapped `COVE-O` showcase against projected `COVE-T` and Parquet
+using the same canonical/provenance SQL shape described in
+`docs/mapped-cove-o-datafusion-showcase.md`.
+
+Command:
+
+```text
+cargo bench -p cove-datafusion --features parquet-compare --bench m6 mapped_showcase -- --sample-size 10 --measurement-time 1 --warm-up-time 0.5
+```
+
+Current local snapshot:
+
+| Track | mapped `COVE-O` | projected `COVE-T` | Parquet |
+| --- | ---: | ---: | ---: |
+| `mapped_showcase_people_projection` | 188.20-192.77 us | 124.29-131.22 us | 130.18-131.38 us |
+| `mapped_showcase_evidence_aggregate` | 710.88-729.13 us | 588.17-600.80 us | 676.92-727.67 us |
+| `mapped_showcase_people_evidence_join` | 887.42-928.92 us | 663.92-684.46 us | 870.47-886.91 us |
+
+Interpretation:
+
+- the mapped `COVE-O` path is now directly benchmarkable in DataFusion
+- projected `COVE-T` is still the fastest current baseline on these showcase
+  queries
+- Parquet is also still faster than the mapped `COVE-O` path on the three
+  current showcase queries
+- the mapped path has now improved materially versus the original baseline:
+  people projection by about **50%**, evidence aggregate by about **20-25%**,
+  and the join by about **25-30%**
+- the current wins line up with the removal of redundant work in the mapped
+  path: reusing the already-loaded projection catalog, avoiding repeated
+  projection-row sorting/cloning, and reconstructing latest/as-of rows directly
+  from sorted `ProjectionRow` values instead of going through `CoveObjectState`
+  while the latest pass also keeps mapped evidence entries structured longer
+  and can build Arrow evidence batches directly for simple `evidence.*`
+  projections without reconstructing per-cell `Value` wrappers for direct
+  evidence UTF-8/UUID columns, plus batch simple one-row-per-object Arrow
+  projections directly from `ProjectionRow` values on the people side
+- that points to the remaining dominant costs now being more about downstream
+  execution over emitted evidence batches than the old dense fetch, redundant
+  catalog parse, or extra state-reconstruction pass, though the join is now
+  falling further as both sides of the showcase join avoid more generic
+  row/value materialization
+
+## 8.2 Projected Table Object-Store Snapshot
+
+`cove-bench check` now emits `semantic_projection_object_store_compare` for the
+public semantic-mapping corpus. This compares:
+
+- mapped `COVE-O`
+- projected `COVE-T`
+- Parquet
+
+for the same simple semantic-mapping dataset using the offline deterministic
+object-store harness.
+
+Current local snapshot from `target/cove-bench/ci/report.json`:
+
+| Metric | mapped `COVE-O` | projected `COVE-T` | Parquet |
+| --- | ---: | ---: | ---: |
+| file size | 837,512 bytes | 16,550 bytes | 16,622 bytes |
+| cold bytes requested | 16,384 | 16,467 | 16,503 |
+| cold range GETs | 3 | 2 | 2 |
+| warm bytes requested | 16,384 | 16,467 | 16,503 |
+| warm range GETs | 3 | 2 | 2 |
+
+Interpretation:
+
+- projected `COVE-T` stays essentially tied with Parquet on this file-level
+  corpus snapshot and is slightly smaller
+- mapped `COVE-O` is far larger on this simple one-source semantic fixture,
+  which is consistent with it storing richer object/evidence structure instead
+  of a plain projected table
+- the deterministic harness samples fixed ranges, so the mapped byte-request
+  delta here is not evidence of better query-time blob-read behavior
+
+## 8.3 Semantic Showcase Bundle Object-Store Snapshot
+
+The public corpus now also emits
+`semantic_showcase_bundle_object_store_compare`, which uses the richer
+multi-source showcase semantics:
+
+- one mapped `COVE-O` artifact containing canonical people rows plus evidence
+- a projected `COVE-T` bundle with `people_projection` and `evidence_projection`
+- a matching Parquet bundle with those same two projected tables
+
+Current local snapshot from `target/cove-bench/ci/report.json`:
+
+| Metric | mapped `COVE-O` | projected `COVE-T` bundle | Parquet bundle |
+| --- | ---: | ---: | ---: |
+| total file size | 20,948 bytes | 3,347 bytes | 2,187 bytes |
+| cold bytes requested | 16,384 | 3,347 | 2,187 |
+| cold range GETs | 3 | 2 | 2 |
+| warm bytes requested | 16,384 | 3,347 | 2,187 |
+| warm range GETs | 3 | 2 | 2 |
+
+Interpretation:
+
+- this is a fairer storage comparison than the simple semantic-mapping corpus,
+  because the projected baselines now include both the canonical table and the
+  evidence table instead of just one narrow table
+- even with that fairer bundle comparison, mapped `COVE-O` is still much larger
+  on the current tiny showcase fixture
+- the result suggests the current showcase is still too small for deduped object
+  semantics to outweigh the cost of storing canonical object/evidence structure
+- the next interesting benchmark axis is **scale**, not just more formats:
+  larger multi-source fixtures with repeated entities and wider evidence volume
+
+### Native mapped read-path follow-on
+
+To turn this into a stronger mapped-storage story, the next follow-on benchmark
+work should do three things:
+
+1. scale up the richer multi-source showcase fixture so repeated entities and
+   larger evidence volumes can amortize object-model overhead,
+2. capture the mapped execution plan's `cove_*` read counters alongside the
+   projected `COVE-T` and Parquet baselines, and
+3. summarize those reads as query-driven measurements rather than fixed-range
+   corpus sampling.
+
+Until that exists, mapped `COVE-O` query benchmarks are valid for current SQL
+end-to-end timing, while the current object-store snapshot should be read as a
+file-level corpus comparison with explicit caveats.
+
 ## 9. M6 Opt-In FileCode Dictionary Tracks
 
 These tracks are not the default COVE registration path.

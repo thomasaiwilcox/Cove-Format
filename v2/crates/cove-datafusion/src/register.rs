@@ -1,6 +1,6 @@
 //! Public registration helpers and thin session glue.
 
-use std::{path::Path, sync::Arc};
+use std::{collections::BTreeSet, path::Path, sync::Arc};
 
 use datafusion::{
     common::Result, datasource::listing::ListingOptions, execution::context::SessionContext,
@@ -19,7 +19,9 @@ use crate::{
         bootstrap_overlay_snapshot_with_options_async,
     },
     overlay::CoveOverlaySnapshot,
+    projection_provider::CoveProjectionTableProvider,
 };
+use cove_map::{projection_descriptors_from_cove_o_path, ProjectionDescriptor};
 
 #[cfg(feature = "covm")]
 use crate::bootstrap::{
@@ -30,6 +32,14 @@ pub use crate::options::{
     CoveTableOptions, CoviDiscovery, CovmTrustPolicy, CovxDiscovery, ExecutionCodePolicy,
     FilterResidualPolicy, SidecarDigestPolicy,
 };
+
+#[derive(Debug, Clone)]
+pub struct RegisteredCoveProjection {
+    pub table_name: String,
+    pub projection_id: String,
+    pub output_table: Option<String>,
+    pub provider: Arc<CoveProjectionTableProvider>,
+}
 
 /// Build a DataFusion table provider for a local `.cove` file.
 ///
@@ -207,6 +217,102 @@ pub async fn register_cove_overlay_snapshot_async(
     Ok(provider)
 }
 
+/// Build a DataFusion table provider for a persisted COVE-O projection.
+pub fn cove_o_projection_table_from_path(
+    object_path: impl AsRef<Path>,
+    mapping_path: Option<&Path>,
+    projection_id: &str,
+) -> Result<Arc<CoveProjectionTableProvider>> {
+    let object_path = object_path.as_ref().to_path_buf();
+    let mapping_path = mapping_path.map(Path::to_path_buf);
+    let descriptor = projection_descriptor(&object_path, mapping_path.as_deref(), projection_id)?;
+    Ok(Arc::new(CoveProjectionTableProvider::try_new(
+        object_path,
+        mapping_path,
+        descriptor,
+    )?))
+}
+
+/// Build a DataFusion table provider for a persisted COVE-O projection.
+pub async fn cove_o_projection_table_from_path_async(
+    object_path: impl AsRef<Path>,
+    mapping_path: Option<&Path>,
+    projection_id: &str,
+) -> Result<Arc<CoveProjectionTableProvider>> {
+    cove_o_projection_table_from_path(object_path, mapping_path, projection_id)
+}
+
+/// Register one persisted COVE-O projection as a DataFusion table.
+pub fn register_cove_o_projection(
+    ctx: &SessionContext,
+    table_name: &str,
+    object_path: impl AsRef<Path>,
+    mapping_path: Option<&Path>,
+    projection_id: &str,
+) -> Result<Arc<CoveProjectionTableProvider>> {
+    install_cove_optimizer(ctx);
+    let provider = cove_o_projection_table_from_path(object_path, mapping_path, projection_id)?;
+    ctx.register_table(table_name, provider.clone())?;
+    Ok(provider)
+}
+
+/// Register one persisted COVE-O projection as a DataFusion table.
+pub async fn register_cove_o_projection_async(
+    ctx: &SessionContext,
+    table_name: &str,
+    object_path: impl AsRef<Path>,
+    mapping_path: Option<&Path>,
+    projection_id: &str,
+) -> Result<Arc<CoveProjectionTableProvider>> {
+    register_cove_o_projection(ctx, table_name, object_path, mapping_path, projection_id)
+}
+
+/// Register all Arrow-capable persisted COVE-O projections as DataFusion tables.
+pub fn register_cove_o_projections(
+    ctx: &SessionContext,
+    object_path: impl AsRef<Path>,
+    mapping_path: Option<&Path>,
+    prefix: Option<&str>,
+) -> Result<Vec<RegisteredCoveProjection>> {
+    install_cove_optimizer(ctx);
+    let object_path = object_path.as_ref().to_path_buf();
+    let mapping_path = mapping_path.map(Path::to_path_buf);
+    let descriptors = supported_projection_descriptors(&object_path, mapping_path.as_deref())?;
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::with_capacity(descriptors.len());
+    for descriptor in descriptors {
+        let table_name = projection_table_name(prefix, &descriptor);
+        if !seen.insert(table_name.clone()) {
+            return Err(datafusion::common::DataFusionError::Execution(format!(
+                "duplicate registered projection table name '{table_name}'"
+            )));
+        }
+        let provider = Arc::new(CoveProjectionTableProvider::try_new(
+            object_path.clone(),
+            mapping_path.clone(),
+            descriptor.clone(),
+        )?);
+        ctx.register_table(&table_name, provider.clone())?;
+        out.push(RegisteredCoveProjection {
+            table_name,
+            projection_id: descriptor.projection_id.clone(),
+            output_table: descriptor.output_table.clone(),
+            provider,
+        });
+    }
+    Ok(out)
+}
+
+/// Register all Arrow-capable persisted COVE-O projections as DataFusion tables.
+pub async fn register_cove_o_projections_async(
+    ctx: &SessionContext,
+    object_path: impl AsRef<Path>,
+    mapping_path: Option<&Path>,
+    prefix: Option<&str>,
+) -> Result<Vec<RegisteredCoveProjection>> {
+    register_cove_o_projections(ctx, object_path, mapping_path, prefix)
+}
+
 #[cfg(feature = "covm")]
 pub fn register_cove_covm(
     ctx: &SessionContext,
@@ -255,6 +361,107 @@ pub async fn register_cove_covm_with_options_async(
     let provider = cove_table_from_covm_path_with_options_async(path, options).await?;
     ctx.register_table(table_name, provider.clone())?;
     Ok(provider)
+}
+
+fn projection_descriptor(
+    object_path: &Path,
+    mapping_path: Option<&Path>,
+    projection_id: &str,
+) -> Result<ProjectionDescriptor> {
+    let descriptors =
+        projection_descriptors_from_cove_o_path(object_path, mapping_path).map_err(|err| {
+            datafusion::common::DataFusionError::Execution(format!(
+                "cannot inspect projections for {}: {err}",
+                object_path.display()
+            ))
+        })?;
+    let descriptor = descriptors
+        .into_iter()
+        .find(|descriptor| descriptor.projection_id == projection_id)
+        .ok_or_else(|| {
+            datafusion::common::DataFusionError::Execution(format!(
+                "projection_id '{projection_id}' was not found for {}",
+                object_path.display()
+            ))
+        })?;
+    ensure_projection_supports_arrow(object_path, &descriptor)?;
+    Ok(descriptor)
+}
+
+fn supported_projection_descriptors(
+    object_path: &Path,
+    mapping_path: Option<&Path>,
+) -> Result<Vec<ProjectionDescriptor>> {
+    let descriptors =
+        projection_descriptors_from_cove_o_path(object_path, mapping_path).map_err(|err| {
+            datafusion::common::DataFusionError::Execution(format!(
+                "cannot inspect projections for {}: {err}",
+                object_path.display()
+            ))
+        })?;
+    let supported = descriptors
+        .into_iter()
+        .filter(|descriptor| descriptor.output_modes.iter().any(|mode| mode == "arrow"))
+        .collect::<Vec<_>>();
+    if supported.is_empty() {
+        return Err(datafusion::common::DataFusionError::Execution(format!(
+            "{} exposes no projections declaring Arrow output mode",
+            object_path.display()
+        )));
+    }
+    Ok(supported)
+}
+
+fn ensure_projection_supports_arrow(
+    object_path: &Path,
+    descriptor: &ProjectionDescriptor,
+) -> Result<()> {
+    if descriptor.output_modes.iter().any(|mode| mode == "arrow") {
+        Ok(())
+    } else {
+        Err(datafusion::common::DataFusionError::Execution(format!(
+            "projection '{}' on {} does not declare Arrow output mode",
+            descriptor.projection_id,
+            object_path.display()
+        )))
+    }
+}
+
+fn projection_table_name(prefix: Option<&str>, descriptor: &ProjectionDescriptor) -> String {
+    let base = descriptor
+        .output_table
+        .as_deref()
+        .unwrap_or(&descriptor.projection_id);
+    let normalized = normalize_identifier(base);
+    match prefix {
+        Some(prefix) if !prefix.is_empty() => {
+            format!("{}__{}", normalize_identifier(prefix), normalized)
+        }
+        _ => normalized,
+    }
+}
+
+fn normalize_identifier(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut prev_underscore = false;
+    for ch in value.chars() {
+        let normalized = if ch.is_ascii_alphanumeric() { ch } else { '_' };
+        if normalized == '_' {
+            if prev_underscore {
+                continue;
+            }
+            prev_underscore = true;
+        } else {
+            prev_underscore = false;
+        }
+        out.push(normalized.to_ascii_lowercase());
+    }
+    let trimmed = out.trim_matches('_');
+    if trimmed.is_empty() {
+        "projection".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 /// Build DataFusion listing options for `.cove` compatibility-mode datasets.

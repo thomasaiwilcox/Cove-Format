@@ -237,7 +237,7 @@ pub fn validate_bytes_for_feature_use(
     let optional_pushdown_policy = opts.optional_pushdown_policy;
     let report = validate_bytes_with_options_inner(data, opts, Some(&request))?;
     for ignored in &report.ignored_optional_sections {
-        if super::profile_validators::ignored_section_required_for_feature_use(ignored, &request) {
+        if super::section_rules::ignored_section_required_for_feature_use(ignored, &request) {
             return Err(CoveError::ChecksumMismatch);
         }
     }
@@ -338,7 +338,7 @@ pub fn validate_bytes_for_ordinary_table_scan(
         ignored_optional_sections,
     };
     for ignored in &report.ignored_optional_sections {
-        if super::profile_validators::ignored_section_required_for_feature_use(ignored, &request) {
+        if super::section_rules::ignored_section_required_for_feature_use(ignored, &request) {
             return Err(CoveError::ChecksumMismatch);
         }
     }
@@ -371,7 +371,7 @@ where
     }
     let report = validate_bytes_with_options_inner(data, opts, Some(&request))?;
     for ignored in &report.ignored_optional_sections {
-        if super::profile_validators::ignored_section_required_for_feature_use(ignored, &request) {
+        if super::section_rules::ignored_section_required_for_feature_use(ignored, &request) {
             return Err(CoveError::ChecksumMismatch);
         }
     }
@@ -400,8 +400,8 @@ fn fail_closed_required_optional_profile_sections(
         let Some(kind) = crate::constants::SectionKind::from_u16(entry.section_kind) else {
             continue;
         };
-        if super::profile_validators::is_embedded_optional_profile_section(kind)
-            && super::profile_validators::section_entry_required_for_feature_use(entry, request)
+        if super::section_rules::is_embedded_optional_profile_section(kind)
+            && super::section_rules::section_entry_required_for_feature_use(entry, request)
         {
             return Err(CoveError::UnsupportedEncoding(
                 "requested optional profile payload requires a semantic validator".into(),

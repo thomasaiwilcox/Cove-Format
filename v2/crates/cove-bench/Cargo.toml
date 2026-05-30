@@ -12,6 +12,7 @@ cove-datafusion = { path = "../cove-datafusion", features = ["covm", "covx", "co
 cove-index = { path = "../cove-index" }
 cove-map = { path = "../cove-map" }
 arrow-array = "58"
+arrow-ipc = "58"
 arrow-schema = "58"
 orc-rust = "0.8"
 parquet = { version = "58", default-features = false, features = ["arrow"] }

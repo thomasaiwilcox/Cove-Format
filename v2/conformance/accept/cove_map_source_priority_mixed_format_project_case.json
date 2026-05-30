@@ -1,0 +1,31 @@
+{
+  "expect_persisted_projection_rows": true,
+  "expected_projected_rows": [
+    {
+      "name": "Support Name",
+      "output_table": "people_projection",
+      "person_goid": "6442ea8602c0f4c38faa3196f810b91f",
+      "projection_id": "person_projection"
+    }
+  ],
+  "expected_projection": {
+    "format": "json",
+    "mapping_id": "people-priority-map",
+    "mapping_version": "2026.05"
+  },
+  "expected_projection_outputs": [
+    {
+      "format": "arrow",
+      "projection_id": "person_projection"
+    },
+    {
+      "format": "cove-t",
+      "projection_id": "person_projection"
+    }
+  ],
+  "mapping": "accept/cove_map_source_priority_projectable.covemap",
+  "sources": [
+    "accept/cove_map_crm.parquet",
+    "accept/cove_map_support.orc"
+  ]
+}

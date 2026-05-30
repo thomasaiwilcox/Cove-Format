@@ -12,6 +12,9 @@
 //!   accept/<fixture>
 //!   reject/<fixture>
 //! ```
+//! By default the runner uses `<corpus-dir>/manifest.jsonl`. A smaller
+//! manifest can be supplied with `--manifest <path>` while still resolving
+//! fixture paths relative to `<corpus-dir>`.
 //!
 //! Manifest format (one JSON object per line):
 //! ```json
@@ -131,6 +134,7 @@ use cove_core::{
     segment::{RowMorselDirectory, TableSegmentHeaderV1, TableSegmentIndex, TableSegmentPayloadV1},
     sort::{ClusteringKeyEntryV1, SortKeyEntryV1},
     table::TableCatalog,
+    utility::hex_encode,
     wire::{
         decode_u64_leb128, encode_u64_leb128, parse_bool_strict, zigzag_decode_i64,
         zigzag_encode_i64,
@@ -166,11 +170,22 @@ use manifest::Entry;
 fn main() {
     let args = std::env::args().collect::<Vec<_>>();
     if args.len() < 2 {
-        eprintln!("Usage: cove-conformance <corpus-dir>");
+        eprintln!("Usage: cove-conformance <corpus-dir> [--manifest <manifest.jsonl>]");
         process::exit(2);
     }
     let corpus = Path::new(&args[1]);
-    let entries = match manifest::load_manifest(corpus) {
+    let manifest_path = match parse_manifest_arg(&args[2..]) {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("{error}");
+            process::exit(2);
+        }
+    };
+    let entries = match manifest_path {
+        Some(path) => manifest::load_manifest_path(&path),
+        None => manifest::load_manifest(corpus),
+    };
+    let entries = match entries {
         Ok(entries) => entries,
         Err(error) => {
             eprintln!("{error}");
@@ -179,6 +194,14 @@ fn main() {
     };
     let all_ok = runner::run_entries(corpus, &entries, validate_fixture);
     process::exit(if all_ok { 0 } else { 1 });
+}
+
+fn parse_manifest_arg(args: &[String]) -> Result<Option<PathBuf>, String> {
+    match args {
+        [] => Ok(None),
+        [flag, path] if flag == "--manifest" => Ok(Some(PathBuf::from(path))),
+        _ => Err("Usage: cove-conformance <corpus-dir> [--manifest <manifest.jsonl>]".into()),
+    }
 }
 
 fn validate_fixture(entry: &Entry, corpus: &Path, bytes: &[u8]) -> Result<(), CoveError> {
@@ -1235,6 +1258,41 @@ fn validate_cove_map_project_fixture(corpus: &Path, bytes: &[u8]) -> Result<(), 
             validate_projection_output_fixture(&map, &sources, output)?;
         }
     }
+    if value
+        .get("expect_persisted_projection_rows")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        validate_persisted_projection_rows(&map, &sources, &projected)?;
+    }
+    Ok(())
+}
+
+fn validate_persisted_projection_rows(
+    map: &Path,
+    sources: &[PathBuf],
+    projected: &Value,
+) -> Result<(), CoveError> {
+    struct TempDirGuard(PathBuf);
+
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    let bytes = cove_map::cove_o_from_paths(map, sources).map_err(|_| CoveError::MapInvalid)?;
+    let dir =
+        std::env::temp_dir().join(format!("cove-conformance-project-cove-o-{}", process::id()));
+    std::fs::create_dir_all(&dir).map_err(CoveError::from)?;
+    let _guard = TempDirGuard(dir.clone());
+    let path = dir.join("projected.cove");
+    std::fs::write(&path, bytes).map_err(CoveError::from)?;
+    let persisted = cove_map::projected_rows_from_cove_o_path(&path, None)
+        .map_err(|_| CoveError::MapInvalid)?;
+    if persisted.get("rows") != projected.get("rows") {
+        return Err(CoveError::MapEvidenceInvalid);
+    }
     Ok(())
 }
 
@@ -1992,16 +2050,6 @@ fn bytes_value_to_json(logical: CoveLogicalType, bytes: &[u8]) -> Result<Value, 
         CoveLogicalType::Binary | CoveLogicalType::Uuid => Ok(json!(hex_encode(bytes))),
         _ => Ok(json!(hex_encode(bytes))),
     }
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    out
 }
 
 fn arrow_array_to_json(expected_type: &str, array: &dyn Array) -> Result<Vec<Value>, CoveError> {

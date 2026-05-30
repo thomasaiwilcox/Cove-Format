@@ -197,6 +197,8 @@ Important v2 paths:
 
 - [`v2/spec.md`](./v2/spec.md): COVE v2 full specification and current
   normative baseline for implementation and conformance-vector development.
+- [`v2/IMPLEMENTERS.md`](./v2/IMPLEMENTERS.md): practical COVE-Core plus
+  COVE-T reader/writer starting point for independent implementations.
 - [`v2/crates/cove-core`](./v2/crates/cove-core): core file structures,
   validation, dictionaries, encodings, indexes, writers, readers, and profiles.
 - [`v2/crates/cove-arrow`](./v2/crates/cove-arrow): Arrow export/import and
@@ -207,6 +209,8 @@ Important v2 paths:
   bootstrap paths, and benchmarks.
 - [`v2/crates/cove-map`](./v2/crates/cove-map): reference COVE-MAP execution,
   materialization, evidence, and projection helpers.
+- [`v2/docs/mapped-cove-o-datafusion-showcase.md`](./v2/docs/mapped-cove-o-datafusion-showcase.md):
+  end-to-end multi-source mapped COVE-O showcase through DataFusion SQL.
 - [`v2/crates/cove-codec`](./v2/crates/cove-codec): COVE-CX descriptor and
   registered-envelope validation.
 - [`v2/crates/cove-coverage`](./v2/crates/cove-coverage): COVE-COVERAGE
@@ -288,6 +292,13 @@ Run the conformance corpus directly:
 cargo run -p cove-conformance --bin cove-conformance -- conformance/
 ```
 
+Run the smaller implementer-kernel subset:
+
+```sh
+cargo run -p cove-conformance --bin cove-conformance -- \
+  conformance/ --manifest conformance/minimal-reader-manifest.jsonl
+```
+
 Register a local `.cove` file with DataFusion:
 
 ```rust
@@ -302,6 +313,37 @@ let df = ctx
     .await?;
 df.show().await?;
 ```
+
+Register mapped `COVE-O` projections as SQL tables with DataFusion:
+
+```rust
+use cove_datafusion::register::register_cove_o_projections;
+use datafusion::prelude::SessionContext;
+
+let ctx = SessionContext::new();
+let registered = register_cove_o_projections(
+    &ctx,
+    "people.cove",
+    Some(std::path::Path::new("people-map.covemap")),
+    Some("demo"),
+)?;
+
+assert!(registered.iter().any(|table| table.table_name == "demo__people"));
+
+let df = ctx
+    .sql("SELECT person_id, full_name FROM demo__people ORDER BY person_id")
+    .await?;
+df.show().await?;
+```
+
+If the mapped `COVE-O` file already embeds its projection catalog, the mapping
+path can be omitted. Projection tables register from the declared
+`output_table` name when present, otherwise from the projection id; an optional
+prefix produces deterministic names like `<prefix>__people`.
+
+For the full multi-source showcase, including canonical-object SQL joined back
+to provenance rows from one mapped `COVE-O` file, see
+[`v2/docs/mapped-cove-o-datafusion-showcase.md`](./v2/docs/mapped-cove-o-datafusion-showcase.md).
 
 Run the benchmark suites:
 

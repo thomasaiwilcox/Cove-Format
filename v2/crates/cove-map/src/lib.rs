@@ -15,10 +15,7 @@ use cove_core::{
     page::{ColumnPageIndexEntryV1, COLUMN_PAGE_INDEX_ENTRY_LEN},
     page_payload::ColumnPagePayloadV1,
     profile::{
-        cove_map::{
-            MapIdentityRule, MapProjectionCatalog, MapProjectionEntry, MapPropertyBinding,
-            MapRowSemanticRule, SourceOperationKind,
-        },
+        cove_map::{MapIdentityRule, MapPropertyBinding, MapRowSemanticRule, SourceOperationKind},
         cove_o::{
             temporal_row_trust_payload, CoveRecordRefV1, ObjectTypeCatalog, ObjectTypeEntryV1,
             PropertyEntryV1, RecordKind, TemporalRowEntryV1, TemporalSegmentData,
@@ -46,13 +43,19 @@ mod identity;
 mod input;
 mod project;
 mod sections;
+mod support;
 mod ui;
 
 #[cfg(test)]
 use crate::cli::{parse_args, Command, OutputFormat};
 pub use api::{
     conversion_report_from_paths, conversion_summary_from_paths, cove_o_from_paths,
-    projected_output_from_paths, projected_rows_from_cove_o_path, projected_rows_from_paths,
+    projected_output_from_cove_o_bytes, projected_output_from_cove_o_path,
+    projected_output_from_paths, projected_record_batch_from_cove_o_bytes,
+    projected_record_batches_from_cove_o_bytes,
+    projected_record_batches_from_cove_o_bytes_with_catalog, projected_rows_from_cove_o_path,
+    projected_rows_from_paths, projection_arrow_schema, projection_descriptors_from_cove_o_path,
+    projection_read_requirements_for_catalog, ProjectionColumnDescriptor, ProjectionDescriptor,
 };
 pub(crate) use api::{parse_map, plan_keys, preview};
 pub(crate) use context::{mapping_context, MappingContext};
@@ -65,17 +68,19 @@ use input::read_csv;
 use input::{
     read_source_inputs, read_sources, validate_source_inputs, ObservedSourceState, SourceRow,
 };
-pub use project::ProjectionFormat;
 use project::{
     diff_maps, project_cove_o_path_output, project_rows_with_source_states_output, run_fixture_path,
 };
 #[cfg(test)]
 use project::{project_cove_o_path, project_rows, property_by_name};
+pub use project::{
+    ProjectionBatchOptions, ProjectionFilter, ProjectionFilterLiteral, ProjectionFilterOp,
+    ProjectionFormat, ProjectionReadRequirements,
+};
 pub(crate) use sections::{embedded_sections, mapping_identity, section_kind};
 #[cfg(test)]
-use std::fs;
-#[cfg(test)]
 use std::path::PathBuf;
+pub(crate) use support::*;
 pub(crate) use ui::{
     candidate_assertion_id, candidate_match_id, evidence_entry_for_candidate,
     evidence_entry_for_identity, explain, identity_assertion_id, print_json, print_usage,
@@ -288,6 +293,7 @@ fn materialize_with_source_states(
     )?;
 
     resolve_property_conflicts(&mut object_rows, &mut evidence_entries)?;
+    prune_empty_shadow_rows(&mut object_rows);
 
     object_rows.sort_by_key(|row| {
         (
@@ -612,6 +618,17 @@ fn validate_property_conflict_policy(policy: &str) -> Result<(), String> {
         "reject_conflict" | "source_priority_wins" => Ok(()),
         other => Err(format!("unsupported property conflict_policy '{other}'")),
     }
+}
+
+fn prune_empty_shadow_rows(rows: &mut Vec<ObjectRow>) {
+    let populated = rows
+        .iter()
+        .filter(|row| !row.properties.is_empty())
+        .map(|row| (row.object_type_id, row.goid))
+        .collect::<BTreeSet<_>>();
+    rows.retain(|row| {
+        !(row.properties.is_empty() && populated.contains(&(row.object_type_id, row.goid)))
+    });
 }
 
 fn resolve_property_conflicts(
@@ -2552,318 +2569,13 @@ fn goid16_parts(parts: &[&[u8]]) -> [u8; 16] {
     out
 }
 
-fn logical_type_from_name(name: &str) -> Result<CoveLogicalType, String> {
-    match name {
-        "null" => Ok(CoveLogicalType::Null),
-        "bool" | "boolean" => Ok(CoveLogicalType::Bool),
-        "int8" => Ok(CoveLogicalType::Int8),
-        "int16" => Ok(CoveLogicalType::Int16),
-        "int32" => Ok(CoveLogicalType::Int32),
-        "int64" | "int" => Ok(CoveLogicalType::Int64),
-        "uint8" => Ok(CoveLogicalType::UInt8),
-        "uint16" => Ok(CoveLogicalType::UInt16),
-        "uint32" => Ok(CoveLogicalType::UInt32),
-        "uint64" | "uint" => Ok(CoveLogicalType::UInt64),
-        "float32" => Ok(CoveLogicalType::Float32),
-        "float64" | "float" => Ok(CoveLogicalType::Float64),
-        "decimal64" => Ok(CoveLogicalType::Decimal64),
-        "decimal128" | "decimal" => Ok(CoveLogicalType::Decimal128),
-        "date_days" | "date32" | "date" => Ok(CoveLogicalType::DateDays),
-        "timestamp_micros" | "timestamp_us" => Ok(CoveLogicalType::TimestampMicros),
-        "timestamp_nanos" | "timestamp_ns" => Ok(CoveLogicalType::TimestampNanos),
-        "utf8" | "string" => Ok(CoveLogicalType::Utf8),
-        "binary" => Ok(CoveLogicalType::Binary),
-        "json" => Ok(CoveLogicalType::Json),
-        "uuid" => Ok(CoveLogicalType::Uuid),
-        "list" => Ok(CoveLogicalType::List),
-        "struct" => Ok(CoveLogicalType::Struct),
-        "map" => Ok(CoveLogicalType::Map),
-        other => Err(format!("unsupported COVE-MAP logical type '{other}'")),
-    }
-}
-
-fn physical_for_logical(logical: CoveLogicalType) -> CovePhysicalKind {
-    match logical {
-        CoveLogicalType::Bool => CovePhysicalKind::Boolean,
-        CoveLogicalType::Utf8 | CoveLogicalType::Binary | CoveLogicalType::Json => {
-            CovePhysicalKind::VarBytes
-        }
-        CoveLogicalType::Uuid | CoveLogicalType::Decimal128 | CoveLogicalType::Decimal64 => {
-            CovePhysicalKind::FixedBytes
-        }
-        CoveLogicalType::List | CoveLogicalType::Struct | CoveLogicalType::Map => {
-            CovePhysicalKind::FileCode
-        }
-        _ => CovePhysicalKind::NumCode,
-    }
-}
-
-fn record_kind_from_name(name: &str) -> Result<RecordKind, String> {
-    match name {
-        "delta" | "Delta" => Ok(RecordKind::Delta),
-        "snapshot" | "Snapshot" => Ok(RecordKind::Snapshot),
-        "baseline" | "Baseline" | "upsert" | "Upsert" => Ok(RecordKind::Baseline),
-        "tombstone" | "Tombstone" => Ok(RecordKind::Tombstone),
-        other => Err(format!("unsupported COVE-O record kind '{other}'")),
-    }
-}
-
-fn encoding_for_physical(physical: CovePhysicalKind) -> CoveEncodingKind {
-    match physical {
-        CovePhysicalKind::Boolean | CovePhysicalKind::FixedBytes => CoveEncodingKind::PlainFixed,
-        CovePhysicalKind::NumCode => CoveEncodingKind::NumCode,
-        CovePhysicalKind::FileCode => CoveEncodingKind::FileCode,
-        CovePhysicalKind::VarBytes => CoveEncodingKind::VarBytes,
-        CovePhysicalKind::List | CovePhysicalKind::Struct | CovePhysicalKind::Map => {
-            CoveEncodingKind::Canonical
-        }
-        _ => CoveEncodingKind::Canonical,
-    }
-}
-
-fn json_bool(value: &Value) -> Result<bool, String> {
-    match value {
-        Value::Bool(value) => Ok(*value),
-        Value::String(text) if text.eq_ignore_ascii_case("true") => Ok(true),
-        Value::String(text) if text.eq_ignore_ascii_case("false") => Ok(false),
-        _ => Err("property value is not a bool".into()),
-    }
-}
-
-fn json_numcode(value: &Value) -> Result<u64, String> {
-    match value {
-        Value::Bool(value) => Ok(u64::from(*value)),
-        Value::Number(number) => number
-            .as_u64()
-            .or_else(|| number.as_i64().and_then(|value| u64::try_from(value).ok()))
-            .ok_or_else(|| "numeric property value is outside supported NumCode range".to_string()),
-        Value::String(text) => text
-            .parse::<u64>()
-            .map_err(|_| format!("'{text}' is not a supported NumCode value")),
-        _ => Err("property value is not numeric".into()),
-    }
-}
-
-fn fixed_bytes_for_property(property: &PropertyEntryV1, value: &Value) -> Result<Vec<u8>, String> {
-    match property.logical_type {
-        CoveLogicalType::Uuid => {
-            let text = value
-                .as_str()
-                .ok_or_else(|| "uuid property values must be hex strings".to_string())?;
-            Ok(hex_decode_16(text)?.to_vec())
-        }
-        CoveLogicalType::Decimal128 => {
-            let int = value
-                .as_i64()
-                .map(i128::from)
-                .or_else(|| value.as_str().and_then(|text| text.parse::<i128>().ok()))
-                .ok_or_else(|| "decimal128 property value must be an integer".to_string())?;
-            Ok(int.to_le_bytes().to_vec())
-        }
-        CoveLogicalType::Decimal64 => {
-            let int = value
-                .as_i64()
-                .or_else(|| value.as_str().and_then(|text| text.parse::<i64>().ok()))
-                .ok_or_else(|| "decimal64 property value must be an integer".to_string())?;
-            Ok(int.to_le_bytes().to_vec())
-        }
-        other => Err(format!("unsupported fixed-bytes logical type '{other:?}'")),
-    }
-}
-
-fn var_bytes_for_property(property: &PropertyEntryV1, value: &Value) -> Result<Vec<u8>, String> {
-    match property.logical_type {
-        CoveLogicalType::Utf8 => value
-            .as_str()
-            .map(|text| text.as_bytes().to_vec())
-            .ok_or_else(|| "utf8 property value must be a string".to_string()),
-        CoveLogicalType::Json => serde_json::to_vec(value).map_err(|err| err.to_string()),
-        CoveLogicalType::Binary => value
-            .as_str()
-            .map(|text| text.as_bytes().to_vec())
-            .ok_or_else(|| "binary property value must be encoded as a string".to_string()),
-        other => Err(format!("unsupported var-bytes logical type '{other:?}'")),
-    }
-}
-
-fn stable_u32(text: &str, fallback: u32) -> u32 {
-    let digest = Sha256::digest(text.as_bytes());
-    let value = u32::from_le_bytes(digest[..4].try_into().unwrap());
-    if value == 0 {
-        fallback
-    } else {
-        value
-    }
-}
-
-fn section_set(file: &CovemapFile) -> BTreeSet<String> {
-    file.sections
-        .iter()
-        .map(|section| section_kind(section.entry.section_id))
-        .collect()
-}
-
-fn object_to_btree(object: &Map<String, Value>) -> BTreeMap<String, Value> {
-    object
-        .iter()
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect()
-}
-
-fn row_digest(row: &SourceRow) -> String {
-    sha256_hex(canonical_row_json(&row.values).as_bytes())
-}
-
-fn schema_fingerprint(row: &SourceRow) -> String {
-    let schema = row
-        .values
-        .iter()
-        .map(|(key, value)| format!("{key}:{}", logical_type_name(value)))
-        .collect::<Vec<_>>()
-        .join("|");
-    sha256_hex(schema.as_bytes())
-}
-
-fn canonical_row_json(values: &BTreeMap<String, Value>) -> String {
-    serde_json::to_string(values).expect("BTreeMap JSON serialization cannot fail")
-}
-
-fn logical_type_name(value: &Value) -> &'static str {
-    match value {
-        Value::Null => "null",
-        Value::Bool(_) => "bool",
-        Value::Number(number) if number.is_i64() => "int64",
-        Value::Number(number) if number.is_u64() => "uint64",
-        Value::Number(_) => "float64",
-        Value::String(_) => "utf8",
-        Value::Array(_) => "list",
-        Value::Object(_) => "struct",
-    }
-}
-
-fn json_i64(value: &Value) -> Result<i64, String> {
-    match value {
-        Value::Number(number) => number
-            .as_i64()
-            .ok_or_else(|| "JSON number is not an i64".to_string()),
-        Value::String(text) => text
-            .parse::<i64>()
-            .map_err(|_| format!("'{text}' is not an i64")),
-        _ => Err("join key value is not an i64".into()),
-    }
-}
-
-fn json_u64(value: &Value) -> Result<u64, String> {
-    match value {
-        Value::Number(number) => number
-            .as_u64()
-            .ok_or_else(|| "JSON number is not a u64".to_string()),
-        Value::String(text) => text
-            .parse::<u64>()
-            .map_err(|_| format!("'{text}' is not a u64")),
-        _ => Err("join key value is not a u64".into()),
-    }
-}
-
-fn json_f64(value: &Value) -> Result<f64, String> {
-    match value {
-        Value::Number(number) => number
-            .as_f64()
-            .ok_or_else(|| "JSON number is not a finite f64".to_string()),
-        Value::String(text) => text
-            .parse::<f64>()
-            .map_err(|_| format!("'{text}' is not an f64")),
-        _ => Err("join key value is not an f64".into()),
-    }
-}
-
-fn json_i128(value: &Value) -> Result<i128, String> {
-    match value {
-        Value::Number(number) => number
-            .as_i64()
-            .map(i128::from)
-            .or_else(|| number.as_u64().map(|value| value as i128))
-            .ok_or_else(|| "JSON number is not an i128-compatible integer".to_string()),
-        Value::String(text) => text
-            .parse::<i128>()
-            .map_err(|_| format!("'{text}' is not an i128")),
-        _ => Err("value is not an i128".into()),
-    }
-}
-
-fn json_string(value: &Value) -> Result<&str, String> {
-    value
-        .as_str()
-        .ok_or_else(|| "value must be a string".to_string())
-}
-
-fn json_uuid(value: &Value) -> Result<[u8; 16], String> {
-    hex_decode_16(json_string(value)?)
-}
-
-fn append_len_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
-    out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
-    out.extend_from_slice(bytes);
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    hex_encode(&Sha256::digest(bytes))
-}
-
-fn sha256_array(bytes: &[u8]) -> [u8; 32] {
-    let digest = Sha256::digest(bytes);
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&digest);
-    out
-}
-
-fn first_16(bytes: &[u8; 32]) -> [u8; 16] {
-    let mut out = [0u8; 16];
-    out.copy_from_slice(&bytes[..16]);
-    out
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    out
-}
-
-fn hex_decode_16(text: &str) -> Result<[u8; 16], String> {
-    let text = text.trim();
-    if text.len() != 32 {
-        return Err("uuid hex string must contain 32 hex characters".into());
-    }
-    let mut out = [0u8; 16];
-    for (index, chunk) in text.as_bytes().chunks_exact(2).enumerate() {
-        out[index] = (hex_nibble(chunk[0])? << 4) | hex_nibble(chunk[1])?;
-    }
-    Ok(out)
-}
-
-fn hex_nibble(byte: u8) -> Result<u8, String> {
-    match byte {
-        b'0'..=b'9' => Ok(byte - b'0'),
-        b'a'..=b'f' => Ok(byte - b'a' + 10),
-        b'A'..=b'F' => Ok(byte - b'A' + 10),
-        _ => Err("invalid hex character".into()),
-    }
-}
-
-fn required_str<'a>(value: &'a Value, key: &str) -> Result<&'a str, String> {
-    value
-        .get(key)
-        .and_then(Value::as_str)
-        .ok_or_else(|| format!("fixture.{key} must be a string"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{fs, sync::Arc};
+
+    use arrow_array::{RecordBatch, StringArray};
+    use arrow_ipc::writer::FileWriter as IpcFileWriter;
     use cove_core::{
         artifact::covemap::{
             CovemapHeaderV1, CovemapPayloadEncodingV2, CovemapPostscriptV1, CovemapSection,
@@ -2877,6 +2589,8 @@ mod tests {
             PROPERTY_FLAG_ASSOCIATION_TYPE, PROPERTY_FLAG_EVIDENCE_REF,
         },
     };
+    use orc_rust::ArrowWriterBuilder as OrcWriterBuilder;
+    use parquet::arrow::ArrowWriter;
 
     fn test_section(kind: SectionKind, value: Value) -> CovemapSection {
         let payload = serde_json::to_vec_pretty(&covemap_payload_value(kind, value)).unwrap();
@@ -2933,6 +2647,60 @@ mod tests {
                 checksum: 0,
             },
         }
+    }
+
+    fn people_batch() -> RecordBatch {
+        RecordBatch::try_from_iter(vec![
+            (
+                "person_id",
+                Arc::new(StringArray::from(vec!["p1"])) as arrow_array::ArrayRef,
+            ),
+            (
+                "team_id",
+                Arc::new(StringArray::from(vec!["t1"])) as arrow_array::ArrayRef,
+            ),
+            (
+                "valid_from",
+                Arc::new(StringArray::from(vec!["2026-01-01"])) as arrow_array::ArrayRef,
+            ),
+            (
+                "valid_to",
+                Arc::new(StringArray::from(vec!["2026-12-31"])) as arrow_array::ArrayRef,
+            ),
+        ])
+        .unwrap()
+    }
+
+    fn write_arrow_ipc(batch: &RecordBatch) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        {
+            let mut writer = IpcFileWriter::try_new(&mut bytes, &batch.schema()).unwrap();
+            writer.write(batch).unwrap();
+            writer.finish().unwrap();
+        }
+        bytes
+    }
+
+    fn write_parquet(batch: &RecordBatch) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        {
+            let mut writer = ArrowWriter::try_new(&mut bytes, batch.schema(), None).unwrap();
+            writer.write(batch).unwrap();
+            writer.close().unwrap();
+        }
+        bytes
+    }
+
+    fn write_orc(batch: &RecordBatch) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        {
+            let mut writer = OrcWriterBuilder::new(&mut bytes, batch.schema())
+                .try_build()
+                .unwrap();
+            writer.write(batch).unwrap();
+            writer.close().unwrap();
+        }
+        bytes
     }
 
     fn two_source_identity_map(do_not_merge: Vec<Value>) -> CovemapFile {
@@ -3943,6 +3711,111 @@ mod tests {
     }
 
     #[test]
+    fn source_projection_matches_persisted_projection_after_conflict_resolution() {
+        let mut file = two_source_property_map("source_priority_wins", Some(10), Some(1));
+        file.sections.push(test_section(
+            SectionKind::MapProjectionCatalog,
+            json!({
+                "mapping_id": "people-map",
+                "mapping_version": "test/v1",
+                "projections": [{
+                    "projection_id": "person_projection",
+                    "output_table": "people_projection",
+                    "row_grain": "one_row_per_object",
+                    "anchor": {"object_type": "Person"},
+                    "temporal_mode": {"as_of": "latest_committed"},
+                    "multi_value_policy": "reject",
+                    "columns": [
+                        {"name": "person_goid", "value": "object.goid"},
+                        {"name": "name", "value": "name", "logical_type": "utf8"}
+                    ],
+                    "output_modes": ["json", "cove-o"]
+                }]
+            }),
+        ));
+        let rows = conflict_rows(json!("CRM Name"), json!("Support Name"));
+        let source_projected = project_rows(&file, &rows).unwrap();
+        let bytes = build_cove_o(&file, &rows).unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "cove-map-project-conflict-test-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let object_path = dir.join("object.cove");
+        fs::write(&object_path, bytes).unwrap();
+        let persisted_projected = project_cove_o_path(&object_path, None).unwrap();
+        assert_eq!(persisted_projected["rows"], source_projected["rows"]);
+        let rows = source_projected["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["projection_id"], json!("person_projection"));
+        assert_eq!(rows[0]["output_table"], json!("people_projection"));
+        assert_eq!(rows[0]["name"], json!("Support Name"));
+        assert!(rows[0]["person_goid"].as_str().is_some());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn projected_record_batches_from_cove_o_bytes_chunks_arrow_output() {
+        let mut file = association_readback_map();
+        file.sections.push(test_section(
+            SectionKind::MapProjectionCatalog,
+            json!({
+                "mapping_id": "people-map",
+                "mapping_version": "test/v1",
+                "projections": [{
+                    "projection_id": "person_objects.v1",
+                    "output_table": "person_objects",
+                    "row_grain": "one_row_per_object",
+                    "anchor": {"object_type": "Person"},
+                    "temporal_mode": {"as_of": "latest_committed"},
+                    "multi_value_policy": "reject",
+                    "columns": [
+                        {"name": "goid", "value": "object.goid", "logical_type": "uuid"},
+                        {"name": "object_type", "value": "object.type", "logical_type": "utf8"}
+                    ],
+                    "output_modes": ["arrow"]
+                }]
+            }),
+        ));
+        let rows = vec![
+            SourceRow {
+                source_id: "people".into(),
+                row_index: 0,
+                values: BTreeMap::from([
+                    ("person_id".into(), json!("p1")),
+                    ("team_id".into(), json!("t1")),
+                    ("valid_from".into(), json!("2026-01-01")),
+                    ("valid_to".into(), json!("2026-12-31")),
+                ]),
+            },
+            SourceRow {
+                source_id: "people".into(),
+                row_index: 1,
+                values: BTreeMap::from([
+                    ("person_id".into(), json!("p2")),
+                    ("team_id".into(), json!("t2")),
+                    ("valid_from".into(), json!("2026-01-01")),
+                    ("valid_to".into(), json!("2026-12-31")),
+                ]),
+            },
+        ];
+        let bytes = build_cove_o(&file, &rows).unwrap();
+        let batches = projected_record_batches_from_cove_o_bytes(
+            &bytes,
+            None,
+            "person_objects.v1",
+            &ProjectionBatchOptions {
+                batch_size: Some(1),
+                ..ProjectionBatchOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].num_rows(), 1);
+        assert_eq!(batches[1].num_rows(), 1);
+    }
+
+    #[test]
     fn projection_rejects_undeclared_runtime_function() {
         let mut file = association_readback_map();
         file.sections.push(test_section(
@@ -4615,5 +4488,41 @@ mod tests {
         let projected = project_rows(&projected_file, &rows).unwrap();
         assert_eq!(projected["rows"].as_array().unwrap().len(), 2);
         assert_eq!(projected["rows"][0]["name"], json!("Ada"));
+    }
+
+    #[test]
+    fn cove_o_conversion_accepts_parquet_orc_and_arrow_ipc_sources() {
+        let dir = std::env::temp_dir().join(format!(
+            "cove-map-multi-source-ingest-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let map_path = dir.join("mapping.covemap");
+        fs::write(&map_path, association_readback_map().serialize().unwrap()).unwrap();
+        let batch = people_batch();
+        let cases = [
+            ("people.parquet", write_parquet(&batch)),
+            ("people.orc", write_orc(&batch)),
+            ("people.arrow", write_arrow_ipc(&batch)),
+        ];
+        for (file_name, bytes) in cases {
+            let source_path = dir.join(file_name);
+            fs::write(&source_path, bytes).unwrap();
+            let cove_bytes =
+                cove_o_from_paths(&map_path, std::slice::from_ref(&source_path)).unwrap();
+            let surface = read_object_surface_from_bytes(&cove_bytes).unwrap();
+            assert_eq!(surface.records.len(), 3, "{file_name}");
+            assert_eq!(
+                surface
+                    .records
+                    .iter()
+                    .filter(|record| record.association.is_some())
+                    .count(),
+                1,
+                "{file_name}"
+            );
+            fs::remove_file(&source_path).unwrap();
+        }
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

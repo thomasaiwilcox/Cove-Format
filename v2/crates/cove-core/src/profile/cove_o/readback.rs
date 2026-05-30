@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{json, Number, Value};
 use sha2::{Digest, Sha256};
@@ -13,17 +13,20 @@ use crate::{
     page_payload::PageBufferKind,
     profile::{
         cove_map::{
-            parse_embedded_section, EmbeddedMapSection, MapEvidenceIndex, MapProjectionCatalog,
+            EmbeddedMapSection, MapEvidenceIndex, MapFunctionRegistry, MapProjectionCatalog,
         },
         cove_o::{
             CoveRecordRefV1, ObjectTypeCatalog, ObjectTypeEntryV1, PropertyEntryV1, RecordKind,
-            TemporalPropertyColumn, TemporalSegmentData, OBJECT_TYPE_FLAG_ASSOCIATION_OBJECT,
-            OBJECT_TYPE_FLAG_LINK_OBJECT, PROPERTY_FLAG_ASSOCIATION_FROM_GOID,
-            PROPERTY_FLAG_ASSOCIATION_TO_GOID, PROPERTY_FLAG_ASSOCIATION_TYPE,
-            PROPERTY_FLAG_EVIDENCE_REF, PROPERTY_FLAG_MAPPING_RULE_REF,
+            TemporalPropertyColumn, TemporalSegmentData, TemporalSegmentHeaderV1,
+            OBJECT_TYPE_FLAG_ASSOCIATION_OBJECT, OBJECT_TYPE_FLAG_LINK_OBJECT,
+            PROPERTY_FLAG_ASSOCIATION_FROM_GOID, PROPERTY_FLAG_ASSOCIATION_TO_GOID,
+            PROPERTY_FLAG_ASSOCIATION_TYPE, PROPERTY_FLAG_EVIDENCE_REF,
+            PROPERTY_FLAG_MAPPING_RULE_REF,
         },
     },
     reader::{validate_bytes_with_options, ValidationOptions},
+    types::logical_type_from_name as parse_logical_type_name,
+    utility::hex_encode,
     validity::ValidityBitmap,
     wire,
     zone_stats::{StatKind, StatScalar, ZoneStatFlags, ZoneStatsEntry, ZoneStatsSection},
@@ -36,6 +39,7 @@ pub struct CoveObjectSurface {
     pub records: Vec<CoveObjectRecord>,
     pub projection_catalog: Option<MapProjectionCatalog>,
     pub evidence_index: Option<MapEvidenceIndex>,
+    pub embedded_function_ids: BTreeSet<String>,
     pub embedded_map_sections: Vec<EmbeddedMapSection>,
 }
 
@@ -76,10 +80,33 @@ pub struct CoveAssociationMetadata {
     pub mapping_rule_ref: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoveObjectReadOptions {
     pub requested_property_ids: Vec<u32>,
     pub requested_property_names: Vec<String>,
+    pub requested_object_type_names: Vec<String>,
+    pub requested_evidence_metadata_keys: Vec<String>,
+    pub include_projection_catalog: bool,
+    pub include_function_registry: bool,
+    pub include_association_object_types: bool,
+    pub include_records: bool,
+    pub include_evidence_index: bool,
+}
+
+impl Default for CoveObjectReadOptions {
+    fn default() -> Self {
+        Self {
+            requested_property_ids: Vec::new(),
+            requested_property_names: Vec::new(),
+            requested_object_type_names: Vec::new(),
+            requested_evidence_metadata_keys: Vec::new(),
+            include_projection_catalog: true,
+            include_function_registry: true,
+            include_association_object_types: false,
+            include_records: true,
+            include_evidence_index: true,
+        }
+    }
 }
 
 impl CoveObjectReadOptions {
@@ -91,6 +118,13 @@ impl CoveObjectReadOptions {
         Self {
             requested_property_ids: property_ids.into_iter().collect(),
             requested_property_names: Vec::new(),
+            requested_object_type_names: Vec::new(),
+            requested_evidence_metadata_keys: Vec::new(),
+            include_projection_catalog: true,
+            include_function_registry: true,
+            include_association_object_types: false,
+            include_records: true,
+            include_evidence_index: true,
         }
     }
 
@@ -100,6 +134,29 @@ impl CoveObjectReadOptions {
         Self {
             requested_property_ids: Vec::new(),
             requested_property_names: property_names.into_iter().map(Into::into).collect(),
+            requested_object_type_names: Vec::new(),
+            requested_evidence_metadata_keys: Vec::new(),
+            include_projection_catalog: true,
+            include_function_registry: true,
+            include_association_object_types: false,
+            include_records: true,
+            include_evidence_index: true,
+        }
+    }
+
+    pub fn requested_object_type_names(
+        object_type_names: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        Self {
+            requested_property_ids: Vec::new(),
+            requested_property_names: Vec::new(),
+            requested_object_type_names: object_type_names.into_iter().map(Into::into).collect(),
+            requested_evidence_metadata_keys: Vec::new(),
+            include_projection_catalog: true,
+            include_function_registry: true,
+            include_association_object_types: false,
+            include_records: true,
+            include_evidence_index: true,
         }
     }
 
@@ -112,6 +169,20 @@ impl CoveObjectReadOptions {
                 .requested_property_names
                 .iter()
                 .any(|name| name == &property.property_name)
+    }
+
+    fn requests_object_type(&self, object_type: &ObjectTypeEntryV1) -> bool {
+        if self
+            .requested_object_type_names
+            .iter()
+            .any(|name| name == &object_type.type_name)
+        {
+            return true;
+        }
+        if self.include_association_object_types && object_type_is_association_like(object_type) {
+            return true;
+        }
+        self.requested_object_type_names.is_empty() && !self.include_association_object_types
     }
 }
 
@@ -182,14 +253,14 @@ pub fn read_object_surface_from_bytes_with_options(
     )?;
 
     let mut catalog = None;
-    let mut segments = Vec::new();
     let mut projection_catalog = None;
     let mut evidence_index = None;
+    let mut embedded_function_ids = BTreeSet::new();
     let mut embedded_map_sections = Vec::new();
     let mut dictionary_index = None::<Vec<u8>>;
     let mut dictionary_payload = None::<Vec<u8>>;
     let mut zone_stats = Vec::<ZoneStatsEntry>::new();
-    let mut temporal_segment_payloads = Vec::<Vec<u8>>::new();
+    let mut temporal_segment_entries = Vec::new();
     let mut codec_descriptors = Vec::<CodecExtensionDescriptorV2>::new();
 
     for entry in &report.validated.footer.sections {
@@ -202,7 +273,7 @@ pub fn read_object_surface_from_bytes_with_options(
                 catalog = Some(ObjectTypeCatalog::parse(payload.as_ref())?);
             }
             SectionKind::TemporalSegmentData => {
-                temporal_segment_payloads.push(payload.as_ref().to_vec());
+                temporal_segment_entries.push(entry.clone());
             }
             SectionKind::FileDictionaryIndex => {
                 dictionary_index = Some(payload.as_ref().to_vec());
@@ -216,30 +287,43 @@ pub fn read_object_surface_from_bytes_with_options(
             SectionKind::CodecExtensionRegistry => {
                 codec_descriptors.extend(CodecExtensionDescriptorV2::parse_many(payload.as_ref())?);
             }
-            kind if is_map_section(kind) => {
-                let embedded = parse_embedded_section(kind, payload.as_ref())?;
-                match &embedded {
-                    EmbeddedMapSection::ProjectionCatalog(catalog) => {
-                        projection_catalog = Some(catalog.clone());
-                    }
-                    EmbeddedMapSection::EvidenceIndex(index) => {
-                        evidence_index = Some(index.clone());
-                    }
-                    _ => {}
+            SectionKind::MapProjectionCatalog => {
+                if options.include_projection_catalog {
+                    let catalog = MapProjectionCatalog::parse(payload.as_ref())?;
+                    projection_catalog = Some(catalog.clone());
+                    embedded_map_sections.push(EmbeddedMapSection::ProjectionCatalog(catalog));
                 }
-                embedded_map_sections.push(embedded);
             }
+            SectionKind::MapFunctionRegistry => {
+                if options.include_function_registry {
+                    let registry = MapFunctionRegistry::parse(payload.as_ref())?;
+                    embedded_function_ids.extend(
+                        registry
+                            .functions
+                            .iter()
+                            .map(|function| function.function_id.clone()),
+                    );
+                    embedded_map_sections.push(EmbeddedMapSection::FunctionRegistry(registry));
+                }
+            }
+            SectionKind::MapEvidenceIndex => {
+                if options.include_evidence_index {
+                    let index = MapEvidenceIndex::parse_with_requested_operation_metadata_keys(
+                        payload.as_ref(),
+                        &options.requested_evidence_metadata_keys,
+                    )?;
+                    evidence_index = Some(index.clone());
+                    embedded_map_sections.push(EmbeddedMapSection::EvidenceIndex(index));
+                }
+            }
+            SectionKind::MapSourceCatalog
+            | SectionKind::MapIdentityRuleCatalog
+            | SectionKind::MapRowSemanticsCatalog
+            | SectionKind::MapAssertionLog
+            | SectionKind::MapIdentityEquivalenceIndex
+            | SectionKind::MapConversionReport => {}
             _ => {}
         }
-    }
-    for payload in temporal_segment_payloads {
-        segments.push(
-            TemporalSegmentData::parse_after_semantic_validation_with_codec_descriptors(
-                &payload,
-                report.validated.header.required_features,
-                &codec_descriptors,
-            )?,
-        );
     }
     let dictionary = match dictionary_index {
         Some(index) => Some(FileDictionary::parse(
@@ -258,26 +342,39 @@ pub fn read_object_surface_from_bytes_with_options(
         .map(|ty| (ty.object_type_id, ty))
         .collect::<BTreeMap<_, _>>();
     let mut records = Vec::new();
-    for segment in segments {
-        let object_type = object_types_by_id
-            .get(&segment.header.object_type_id)
-            .copied()
-            .ok_or_else(|| {
-                CoveError::BadSchema(format!(
-                    "temporal segment references missing object_type_id {}",
-                    segment.header.object_type_id
-                ))
-            })?;
-        records.extend(records_from_segment(
-            &segment,
-            object_type,
-            dictionary.as_ref(),
-            &zone_stats,
-            options,
-        )?);
-    }
-    if let Some(catalog) = &projection_catalog {
-        apply_projection_nested_shapes(&mut records, catalog)?;
+    if options.include_records {
+        for entry in temporal_segment_entries {
+            let payload = compression::section_payload(bytes, &entry)?;
+            let header = TemporalSegmentHeaderV1::parse(payload.as_ref())?;
+            let object_type = object_types_by_id
+                .get(&header.object_type_id)
+                .copied()
+                .ok_or_else(|| {
+                    CoveError::BadSchema(format!(
+                        "temporal segment references missing object_type_id {}",
+                        header.object_type_id
+                    ))
+                })?;
+            if !options.requests_object_type(object_type) {
+                continue;
+            }
+            let segment =
+                TemporalSegmentData::parse_after_semantic_validation_with_codec_descriptors(
+                    payload.as_ref(),
+                    report.validated.header.required_features,
+                    &codec_descriptors,
+                )?;
+            records.extend(records_from_segment(
+                &segment,
+                object_type,
+                dictionary.as_ref(),
+                &zone_stats,
+                options,
+            )?);
+        }
+        if let Some(catalog) = &projection_catalog {
+            apply_projection_nested_shapes(&mut records, catalog)?;
+        }
     }
 
     Ok(CoveObjectSurface {
@@ -285,8 +382,14 @@ pub fn read_object_surface_from_bytes_with_options(
         records,
         projection_catalog,
         evidence_index,
+        embedded_function_ids,
         embedded_map_sections,
     })
+}
+
+fn object_type_is_association_like(object_type: &ObjectTypeEntryV1) -> bool {
+    object_type.flags & (OBJECT_TYPE_FLAG_ASSOCIATION_OBJECT | OBJECT_TYPE_FLAG_LINK_OBJECT) != 0
+        || object_type.type_name.starts_with("Association:")
 }
 
 fn records_from_segment(
@@ -589,35 +692,9 @@ fn restore_nested_projection_value(
 }
 
 fn projection_logical_type_from_name(name: &str) -> Result<CoveLogicalType, CoveError> {
-    match name {
-        "null" => Ok(CoveLogicalType::Null),
-        "bool" | "boolean" => Ok(CoveLogicalType::Bool),
-        "int8" => Ok(CoveLogicalType::Int8),
-        "int16" => Ok(CoveLogicalType::Int16),
-        "int32" => Ok(CoveLogicalType::Int32),
-        "int64" | "int" => Ok(CoveLogicalType::Int64),
-        "uint8" => Ok(CoveLogicalType::UInt8),
-        "uint16" => Ok(CoveLogicalType::UInt16),
-        "uint32" => Ok(CoveLogicalType::UInt32),
-        "uint64" | "uint" => Ok(CoveLogicalType::UInt64),
-        "float32" => Ok(CoveLogicalType::Float32),
-        "float64" | "float" => Ok(CoveLogicalType::Float64),
-        "decimal64" => Ok(CoveLogicalType::Decimal64),
-        "decimal128" | "decimal" => Ok(CoveLogicalType::Decimal128),
-        "date_days" | "date32" | "date" => Ok(CoveLogicalType::DateDays),
-        "timestamp_micros" | "timestamp_us" => Ok(CoveLogicalType::TimestampMicros),
-        "timestamp_nanos" | "timestamp_ns" => Ok(CoveLogicalType::TimestampNanos),
-        "utf8" | "string" => Ok(CoveLogicalType::Utf8),
-        "binary" => Ok(CoveLogicalType::Binary),
-        "uuid" => Ok(CoveLogicalType::Uuid),
-        "json" => Ok(CoveLogicalType::Json),
-        "list" => Ok(CoveLogicalType::List),
-        "struct" => Ok(CoveLogicalType::Struct),
-        "map" => Ok(CoveLogicalType::Map),
-        other => Err(CoveError::BadSchema(format!(
-            "unsupported nested_shape logical_type '{other}'"
-        ))),
-    }
+    parse_logical_type_name(name).map_err(|_| {
+        CoveError::BadSchema(format!("unsupported nested_shape logical_type '{name}'"))
+    })
 }
 
 fn stable_projection_field_id(text: &str, fallback: u32) -> u32 {
@@ -1481,31 +1558,6 @@ fn json_value_to_string(value: &Value) -> Option<String> {
     }
 }
 
-fn is_map_section(kind: SectionKind) -> bool {
-    matches!(
-        kind,
-        SectionKind::MapSourceCatalog
-            | SectionKind::MapFunctionRegistry
-            | SectionKind::MapIdentityRuleCatalog
-            | SectionKind::MapRowSemanticsCatalog
-            | SectionKind::MapAssertionLog
-            | SectionKind::MapIdentityEquivalenceIndex
-            | SectionKind::MapEvidenceIndex
-            | SectionKind::MapConversionReport
-            | SectionKind::MapProjectionCatalog
-    )
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1579,6 +1631,7 @@ mod tests {
             records,
             projection_catalog: None,
             evidence_index: None,
+            embedded_function_ids: BTreeSet::new(),
             embedded_map_sections: Vec::new(),
         }
     }

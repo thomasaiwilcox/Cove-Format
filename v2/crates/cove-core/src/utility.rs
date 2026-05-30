@@ -164,6 +164,30 @@ pub fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
+pub fn hex_decode_exact<const N: usize>(text: &str) -> Result<[u8; N], CoveError> {
+    let text = text.trim();
+    if text.len() != N * 2 {
+        return Err(CoveError::BadSection(format!(
+            "hex value must contain {} characters",
+            N * 2
+        )));
+    }
+    let mut out = [0u8; N];
+    for (index, chunk) in text.as_bytes().chunks_exact(2).enumerate() {
+        out[index] = (hex_nibble(chunk[0])? << 4) | hex_nibble(chunk[1])?;
+    }
+    Ok(out)
+}
+
+fn hex_nibble(byte: u8) -> Result<u8, CoveError> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(CoveError::BadSection("invalid hex character".into())),
+    }
+}
+
 fn input_identities(inputs: &[PathBuf]) -> Result<Vec<InputIdentity>, CoveError> {
     if inputs.is_empty() {
         return Err(CoveError::BadSection(

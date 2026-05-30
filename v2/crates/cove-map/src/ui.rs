@@ -96,11 +96,11 @@ pub(crate) fn print_usage() {
 Subcommands:\n  \
 validate <mapping.covemap>\n  \
 preview <mapping.covemap>\n  \
-plan-keys <mapping.covemap> <source.csv|source.jsonl>...\n  \
-convert [--format json|cove-o] [-o output] <mapping.covemap> <source.csv|source.jsonl>...\n  \
+  plan-keys <mapping.covemap> <source.csv|source.jsonl|source.parquet|source.orc|source.arrow>...\n  \
+  convert [--format json|cove-o] [-o output] <mapping.covemap> <source.csv|source.jsonl|source.parquet|source.orc|source.arrow>...\n  \
 explain <mapping.covemap> <goid|assertion-id>\n  \
 diff <left.covemap> <right.covemap>\n  \
-project [-o output.json] <mapping.covemap> <source.csv|source.jsonl>...\n  \
+  project [-o output.json] <mapping.covemap> <source.csv|source.jsonl|source.parquet|source.orc|source.arrow>...\n  \
 project-cove-o [--mapping mapping.covemap] [-o output.json] <object.cove>\n  \
 test <fixture.json>"
     );

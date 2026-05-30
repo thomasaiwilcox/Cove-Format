@@ -356,6 +356,46 @@ mod tests {
         value
     }
 
+    #[test]
+    fn evidence_index_parse_can_filter_operation_metadata_keys() {
+        let bytes = serde_json::to_vec_pretty(&payload(
+            SectionKind::MapEvidenceIndex,
+            json!({
+                "mapping_id": "demo",
+                "mapping_version": "1",
+                "entries": [{
+                    "source_id": "crm",
+                    "source_row_identity": "crm:0",
+                    "rule_id": "row_rule",
+                    "assertion_id": "assertion:1",
+                    "output_object_id": "goid:1",
+                    "source_operation_kind": "Upsert",
+                    "operation_effect": "merged",
+                    "property_name": "name"
+                }]
+            }),
+        ))
+        .unwrap();
+        let index = MapEvidenceIndex::parse_with_requested_operation_metadata_keys(
+            &bytes,
+            &[String::from("source_operation_kind")],
+        )
+        .unwrap();
+        assert_eq!(index.entries.len(), 1);
+        assert_eq!(
+            index.entries[0]
+                .operation_metadata
+                .get("source_operation_kind"),
+            Some(&json!("Upsert"))
+        );
+        assert!(!index.entries[0]
+            .operation_metadata
+            .contains_key("operation_effect"));
+        assert!(!index.entries[0]
+            .operation_metadata
+            .contains_key("property_name"));
+    }
+
     fn row_rule_with_operation(
         operation: &str,
         row_semantics_kind: &str,

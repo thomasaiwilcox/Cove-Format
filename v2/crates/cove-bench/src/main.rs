@@ -3,6 +3,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs,
+    io::Cursor,
     ops::Range,
     path::{Path, PathBuf},
     process::ExitCode,
@@ -10,6 +11,7 @@ use std::{
 };
 
 use arrow_array::{ArrayRef, BooleanArray, Int64Array, RecordBatch, StringArray};
+use arrow_ipc::reader::{FileReader, StreamReader};
 use arrow_schema::{DataType, Field, Schema};
 use cove_arrow::convert::{
     convert_arrow_record_batches, ParquetAccelerationPolicy, ParquetAggregatePolicy,
@@ -25,7 +27,7 @@ use cove_core::{
     checksum,
     constants::{
         CompressionCodec, CoveEncodingKind, CoveLogicalType, CovePhysicalKind, DigestAlgorithm,
-        PrimaryProfile, SectionKind, ValueTag,
+        PrimaryProfile, SectionKind, ValueTag, FEATURE_SEMANTIC_MAP,
     },
     digest::compute_digest,
     durable, reader,
@@ -51,6 +53,10 @@ use cove_datafusion::{
     register::{CoveTableOptions, CoviDiscovery},
 };
 use cove_index::build::{build_covi_from_cove_bytes, CoviBuildOptions};
+use cove_map::{
+    cove_o_from_paths, projected_output_from_cove_o_path, projected_output_from_paths,
+    ProjectionFormat,
+};
 use orc_rust::{ArrowReaderBuilder as OrcReaderBuilder, ArrowWriterBuilder as OrcWriterBuilder};
 use parquet::{arrow::ArrowWriter, file::properties::WriterProperties};
 use serde_json::{json, Value};
@@ -394,6 +400,40 @@ fn generate_publication_gap_datasets(
     }
     fs::write(semantic_dir.join("people.csv"), csv.as_bytes())
         .map_err(|err| format!("cannot write semantic mapping CSV: {err}"))?;
+    let semantic_map_path = semantic_dir.join("people.covemap");
+    let semantic_csv_path = semantic_dir.join("people.csv");
+    let semantic_mapped_cove_o =
+        cove_o_from_paths(&semantic_map_path, std::slice::from_ref(&semantic_csv_path))
+            .map_err(|err| format!("cannot build semantic mapping mapped COVE-O: {err}"))?;
+    durable::durable_replace(
+        &semantic_dir.join("people_mapped.cove"),
+        &semantic_mapped_cove_o,
+    )
+    .map_err(|err| format!("cannot publish semantic mapping mapped COVE-O: {err}"))?;
+    let semantic_cove_t = projected_output_from_paths(
+        &semantic_map_path,
+        std::slice::from_ref(&semantic_csv_path),
+        ProjectionFormat::CoveT,
+        Some("person_projection"),
+    )
+    .map_err(|err| format!("cannot build semantic mapping projected COVE-T: {err}"))?;
+    durable::durable_replace(
+        &semantic_dir.join("people_projection.cove"),
+        &semantic_cove_t,
+    )
+    .map_err(|err| format!("cannot publish semantic mapping projected COVE-T: {err}"))?;
+    let semantic_arrow = projected_output_from_paths(
+        &semantic_map_path,
+        std::slice::from_ref(&semantic_csv_path),
+        ProjectionFormat::Arrow,
+        Some("person_projection"),
+    )
+    .map_err(|err| format!("cannot build semantic mapping Arrow projection: {err}"))?;
+    let semantic_projection_batch = decode_single_arrow_projection_batch(&semantic_arrow)?;
+    write_parquet_file(
+        &semantic_dir.join("people_projection.parquet"),
+        &semantic_projection_batch,
+    )?;
     let semantic_expected = serde_json::to_vec_pretty(&json!({
         "version": 1,
         "dataset": "semantic-mapping",
@@ -415,10 +455,165 @@ fn generate_publication_gap_datasets(
         csv.as_bytes(),
     )?);
     locks.push(dataset_lock(
+        "semantic-mapping-mapped-cove-o",
+        "semantic-mapping/people_mapped.cove",
+        &semantic_mapped_cove_o,
+    )?);
+    locks.push(dataset_lock(
+        "semantic-mapping-cove-t",
+        "semantic-mapping/people_projection.cove",
+        &semantic_cove_t,
+    )?);
+    locks.push(dataset_lock(
+        "semantic-mapping-parquet",
+        "semantic-mapping/people_projection.parquet",
+        &fs::read(semantic_dir.join("people_projection.parquet")).map_err(|err| err.to_string())?,
+    )?);
+    locks.push(dataset_lock(
         "semantic-mapping-expected",
         "semantic-mapping/expected.json",
         &semantic_expected,
     )?);
+
+    let showcase_dir = out.join("semantic-showcase");
+    fs::create_dir_all(&showcase_dir)
+        .map_err(|err| format!("cannot create semantic showcase dir: {err}"))?;
+    let showcase_map_bytes = showcase_multi_source_covemap()?
+        .serialize()
+        .map_err(|err| err.to_string())?;
+    durable::durable_replace(&showcase_dir.join("showcase.covemap"), &showcase_map_bytes)
+        .map_err(|err| format!("cannot publish semantic showcase COVE-MAP: {err}"))?;
+    fs::write(
+        showcase_dir.join("crm.csv"),
+        b"id,name\np1,Ada CRM\np2,Linus CRM\n",
+    )
+    .map_err(|err| format!("cannot write semantic showcase CRM CSV: {err}"))?;
+    write_parquet_file(
+        &showcase_dir.join("directory.parquet"),
+        &showcase_directory_name_batch()?,
+    )?;
+    fs::write(
+        showcase_dir.join("subscription.csv"),
+        b"id,name\np1,Ada\np2,Linus\n",
+    )
+    .map_err(|err| format!("cannot write semantic showcase subscription CSV: {err}"))?;
+    let showcase_map_path = showcase_dir.join("showcase.covemap");
+    let showcase_sources = vec![
+        showcase_dir.join("crm.csv"),
+        showcase_dir.join("directory.parquet"),
+        showcase_dir.join("subscription.csv"),
+    ];
+    let showcase_object_bytes = cove_o_from_paths(&showcase_map_path, &showcase_sources)
+        .map_err(|err| format!("cannot build semantic showcase mapped COVE-O: {err}"))?;
+    durable::durable_replace(
+        &showcase_dir.join("showcase_mapped.cove"),
+        &showcase_object_bytes,
+    )
+    .map_err(|err| format!("cannot publish semantic showcase mapped COVE-O: {err}"))?;
+    let showcase_object_path = showcase_dir.join("showcase_mapped.cove");
+    let showcase_people_cove_t = projected_output_from_cove_o_path(
+        &showcase_object_path,
+        None,
+        ProjectionFormat::CoveT,
+        Some("person_projection"),
+    )
+    .map_err(|err| format!("cannot build semantic showcase people COVE-T: {err}"))?;
+    durable::durable_replace(
+        &showcase_dir.join("people_projection.cove"),
+        &showcase_people_cove_t,
+    )
+    .map_err(|err| format!("cannot publish semantic showcase people COVE-T: {err}"))?;
+    let showcase_evidence_cove_t = projected_output_from_cove_o_path(
+        &showcase_object_path,
+        None,
+        ProjectionFormat::CoveT,
+        Some("evidence_projection"),
+    )
+    .map_err(|err| format!("cannot build semantic showcase evidence COVE-T: {err}"))?;
+    durable::durable_replace(
+        &showcase_dir.join("evidence_projection.cove"),
+        &showcase_evidence_cove_t,
+    )
+    .map_err(|err| format!("cannot publish semantic showcase evidence COVE-T: {err}"))?;
+    let showcase_people_arrow = projected_output_from_cove_o_path(
+        &showcase_object_path,
+        None,
+        ProjectionFormat::Arrow,
+        Some("person_projection"),
+    )
+    .map_err(|err| format!("cannot build semantic showcase people Arrow: {err}"))?;
+    write_parquet_file(
+        &showcase_dir.join("people_projection.parquet"),
+        &decode_single_arrow_projection_batch(&showcase_people_arrow)?,
+    )?;
+    let showcase_evidence_arrow = projected_output_from_cove_o_path(
+        &showcase_object_path,
+        None,
+        ProjectionFormat::Arrow,
+        Some("evidence_projection"),
+    )
+    .map_err(|err| format!("cannot build semantic showcase evidence Arrow: {err}"))?;
+    write_parquet_file(
+        &showcase_dir.join("evidence_projection.parquet"),
+        &decode_single_arrow_projection_batch(&showcase_evidence_arrow)?,
+    )?;
+    let showcase_expected = serde_json::to_vec_pretty(&json!({
+        "version": 1,
+        "dataset": "semantic-showcase",
+        "expected_people_rows": 2,
+        "expected_evidence_rows": 6,
+        "mapping_id": "showcase-map",
+        "mapping_version": "bench/showcase.v1",
+    }))
+    .map_err(|err| err.to_string())?;
+    fs::write(showcase_dir.join("expected.json"), &showcase_expected)
+        .map_err(|err| format!("cannot write semantic showcase metadata: {err}"))?;
+    locks.push(dataset_lock(
+        "semantic-showcase-covemap",
+        "semantic-showcase/showcase.covemap",
+        &showcase_map_bytes,
+    )?);
+    for (name, rel) in [
+        ("semantic-showcase-crm", "semantic-showcase/crm.csv"),
+        (
+            "semantic-showcase-directory",
+            "semantic-showcase/directory.parquet",
+        ),
+        (
+            "semantic-showcase-subscription",
+            "semantic-showcase/subscription.csv",
+        ),
+        (
+            "semantic-showcase-mapped-cove-o",
+            "semantic-showcase/showcase_mapped.cove",
+        ),
+        (
+            "semantic-showcase-people-cove-t",
+            "semantic-showcase/people_projection.cove",
+        ),
+        (
+            "semantic-showcase-evidence-cove-t",
+            "semantic-showcase/evidence_projection.cove",
+        ),
+        (
+            "semantic-showcase-people-parquet",
+            "semantic-showcase/people_projection.parquet",
+        ),
+        (
+            "semantic-showcase-evidence-parquet",
+            "semantic-showcase/evidence_projection.parquet",
+        ),
+        (
+            "semantic-showcase-expected",
+            "semantic-showcase/expected.json",
+        ),
+    ] {
+        locks.push(dataset_lock(
+            name,
+            rel,
+            &fs::read(out.join(rel)).map_err(|err| err.to_string())?,
+        )?);
+    }
 
     Ok(locks)
 }
@@ -950,6 +1145,8 @@ fn run_publication_gap_cases(corpus: &Path) -> Result<Vec<Value>, String> {
         },
         "optional_features": ["cove_map"],
     }));
+    cases.push(run_semantic_projection_object_store_case(corpus)?);
+    cases.push(run_semantic_showcase_bundle_object_store_case(corpus)?);
 
     Ok(cases)
 }
@@ -1338,6 +1535,305 @@ fn run_object_store_cold_warm_case(corpus: &Path, path: &Path) -> Result<Value, 
     }))
 }
 
+fn run_semantic_projection_object_store_case(corpus: &Path) -> Result<Value, String> {
+    let semantic_dir = corpus.join("semantic-mapping");
+    let mapped_path = semantic_dir.join("people_mapped.cove");
+    let cove_t_path = semantic_dir.join("people_projection.cove");
+    let parquet_path = semantic_dir.join("people_projection.parquet");
+    let start = Instant::now();
+    let mapped_bytes = fs::read(&mapped_path)
+        .map_err(|err| format!("cannot read semantic mapping mapped COVE-O: {err}"))?;
+    let cove_t_bytes = fs::read(&cove_t_path)
+        .map_err(|err| format!("cannot read semantic mapping projected COVE-T: {err}"))?;
+    let parquet_bytes = fs::read(&parquet_path)
+        .map_err(|err| format!("cannot read semantic mapping projected Parquet: {err}"))?;
+    let (mapped_cold, mapped_warm, mapped_original, mapped_coalesced) =
+        simulate_object_store_cold_warm("people_mapped.cove", mapped_bytes.clone())?;
+    let (cove_t_cold, cove_t_warm, cove_t_original, cove_t_coalesced) =
+        simulate_object_store_cold_warm("people_projection.cove", cove_t_bytes.clone())?;
+    let (parquet_cold, parquet_warm, parquet_original, parquet_coalesced) =
+        simulate_object_store_cold_warm("people_projection.parquet", parquet_bytes.clone())?;
+    let elapsed = start.elapsed().as_nanos();
+    Ok(json!({
+        "id": "semantic_projection_object_store_compare",
+        "category": "semantic-mapping mapped COVE-O vs projected COVE-T vs Parquet object-store comparison",
+        "status": "measured",
+        "metrics": {
+            "planning_ns": 0,
+            "scan_ns": elapsed,
+            "end_to_end_ns": elapsed,
+            "rows_materialized": 512,
+            "mapped_cove_o_bytes": mapped_bytes.len(),
+            "cove_bytes": cove_t_bytes.len(),
+            "parquet_bytes": parquet_bytes.len(),
+            "bytes_read": mapped_cold.bytes_requested + cove_t_cold.bytes_requested + parquet_cold.bytes_requested,
+            "request_count": mapped_cold.range_gets + cove_t_cold.range_gets + parquet_cold.range_gets,
+            "fragments_visited": 0,
+            "pages_visited": 0,
+            "pruning_tightness": 0.0,
+            "coverage_cache": {"hits": 0, "misses": 0, "entries_loaded": 0},
+            "index_use": {"covi_used": false, "lookup_hits": 0, "lookup_misses": 0, "index_fallbacks": 0},
+            "memory_peak_bytes": Value::Null,
+            "artifact_sizes": {
+                "mapped_cove_o_bytes": mapped_bytes.len(),
+                "cove_bytes": cove_t_bytes.len(),
+                "parquet_bytes": parquet_bytes.len(),
+                "orc_bytes": 0,
+                "covx_bytes": 0
+            },
+            "delta": {
+                "mapped_bytes_saved_vs_parquet": parquet_bytes.len() as i64 - mapped_bytes.len() as i64,
+                "mapped_cold_request_delta": parquet_cold.range_gets as i64 - mapped_cold.range_gets as i64,
+                "mapped_cold_bytes_requested_delta": parquet_cold.bytes_requested as i64 - mapped_cold.bytes_requested as i64,
+                "bytes_saved_vs_parquet": parquet_bytes.len() as i64 - cove_t_bytes.len() as i64,
+                "cold_request_delta": parquet_cold.range_gets as i64 - cove_t_cold.range_gets as i64,
+                "cold_bytes_requested_delta": parquet_cold.bytes_requested as i64 - cove_t_cold.bytes_requested as i64,
+            }
+        },
+        "cost": {
+            "simulation": "offline deterministic object-store harness",
+            "object_store_harness": {
+                "mapped_cove_o": {
+                    "file_bytes": mapped_bytes.len(),
+                    "cold": object_store_stats_json(&mapped_cold),
+                    "warm": object_store_stats_json(&mapped_warm),
+                    "ranges": {
+                        "original": mapped_original.len(),
+                        "coalesced": mapped_coalesced.len(),
+                    }
+                },
+                "projected_cove_t": {
+                    "file_bytes": cove_t_bytes.len(),
+                    "cold": object_store_stats_json(&cove_t_cold),
+                    "warm": object_store_stats_json(&cove_t_warm),
+                    "ranges": {
+                        "original": cove_t_original.len(),
+                        "coalesced": cove_t_coalesced.len(),
+                    }
+                },
+                "parquet": {
+                    "file_bytes": parquet_bytes.len(),
+                    "cold": object_store_stats_json(&parquet_cold),
+                    "warm": object_store_stats_json(&parquet_warm),
+                    "ranges": {
+                        "original": parquet_original.len(),
+                        "coalesced": parquet_coalesced.len(),
+                    }
+                },
+                "caveat": "Hermetic object-store semantics for corpus artifacts, not live cloud storage performance."
+            }
+        },
+        "optional_features": ["cove_map", "parquet_compare", "object_store_harness"],
+    }))
+}
+
+fn run_semantic_showcase_bundle_object_store_case(corpus: &Path) -> Result<Value, String> {
+    let showcase_dir = corpus.join("semantic-showcase");
+    let mapped_path = showcase_dir.join("showcase_mapped.cove");
+    let people_cove_t_path = showcase_dir.join("people_projection.cove");
+    let evidence_cove_t_path = showcase_dir.join("evidence_projection.cove");
+    let people_parquet_path = showcase_dir.join("people_projection.parquet");
+    let evidence_parquet_path = showcase_dir.join("evidence_projection.parquet");
+    let start = Instant::now();
+    let mapped_bytes = fs::read(&mapped_path)
+        .map_err(|err| format!("cannot read semantic showcase mapped COVE-O: {err}"))?;
+    let people_cove_t_bytes = fs::read(&people_cove_t_path)
+        .map_err(|err| format!("cannot read semantic showcase people COVE-T: {err}"))?;
+    let evidence_cove_t_bytes = fs::read(&evidence_cove_t_path)
+        .map_err(|err| format!("cannot read semantic showcase evidence COVE-T: {err}"))?;
+    let people_parquet_bytes = fs::read(&people_parquet_path)
+        .map_err(|err| format!("cannot read semantic showcase people Parquet: {err}"))?;
+    let evidence_parquet_bytes = fs::read(&evidence_parquet_path)
+        .map_err(|err| format!("cannot read semantic showcase evidence Parquet: {err}"))?;
+
+    let (mapped_cold, mapped_warm, mapped_original, mapped_coalesced) =
+        simulate_object_store_cold_warm("showcase_mapped.cove", mapped_bytes.clone())?;
+    let (people_cove_t_cold, people_cove_t_warm, people_cove_t_original, people_cove_t_coalesced) =
+        simulate_object_store_cold_warm("people_projection.cove", people_cove_t_bytes.clone())?;
+    let (
+        evidence_cove_t_cold,
+        evidence_cove_t_warm,
+        evidence_cove_t_original,
+        evidence_cove_t_coalesced,
+    ) = simulate_object_store_cold_warm("evidence_projection.cove", evidence_cove_t_bytes.clone())?;
+    let (
+        people_parquet_cold,
+        people_parquet_warm,
+        people_parquet_original,
+        people_parquet_coalesced,
+    ) = simulate_object_store_cold_warm("people_projection.parquet", people_parquet_bytes.clone())?;
+    let (
+        evidence_parquet_cold,
+        evidence_parquet_warm,
+        evidence_parquet_original,
+        evidence_parquet_coalesced,
+    ) = simulate_object_store_cold_warm(
+        "evidence_projection.parquet",
+        evidence_parquet_bytes.clone(),
+    )?;
+
+    let projected_cove_t_cold =
+        sum_offline_object_store_stats(&[people_cove_t_cold.clone(), evidence_cove_t_cold.clone()]);
+    let projected_cove_t_warm =
+        sum_offline_object_store_stats(&[people_cove_t_warm.clone(), evidence_cove_t_warm.clone()]);
+    let parquet_bundle_cold = sum_offline_object_store_stats(&[
+        people_parquet_cold.clone(),
+        evidence_parquet_cold.clone(),
+    ]);
+    let parquet_bundle_warm = sum_offline_object_store_stats(&[
+        people_parquet_warm.clone(),
+        evidence_parquet_warm.clone(),
+    ]);
+
+    let projected_cove_t_bytes = people_cove_t_bytes.len() + evidence_cove_t_bytes.len();
+    let parquet_bundle_bytes = people_parquet_bytes.len() + evidence_parquet_bytes.len();
+    let elapsed = start.elapsed().as_nanos();
+    Ok(json!({
+        "id": "semantic_showcase_bundle_object_store_compare",
+        "category": "semantic-showcase mapped COVE-O vs projected bundle vs Parquet bundle object-store comparison",
+        "status": "measured",
+        "metrics": {
+            "planning_ns": 0,
+            "scan_ns": elapsed,
+            "end_to_end_ns": elapsed,
+            "rows_materialized": 8,
+            "mapped_cove_o_bytes": mapped_bytes.len(),
+            "cove_bytes": projected_cove_t_bytes,
+            "parquet_bytes": parquet_bundle_bytes,
+            "bytes_read": mapped_cold.bytes_requested + projected_cove_t_cold.bytes_requested + parquet_bundle_cold.bytes_requested,
+            "request_count": mapped_cold.range_gets + projected_cove_t_cold.range_gets + parquet_bundle_cold.range_gets,
+            "fragments_visited": 0,
+            "pages_visited": 0,
+            "pruning_tightness": 0.0,
+            "coverage_cache": {"hits": 0, "misses": 0, "entries_loaded": 0},
+            "index_use": {"covi_used": false, "lookup_hits": 0, "lookup_misses": 0, "index_fallbacks": 0},
+            "memory_peak_bytes": Value::Null,
+            "artifact_sizes": {
+                "mapped_cove_o_bytes": mapped_bytes.len(),
+                "cove_bytes": projected_cove_t_bytes,
+                "parquet_bytes": parquet_bundle_bytes,
+                "orc_bytes": 0,
+                "covx_bytes": 0
+            },
+            "delta": {
+                "mapped_bytes_saved_vs_parquet_bundle": parquet_bundle_bytes as i64 - mapped_bytes.len() as i64,
+                "projected_bundle_bytes_saved_vs_parquet_bundle": parquet_bundle_bytes as i64 - projected_cove_t_bytes as i64,
+                "mapped_cold_request_delta_vs_parquet_bundle": parquet_bundle_cold.range_gets as i64 - mapped_cold.range_gets as i64,
+                "projected_bundle_cold_request_delta_vs_parquet_bundle": parquet_bundle_cold.range_gets as i64 - projected_cove_t_cold.range_gets as i64,
+                "mapped_cold_bytes_requested_delta_vs_parquet_bundle": parquet_bundle_cold.bytes_requested as i64 - mapped_cold.bytes_requested as i64,
+                "projected_bundle_cold_bytes_requested_delta_vs_parquet_bundle": parquet_bundle_cold.bytes_requested as i64 - projected_cove_t_cold.bytes_requested as i64
+            }
+        },
+        "cost": {
+            "simulation": "offline deterministic object-store harness",
+            "object_store_harness": {
+                "mapped_cove_o": {
+                    "file_bytes": mapped_bytes.len(),
+                    "cold": object_store_stats_json(&mapped_cold),
+                    "warm": object_store_stats_json(&mapped_warm),
+                    "ranges": {
+                        "original": mapped_original.len(),
+                        "coalesced": mapped_coalesced.len(),
+                    }
+                },
+                "projected_cove_t_bundle": {
+                    "file_bytes": projected_cove_t_bytes,
+                    "cold": object_store_stats_json(&projected_cove_t_cold),
+                    "warm": object_store_stats_json(&projected_cove_t_warm),
+                    "artifacts": {
+                        "people_projection": {
+                            "file_bytes": people_cove_t_bytes.len(),
+                            "cold": object_store_stats_json(&people_cove_t_cold),
+                            "warm": object_store_stats_json(&people_cove_t_warm),
+                            "ranges": {
+                                "original": people_cove_t_original.len(),
+                                "coalesced": people_cove_t_coalesced.len(),
+                            }
+                        },
+                        "evidence_projection": {
+                            "file_bytes": evidence_cove_t_bytes.len(),
+                            "cold": object_store_stats_json(&evidence_cove_t_cold),
+                            "warm": object_store_stats_json(&evidence_cove_t_warm),
+                            "ranges": {
+                                "original": evidence_cove_t_original.len(),
+                                "coalesced": evidence_cove_t_coalesced.len(),
+                            }
+                        }
+                    }
+                },
+                "parquet_bundle": {
+                    "file_bytes": parquet_bundle_bytes,
+                    "cold": object_store_stats_json(&parquet_bundle_cold),
+                    "warm": object_store_stats_json(&parquet_bundle_warm),
+                    "artifacts": {
+                        "people_projection": {
+                            "file_bytes": people_parquet_bytes.len(),
+                            "cold": object_store_stats_json(&people_parquet_cold),
+                            "warm": object_store_stats_json(&people_parquet_warm),
+                            "ranges": {
+                                "original": people_parquet_original.len(),
+                                "coalesced": people_parquet_coalesced.len(),
+                            }
+                        },
+                        "evidence_projection": {
+                            "file_bytes": evidence_parquet_bytes.len(),
+                            "cold": object_store_stats_json(&evidence_parquet_cold),
+                            "warm": object_store_stats_json(&evidence_parquet_warm),
+                            "ranges": {
+                                "original": evidence_parquet_original.len(),
+                                "coalesced": evidence_parquet_coalesced.len(),
+                            }
+                        }
+                    }
+                },
+                "caveat": "Hermetic object-store semantics for corpus artifacts, not live cloud storage performance."
+            }
+        },
+        "optional_features": ["cove_map", "parquet_compare", "object_store_harness"],
+    }))
+}
+
+type ColdWarmRangeStats = (
+    OfflineObjectStoreStats,
+    OfflineObjectStoreStats,
+    Vec<Range<u64>>,
+    Vec<Range<u64>>,
+);
+
+fn simulate_object_store_cold_warm(
+    key: &str,
+    bytes: Vec<u8>,
+) -> Result<ColdWarmRangeStats, String> {
+    let mut harness = OfflineObjectStoreHarness::default();
+    harness.put_object(key, bytes.clone());
+    let original_ranges = deterministic_object_ranges(bytes.len() as u64);
+    let coalesced_ranges = coalesce_object_ranges(&original_ranges, 1024, 16 * 1024);
+    harness.stats.original_ranges = original_ranges.len() as u64;
+    harness.stats.coalesced_ranges = coalesced_ranges.len() as u64;
+    read_harness_ranges(&mut harness, key, &coalesced_ranges)?;
+    let cold = harness.take_stats();
+    harness.stats.original_ranges = original_ranges.len() as u64;
+    harness.stats.coalesced_ranges = coalesced_ranges.len() as u64;
+    read_harness_ranges(&mut harness, key, &coalesced_ranges)?;
+    let warm = harness.take_stats();
+    Ok((cold, warm, original_ranges, coalesced_ranges))
+}
+
+fn sum_offline_object_store_stats(stats: &[OfflineObjectStoreStats]) -> OfflineObjectStoreStats {
+    let mut total = OfflineObjectStoreStats::default();
+    for stat in stats {
+        total.object_gets = total.object_gets.saturating_add(stat.object_gets);
+        total.range_gets = total.range_gets.saturating_add(stat.range_gets);
+        total.bytes_requested = total.bytes_requested.saturating_add(stat.bytes_requested);
+        total.bytes_returned = total.bytes_returned.saturating_add(stat.bytes_returned);
+        total.cache_hits = total.cache_hits.saturating_add(stat.cache_hits);
+        total.cache_misses = total.cache_misses.saturating_add(stat.cache_misses);
+        total.original_ranges = total.original_ranges.saturating_add(stat.original_ranges);
+        total.coalesced_ranges = total.coalesced_ranges.saturating_add(stat.coalesced_ranges);
+    }
+    total
+}
+
 fn run_cove_map_identity_case(corpus: &Path) -> Result<Value, String> {
     let dir = corpus.join("cove-map-identity");
     fs::create_dir_all(&dir).map_err(|err| format!("cannot create COVE-MAP dir: {err}"))?;
@@ -1444,9 +1940,30 @@ fn bench_covemap_bytes() -> Result<Vec<u8>, String> {
                     }]
                 }),
             )?,
+            covemap_json_section(
+                SectionKind::MapProjectionCatalog,
+                json!({
+                    "mapping_id": "bench-map",
+                    "mapping_version": "bench/v1",
+                    "projections": [{
+                        "projection_id": "person_projection",
+                        "output_table": "people_projection",
+                        "row_grain": "one_row_per_object",
+                        "anchor": {"object_type": "Person"},
+                        "temporal_mode": {"as_of": "latest_committed"},
+                        "multi_value_policy": "reject",
+                        "missing_policy": "null",
+                        "output_modes": ["json", "arrow", "cove-t"],
+                        "columns": [
+                            {"name": "person_goid", "logical_type": "uuid", "value": "object.goid"},
+                            {"name": "name", "logical_type": "utf8", "value": "name"}
+                        ]
+                    }]
+                }),
+            )?,
         ],
         postscript: cove_core::artifact::covemap::CovemapPostscriptV1 {
-            required_features: 0,
+            required_features: FEATURE_SEMANTIC_MAP,
             optional_features: 0,
             file_len: 0,
             header_offset: 0,
@@ -1455,6 +1972,194 @@ fn bench_covemap_bytes() -> Result<Vec<u8>, String> {
         },
     };
     file.serialize().map_err(|err| err.to_string())
+}
+
+fn showcase_multi_source_covemap() -> Result<CovemapFile, String> {
+    Ok(CovemapFile {
+        header: CovemapHeaderV1::new([0x53; 16], 0),
+        mapping_version: "bench/showcase.v1".into(),
+        sections: vec![
+            covemap_json_section(
+                SectionKind::MapSourceCatalog,
+                json!({
+                    "mapping_id": "showcase-map",
+                    "mapping_version": "bench/showcase.v1",
+                    "sources": [
+                        {"source_id": "crm", "row_identity_rules": ["person_by_id"], "source_priority": 10},
+                        {"source_id": "directory", "row_identity_rules": ["person_by_id"], "source_priority": 20},
+                        {"source_id": "subscription", "row_identity_rules": ["person_by_id"], "source_priority": 1}
+                    ]
+                }),
+            )?,
+            covemap_json_section(
+                SectionKind::MapFunctionRegistry,
+                json!({
+                    "mapping_id": "showcase-map",
+                    "mapping_version": "bench/showcase.v1",
+                    "functions": [{
+                        "function_id": "identity",
+                        "version": "1",
+                        "deterministic": true,
+                        "dependency": "pure"
+                    }]
+                }),
+            )?,
+            covemap_json_section(
+                SectionKind::MapIdentityRuleCatalog,
+                json!({
+                    "mapping_id": "showcase-map",
+                    "mapping_version": "bench/showcase.v1",
+                    "identity_rules": [{
+                        "rule_id": "person_by_id",
+                        "object_type": "Person",
+                        "semantic_role": "subject",
+                        "confidence_class": "authoritative",
+                        "candidate_only": false,
+                        "property_conflicts_declared": true,
+                        "function_ids": ["identity"],
+                        "join_keys": [{
+                            "role_id": "person_id",
+                            "source_column": "id",
+                            "logical_type": "utf8",
+                            "canonicalization": "identity",
+                            "null_policy": "reject",
+                            "ordering": "declared"
+                        }]
+                    }],
+                    "do_not_merge": []
+                }),
+            )?,
+            covemap_json_section(
+                SectionKind::MapRowSemanticsCatalog,
+                json!({
+                    "mapping_id": "showcase-map",
+                    "mapping_version": "bench/showcase.v1",
+                    "rules": [
+                        {
+                            "rule_id": "upsert_person_name_crm",
+                            "source_id": "crm",
+                            "identity_rule_id": "person_by_id",
+                            "row_semantics_kind": "Object",
+                            "assertion_kinds": ["object", "property", "evidence"],
+                            "function_ids": ["identity"],
+                            "output_assertion_ids": ["person_name_assertion_crm"],
+                            "association_endpoints": [],
+                            "property_bindings": [{
+                                "assertion_id": "person_name_assertion_crm",
+                                "property_id": "name",
+                                "property_name": "name",
+                                "source_column": "name",
+                                "logical_type": "utf8",
+                                "nullable": true,
+                                "missing_policy": "reject",
+                                "conflict_policy": "source_priority_wins"
+                            }]
+                        },
+                        {
+                            "rule_id": "upsert_person_name_directory",
+                            "source_id": "directory",
+                            "identity_rule_id": "person_by_id",
+                            "row_semantics_kind": "Object",
+                            "assertion_kinds": ["object", "property", "evidence"],
+                            "function_ids": ["identity"],
+                            "output_assertion_ids": ["person_name_assertion_directory"],
+                            "association_endpoints": [],
+                            "property_bindings": [{
+                                "assertion_id": "person_name_assertion_directory",
+                                "property_id": "name",
+                                "property_name": "name",
+                                "source_column": "name",
+                                "logical_type": "utf8",
+                                "nullable": true,
+                                "missing_policy": "reject",
+                                "conflict_policy": "source_priority_wins"
+                            }]
+                        },
+                        {
+                            "rule_id": "upsert_person_name_subscription",
+                            "source_id": "subscription",
+                            "identity_rule_id": "person_by_id",
+                            "row_semantics_kind": "Object",
+                            "assertion_kinds": ["object", "property", "evidence"],
+                            "function_ids": ["identity"],
+                            "output_assertion_ids": ["person_name_assertion_subscription"],
+                            "association_endpoints": [],
+                            "property_bindings": [{
+                                "assertion_id": "person_name_assertion_subscription",
+                                "property_id": "name",
+                                "property_name": "name",
+                                "source_column": "name",
+                                "logical_type": "utf8",
+                                "nullable": true,
+                                "missing_policy": "reject",
+                                "conflict_policy": "source_priority_wins"
+                            }]
+                        }
+                    ]
+                }),
+            )?,
+            covemap_json_section(
+                SectionKind::MapProjectionCatalog,
+                json!({
+                    "mapping_id": "showcase-map",
+                    "mapping_version": "bench/showcase.v1",
+                    "projections": [
+                        {
+                            "projection_id": "person_projection",
+                            "output_table": "people_projection",
+                            "row_grain": "one_row_per_object",
+                            "anchor": {"object_type": "Person"},
+                            "temporal_mode": {"as_of": "latest_committed"},
+                            "multi_value_policy": "reject",
+                            "missing_policy": "null",
+                            "output_modes": ["json", "arrow", "cove-t", "cove-o"],
+                            "columns": [
+                                {"name": "person_goid", "logical_type": "uuid", "value": "object.goid"},
+                                {"name": "name", "logical_type": "utf8", "value": "name"}
+                            ]
+                        },
+                        {
+                            "projection_id": "evidence_projection",
+                            "output_table": "evidence_projection",
+                            "row_grain": "one_row_per_evidence_assertion",
+                            "anchor": {"object_type": "Person"},
+                            "temporal_mode": {"as_of": "latest_committed"},
+                            "multi_value_policy": "reject",
+                            "missing_policy": "null",
+                            "output_modes": ["json", "arrow", "cove-t", "cove-o"],
+                            "columns": [
+                                {"name": "source_id", "logical_type": "utf8", "value": "evidence.source_id"},
+                                {"name": "source_row_identity", "logical_type": "utf8", "value": "evidence.source_row_identity"},
+                                {"name": "output_object_id", "logical_type": "uuid", "value": "evidence.output_object_id"}
+                            ]
+                        }
+                    ]
+                }),
+            )?,
+        ],
+        postscript: cove_core::artifact::covemap::CovemapPostscriptV1 {
+            required_features: FEATURE_SEMANTIC_MAP,
+            optional_features: 0,
+            file_len: 0,
+            header_offset: 0,
+            header_length: 0,
+            checksum: 0,
+        },
+    })
+}
+
+fn showcase_directory_name_batch() -> Result<RecordBatch, String> {
+    RecordBatch::try_from_iter(vec![
+        (
+            "id",
+            Arc::new(StringArray::from(vec!["p1", "p2"])) as ArrayRef,
+        ),
+        (
+            "name",
+            Arc::new(StringArray::from(vec!["Ada Directory", "Linus Directory"])) as ArrayRef,
+        ),
+    ])
+    .map_err(|err| err.to_string())
 }
 
 fn covemap_json_section(kind: SectionKind, value: Value) -> Result<CovemapSection, String> {
@@ -1638,6 +2343,8 @@ fn validate_report_cases(cases: &[Value]) -> Result<(), String> {
         "covi_index_latency",
         "covi_index_only_count",
         "object_store_cold_warm",
+        "semantic_projection_object_store_compare",
+        "semantic_showcase_bundle_object_store_compare",
         "parquet_conversion_cost",
         "orc_conversion_cost",
         "orc_full_scan_readback",
@@ -1658,6 +2365,8 @@ fn validate_report_cases(cases: &[Value]) -> Result<(), String> {
         "negative_corrupt_validation",
         "canonicalisation_vectors",
         "semantic_mapping_corpus",
+        "semantic_projection_object_store_compare",
+        "semantic_showcase_bundle_object_store_compare",
     ];
     for id in required {
         if !cases.iter().any(|case| case.get("id") == Some(&json!(id))) {
@@ -1826,6 +2535,28 @@ fn write_parquet_file(path: &Path, batch: &RecordBatch) -> Result<(), String> {
     writer.write(batch).map_err(|err| err.to_string())?;
     writer.close().map_err(|err| err.to_string())?;
     Ok(())
+}
+
+fn decode_single_arrow_projection_batch(bytes: &[u8]) -> Result<RecordBatch, String> {
+    if let Ok(reader) = FileReader::try_new(Cursor::new(bytes.to_vec()), None) {
+        let batches = reader
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|err| format!("cannot decode Arrow IPC file projection: {err}"))?;
+        return batches
+            .into_iter()
+            .next()
+            .ok_or_else(|| "Arrow IPC file projection did not contain any batches".to_string());
+    }
+
+    let reader = StreamReader::try_new(Cursor::new(bytes.to_vec()), None)
+        .map_err(|err| format!("cannot decode Arrow IPC projection as file or stream: {err}"))?;
+    let batches = reader
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|err| format!("cannot decode Arrow IPC stream projection: {err}"))?;
+    batches
+        .into_iter()
+        .next()
+        .ok_or_else(|| "Arrow IPC stream projection did not contain any batches".to_string())
 }
 
 fn write_orc_file(path: &Path, batch: &RecordBatch) -> Result<(), String> {
@@ -2304,6 +3035,8 @@ mod tests {
             "covi_index_latency",
             "covi_index_only_count",
             "object_store_cold_warm",
+            "semantic_projection_object_store_compare",
+            "semantic_showcase_bundle_object_store_compare",
             "coverage_cache_hit_miss_invalidation",
             "tpch_style_queries",
             "tpcds_style_queries",

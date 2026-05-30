@@ -125,8 +125,15 @@
       "id": "semantic-mapping",
       "kind": "deterministic-covemap-semantic-mapping",
       "seed": 26,
-      "artifacts": ["semantic-mapping/people.covemap", "semantic-mapping/people.csv", "semantic-mapping/expected.json"],
+      "artifacts": ["semantic-mapping/people.covemap", "semantic-mapping/people.csv", "semantic-mapping/people_mapped.cove", "semantic-mapping/people_projection.cove", "semantic-mapping/people_projection.parquet", "semantic-mapping/expected.json"],
       "purpose": "semantic mapping conversion and evidence workload"
+    },
+    {
+      "id": "semantic-showcase",
+      "kind": "deterministic-covemap-multisource-showcase",
+      "seed": 27,
+      "artifacts": ["semantic-showcase/showcase.covemap", "semantic-showcase/crm.csv", "semantic-showcase/directory.parquet", "semantic-showcase/subscription.csv", "semantic-showcase/showcase_mapped.cove", "semantic-showcase/people_projection.cove", "semantic-showcase/evidence_projection.cove", "semantic-showcase/people_projection.parquet", "semantic-showcase/evidence_projection.parquet", "semantic-showcase/expected.json"],
+      "purpose": "multi-source semantic showcase bundle benchmark"
     }
   ],
   "query_groups": [
@@ -139,6 +146,8 @@
     "top_n",
     "metadata_count_min_max",
     "object_store_cold_warm",
+    "semantic_projection_object_store_compare",
+    "semantic_showcase_bundle_object_store_compare",
     "covm_many_file_planning",
     "parquet_conversion_cost",
     "orc_conversion_cost",
