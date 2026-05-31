@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use cove_core::{
+    collation::{CollationKind, CollationRegistry},
     constants::{CoveLogicalType, CovePhysicalKind},
     domain::ColumnDomain,
     index::{
@@ -44,22 +45,29 @@ impl PlanningCache {
             .iter()
             .map(|segment| (segment.segment_id, segment))
             .collect::<BTreeMap<_, _>>();
+        let mut valid_domains = BTreeMap::<(u32, u32), u32>::new();
+        for (index, domain) in pruning.column_domains.iter().enumerate() {
+            if column_domain_binds_to_table(table, domain, pruning.collation_registry.as_deref()) {
+                cache
+                    .column_domain_by_id
+                    .entry(domain.header.column_or_property_id)
+                    .or_insert(index);
+                valid_domains
+                    .entry((
+                        domain.header.table_or_object_id,
+                        domain.header.column_or_property_id,
+                    ))
+                    .or_insert(domain.header.domain_count);
+            }
+        }
         for (section_index, section) in pruning.zone_stats.iter().enumerate() {
             for (entry_index, entry) in section.entries.iter().enumerate() {
-                if zone_stat_entry_binds_to_table(table, &segments_by_id, entry) {
+                if zone_stat_entry_binds_to_table(table, &segments_by_id, &valid_domains, entry) {
                     cache
                         .zone_stat_by_key
                         .entry((entry.segment_id, entry.morsel_id, entry.column_id))
                         .or_insert((section_index, entry_index));
                 }
-            }
-        }
-        for (index, domain) in pruning.column_domains.iter().enumerate() {
-            if column_domain_binds_to_table(table, domain) {
-                cache
-                    .column_domain_by_id
-                    .entry(domain.header.column_or_property_id)
-                    .or_insert(index);
             }
         }
         for (index, exact_set) in pruning.exact_sets.iter().enumerate() {
@@ -98,12 +106,23 @@ impl PlanningCache {
     }
 }
 
-fn column_domain_binds_to_table(table: &TableEntry, domain: &ColumnDomain) -> bool {
+fn column_domain_binds_to_table(
+    table: &TableEntry,
+    domain: &ColumnDomain,
+    collation_registry: Option<&CollationRegistry>,
+) -> bool {
     let Some(logical) = CoveLogicalType::from_u16(domain.header.logical_type) else {
+        return false;
+    };
+    let Some(collation) =
+        resolve_domain_collation_kind(domain.header.collation_id, collation_registry)
+    else {
         return false;
     };
     table.table_id == domain.header.table_or_object_id
         && domain.is_safe()
+        && collation.supports_ordering()
+        && domain_collation_matches_logical(logical, collation)
         && table.columns.iter().any(|column| {
             column.column_id == domain.header.column_or_property_id
                 && column.physical == CovePhysicalKind::FileCode
@@ -115,6 +134,7 @@ fn column_domain_binds_to_table(table: &TableEntry, domain: &ColumnDomain) -> bo
 fn zone_stat_entry_binds_to_table(
     table: &TableEntry,
     segments_by_id: &BTreeMap<u32, &TableSegmentIndexEntryV1>,
+    valid_domains: &BTreeMap<(u32, u32), u32>,
     entry: &ZoneStatsEntry,
 ) -> bool {
     if entry.table_id != table.table_id {
@@ -137,13 +157,94 @@ fn zone_stat_entry_binds_to_table(
         .stats
         .flags
         .contains(cove_core::zone_stats::ZoneStatFlags::HAS_DOMAIN_RANGE)
-        && column.physical != CovePhysicalKind::FileCode
     {
-        return false;
+        let Some(domain_count) = valid_domains
+            .get(&(entry.table_id, entry.column_id))
+            .copied()
+        else {
+            return false;
+        };
+        if column.physical != CovePhysicalKind::FileCode
+            || entry.min_domain_rank > entry.max_domain_rank
+            || entry.max_domain_rank >= domain_count
+        {
+            return false;
+        }
     }
     match (&entry.stats.min, &entry.stats.max) {
-        (Some(min), Some(max)) => min.kind == max.kind,
+        (Some(min), Some(max)) => {
+            min.kind == max.kind
+                && stat_kind_matches_column(column.logical, column.physical, min.kind)
+        }
         (None, None) => true,
+        _ => false,
+    }
+}
+
+fn resolve_domain_collation_kind(
+    collation_id: u16,
+    registry: Option<&CollationRegistry>,
+) -> Option<CollationKind> {
+    CollationKind::from_id(collation_id)
+        .or_else(|| registry.and_then(|registry| registry.kind_for_id(collation_id)))
+}
+
+fn domain_collation_matches_logical(logical: CoveLogicalType, collation: CollationKind) -> bool {
+    match logical {
+        CoveLogicalType::Utf8 | CoveLogicalType::Json => collation == CollationKind::Utf8Bytewise,
+        CoveLogicalType::Binary | CoveLogicalType::Uuid => {
+            collation == CollationKind::UnsignedFixedBytes
+        }
+        CoveLogicalType::Bool
+        | CoveLogicalType::UInt8
+        | CoveLogicalType::UInt16
+        | CoveLogicalType::UInt32
+        | CoveLogicalType::UInt64 => collation == CollationKind::UnsignedNumeric,
+        CoveLogicalType::Int8
+        | CoveLogicalType::Int16
+        | CoveLogicalType::Int32
+        | CoveLogicalType::Int64
+        | CoveLogicalType::Decimal64
+        | CoveLogicalType::Decimal128
+        | CoveLogicalType::DateDays => collation == CollationKind::SignedNumeric,
+        CoveLogicalType::TimestampMicros | CoveLogicalType::TimestampNanos => {
+            collation == CollationKind::TimestampChronological
+        }
+        _ => false,
+    }
+}
+
+fn stat_kind_matches_column(
+    logical: CoveLogicalType,
+    physical: CovePhysicalKind,
+    kind: cove_core::zone_stats::StatKind,
+) -> bool {
+    use cove_core::zone_stats::StatKind;
+    match physical {
+        CovePhysicalKind::FileCode => kind == StatKind::UInt64,
+        CovePhysicalKind::Boolean => matches!(kind, StatKind::UInt64 | StatKind::FixedBytes),
+        CovePhysicalKind::NumCode => match logical {
+            CoveLogicalType::Bool
+            | CoveLogicalType::UInt8
+            | CoveLogicalType::UInt16
+            | CoveLogicalType::UInt32
+            | CoveLogicalType::UInt64 => kind == StatKind::UInt64,
+            CoveLogicalType::Int8
+            | CoveLogicalType::Int16
+            | CoveLogicalType::Int32
+            | CoveLogicalType::Int64
+            | CoveLogicalType::Decimal64 => kind == StatKind::Int64,
+            CoveLogicalType::Float32 => {
+                matches!(kind, StatKind::Float64Bits | StatKind::FixedBytes)
+            }
+            CoveLogicalType::Float64 => kind == StatKind::Float64Bits,
+            CoveLogicalType::DateDays => kind == StatKind::DateDays,
+            CoveLogicalType::TimestampMicros => kind == StatKind::TimestampMicros,
+            CoveLogicalType::TimestampNanos => kind == StatKind::TimestampNanos,
+            _ => false,
+        },
+        CovePhysicalKind::FixedBytes | CovePhysicalKind::VarBytes => kind == StatKind::FixedBytes,
+        CovePhysicalKind::List | CovePhysicalKind::Struct | CovePhysicalKind::Map => false,
         _ => false,
     }
 }
@@ -457,6 +558,14 @@ fn entry_count(entry: &AggregateEntry) -> Result<u64, CoveError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use cove_core::{
+        collation::{CollationEntry, CollationRegistry},
+        domain::ColumnDomain,
+        table::ColumnEntry,
+        zone_stats::{ZoneScope, ZoneStatFlags, ZoneStats, ZoneStatsEntry, ZoneStatsSection},
+    };
 
     fn segment(segment_id: u32, row_start: u64, row_count: u32) -> TableSegmentIndexEntryV1 {
         TableSegmentIndexEntryV1 {
@@ -499,6 +608,127 @@ mod tests {
             stats_ref: 0,
             checksum: 0,
         }
+    }
+
+    fn filecode_table(collation_id: u16) -> TableEntry {
+        TableEntry {
+            table_id: 1,
+            namespace: String::new(),
+            name: "t".into(),
+            row_count: 1,
+            primary_sort_key_count: 0,
+            clustering_key_count: 0,
+            flags: 0,
+            columns: vec![ColumnEntry {
+                column_id: 1,
+                name: "c".into(),
+                logical: CoveLogicalType::Utf8,
+                physical: CovePhysicalKind::FileCode,
+                nullable: false,
+                sort_order: 0,
+                collation_id,
+                precision: 0,
+                scale: 0,
+                flags: 0,
+            }],
+        }
+    }
+
+    fn filecode_domain(collation_id: u16) -> ColumnDomain {
+        ColumnDomain::from_sorted_present_codes(
+            &[0],
+            1,
+            1,
+            1,
+            CoveLogicalType::Utf8 as u16,
+            collation_id,
+            0,
+        )
+        .unwrap()
+    }
+
+    fn domain_rank_stats(rank: u32) -> ZoneStatsEntry {
+        ZoneStatsEntry {
+            table_id: 1,
+            segment_id: 10,
+            morsel_id: 0,
+            column_id: 1,
+            non_null_count: 1,
+            distinct_count: 1,
+            run_count: 1,
+            stats: ZoneStats {
+                scope: ZoneScope::Morsel,
+                row_count: 1,
+                null_count: 0,
+                min: None,
+                max: None,
+                flags: ZoneStatFlags::HAS_DOMAIN_RANGE,
+            },
+            min_domain_rank: rank,
+            max_domain_rank: rank,
+            exact_set_ref: u32::MAX,
+            bloom_ref: u32::MAX,
+        }
+    }
+
+    #[test]
+    fn planning_cache_rejects_unordered_filecode_domain_and_dependent_stats() {
+        let table = filecode_table(0);
+        let segments = vec![segment(10, 0, 1)];
+        let pruning = PruningMetadata {
+            column_domains: Arc::new(vec![filecode_domain(0)]),
+            zone_stats: Arc::new(vec![ZoneStatsSection {
+                entries: vec![domain_rank_stats(0)],
+            }]),
+            ..PruningMetadata::default()
+        };
+
+        let cache = PlanningCache::build(&table, &segments, &pruning);
+        assert!(cache.column_domain_by_id.is_empty());
+        assert!(cache.zone_stat_by_key.is_empty());
+    }
+
+    #[test]
+    fn planning_cache_rejects_domain_rank_stats_outside_domain_count() {
+        let table = filecode_table(1);
+        let segments = vec![segment(10, 0, 1)];
+        let pruning = PruningMetadata {
+            column_domains: Arc::new(vec![filecode_domain(1)]),
+            zone_stats: Arc::new(vec![ZoneStatsSection {
+                entries: vec![domain_rank_stats(1)],
+            }]),
+            ..PruningMetadata::default()
+        };
+
+        let cache = PlanningCache::build(&table, &segments, &pruning);
+        assert_eq!(cache.column_domain_by_id.get(&1), Some(&0));
+        assert!(cache.zone_stat_by_key.is_empty());
+    }
+
+    #[test]
+    fn planning_cache_accepts_registered_known_collation_id() {
+        let table = filecode_table(100);
+        let segments = vec![segment(10, 0, 1)];
+        let pruning = PruningMetadata {
+            collation_registry: Some(Arc::new(CollationRegistry {
+                entries: vec![CollationEntry {
+                    collation_id: 100,
+                    name: "utf8-bytewise".into(),
+                    version: "v2".into(),
+                    flags: 0,
+                    kind: Some(CollationKind::Utf8Bytewise),
+                }],
+            })),
+            column_domains: Arc::new(vec![filecode_domain(100)]),
+            zone_stats: Arc::new(vec![ZoneStatsSection {
+                entries: vec![domain_rank_stats(0)],
+            }]),
+            ..PruningMetadata::default()
+        };
+
+        let cache = PlanningCache::build(&table, &segments, &pruning);
+        assert_eq!(cache.column_domain_by_id.get(&1), Some(&0));
+        assert_eq!(cache.zone_stat_by_key.get(&(10, 0, 1)), Some(&(0, 0)));
     }
 
     #[test]

@@ -20,6 +20,7 @@ use cove_arrow::arrow::ArrowExportOptions;
 use cove_cache::CoverageCacheEntryV2;
 use cove_core::{
     codec::CodecExtensionDescriptorV2,
+    collation::CollationRegistry,
     constants::{CompressionCodec, CovePhysicalKind, PrimaryProfile, SectionKind},
     domain::ColumnDomain,
     feature_binding::OperationKindV2,
@@ -69,13 +70,14 @@ use crate::{
 pub use pruning_sections::{
     embedded_coverage_snapshot_validity_ref, parse_aggregates_from_sections,
     parse_blooms_from_sections, parse_codec_descriptors_from_sections,
-    parse_column_domains_from_sections, parse_composites_from_sections,
+    parse_collation_registry_from_sections, parse_column_domains_from_sections,
+    parse_column_domains_from_sections_excluding, parse_composites_from_sections,
     parse_coverage_plan_candidates_from_sections, parse_coverage_proofs_from_sections,
     parse_coverage_providers_from_sections, parse_coverage_sets_from_sections,
     parse_exact_sets_from_sections, parse_inverted_from_sections, parse_lookups_from_sections,
     parse_predicate_forms_from_sections, parse_predicate_forms_with_payloads_from_sections,
     parse_topn_from_sections, parse_zone_stats_from_sections,
-    selected_coverage_snapshot_validity_ref,
+    parse_zone_stats_from_sections_excluding, selected_coverage_snapshot_validity_ref,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -179,6 +181,7 @@ impl Default for CoverageCacheMetadata {
 #[derive(Debug, Clone, Default)]
 pub struct PruningMetadata {
     pub selected_coverage_snapshot_validity_ref: Option<u32>,
+    pub collation_registry: Option<Arc<CollationRegistry>>,
     pub nested_schemas: Arc<Vec<NestedSchemaSectionV1>>,
     pub codec_descriptors: Arc<Vec<CodecExtensionDescriptorV2>>,
     pub column_domains: Arc<Vec<ColumnDomain>>,

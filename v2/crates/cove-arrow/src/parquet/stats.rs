@@ -5,9 +5,9 @@ type ScalarZoneStats = (StatKind, Vec<u8>, Vec<u8>, u32, u32, ZoneStatFlags);
 
 pub(super) fn build_column_domains(
     columns: &[ConvertedColumn],
-    dictionary_entry_count: Option<u32>,
+    dictionary: Option<&FileDictionary>,
 ) -> Result<Vec<ColumnDomain>, CoveError> {
-    let Some(dictionary_entry_count) = dictionary_entry_count else {
+    let Some(dictionary) = dictionary else {
         return Ok(Vec::new());
     };
     let mut domains = Vec::new();
@@ -15,17 +15,27 @@ pub(super) fn build_column_domains(
         let MaterializedValues::FileCode(codes) = &column.values else {
             continue;
         };
-        let sorted_codes = codes
+        let mut sorted_codes = codes
             .iter()
             .enumerate()
             .filter_map(|(row, code)| (!column.is_null(row)).then_some(*code))
-            .collect::<BTreeSet<_>>();
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
         if sorted_codes.is_empty() {
             continue;
         }
+        let mut sort_keys = BTreeMap::new();
+        for code in &sorted_codes {
+            sort_keys.insert(
+                *code,
+                dictionary_domain_sort_key(column.entry.logical, dictionary, *code)?,
+            );
+        }
+        sorted_codes.sort_by(|left, right| sort_keys[left].cmp(&sort_keys[right]));
         let domain = ColumnDomain::from_sorted_present_codes(
-            &sorted_codes.into_iter().collect::<Vec<_>>(),
-            dictionary_entry_count,
+            &sorted_codes,
+            dictionary.len(),
             1,
             column.entry.column_id,
             column.entry.logical as u16,
@@ -35,6 +45,42 @@ pub(super) fn build_column_domains(
         domains.push(domain);
     }
     Ok(domains)
+}
+
+fn dictionary_domain_sort_key(
+    logical: CoveLogicalType,
+    dictionary: &FileDictionary,
+    file_code: u32,
+) -> Result<Vec<u8>, CoveError> {
+    let entry = dictionary.get_entry(file_code)?;
+    let bytes = match dictionary.decode_value(file_code)? {
+        DictionaryValue::RawBytes(bytes) => bytes,
+        DictionaryValue::RedactedPresent => return Err(CoveError::BadDomain),
+        _ => return Err(CoveError::BadDomain),
+    };
+    match logical {
+        CoveLogicalType::Utf8 | CoveLogicalType::Binary => {
+            let (len, prefix_len) =
+                wire::decode_u64_leb128(&bytes).map_err(|_| CoveError::BadDomain)?;
+            let len = usize::try_from(len).map_err(|_| CoveError::BadDomain)?;
+            let end = prefix_len
+                .checked_add(len)
+                .ok_or(CoveError::ArithOverflow)?;
+            if end != bytes.len() {
+                return Err(CoveError::BadDomain);
+            }
+            Ok(bytes[prefix_len..end].to_vec())
+        }
+        _ => Err(CoveError::BadDomain),
+    }
+    .and_then(|key| {
+        let tag = ValueTag::from_u16(entry.value_tag).ok_or(CoveError::BadDomain)?;
+        match (logical, tag) {
+            (CoveLogicalType::Utf8, ValueTag::Utf8)
+            | (CoveLogicalType::Binary, ValueTag::Binary) => Ok(key),
+            _ => Err(CoveError::BadDomain),
+        }
+    })
 }
 
 pub(super) fn build_zone_stats(

@@ -16,6 +16,7 @@ pub const STAT_SCALAR_ENCODED_LEN: usize = 20;
 pub const ZONE_STATS_ENTRY_LEN: usize = 96;
 const STAT_SCALAR_FLAG_TRUNCATED: u8 = 1 << 0;
 const STAT_SCALAR_KNOWN_FLAGS: u8 = STAT_SCALAR_FLAG_TRUNCATED;
+const ZONE_STAT_KNOWN_FLAGS: u32 = (1 << 11) - 1;
 
 /// Scope at which a [`ZoneStats`] applies (Spec §28.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -340,6 +341,9 @@ impl ZoneStatsSection {
 impl ZoneStats {
     /// Spec §28.5 safety invariants.
     pub fn validate(&self) -> Result<(), CoveError> {
+        if self.flags.bits() & !ZONE_STAT_KNOWN_FLAGS != 0 {
+            return Err(CoveError::BadStats);
+        }
         if self.null_count > self.row_count {
             return Err(CoveError::BadStats);
         }
@@ -588,6 +592,12 @@ mod tests {
             0,
             ZoneStatFlags::SORTED_ASC | ZoneStatFlags::SORTED_DESC,
         );
+        assert_eq!(s.validate(), Err(CoveError::BadStats));
+    }
+
+    #[test]
+    fn spec_28_reserved_zone_stat_flags_rejected() {
+        let s = stats(None, None, 1, 0, ZoneStatFlags::from_bits(1 << 31));
         assert_eq!(s.validate(), Err(CoveError::BadStats));
     }
 

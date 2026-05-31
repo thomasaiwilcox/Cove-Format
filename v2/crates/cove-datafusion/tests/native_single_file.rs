@@ -30,9 +30,9 @@ use cove_core::{
     },
     constants::{
         CoveEncodingKind, CoveLogicalType, CovePhysicalKind, PrimaryProfile, SectionKind,
-        StorageClass, ValueTag, FEATURE_ENGINE_PROFILE, FEATURE_EXTENDED_FEATURE_SET,
-        FEATURE_REDACTIONS, FEATURE_REGISTERED_ENCODINGS, FEATURE_SEMANTIC_MAP,
-        FEATURE_TABLE_PROFILE,
+        StorageClass, ValueTag, FEATURE_COLUMN_DOMAINS, FEATURE_ENGINE_PROFILE,
+        FEATURE_EXTENDED_FEATURE_SET, FEATURE_REDACTIONS, FEATURE_REGISTERED_ENCODINGS,
+        FEATURE_SEMANTIC_MAP, FEATURE_TABLE_PROFILE,
     },
     dictionary::{FileDictionary, FileDictionaryHeaderV1, FileDictionaryIndexEntryV1},
     domain::ColumnDomain,
@@ -4861,12 +4861,13 @@ fn dictionary_items_file_with_domain_stats() -> Vec<u8> {
             clustering_key_count: 0,
             flags: 0,
             columns: vec![
-                column(
+                column_with_collation(
                     1,
                     "name",
                     CoveLogicalType::Utf8,
                     CovePhysicalKind::FileCode,
                     false,
+                    1,
                 ),
                 column(
                     2,
@@ -5238,6 +5239,19 @@ fn column(
     }
 }
 
+fn column_with_collation(
+    column_id: u32,
+    name: &str,
+    logical: CoveLogicalType,
+    physical: CovePhysicalKind,
+    nullable: bool,
+    collation_id: u16,
+) -> ColumnEntry {
+    let mut column = column(column_id, name, logical, physical, nullable);
+    column.collation_id = collation_id;
+    column
+}
+
 fn numcode_page(row_count: u32, payload: Vec<u8>) -> ScanPageSpec {
     ScanPageSpec::new(row_count, payload).with_encoding_root(CoveEncodingKind::NumCode as u32)
 }
@@ -5322,7 +5336,7 @@ fn column_domain_section() -> SectionPayload {
         7,
         1,
         CoveLogicalType::Utf8 as u16,
-        0,
+        1,
         0,
     )
     .unwrap();
@@ -5335,7 +5349,7 @@ fn column_domain_section() -> SectionPayload {
         compression: 0,
         alignment_log2: 0,
         required_features: 0,
-        optional_features: 0,
+        optional_features: FEATURE_COLUMN_DOMAINS,
         data: domain.serialize().unwrap(),
     }
 }

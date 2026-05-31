@@ -500,10 +500,13 @@ mod tests {
             ProfileCapabilityMatrixV2,
         },
         footer::FOOTER_HEADER_SIZE,
+        page::{PAGE_FLAG_ALL_NON_NULL, PAGE_FLAG_STATS_ONLY_CONSTANT},
         postscript::POSTSCRIPT_TOTAL_SIZE,
         segment::TableSegmentPayloadV1,
         table::{ColumnEntry, TableCatalog, TableEntry},
-        writer::{MinimalCoveWriter, ScanProfileCoveWriter, ScanSegment, SectionPayload},
+        writer::{
+            MinimalCoveWriter, ScanPageSpec, ScanProfileCoveWriter, ScanSegment, SectionPayload,
+        },
         zone_stats::{
             StatKind, StatScalar, ZoneStatFlags, ZoneStats, ZoneStatsEntry, ZoneStatsSection,
         },
@@ -605,6 +608,14 @@ mod tests {
         logical: crate::constants::CoveLogicalType,
         physical: crate::constants::CovePhysicalKind,
     ) -> TableCatalog {
+        single_column_catalog_with_collation(logical, physical, 0)
+    }
+
+    fn single_column_catalog_with_collation(
+        logical: crate::constants::CoveLogicalType,
+        physical: crate::constants::CovePhysicalKind,
+        collation_id: u16,
+    ) -> TableCatalog {
         TableCatalog {
             flags: 0,
             tables: vec![TableEntry {
@@ -622,7 +633,7 @@ mod tests {
                     physical,
                     nullable: false,
                     sort_order: 0,
-                    collation_id: 0,
+                    collation_id,
                     precision: 0,
                     scale: 0,
                     flags: 0,
@@ -992,6 +1003,69 @@ mod tests {
             )
             .unwrap_err(),
             CoveError::BadDomain
+        );
+    }
+
+    #[test]
+    fn fail_open_ignores_semantically_invalid_optional_column_domain() {
+        let dictionary = crate::dictionary::FileDictionaryEncoding::from_keys([
+            crate::dictionary::FileDictionaryKey::from_logical_bytes(
+                crate::constants::CoveLogicalType::Utf8,
+                b"red",
+            )
+            .unwrap(),
+        ])
+        .unwrap()
+        .dictionary;
+        let catalog = single_column_catalog_with_collation(
+            crate::constants::CoveLogicalType::Utf8,
+            crate::constants::CovePhysicalKind::FileCode,
+            0,
+        );
+        let domain = crate::domain::ColumnDomain::from_sorted_present_codes(
+            &[0],
+            1,
+            1,
+            1,
+            crate::constants::CoveLogicalType::Utf8 as u16,
+            0,
+            0,
+        )
+        .unwrap();
+        let mut writer = ScanProfileCoveWriter::new(catalog);
+        writer.push_file_dictionary(&dictionary);
+        writer.push_column_domain(&domain).unwrap();
+        writer.push_segment(ScanSegment::new(1, 0, 0, 1, 1));
+        let bytes = writer.write().unwrap();
+
+        assert_eq!(
+            validate_bytes_with_options(
+                &bytes,
+                ValidationOptions {
+                    semantic: true,
+                    verify_digests: false,
+                    allow_unknown_optional_extensions: true,
+                    optional_pushdown_policy: OptionalPushdownPolicy::Strict,
+                },
+            )
+            .unwrap_err(),
+            CoveError::BadDomain
+        );
+
+        let report = validate_bytes_with_options(
+            &bytes,
+            ValidationOptions {
+                semantic: true,
+                verify_digests: false,
+                allow_unknown_optional_extensions: true,
+                optional_pushdown_policy: OptionalPushdownPolicy::FailOpen,
+            },
+        )
+        .unwrap();
+        assert_eq!(report.ignored_optional_sections.len(), 1);
+        assert_eq!(
+            report.ignored_optional_sections[0].section_kind,
+            SectionKind::ColumnDomain as u16
         );
     }
 
@@ -1773,6 +1847,100 @@ mod tests {
     }
 
     #[test]
+    fn fail_open_ignores_optional_zone_stats_wrong_morsel_row_count() {
+        let catalog = single_column_catalog(
+            crate::constants::CoveLogicalType::Int64,
+            crate::constants::CovePhysicalKind::NumCode,
+        );
+        let mut writer = ScanProfileCoveWriter::new(catalog);
+        writer
+            .push_zone_stats(&ZoneStatsSection {
+                entries: vec![zone_stats_entry(
+                    2,
+                    StatKind::Int64,
+                    7i64.to_le_bytes().to_vec(),
+                    ZoneStatFlags::HAS_MIN_MAX | ZoneStatFlags::CONSTANT,
+                )],
+            })
+            .unwrap();
+        writer.push_segment(ScanSegment::new(1, 0, 0, 1, 1));
+
+        let report = validate_bytes_with_options(
+            &writer.write().unwrap(),
+            ValidationOptions {
+                semantic: true,
+                verify_digests: false,
+                allow_unknown_optional_extensions: true,
+                optional_pushdown_policy: OptionalPushdownPolicy::FailOpen,
+            },
+        )
+        .unwrap();
+        assert!(report.ignored_optional_sections.is_empty());
+    }
+
+    #[test]
+    fn fail_open_preserves_zone_stats_refs_for_required_stats_only_page() {
+        let catalog = single_column_catalog(
+            crate::constants::CoveLogicalType::Int64,
+            crate::constants::CovePhysicalKind::NumCode,
+        );
+        let mut writer = ScanProfileCoveWriter::new(catalog);
+        writer
+            .push_zone_stats(&ZoneStatsSection {
+                entries: vec![
+                    zone_stats_entry(
+                        2,
+                        StatKind::Int64,
+                        7i64.to_le_bytes().to_vec(),
+                        ZoneStatFlags::HAS_MIN_MAX | ZoneStatFlags::CONSTANT,
+                    ),
+                    zone_stats_entry(
+                        1,
+                        StatKind::Int64,
+                        7i64.to_le_bytes().to_vec(),
+                        ZoneStatFlags::HAS_MIN_MAX | ZoneStatFlags::CONSTANT,
+                    ),
+                ],
+            })
+            .unwrap();
+        let mut page = ScanPageSpec::new(1, Vec::new())
+            .with_counts(1, 0)
+            .with_encoding_root(u32::MAX)
+            .with_flags(PAGE_FLAG_STATS_ONLY_CONSTANT | PAGE_FLAG_ALL_NON_NULL);
+        page.stats_ref = 1;
+        let mut segment = ScanSegment::new(1, 0, 0, 1, 1);
+        segment.set_column_pages(1, vec![page]);
+        writer.push_segment(segment);
+        let bytes = writer.write().unwrap();
+
+        assert_eq!(
+            validate_bytes_with_options(
+                &bytes,
+                ValidationOptions {
+                    semantic: true,
+                    verify_digests: false,
+                    allow_unknown_optional_extensions: true,
+                    ..ValidationOptions::default()
+                },
+            )
+            .unwrap_err(),
+            CoveError::BadStats
+        );
+
+        let report = validate_bytes_with_options(
+            &bytes,
+            ValidationOptions {
+                semantic: true,
+                verify_digests: false,
+                allow_unknown_optional_extensions: true,
+                optional_pushdown_policy: OptionalPushdownPolicy::FailOpen,
+            },
+        )
+        .unwrap();
+        assert!(report.ignored_optional_sections.is_empty());
+    }
+
+    #[test]
     fn semantic_validation_rejects_zone_stats_wrong_scalar_kind() {
         let catalog = single_column_catalog(
             crate::constants::CoveLogicalType::Int64,
@@ -1843,6 +2011,77 @@ mod tests {
                     },
                     min_domain_rank: 0,
                     max_domain_rank: 0,
+                    exact_set_ref: u32::MAX,
+                    bloom_ref: u32::MAX,
+                }],
+            })
+            .unwrap();
+        writer.push_segment(ScanSegment::new(1, 0, 0, 1, 1));
+
+        assert_eq!(
+            validate_bytes_with_options(
+                &writer.write().unwrap(),
+                ValidationOptions {
+                    semantic: true,
+                    verify_digests: false,
+                    allow_unknown_optional_extensions: true,
+                    ..ValidationOptions::default()
+                },
+            )
+            .unwrap_err(),
+            CoveError::BadStats
+        );
+    }
+
+    #[test]
+    fn semantic_validation_rejects_filecode_domain_rank_outside_domain_count() {
+        let dictionary = crate::dictionary::FileDictionaryEncoding::from_keys([
+            crate::dictionary::FileDictionaryKey::from_logical_bytes(
+                crate::constants::CoveLogicalType::Utf8,
+                b"red",
+            )
+            .unwrap(),
+        ])
+        .unwrap()
+        .dictionary;
+        let catalog = single_column_catalog_with_collation(
+            crate::constants::CoveLogicalType::Utf8,
+            crate::constants::CovePhysicalKind::FileCode,
+            1,
+        );
+        let domain = crate::domain::ColumnDomain::from_sorted_present_codes(
+            &[0],
+            1,
+            1,
+            1,
+            crate::constants::CoveLogicalType::Utf8 as u16,
+            1,
+            0,
+        )
+        .unwrap();
+        let mut writer = ScanProfileCoveWriter::new(catalog);
+        writer.push_file_dictionary(&dictionary);
+        writer.push_column_domain(&domain).unwrap();
+        writer
+            .push_zone_stats(&ZoneStatsSection {
+                entries: vec![ZoneStatsEntry {
+                    table_id: 1,
+                    segment_id: 0,
+                    morsel_id: 0,
+                    column_id: 1,
+                    non_null_count: 1,
+                    distinct_count: 1,
+                    run_count: 1,
+                    stats: ZoneStats {
+                        scope: crate::zone_stats::ZoneScope::Morsel,
+                        row_count: 1,
+                        null_count: 0,
+                        min: None,
+                        max: None,
+                        flags: ZoneStatFlags::HAS_DOMAIN_RANGE | ZoneStatFlags::CONSTANT,
+                    },
+                    min_domain_rank: 1,
+                    max_domain_rank: 1,
                     exact_set_ref: u32::MAX,
                     bloom_ref: u32::MAX,
                 }],

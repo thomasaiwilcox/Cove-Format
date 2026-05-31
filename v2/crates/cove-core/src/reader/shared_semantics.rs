@@ -1,8 +1,8 @@
 use std::borrow::Cow;
 
 use crate::{
-    compression, constants::SectionKind, dictionary::FileDictionaryView, footer::CoveFooter,
-    CoveError,
+    collation::CollationRegistry, compression, constants::SectionKind,
+    dictionary::FileDictionaryView, footer::CoveFooter, CoveError,
 };
 
 pub(super) fn parse_validation_dictionary<'a>(
@@ -28,4 +28,19 @@ pub(super) fn parse_validation_dictionary<'a>(
     let dictionary = FileDictionaryView::parse(index_bytes, payload_bytes)?;
     dictionary.validate_all()?;
     Ok(Some(dictionary))
+}
+
+pub(super) fn parse_validation_collation_registry(
+    data: &[u8],
+    footer: &CoveFooter,
+) -> Result<Option<CollationRegistry>, CoveError> {
+    let Some(entry) = footer
+        .sections
+        .iter()
+        .find(|entry| entry.section_kind == SectionKind::CollationRegistry as u16)
+    else {
+        return Ok(None);
+    };
+    let payload = compression::section_payload(data, entry)?;
+    CollationRegistry::parse(&payload).map(Some)
 }

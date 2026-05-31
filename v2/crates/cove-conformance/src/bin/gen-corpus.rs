@@ -1474,7 +1474,7 @@ fn main() {
             None,
             &["§22"],
         ),
-        collation_registry_payload(&[("utf8-bytewise", b""), ("signed-numeric", b"")]),
+        collation_registry_payload(&[(1, "utf8-bytewise", ""), (3, "signed-numeric", "")]),
     );
 
     write_fixture(
@@ -9890,22 +9890,28 @@ fn set_cove_scoped_feature_section_ids(
     bytes[156..160].copy_from_slice(&header_crc.to_le_bytes());
 }
 
-fn collation_registry_payload(entries: &[(&str, &[u8])]) -> Vec<u8> {
+fn collation_registry_payload(entries: &[(u16, &str, &str)]) -> Vec<u8> {
     let mut out = (entries.len() as u32).to_le_bytes().to_vec();
-    for (name, metadata) in entries {
+    out.extend_from_slice(&0u32.to_le_bytes());
+    for (collation_id, name, version) in entries {
+        out.extend_from_slice(&collation_id.to_le_bytes());
         out.extend_from_slice(&(name.len() as u16).to_le_bytes());
         out.extend_from_slice(name.as_bytes());
-        out.extend_from_slice(&(metadata.len() as u16).to_le_bytes());
-        out.extend_from_slice(metadata);
+        out.extend_from_slice(&(version.len() as u16).to_le_bytes());
+        out.extend_from_slice(version.as_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
     }
     out
 }
 
 fn collation_registry_bad_utf8_payload() -> Vec<u8> {
     let mut out = 1u32.to_le_bytes().to_vec();
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
     out.extend_from_slice(&1u16.to_le_bytes());
     out.push(0xff);
     out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
     out
 }
 

@@ -153,7 +153,8 @@ pub async fn bootstrap_range_reader_with_options<R: CoveRangeReader + ?Sized>(
     let feature_scope_table = parse_feature_scope_table(reader, &header, &footer).await?;
     feature_scope_table
         .reject_unknowns_for_request(&ordinary_table_scan_feature_use_request(&footer))?;
-    validate_ordinary_table_scan_semantics(file_len, reader, &footer).await?;
+    let ignored_optional_sections =
+        validate_ordinary_table_scan_semantics(file_len, reader, &footer).await?;
     if options.execution_code_policy() == ExecutionCodePolicy::RequireSupported {
         validate_required_engine_execution_semantics(file_len, reader).await?;
     }
@@ -175,7 +176,14 @@ pub async fn bootstrap_range_reader_with_options<R: CoveRangeReader + ?Sized>(
         .into_iter()
         .filter(|segment| segment.table_id == table.table_id)
         .collect::<Vec<_>>();
-    let pruning = parse_pruning_metadata(reader, &header, file_len, &footer).await?;
+    let pruning = parse_pruning_metadata(
+        reader,
+        &header,
+        file_len,
+        &footer,
+        &ignored_optional_sections,
+    )
+    .await?;
     let layout = parse_layout_metadata(reader, &header, &footer, &table, &segments).await;
 
     let state = Arc::new(DatasetState::from_metadata_with_options_and_feature_scope(
@@ -209,11 +217,11 @@ async fn validate_ordinary_table_scan_semantics<R: CoveRangeReader + ?Sized>(
     file_len: u64,
     reader: &R,
     footer: &cove_core::footer::CoveFooter,
-) -> Result<(), CoveError> {
+) -> Result<Vec<reader::IgnoredOptionalSection>, CoveError> {
     let bytes = reader
         .read_range(0..file_len, RangeReadKind::Metadata)
         .await?;
-    reader::validate_bytes_for_ordinary_table_scan(
+    let report = reader::validate_bytes_for_ordinary_table_scan(
         &bytes,
         ValidationOptions {
             semantic: true,
@@ -223,7 +231,7 @@ async fn validate_ordinary_table_scan_semantics<R: CoveRangeReader + ?Sized>(
         },
         ordinary_table_scan_feature_use_request(footer),
     )?;
-    Ok(())
+    Ok(report.ignored_optional_sections)
 }
 
 async fn validate_required_engine_execution_semantics<R: CoveRangeReader + ?Sized>(

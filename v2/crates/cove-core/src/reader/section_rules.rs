@@ -49,6 +49,7 @@ pub(super) fn is_optional_advisory_section(kind: SectionKind) -> bool {
     matches!(
         kind,
         SectionKind::ColumnDomain
+            | SectionKind::ZoneStats
             | SectionKind::ExactSetIndex
             | SectionKind::BloomIndex
             | SectionKind::InvertedMorselIndex
@@ -269,7 +270,6 @@ fn is_table_scan_section(kind: SectionKind) -> bool {
             | SectionKind::FileDictionaryIndex
             | SectionKind::FileDictionaryPayload
             | SectionKind::NestedSchema
-            | SectionKind::ZoneStats
             | SectionKind::CodecExtensionRegistry
     )
 }
@@ -339,7 +339,6 @@ mod tests {
             SectionKind::FileDictionaryIndex,
             SectionKind::FileDictionaryPayload,
             SectionKind::NestedSchema,
-            SectionKind::ZoneStats,
             SectionKind::CodecExtensionRegistry,
         ] {
             assert!(

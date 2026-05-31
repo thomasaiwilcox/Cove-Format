@@ -1,6 +1,7 @@
 use cove_core::{
     checksum,
     codec::CodecExtensionDescriptorV2,
+    collation::CollationRegistry,
     compression,
     constants::SectionKind,
     domain::ColumnDomain,
@@ -10,6 +11,7 @@ use cove_core::{
         exact_set::ExactSetIndex, inverted::InvertedMorselIndex, lookup::LookupIndex,
         topn::TopNSummary,
     },
+    reader::IgnoredOptionalSection,
     zone_stats::ZoneStatsSection,
 };
 use cove_coverage::{
@@ -76,10 +78,35 @@ fn is_coverage_section_kind(section_kind: u16) -> bool {
 }
 
 pub fn parse_column_domains_from_sections(bytes: &[u8], footer: &CoveFooter) -> Vec<ColumnDomain> {
+    parse_column_domains_from_sections_excluding(bytes, footer, &[])
+}
+
+pub fn parse_collation_registry_from_sections(
+    bytes: &[u8],
+    footer: &CoveFooter,
+) -> Option<CollationRegistry> {
+    footer
+        .sections
+        .iter()
+        .find(|entry| entry.section_kind == SectionKind::CollationRegistry as u16)
+        .and_then(|entry| compression::section_payload(bytes, entry).ok())
+        .and_then(|payload| CollationRegistry::parse(&payload).ok())
+}
+
+pub fn parse_column_domains_from_sections_excluding(
+    bytes: &[u8],
+    footer: &CoveFooter,
+    ignored: &[IgnoredOptionalSection],
+) -> Vec<ColumnDomain> {
     footer
         .sections
         .iter()
         .filter(|entry| entry.section_kind == SectionKind::ColumnDomain as u16)
+        .filter(|entry| {
+            !ignored
+                .iter()
+                .any(|ignored| ignored.section_id == entry.section_id)
+        })
         .filter_map(|entry| compression::section_payload(bytes, entry).ok())
         .filter_map(|payload| ColumnDomain::parse(&payload).ok())
         .collect()
@@ -100,10 +127,23 @@ pub fn parse_codec_descriptors_from_sections(
 }
 
 pub fn parse_zone_stats_from_sections(bytes: &[u8], footer: &CoveFooter) -> Vec<ZoneStatsSection> {
+    parse_zone_stats_from_sections_excluding(bytes, footer, &[])
+}
+
+pub fn parse_zone_stats_from_sections_excluding(
+    bytes: &[u8],
+    footer: &CoveFooter,
+    ignored: &[IgnoredOptionalSection],
+) -> Vec<ZoneStatsSection> {
     footer
         .sections
         .iter()
         .filter(|entry| entry.section_kind == SectionKind::ZoneStats as u16)
+        .filter(|entry| {
+            !ignored
+                .iter()
+                .any(|ignored| ignored.section_id == entry.section_id)
+        })
         .filter_map(|entry| compression::section_payload(bytes, entry).ok())
         .filter_map(|payload| ZoneStatsSection::parse(&payload).ok())
         .collect()
