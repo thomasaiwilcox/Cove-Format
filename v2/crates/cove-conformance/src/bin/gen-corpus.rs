@@ -588,7 +588,7 @@ fn main() {
             "reject/cove_t_stats_only_all_non_null_wrong_scope.cove",
             "cove",
             "reject",
-            Some("COVE_E_PAGE_CORRUPT"),
+            Some("COVE_E_BAD_STATS"),
             &["§27.2", "§28", "§73"],
         ),
         cove_t_payload_elision_stats_only_all_non_null_file(

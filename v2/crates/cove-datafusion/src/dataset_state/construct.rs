@@ -196,7 +196,7 @@ impl DatasetState {
             flags: 0,
         };
         let file_table = FileTable::from_files(std::slice::from_ref(&file))?;
-        let planning_cache = PlanningCache::build(table.as_ref(), &pruning);
+        let planning_cache = PlanningCache::build(table.as_ref(), segments.as_slice(), &pruning);
 
         let mut bootstrap_stats = single_file_bootstrap_stats();
         bootstrap_stats.add_layout_metadata(&layout);
@@ -330,7 +330,7 @@ impl DatasetState {
             flags: 0,
         };
         let file_table = FileTable::from_files(std::slice::from_ref(&file))?;
-        let planning_cache = PlanningCache::build(table.as_ref(), &pruning);
+        let planning_cache = PlanningCache::build(table.as_ref(), segments.as_slice(), &pruning);
 
         let mut bootstrap_stats = single_file_bootstrap_stats();
         bootstrap_stats.add_layout_metadata(&layout);
@@ -400,7 +400,8 @@ impl DatasetState {
         let pruning = primary.pruning.clone();
         let layout = primary.layout.clone();
         let coverage_cache = primary.coverage_cache.clone();
-        let planning_cache = PlanningCache::build(&logical_table, &pruning);
+        let planning_cache =
+            PlanningCache::build(&logical_table, primary.segments.as_slice(), &pruning);
         Ok(Self {
             identity: FileIdentity {
                 source: source.into(),
@@ -434,7 +435,8 @@ impl DatasetState {
     pub fn single_file_view(&self, file_ordinal: usize) -> Result<Self, CoveError> {
         let file = self.file(file_ordinal)?.clone();
         let file_table = FileTable::from_files(std::slice::from_ref(&file))?;
-        let planning_cache = PlanningCache::build(file.table.as_ref(), &file.pruning);
+        let planning_cache =
+            PlanningCache::build(file.table.as_ref(), file.segments.as_slice(), &file.pruning);
         let schema = Arc::new(schema_for_table(
             file.table.as_ref(),
             file.mounted.dictionary.is_some(),

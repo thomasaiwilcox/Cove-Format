@@ -5317,7 +5317,7 @@ fn redaction_manifest_section() -> SectionPayload {
 
 fn column_domain_section() -> SectionPayload {
     let domain = ColumnDomain::from_sorted_present_codes(
-        &[0, 1],
+        &[1, 0],
         2,
         7,
         1,
@@ -5342,8 +5342,8 @@ fn column_domain_section() -> SectionPayload {
 
 fn filecode_zone_stats_section() -> SectionPayload {
     let entries = vec![
-        filecode_zone_stats_entry(0, 0),
-        filecode_zone_stats_entry(1, 1),
+        filecode_zone_stats_entry(0, 1),
+        filecode_zone_stats_entry(1, 0),
     ];
     let section = ZoneStatsSection { entries };
     SectionPayload {

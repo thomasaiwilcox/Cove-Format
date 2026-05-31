@@ -16,8 +16,9 @@
 //! a `u32` per Spec §6.1.
 //!
 //! Spec §23 Rules enforced by this module:
-//! * `sorted_file_codes` MUST be sorted in ascending order; duplicates are
-//!   rejected.
+//! * `sorted_file_codes` MUST be sorted by logical value order; this module
+//!   rejects duplicates, while semantic validation binds the logical order to
+//!   the file dictionary and declared collation.
 //! * `file_code_to_rank` maps `FileCode` → domain rank.
 //! * Values absent from the column MAY map to [`INVALID_RANK`].
 //! * Readers MUST validate ranks before using domain min/max — see
@@ -153,11 +154,11 @@ impl ColumnDomain {
             let off = sfc_off + i * 4;
             sorted_file_codes.push(u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap()));
         }
-        // Spec §23: sorted_file_codes MUST be sorted by logical value order.
-        // We require strict ascending (no duplicates) since duplicates would
-        // collapse two ranks onto one FileCode.
-        for w in sorted_file_codes.windows(2) {
-            if w[0] >= w[1] {
+        // Logical sort order depends on the dictionary and collation, so the
+        // structural parser can only reject duplicate FileCodes here.
+        let mut seen = std::collections::BTreeSet::new();
+        for &code in &sorted_file_codes {
+            if !seen.insert(code) {
                 return Err(CoveError::BadDomain);
             }
         }
@@ -270,8 +271,9 @@ impl ColumnDomain {
         collation_id: u16,
         flags: u32,
     ) -> Result<Self, CoveError> {
-        for w in sorted_codes.windows(2) {
-            if w[0] >= w[1] {
+        let mut seen = std::collections::BTreeSet::new();
+        for &code in sorted_codes {
+            if !seen.insert(code) {
                 return Err(CoveError::BadDomain);
             }
         }
@@ -375,11 +377,12 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsorted_sorted_file_codes() {
+    fn accepts_non_numeric_sorted_file_codes_for_semantic_validation() {
         let mut d = sample();
         d.sorted_file_codes = vec![3, 1, 4];
+        d.file_code_to_rank = vec![INVALID_RANK, 1, INVALID_RANK, 0, 2];
         let bytes = d.serialize().unwrap();
-        assert_eq!(ColumnDomain::parse(&bytes), Err(CoveError::BadDomain));
+        assert!(ColumnDomain::parse(&bytes).unwrap().is_safe());
     }
 
     #[test]

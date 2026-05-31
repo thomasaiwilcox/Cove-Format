@@ -10,12 +10,13 @@ use crate::{
     compression,
     constants::{
         CoveEncodingKind, CoveLogicalType, CovePhysicalKind, PrimaryProfile, SectionKind,
-        StorageClass, FEATURE_ENGINE_PROFILE, FEATURE_EXTENSION_REGISTRY, FEATURE_FILE_DICTIONARY,
-        FEATURE_HARBOR_PROFILE, FEATURE_OBJECT_PROFILE, FEATURE_SEMANTIC_MAP,
+        StorageClass, ValueTag, FEATURE_ENGINE_PROFILE, FEATURE_EXTENSION_REGISTRY,
+        FEATURE_FILE_DICTIONARY, FEATURE_HARBOR_PROFILE, FEATURE_OBJECT_PROFILE,
+        FEATURE_SEMANTIC_MAP,
     },
-    dictionary::FileDictionaryView,
+    dictionary::{DictionaryValue, FileDictionaryView},
     digest::DigestManifest,
-    domain::ColumnDomain,
+    domain::{ColumnDomain, FLAG_OBJECT_DOMAIN},
     extensions::{ExtensionRegistry, ExtensionValidationContext},
     feature_binding::OperationKindV2,
     feature_scope::{FeatureTargetRefV2, FeatureUseRequestV2},
@@ -63,7 +64,7 @@ use crate::{
         numcode_as_timestamp_nanos, numcode_as_u16, numcode_as_u32, numcode_as_u64, numcode_as_u8,
     },
     validity::ValidityBitmap,
-    zone_stats::{ZoneStatsEntry, ZoneStatsSection},
+    zone_stats::{StatKind, ZoneStatFlags, ZoneStatsEntry, ZoneStatsSection},
     CoveError,
 };
 
@@ -260,6 +261,7 @@ pub(super) fn validate_shared_semantics(
                 {
                     let _ = optional_section_payload(
                         data,
+                        &validated.header,
                         entry,
                         opts.optional_pushdown_policy,
                         ignored_optional_sections,
@@ -366,6 +368,7 @@ pub(super) fn validate_cove_t_semantics_with_registered_page_scope(
     let mut nested_schemas = Vec::new();
     let mut segment_indexes = Vec::new();
     let mut segment_payloads = Vec::new();
+    let mut column_domains = Vec::new();
     let mut zone_stats_entries = Vec::new();
     let mut codec_descriptors = Vec::new();
     let dictionary = parse_validation_dictionary(data, &validated.footer)?;
@@ -408,14 +411,19 @@ pub(super) fn validate_cove_t_semantics_with_registered_page_scope(
             SectionKind::ColumnDomain => {
                 if let Some(payload) = optional_section_payload(
                     data,
+                    &validated.header,
                     entry,
                     opts.optional_pushdown_policy,
                     ignored_optional_sections,
                 )? {
                     match ColumnDomain::parse(&payload) {
-                        Ok(_) => checked += 1,
+                        Ok(domain) => {
+                            column_domains.push(domain);
+                            checked += 1;
+                        }
                         Err(error) => {
                             optional_section_parse_error(
+                                &validated.header,
                                 entry,
                                 opts.optional_pushdown_policy,
                                 ignored_optional_sections,
@@ -428,6 +436,7 @@ pub(super) fn validate_cove_t_semantics_with_registered_page_scope(
             SectionKind::ExactSetIndex => {
                 if let Some(payload) = optional_section_payload(
                     data,
+                    &validated.header,
                     entry,
                     opts.optional_pushdown_policy,
                     ignored_optional_sections,
@@ -436,6 +445,7 @@ pub(super) fn validate_cove_t_semantics_with_registered_page_scope(
                         Ok(_) => checked += 1,
                         Err(error) => {
                             optional_section_parse_error(
+                                &validated.header,
                                 entry,
                                 opts.optional_pushdown_policy,
                                 ignored_optional_sections,
@@ -448,6 +458,7 @@ pub(super) fn validate_cove_t_semantics_with_registered_page_scope(
             SectionKind::BloomIndex => {
                 if let Some(payload) = optional_section_payload(
                     data,
+                    &validated.header,
                     entry,
                     opts.optional_pushdown_policy,
                     ignored_optional_sections,
@@ -456,6 +467,7 @@ pub(super) fn validate_cove_t_semantics_with_registered_page_scope(
                         Ok(_) => checked += 1,
                         Err(error) => {
                             optional_section_parse_error(
+                                &validated.header,
                                 entry,
                                 opts.optional_pushdown_policy,
                                 ignored_optional_sections,
@@ -468,6 +480,7 @@ pub(super) fn validate_cove_t_semantics_with_registered_page_scope(
             SectionKind::InvertedMorselIndex => {
                 if let Some(payload) = optional_section_payload(
                     data,
+                    &validated.header,
                     entry,
                     opts.optional_pushdown_policy,
                     ignored_optional_sections,
@@ -476,6 +489,7 @@ pub(super) fn validate_cove_t_semantics_with_registered_page_scope(
                         Ok(_) => checked += 1,
                         Err(error) => {
                             optional_section_parse_error(
+                                &validated.header,
                                 entry,
                                 opts.optional_pushdown_policy,
                                 ignored_optional_sections,
@@ -488,6 +502,7 @@ pub(super) fn validate_cove_t_semantics_with_registered_page_scope(
             SectionKind::LookupIndex => {
                 if let Some(payload) = optional_section_payload(
                     data,
+                    &validated.header,
                     entry,
                     opts.optional_pushdown_policy,
                     ignored_optional_sections,
@@ -496,6 +511,7 @@ pub(super) fn validate_cove_t_semantics_with_registered_page_scope(
                         Ok(_) => checked += 1,
                         Err(error) => {
                             optional_section_parse_error(
+                                &validated.header,
                                 entry,
                                 opts.optional_pushdown_policy,
                                 ignored_optional_sections,
@@ -508,6 +524,7 @@ pub(super) fn validate_cove_t_semantics_with_registered_page_scope(
             SectionKind::AggregateSynopsis => {
                 if let Some(payload) = optional_section_payload(
                     data,
+                    &validated.header,
                     entry,
                     opts.optional_pushdown_policy,
                     ignored_optional_sections,
@@ -516,6 +533,7 @@ pub(super) fn validate_cove_t_semantics_with_registered_page_scope(
                         Ok(_) => checked += 1,
                         Err(error) => {
                             optional_section_parse_error(
+                                &validated.header,
                                 entry,
                                 opts.optional_pushdown_policy,
                                 ignored_optional_sections,
@@ -528,6 +546,7 @@ pub(super) fn validate_cove_t_semantics_with_registered_page_scope(
             SectionKind::CompositeZoneIndex => {
                 if let Some(payload) = optional_section_payload(
                     data,
+                    &validated.header,
                     entry,
                     opts.optional_pushdown_policy,
                     ignored_optional_sections,
@@ -536,6 +555,7 @@ pub(super) fn validate_cove_t_semantics_with_registered_page_scope(
                         Ok(_) => checked += 1,
                         Err(error) => {
                             optional_section_parse_error(
+                                &validated.header,
                                 entry,
                                 opts.optional_pushdown_policy,
                                 ignored_optional_sections,
@@ -548,6 +568,7 @@ pub(super) fn validate_cove_t_semantics_with_registered_page_scope(
             SectionKind::TopNZoneSummary => {
                 if let Some(payload) = optional_section_payload(
                     data,
+                    &validated.header,
                     entry,
                     opts.optional_pushdown_policy,
                     ignored_optional_sections,
@@ -556,6 +577,7 @@ pub(super) fn validate_cove_t_semantics_with_registered_page_scope(
                         Ok(_) => checked += 1,
                         Err(error) => {
                             optional_section_parse_error(
+                                &validated.header,
                                 entry,
                                 opts.optional_pushdown_policy,
                                 ignored_optional_sections,
@@ -629,6 +651,7 @@ pub(super) fn validate_cove_t_semantics_with_registered_page_scope(
         &segment_payloads,
         CoveTCrossSectionRefs {
             dictionary: dictionary.as_ref(),
+            column_domains: &column_domains,
             zone_stats: &zone_stats_entries,
             codec_descriptors: &codec_descriptors,
             registered_page_scope,
@@ -645,6 +668,7 @@ pub(super) fn validate_cove_t_semantics_with_registered_page_scope(
 
 fn optional_section_payload<'a>(
     data: &'a [u8],
+    header: &CoveHeaderV1,
     entry: &CoveSectionEntryV1,
     policy: OptionalPushdownPolicy,
     ignored_optional_sections: &mut Vec<IgnoredOptionalSection>,
@@ -652,19 +676,20 @@ fn optional_section_payload<'a>(
     match compression::section_payload(data, entry) {
         Ok(payload) => Ok(Some(payload)),
         Err(error) => {
-            optional_section_parse_error(entry, policy, ignored_optional_sections, error)?;
+            optional_section_parse_error(header, entry, policy, ignored_optional_sections, error)?;
             Ok(None)
         }
     }
 }
 
 fn optional_section_parse_error(
+    header: &CoveHeaderV1,
     entry: &CoveSectionEntryV1,
     policy: OptionalPushdownPolicy,
     ignored_optional_sections: &mut Vec<IgnoredOptionalSection>,
     error: CoveError,
 ) -> Result<(), CoveError> {
-    if policy == OptionalPushdownPolicy::FailOpen && is_optional_advisory_entry(entry) {
+    if policy == OptionalPushdownPolicy::FailOpen && is_optional_advisory_entry(header, entry) {
         if ignored_optional_sections
             .iter()
             .any(|ignored| ignored.section_id == entry.section_id)
@@ -684,6 +709,7 @@ fn optional_section_parse_error(
 #[derive(Clone, Copy)]
 struct CoveTCrossSectionRefs<'a, 'data> {
     dictionary: Option<&'a FileDictionaryView<'data>>,
+    column_domains: &'a [ColumnDomain],
     zone_stats: &'a [ZoneStatsEntry],
     codec_descriptors: &'a [CodecExtensionDescriptorV2],
     registered_page_scope: RegisteredPageValidationScope<'a>,
@@ -725,6 +751,12 @@ fn validate_cove_t_cross_sections(
             "native nested COVE-T columns require a NestedSchema section".into(),
         ));
     }
+    let tables = catalog
+        .tables
+        .iter()
+        .map(|table| (table.table_id, table))
+        .collect::<BTreeMap<_, _>>();
+    let validated_domains = validate_column_domains(catalog, refs.dictionary, refs.column_domains)?;
     if segment_indexes.is_empty() && segment_payloads.is_empty() {
         if catalogs[0]
             .1
@@ -740,11 +772,6 @@ fn validate_cove_t_cross_sections(
         return Err(CoveError::SegmentCorrupt);
     }
     let segment_index = &segment_indexes[0].1;
-    let tables = catalog
-        .tables
-        .iter()
-        .map(|table| (table.table_id, table))
-        .collect::<BTreeMap<_, _>>();
     let mut payloads_by_key = BTreeMap::new();
     for (section_id, file_offset, payload, bytes) in segment_payloads {
         if payloads_by_key
@@ -757,6 +784,13 @@ fn validate_cove_t_cross_sections(
             return Err(CoveError::SegmentCorrupt);
         }
     }
+    validate_zone_stats_against_table(
+        &tables,
+        segment_index,
+        &payloads_by_key,
+        refs.zone_stats,
+        &validated_domains,
+    )?;
     let mut rows_by_table = BTreeMap::<u32, u64>::new();
     for entry in &segment_index.entries {
         let table = tables.get(&entry.table_id).ok_or_else(|| {
@@ -817,12 +851,373 @@ fn validate_cove_t_cross_sections(
     Ok(())
 }
 
+type ValidatedDomainKeys = BTreeSet<(u32, u32)>;
+
+fn validate_column_domains(
+    catalog: &TableCatalog,
+    dictionary: Option<&FileDictionaryView<'_>>,
+    domains: &[ColumnDomain],
+) -> Result<ValidatedDomainKeys, CoveError> {
+    let tables = catalog
+        .tables
+        .iter()
+        .map(|table| (table.table_id, table))
+        .collect::<BTreeMap<_, _>>();
+    let mut validated = BTreeSet::new();
+    for domain in domains {
+        if domain.header.flags & FLAG_OBJECT_DOMAIN != 0 {
+            return Err(CoveError::BadDomain);
+        }
+        domain.validate()?;
+        let logical =
+            CoveLogicalType::from_u16(domain.header.logical_type).ok_or(CoveError::BadDomain)?;
+        let table = tables
+            .get(&domain.header.table_or_object_id)
+            .ok_or(CoveError::BadDomain)?;
+        let column = table
+            .columns
+            .iter()
+            .find(|column| column.column_id == domain.header.column_or_property_id)
+            .ok_or(CoveError::BadDomain)?;
+        if column.physical != CovePhysicalKind::FileCode
+            || column.logical != logical
+            || column.collation_id != domain.header.collation_id
+        {
+            return Err(CoveError::BadDomain);
+        }
+        let dictionary = dictionary.ok_or(CoveError::BadFileCode)?;
+        if domain.file_code_to_rank.len()
+            != usize::try_from(dictionary.len()).map_err(|_| CoveError::ArithOverflow)?
+        {
+            return Err(CoveError::BadDomain);
+        }
+        validate_domain_logical_order(domain, logical, dictionary)?;
+        if !validated.insert((
+            domain.header.table_or_object_id,
+            domain.header.column_or_property_id,
+        )) {
+            return Err(CoveError::BadDomain);
+        }
+    }
+    Ok(validated)
+}
+
+fn validate_domain_logical_order(
+    domain: &ColumnDomain,
+    logical: CoveLogicalType,
+    dictionary: &FileDictionaryView<'_>,
+) -> Result<(), CoveError> {
+    let mut previous = None::<SortValue>;
+    for &file_code in &domain.sorted_file_codes {
+        let value = dictionary_sort_value(logical, dictionary, file_code)?;
+        if let Some(previous) = &previous {
+            if previous.cmp_total(&value)? != std::cmp::Ordering::Less {
+                return Err(CoveError::BadDomain);
+            }
+        }
+        previous = Some(value);
+    }
+    Ok(())
+}
+
+fn dictionary_sort_value(
+    logical: CoveLogicalType,
+    dictionary: &FileDictionaryView<'_>,
+    file_code: u32,
+) -> Result<SortValue, CoveError> {
+    let entry = dictionary
+        .get_entry(file_code)
+        .map_err(|_| CoveError::BadDomain)?;
+    let value_tag = ValueTag::from_u16(entry.value_tag).ok_or(CoveError::BadDomain)?;
+    let bytes = match dictionary.decode_value(file_code)? {
+        DictionaryValue::RawBytes(bytes) => bytes,
+        DictionaryValue::RedactedPresent => return Err(CoveError::BadDomain),
+    };
+    match logical {
+        CoveLogicalType::Bool => match value_tag {
+            ValueTag::BoolFalse => Ok(SortValue::Bool(false)),
+            ValueTag::BoolTrue => Ok(SortValue::Bool(true)),
+            _ => Err(CoveError::BadDomain),
+        },
+        CoveLogicalType::Int8
+        | CoveLogicalType::Int16
+        | CoveLogicalType::Int32
+        | CoveLogicalType::Int64 => {
+            require_tag(value_tag, ValueTag::Int64)?;
+            Ok(SortValue::I64(read_i64_prefix(&bytes)?))
+        }
+        CoveLogicalType::UInt8
+        | CoveLogicalType::UInt16
+        | CoveLogicalType::UInt32
+        | CoveLogicalType::UInt64 => {
+            require_tag(value_tag, ValueTag::UInt64)?;
+            Ok(SortValue::U64(read_u64_prefix(&bytes)?))
+        }
+        CoveLogicalType::Float32 => {
+            require_tag(value_tag, ValueTag::Float32Bits)?;
+            Ok(SortValue::F32(f32::from_bits(read_u32_exact(&bytes)?)))
+        }
+        CoveLogicalType::Float64 => {
+            require_tag(value_tag, ValueTag::Float64Bits)?;
+            Ok(SortValue::F64(f64::from_bits(read_u64_prefix(&bytes)?)))
+        }
+        CoveLogicalType::Decimal64 => {
+            require_tag(value_tag, ValueTag::Decimal64)?;
+            Ok(SortValue::I64(read_i64_prefix(&bytes)?))
+        }
+        CoveLogicalType::Decimal128 => {
+            require_tag(value_tag, ValueTag::Decimal128)?;
+            Ok(SortValue::I128(read_i128_exact(&bytes)?))
+        }
+        CoveLogicalType::DateDays => {
+            require_tag(value_tag, ValueTag::DateDays)?;
+            Ok(SortValue::I64(i64::from(read_i32_exact(&bytes)?)))
+        }
+        CoveLogicalType::TimestampMicros => {
+            require_tag(value_tag, ValueTag::TimestampMicros)?;
+            Ok(SortValue::I64(read_i64_prefix(&bytes)?))
+        }
+        CoveLogicalType::TimestampNanos => {
+            require_tag(value_tag, ValueTag::TimestampNanos)?;
+            Ok(SortValue::I64(read_i64_prefix(&bytes)?))
+        }
+        CoveLogicalType::Utf8 => {
+            require_tag(value_tag, ValueTag::Utf8)?;
+            let payload = decode_domain_length_prefixed(&bytes)?;
+            std::str::from_utf8(payload).map_err(|_| CoveError::BadDomain)?;
+            Ok(SortValue::Bytes(payload.to_vec()))
+        }
+        CoveLogicalType::Binary => {
+            require_tag(value_tag, ValueTag::Binary)?;
+            Ok(SortValue::Bytes(
+                decode_domain_length_prefixed(&bytes)?.to_vec(),
+            ))
+        }
+        CoveLogicalType::Uuid => {
+            require_tag(value_tag, ValueTag::Uuid)?;
+            if bytes.len() != 16 {
+                return Err(CoveError::BadDomain);
+            }
+            Ok(SortValue::Bytes(bytes))
+        }
+        CoveLogicalType::Json => {
+            require_tag(value_tag, ValueTag::Json)?;
+            let payload = decode_domain_length_prefixed(&bytes)?;
+            serde_json::from_slice::<serde_json::Value>(payload)
+                .map_err(|_| CoveError::BadDomain)?;
+            Ok(SortValue::Bytes(payload.to_vec()))
+        }
+        CoveLogicalType::Null
+        | CoveLogicalType::List
+        | CoveLogicalType::Struct
+        | CoveLogicalType::Map => Err(CoveError::BadDomain),
+    }
+}
+
+fn require_tag(actual: ValueTag, expected: ValueTag) -> Result<(), CoveError> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(CoveError::BadDomain)
+    }
+}
+
+fn decode_domain_length_prefixed(bytes: &[u8]) -> Result<&[u8], CoveError> {
+    let (len, prefix_len) =
+        crate::wire::decode_u64_leb128(bytes).map_err(|_| CoveError::BadDomain)?;
+    let len = usize::try_from(len).map_err(|_| CoveError::BadDomain)?;
+    let end = prefix_len
+        .checked_add(len)
+        .ok_or(CoveError::ArithOverflow)?;
+    if end != bytes.len() {
+        return Err(CoveError::BadDomain);
+    }
+    Ok(&bytes[prefix_len..end])
+}
+
+fn read_i32_exact(bytes: &[u8]) -> Result<i32, CoveError> {
+    if bytes.len() != 4 {
+        return Err(CoveError::BadDomain);
+    }
+    Ok(i32::from_le_bytes(bytes.try_into().unwrap()))
+}
+
+fn read_u32_exact(bytes: &[u8]) -> Result<u32, CoveError> {
+    if bytes.len() != 4 {
+        return Err(CoveError::BadDomain);
+    }
+    Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
+}
+
+fn read_i64_prefix(bytes: &[u8]) -> Result<i64, CoveError> {
+    if bytes.len() < 8 {
+        return Err(CoveError::BadDomain);
+    }
+    Ok(i64::from_le_bytes(bytes[..8].try_into().unwrap()))
+}
+
+fn read_u64_prefix(bytes: &[u8]) -> Result<u64, CoveError> {
+    if bytes.len() < 8 {
+        return Err(CoveError::BadDomain);
+    }
+    Ok(u64::from_le_bytes(bytes[..8].try_into().unwrap()))
+}
+
+fn read_i128_exact(bytes: &[u8]) -> Result<i128, CoveError> {
+    if bytes.len() != 16 {
+        return Err(CoveError::BadDomain);
+    }
+    Ok(i128::from_le_bytes(bytes.try_into().unwrap()))
+}
+
+fn validate_zone_stats_against_table(
+    tables: &BTreeMap<u32, &TableEntry>,
+    segment_index: &TableSegmentIndex,
+    payloads_by_key: &SegmentPayloadByKey<'_>,
+    zone_stats: &[ZoneStatsEntry],
+    validated_domains: &ValidatedDomainKeys,
+) -> Result<(), CoveError> {
+    let segments = segment_index
+        .entries
+        .iter()
+        .map(|entry| ((entry.table_id, entry.segment_id), entry))
+        .collect::<BTreeMap<_, _>>();
+    let mut morsel_rows = BTreeMap::<(u32, u32, u32), u32>::new();
+    let mut page_rows = BTreeMap::<(u32, u32, u32, u32), (u32, u32, u32)>::new();
+    for ((table_id, segment_id), (_, _, payload, bytes)) in payloads_by_key {
+        for morsel in &payload.morsels.entries {
+            morsel_rows.insert((*table_id, *segment_id, morsel.morsel_id), morsel.row_count);
+        }
+        for column_dir in &payload.columns {
+            let start = usize::try_from(column_dir.page_index_offset)
+                .map_err(|_| CoveError::OffsetRange)?;
+            let end = usize::try_from(
+                column_dir
+                    .page_index_offset
+                    .checked_add(column_dir.page_index_length)
+                    .ok_or(CoveError::ArithOverflow)?,
+            )
+            .map_err(|_| CoveError::OffsetRange)?;
+            let page_index = ColumnPageIndex::parse(&bytes[start..end])?;
+            for page in &page_index.entries {
+                if page_rows
+                    .insert(
+                        (*table_id, *segment_id, column_dir.column_id, page.morsel_id),
+                        (page.row_count, page.null_count, page.non_null_count),
+                    )
+                    .is_some()
+                {
+                    return Err(CoveError::PageCorrupt);
+                }
+            }
+        }
+    }
+
+    for entry in zone_stats {
+        let table = tables.get(&entry.table_id).ok_or(CoveError::BadStats)?;
+        let column = table
+            .columns
+            .iter()
+            .find(|column| column.column_id == entry.column_id)
+            .ok_or(CoveError::BadStats)?;
+        validate_zone_stat_scalar_binding(column, entry, validated_domains)?;
+        if entry.morsel_id == u32::MAX {
+            let segment = segments
+                .get(&(entry.table_id, entry.segment_id))
+                .ok_or(CoveError::BadStats)?;
+            if entry.stats.row_count != u64::from(segment.row_count) {
+                return Err(CoveError::BadStats);
+            }
+            continue;
+        }
+        let morsel_row_count = morsel_rows
+            .get(&(entry.table_id, entry.segment_id, entry.morsel_id))
+            .copied()
+            .ok_or(CoveError::BadStats)?;
+        if entry.stats.row_count != u64::from(morsel_row_count) {
+            return Err(CoveError::BadStats);
+        }
+        if let Some((page_row_count, page_null_count, page_non_null_count)) = page_rows.get(&(
+            entry.table_id,
+            entry.segment_id,
+            entry.column_id,
+            entry.morsel_id,
+        )) {
+            if entry.stats.row_count != u64::from(*page_row_count)
+                || entry.stats.null_count != u64::from(*page_null_count)
+                || entry.non_null_count != *page_non_null_count
+            {
+                return Err(CoveError::BadStats);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_zone_stat_scalar_binding(
+    column: &ColumnEntry,
+    entry: &ZoneStatsEntry,
+    validated_domains: &ValidatedDomainKeys,
+) -> Result<(), CoveError> {
+    if entry.stats.flags.contains(ZoneStatFlags::HAS_DOMAIN_RANGE)
+        && (column.physical != CovePhysicalKind::FileCode
+            || !validated_domains.contains(&(entry.table_id, entry.column_id))
+            || entry.min_domain_rank > entry.max_domain_rank)
+    {
+        return Err(CoveError::BadStats);
+    }
+    let (Some(min), Some(max)) = (&entry.stats.min, &entry.stats.max) else {
+        return Ok(());
+    };
+    if min.kind != max.kind {
+        return Err(CoveError::BadStats);
+    }
+    if !stat_kind_matches_column(column.logical, column.physical, min.kind) {
+        return Err(CoveError::BadStats);
+    }
+    Ok(())
+}
+
+fn stat_kind_matches_column(
+    logical: CoveLogicalType,
+    physical: CovePhysicalKind,
+    kind: StatKind,
+) -> bool {
+    match physical {
+        CovePhysicalKind::FileCode => kind == StatKind::UInt64,
+        CovePhysicalKind::Boolean => matches!(kind, StatKind::UInt64 | StatKind::FixedBytes),
+        CovePhysicalKind::NumCode => match logical {
+            CoveLogicalType::Bool
+            | CoveLogicalType::UInt8
+            | CoveLogicalType::UInt16
+            | CoveLogicalType::UInt32
+            | CoveLogicalType::UInt64 => kind == StatKind::UInt64,
+            CoveLogicalType::Int8
+            | CoveLogicalType::Int16
+            | CoveLogicalType::Int32
+            | CoveLogicalType::Int64
+            | CoveLogicalType::Decimal64 => kind == StatKind::Int64,
+            CoveLogicalType::Float32 => {
+                matches!(kind, StatKind::Float64Bits | StatKind::FixedBytes)
+            }
+            CoveLogicalType::Float64 => kind == StatKind::Float64Bits,
+            CoveLogicalType::DateDays => kind == StatKind::DateDays,
+            CoveLogicalType::TimestampMicros => kind == StatKind::TimestampMicros,
+            CoveLogicalType::TimestampNanos => kind == StatKind::TimestampNanos,
+            _ => false,
+        },
+        CovePhysicalKind::FixedBytes | CovePhysicalKind::VarBytes => kind == StatKind::FixedBytes,
+        CovePhysicalKind::List | CovePhysicalKind::Struct | CovePhysicalKind::Map => false,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 enum SortValue {
     Null,
     Bool(bool),
     I64(i64),
     U64(u64),
+    I128(i128),
     F32(f32),
     F64(f64),
     Bytes(Vec<u8>),
@@ -838,6 +1233,7 @@ impl SortValue {
             (Self::Bool(a), Self::Bool(b)) => Ok(a.cmp(b)),
             (Self::I64(a), Self::I64(b)) => Ok(a.cmp(b)),
             (Self::U64(a), Self::U64(b)) => Ok(a.cmp(b)),
+            (Self::I128(a), Self::I128(b)) => Ok(a.cmp(b)),
             (Self::F32(a), Self::F32(b)) => Ok(a.total_cmp(b)),
             (Self::F64(a), Self::F64(b)) => Ok(a.total_cmp(b)),
             (Self::Bytes(a), Self::Bytes(b)) => Ok(a.cmp(b)),
@@ -2146,6 +2542,11 @@ pub(super) fn request_requires_map_profile(request: &FeatureUseRequestV2) -> boo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::borrow::Cow;
+
+    use crate::dictionary::{
+        FileDictionaryHeaderV1, FileDictionaryIndexEntryV1, DICT_INDEX_ENTRY_SIZE,
+    };
 
     #[test]
     fn table_sort_validation_only_claims_supported_default_semantics() {
@@ -2179,6 +2580,78 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn column_domain_rejects_numeric_order_that_is_not_logical_order() {
+        let catalog = domain_test_catalog(CoveLogicalType::Utf8, CovePhysicalKind::FileCode, 0);
+        let dictionary = dictionary_view_with_utf8_codes(&["b", "a"]);
+        let domain = ColumnDomain::from_sorted_present_codes(
+            &[0, 1],
+            2,
+            1,
+            1,
+            CoveLogicalType::Utf8 as u16,
+            0,
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(
+            validate_column_domains(&catalog, Some(&dictionary), &[domain]),
+            Err(CoveError::BadDomain)
+        );
+    }
+
+    #[test]
+    fn column_domain_requires_matching_filecode_column_semantics() {
+        let dictionary = dictionary_view_with_utf8_codes(&["a", "b"]);
+        let domain = ColumnDomain::from_sorted_present_codes(
+            &[0, 1],
+            2,
+            1,
+            1,
+            CoveLogicalType::Utf8 as u16,
+            0,
+            0,
+        )
+        .unwrap();
+        let wrong_physical =
+            domain_test_catalog(CoveLogicalType::Utf8, CovePhysicalKind::VarBytes, 0);
+        assert_eq!(
+            validate_column_domains(
+                &wrong_physical,
+                Some(&dictionary),
+                std::slice::from_ref(&domain)
+            ),
+            Err(CoveError::BadDomain)
+        );
+
+        let wrong_collation =
+            domain_test_catalog(CoveLogicalType::Utf8, CovePhysicalKind::FileCode, 1);
+        assert_eq!(
+            validate_column_domains(&wrong_collation, Some(&dictionary), &[domain]),
+            Err(CoveError::BadDomain)
+        );
+    }
+
+    #[test]
+    fn column_domain_accepts_safe_logical_order() {
+        let catalog = domain_test_catalog(CoveLogicalType::Utf8, CovePhysicalKind::FileCode, 0);
+        let dictionary = dictionary_view_with_utf8_codes(&["a", "b"]);
+        let domain = ColumnDomain::from_sorted_present_codes(
+            &[0, 1],
+            2,
+            1,
+            1,
+            CoveLogicalType::Utf8 as u16,
+            0,
+            0,
+        )
+        .unwrap();
+
+        let validated = validate_column_domains(&catalog, Some(&dictionary), &[domain]).unwrap();
+        assert!(validated.contains(&(1, 1)));
+    }
+
     fn sort_test_table(column: ColumnEntry) -> TableEntry {
         TableEntry {
             table_id: 1,
@@ -2205,6 +2678,75 @@ mod tests {
             scale: 0,
             flags: 0,
         }
+    }
+
+    fn domain_test_catalog(
+        logical: CoveLogicalType,
+        physical: CovePhysicalKind,
+        collation_id: u16,
+    ) -> TableCatalog {
+        TableCatalog {
+            flags: 0,
+            tables: vec![TableEntry {
+                table_id: 1,
+                namespace: String::new(),
+                name: "t".into(),
+                row_count: 0,
+                primary_sort_key_count: 0,
+                clustering_key_count: 0,
+                flags: 0,
+                columns: vec![ColumnEntry {
+                    column_id: 1,
+                    name: "c".into(),
+                    logical,
+                    physical,
+                    nullable: false,
+                    sort_order: 0,
+                    collation_id,
+                    precision: 0,
+                    scale: 0,
+                    flags: 0,
+                }],
+            }],
+        }
+    }
+
+    fn dictionary_view_with_utf8_codes(values: &[&str]) -> FileDictionaryView<'static> {
+        let mut index = Vec::new();
+        index.extend_from_slice(
+            &FileDictionaryHeaderV1 {
+                entry_count: values.len() as u32,
+                flags: 0,
+                index_entry_len: DICT_INDEX_ENTRY_SIZE as u16,
+                value_hash_algorithm: 0,
+                payload_length: 0,
+                reserved: [0; 24],
+            }
+            .serialize(),
+        );
+        for value in values {
+            let mut inline_data = [0u8; 16];
+            let mut canonical = Vec::new();
+            canonical.push(value.len() as u8);
+            canonical.extend_from_slice(value.as_bytes());
+            inline_data[..canonical.len()].copy_from_slice(&canonical);
+            index.extend_from_slice(
+                &FileDictionaryIndexEntryV1 {
+                    value_tag: ValueTag::Utf8 as u16,
+                    storage_class: StorageClass::Inline as u8,
+                    flags: 0,
+                    inline_len: canonical.len() as u8,
+                    reserved0: [0; 3],
+                    inline_data,
+                    payload_offset: 0,
+                    payload_length: 0,
+                    canonical_hash64: 0,
+                    reserved1: 0,
+                }
+                .serialize(),
+            );
+        }
+        FileDictionaryView::parse(Cow::Owned(index), Cow::Owned(Vec::new())).unwrap()
     }
 
     #[test]

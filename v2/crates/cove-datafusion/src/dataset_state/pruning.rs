@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use cove_core::{
-    constants::CovePhysicalKind,
+    constants::{CoveLogicalType, CovePhysicalKind},
     domain::ColumnDomain,
     index::{
         aggregate::{AggregateEntry, SynopsisAccuracy, SynopsisKind},
@@ -31,14 +31,22 @@ pub(super) struct PlanningCache {
 }
 
 impl PlanningCache {
-    pub(super) fn build(table: &TableEntry, pruning: &PruningMetadata) -> Self {
+    pub(super) fn build(
+        table: &TableEntry,
+        segments: &[TableSegmentIndexEntryV1],
+        pruning: &PruningMetadata,
+    ) -> Self {
         let mut cache = Self::default();
         for (index, column) in table.columns.iter().enumerate() {
             cache.column_by_id.entry(column.column_id).or_insert(index);
         }
+        let segments_by_id = segments
+            .iter()
+            .map(|segment| (segment.segment_id, segment))
+            .collect::<BTreeMap<_, _>>();
         for (section_index, section) in pruning.zone_stats.iter().enumerate() {
             for (entry_index, entry) in section.entries.iter().enumerate() {
-                if entry.table_id == table.table_id {
+                if zone_stat_entry_binds_to_table(table, &segments_by_id, entry) {
                     cache
                         .zone_stat_by_key
                         .entry((entry.segment_id, entry.morsel_id, entry.column_id))
@@ -47,7 +55,7 @@ impl PlanningCache {
             }
         }
         for (index, domain) in pruning.column_domains.iter().enumerate() {
-            if domain.header.table_or_object_id == table.table_id && domain.is_safe() {
+            if column_domain_binds_to_table(table, domain) {
                 cache
                     .column_domain_by_id
                     .entry(domain.header.column_or_property_id)
@@ -87,6 +95,56 @@ impl PlanningCache {
             }
         }
         cache
+    }
+}
+
+fn column_domain_binds_to_table(table: &TableEntry, domain: &ColumnDomain) -> bool {
+    let Some(logical) = CoveLogicalType::from_u16(domain.header.logical_type) else {
+        return false;
+    };
+    table.table_id == domain.header.table_or_object_id
+        && domain.is_safe()
+        && table.columns.iter().any(|column| {
+            column.column_id == domain.header.column_or_property_id
+                && column.physical == CovePhysicalKind::FileCode
+                && column.logical == logical
+                && column.collation_id == domain.header.collation_id
+        })
+}
+
+fn zone_stat_entry_binds_to_table(
+    table: &TableEntry,
+    segments_by_id: &BTreeMap<u32, &TableSegmentIndexEntryV1>,
+    entry: &ZoneStatsEntry,
+) -> bool {
+    if entry.table_id != table.table_id {
+        return false;
+    }
+    let Some(column) = table
+        .columns
+        .iter()
+        .find(|column| column.column_id == entry.column_id)
+    else {
+        return false;
+    };
+    let Some(segment) = segments_by_id.get(&entry.segment_id) else {
+        return false;
+    };
+    if entry.morsel_id == u32::MAX && entry.stats.row_count != u64::from(segment.row_count) {
+        return false;
+    }
+    if entry
+        .stats
+        .flags
+        .contains(cove_core::zone_stats::ZoneStatFlags::HAS_DOMAIN_RANGE)
+        && column.physical != CovePhysicalKind::FileCode
+    {
+        return false;
+    }
+    match (&entry.stats.min, &entry.stats.max) {
+        (Some(min), Some(max)) => min.kind == max.kind,
+        (None, None) => true,
+        _ => false,
     }
 }
 
