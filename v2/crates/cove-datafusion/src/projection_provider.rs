@@ -26,10 +26,15 @@ use crate::{adapter_v53::metrics::CoveFileMetrics, range_reader::LocalFileRangeR
 mod filters;
 mod loading;
 
+pub use self::filters::{
+    classify_projection_filter, classify_projection_filters_report,
+    ProjectionFilterClassificationReport,
+};
+
 use self::{
     filters::{
-        classify_projection_filter, classify_projection_filters, merged_projection_columns,
-        project_batch_columns, projected_schema,
+        classify_projection_filters, merged_projection_columns, project_batch_columns,
+        projected_schema,
     },
     loading::{load_projection_bytes_via_ranges, InstrumentedProjectionRangeReader},
 };

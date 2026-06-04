@@ -79,6 +79,51 @@ impl StableRegisteredCodec {
         }
     }
 
+    fn codec_family(self) -> u16 {
+        match self {
+            Self::FsstUtf8 => 0,
+            Self::AlpFloat => 1,
+            Self::FastLanesInteger => 2,
+        }
+    }
+
+    fn supported_type_masks(self) -> (u64, u64) {
+        match self {
+            Self::FsstUtf8 => (
+                logical_type_mask(&[CoveLogicalType::Utf8]),
+                physical_kind_mask(&[CovePhysicalKind::VarBytes]),
+            ),
+            Self::AlpFloat => (
+                logical_type_mask(&[CoveLogicalType::Float32, CoveLogicalType::Float64]),
+                physical_kind_mask(&[CovePhysicalKind::NumCode]),
+            ),
+            Self::FastLanesInteger => (
+                logical_type_mask(&[
+                    CoveLogicalType::Int8,
+                    CoveLogicalType::Int16,
+                    CoveLogicalType::Int32,
+                    CoveLogicalType::Int64,
+                    CoveLogicalType::UInt8,
+                    CoveLogicalType::UInt16,
+                    CoveLogicalType::UInt32,
+                    CoveLogicalType::UInt64,
+                    CoveLogicalType::Decimal64,
+                    CoveLogicalType::Decimal128,
+                    CoveLogicalType::DateDays,
+                    CoveLogicalType::TimestampMicros,
+                    CoveLogicalType::TimestampNanos,
+                ]),
+                physical_kind_mask(&[CovePhysicalKind::NumCode]),
+            ),
+        }
+    }
+
+    fn supports_page(self, logical_type: CoveLogicalType, physical_kind: CovePhysicalKind) -> bool {
+        let (logical_mask, physical_mask) = self.supported_type_masks();
+        logical_mask & logical_type_bit(logical_type) != 0
+            && physical_mask & physical_kind_bit(physical_kind) != 0
+    }
+
     fn decode(self, payload: &[u8]) -> Result<LogicalPage, CoveError> {
         let expected_magic = match self {
             Self::FsstUtf8 => b"CFS2",
@@ -93,6 +138,48 @@ impl StableRegisteredCodec {
         }
         Ok(page)
     }
+}
+
+fn logical_type_bit(logical_type: CoveLogicalType) -> u64 {
+    1u64 << (logical_type as u32)
+}
+
+fn physical_kind_bit(physical_kind: CovePhysicalKind) -> u64 {
+    1u64 << (physical_kind as u32)
+}
+
+fn logical_type_mask(types: &[CoveLogicalType]) -> u64 {
+    types.iter().copied().fold(0u64, |mask, logical_type| {
+        mask | logical_type_bit(logical_type)
+    })
+}
+
+fn physical_kind_mask(kinds: &[CovePhysicalKind]) -> u64 {
+    kinds.iter().copied().fold(0u64, |mask, physical_kind| {
+        mask | physical_kind_bit(physical_kind)
+    })
+}
+
+pub fn stable_registered_codec_supported_masks(
+    namespace: &str,
+    name: &str,
+    version_major: u16,
+    version_minor: u16,
+) -> Option<(u64, u64)> {
+    [
+        StableRegisteredCodec::FsstUtf8,
+        StableRegisteredCodec::AlpFloat,
+        StableRegisteredCodec::FastLanesInteger,
+    ]
+    .into_iter()
+    .find_map(|codec| {
+        let (known_namespace, known_name, known_major, known_minor) = codec.descriptor_identity();
+        (namespace == known_namespace
+            && name == known_name
+            && version_major == known_major
+            && version_minor == known_minor)
+            .then_some(codec.supported_type_masks())
+    })
 }
 
 fn stable_codec_for_descriptor(
@@ -114,9 +201,41 @@ fn stable_codec_for_descriptor(
             && descriptor.name == name
             && descriptor.version_major == major
             && descriptor.version_minor == minor
+            && descriptor.codec_family == codec.codec_family()
             && descriptor.specification_status == CodecSpecificationStatusV2::StableRegistered
             && descriptor.spec_digest == stable_spec_digest(*codec)
     })
+}
+
+fn stable_codec_for_descriptor_identity(
+    namespace: &str,
+    name: &str,
+    version_major: u16,
+    version_minor: u16,
+) -> Option<StableRegisteredCodec> {
+    [
+        StableRegisteredCodec::FsstUtf8,
+        StableRegisteredCodec::AlpFloat,
+        StableRegisteredCodec::FastLanesInteger,
+    ]
+    .into_iter()
+    .find(|codec| {
+        let (known_namespace, known_name, known_major, known_minor) = codec.descriptor_identity();
+        namespace == known_namespace
+            && name == known_name
+            && version_major == known_major
+            && version_minor == known_minor
+    })
+}
+
+fn stable_registered_family_and_masks_for_identity(
+    namespace: &str,
+    name: &str,
+    version_major: u16,
+    version_minor: u16,
+) -> Option<(u16, (u64, u64))> {
+    stable_codec_for_descriptor_identity(namespace, name, version_major, version_minor)
+        .map(|codec| (codec.codec_family(), codec.supported_type_masks()))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -354,6 +473,31 @@ impl CodecExtensionDescriptorV2 {
         if self.namespace.is_empty() || self.name.is_empty() {
             return Err(CoveError::BadCodecExtension);
         }
+        if self.logical_type_mask == 0 || self.physical_kind_mask == 0 {
+            return Err(CoveError::BadCodecExtension);
+        }
+        if self.codec_family > 4 {
+            return Err(CoveError::BadCodecExtension);
+        }
+        if self.specification_status == CodecSpecificationStatusV2::StableRegistered {
+            if let Some((expected_family, (logical_mask, physical_mask))) =
+                stable_registered_family_and_masks_for_identity(
+                    &self.namespace,
+                    &self.name,
+                    self.version_major,
+                    self.version_minor,
+                )
+            {
+                if self.codec_family != expected_family {
+                    return Err(CoveError::BadCodecExtension);
+                }
+                if self.logical_type_mask & !logical_mask != 0
+                    || self.physical_kind_mask & !physical_mask != 0
+                {
+                    return Err(CoveError::BadCodecExtension);
+                }
+            }
+        }
         if self.parameter_schema_kind > 3 {
             return Err(CoveError::BadCodecExtension);
         }
@@ -570,6 +714,7 @@ pub fn materialize_registered_page_payload<R: RegisteredCodecResolver + ?Sized>(
     });
 
     if let Some(descriptor) = descriptor {
+        validate_descriptor_supports_page(descriptor, logical_type, physical_kind)?;
         match resolver.decode_registered_page(descriptor, &envelope, encoded_payload) {
             Ok(decoded) => {
                 let materialized = logical_page_to_column_payload(
@@ -600,6 +745,37 @@ pub fn materialize_registered_page_payload<R: RegisteredCodecResolver + ?Sized>(
         }));
     }
     Err(CoveError::CodecUnsupported)
+}
+
+fn validate_descriptor_supports_page(
+    descriptor: &CodecExtensionDescriptorV2,
+    logical_type: CoveLogicalType,
+    physical_kind: CovePhysicalKind,
+) -> Result<(), CoveError> {
+    let logical_bit = 1u64
+        .checked_shl(logical_type as u32)
+        .ok_or(CoveError::BadCodecExtension)?;
+    let physical_bit = 1u64
+        .checked_shl(physical_kind as u32)
+        .ok_or(CoveError::BadCodecExtension)?;
+    if descriptor.logical_type_mask & logical_bit == 0
+        || descriptor.physical_kind_mask & physical_bit == 0
+    {
+        return Err(CoveError::BadCodecExtension);
+    }
+    if descriptor.specification_status == CodecSpecificationStatusV2::StableRegistered {
+        if let Some(codec) = stable_codec_for_descriptor_identity(
+            &descriptor.namespace,
+            &descriptor.name,
+            descriptor.version_major,
+            descriptor.version_minor,
+        ) {
+            if !codec.supports_page(logical_type, physical_kind) {
+                return Err(CoveError::BadCodecExtension);
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn registered_page_has_fallback(payload: &[u8]) -> Result<bool, CoveError> {
@@ -936,6 +1112,9 @@ fn decode_row_bytes(expected_magic: &[u8; 4], bytes: &[u8]) -> Result<LogicalPag
         let is_null = (null_bitmap[index >> 3] & (1 << (index & 7))) != 0;
         values.push((!is_null).then(|| payload[start..end].to_vec()));
     }
+    if offsets.last() != Some(&payload.len()) {
+        return Err(CoveError::BadCodecExtension);
+    }
     if !row_count.is_multiple_of(8) && !null_bitmap.is_empty() {
         let unused_mask = !((1u8 << (row_count % 8)) - 1);
         if null_bitmap[null_bitmap.len() - 1] & unused_mask != 0 {
@@ -1019,15 +1198,22 @@ mod tests {
     }
 
     fn stable_fsst_descriptor() -> CodecExtensionDescriptorV2 {
+        let (logical_type_mask, physical_kind_mask) = stable_registered_codec_supported_masks(
+            FSST_UTF8_CODEC_IDENTITY.0,
+            FSST_UTF8_CODEC_IDENTITY.1,
+            FSST_UTF8_CODEC_IDENTITY.2,
+            FSST_UTF8_CODEC_IDENTITY.3,
+        )
+        .unwrap();
         CodecExtensionDescriptorV2 {
             codec_id: 1,
             namespace: FSST_UTF8_CODEC_IDENTITY.0.into(),
             name: FSST_UTF8_CODEC_IDENTITY.1.into(),
             version_major: FSST_UTF8_CODEC_IDENTITY.2,
             version_minor: FSST_UTF8_CODEC_IDENTITY.3,
-            codec_family: 1,
-            logical_type_mask: u64::MAX,
-            physical_kind_mask: u64::MAX,
+            codec_family: 0,
+            logical_type_mask,
+            physical_kind_mask,
             requirement: CodecRequirementV2::OptionalWithFallback,
             fallback_policy: CodecFallbackPolicyV2::CoreEncodingPayloadPresent,
             parameter_schema_kind: 0,
@@ -1141,6 +1327,34 @@ mod tests {
     }
 
     #[test]
+    fn descriptor_rejects_unknown_codec_family() {
+        let mut item = descriptor(1);
+        item.codec_family = 5;
+        assert_eq!(item.validate(), Err(CoveError::BadCodecExtension));
+        assert_eq!(item.serialize(), Err(CoveError::BadCodecExtension));
+    }
+
+    #[test]
+    fn descriptor_rejects_stable_registered_wrong_family() {
+        let mut item = stable_fsst_descriptor();
+        item.codec_family = 1;
+        assert_eq!(item.validate(), Err(CoveError::BadCodecExtension));
+        assert_eq!(item.serialize(), Err(CoveError::BadCodecExtension));
+    }
+
+    #[test]
+    fn descriptor_rejects_stable_registered_overbroad_type_masks() {
+        let mut item = stable_fsst_descriptor();
+        item.logical_type_mask |= 1u64 << (CoveLogicalType::Int64 as u32);
+        assert_eq!(item.validate(), Err(CoveError::BadCodecExtension));
+        assert_eq!(item.serialize(), Err(CoveError::BadCodecExtension));
+
+        let mut item = stable_fsst_descriptor();
+        item.physical_kind_mask |= 1u64 << (CovePhysicalKind::NumCode as u32);
+        assert_eq!(item.validate(), Err(CoveError::BadCodecExtension));
+    }
+
+    #[test]
     fn registered_encoding_envelope_rejects_malformed_fallback() {
         let mut item = RegisteredEncodingEnvelopeV2 {
             codec_id: 1,
@@ -1186,6 +1400,79 @@ mod tests {
             materialized.payload.root_node().unwrap().encoding_kind,
             CoveEncodingKind::VarBytes
         );
+    }
+
+    #[test]
+    fn registered_page_rejects_descriptor_type_mask_mismatch() {
+        let logical = utf8_logical_page();
+        let payload = registered_payload(&logical, Some(fallback_payload(&logical)));
+        let mut descriptor = stable_fsst_descriptor();
+        descriptor.logical_type_mask = 1u64 << (CoveLogicalType::Int64 as u32);
+        let err = materialize_registered_page_payload(
+            &payload,
+            &registered_page(),
+            CoveLogicalType::Utf8,
+            CovePhysicalKind::VarBytes,
+            &[descriptor],
+            &StableRegisteredCodecResolver,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(err, CoveError::BadCodecExtension);
+    }
+
+    #[test]
+    fn registered_page_rejects_stable_descriptor_family_type_mismatch() {
+        let logical = LogicalPage {
+            values: vec![
+                Some(1u64.to_le_bytes().to_vec()),
+                None,
+                Some(2u64.to_le_bytes().to_vec()),
+            ],
+        };
+        let encoded = encode_registered_row_bytes(b"CFS2", &logical);
+        let fallback = logical_page_to_column_payload(
+            &logical,
+            CoveLogicalType::Int64,
+            CovePhysicalKind::NumCode,
+            None,
+        )
+        .unwrap()
+        .serialize()
+        .unwrap();
+        let payload = ColumnPagePayloadV1::parse(
+            &ColumnPagePayloadV1::build_registered_single_node(
+                3,
+                2,
+                CoveLogicalType::Int64,
+                CovePhysicalKind::NumCode,
+                1,
+                2,
+                0,
+                encoded,
+                Some(fallback),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut page = registered_page();
+        page.non_null_count = 2;
+        page.null_count = 1;
+        let mut descriptor = stable_fsst_descriptor();
+        descriptor.logical_type_mask |= 1u64 << (CoveLogicalType::Int64 as u32);
+        descriptor.physical_kind_mask |= 1u64 << (CovePhysicalKind::NumCode as u32);
+
+        let err = materialize_registered_page_payload(
+            &payload,
+            &page,
+            CoveLogicalType::Int64,
+            CovePhysicalKind::NumCode,
+            &[descriptor],
+            &StableRegisteredCodecResolver,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(err, CoveError::BadCodecExtension);
     }
 
     #[test]
@@ -1254,6 +1541,17 @@ mod tests {
         assert_eq!(
             descriptor_offset + PAGE_BUFFER_DESCRIPTOR_LEN,
             payload.header.buffers_offset as usize
+        );
+    }
+
+    #[test]
+    fn stable_registered_payload_rejects_trailing_bytes() {
+        let logical = utf8_logical_page();
+        let mut bytes = encode_registered_row_bytes(b"CFS2", &logical);
+        bytes.push(0);
+        assert_eq!(
+            decode_row_bytes(b"CFS2", &bytes),
+            Err(CoveError::BadCodecExtension)
         );
     }
 }

@@ -12,7 +12,8 @@ use crate::{
     CoveError,
 };
 
-pub const COLUMN_PAGE_PAYLOAD_MAGIC: [u8; 4] = *b"CPG1";
+pub const COLUMN_PAGE_PAYLOAD_MAGIC: [u8; 4] = *b"CPG2";
+pub const COLUMN_PAGE_PAYLOAD_VERSION_MAJOR: u16 = 2;
 pub const COLUMN_PAGE_PAYLOAD_HEADER_LEN: usize = 36;
 pub const COVE_ENCODING_NODE_LEN: usize = 30;
 pub const PAGE_BUFFER_DESCRIPTOR_LEN: usize = 32;
@@ -92,7 +93,7 @@ impl ColumnPagePayloadHeaderV1 {
             return Err(CoveError::BadMagic);
         }
         let version_major = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
-        if version_major != 1 {
+        if version_major != COLUMN_PAGE_PAYLOAD_VERSION_MAJOR {
             return Err(CoveError::BadVersion);
         }
         let header_len = u16::from_le_bytes(bytes[6..8].try_into().unwrap());
@@ -359,7 +360,7 @@ impl ColumnPagePayloadV1 {
             .ok_or(CoveError::ArithOverflow)?;
         let header = ColumnPagePayloadHeaderV1 {
             magic: COLUMN_PAGE_PAYLOAD_MAGIC,
-            version_major: 1,
+            version_major: COLUMN_PAGE_PAYLOAD_VERSION_MAJOR,
             header_len: COLUMN_PAGE_PAYLOAD_HEADER_LEN as u16,
             flags: 0,
             root_node_id: 0,
@@ -453,7 +454,7 @@ impl ColumnPagePayloadV1 {
             .ok_or(CoveError::ArithOverflow)?;
         let header = ColumnPagePayloadHeaderV1 {
             magic: COLUMN_PAGE_PAYLOAD_MAGIC,
-            version_major: 1,
+            version_major: COLUMN_PAGE_PAYLOAD_VERSION_MAJOR,
             header_len: COLUMN_PAGE_PAYLOAD_HEADER_LEN as u16,
             flags: 0,
             root_node_id,
@@ -558,7 +559,7 @@ impl ColumnPagePayloadV1 {
         }
         let header = ColumnPagePayloadHeaderV1 {
             magic: COLUMN_PAGE_PAYLOAD_MAGIC,
-            version_major: 1,
+            version_major: COLUMN_PAGE_PAYLOAD_VERSION_MAJOR,
             header_len: COLUMN_PAGE_PAYLOAD_HEADER_LEN as u16,
             flags: 0,
             root_node_id: 0,
@@ -1092,7 +1093,7 @@ mod tests {
     fn rejects_duplicate_node_ids() {
         let header = ColumnPagePayloadHeaderV1 {
             magic: COLUMN_PAGE_PAYLOAD_MAGIC,
-            version_major: 1,
+            version_major: COLUMN_PAGE_PAYLOAD_VERSION_MAJOR,
             header_len: COLUMN_PAGE_PAYLOAD_HEADER_LEN as u16,
             flags: 0,
             root_node_id: 0,

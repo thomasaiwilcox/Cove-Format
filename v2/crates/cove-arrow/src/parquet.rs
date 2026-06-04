@@ -37,7 +37,8 @@ use crate::{
         SectionKind, ValueTag,
     },
     dictionary::{
-        file_dictionary_candidate_len, FileDictionary, FileDictionaryEncoding, FileDictionaryKey,
+        file_dictionary_candidate_len, DictionaryValue, FileDictionary, FileDictionaryEncoding,
+        FileDictionaryKey,
     },
     digest::compute_digest,
     domain::ColumnDomain,
@@ -1504,6 +1505,8 @@ fn apply_dictionary_synthesis(
         }
         columns[index].values = MaterializedValues::FileCode(codes);
         columns[index].entry.physical = CovePhysicalKind::FileCode;
+        columns[index].entry.collation_id =
+            dictionary_collation_id(columns[index].entry.logical).unwrap_or(0);
         columns[index].encoding = CoveEncodingKind::FileCode;
         columns[index]
             .notes
@@ -1511,6 +1514,14 @@ fn apply_dictionary_synthesis(
     }
 
     Ok(Some(encoding.dictionary))
+}
+
+fn dictionary_collation_id(logical: CoveLogicalType) -> Option<u16> {
+    match logical {
+        CoveLogicalType::Utf8 => Some(1),
+        CoveLogicalType::Binary => Some(2),
+        _ => None,
+    }
 }
 
 fn dictionary_unique_keys(

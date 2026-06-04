@@ -2,9 +2,6 @@
   "encoding": "plain_varint",
   "expect_values": [],
   "payload": [
-    1,
-    0,
-    0,
-    0
+    128
   ]
 }

@@ -1,8 +1,16 @@
 use crate::{
-    constants::{PrimaryProfile, SectionKind},
+    constants::{
+        PrimaryProfile, SectionKind, FEATURE_AGGREGATE_SYNOPSES, FEATURE_BLOOM_FILTERS,
+        FEATURE_COLUMN_DOMAINS, FEATURE_COMPOSITE_ZONES, FEATURE_COVERAGE_METADATA,
+        FEATURE_EXACT_SETS, FEATURE_FAST_METADATA_INDEX, FEATURE_INDEX_ONLY_CAPABILITY,
+        FEATURE_INVERTED_INDEXES, FEATURE_LAYOUT_PLAN, FEATURE_LOOKUP_INDEXES,
+        FEATURE_PAGE_CLUSTER_DIRECTORY, FEATURE_RUNTIME_COMPATIBILITY_HINTS,
+        FEATURE_SCAN_SPLIT_INDEX, FEATURE_TOPN_SUMMARIES, FEATURE_ZERO_COPY_BUFFER_MAP,
+    },
     feature_binding::OperationKindV2,
     feature_scope::FeatureUseRequestV2,
     footer::CoveSectionEntryV1,
+    header::CoveHeaderV1,
     CoveError,
 };
 
@@ -20,17 +28,28 @@ pub(super) fn validate_section_profile(section_kind: u16, profile: u8) -> Result
     Ok(())
 }
 
-pub(super) fn is_optional_advisory_entry(entry: &CoveSectionEntryV1) -> bool {
-    entry.required_features == 0
-        && SectionKind::from_u16(entry.section_kind)
-            .map(is_optional_advisory_section)
-            .unwrap_or(false)
+pub(super) fn is_optional_advisory_entry(
+    header: &CoveHeaderV1,
+    entry: &CoveSectionEntryV1,
+) -> bool {
+    if entry.required_features != 0 {
+        return false;
+    }
+    let Some(kind) = SectionKind::from_u16(entry.section_kind) else {
+        return false;
+    };
+    if !is_optional_advisory_section(kind) {
+        return false;
+    }
+    let owning_feature = section_owning_feature_bit(kind);
+    owning_feature == 0 || header.required_features & owning_feature == 0
 }
 
 pub(super) fn is_optional_advisory_section(kind: SectionKind) -> bool {
     matches!(
         kind,
         SectionKind::ColumnDomain
+            | SectionKind::ZoneStats
             | SectionKind::ExactSetIndex
             | SectionKind::BloomIndex
             | SectionKind::InvertedMorselIndex
@@ -183,7 +202,8 @@ fn operation_requires_section(operation: OperationKindV2, kind: SectionKind) -> 
         OperationKindV2::RedactionPolicyEvaluation => kind == SectionKind::RedactionManifest,
         OperationKindV2::MappingReplay
         | OperationKindV2::MappingExplanation
-        | OperationKindV2::ProjectionReadback => is_map_section(kind),
+        | OperationKindV2::ProjectionReadback
+        | OperationKindV2::EvidenceReadback => is_map_section(kind),
         OperationKindV2::HarborMount => is_harbor_section(kind),
         _ => false,
     }
@@ -202,6 +222,32 @@ fn profile_requires_section(profile: u8, kind: SectionKind) -> bool {
         Some(PrimaryProfile::CoverageMetadata) => is_coverage_section(kind),
         Some(PrimaryProfile::SecondaryIndex) => kind == SectionKind::IndexOnlyCapability,
         _ => false,
+    }
+}
+
+fn section_owning_feature_bit(kind: SectionKind) -> u64 {
+    match kind {
+        SectionKind::ColumnDomain => FEATURE_COLUMN_DOMAINS,
+        SectionKind::ExactSetIndex => FEATURE_EXACT_SETS,
+        SectionKind::BloomIndex => FEATURE_BLOOM_FILTERS,
+        SectionKind::InvertedMorselIndex => FEATURE_INVERTED_INDEXES,
+        SectionKind::LookupIndex => FEATURE_LOOKUP_INDEXES,
+        SectionKind::AggregateSynopsis => FEATURE_AGGREGATE_SYNOPSES,
+        SectionKind::CompositeZoneIndex => FEATURE_COMPOSITE_ZONES,
+        SectionKind::TopNZoneSummary => FEATURE_TOPN_SUMMARIES,
+        SectionKind::LayoutPlan => FEATURE_LAYOUT_PLAN,
+        SectionKind::ScanSplitIndex => FEATURE_SCAN_SPLIT_INDEX,
+        SectionKind::PageClusterDirectory => FEATURE_PAGE_CLUSTER_DIRECTORY,
+        SectionKind::ZeroCopyBufferMap => FEATURE_ZERO_COPY_BUFFER_MAP,
+        SectionKind::FastMetadataIndex => FEATURE_FAST_METADATA_INDEX,
+        SectionKind::CoverageProviderRegistry
+        | SectionKind::CoverageSet
+        | SectionKind::CoveragePlanCandidate
+        | SectionKind::PredicateNormalForm
+        | SectionKind::CoverageProofRecord => FEATURE_COVERAGE_METADATA,
+        SectionKind::IndexOnlyCapability => FEATURE_INDEX_ONLY_CAPABILITY,
+        SectionKind::RuntimeCompatibilityHints => FEATURE_RUNTIME_COMPATIBILITY_HINTS,
+        _ => 0,
     }
 }
 
@@ -225,7 +271,6 @@ fn is_table_scan_section(kind: SectionKind) -> bool {
             | SectionKind::FileDictionaryIndex
             | SectionKind::FileDictionaryPayload
             | SectionKind::NestedSchema
-            | SectionKind::ZoneStats
             | SectionKind::CodecExtensionRegistry
     )
 }
@@ -295,7 +340,6 @@ mod tests {
             SectionKind::FileDictionaryIndex,
             SectionKind::FileDictionaryPayload,
             SectionKind::NestedSchema,
-            SectionKind::ZoneStats,
             SectionKind::CodecExtensionRegistry,
         ] {
             assert!(
@@ -317,6 +361,29 @@ mod tests {
             assert!(
                 operation_requires_section(OperationKindV2::EngineExecutionMapping, kind),
                 "{kind:?} should be required for engine execution mapping"
+            );
+        }
+    }
+
+    #[test]
+    fn map_readback_operations_require_cove_map_sections() {
+        for operation in [
+            OperationKindV2::MappingReplay,
+            OperationKindV2::MappingExplanation,
+            OperationKindV2::ProjectionReadback,
+            OperationKindV2::EvidenceReadback,
+        ] {
+            assert!(
+                operation_requires_section(operation, SectionKind::MapEvidenceIndex),
+                "{operation:?} should require COVE-MAP evidence metadata"
+            );
+            assert!(
+                operation_requires_section(operation, SectionKind::MapProjectionCatalog),
+                "{operation:?} should require COVE-MAP projection metadata"
+            );
+            assert!(
+                !operation_requires_section(operation, SectionKind::ObjectTypeCatalog),
+                "{operation:?} should not use COVE-O object sections as MAP metadata"
             );
         }
     }

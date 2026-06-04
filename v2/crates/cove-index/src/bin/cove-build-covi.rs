@@ -53,13 +53,17 @@ fn parse_build_args(args: Vec<String>) -> Result<BuildCommand, String> {
             }
             "--all-columns" => options.all_columns = true,
             "--index-only-counts" => options.include_index_only_counts = true,
+            "--index-only-exists" => options.include_index_only_exists = true,
+            "--index-only-min-max" => options.include_index_only_min_max = true,
+            "--index-only-distinct-count" => options.include_index_only_distinct_count = true,
+            "--index-only-sum-avg" => options.include_index_only_sum_avg = true,
             _ if arg.starts_with("--") => return Err(format!("unknown option: {arg}")),
             _ => positionals.push(arg),
         }
     }
     if positionals.len() != 2 {
         return Err(
-            "usage: cove-build-covi <input.cove> <output.covi> [--table-id <id>] [--column-id <id> ... | --all-columns] [--index-only-counts]\n       cove-build-covi <output.covi>  # empty artifact compatibility mode"
+            "usage: cove-build-covi <input.cove> <output.covi> [--table-id <id>] [--column-id <id> ... | --all-columns] [--index-only-counts] [--index-only-exists] [--index-only-min-max] [--index-only-distinct-count] [--index-only-sum-avg]\n       cove-build-covi <output.covi>  # empty artifact compatibility mode"
                 .to_string(),
         );
     }

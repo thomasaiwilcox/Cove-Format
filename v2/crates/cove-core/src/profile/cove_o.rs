@@ -32,16 +32,25 @@ pub use object_catalog::{
     PROPERTY_FLAG_EVIDENCE_REF, PROPERTY_FLAG_MAPPING_RULE_REF,
 };
 pub use readback::{
-    read_object_surface_from_bytes, read_object_surface_from_bytes_with_options,
-    reconstruct_object_states, CoveAssociationMetadata, CoveObjectPropertyValue,
-    CoveObjectReadOptions, CoveObjectReconstructionOptions, CoveObjectRecord, CoveObjectState,
-    CoveObjectSurface, CoveObjectTemporalCut, CoveObjectTombstoneStatus,
+    read_object_kernel_surface_from_bytes_with_options, read_object_surface_from_bytes,
+    read_object_surface_from_bytes_with_options,
+    read_object_surface_from_bytes_with_pushdown_options, read_retained_object_temporal_segments,
+    reconstruct_object_states, CoveAssociationMetadata, CoveObjectAssociationEndpointCandidate,
+    CoveObjectKernelPropertyLane, CoveObjectKernelPropertyValues, CoveObjectKernelReadOptions,
+    CoveObjectKernelReadResult, CoveObjectKernelSurface, CoveObjectKernelSystemLanes,
+    CoveObjectPropertyPredicateCandidate, CoveObjectPropertyPredicateLiteral,
+    CoveObjectPropertyPredicateOp, CoveObjectPropertyValue, CoveObjectReadOptions,
+    CoveObjectReadPushdownDecision, CoveObjectReadPushdownOptions, CoveObjectReadPushdownReport,
+    CoveObjectReadResult, CoveObjectReadWithPushdownOptions, CoveObjectReconstructionOptions,
+    CoveObjectRecord, CoveObjectRedactionReadPolicy, CoveObjectRetainedTemporalReadResult,
+    CoveObjectState, CoveObjectSurface, CoveObjectTemporalCut, CoveObjectTombstoneStatus,
 };
 pub(crate) use segment::{
     validate_temporal_property_page_elision_features, validate_temporal_property_stats_only_page,
 };
 pub use segment::{
-    CoveRecordRefV1, TemporalPropertyColumn, TemporalPropertyPage, TemporalRowEntryV1,
+    CoveRecordRefV1, RetainedTemporalPropertyColumn, RetainedTemporalPropertyPage,
+    RetainedTemporalSegmentData, TemporalPropertyColumn, TemporalPropertyPage, TemporalRowEntryV1,
     TemporalSegmentData, TemporalSegmentHeaderV1,
 };
 pub use segment_index::{TemporalSegmentIndex, TemporalSegmentIndexEntryV1};

@@ -1,6 +1,6 @@
 use std::{fs, path::Path, path::PathBuf, sync::Arc};
 
-use cove_cache::CoverageCacheV2;
+use cove_cache::{CoverageCacheUseContextV2, CoverageCacheV2, ABSENT_REF};
 use cove_core::{
     constants::{CovePhysicalKind, DigestAlgorithm},
     dictionary::FileDictionary,
@@ -153,7 +153,8 @@ pub async fn bootstrap_range_reader_with_options<R: CoveRangeReader + ?Sized>(
     let feature_scope_table = parse_feature_scope_table(reader, &header, &footer).await?;
     feature_scope_table
         .reject_unknowns_for_request(&ordinary_table_scan_feature_use_request(&footer))?;
-    validate_ordinary_table_scan_semantics(file_len, reader, &footer).await?;
+    let ignored_optional_sections =
+        validate_ordinary_table_scan_semantics(file_len, reader, &footer).await?;
     if options.execution_code_policy() == ExecutionCodePolicy::RequireSupported {
         validate_required_engine_execution_semantics(file_len, reader).await?;
     }
@@ -175,7 +176,14 @@ pub async fn bootstrap_range_reader_with_options<R: CoveRangeReader + ?Sized>(
         .into_iter()
         .filter(|segment| segment.table_id == table.table_id)
         .collect::<Vec<_>>();
-    let pruning = parse_pruning_metadata(reader, &header, file_len, &footer).await?;
+    let pruning = parse_pruning_metadata(
+        reader,
+        &header,
+        file_len,
+        &footer,
+        &ignored_optional_sections,
+    )
+    .await?;
     let layout = parse_layout_metadata(reader, &header, &footer, &table, &segments).await;
 
     let state = Arc::new(DatasetState::from_metadata_with_options_and_feature_scope(
@@ -209,11 +217,11 @@ async fn validate_ordinary_table_scan_semantics<R: CoveRangeReader + ?Sized>(
     file_len: u64,
     reader: &R,
     footer: &cove_core::footer::CoveFooter,
-) -> Result<(), CoveError> {
+) -> Result<Vec<reader::IgnoredOptionalSection>, CoveError> {
     let bytes = reader
         .read_range(0..file_len, RangeReadKind::Metadata)
         .await?;
-    reader::validate_bytes_for_ordinary_table_scan(
+    let report = reader::validate_bytes_for_ordinary_table_scan(
         &bytes,
         ValidationOptions {
             semantic: true,
@@ -223,7 +231,7 @@ async fn validate_ordinary_table_scan_semantics<R: CoveRangeReader + ?Sized>(
         },
         ordinary_table_scan_feature_use_request(footer),
     )?;
-    Ok(())
+    Ok(report.ignored_optional_sections)
 }
 
 async fn validate_required_engine_execution_semantics<R: CoveRangeReader + ?Sized>(
@@ -324,8 +332,12 @@ fn load_sibling_coverage_cache(
             return Ok((CoverageCacheMetadata::enabled_empty(), stats));
         }
     };
-    let (dataset_id, snapshot_id) = coverage_cache_ids(state.identity())?;
-    if cache.header.dataset_id != dataset_id || cache.header.snapshot_id != snapshot_id {
+    let file_bytes = fs::read(path)?;
+    let (dataset_id, snapshot_id) = coverage_cache_ids(state.identity(), &file_bytes)?;
+    if cache
+        .validate_header_for_use_context(dataset_id, snapshot_id, &[0])
+        .is_err()
+    {
         stats.coverage_cache_entries_stale += cache.entries.len().max(1);
         stats.coverage_cache_invalidations += cache.entries.len().max(1);
         return Ok((CoverageCacheMetadata::enabled_empty(), stats));
@@ -333,7 +345,7 @@ fn load_sibling_coverage_cache(
 
     let mut valid_entries = Vec::new();
     for entry in cache.entries {
-        if coverage_cache_entry_usable(state, &entry) {
+        if coverage_cache_entry_usable(state, &entry, dataset_id, snapshot_id) {
             valid_entries.push(entry);
         } else {
             stats.coverage_cache_entries_ignored += 1;
@@ -351,11 +363,16 @@ fn sibling_coverage_cache_path(path: &Path) -> PathBuf {
     PathBuf::from(format!("{}.cache", path.display()))
 }
 
-fn coverage_cache_ids(identity: &FileIdentity) -> Result<([u8; 16], [u8; 16]), CoveError> {
-    let mut seed = Vec::with_capacity(28);
+fn coverage_cache_ids(
+    identity: &FileIdentity,
+    file_bytes: &[u8],
+) -> Result<([u8; 16], [u8; 16]), CoveError> {
+    let file_digest = compute_digest(DigestAlgorithm::Sha256, file_bytes)?;
+    let mut seed = Vec::with_capacity(28 + file_digest.len());
     seed.extend_from_slice(&identity.file_id);
     seed.extend_from_slice(&identity.file_len.to_le_bytes());
     seed.extend_from_slice(&identity.footer_crc32c.to_le_bytes());
+    seed.extend_from_slice(&file_digest);
     let digest = compute_digest(DigestAlgorithm::Sha256, &seed)?;
     let mut snapshot_id = [0u8; 16];
     snapshot_id.copy_from_slice(&digest[..16]);
@@ -365,24 +382,22 @@ fn coverage_cache_ids(identity: &FileIdentity) -> Result<([u8; 16], [u8; 16]), C
 fn coverage_cache_entry_usable(
     state: &DatasetState,
     entry: &cove_cache::CoverageCacheEntryV2,
+    dataset_id: [u8; 16],
+    snapshot_id: [u8; 16],
 ) -> bool {
-    const ABSENT_REF: u32 = u32::MAX;
-
     if entry.interval_normal_form_ref != ABSENT_REF {
         return false;
     }
-    if entry.producer_engine_ref != ABSENT_REF && entry.producer_engine_ref != 0 {
+    let Ok(file) = state.file(0) else {
+        return false;
+    };
+    if !file.visibility().is_all() || file.has_redaction() {
         return false;
     }
     let Some(selected_snapshot_ref) = state.pruning().selected_coverage_snapshot_validity_ref
     else {
         return false;
     };
-    if entry.valid_until_snapshot_ref != ABSENT_REF
-        && entry.valid_until_snapshot_ref != selected_snapshot_ref
-    {
-        return false;
-    }
     let predicate_exists = state
         .pruning()
         .predicate_forms
@@ -397,13 +412,21 @@ fn coverage_cache_entry_usable(
         return false;
     }
     state.pruning().coverage_sets.iter().any(|set| {
-        set.header.coverage_set_id == entry.coverage_set_ref
-            && set.header.predicate_form_ref == entry.predicate_normal_form_ref
-            && set.header.granularity == entry.coverage_granularity
-            && set.header.proof_strength == entry.proof_strength
-            && set.header.exactness == entry.exactness
-            && set.header.snapshot_validity_ref == selected_snapshot_ref
-            && !set.header.exactness.may_under_include()
-            && set.header.proof_strength.allows_pruning()
+        if set.header.snapshot_validity_ref != selected_snapshot_ref {
+            return false;
+        }
+        let context = CoverageCacheUseContextV2 {
+            dataset_id,
+            snapshot_id,
+            predicate_normal_form_ref: set.header.predicate_form_ref,
+            interval_normal_form_ref: ABSENT_REF,
+            coverage_set_ref: set.header.coverage_set_id,
+            coverage_granularity: set.header.granularity,
+            proof_strength: set.header.proof_strength,
+            exactness: set.header.exactness,
+            selected_snapshot_ref: Some(selected_snapshot_ref),
+            compatible_producer_engine_refs: &[0],
+        };
+        entry.validate_for_use_context(&context).is_ok()
     })
 }

@@ -45,6 +45,31 @@ pub enum CollationKind {
 }
 
 impl CollationKind {
+    /// Minimum spec collation ID.
+    pub const fn id(self) -> u16 {
+        match self {
+            CollationKind::None => 0,
+            CollationKind::Utf8Bytewise => 1,
+            CollationKind::UnsignedFixedBytes => 2,
+            CollationKind::SignedNumeric => 3,
+            CollationKind::UnsignedNumeric => 4,
+            CollationKind::TimestampChronological => 5,
+        }
+    }
+
+    /// Look up one of the minimum v2 collations by ID.
+    pub const fn from_id(id: u16) -> Option<Self> {
+        match id {
+            0 => Some(CollationKind::None),
+            1 => Some(CollationKind::Utf8Bytewise),
+            2 => Some(CollationKind::UnsignedFixedBytes),
+            3 => Some(CollationKind::SignedNumeric),
+            4 => Some(CollationKind::UnsignedNumeric),
+            5 => Some(CollationKind::TimestampChronological),
+            _ => None,
+        }
+    }
+
     /// Stable spec name for this collation.
     pub const fn name(self) -> &'static str {
         match self {
@@ -147,10 +172,14 @@ pub const V1_COLLATIONS: &[CollationKind] = &[
 /// A collation entry, mapping a column or domain to a named collation.
 #[derive(Debug, Clone)]
 pub struct CollationEntry {
+    /// File-local collation ID.
+    pub collation_id: u16,
     /// Collation name (e.g. "utf8-bytewise").
     pub name: String,
-    /// Optional vendor-defined metadata bytes.
-    pub metadata: Vec<u8>,
+    /// Collation version string.
+    pub version: String,
+    /// Entry flags.
+    pub flags: u32,
     /// Resolved kind, if it matches a v1 collation.
     pub kind: Option<CollationKind>,
 }
@@ -164,20 +193,30 @@ pub struct CollationRegistry {
 impl CollationRegistry {
     /// Parse a collation registry section.
     ///
-    /// Wire format: `u32` LE entry count, then entries of:
-    /// `u16` LE `name_len`, name bytes (UTF-8), `u16` LE `meta_len`, meta bytes.
+    /// Wire format: `CollationRegistryHeaderV2`, then entries of:
+    /// `u16 collation_id`, `u16 name_len`, name bytes, `u16 version_len`,
+    /// version bytes, `u32 flags`.
     pub fn parse(bytes: &[u8]) -> Result<Self, CoveError> {
-        if bytes.len() < 4 {
+        if bytes.len() < 8 {
             return Err(CoveError::BufferTooShort);
         }
         let entry_count = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
-        let mut pos = 4usize;
+        let flags = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+        if flags != 0 {
+            return Err(CoveError::BadSection(
+                "collation registry reserved flags must be zero".into(),
+            ));
+        }
+        let mut pos = 8usize;
         let mut entries = Vec::with_capacity(entry_count as usize);
+        let mut seen_ids = std::collections::BTreeSet::new();
 
         for _ in 0..entry_count {
-            if pos + 2 > bytes.len() {
+            if pos + 4 > bytes.len() {
                 return Err(CoveError::BufferTooShort);
             }
+            let collation_id = u16::from_le_bytes(bytes[pos..pos + 2].try_into().unwrap());
+            pos += 2;
             let name_len = u16::from_le_bytes(bytes[pos..pos + 2].try_into().unwrap()) as usize;
             pos += 2;
             let name_end = pos.checked_add(name_len).ok_or(CoveError::ArithOverflow)?;
@@ -192,21 +231,50 @@ impl CollationRegistry {
             if pos + 2 > bytes.len() {
                 return Err(CoveError::BufferTooShort);
             }
-            let meta_len = u16::from_le_bytes(bytes[pos..pos + 2].try_into().unwrap()) as usize;
+            let version_len = u16::from_le_bytes(bytes[pos..pos + 2].try_into().unwrap()) as usize;
             pos += 2;
-            let meta_end = pos.checked_add(meta_len).ok_or(CoveError::ArithOverflow)?;
-            if meta_end > bytes.len() {
+            let version_end = pos
+                .checked_add(version_len)
+                .ok_or(CoveError::ArithOverflow)?;
+            if version_end > bytes.len() {
                 return Err(CoveError::BufferTooShort);
             }
-            let metadata = bytes[pos..meta_end].to_vec();
-            pos = meta_end;
+            let version = std::str::from_utf8(&bytes[pos..version_end])
+                .map_err(|_| CoveError::BadSection("collation version is not valid UTF-8".into()))?
+                .to_string();
+            pos = version_end;
 
+            if pos + 4 > bytes.len() {
+                return Err(CoveError::BufferTooShort);
+            }
+            let flags = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+            pos += 4;
+
+            if !seen_ids.insert(collation_id) {
+                return Err(CoveError::BadSection(
+                    "collation registry has duplicate collation_id".into(),
+                ));
+            }
             let kind = CollationKind::from_name(&name);
+            if let Some(minimum_kind) = CollationKind::from_id(collation_id) {
+                if Some(minimum_kind) != kind {
+                    return Err(CoveError::BadSection(
+                        "minimum collation IDs must use their spec-defined names".into(),
+                    ));
+                }
+            }
             entries.push(CollationEntry {
+                collation_id,
                 name,
-                metadata,
+                version,
+                flags,
                 kind,
             });
+        }
+        if pos != bytes.len() {
+            return Err(CoveError::BadSection(
+                "collation registry has trailing bytes".into(),
+            ));
         }
         Ok(Self { entries })
     }
@@ -215,18 +283,22 @@ impl CollationRegistry {
     pub fn serialize(&self) -> Result<Vec<u8>, CoveError> {
         let mut out = Vec::with_capacity(4 + self.entries.len() * 8);
         out.extend_from_slice(&(self.entries.len() as u32).to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
         for entry in &self.entries {
             let name_bytes = entry.name.as_bytes();
+            let version_bytes = entry.version.as_bytes();
             let name_len = u16::try_from(name_bytes.len()).map_err(|_| {
                 CoveError::BadSection("collation name exceeds u16 length limit".into())
             })?;
-            let meta_len = u16::try_from(entry.metadata.len()).map_err(|_| {
-                CoveError::BadSection("collation metadata exceeds u16 length limit".into())
+            let version_len = u16::try_from(version_bytes.len()).map_err(|_| {
+                CoveError::BadSection("collation version exceeds u16 length limit".into())
             })?;
+            out.extend_from_slice(&entry.collation_id.to_le_bytes());
             out.extend_from_slice(&name_len.to_le_bytes());
             out.extend_from_slice(name_bytes);
-            out.extend_from_slice(&meta_len.to_le_bytes());
-            out.extend_from_slice(&entry.metadata);
+            out.extend_from_slice(&version_len.to_le_bytes());
+            out.extend_from_slice(version_bytes);
+            out.extend_from_slice(&entry.flags.to_le_bytes());
         }
         Ok(out)
     }
@@ -240,6 +312,24 @@ impl CollationRegistry {
     pub fn is_known_collation(name: &str) -> bool {
         CollationKind::from_name(name).is_some()
     }
+
+    /// Whether an ID names one of the minimum collations and supports ordering.
+    pub fn is_ordering_collation_id(id: u16) -> bool {
+        CollationKind::from_id(id)
+            .map(CollationKind::supports_ordering)
+            .unwrap_or(false)
+    }
+
+    /// Resolve an ID to a supported collation kind. Minimum spec IDs are fixed
+    /// and cannot be overridden by registry entries.
+    pub fn kind_for_id(&self, id: u16) -> Option<CollationKind> {
+        CollationKind::from_id(id).or_else(|| {
+            self.entries
+                .iter()
+                .find(|entry| entry.collation_id == id)
+                .and_then(|entry| entry.kind)
+        })
+    }
 }
 
 #[cfg(test)]
@@ -251,13 +341,17 @@ mod serialize_tests {
         let reg = CollationRegistry {
             entries: vec![
                 CollationEntry {
+                    collation_id: 1,
                     name: "utf8-bytewise".into(),
-                    metadata: vec![],
+                    version: "v2".into(),
+                    flags: 0,
                     kind: Some(CollationKind::Utf8Bytewise),
                 },
                 CollationEntry {
+                    collation_id: 100,
                     name: "vendor-x".into(),
-                    metadata: vec![1, 2, 3, 4],
+                    version: "2026".into(),
+                    flags: 0,
                     kind: None,
                 },
             ],
@@ -266,14 +360,15 @@ mod serialize_tests {
         let back = CollationRegistry::parse(&bytes).unwrap();
         assert_eq!(back.entries.len(), 2);
         assert_eq!(back.entries[0].name, "utf8-bytewise");
-        assert_eq!(back.entries[1].metadata, vec![1, 2, 3, 4]);
+        assert_eq!(back.entries[1].collation_id, 100);
+        assert_eq!(back.entries[1].version, "2026");
     }
 
     #[test]
     fn serialize_empty() {
         let reg = CollationRegistry::default();
         let bytes = reg.serialize().unwrap();
-        assert_eq!(bytes, vec![0u8; 4]);
+        assert_eq!(bytes, vec![0u8; 8]);
         assert!(CollationRegistry::parse(&bytes).unwrap().entries.is_empty());
     }
 
@@ -281,8 +376,10 @@ mod serialize_tests {
     fn serialize_rejects_name_longer_than_u16() {
         let reg = CollationRegistry {
             entries: vec![CollationEntry {
+                collation_id: 1,
                 name: "a".repeat(usize::from(u16::MAX) + 1),
-                metadata: vec![],
+                version: String::new(),
+                flags: 0,
                 kind: None,
             }],
         };
@@ -295,13 +392,16 @@ mod serialize_tests {
 mod tests {
     use super::*;
 
-    fn make_registry_bytes(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    fn make_registry_bytes(entries: &[(u16, &str, &str)]) -> Vec<u8> {
         let mut out = (entries.len() as u32).to_le_bytes().to_vec();
-        for (name, meta) in entries {
+        out.extend_from_slice(&0u32.to_le_bytes());
+        for (id, name, version) in entries {
+            out.extend_from_slice(&id.to_le_bytes());
             out.extend_from_slice(&(name.len() as u16).to_le_bytes());
             out.extend_from_slice(name.as_bytes());
-            out.extend_from_slice(&(meta.len() as u16).to_le_bytes());
-            out.extend_from_slice(meta);
+            out.extend_from_slice(&(version.len() as u16).to_le_bytes());
+            out.extend_from_slice(version.as_bytes());
+            out.extend_from_slice(&0u32.to_le_bytes());
         }
         out
     }
@@ -317,6 +417,7 @@ mod tests {
     fn spec_22_v1_collations_all_resolve() {
         for c in V1_COLLATIONS {
             assert_eq!(CollationKind::from_name(c.name()), Some(*c));
+            assert_eq!(CollationKind::from_id(c.id()), Some(*c));
         }
     }
 
@@ -378,7 +479,7 @@ mod tests {
 
     #[test]
     fn registry_with_v1_entries_resolves_all() {
-        let bytes = make_registry_bytes(&[("utf8-bytewise", b""), ("signed-numeric", b"")]);
+        let bytes = make_registry_bytes(&[(1, "utf8-bytewise", ""), (3, "signed-numeric", "")]);
         let reg = CollationRegistry::parse(&bytes).unwrap();
         assert_eq!(reg.entries.len(), 2);
         assert!(reg.all_known());
@@ -386,8 +487,36 @@ mod tests {
 
     #[test]
     fn registry_with_unknown_entry_is_not_all_known() {
-        let bytes = make_registry_bytes(&[("vendor-magic", b"")]);
+        let bytes = make_registry_bytes(&[(100, "vendor-magic", "1")]);
         let reg = CollationRegistry::parse(&bytes).unwrap();
         assert!(!reg.all_known());
+    }
+
+    #[test]
+    fn registry_rejects_trailing_bytes() {
+        let mut bytes = make_registry_bytes(&[(1, "utf8-bytewise", "")]);
+        bytes.push(0);
+        assert!(matches!(
+            CollationRegistry::parse(&bytes),
+            Err(CoveError::BadSection(_))
+        ));
+    }
+
+    #[test]
+    fn registry_rejects_duplicate_collation_id() {
+        let bytes = make_registry_bytes(&[(100, "utf8-bytewise", ""), (100, "utf8-bytewise", "")]);
+        assert!(matches!(
+            CollationRegistry::parse(&bytes),
+            Err(CoveError::BadSection(_))
+        ));
+    }
+
+    #[test]
+    fn registry_rejects_minimum_id_override() {
+        let bytes = make_registry_bytes(&[(1, "signed-numeric", "")]);
+        assert!(matches!(
+            CollationRegistry::parse(&bytes),
+            Err(CoveError::BadSection(_))
+        ));
     }
 }

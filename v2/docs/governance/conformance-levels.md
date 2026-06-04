@@ -9,6 +9,10 @@ COVE v2.0 conformance levels describe how much of the format an implementation s
 
 Feature-scope rules are part of every level. Unknown required local features fail. Unknown optional local features remain visible through inspect/report fallback.
 
+Level claims do not imply production lakehouse catalog integration. The reference implementation's lakehouse evidence is fixture-backed visibility and overlay validation; Iceberg, Delta, Hudi, Hive, Unity, or other catalog adapters must be named as separate engine/table-format claims.
+
+Conversion claims should identify fallback behavior. The reference converter emits native COVE nested layouts for supported List, Struct, and Map shapes, while unsupported nested child shapes are converted through explicit JSON fallback reports rather than claimed as native nested coverage.
+
 Required conformance command set:
 
 ```sh

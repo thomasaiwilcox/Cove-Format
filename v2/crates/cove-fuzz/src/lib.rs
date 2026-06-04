@@ -542,7 +542,7 @@ fn run_encoding_parity(seed: u64, stats: &mut CampaignStats) -> Result<(), FuzzF
     })?;
     assert_encoding("plain-varint", seed, 0, stats, || {
         assert_parity::<PlainVarint>(&PlainVarintPayload {
-            values: vec![i64::MIN, -123, 0, 456, i64::MAX],
+            values: vec![0, 123, 456, i64::MAX as u64, u64::MAX],
         })
     })?;
     assert_encoding("rle", seed, 0, stats, || {

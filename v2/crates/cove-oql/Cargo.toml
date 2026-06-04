@@ -1,0 +1,37 @@
+[package]
+name = "cove-oql"
+version = "0.1.0"
+edition = "2021"
+description = "Cove-OQL operation context and spec validation foundation"
+license = "MIT"
+
+[features]
+default = []
+datafusion = ["dep:cove-datafusion", "cove-datafusion/covm", "dep:datafusion"]
+
+[dependencies]
+arrow-array = "58"
+arrow-schema = "58"
+async-trait = "0.1"
+cove-arrow = { path = "../cove-arrow" }
+cove-core = { path = "../cove-core" }
+cove-cache = { path = "../cove-cache" }
+cove-coverage = { path = "../cove-coverage" }
+cove-datafusion = { path = "../cove-datafusion", optional = true }
+cove-index = { path = "../cove-index" }
+cove-layout = { path = "../cove-layout" }
+cove-map = { path = "../cove-map" }
+cove-profile-validation = { path = "../cove-profile-validation" }
+cove-runtime = { path = "../cove-runtime" }
+datafusion = { version = "53.1.0", default-features = false, features = ["sql"], optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.10"
+time = { version = "0.3", features = ["formatting", "parsing"] }
+
+[[bench]]
+name = "kernel_execution"
+harness = false
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

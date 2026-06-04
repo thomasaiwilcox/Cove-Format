@@ -152,10 +152,7 @@ where
 
     let mut domain_count = 0usize;
     if options.stats_policy == ParquetStatsPolicy::Recompute {
-        for domain in build_column_domains(
-            &columns,
-            dictionary.as_ref().map(|dictionary| dictionary.len()),
-        )? {
+        for domain in build_column_domains(&columns, dictionary.as_ref())? {
             writer.push_column_domain(&domain)?;
             domain_count += 1;
         }

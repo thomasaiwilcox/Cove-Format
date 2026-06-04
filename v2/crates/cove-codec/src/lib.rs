@@ -3,8 +3,9 @@
 use cove_core::CoveError;
 
 pub use cove_core::codec::{
-    validate_descriptor_set, CodecExtensionDescriptorV2, CodecFallbackPolicyV2, CodecRequirementV2,
-    CodecSpecificationStatusV2, LogicalPage, RegisteredEncodingEnvelopeV2, ABSENT_REF,
+    stable_registered_codec_supported_masks, validate_descriptor_set, CodecExtensionDescriptorV2,
+    CodecFallbackPolicyV2, CodecRequirementV2, CodecSpecificationStatusV2, LogicalPage,
+    RegisteredEncodingEnvelopeV2, ABSENT_REF,
 };
 
 pub const FSST_UTF8_CODEC_IDENTITY: (&str, &str, u16, u16) =
@@ -35,11 +36,22 @@ impl StableRegisteredCodec {
             Self::FastLanesInteger => FASTLANES_INTEGER_CODEC_IDENTITY,
         }
     }
+
+    pub fn codec_family(self) -> u16 {
+        match self {
+            Self::FsstUtf8 => 0,
+            Self::AlpFloat => 1,
+            Self::FastLanesInteger => 2,
+        }
+    }
 }
 
 impl RegisteredCodec for StableRegisteredCodec {
     fn descriptor(&self) -> CodecExtensionDescriptorV2 {
         let (namespace, name, version_major, version_minor) = self.descriptor_identity();
+        let (logical_type_mask, physical_kind_mask) =
+            stable_registered_codec_supported_masks(namespace, name, version_major, version_minor)
+                .expect("stable codec identity has registered type masks");
         CodecExtensionDescriptorV2 {
             codec_id: match self {
                 StableRegisteredCodec::FsstUtf8 => 1,
@@ -51,12 +63,12 @@ impl RegisteredCodec for StableRegisteredCodec {
             version_major,
             version_minor,
             codec_family: match self {
-                StableRegisteredCodec::FsstUtf8 => 1,
-                StableRegisteredCodec::AlpFloat => 2,
-                StableRegisteredCodec::FastLanesInteger => 3,
+                StableRegisteredCodec::FsstUtf8 => 0,
+                StableRegisteredCodec::AlpFloat => 1,
+                StableRegisteredCodec::FastLanesInteger => 2,
             },
-            logical_type_mask: u64::MAX,
-            physical_kind_mask: u64::MAX,
+            logical_type_mask,
+            physical_kind_mask,
             requirement: CodecRequirementV2::OptionalWithFallback,
             fallback_policy: CodecFallbackPolicyV2::CoreEncodingPayloadPresent,
             parameter_schema_kind: 0,
@@ -128,6 +140,7 @@ impl CodecRegistry {
                 && descriptor.name == name
                 && descriptor.version_major == major
                 && descriptor.version_minor == minor
+                && descriptor.codec_family == codec.codec_family()
                 && descriptor.specification_status == CodecSpecificationStatusV2::StableRegistered
                 && descriptor.spec_digest == stable_spec_digest(*codec)
         })
@@ -260,6 +273,9 @@ fn decode_row_bytes(expected_magic: &[u8; 4], bytes: &[u8]) -> Result<LogicalPag
         let is_null = (null_bitmap[index >> 3] & (1 << (index & 7))) != 0;
         values.push((!is_null).then(|| payload[start..end].to_vec()));
     }
+    if offsets.last() != Some(&payload.len()) {
+        return Err(CoveError::BadCodecExtension);
+    }
     if !row_count.is_multiple_of(8) && !null_bitmap.is_empty() {
         let unused_mask = !((1u8 << (row_count % 8)) - 1);
         if null_bitmap[null_bitmap.len() - 1] & unused_mask != 0 {
@@ -332,6 +348,42 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn stable_registry_rejects_wrong_codec_family() {
+        let mut descriptor = StableRegisteredCodec::FsstUtf8.descriptor();
+        descriptor.codec_family = StableRegisteredCodec::AlpFloat.codec_family();
+        assert!(CodecRegistry::stable_v2()
+            .codec_for_descriptor(&descriptor)
+            .is_none());
+        assert!(matches!(
+            descriptor.validate(),
+            Err(CoveError::BadCodecExtension)
+        ));
+    }
+
+    #[test]
+    fn stable_descriptors_advertise_registered_type_domains() {
+        let fsst = StableRegisteredCodec::FsstUtf8.descriptor();
+        assert_eq!(
+            fsst.logical_type_mask,
+            1u64 << (cove_core::constants::CoveLogicalType::Utf8 as u32)
+        );
+        assert_eq!(
+            fsst.physical_kind_mask,
+            1u64 << (cove_core::constants::CovePhysicalKind::VarBytes as u32)
+        );
+
+        let alp = StableRegisteredCodec::AlpFloat.descriptor();
+        assert_ne!(
+            alp.logical_type_mask & (1u64 << (cove_core::constants::CoveLogicalType::Int64 as u32)),
+            1u64 << (cove_core::constants::CoveLogicalType::Int64 as u32)
+        );
+        assert_eq!(
+            alp.physical_kind_mask,
+            1u64 << (cove_core::constants::CovePhysicalKind::NumCode as u32)
+        );
+    }
+
     fn envelope() -> RegisteredEncodingEnvelopeV2 {
         RegisteredEncodingEnvelopeV2 {
             codec_id: 1,
@@ -382,6 +434,19 @@ mod tests {
         assert!(matches!(
             RegisteredEncodingEnvelopeV2::parse(&bytes),
             Err(CoveError::ChecksumMismatch)
+        ));
+    }
+
+    #[test]
+    fn stable_payload_rejects_trailing_bytes() {
+        let page = LogicalPage {
+            values: vec![Some(b"alpha".to_vec()), None, Some(b"omega".to_vec())],
+        };
+        let mut bytes = StableRegisteredCodec::FsstUtf8.encode(&page).unwrap();
+        bytes.push(0);
+        assert!(matches!(
+            StableRegisteredCodec::FsstUtf8.decode(&bytes),
+            Err(CoveError::BadCodecExtension)
         ));
     }
 }

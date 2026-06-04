@@ -371,6 +371,7 @@ mod tests {
                     "output_object_id": "goid:1",
                     "source_operation_kind": "Upsert",
                     "operation_effect": "merged",
+                    "association_type": "member_of",
                     "property_name": "name"
                 }]
             }),
@@ -393,7 +394,23 @@ mod tests {
             .contains_key("operation_effect"));
         assert!(!index.entries[0]
             .operation_metadata
+            .contains_key("association_type"));
+        assert!(!index.entries[0]
+            .operation_metadata
             .contains_key("property_name"));
+
+        let index = MapEvidenceIndex::parse_with_requested_operation_metadata_keys(
+            &bytes,
+            &[String::from("association_type")],
+        )
+        .unwrap();
+        assert_eq!(
+            index.entries[0].operation_metadata.get("association_type"),
+            Some(&json!("member_of"))
+        );
+        assert!(!index.entries[0]
+            .operation_metadata
+            .contains_key("source_operation_kind"));
     }
 
     fn row_rule_with_operation(

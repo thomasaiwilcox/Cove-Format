@@ -26,7 +26,7 @@ pub mod metadata_aggregate;
 pub mod options;
 pub mod overlay;
 pub mod planner;
-mod projection_provider;
+pub mod projection_provider;
 pub mod prune;
 pub mod range_reader;
 pub mod register;

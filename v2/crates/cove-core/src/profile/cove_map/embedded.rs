@@ -948,6 +948,7 @@ impl MapEvidenceIndex {
                         "candidate",
                         "identity_rule_id",
                         "object_type",
+                        "association_type",
                         "join_key_sha256",
                     ],
                 )?;
@@ -1005,6 +1006,7 @@ fn is_evidence_operation_metadata_key(key: &str) -> bool {
             | "candidate"
             | "identity_rule_id"
             | "object_type"
+            | "association_type"
             | "join_key_sha256"
     )
 }

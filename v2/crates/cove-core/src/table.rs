@@ -64,7 +64,7 @@ pub struct ColumnEntry {
     pub nullable: bool,
     /// Per-column sort indicator (Spec §53). `0` means no declared sort.
     pub sort_order: u16,
-    /// Collation registry id (Spec §22). `0` means default/identity.
+    /// Collation registry id (Spec §22). `0` means unordered/no collation.
     pub collation_id: u16,
     /// Decimal precision (ignored for non-decimal logical types).
     pub precision: u16,

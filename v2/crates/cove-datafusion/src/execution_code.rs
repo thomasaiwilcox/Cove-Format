@@ -68,7 +68,7 @@ pub fn validate_policy_for_filters(
 pub fn resolve_file_code_predicate_for_file(
     state: &DatasetState,
     file_ordinal: usize,
-    canonical_values: &[Vec<u8>],
+    canonical_keys: &[Vec<u8>],
 ) -> Result<(Vec<u32>, ExecutionCodePlanStats), CoveError> {
     let file = state.file(file_ordinal)?;
     let support = match state.execution_code_policy() {
@@ -83,9 +83,9 @@ pub fn resolve_file_code_predicate_for_file(
         return Err(CoveError::BadEngineProfile);
     }
 
-    let mut resolved = Vec::with_capacity(canonical_values.len());
-    for canonical in canonical_values {
-        if let Some(file_code) = state.file_code_for_canonical(file_ordinal, canonical)? {
+    let mut resolved = Vec::with_capacity(canonical_keys.len());
+    for canonical_key in canonical_keys {
+        if let Some(file_code) = state.file_code_for_canonical_key(file_ordinal, canonical_key)? {
             resolved.push(file_code);
         }
     }
@@ -96,7 +96,7 @@ pub fn resolve_file_code_predicate_for_file(
         ExecutionCodePlanStats {
             supported_files: usize::from(matches!(support, ExecutionCodeSupport::Supported { .. })),
             fallback_files: usize::from(!matches!(support, ExecutionCodeSupport::Supported { .. })),
-            literal_resolutions: canonical_values.len(),
+            literal_resolutions: canonical_keys.len(),
         },
     ))
 }

@@ -4,8 +4,11 @@ use std::collections::BTreeSet;
 
 use cove_core::{
     checksum,
-    constants::{CoveLogicalType, CovePhysicalKind, SectionKind},
+    constants::{CompressionCodec, CoveLogicalType, CovePhysicalKind, SectionKind},
     footer::{CoveFooter, CoveSectionEntryV1},
+    page::page_flag_codec,
+    page_payload::PageBufferKind,
+    profile::cove_o::ObjectTypeCatalog,
     segment::TableSegmentIndexEntryV1,
     table::TableEntry,
     CoveError,
@@ -1224,6 +1227,32 @@ pub struct ValidatedZeroCopyBufferMapV2 {
     pub map: ZeroCopyBufferMapV2,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectZeroCopySegmentAuthority {
+    pub object_type_id: u32,
+    pub segment_id: u32,
+    pub morsel_count: u32,
+    pub columns: Vec<ObjectZeroCopyColumnAuthority>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectZeroCopyColumnAuthority {
+    pub property_id: u32,
+    pub logical_type: CoveLogicalType,
+    pub physical_kind: CovePhysicalKind,
+    pub pages: Vec<ObjectZeroCopyPageAuthority>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectZeroCopyPageAuthority {
+    /// One-based page reference used by COVE-L zero-copy entries.
+    pub page_ref: u32,
+    pub morsel_id: u32,
+    pub row_count: u32,
+    pub flags: u32,
+    pub has_payload: bool,
+}
+
 impl ValidatedLayoutPlanV2 {
     pub fn validate(
         plan: LayoutPlanV2,
@@ -1257,6 +1286,16 @@ impl ValidatedZeroCopyBufferMapV2 {
         segments: &[TableSegmentIndexEntryV1],
     ) -> Result<Self, CoveError> {
         validate_zero_copy_map_authority(&map, table, segments)?;
+        Ok(Self { map })
+    }
+
+    pub fn validate_object_temporal(
+        map: ZeroCopyBufferMapV2,
+        catalog: &ObjectTypeCatalog,
+        segments: &[ObjectZeroCopySegmentAuthority],
+        compatibility: &ZeroCopyCompatibilityContext,
+    ) -> Result<Self, CoveError> {
+        validate_zero_copy_map_object_authority(&map, catalog, segments, compatibility)?;
         Ok(Self { map })
     }
 }
@@ -1560,6 +1599,84 @@ pub fn validate_zero_copy_map_authority(
             return Err(CoveError::BadLayoutPlan);
         }
         if entry.source_endianness != 0 {
+            return Err(CoveError::BadLayoutPlan);
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_zero_copy_map_object_authority(
+    map: &ZeroCopyBufferMapV2,
+    catalog: &ObjectTypeCatalog,
+    segments: &[ObjectZeroCopySegmentAuthority],
+    compatibility: &ZeroCopyCompatibilityContext,
+) -> Result<(), CoveError> {
+    let target_ids = map
+        .targets
+        .iter()
+        .map(|target| target.target_id)
+        .collect::<BTreeSet<_>>();
+    for entry in &map.entries {
+        if !target_ids.contains(&entry.target_id) {
+            return Err(CoveError::BadLayoutPlan);
+        }
+        if entry.source_endianness != 0 {
+            return Err(CoveError::BadLayoutPlan);
+        }
+        if entry.compatibility(compatibility) != ZeroCopyCompatibilityV2::Compatible {
+            return Err(CoveError::BadLayoutPlan);
+        }
+        if entry.target_buffer_role != ZeroCopyTargetBufferRoleV2::Values
+            || entry.source_buffer_role != ZeroCopySourceBufferRoleV2::CoveValues
+            || entry.buffer_kind != PageBufferKind::Values as u16
+        {
+            return Err(CoveError::BadLayoutPlan);
+        }
+        let object_type = catalog
+            .types
+            .iter()
+            .find(|object_type| object_type.object_type_id == entry.table_id)
+            .ok_or(CoveError::BadLayoutPlan)?;
+        let property = object_type
+            .properties
+            .iter()
+            .find(|property| property.property_id == entry.column_id)
+            .ok_or(CoveError::BadLayoutPlan)?;
+        if CoveLogicalType::from_u16(entry.logical_type) != Some(property.logical_type)
+            || CovePhysicalKind::from_u8(entry.physical_kind) != Some(property.physical_kind)
+        {
+            return Err(CoveError::BadLayoutPlan);
+        }
+        let segment = segments
+            .iter()
+            .find(|segment| {
+                segment.object_type_id == entry.table_id && segment.segment_id == entry.segment_id
+            })
+            .ok_or(CoveError::BadLayoutPlan)?;
+        if entry.morsel_id >= segment.morsel_count {
+            return Err(CoveError::BadLayoutPlan);
+        }
+        let column = segment
+            .columns
+            .iter()
+            .find(|column| column.property_id == entry.column_id)
+            .ok_or(CoveError::BadLayoutPlan)?;
+        if column.logical_type != property.logical_type
+            || column.physical_kind != property.physical_kind
+        {
+            return Err(CoveError::BadLayoutPlan);
+        }
+        let page = column
+            .pages
+            .iter()
+            .find(|page| page.page_ref == entry.page_ref)
+            .ok_or(CoveError::BadLayoutPlan)?;
+        if page.morsel_id != entry.morsel_id || page.row_count == 0 || !page.has_payload {
+            return Err(CoveError::BadLayoutPlan);
+        }
+        if entry.compression_required_none == 1
+            && page_flag_codec(page.flags)? != CompressionCodec::None
+        {
             return Err(CoveError::BadLayoutPlan);
         }
     }
@@ -2465,6 +2582,118 @@ mod tests {
                 ZeroCopyMaterializationReasonV2::UnknownRole
             )
         );
+    }
+
+    fn object_catalog() -> cove_core::profile::cove_o::ObjectTypeCatalog {
+        cove_core::profile::cove_o::ObjectTypeCatalog {
+            flags: 0,
+            types: vec![cove_core::profile::cove_o::ObjectTypeEntryV1 {
+                object_type_id: 1,
+                type_name: "Thing".into(),
+                flags: cove_core::profile::cove_o::OBJECT_TYPE_FLAG_ENTITY_OBJECT,
+                properties: vec![cove_core::profile::cove_o::PropertyEntryV1 {
+                    property_id: 1,
+                    property_name: "metric".into(),
+                    logical_type: CoveLogicalType::UInt16,
+                    physical_kind: CovePhysicalKind::NumCode,
+                    nullable: false,
+                    collation_id: 0,
+                    flags: 0,
+                }],
+            }],
+        }
+    }
+
+    fn object_authority() -> Vec<ObjectZeroCopySegmentAuthority> {
+        vec![ObjectZeroCopySegmentAuthority {
+            object_type_id: 1,
+            segment_id: 1,
+            morsel_count: 1,
+            columns: vec![ObjectZeroCopyColumnAuthority {
+                property_id: 1,
+                logical_type: CoveLogicalType::UInt16,
+                physical_kind: CovePhysicalKind::NumCode,
+                pages: vec![ObjectZeroCopyPageAuthority {
+                    page_ref: 1,
+                    morsel_id: 0,
+                    row_count: 2,
+                    flags: 0,
+                    has_payload: true,
+                }],
+            }],
+        }]
+    }
+
+    #[test]
+    fn zero_copy_object_authority_accepts_valid_object_page_map() {
+        let mut entry = zero_copy_entry();
+        entry.buffer_kind = cove_core::page_payload::PageBufferKind::Values as u16;
+        let map = zero_copy_map(entry);
+        validate_zero_copy_map_object_authority(
+            &map,
+            &object_catalog(),
+            &object_authority(),
+            &ZeroCopyCompatibilityContext {
+                required_lifetime_scope: ZeroCopyLifetimeScopeV2::ReaderSession,
+                ..ZeroCopyCompatibilityContext::default()
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn zero_copy_object_authority_rejects_wrong_property_and_page() {
+        let catalog = object_catalog();
+        let authority = object_authority();
+        let mut entry = zero_copy_entry();
+        entry.column_id = 99;
+        assert!(matches!(
+            validate_zero_copy_map_object_authority(
+                &zero_copy_map(entry),
+                &catalog,
+                &authority,
+                &ZeroCopyCompatibilityContext {
+                    required_lifetime_scope: ZeroCopyLifetimeScopeV2::ReaderSession,
+                    ..ZeroCopyCompatibilityContext::default()
+                },
+            ),
+            Err(CoveError::BadLayoutPlan)
+        ));
+
+        let mut entry = zero_copy_entry();
+        entry.page_ref = 2;
+        assert!(matches!(
+            validate_zero_copy_map_object_authority(
+                &zero_copy_map(entry),
+                &catalog,
+                &authority,
+                &ZeroCopyCompatibilityContext {
+                    required_lifetime_scope: ZeroCopyLifetimeScopeV2::ReaderSession,
+                    ..ZeroCopyCompatibilityContext::default()
+                },
+            ),
+            Err(CoveError::BadLayoutPlan)
+        ));
+    }
+
+    #[test]
+    fn zero_copy_object_authority_rejects_compressed_pages() {
+        let mut entry = zero_copy_entry();
+        entry.buffer_kind = cove_core::page_payload::PageBufferKind::Values as u16;
+        let mut authority = object_authority();
+        authority[0].columns[0].pages[0].flags = CompressionCodec::Lz4 as u32;
+        assert!(matches!(
+            validate_zero_copy_map_object_authority(
+                &zero_copy_map(entry),
+                &object_catalog(),
+                &authority,
+                &ZeroCopyCompatibilityContext {
+                    required_lifetime_scope: ZeroCopyLifetimeScopeV2::ReaderSession,
+                    ..ZeroCopyCompatibilityContext::default()
+                },
+            ),
+            Err(CoveError::BadLayoutPlan)
+        ));
     }
 
     fn authority_table() -> cove_core::table::TableEntry {

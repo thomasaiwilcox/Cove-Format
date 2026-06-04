@@ -3,6 +3,7 @@ use std::sync::Arc;
 use cove_core::{
     checksum,
     codec::CodecExtensionDescriptorV2,
+    collation::CollationRegistry,
     compression::section_payload_from_raw,
     constants::{SectionKind, FEATURE_ENGINE_PROFILE, FEATURE_EXTENDED_FEATURE_SET},
     dictionary::FileDictionary,
@@ -23,6 +24,7 @@ use cove_core::{
         CodeSpaceDescriptorV1, EngineMountPolicyV1, EngineProfileRegistry,
         ExecutionCodeDescriptorV1, ExecutionScopeDescriptorV1,
     },
+    reader::IgnoredOptionalSection,
     segment::TableSegmentIndex,
     table::TableCatalog,
     zone_stats::{ZoneStatsEntry, ZoneStatsSection},
@@ -151,6 +153,7 @@ pub(super) async fn parse_engine_metadata<R: CoveRangeReader + ?Sized>(
                 footer,
                 SectionKind::EngineProfileRegistry,
                 EngineProfileRegistry::parse,
+                &[],
             )
             .await,
             execution_descriptors: parse_optional_sections(
@@ -158,6 +161,7 @@ pub(super) async fn parse_engine_metadata<R: CoveRangeReader + ?Sized>(
                 footer,
                 SectionKind::ExecutionCodeDescriptor,
                 ExecutionCodeDescriptorV1::parse,
+                &[],
             )
             .await,
             execution_scopes: parse_optional_sections(
@@ -165,6 +169,7 @@ pub(super) async fn parse_engine_metadata<R: CoveRangeReader + ?Sized>(
                 footer,
                 SectionKind::ExecutionScopeDescriptor,
                 ExecutionScopeDescriptorV1::parse,
+                &[],
             )
             .await,
             code_spaces: parse_optional_sections(
@@ -172,6 +177,7 @@ pub(super) async fn parse_engine_metadata<R: CoveRangeReader + ?Sized>(
                 footer,
                 SectionKind::CodeSpaceDescriptor,
                 CodeSpaceDescriptorV1::parse,
+                &[],
             )
             .await,
             engine_mount_policies: parse_optional_sections(
@@ -179,6 +185,7 @@ pub(super) async fn parse_engine_metadata<R: CoveRangeReader + ?Sized>(
                 footer,
                 SectionKind::EngineMountPolicy,
                 EngineMountPolicyV1::parse,
+                &[],
             )
             .await,
         });
@@ -249,12 +256,14 @@ pub(super) async fn parse_pruning_metadata<R: CoveRangeReader + ?Sized>(
     header: &CoveHeaderV1,
     file_len: u64,
     footer: &CoveFooter,
+    ignored_optional_sections: &[IgnoredOptionalSection],
 ) -> Result<PruningMetadata, CoveError> {
     let zone_stats = parse_optional_sections(
         reader,
         footer,
         SectionKind::ZoneStats,
         ZoneStatsSection::parse,
+        ignored_optional_sections,
     )
     .await;
     let zone_stats_entries = zone_stats
@@ -267,12 +276,24 @@ pub(super) async fn parse_pruning_metadata<R: CoveRangeReader + ?Sized>(
             &header.file_id,
             file_len,
         ),
+        collation_registry: parse_optional_sections(
+            reader,
+            footer,
+            SectionKind::CollationRegistry,
+            CollationRegistry::parse,
+            ignored_optional_sections,
+        )
+        .await
+        .into_iter()
+        .next()
+        .map(Arc::new),
         nested_schemas: Arc::new(
             parse_optional_sections(
                 reader,
                 footer,
                 SectionKind::NestedSchema,
                 NestedSchemaSectionV1::parse,
+                ignored_optional_sections,
             )
             .await,
         ),
@@ -282,6 +303,7 @@ pub(super) async fn parse_pruning_metadata<R: CoveRangeReader + ?Sized>(
                 footer,
                 SectionKind::CodecExtensionRegistry,
                 CodecExtensionDescriptorV2::parse_many,
+                ignored_optional_sections,
             )
             .await,
         ),
@@ -291,6 +313,7 @@ pub(super) async fn parse_pruning_metadata<R: CoveRangeReader + ?Sized>(
                 footer,
                 SectionKind::ColumnDomain,
                 ColumnDomain::parse,
+                ignored_optional_sections,
             )
             .await,
         ),
@@ -302,6 +325,7 @@ pub(super) async fn parse_pruning_metadata<R: CoveRangeReader + ?Sized>(
                 footer,
                 SectionKind::ExactSetIndex,
                 ExactSetIndex::parse,
+                ignored_optional_sections,
             )
             .await,
         ),
@@ -311,12 +335,19 @@ pub(super) async fn parse_pruning_metadata<R: CoveRangeReader + ?Sized>(
                 footer,
                 SectionKind::BloomIndex,
                 BloomFilterIndex::parse,
+                ignored_optional_sections,
             )
             .await,
         ),
         lookups: Arc::new(
-            parse_optional_sections(reader, footer, SectionKind::LookupIndex, LookupIndex::parse)
-                .await,
+            parse_optional_sections(
+                reader,
+                footer,
+                SectionKind::LookupIndex,
+                LookupIndex::parse,
+                ignored_optional_sections,
+            )
+            .await,
         ),
         inverted: Arc::new(
             parse_optional_sections(
@@ -324,6 +355,7 @@ pub(super) async fn parse_pruning_metadata<R: CoveRangeReader + ?Sized>(
                 footer,
                 SectionKind::InvertedMorselIndex,
                 InvertedMorselIndex::parse,
+                ignored_optional_sections,
             )
             .await,
         ),
@@ -333,6 +365,7 @@ pub(super) async fn parse_pruning_metadata<R: CoveRangeReader + ?Sized>(
                 footer,
                 SectionKind::AggregateSynopsis,
                 AggregateSynopsis::parse,
+                ignored_optional_sections,
             )
             .await,
         ),
@@ -342,6 +375,7 @@ pub(super) async fn parse_pruning_metadata<R: CoveRangeReader + ?Sized>(
                 footer,
                 SectionKind::CompositeZoneIndex,
                 CompositeIndex::parse,
+                ignored_optional_sections,
             )
             .await,
         ),
@@ -351,6 +385,7 @@ pub(super) async fn parse_pruning_metadata<R: CoveRangeReader + ?Sized>(
                 footer,
                 SectionKind::TopNZoneSummary,
                 TopNSummary::parse,
+                ignored_optional_sections,
             )
             .await,
         ),
@@ -360,6 +395,7 @@ pub(super) async fn parse_pruning_metadata<R: CoveRangeReader + ?Sized>(
                 footer,
                 SectionKind::CoverageProviderRegistry,
                 CoverageProviderDescriptorV2::parse_many,
+                ignored_optional_sections,
             )
             .await,
         ),
@@ -369,6 +405,7 @@ pub(super) async fn parse_pruning_metadata<R: CoveRangeReader + ?Sized>(
                 footer,
                 SectionKind::CoverageSet,
                 CoverageSetV2::parse,
+                ignored_optional_sections,
             )
             .await,
         ),
@@ -378,6 +415,7 @@ pub(super) async fn parse_pruning_metadata<R: CoveRangeReader + ?Sized>(
                 footer,
                 SectionKind::CoverageProofRecord,
                 CoverageProofRecordV2::parse_many,
+                ignored_optional_sections,
             )
             .await,
         ),
@@ -387,6 +425,7 @@ pub(super) async fn parse_pruning_metadata<R: CoveRangeReader + ?Sized>(
                 footer,
                 SectionKind::CoveragePlanCandidate,
                 CoveragePlanCandidateV2::parse_many,
+                ignored_optional_sections,
             )
             .await,
         ),
@@ -396,6 +435,7 @@ pub(super) async fn parse_pruning_metadata<R: CoveRangeReader + ?Sized>(
                 footer,
                 SectionKind::PredicateNormalForm,
                 PredicateNormalFormV2::parse_many,
+                ignored_optional_sections,
             )
             .await,
         ),
@@ -405,6 +445,7 @@ pub(super) async fn parse_pruning_metadata<R: CoveRangeReader + ?Sized>(
                 footer,
                 SectionKind::PredicateNormalForm,
                 PredicateNormalFormWithPayloadV2::parse_many,
+                ignored_optional_sections,
             )
             .await,
         ),
@@ -708,6 +749,7 @@ async fn parse_optional_sections<R, T, F>(
     footer: &CoveFooter,
     kind: SectionKind,
     mut parse: F,
+    ignored_optional_sections: &[IgnoredOptionalSection],
 ) -> Vec<T>
 where
     R: CoveRangeReader + ?Sized,
@@ -715,6 +757,12 @@ where
 {
     let mut out = Vec::new();
     for entry in find_sections(footer, kind) {
+        if ignored_optional_sections
+            .iter()
+            .any(|ignored| ignored.section_id == entry.section_id)
+        {
+            continue;
+        }
         if let Ok(payload) = read_section_payload(reader, entry).await {
             if let Ok(value) = parse(&payload) {
                 out.push(value);
@@ -729,6 +777,7 @@ async fn parse_optional_flat_sections<R, T, F>(
     footer: &CoveFooter,
     kind: SectionKind,
     mut parse: F,
+    ignored_optional_sections: &[IgnoredOptionalSection],
 ) -> Vec<T>
 where
     R: CoveRangeReader + ?Sized,
@@ -736,6 +785,12 @@ where
 {
     let mut out = Vec::new();
     for entry in find_sections(footer, kind) {
+        if ignored_optional_sections
+            .iter()
+            .any(|ignored| ignored.section_id == entry.section_id)
+        {
+            continue;
+        }
         if let Ok(payload) = read_section_payload(reader, entry).await {
             if let Ok(mut values) = parse(&payload) {
                 out.append(&mut values);

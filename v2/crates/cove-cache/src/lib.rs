@@ -5,6 +5,22 @@ use std::collections::BTreeSet;
 use cove_core::{checksum, CoveError};
 use cove_coverage::{CoverageExactnessV2, CoverageGranularityV2, CoverageProofStrengthV2};
 
+pub const ABSENT_REF: u32 = u32::MAX;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CoverageCacheUseContextV2<'a> {
+    pub dataset_id: [u8; 16],
+    pub snapshot_id: [u8; 16],
+    pub predicate_normal_form_ref: u32,
+    pub interval_normal_form_ref: u32,
+    pub coverage_set_ref: u32,
+    pub coverage_granularity: CoverageGranularityV2,
+    pub proof_strength: CoverageProofStrengthV2,
+    pub exactness: CoverageExactnessV2,
+    pub selected_snapshot_ref: Option<u32>,
+    pub compatible_producer_engine_refs: &'a [u32],
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoveCoverageCacheHeaderV2 {
     pub cache_format_namespace_ref: u32,
@@ -149,6 +165,39 @@ impl CoverageCacheEntryV2 {
         }
         Ok(())
     }
+
+    pub fn validate_for_use_context(
+        &self,
+        context: &CoverageCacheUseContextV2<'_>,
+    ) -> Result<(), CoveError> {
+        self.validate_for_pruning()?;
+        if self.dataset_id != context.dataset_id
+            || self.snapshot_id != context.snapshot_id
+            || self.predicate_normal_form_ref != context.predicate_normal_form_ref
+            || self.interval_normal_form_ref != context.interval_normal_form_ref
+            || self.coverage_set_ref != context.coverage_set_ref
+            || self.coverage_granularity != context.coverage_granularity
+            || self.proof_strength != context.proof_strength
+            || self.exactness != context.exactness
+            || context.exactness.may_under_include()
+            || !context.proof_strength.allows_pruning()
+        {
+            return Err(CoveError::CacheStale);
+        }
+        if self.valid_until_snapshot_ref != ABSENT_REF
+            && Some(self.valid_until_snapshot_ref) != context.selected_snapshot_ref
+        {
+            return Err(CoveError::CacheStale);
+        }
+        if self.producer_engine_ref != ABSENT_REF
+            && !context
+                .compatible_producer_engine_refs
+                .contains(&self.producer_engine_ref)
+        {
+            return Err(CoveError::CacheStale);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -197,6 +246,23 @@ impl CoverageCacheV2 {
             out.extend_from_slice(&entry.serialize());
         }
         Ok(out)
+    }
+
+    pub fn validate_header_for_use_context(
+        &self,
+        dataset_id: [u8; 16],
+        snapshot_id: [u8; 16],
+        compatible_producer_engine_refs: &[u32],
+    ) -> Result<(), CoveError> {
+        if self.header.dataset_id != dataset_id || self.header.snapshot_id != snapshot_id {
+            return Err(CoveError::CacheStale);
+        }
+        if self.header.producer_engine_ref != ABSENT_REF
+            && !compatible_producer_engine_refs.contains(&self.header.producer_engine_ref)
+        {
+            return Err(CoveError::CacheStale);
+        }
+        Ok(())
     }
 }
 
@@ -297,6 +363,71 @@ mod tests {
         entry.exactness = CoverageExactnessV2::ApproximateMayUnderInclude;
         assert!(matches!(
             entry.validate_for_pruning(),
+            Err(CoveError::CacheStale)
+        ));
+    }
+
+    #[test]
+    fn cache_entry_context_must_match_predicate_coverage_and_snapshot() {
+        let dataset_id = [1u8; 16];
+        let snapshot_id = [2u8; 16];
+        let mut entry = entry(dataset_id, snapshot_id);
+        entry.valid_until_snapshot_ref = 7;
+        entry.producer_engine_ref = 0;
+        let mut context = CoverageCacheUseContextV2 {
+            dataset_id,
+            snapshot_id,
+            predicate_normal_form_ref: 1,
+            interval_normal_form_ref: ABSENT_REF,
+            coverage_set_ref: 1,
+            coverage_granularity: CoverageGranularityV2::Page,
+            proof_strength: CoverageProofStrengthV2::ExactConservative,
+            exactness: CoverageExactnessV2::Exact,
+            selected_snapshot_ref: Some(7),
+            compatible_producer_engine_refs: &[0],
+        };
+
+        assert!(entry.validate_for_use_context(&context).is_ok());
+        context.predicate_normal_form_ref = 99;
+        assert!(matches!(
+            entry.validate_for_use_context(&context),
+            Err(CoveError::CacheStale)
+        ));
+        context.predicate_normal_form_ref = 1;
+        context.selected_snapshot_ref = Some(8);
+        assert!(matches!(
+            entry.validate_for_use_context(&context),
+            Err(CoveError::CacheStale)
+        ));
+    }
+
+    #[test]
+    fn cache_header_context_rejects_incompatible_engine() {
+        let dataset_id = [1u8; 16];
+        let snapshot_id = [2u8; 16];
+        let cache = CoverageCacheV2 {
+            header: CoveCoverageCacheHeaderV2 {
+                cache_format_namespace_ref: 1,
+                cache_format_version_major: 2,
+                cache_format_version_minor: 0,
+                flags: 0,
+                cache_id: [3u8; 16],
+                dataset_id,
+                snapshot_id,
+                entry_count: 0,
+                created_at_us: 0,
+                producer_engine_ref: 42,
+                reserved: [0u8; 32],
+                checksum: 0,
+            },
+            entries: Vec::new(),
+        };
+
+        assert!(cache
+            .validate_header_for_use_context(dataset_id, snapshot_id, &[42])
+            .is_ok());
+        assert!(matches!(
+            cache.validate_header_for_use_context(dataset_id, snapshot_id, &[0]),
             Err(CoveError::CacheStale)
         ));
     }

@@ -26,6 +26,7 @@ use cove_core::artifact::covm::{CovmFile, CovmFileEntryV1, CovmHeaderV1, CovmPos
 #[cfg(feature = "covm")]
 use cove_core::constants::DigestAlgorithm;
 use cove_core::{
+    collation::CollationKind,
     constants::{
         CoveEncodingKind, CoveLogicalType, CovePhysicalKind, PrimaryProfile, SectionKind,
         StorageClass, ValueTag, FEATURE_SEMANTIC_MAP,
@@ -1574,6 +1575,14 @@ fn primitive_events_file() -> Vec<u8> {
 }
 
 fn dictionary_items_file_with_domain() -> Vec<u8> {
+    let mut name_column = column(
+        1,
+        "name",
+        CoveLogicalType::Utf8,
+        CovePhysicalKind::FileCode,
+        false,
+    );
+    name_column.collation_id = CollationKind::Utf8Bytewise.id();
     let catalog = TableCatalog {
         flags: 0,
         tables: vec![TableEntry {
@@ -1585,13 +1594,7 @@ fn dictionary_items_file_with_domain() -> Vec<u8> {
             clustering_key_count: 0,
             flags: 0,
             columns: vec![
-                column(
-                    1,
-                    "name",
-                    CoveLogicalType::Utf8,
-                    CovePhysicalKind::FileCode,
-                    false,
-                ),
+                name_column,
                 column(
                     2,
                     "payload",
@@ -2974,12 +2977,12 @@ fn canonical_utf8(value: &str) -> Vec<u8> {
 
 fn column_domain_section() -> SectionPayload {
     let domain = ColumnDomain::from_sorted_present_codes(
-        &[0, 1],
+        &[1, 0],
         2,
         7,
         1,
         CoveLogicalType::Utf8 as u16,
-        0,
+        CollationKind::Utf8Bytewise.id(),
         0,
     )
     .expect("column domain");
@@ -2999,8 +3002,8 @@ fn column_domain_section() -> SectionPayload {
 
 fn filecode_zone_stats_section() -> SectionPayload {
     let entries = vec![
-        filecode_zone_stats_entry(0, 0),
-        filecode_zone_stats_entry(1, 1),
+        filecode_zone_stats_entry(0, 1),
+        filecode_zone_stats_entry(1, 0),
     ];
     let section = ZoneStatsSection { entries };
     SectionPayload {

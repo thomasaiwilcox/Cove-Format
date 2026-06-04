@@ -15,7 +15,7 @@ use crate::{
     CoviKeyEncodingKindV2, CoviMorselRefPostingV2, CoviObjectPathPostingV2, CoviPageRefPostingV2,
     CoviPostingRepresentationV2, CoviPostingsBlockV2, CoviReferencedFileV2, CoviRowRangePostingV2,
     CoviSectionKindV2, CoviSegmentRefPostingV2, CoviSnapshotValidityV2, IndexCapabilityExactnessV2,
-    IndexCapabilityV2,
+    IndexCapabilityV2, IndexOnlyCapabilityUseContextV2, IndexOnlyCapabilityV2,
 };
 
 const ABSENT_U32: u32 = u32::MAX;
@@ -124,7 +124,9 @@ pub struct ValidatedCoviArtifactV2 {
     host_file_ref: u32,
     roots: BTreeMap<u32, CoviIndexRootV2>,
     capabilities: BTreeMap<u32, IndexCapabilityV2>,
+    index_only_capabilities: BTreeMap<(u32, u16), IndexOnlyCapabilityV2>,
     snapshot_validity: BTreeMap<u32, CoviSnapshotValidityV2>,
+    active_visibility_overlay_ref: Option<u32>,
     key_blocks: BTreeMap<u32, CoviKeyBlockV2>,
     entry_blocks: BTreeMap<u32, CoviEntryBlockV2>,
     postings_blocks: BTreeMap<u32, CoviPostingsBlockV2>,
@@ -646,6 +648,35 @@ impl ValidatedCoviArtifactV2 {
             }
             validate_snapshot_ref(capability.snapshot_validity_ref, &snapshot_validity)?;
         }
+        let mut index_only_capabilities = BTreeMap::new();
+        for index_only in &artifact.index_only_capabilities {
+            let aggregate_kind = CoviAggregateKindV2::from_u16(index_only.aggregate_kind)
+                .ok_or(CoveError::BadCovi)?;
+            let capability = artifact
+                .capabilities
+                .iter()
+                .find(|capability| capability.capability_id == index_only.capability_id)
+                .ok_or(CoveError::BadCovi)?;
+            if capability.supports_index_only == 0
+                || !index_only_capability_supports_aggregate(capability, aggregate_kind)
+                || index_only.null_semantics != capability.null_semantics
+            {
+                return Err(CoveError::BadCovi);
+            }
+            validate_snapshot_ref(index_only.snapshot_validity_ref, &snapshot_validity)?;
+            if index_only_capabilities
+                .insert(
+                    (index_only.capability_id, index_only.aggregate_kind),
+                    index_only.clone(),
+                )
+                .is_some()
+            {
+                return Err(CoveError::BadCovi);
+            }
+        }
+        let active_visibility_overlay_ref = context
+            .external_visibility_ref
+            .filter(|overlay_ref| *overlay_ref != ABSENT_U32);
 
         let mut key_blocks = BTreeMap::new();
         let mut entry_blocks = BTreeMap::new();
@@ -728,7 +759,9 @@ impl ValidatedCoviArtifactV2 {
             host_file_ref,
             roots,
             capabilities,
+            index_only_capabilities,
             snapshot_validity,
+            active_visibility_overlay_ref,
             key_blocks,
             entry_blocks,
             postings_blocks,
@@ -954,16 +987,28 @@ impl ValidatedCoviArtifactV2 {
         &self,
         request: &CoviIndexOnlyRequestV2,
     ) -> Result<Option<CoviIndexOnlyAnswerV2>, CoveError> {
+        self.index_only_answer_for_target(
+            CoviLookupTargetV2::TableColumn {
+                table_id: request.table_id,
+                column_id: request.column_id.unwrap_or(ABSENT_U32),
+            },
+            request,
+        )
+    }
+
+    pub fn index_only_answer_for_target(
+        &self,
+        target: CoviLookupTargetV2,
+        request: &CoviIndexOnlyRequestV2,
+    ) -> Result<Option<CoviIndexOnlyAnswerV2>, CoveError> {
         let mut saw_matching_root = false;
         let mut saw_inexact_candidate = false;
         let mut saw_unsupported_aggregate_candidate = false;
-        for root in self.roots.values().filter(|root| {
-            root.table_id == request.table_id
-                && request
-                    .column_id
-                    .map(|column_id| root.column_id == column_id)
-                    .unwrap_or(true)
-        }) {
+        for root in self
+            .roots
+            .values()
+            .filter(|root| root_matches_index_only_target(root, target, request.column_id))
+        {
             saw_matching_root = true;
             let Some(capability) = self.capabilities.get(&root.index_root_id) else {
                 continue;
@@ -1007,15 +1052,54 @@ impl ValidatedCoviArtifactV2 {
                 }
                 continue;
             }
+            if self
+                .validate_index_only_capability_for_answer(capability, request, answer)
+                .is_err()
+            {
+                if request.require_exact {
+                    saw_unsupported_aggregate_candidate = true;
+                }
+                continue;
+            }
             return Ok(Some(answer_to_public(answer, block)?));
         }
         if request.require_exact && saw_matching_root && saw_unsupported_aggregate_candidate {
-            return Err(CoveError::BadCovi);
+            return Err(CoveError::IndexOnlyUnsafe);
         }
         if request.require_exact && saw_matching_root && saw_inexact_candidate {
-            return Err(CoveError::BadCovi);
+            return Err(CoveError::IndexOnlyUnsafe);
         }
         Ok(None)
+    }
+
+    fn validate_index_only_capability_for_answer(
+        &self,
+        capability: &IndexCapabilityV2,
+        request: &CoviIndexOnlyRequestV2,
+        answer: &CoviAggregateAnswerV2,
+    ) -> Result<(), CoveError> {
+        let Some(index_only) = self
+            .index_only_capabilities
+            .get(&(capability.capability_id, request.aggregate_kind as u16))
+        else {
+            return Err(CoveError::BadCovi);
+        };
+        if request.predicate_form_ref.is_some() && index_only.predicate_supported == 0 {
+            return Err(CoveError::BadCovi);
+        }
+        if index_only.null_semantics != capability.null_semantics
+            || answer.null_semantics != capability.null_semantics
+        {
+            return Err(CoveError::BadCovi);
+        }
+        if request.require_exact && answer.exactness != IndexCapabilityExactnessV2::Exact as u8 {
+            return Err(CoveError::IndexOnlyUnsafe);
+        }
+        index_only.validate_for_use_context(&IndexOnlyCapabilityUseContextV2 {
+            selected_snapshot_validity_ref: answer.snapshot_validity_ref,
+            active_visibility_overlay_ref: self.active_visibility_overlay_ref,
+            require_exact: request.require_exact,
+        })
     }
 
     fn lookup_root(
@@ -1204,6 +1288,50 @@ fn root_matches_target(root: &CoviIndexRootV2, target: CoviLookupTargetV2) -> bo
             root.indexed_target_kind == CoviIndexedTargetKindV2::TableColumn
                 && root.table_id == table_id
                 && root.column_id == column_id
+        }
+        CoviLookupTargetV2::ObjectProperty {
+            object_type_id,
+            property_id,
+        } => {
+            root.indexed_target_kind == CoviIndexedTargetKindV2::ObjectProperty
+                && root.object_type_id == object_type_id
+                && root.property_id == property_id
+        }
+        CoviLookupTargetV2::ObjectPath {
+            object_type_id,
+            path_ref,
+        } => {
+            root.indexed_target_kind == CoviIndexedTargetKindV2::ObjectPath
+                && root.object_type_id == object_type_id
+                && root.path_ref == path_ref
+        }
+        CoviLookupTargetV2::SemanticDimension {
+            semantic_dimension_ref,
+        } => {
+            root.indexed_target_kind == CoviIndexedTargetKindV2::SemanticDimension
+                && root.semantic_dimension_ref == semantic_dimension_ref
+        }
+        CoviLookupTargetV2::DimensionalTuple {
+            semantic_dimension_ref,
+        } => {
+            root.indexed_target_kind == CoviIndexedTargetKindV2::DimensionalTuple
+                && root.semantic_dimension_ref == semantic_dimension_ref
+        }
+    }
+}
+
+fn root_matches_index_only_target(
+    root: &CoviIndexRootV2,
+    target: CoviLookupTargetV2,
+    request_column_id: Option<u32>,
+) -> bool {
+    match target {
+        CoviLookupTargetV2::TableColumn { table_id, .. } => {
+            root.indexed_target_kind == CoviIndexedTargetKindV2::TableColumn
+                && root.table_id == table_id
+                && request_column_id
+                    .map(|column_id| root.column_id == column_id)
+                    .unwrap_or(true)
         }
         CoviLookupTargetV2::ObjectProperty {
             object_type_id,
@@ -1687,7 +1815,21 @@ fn validate_aggregate_answer_payload(
             let value_tag = aggregate_answer_value_tag(logical).ok_or(CoveError::BadCovi)?;
             validate_canonical_payload(value_tag, value).map_err(|_| CoveError::BadCovi)?;
         }
-        CoviAggregateKindV2::Membership | CoviAggregateKindV2::Sum | CoviAggregateKindV2::Avg => {}
+        CoviAggregateKindV2::Sum | CoviAggregateKindV2::Avg => {
+            let Some(value) = value else {
+                if answer.non_null_count == 0 {
+                    return Ok(());
+                }
+                return Err(CoveError::BadCovi);
+            };
+            if answer.non_null_count == 0 {
+                return Err(CoveError::BadCovi);
+            }
+            let logical = CoveLogicalType::from_u16(root.logical_type).ok_or(CoveError::BadCovi)?;
+            let value_tag = aggregate_sum_answer_value_tag(logical).ok_or(CoveError::BadCovi)?;
+            validate_canonical_payload(value_tag, value).map_err(|_| CoveError::BadCovi)?;
+        }
+        CoviAggregateKindV2::Membership => {}
     }
     Ok(())
 }
@@ -2450,6 +2592,24 @@ fn parse_u32_refs(payload: &[u8]) -> Result<Vec<u32>, CoveError> {
         .collect())
 }
 
+fn aggregate_sum_answer_value_tag(logical: CoveLogicalType) -> Option<ValueTag> {
+    match logical {
+        CoveLogicalType::Int8
+        | CoveLogicalType::Int16
+        | CoveLogicalType::Int32
+        | CoveLogicalType::Int64 => Some(ValueTag::Int64),
+        CoveLogicalType::UInt8
+        | CoveLogicalType::UInt16
+        | CoveLogicalType::UInt32
+        | CoveLogicalType::UInt64 => Some(ValueTag::UInt64),
+        CoveLogicalType::Float32 => Some(ValueTag::Float32Bits),
+        CoveLogicalType::Float64 => Some(ValueTag::Float64Bits),
+        CoveLogicalType::Decimal64 => Some(ValueTag::Decimal64),
+        CoveLogicalType::Decimal128 => Some(ValueTag::Decimal128),
+        _ => None,
+    }
+}
+
 fn aggregate_value_payload<'a>(
     answer: &CoviAggregateAnswerV2,
     block: &'a CoviAggregateAnswerBlockV2,
@@ -2723,6 +2883,50 @@ mod tests {
         }
     }
 
+    fn aggregate_value_block(
+        root_id: u32,
+        aggregate_kind: CoviAggregateKindV2,
+        row_count: u64,
+        null_count: u64,
+        non_null_count: u64,
+        payload: Option<Vec<u8>>,
+    ) -> CoviAggregateAnswerBlockV2 {
+        let payload_len = payload.as_ref().map_or(0, Vec::len);
+        CoviAggregateAnswerBlockV2 {
+            header: CoviAggregateAnswerBlockHeaderV2 {
+                magic: CoviAggregateAnswerBlockHeaderV2::MAGIC,
+                version_major: 2,
+                version_minor: 0,
+                header_len: CoviAggregateAnswerBlockHeaderV2::LEN as u16,
+                aggregate_answer_len: CoviAggregateAnswerV2::LEN as u16,
+                aggregate_block_id: 13,
+                index_root_id: root_id,
+                aggregate_answer_count: 1,
+                aggregate_answers_offset: CoviAggregateAnswerBlockHeaderV2::LEN as u64,
+                aggregate_payload_offset: 0,
+                aggregate_payload_length: payload_len as u64,
+                flags: 0,
+                checksum: 0,
+            },
+            answers: vec![CoviAggregateAnswerV2 {
+                aggregate_answer_ref: 0,
+                index_root_id: root_id,
+                aggregate_kind: aggregate_kind as u16,
+                exactness: IndexCapabilityExactnessV2::Exact as u8,
+                null_semantics: 0,
+                flags: 0,
+                row_count,
+                null_count,
+                non_null_count,
+                value_ref: if payload.is_some() { 0 } else { ABSENT_U32 },
+                predicate_form_ref: ABSENT_U32,
+                snapshot_validity_ref: 0,
+                checksum: 0,
+            }],
+            payload: payload.unwrap_or_default(),
+        }
+    }
+
     fn row_range_postings_block(
         root_id: u32,
         block_id: u32,
@@ -2816,6 +3020,7 @@ mod tests {
             snapshot_validity: Vec::new(),
             index_roots: Vec::new(),
             capabilities: Vec::new(),
+            index_only_capabilities: Vec::new(),
             key_blocks: Vec::new(),
             entry_blocks: Vec::new(),
             postings_blocks: Vec::new(),
@@ -2836,6 +3041,7 @@ mod tests {
             entry_blocks.insert(root.entry_block_section_id, entry_block);
             postings_blocks.insert(root.postings_block_section_id, postings_block);
         }
+        let index_only_capabilities = test_index_only_capabilities(&capabilities);
         ValidatedCoviArtifactV2 {
             artifact: blank_artifact(),
             host_file_ref: 0,
@@ -2847,12 +3053,57 @@ mod tests {
                 .into_iter()
                 .map(|capability| (capability.index_root_id, capability))
                 .collect(),
+            index_only_capabilities,
             snapshot_validity: std::collections::BTreeMap::new(),
+            active_visibility_overlay_ref: None,
             key_blocks,
             entry_blocks,
             postings_blocks,
             aggregate_blocks: std::collections::BTreeMap::new(),
         }
+    }
+
+    fn test_index_only_capabilities(
+        capabilities: &[IndexCapabilityV2],
+    ) -> std::collections::BTreeMap<(u32, u16), IndexOnlyCapabilityV2> {
+        let mut index_only_capabilities = std::collections::BTreeMap::new();
+        for capability in capabilities {
+            if capability.supports_index_only == 0 {
+                continue;
+            }
+            for (enabled, aggregate_kind) in [
+                (capability.supports_count, CoviAggregateKindV2::Count),
+                (capability.supports_count, CoviAggregateKindV2::Exists),
+                (capability.supports_min, CoviAggregateKindV2::Min),
+                (capability.supports_max, CoviAggregateKindV2::Max),
+                (
+                    capability.supports_distinct_count,
+                    CoviAggregateKindV2::DistinctCount,
+                ),
+                (capability.supports_sum, CoviAggregateKindV2::Sum),
+                (capability.supports_sum, CoviAggregateKindV2::Avg),
+            ] {
+                if enabled == 0 {
+                    continue;
+                }
+                let index_only = IndexOnlyCapabilityV2 {
+                    capability_id: capability.capability_id,
+                    aggregate_kind: aggregate_kind as u16,
+                    predicate_supported: 0,
+                    exactness: capability.exactness,
+                    null_semantics: capability.null_semantics,
+                    flags: 0,
+                    snapshot_validity_ref: capability.snapshot_validity_ref,
+                    required_visibility_overlay_ref: ABSENT_U32,
+                    checksum: 0,
+                };
+                index_only_capabilities.insert(
+                    (index_only.capability_id, index_only.aggregate_kind),
+                    index_only,
+                );
+            }
+        }
+        index_only_capabilities
     }
 
     fn snapshot_with_external_visibility(external_visibility_ref: u32) -> CoviSnapshotValidityV2 {
@@ -3403,6 +3654,88 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_block_validation_accepts_sum_and_avg_payloads() {
+        let root = root_with(
+            CoveLogicalType::Int64,
+            CoviKeyEncodingKindV2::CanonicalValueBytes,
+            CoviComparatorKindV2::CanonicalOrdering,
+        );
+        let snapshots =
+            std::collections::BTreeMap::from([(0, snapshot_with_external_visibility(ABSENT_U32))]);
+        for kind in [CoviAggregateKindV2::Sum, CoviAggregateKindV2::Avg] {
+            let block = aggregate_value_block(
+                root.index_root_id,
+                kind,
+                3,
+                0,
+                3,
+                Some(6i64.to_le_bytes().to_vec()),
+            );
+            validate_aggregate_block(&root, &snapshots, &block).unwrap();
+        }
+    }
+
+    #[test]
+    fn aggregate_block_validation_rejects_malformed_sum_payload() {
+        let root = root_with(
+            CoveLogicalType::Int64,
+            CoviKeyEncodingKindV2::CanonicalValueBytes,
+            CoviComparatorKindV2::CanonicalOrdering,
+        );
+        let block = aggregate_value_block(
+            root.index_root_id,
+            CoviAggregateKindV2::Sum,
+            3,
+            0,
+            3,
+            Some(vec![1, 2]),
+        );
+        let snapshots =
+            std::collections::BTreeMap::from([(0, snapshot_with_external_visibility(ABSENT_U32))]);
+        assert!(matches!(
+            validate_aggregate_block(&root, &snapshots, &block),
+            Err(CoveError::BadCovi)
+        ));
+    }
+
+    #[test]
+    fn aggregate_block_validation_rejects_unsupported_sum_logical_type() {
+        let root = root_with(
+            CoveLogicalType::Utf8,
+            CoviKeyEncodingKindV2::CanonicalValueBytes,
+            CoviComparatorKindV2::CanonicalOrdering,
+        );
+        let block = aggregate_value_block(
+            root.index_root_id,
+            CoviAggregateKindV2::Sum,
+            1,
+            0,
+            1,
+            Some(b"x".to_vec()),
+        );
+        let snapshots =
+            std::collections::BTreeMap::from([(0, snapshot_with_external_visibility(ABSENT_U32))]);
+        assert!(matches!(
+            validate_aggregate_block(&root, &snapshots, &block),
+            Err(CoveError::BadCovi)
+        ));
+    }
+
+    #[test]
+    fn aggregate_block_validation_accepts_all_null_sum_without_payload() {
+        let root = root_with(
+            CoveLogicalType::Int64,
+            CoviKeyEncodingKindV2::CanonicalValueBytes,
+            CoviComparatorKindV2::CanonicalOrdering,
+        );
+        let block =
+            aggregate_value_block(root.index_root_id, CoviAggregateKindV2::Sum, 2, 2, 0, None);
+        let snapshots =
+            std::collections::BTreeMap::from([(0, snapshot_with_external_visibility(ABSENT_U32))]);
+        validate_aggregate_block(&root, &snapshots, &block).unwrap();
+    }
+
+    #[test]
     fn aggregate_block_validation_rejects_boolean_minmax_payload() {
         let root = root_with(
             CoveLogicalType::Bool,
@@ -3903,6 +4236,51 @@ mod tests {
     }
 
     #[test]
+    fn index_only_answer_matches_object_property_targets() {
+        let mut root = root_with(
+            CoveLogicalType::Bool,
+            CoviKeyEncodingKindV2::CanonicalValueBytes,
+            CoviComparatorKindV2::CanonicalOrdering,
+        );
+        root.indexed_target_kind = CoviIndexedTargetKindV2::ObjectProperty;
+        root.table_id = ABSENT_U32;
+        root.column_id = ABSENT_U32;
+        root.object_type_id = 7;
+        root.property_id = 11;
+        root.key_block_section_id = 10;
+        root.entry_block_section_id = 11;
+        root.postings_block_section_id = 12;
+        root.aggregate_block_section_id = 13;
+        let mut capability = capability(1, 1, 0, 0, IndexCapabilityExactnessV2::Exact);
+        capability.supports_index_only = 1;
+        capability.supports_count = 1;
+        let mut artifact = validated_with_roots(vec![root], vec![capability]);
+        artifact.aggregate_blocks.insert(
+            13,
+            aggregate_count_block(1, 13, IndexCapabilityExactnessV2::Exact, 5),
+        );
+
+        let answer = artifact
+            .index_only_answer_for_target(
+                CoviLookupTargetV2::ObjectProperty {
+                    object_type_id: 7,
+                    property_id: 11,
+                },
+                &CoviIndexOnlyRequestV2 {
+                    table_id: ABSENT_U32,
+                    column_id: None,
+                    aggregate_kind: CoviAggregateKindV2::Count,
+                    predicate_form_ref: None,
+                    require_exact: true,
+                },
+            )
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(answer.non_null_count, 5);
+    }
+
+    #[test]
     fn index_only_answer_rejects_only_non_exact_proof_for_exact_request() {
         let mut root = root_with(
             CoveLogicalType::Int64,
@@ -3931,7 +4309,7 @@ mod tests {
                 predicate_form_ref: None,
                 require_exact: true,
             }),
-            Err(CoveError::BadCovi)
+            Err(CoveError::IndexOnlyUnsafe)
         ));
     }
 
@@ -3963,7 +4341,7 @@ mod tests {
                 predicate_form_ref: None,
                 require_exact: true,
             }),
-            Err(CoveError::BadCovi)
+            Err(CoveError::IndexOnlyUnsafe)
         ));
     }
 

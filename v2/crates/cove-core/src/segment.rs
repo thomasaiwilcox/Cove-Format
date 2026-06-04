@@ -1147,7 +1147,7 @@ mod tests {
     }
 
     #[test]
-    fn page_index_coverage_rejects_duplicate_and_missing_morsel_refs() {
+    fn page_index_coverage_rejects_split_pages_per_morsel() {
         let dir = RowMorselDirectory {
             entries: vec![morsel(3, 0, 4), morsel(9, 4, 1)],
         };
@@ -1156,8 +1156,8 @@ mod tests {
                 ColumnPageIndexEntryV1 {
                     column_id: 7,
                     morsel_id: 3,
-                    row_count: 4,
-                    non_null_count: 4,
+                    row_count: 2,
+                    non_null_count: 2,
                     null_count: 0,
                     encoding_root: CoveEncodingKind::NumCode as u32,
                     page_offset: 0,
@@ -1170,8 +1170,8 @@ mod tests {
                 ColumnPageIndexEntryV1 {
                     column_id: 7,
                     morsel_id: 3,
-                    row_count: 4,
-                    non_null_count: 4,
+                    row_count: 2,
+                    non_null_count: 2,
                     null_count: 0,
                     encoding_root: CoveEncodingKind::NumCode as u32,
                     page_offset: 1,
@@ -1181,7 +1181,48 @@ mod tests {
                     flags: 0,
                     checksum: 0,
                 },
+                ColumnPageIndexEntryV1 {
+                    column_id: 7,
+                    morsel_id: 9,
+                    row_count: 1,
+                    non_null_count: 1,
+                    null_count: 0,
+                    encoding_root: CoveEncodingKind::NumCode as u32,
+                    page_offset: 2,
+                    page_length: 1,
+                    uncompressed_length: 1,
+                    stats_ref: 0,
+                    flags: 0,
+                    checksum: 0,
+                },
             ],
+        };
+        assert_eq!(
+            dir.validate_page_index_coverage(&page_index),
+            Err(CoveError::PageCorrupt)
+        );
+    }
+
+    #[test]
+    fn page_index_coverage_rejects_missing_morsel_row_totals() {
+        let dir = RowMorselDirectory {
+            entries: vec![morsel(3, 0, 4), morsel(9, 4, 1)],
+        };
+        let page_index = ColumnPageIndex {
+            entries: vec![ColumnPageIndexEntryV1 {
+                column_id: 7,
+                morsel_id: 3,
+                row_count: 4,
+                non_null_count: 4,
+                null_count: 0,
+                encoding_root: CoveEncodingKind::NumCode as u32,
+                page_offset: 0,
+                page_length: 1,
+                uncompressed_length: 1,
+                stats_ref: 0,
+                flags: 0,
+                checksum: 0,
+            }],
         };
         assert_eq!(
             dir.validate_page_index_coverage(&page_index),

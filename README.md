@@ -134,6 +134,12 @@ or AI-based schema matching. Those systems may produce inputs, but COVE-MAP's
 portable contract is deterministic replay, explanation, evidence, and
 projection semantics.
 
+Cove-OQL is the read/query layer over that semantic surface. It provides a
+compact object query language for object, association, evidence, projection,
+temporal, aggregate, Arrow, and DataFusion-backed reads while keeping
+materialized object reconstruction as the semantic authority for any optimized
+or coded path that cannot prove equivalence.
+
 ### Object Storage and Cheaper Reads
 
 On object storage, every range request has latency and often a per-request cost.
@@ -209,8 +215,14 @@ Important v2 paths:
   bootstrap paths, and benchmarks.
 - [`v2/crates/cove-map`](./v2/crates/cove-map): reference COVE-MAP execution,
   materialization, evidence, and projection helpers.
+- [`v2/crates/cove-oql`](./v2/crates/cove-oql): Cove-OQL parser, builder API,
+  resolver, dependency contracts, materialized and coded execution, stable
+  explain output, Arrow output, manifest-aware planning, and DataFusion table
+  provider integration for COVE-O reads.
 - [`v2/docs/mapped-cove-o-datafusion-showcase.md`](./v2/docs/mapped-cove-o-datafusion-showcase.md):
   end-to-end multi-source mapped COVE-O showcase through DataFusion SQL.
+- [`v2/docs/proposals/cove-o-query-language.md`](./v2/docs/proposals/cove-o-query-language.md):
+  Cove-OQL proposal and conformance decisions.
 - [`v2/crates/cove-codec`](./v2/crates/cove-codec): COVE-CX descriptor and
   registered-envelope validation.
 - [`v2/crates/cove-coverage`](./v2/crates/cove-coverage): COVE-COVERAGE
@@ -292,6 +304,12 @@ Run the conformance corpus directly:
 cargo run -p cove-conformance --bin cove-conformance -- conformance/
 ```
 
+Run the Cove-OQL suite:
+
+```sh
+cargo test -p cove-oql --all-features
+```
+
 Run the smaller implementer-kernel subset:
 
 ```sh
@@ -340,6 +358,29 @@ If the mapped `COVE-O` file already embeds its projection catalog, the mapping
 path can be omitted. Projection tables register from the declared
 `output_table` name when present, otherwise from the projection id; an optional
 prefix produces deterministic names like `<prefix>__people`.
+
+Execute a Cove-OQL query directly against mapped `COVE-O` bytes:
+
+```rust
+use cove_core::reader::ValidationOptions;
+use cove_oql::{
+    parse_resolve_plan_and_execute_query, ExecutionOptions, ParseOptions,
+    PlanOptions, ResolveOptions,
+};
+
+let bytes = std::fs::read("people.cove")?;
+let executed = parse_resolve_plan_and_execute_query(
+    &bytes,
+    r#"Person.where(active == true).select(person_id, full_name).explain("coded")"#,
+    ParseOptions::default(),
+    ResolveOptions::default(),
+    PlanOptions::default(),
+    ExecutionOptions::default(),
+    ValidationOptions::default(),
+)?;
+
+println!("{}", executed.explain_text());
+```
 
 For the full multi-source showcase, including canonical-object SQL joined back
 to provenance rows from one mapped `COVE-O` file, see
