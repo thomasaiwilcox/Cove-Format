@@ -150,8 +150,18 @@ fn zone_stat_entry_binds_to_table(
     let Some(segment) = segments_by_id.get(&entry.segment_id) else {
         return false;
     };
-    if entry.morsel_id == u32::MAX && entry.stats.row_count != u64::from(segment.row_count) {
-        return false;
+    if entry.morsel_id == u32::MAX {
+        if entry.stats.row_count != u64::from(segment.row_count) {
+            return false;
+        }
+    } else {
+        let segment_end = segment.row_start.checked_add(u64::from(segment.row_count));
+        let row_count_ok = segment_end.is_some()
+            && entry.stats.row_count <= u64::from(segment.morsel_row_count)
+            && entry.stats.row_count <= u64::from(segment.row_count);
+        if !row_count_ok {
+            return false;
+        }
     }
     if entry
         .stats

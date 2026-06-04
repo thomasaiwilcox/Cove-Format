@@ -346,15 +346,18 @@ impl DatasetState {
         &self.coverage_cache
     }
 
-    pub fn file_code_for_canonical(
+    pub fn file_code_for_canonical_key(
         &self,
         file_ordinal: usize,
-        canonical: &[u8],
+        canonical_key: &[u8],
     ) -> Result<Option<u32>, CoveError> {
         let Some(reverse_lookup) = self.file(file_ordinal)?.mounted.reverse_lookup.as_ref() else {
             return Ok(None);
         };
-        Ok(reverse_lookup.by_canonical_value.get(canonical).copied())
+        Ok(reverse_lookup
+            .by_canonical_value
+            .get(canonical_key)
+            .copied())
     }
 
     pub fn resolved_plan_for_file(
@@ -376,20 +379,20 @@ impl DatasetState {
         for filter in &mut plan.filters {
             let Some(CovePredicate::FileCodeIn {
                 file_codes,
-                canonical_values,
+                canonical_keys,
                 ..
             }) = filter.predicate.as_mut()
             else {
                 continue;
             };
-            if canonical_values.is_empty() {
+            if canonical_keys.is_empty() {
                 continue;
             }
             let (resolved, resolution_stats) =
                 execution_code::resolve_file_code_predicate_for_file(
                     self,
                     file_ordinal,
-                    canonical_values,
+                    canonical_keys,
                 )?;
             stats.supported_files += resolution_stats.supported_files;
             stats.fallback_files += resolution_stats.fallback_files;

@@ -155,6 +155,9 @@ impl CoveHeaderV1 {
         }
 
         let flags = u32::from_le_bytes(buf[12..16].try_into().unwrap());
+        if flags != 0 {
+            return Err(CoveError::ReservedNotZero);
+        }
         let required_features = u64::from_le_bytes(buf[16..24].try_into().unwrap());
         let optional_features = u64::from_le_bytes(buf[24..32].try_into().unwrap());
 
@@ -185,6 +188,9 @@ impl CoveHeaderV1 {
         let profile_capability_section_id = u32::from_le_bytes(buf[80..84].try_into().unwrap());
         let fast_metadata_section_id = u32::from_le_bytes(buf[84..88].try_into().unwrap());
         let v2_flags = u32::from_le_bytes(buf[88..92].try_into().unwrap());
+        if v2_flags != 0 {
+            return Err(CoveError::ReservedNotZero);
+        }
 
         let mut reserved = [0u8; 64];
         reserved.copy_from_slice(&buf[92..156]);
@@ -286,13 +292,14 @@ mod tests {
     #[test]
     fn reserved_nonzero_rejected() {
         let hdr = minimal_header();
-        let mut bytes = hdr.serialize();
-        bytes[96] = 1; // inside reserved bytes (offset 92+4 = 96)
-                       // Recompute CRC.
-        bytes[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4].copy_from_slice(&[0, 0, 0, 0]);
-        let crc = checksum::crc32c(&bytes);
-        bytes[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
-        assert_eq!(CoveHeaderV1::parse(&bytes), Err(CoveError::ReservedNotZero));
+        for offset in [12, 88, 96] {
+            let mut bytes = hdr.serialize();
+            bytes[offset] = 1;
+            bytes[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4].copy_from_slice(&[0, 0, 0, 0]);
+            let crc = checksum::crc32c(&bytes);
+            bytes[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
+            assert_eq!(CoveHeaderV1::parse(&bytes), Err(CoveError::ReservedNotZero));
+        }
     }
 
     #[test]

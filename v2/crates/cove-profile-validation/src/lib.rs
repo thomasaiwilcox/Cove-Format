@@ -160,7 +160,8 @@ pub fn validate_embedded_optional_profile_sections_with_runtime_session(
                 CoverageProofRecordV2::parse_many(&payload).map(|_| ())
             }
             SectionKind::IndexOnlyCapability => {
-                IndexOnlyCapabilityV2::parse_many(&payload).map(|_| ())
+                let capabilities = IndexOnlyCapabilityV2::parse_many(&payload)?;
+                validate_embedded_index_only_capabilities(&capabilities, entry, feature_use)
             }
             SectionKind::RuntimeCompatibilityHints => {
                 let hints = RuntimeCompatibilityHintV2::parse_many(&payload)?;
@@ -195,6 +196,20 @@ pub fn validate_embedded_optional_profile_sections_with_runtime_session(
         feature_use,
         only_required_for_feature_use,
     )?;
+    Ok(())
+}
+
+fn validate_embedded_index_only_capabilities(
+    capabilities: &[IndexOnlyCapabilityV2],
+    entry: &CoveSectionEntryV1,
+    feature_use: Option<&FeatureUseRequestV2>,
+) -> Result<(), CoveError> {
+    if capabilities.is_empty() {
+        return Ok(());
+    }
+    if section_is_required_for_feature_use(entry, feature_use) {
+        return Err(CoveError::BadCovi);
+    }
     Ok(())
 }
 
@@ -530,7 +545,7 @@ fn validate_coverage_set_authority(
             return Err(CoveError::BadCoverage);
         }
         if set.header.snapshot_validity_ref != selected_snapshot {
-            return Err(CoveError::BadCoverage);
+            return Err(CoveError::CoverageStale);
         }
         for entry in &set.entries {
             validate_coverage_entry_authority(entry, authority)?;
@@ -913,7 +928,8 @@ fn operation_requires_section(operation: OperationKindV2, kind: SectionKind) -> 
         OperationKindV2::RedactionPolicyEvaluation => kind == SectionKind::RedactionManifest,
         OperationKindV2::MappingReplay
         | OperationKindV2::MappingExplanation
-        | OperationKindV2::ProjectionReadback => is_map_section(kind),
+        | OperationKindV2::ProjectionReadback
+        | OperationKindV2::EvidenceReadback => is_map_section(kind),
         OperationKindV2::HarborMount => is_harbor_section(kind),
         _ => false,
     }
@@ -1021,6 +1037,7 @@ mod tests {
         table::ColumnEntry,
     };
     use cove_coverage::CoverageSetEntryV2;
+    use cove_index::{IndexCapabilityExactnessV2, IndexOnlyCapabilityV2};
     use cove_runtime::RuntimeHintKindV2;
 
     #[test]
@@ -1124,6 +1141,29 @@ mod tests {
     }
 
     #[test]
+    fn map_readback_operations_require_cove_map_sections() {
+        for operation in [
+            OperationKindV2::MappingReplay,
+            OperationKindV2::MappingExplanation,
+            OperationKindV2::ProjectionReadback,
+            OperationKindV2::EvidenceReadback,
+        ] {
+            assert!(
+                operation_requires_section(operation, SectionKind::MapEvidenceIndex),
+                "{operation:?} should require COVE-MAP evidence metadata"
+            );
+            assert!(
+                operation_requires_section(operation, SectionKind::MapProjectionCatalog),
+                "{operation:?} should require COVE-MAP projection metadata"
+            );
+            assert!(
+                !operation_requires_section(operation, SectionKind::ObjectTypeCatalog),
+                "{operation:?} should not use COVE-O object sections as MAP metadata"
+            );
+        }
+    }
+
+    #[test]
     fn policy_operations_require_policy_sections() {
         assert!(operation_requires_section(
             OperationKindV2::TrustVerification,
@@ -1133,6 +1173,34 @@ mod tests {
             OperationKindV2::RedactionPolicyEvaluation,
             SectionKind::RedactionManifest
         ));
+    }
+
+    #[test]
+    fn embedded_index_only_capability_is_not_authoritative_for_required_operation() {
+        let entry = index_only_section_entry();
+        let capability = IndexOnlyCapabilityV2 {
+            capability_id: 1,
+            aggregate_kind: 0,
+            predicate_supported: 1,
+            exactness: IndexCapabilityExactnessV2::Exact,
+            null_semantics: 0,
+            flags: 0,
+            snapshot_validity_ref: 1,
+            required_visibility_overlay_ref: ABSENT_REF,
+            checksum: 0,
+        };
+        let request = FeatureUseRequestV2::new().with_operation(OperationKindV2::IndexOnlyAnswer);
+
+        assert!(matches!(
+            validate_embedded_index_only_capabilities(
+                &[capability.clone()],
+                &entry,
+                Some(&request)
+            ),
+            Err(CoveError::BadCovi)
+        ));
+        assert!(validate_embedded_index_only_capabilities(&[], &entry, Some(&request)).is_ok());
+        assert!(validate_embedded_index_only_capabilities(&[capability], &entry, None).is_ok());
     }
 
     #[test]
@@ -1248,6 +1316,28 @@ mod tests {
             section_id: 1,
             section_kind: SectionKind::CoverageSet as u16,
             profile: PrimaryProfile::CoverageMetadata as u8,
+            flags: 0,
+            offset: 0,
+            length: 0,
+            uncompressed_length: 0,
+            item_count: 0,
+            row_count: 0,
+            compression: 0,
+            encryption: 0,
+            alignment_log2: 0,
+            reserved0: 0,
+            required_features: 0,
+            optional_features: 0,
+            crc32c: 0,
+            reserved1: 0,
+        }
+    }
+
+    fn index_only_section_entry() -> CoveSectionEntryV1 {
+        CoveSectionEntryV1 {
+            section_id: 2,
+            section_kind: SectionKind::IndexOnlyCapability as u16,
+            profile: PrimaryProfile::SecondaryIndex as u8,
             flags: 0,
             offset: 0,
             length: 0,

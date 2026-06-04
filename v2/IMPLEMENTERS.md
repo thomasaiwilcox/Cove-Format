@@ -106,3 +106,17 @@ object-temporal reconstruction, secondary index artifacts, runtime coverage
 caches, object-store planning, zero-copy Arrow views, registered codec plugins,
 Harbor integration, or DataFusion integration. Those are valuable profile
 claims after the reader kernel is correct.
+
+## Current Reference Boundaries
+
+The reference workspace includes lakehouse visibility overlay fixtures and a
+deterministic offline object-store harness. It does not ship production
+Iceberg, Delta, Hudi, Hive, or Unity catalog clients; those adapters must be
+claimed separately and must apply the external catalog's visibility and delete
+rules before returning rows.
+
+Parquet, Arrow IPC, CSV, and ORC conversion are implemented through the shared
+conversion facade. Nested List, Struct, and Map values are emitted as native
+COVE nested layouts for the supported Arrow/Parquet shapes. Unsupported nested
+child shapes are explicit JSON fallback conversions, not native nested-layout
+coverage.

@@ -591,22 +591,30 @@ pub fn exact_covi_unfiltered_min_max(
     state: &DatasetState,
     requests: &[(usize, CoviAggregateKindV2)],
 ) -> Result<Option<MetadataAggregatePlan>, CoveError> {
-    let mut values = Vec::with_capacity(requests.len());
-    for (column_index, aggregate_kind) in requests {
-        if !matches!(
+    if !requests.iter().all(|(_, aggregate_kind)| {
+        matches!(
             aggregate_kind,
             CoviAggregateKindV2::Min | CoviAggregateKindV2::Max
-        ) {
+        )
+    }) {
+        return Ok(None);
+    }
+    exact_covi_unfiltered_scalar_values(state, requests)
+}
+
+#[cfg(feature = "covi")]
+pub fn exact_covi_unfiltered_scalar_values(
+    state: &DatasetState,
+    requests: &[(usize, CoviAggregateKindV2)],
+) -> Result<Option<MetadataAggregatePlan>, CoveError> {
+    let mut values = Vec::with_capacity(requests.len());
+    for (column_index, aggregate_kind) in requests {
+        let column = state.table().columns.get(*column_index).ok_or_else(|| {
+            CoveError::BadSchema("index-only aggregate column out of bounds".into())
+        })?;
+        if !covi_index_only_scalar_value_type_is_supported(column.logical, *aggregate_kind) {
             return Ok(None);
         }
-        let column = state
-            .table()
-            .columns
-            .get(*column_index)
-            .ok_or_else(|| CoveError::BadSchema("min/max column out of bounds".into()))?;
-        let Some(value_tag) = value_tag_for_covi_index_only(column.logical) else {
-            return Ok(None);
-        };
         let Some(answer) =
             exact_covi_unfiltered_answer(state, Some(*column_index), *aggregate_kind)?
         else {
@@ -615,29 +623,183 @@ pub fn exact_covi_unfiltered_min_max(
         if !covi_answer_counts_consistent(&answer) {
             return Ok(None);
         }
-        let canonical_value = match answer.value {
-            Some(value) => {
-                if validate_canonical_payload(value_tag, &value).is_err() {
-                    return Ok(None);
-                }
-                Some(value)
+        let value = match aggregate_kind {
+            CoviAggregateKindV2::Min | CoviAggregateKindV2::Max => {
+                covi_index_only_min_max_value(column.logical, &answer)?
             }
-            None if answer.non_null_count == 0 => None,
-            None => return Ok(None),
+            CoviAggregateKindV2::Sum => covi_index_only_sum_value(column.logical, &answer)?,
+            CoviAggregateKindV2::Avg => covi_index_only_avg_value(column.logical, &answer)?,
+            _ => return Ok(None),
         };
-        values.push(MetadataAggregateValue {
-            logical: column.logical,
-            canonical_value,
-        });
+        if value.canonical_value.is_none() && answer.non_null_count > 0 {
+            return Ok(None);
+        }
+        values.push(value);
     }
     Ok(Some(MetadataAggregatePlan::ScalarValues {
         values,
         proof: MetadataAggregateProof {
             kind: MetadataAggregateProofKind::CoviIndexOnlyValue,
-            reason: "exact COVE-I index-only min/max answer".into(),
+            reason: "exact COVE-I index-only scalar aggregate answer".into(),
             dictionary_group_labels_decoded: 0,
         },
     }))
+}
+
+#[cfg(feature = "covi")]
+fn covi_index_only_scalar_value_type_is_supported(
+    logical: CoveLogicalType,
+    aggregate_kind: CoviAggregateKindV2,
+) -> bool {
+    match aggregate_kind {
+        CoviAggregateKindV2::Min | CoviAggregateKindV2::Max => {
+            value_tag_for_covi_index_only(logical).is_some()
+        }
+        CoviAggregateKindV2::Sum => value_tag_for_covi_index_only_sum(logical).is_some(),
+        CoviAggregateKindV2::Avg => matches!(
+            logical,
+            CoveLogicalType::Int8
+                | CoveLogicalType::Int16
+                | CoveLogicalType::Int32
+                | CoveLogicalType::Int64
+                | CoveLogicalType::UInt8
+                | CoveLogicalType::UInt16
+                | CoveLogicalType::UInt32
+                | CoveLogicalType::UInt64
+                | CoveLogicalType::Float32
+                | CoveLogicalType::Float64
+        ),
+        _ => false,
+    }
+}
+
+#[cfg(feature = "covi")]
+fn covi_index_only_min_max_value(
+    logical: CoveLogicalType,
+    answer: &cove_index::execution::CoviIndexOnlyAnswerV2,
+) -> Result<MetadataAggregateValue, CoveError> {
+    let Some(value_tag) = value_tag_for_covi_index_only(logical) else {
+        return Ok(MetadataAggregateValue {
+            logical,
+            canonical_value: None,
+        });
+    };
+    let canonical_value = match answer.value.as_deref() {
+        Some(value) => {
+            if validate_canonical_payload(value_tag, value).is_err() {
+                return Ok(MetadataAggregateValue {
+                    logical,
+                    canonical_value: None,
+                });
+            }
+            Some(value.to_vec())
+        }
+        None if answer.non_null_count == 0 => None,
+        None => {
+            return Ok(MetadataAggregateValue {
+                logical,
+                canonical_value: None,
+            });
+        }
+    };
+    Ok(MetadataAggregateValue {
+        logical,
+        canonical_value,
+    })
+}
+
+#[cfg(feature = "covi")]
+fn covi_index_only_sum_value(
+    logical: CoveLogicalType,
+    answer: &cove_index::execution::CoviIndexOnlyAnswerV2,
+) -> Result<MetadataAggregateValue, CoveError> {
+    let Some(value_tag) = value_tag_for_covi_index_only_sum(logical) else {
+        return Ok(MetadataAggregateValue {
+            logical,
+            canonical_value: None,
+        });
+    };
+    let canonical_value = match answer.value.as_deref() {
+        Some(value) if answer.non_null_count > 0 => {
+            if validate_canonical_payload(value_tag, value).is_err() {
+                return Ok(MetadataAggregateValue {
+                    logical,
+                    canonical_value: None,
+                });
+            }
+            Some(value.to_vec())
+        }
+        None if answer.non_null_count == 0 => None,
+        _ => {
+            return Ok(MetadataAggregateValue {
+                logical,
+                canonical_value: None,
+            });
+        }
+    };
+    Ok(MetadataAggregateValue {
+        logical,
+        canonical_value,
+    })
+}
+
+#[cfg(feature = "covi")]
+fn covi_index_only_avg_value(
+    logical: CoveLogicalType,
+    answer: &cove_index::execution::CoviIndexOnlyAnswerV2,
+) -> Result<MetadataAggregateValue, CoveError> {
+    if answer.non_null_count == 0 {
+        return Ok(MetadataAggregateValue {
+            logical: CoveLogicalType::Float64,
+            canonical_value: None,
+        });
+    }
+    let Some(value) = answer.value.as_deref() else {
+        return Ok(MetadataAggregateValue {
+            logical: CoveLogicalType::Float64,
+            canonical_value: None,
+        });
+    };
+    let Some(sum) = covi_sum_payload_as_f64(logical, value)? else {
+        return Ok(MetadataAggregateValue {
+            logical: CoveLogicalType::Float64,
+            canonical_value: None,
+        });
+    };
+    let avg = sum / answer.non_null_count as f64;
+    Ok(MetadataAggregateValue {
+        logical: CoveLogicalType::Float64,
+        canonical_value: Some(avg.to_bits().to_le_bytes().to_vec()),
+    })
+}
+
+#[cfg(feature = "covi")]
+fn covi_sum_payload_as_f64(
+    logical: CoveLogicalType,
+    value: &[u8],
+) -> Result<Option<f64>, CoveError> {
+    let Some(value_tag) = value_tag_for_covi_index_only_sum(logical) else {
+        return Ok(None);
+    };
+    if validate_canonical_payload(value_tag, value).is_err() {
+        return Ok(None);
+    }
+    let sum = match logical {
+        CoveLogicalType::Int8
+        | CoveLogicalType::Int16
+        | CoveLogicalType::Int32
+        | CoveLogicalType::Int64 => i64::from_le_bytes(fixed_value_bytes(value)?) as f64,
+        CoveLogicalType::UInt8
+        | CoveLogicalType::UInt16
+        | CoveLogicalType::UInt32
+        | CoveLogicalType::UInt64 => u64::from_le_bytes(fixed_value_bytes(value)?) as f64,
+        CoveLogicalType::Float32 => {
+            f32::from_bits(u32::from_le_bytes(fixed_value_bytes(value)?)) as f64
+        }
+        CoveLogicalType::Float64 => f64::from_bits(u64::from_le_bytes(fixed_value_bytes(value)?)),
+        _ => return Ok(None),
+    };
+    Ok(Some(sum))
 }
 
 #[cfg(feature = "covi")]
@@ -747,16 +909,34 @@ fn value_tag_for_covi_index_only(logical: CoveLogicalType) -> Option<ValueTag> {
     }
 }
 
+#[cfg(feature = "covi")]
+fn value_tag_for_covi_index_only_sum(logical: CoveLogicalType) -> Option<ValueTag> {
+    match logical {
+        CoveLogicalType::Int8
+        | CoveLogicalType::Int16
+        | CoveLogicalType::Int32
+        | CoveLogicalType::Int64 => Some(ValueTag::Int64),
+        CoveLogicalType::UInt8
+        | CoveLogicalType::UInt16
+        | CoveLogicalType::UInt32
+        | CoveLogicalType::UInt64 => Some(ValueTag::UInt64),
+        CoveLogicalType::Float32 => Some(ValueTag::Float32Bits),
+        CoveLogicalType::Float64 => Some(ValueTag::Float64Bits),
+        CoveLogicalType::Decimal128 => Some(ValueTag::Decimal128),
+        _ => None,
+    }
+}
+
 pub fn exact_filecode_filtered_count(
     state: &DatasetState,
     column_index: usize,
-    canonical_values: &[Vec<u8>],
+    canonical_keys: &[Vec<u8>],
 ) -> Result<Option<MetadataAggregatePlan>, CoveError> {
-    if canonical_values.is_empty() || !filecode_fast_paths_are_safe(state, column_index)? {
+    if canonical_keys.is_empty() || !filecode_fast_paths_are_safe(state, column_index)? {
         return Ok(None);
     }
     if let Some(plan) =
-        exact_filecode_histogram_filtered_count(state, column_index, canonical_values)?
+        exact_filecode_histogram_filtered_count(state, column_index, canonical_keys)?
     {
         return Ok(Some(plan));
     }
@@ -775,10 +955,10 @@ pub fn exact_filecode_filtered_count(
             return Ok(None);
         }
         let mut selected = BTreeSet::new();
-        for canonical in canonical_values {
+        for canonical_key in canonical_keys {
             // INVARIANT: `file_state` is a single-file dataset view, so file
             // ordinal 0 refers to that concrete file only.
-            let Some(file_code) = file_state.file_code_for_canonical(0, canonical)? else {
+            let Some(file_code) = file_state.file_code_for_canonical_key(0, canonical_key)? else {
                 continue;
             };
             if let Some(rows) = lookup.rows_for(u64::from(file_code)) {
@@ -806,7 +986,7 @@ pub fn exact_filecode_filtered_count(
 fn exact_filecode_histogram_filtered_count(
     state: &DatasetState,
     column_index: usize,
-    canonical_values: &[Vec<u8>],
+    canonical_keys: &[Vec<u8>],
 ) -> Result<Option<MetadataAggregatePlan>, CoveError> {
     let mut total = 0u64;
     for file_ordinal in 0..state.file_count() {
@@ -817,8 +997,8 @@ fn exact_filecode_histogram_filtered_count(
             .get(column_index)
             .ok_or_else(|| CoveError::BadSchema("FileCode filter column out of bounds".into()))?;
         let mut selected_codes = BTreeSet::new();
-        for canonical in canonical_values {
-            if let Some(file_code) = file_state.file_code_for_canonical(0, canonical)? {
+        for canonical_key in canonical_keys {
+            if let Some(file_code) = file_state.file_code_for_canonical_key(0, canonical_key)? {
                 selected_codes.insert(u64::from(file_code));
             }
         }

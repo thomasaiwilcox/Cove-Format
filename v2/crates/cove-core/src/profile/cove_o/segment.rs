@@ -6,12 +6,13 @@ use crate::{
     page::{
         page_uses_payload_elision, ColumnPageIndex, ColumnPageIndexEntryV1, PAGE_FLAG_ALL_NON_NULL,
     },
-    page_payload::ColumnPagePayloadV1,
+    page_payload::{BufferChecksumValidation, ColumnPagePayloadV1, RetainedColumnPagePayloadV1},
     page_validation::{
         validate_column_page_payload, validate_page_codec_feature_advertisement,
         validate_stats_only_constant_page, validate_stats_only_constant_page_envelope,
         PageValidationContext,
     },
+    retained_bytes::RetainedBytes,
     segment::{TableColumnDirectoryEntryV1, TABLE_COLUMN_DIRECTORY_ENTRY_LEN},
     CoveError,
 };
@@ -226,6 +227,26 @@ pub struct TemporalPropertyPage {
     pub payload: Option<ColumnPagePayloadV1>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetainedTemporalSegmentData {
+    pub header: TemporalSegmentHeaderV1,
+    pub rows: Vec<TemporalRowEntryV1>,
+    pub property_columns: Vec<RetainedTemporalPropertyColumn>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetainedTemporalPropertyColumn {
+    pub directory: TableColumnDirectoryEntryV1,
+    pub page_index: ColumnPageIndex,
+    pub pages: Vec<RetainedTemporalPropertyPage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetainedTemporalPropertyPage {
+    pub index_entry: ColumnPageIndexEntryV1,
+    pub payload: Option<RetainedColumnPagePayloadV1>,
+}
+
 impl TemporalSegmentData {
     pub fn parse(bytes: &[u8]) -> Result<Self, CoveError> {
         Self::parse_inner(bytes, None, None, None, false, &[])
@@ -423,6 +444,173 @@ impl TemporalSegmentData {
     }
 }
 
+impl RetainedTemporalSegmentData {
+    /// Parse temporal segment bytes while retaining property page payload owners.
+    pub fn parse(data: impl Into<RetainedBytes>) -> Result<Self, CoveError> {
+        Self::parse_inner(data, None, None, None, false, &[])
+    }
+
+    pub fn parse_with_required_features(
+        data: impl Into<RetainedBytes>,
+        required_features: u64,
+    ) -> Result<Self, CoveError> {
+        Self::parse_inner(data, Some(required_features), None, None, false, &[])
+    }
+
+    pub(crate) fn parse_after_semantic_validation_with_codec_descriptors(
+        data: impl Into<RetainedBytes>,
+        required_features: u64,
+        codec_descriptors: &[CodecExtensionDescriptorV2],
+    ) -> Result<Self, CoveError> {
+        Self::parse_inner(
+            data,
+            Some(required_features),
+            None,
+            None,
+            true,
+            codec_descriptors,
+        )
+    }
+
+    fn parse_inner(
+        data: impl Into<RetainedBytes>,
+        required_features: Option<u64>,
+        file_advertised_features: Option<u64>,
+        section_advertised_features: Option<u64>,
+        allow_contextual_stats_only: bool,
+        codec_descriptors: &[CodecExtensionDescriptorV2],
+    ) -> Result<Self, CoveError> {
+        let data = data.into();
+        let bytes = data.as_slice();
+        let header = TemporalSegmentHeaderV1::parse(bytes)?;
+        if header.row_count == 0 && header.morsel_count != 0 {
+            return Err(CoveError::BadSchema(
+                "temporal segment with zero rows cannot have morsels".into(),
+            ));
+        }
+        if header.row_count != 0 && header.morsel_row_count == 0 {
+            return Err(CoveError::BadSchema(
+                "temporal segment with rows must declare morsel_row_count".into(),
+            ));
+        }
+        let row_directory_offset =
+            usize::try_from(header.row_directory_offset).map_err(|_| CoveError::OffsetRange)?;
+        let column_directory_offset =
+            usize::try_from(header.column_directory_offset).map_err(|_| CoveError::OffsetRange)?;
+        let page_index_offset =
+            usize::try_from(header.page_index_offset).map_err(|_| CoveError::OffsetRange)?;
+        let data_offset =
+            usize::try_from(header.data_offset).map_err(|_| CoveError::OffsetRange)?;
+        if row_directory_offset < TEMPORAL_SEGMENT_HEADER_LEN
+            || column_directory_offset < row_directory_offset
+            || page_index_offset < column_directory_offset
+            || data_offset < page_index_offset
+            || data_offset > bytes.len()
+        {
+            return Err(CoveError::BadSchema(
+                "temporal segment offsets are invalid".into(),
+            ));
+        }
+        let row_bytes_len = (header.row_count as usize)
+            .checked_mul(TEMPORAL_ROW_ENTRY_LEN)
+            .ok_or(CoveError::ArithOverflow)?;
+        let row_end = row_directory_offset
+            .checked_add(row_bytes_len)
+            .ok_or(CoveError::ArithOverflow)?;
+        if row_end > column_directory_offset {
+            return Err(CoveError::BadSchema(
+                "temporal row directory exceeds declared boundary".into(),
+            ));
+        }
+        let column_dir_len = (header.column_count as usize)
+            .checked_mul(TABLE_COLUMN_DIRECTORY_ENTRY_LEN)
+            .ok_or(CoveError::ArithOverflow)?;
+        let column_dir_end = column_directory_offset
+            .checked_add(column_dir_len)
+            .ok_or(CoveError::ArithOverflow)?;
+        if column_dir_end > page_index_offset {
+            return Err(CoveError::BadSchema(
+                "temporal property column directory exceeds declared boundary".into(),
+            ));
+        }
+        let mut rows = Vec::with_capacity(header.row_count as usize);
+        let mut pos = row_directory_offset;
+        for _ in 0..header.row_count {
+            rows.push(TemporalRowEntryV1::parse(
+                &bytes[pos..pos + TEMPORAL_ROW_ENTRY_LEN],
+            )?);
+            pos += TEMPORAL_ROW_ENTRY_LEN;
+        }
+        let property_columns = parse_retained_temporal_property_columns(
+            &data,
+            &header,
+            column_directory_offset,
+            TemporalPropertyParseContext {
+                required_features,
+                file_advertised_features,
+                section_advertised_features,
+                allow_contextual_stats_only,
+                codec_descriptors,
+            },
+        )?;
+        let segment = Self {
+            header,
+            rows,
+            property_columns,
+        };
+        segment.validate()?;
+        Ok(segment)
+    }
+
+    pub fn validate(&self) -> Result<(), CoveError> {
+        let row_keys = self
+            .rows
+            .iter()
+            .map(TemporalRowEntryV1::row_key)
+            .collect::<Vec<_>>();
+        validate_temporal_order(&row_keys)?;
+        for pair in self.rows.windows(2) {
+            if pair[1].csn < pair[0].csn {
+                return Err(CoveError::BadSchema(
+                    "temporal segment csn decreases in row order".into(),
+                ));
+            }
+        }
+
+        for (row_index, row) in self.rows.iter().enumerate() {
+            if let Some(prev_ref) = row.prev_ref {
+                if prev_ref.segment_id == self.header.segment_id
+                    && prev_ref.row_index >= row_index as u32
+                {
+                    return Err(CoveError::RefInvalid);
+                }
+                if prev_ref.segment_id > self.header.segment_id {
+                    return Err(CoveError::RefInvalid);
+                }
+            }
+        }
+
+        if let Some(first) = self.rows.first() {
+            if first.timestamp_us < self.header.time_range_start_us
+                || first.csn < self.header.csn_min
+            {
+                return Err(CoveError::BadSchema(
+                    "temporal segment row falls before declared min range".into(),
+                ));
+            }
+        }
+        if let Some(last) = self.rows.last() {
+            if last.timestamp_us > self.header.time_range_end_us || last.csn > self.header.csn_max {
+                return Err(CoveError::BadSchema(
+                    "temporal segment row falls after declared max range".into(),
+                ));
+            }
+        }
+
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy)]
 struct TemporalPropertyParseContext<'a> {
     required_features: Option<u64>,
@@ -533,6 +721,130 @@ fn parse_temporal_property_columns(
             });
         }
         out.push(TemporalPropertyColumn {
+            directory,
+            page_index,
+            pages,
+        });
+    }
+    Ok(out)
+}
+
+fn parse_retained_temporal_property_columns(
+    data: &RetainedBytes,
+    header: &TemporalSegmentHeaderV1,
+    column_directory_offset: usize,
+    context: TemporalPropertyParseContext<'_>,
+) -> Result<Vec<RetainedTemporalPropertyColumn>, CoveError> {
+    let bytes = data.as_slice();
+    let page_index_offset =
+        usize::try_from(header.page_index_offset).map_err(|_| CoveError::OffsetRange)?;
+    let data_offset = usize::try_from(header.data_offset).map_err(|_| CoveError::OffsetRange)?;
+    let mut out = Vec::with_capacity(header.column_count as usize);
+    let mut pos = column_directory_offset;
+    for _ in 0..header.column_count {
+        let directory = TableColumnDirectoryEntryV1::parse(
+            &bytes[pos..pos + TABLE_COLUMN_DIRECTORY_ENTRY_LEN],
+        )?;
+        pos += TABLE_COLUMN_DIRECTORY_ENTRY_LEN;
+
+        let page_index_start =
+            usize::try_from(directory.page_index_offset).map_err(|_| CoveError::OffsetRange)?;
+        let page_index_end = usize::try_from(
+            directory
+                .page_index_offset
+                .checked_add(directory.page_index_length)
+                .ok_or(CoveError::ArithOverflow)?,
+        )
+        .map_err(|_| CoveError::OffsetRange)?;
+        if page_index_start < page_index_offset || page_index_end > data_offset {
+            return Err(CoveError::SegmentCorrupt);
+        }
+        let page_index = ColumnPageIndex::parse(&bytes[page_index_start..page_index_end])?;
+
+        let data_start =
+            usize::try_from(directory.data_offset).map_err(|_| CoveError::OffsetRange)?;
+        let data_end = usize::try_from(
+            directory
+                .data_offset
+                .checked_add(directory.data_length)
+                .ok_or(CoveError::ArithOverflow)?,
+        )
+        .map_err(|_| CoveError::OffsetRange)?;
+        if data_start < data_offset || data_end > bytes.len() {
+            return Err(CoveError::SegmentCorrupt);
+        }
+
+        let mut pages = Vec::with_capacity(page_index.entries.len());
+        for page in &page_index.entries {
+            if page.column_id != directory.column_id {
+                return Err(CoveError::PageCorrupt);
+            }
+            validate_temporal_property_page_elision_features(page, context.required_features)?;
+            validate_page_codec_feature_advertisement(
+                page,
+                context.file_advertised_features,
+                context.section_advertised_features,
+            )?;
+            let page_context = PageValidationContext {
+                table_id: None,
+                segment_id: Some(header.segment_id),
+                column_id: directory.column_id,
+                logical_type: directory.logical_type,
+                physical_kind: directory.physical_kind,
+                dictionary: None,
+                zone_stats: None,
+                codec_descriptors: context.codec_descriptors,
+                nested_schema: None,
+            };
+            if page.page_length == 0 {
+                if page.flags & PAGE_FLAG_ALL_NON_NULL != 0 {
+                    validate_stats_only_constant_page_envelope(page)?;
+                    if !context.allow_contextual_stats_only {
+                        return Err(CoveError::PageCorrupt);
+                    }
+                } else {
+                    validate_temporal_property_stats_only_page(&page_context, page)?;
+                }
+                pages.push(RetainedTemporalPropertyPage {
+                    index_entry: page.clone(),
+                    payload: None,
+                });
+                continue;
+            }
+            let page_start =
+                usize::try_from(page.page_offset).map_err(|_| CoveError::OffsetRange)?;
+            let page_end = usize::try_from(
+                page.page_offset
+                    .checked_add(page.page_length)
+                    .ok_or(CoveError::ArithOverflow)?,
+            )
+            .map_err(|_| CoveError::OffsetRange)?;
+            if page_start < data_start || page_end > data_end {
+                return Err(CoveError::PageCorrupt);
+            }
+            let page_wire = data.slice(page_start, page_end - page_start)?;
+            let decoded = compression::column_page_payload_retained_with_checksum_validation(
+                page_wire,
+                page,
+                compression::PageChecksumValidation::Verify,
+            )?;
+            let payload = RetainedColumnPagePayloadV1::parse_with_buffer_checksum_validation(
+                decoded,
+                BufferChecksumValidation::Verify,
+            )?;
+            let owned_payload = ColumnPagePayloadV1 {
+                header: payload.header.clone(),
+                nodes: payload.nodes.clone(),
+                buffers: payload.buffers.clone(),
+                data: payload.data.to_vec(),
+            };
+            validate_column_page_payload(&page_context, page, &owned_payload)?;
+            pages.push(RetainedTemporalPropertyPage {
+                index_entry: page.clone(),
+                payload: Some(payload),
+            });
+        }
+        out.push(RetainedTemporalPropertyColumn {
             directory,
             page_index,
             pages,

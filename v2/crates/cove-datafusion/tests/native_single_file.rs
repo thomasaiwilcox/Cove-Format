@@ -124,6 +124,15 @@ use cove_datafusion::{
     },
     task_graph::build_task_graph,
 };
+#[cfg(feature = "covi")]
+use cove_index::{
+    execution::CoviAggregateKindV2, CoviAggregateAnswerBlockHeaderV2, CoviAggregateAnswerBlockV2,
+    CoviAggregateAnswerV2, CoviArtifactV2, CoviComparatorKindV2, CoviEntryBlockHeaderV2,
+    CoviEntryBlockV2, CoviIndexEntryV2, CoviIndexKindV2, CoviIndexRootV2, CoviIndexedTargetKindV2,
+    CoviKeyBlockHeaderV2, CoviKeyBlockV2, CoviKeyEncodingKindV2, CoviPostingsBlockHeaderV2,
+    CoviPostingsBlockV2, CoviReferencedFileV2, CoviSectionKindV2, CoviSectionPayloadV2,
+    CoviSnapshotValidityV2, IndexCapabilityExactnessV2, IndexCapabilityV2, IndexOnlyCapabilityV2,
+};
 use cove_map::cove_o_from_paths;
 use datafusion::object_store::{
     memory::InMemory, path::Path, CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload,
@@ -2287,7 +2296,7 @@ fn sibling_coverage_cache_is_explicit_and_records_planner_hits() {
     let base_state = bootstrap_local_file(&path).unwrap();
     assert!(!base_state.coverage_cache().runtime_stats().enabled);
 
-    let cache_bytes = coverage_cache_bytes_for_state(base_state.as_ref());
+    let cache_bytes = coverage_cache_bytes_for_state(base_state.as_ref(), &bytes);
     let cache_path = PathBuf::from(format!("{}.cache", path.display()));
     fs::write(&cache_path, cache_bytes).unwrap();
 
@@ -2472,6 +2481,48 @@ fn direct_decode_resolves_canonical_filecode_filters_for_single_file_state() {
         "| payload |",
         "+---------+",
         "| first   |",
+        "+---------+",
+    ];
+    assert_batches_eq!(expected, &decoded.batches);
+    assert_eq!(decoded.stats.lookup_index_hits, 1);
+    assert_eq!(decoded.stats.index_rows_selected, 1);
+}
+
+#[test]
+fn direct_decode_resolves_bool_filecode_filters_by_value_tag() {
+    let state = bootstrap_bytes("items", bool_filecode_items_file_with_lookup_index()).unwrap();
+    let projection = vec![1];
+    let filter = lower_filter(
+        &state,
+        &LowerExpr::Binary {
+            left: Box::new(LowerExpr::Column("active".into())),
+            op: LowerOperator::Eq,
+            right: Box::new(LowerExpr::Literal(LowerLiteral::Boolean(true))),
+        },
+        "active = true",
+    );
+    match filter.predicate.as_ref() {
+        Some(CovePredicate::FileCodeIn {
+            file_codes,
+            canonical_values,
+            canonical_keys,
+            ..
+        }) => {
+            assert!(file_codes.is_empty());
+            assert_eq!(canonical_values, &vec![Vec::<u8>::new()]);
+            assert_eq!(canonical_keys, &vec![vec![ValueTag::BoolTrue as u8]]);
+        }
+        other => panic!("expected bool FileCode predicate, got {other:?}"),
+    }
+    let plan = plan_scan(&state, Some(&projection), vec![filter]).unwrap();
+
+    let decoded = decode_scan(&state, &plan).unwrap();
+
+    let expected = [
+        "+---------+",
+        "| payload |",
+        "+---------+",
+        "| second  |",
         "+---------+",
     ];
     assert_batches_eq!(expected, &decoded.batches);
@@ -2758,6 +2809,96 @@ fn generated_covi_min_max_answers_feed_datafusion_metadata_path() {
     .unwrap();
 
     assert!(plan.is_some());
+}
+
+#[cfg(feature = "covi")]
+#[tokio::test]
+async fn generated_covi_sum_avg_answers_feed_datafusion_metadata_path() {
+    let bytes = primitive_events_file();
+    let covi = cove_index::build::build_covi_from_cove_bytes(
+        &bytes,
+        &cove_index::build::CoviBuildOptions {
+            all_columns: true,
+            include_index_only_sum_avg: true,
+            ..cove_index::build::CoviBuildOptions::default()
+        },
+    )
+    .unwrap();
+    let path = write_temp_cove("generated_covi_sum_avg", bytes);
+    let covi_path = PathBuf::from(format!("{}.covi", path.display()));
+    fs::write(&covi_path, covi).unwrap();
+    let ctx = SessionContext::new();
+    let provider = register_cove_file(&ctx, "events", &path).unwrap();
+    assert_eq!(provider.state().bootstrap_stats().covi_sidecars_loaded, 1);
+
+    let batches = ctx
+        .sql("SELECT SUM(id) AS total, AVG(id) AS mean FROM events")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let expected = [
+        "+-------+------+",
+        "| total | mean |",
+        "+-------+------+",
+        "| 6     | 2.0  |",
+        "+-------+------+",
+    ];
+    assert_batches_eq!(expected, &batches);
+
+    let explain = ctx
+        .sql("EXPLAIN SELECT SUM(id) AS total, AVG(id) AS mean FROM events")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let explain_text = pretty_format_batches(&explain).unwrap().to_string();
+    assert!(!explain_text.contains("CoveExec"), "{explain_text}");
+    fs::remove_file(path).unwrap();
+    fs::remove_file(covi_path).unwrap();
+}
+
+#[cfg(feature = "covi")]
+#[tokio::test]
+async fn covi_sum_avg_answers_feed_datafusion_metadata_path() {
+    let bytes = float_metrics_file();
+    let covi = float_metric_sum_avg_covi_artifact(&bytes);
+    let path = write_temp_cove("covi_sum_avg_metrics", bytes);
+    let covi_path = PathBuf::from(format!("{}.covi", path.display()));
+    fs::write(&covi_path, covi).unwrap();
+    let ctx = SessionContext::new();
+    let provider = register_cove_file(&ctx, "metrics", &path).unwrap();
+    assert_eq!(provider.state().bootstrap_stats().covi_sidecars_loaded, 1);
+
+    let batches = ctx
+        .sql("SELECT SUM(f64) AS total, AVG(f64) AS mean FROM metrics")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let expected = [
+        "+-------+------+",
+        "| total | mean |",
+        "+-------+------+",
+        "| 0.75  | 0.25 |",
+        "+-------+------+",
+    ];
+    assert_batches_eq!(expected, &batches);
+
+    let explain = ctx
+        .sql("EXPLAIN SELECT SUM(f64) AS total, AVG(f64) AS mean FROM metrics")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let explain_text = pretty_format_batches(&explain).unwrap().to_string();
+    assert!(!explain_text.contains("CoveExec"), "{explain_text}");
+    fs::remove_file(path).unwrap();
+    fs::remove_file(covi_path).unwrap();
 }
 
 #[tokio::test]
@@ -3914,6 +4055,285 @@ fn float_metrics_file() -> Vec<u8> {
     writer.write().unwrap()
 }
 
+#[cfg(feature = "covi")]
+fn float_metric_sum_avg_covi_artifact(bytes: &[u8]) -> Vec<u8> {
+    let state = bootstrap_bytes("float_metric_covi_identity", bytes.to_vec()).unwrap();
+    let identity = state.file(0).unwrap().identity();
+    let dataset_id = identity.file_id;
+    let digest =
+        cove_core::digest::compute_digest(cove_core::constants::DigestAlgorithm::Sha256, bytes)
+            .unwrap();
+    let mut snapshot_id = [0u8; 16];
+    snapshot_id[0..4].copy_from_slice(&checksum::crc32c(bytes).to_le_bytes());
+    snapshot_id[4..8].copy_from_slice(&identity.footer_crc32c.to_le_bytes());
+    snapshot_id[8..16].copy_from_slice(&(bytes.len() as u64).to_le_bytes());
+    let root = CoviIndexRootV2 {
+        index_root_id: 0,
+        indexed_target_kind: CoviIndexedTargetKindV2::TableColumn,
+        index_kind: CoviIndexKindV2::AggregateOnly,
+        coverage_granularity: 0,
+        proof_strength: CoverageProofStrengthV2::ExactConservative as u8,
+        exactness: 0,
+        flags: 0,
+        table_id: 1,
+        column_id: 3,
+        object_type_id: u32::MAX,
+        property_id: u32::MAX,
+        path_ref: u32::MAX,
+        semantic_dimension_ref: u32::MAX,
+        logical_type: CoveLogicalType::Float64 as u16,
+        physical_kind: CovePhysicalKind::NumCode as u8,
+        key_encoding_kind: CoviKeyEncodingKindV2::CanonicalValueBytes as u8,
+        comparator_kind: CoviComparatorKindV2::CanonicalOrdering as u16,
+        collation_id: 0,
+        null_semantics: 0,
+        sort_order: 0,
+        value_count: 3,
+        distinct_count: 0,
+        null_count: 0,
+        min_key_ref: u32::MAX,
+        max_key_ref: u32::MAX,
+        key_block_section_id: 1,
+        entry_block_section_id: 2,
+        postings_block_section_id: 3,
+        aggregate_block_section_id: 4,
+        coverage_set_ref: u32::MAX,
+        capability_ref: 0,
+        snapshot_validity_ref: 0,
+        checksum: 0,
+    };
+    let capability = IndexCapabilityV2 {
+        capability_id: 0,
+        index_root_id: 0,
+        flags: 0,
+        supports_eq: 0,
+        supports_range: 0,
+        supports_membership: 0,
+        supports_prefix: 0,
+        supports_contains: 0,
+        supports_count: 1,
+        supports_min: 0,
+        supports_max: 0,
+        supports_sum: 1,
+        supports_distinct_count: 0,
+        supports_join_coverage: 0,
+        supports_index_only: 1,
+        exactness: IndexCapabilityExactnessV2::Exact,
+        proof_strength: CoverageProofStrengthV2::ExactConservative,
+        null_semantics: 0,
+        reserved: 0,
+        snapshot_validity_ref: 0,
+        coverage_provider_ref: u32::MAX,
+        checksum: 0,
+    };
+    let index_only = [CoviAggregateKindV2::Sum, CoviAggregateKindV2::Avg]
+        .into_iter()
+        .map(|kind| IndexOnlyCapabilityV2 {
+            capability_id: 0,
+            aggregate_kind: kind as u16,
+            predicate_supported: 0,
+            exactness: IndexCapabilityExactnessV2::Exact,
+            null_semantics: 0,
+            flags: 0,
+            snapshot_validity_ref: 0,
+            required_visibility_overlay_ref: u32::MAX,
+            checksum: 0,
+        })
+        .collect::<Vec<_>>();
+    let key_block = CoviKeyBlockV2 {
+        header: CoviKeyBlockHeaderV2 {
+            magic: CoviKeyBlockHeaderV2::MAGIC,
+            version_major: 2,
+            version_minor: 0,
+            header_len: CoviKeyBlockHeaderV2::LEN as u16,
+            reserved0: 0,
+            key_block_id: 1,
+            index_root_id: 0,
+            key_count: 0,
+            encoding_kind: CoviKeyEncodingKindV2::CanonicalValueBytes,
+            comparator_kind: CoviComparatorKindV2::CanonicalOrdering,
+            flags: 0,
+            key_data_offset: CoviKeyBlockHeaderV2::LEN as u64,
+            key_data_length: 0,
+            checksum: 0,
+        },
+        key_data: Vec::new(),
+    };
+    let entry_block = CoviEntryBlockV2 {
+        header: CoviEntryBlockHeaderV2 {
+            magic: CoviEntryBlockHeaderV2::MAGIC,
+            version_major: 2,
+            version_minor: 0,
+            header_len: CoviEntryBlockHeaderV2::LEN as u16,
+            entry_len: CoviIndexEntryV2::LEN as u16,
+            entry_block_id: 2,
+            index_root_id: 0,
+            entry_count: 0,
+            key_block_id: 1,
+            postings_block_id: 3,
+            aggregate_block_id: 4,
+            entries_offset: CoviEntryBlockHeaderV2::LEN as u64,
+            entries_length: 0,
+            flags: 0,
+            checksum: 0,
+        },
+        entries: Vec::new(),
+    };
+    let postings_block = CoviPostingsBlockV2 {
+        header: CoviPostingsBlockHeaderV2 {
+            magic: CoviPostingsBlockHeaderV2::MAGIC,
+            version_major: 2,
+            version_minor: 0,
+            header_len: CoviPostingsBlockHeaderV2::LEN as u16,
+            postings_header_len: cove_index::CoviPostingsHeaderV2::LEN as u16,
+            postings_block_id: 3,
+            index_root_id: 0,
+            postings_count: 0,
+            row_ordinal_set_count: 0,
+            postings_headers_offset: CoviPostingsBlockHeaderV2::LEN as u64,
+            row_ordinal_headers_offset: 0,
+            postings_payload_offset: 0,
+            postings_payload_length: 0,
+            flags: 0,
+            checksum: 0,
+        },
+        postings: Vec::new(),
+        row_ordinal_sets: Vec::new(),
+        payload: Vec::new(),
+    };
+    let sum_payload = 0.75f64.to_bits().to_le_bytes();
+    let mut aggregate_payload = Vec::new();
+    let aggregate_answers = [CoviAggregateKindV2::Sum, CoviAggregateKindV2::Avg]
+        .into_iter()
+        .enumerate()
+        .map(|(index, kind)| {
+            let value_ref = u32::try_from(aggregate_payload.len()).unwrap();
+            aggregate_payload.extend_from_slice(&sum_payload);
+            CoviAggregateAnswerV2 {
+                aggregate_answer_ref: index as u32,
+                index_root_id: 0,
+                aggregate_kind: kind as u16,
+                exactness: IndexCapabilityExactnessV2::Exact as u8,
+                null_semantics: 0,
+                flags: 0,
+                row_count: 3,
+                null_count: 0,
+                non_null_count: 3,
+                value_ref,
+                predicate_form_ref: u32::MAX,
+                snapshot_validity_ref: 0,
+                checksum: 0,
+            }
+        })
+        .collect::<Vec<_>>();
+    let aggregate_block = CoviAggregateAnswerBlockV2 {
+        header: CoviAggregateAnswerBlockHeaderV2 {
+            magic: CoviAggregateAnswerBlockHeaderV2::MAGIC,
+            version_major: 2,
+            version_minor: 0,
+            header_len: CoviAggregateAnswerBlockHeaderV2::LEN as u16,
+            aggregate_answer_len: CoviAggregateAnswerV2::LEN as u16,
+            aggregate_block_id: 4,
+            index_root_id: 0,
+            aggregate_answer_count: aggregate_answers.len() as u32,
+            aggregate_answers_offset: CoviAggregateAnswerBlockHeaderV2::LEN as u64,
+            aggregate_payload_offset: 0,
+            aggregate_payload_length: aggregate_payload.len() as u64,
+            flags: 0,
+            checksum: 0,
+        },
+        answers: aggregate_answers,
+        payload: aggregate_payload,
+    };
+    let index_only_payload = index_only
+        .iter()
+        .flat_map(|capability| capability.serialize().unwrap())
+        .collect::<Vec<_>>();
+    CoviArtifactV2::serialize_with_sections(
+        dataset_id,
+        snapshot_id,
+        &[CoviReferencedFileV2 {
+            file_ref: 0,
+            flags: 0,
+            file_id: identity.file_id,
+            file_len: identity.file_len,
+            footer_crc32c: identity.footer_crc32c,
+            digest_algorithm: cove_core::constants::DigestAlgorithm::Sha256 as u16,
+            digest_len: digest.len() as u16,
+            digest_offset: 0,
+            uri_ref: u32::MAX,
+            schema_fingerprint_ref: u32::MAX,
+            checksum: 0,
+        }],
+        &[CoviSnapshotValidityV2 {
+            snapshot_validity_ref: 0,
+            dataset_id,
+            snapshot_id,
+            schema_fingerprint_ref: u32::MAX,
+            semantic_map_fingerprint_ref: u32::MAX,
+            external_visibility_ref: u32::MAX,
+            data_checksum_root_ref: u32::MAX,
+            valid_from_us: 0,
+            valid_until_us: i64::MAX,
+            flags: 0,
+            checksum: 0,
+        }],
+        &[root],
+        &[capability],
+        &[
+            CoviSectionPayloadV2 {
+                section_id: 1,
+                section_kind: CoviSectionKindV2::KeyBlock,
+                payload: key_block.serialize().unwrap(),
+                item_count: 0,
+                required_features: 0,
+                optional_features: 0,
+            },
+            CoviSectionPayloadV2 {
+                section_id: 2,
+                section_kind: CoviSectionKindV2::EntryBlock,
+                payload: entry_block.serialize().unwrap(),
+                item_count: 0,
+                required_features: 0,
+                optional_features: 0,
+            },
+            CoviSectionPayloadV2 {
+                section_id: 3,
+                section_kind: CoviSectionKindV2::PostingsBlock,
+                payload: postings_block.serialize().unwrap(),
+                item_count: 0,
+                required_features: 0,
+                optional_features: 0,
+            },
+            CoviSectionPayloadV2 {
+                section_id: 4,
+                section_kind: CoviSectionKindV2::AggregateAnswerBlock,
+                payload: aggregate_block.serialize().unwrap(),
+                item_count: 2,
+                required_features: 0,
+                optional_features: 0,
+            },
+            CoviSectionPayloadV2 {
+                section_id: 5,
+                section_kind: CoviSectionKindV2::IndexOnlyCapabilities,
+                payload: index_only_payload,
+                item_count: 2,
+                required_features: 0,
+                optional_features: 0,
+            },
+            CoviSectionPayloadV2 {
+                section_id: 6,
+                section_kind: CoviSectionKindV2::StringTable,
+                payload: digest,
+                item_count: 1,
+                required_features: 0,
+                optional_features: 0,
+            },
+        ],
+    )
+    .unwrap()
+}
+
 fn stats_only_numeric_metrics_file(include_stats: bool) -> Vec<u8> {
     let catalog = TableCatalog {
         flags: 0,
@@ -4137,11 +4557,20 @@ fn primitive_events_file_with_name_gamma_coverage_snapshot(
     writer.write().unwrap()
 }
 
-fn coverage_cache_bytes_for_state(state: &cove_datafusion::dataset_state::DatasetState) -> Vec<u8> {
+fn coverage_cache_bytes_for_state(
+    state: &cove_datafusion::dataset_state::DatasetState,
+    file_bytes: &[u8],
+) -> Vec<u8> {
     let mut seed = Vec::new();
     seed.extend_from_slice(state.file_id());
     seed.extend_from_slice(&state.file_len().to_le_bytes());
     seed.extend_from_slice(&state.footer_crc32c().to_le_bytes());
+    let file_digest = cove_core::digest::compute_digest(
+        cove_core::constants::DigestAlgorithm::Sha256,
+        file_bytes,
+    )
+    .unwrap();
+    seed.extend_from_slice(&file_digest);
     let digest =
         cove_core::digest::compute_digest(cove_core::constants::DigestAlgorithm::Sha256, &seed)
             .unwrap();
@@ -4903,6 +5332,61 @@ fn dictionary_items_file_with_lookup_index() -> Vec<u8> {
 
     let mut writer = ScanProfileCoveWriter::new(catalog);
     writer.push_file_dictionary(&sample_dictionary());
+    writer.push_extra_section(lookup_index_section());
+    writer.push_segment(segment);
+    writer.write().unwrap()
+}
+
+fn bool_filecode_items_file_with_lookup_index() -> Vec<u8> {
+    let dictionary = FileDictionary {
+        header: FileDictionaryHeaderV1 {
+            entry_count: 2,
+            flags: 0,
+            index_entry_len: FileDictionaryHeaderV1::INDEX_ENTRY_LEN,
+            value_hash_algorithm: 0,
+            payload_length: 0,
+            reserved: [0; 24],
+        },
+        entries: vec![
+            inline_bool_entry(ValueTag::BoolFalse),
+            inline_bool_entry(ValueTag::BoolTrue),
+        ],
+        payload: Vec::new(),
+    };
+    let catalog = TableCatalog {
+        flags: 0,
+        tables: vec![TableEntry {
+            table_id: 7,
+            namespace: "public".into(),
+            name: "items".into(),
+            row_count: 2,
+            primary_sort_key_count: 0,
+            clustering_key_count: 0,
+            flags: 0,
+            columns: vec![
+                column(
+                    1,
+                    "active",
+                    CoveLogicalType::Bool,
+                    CovePhysicalKind::FileCode,
+                    false,
+                ),
+                column(
+                    2,
+                    "payload",
+                    CoveLogicalType::Utf8,
+                    CovePhysicalKind::VarBytes,
+                    false,
+                ),
+            ],
+        }],
+    };
+    let mut segment = ScanSegment::new(7, 0, 0, 2, 2);
+    segment.set_column_pages(1, vec![filecode_page(2, filecodes(&[0, 1]))]);
+    segment.set_column_pages(2, vec![varbytes_page(2, varbytes(&["first", "second"]))]);
+
+    let mut writer = ScanProfileCoveWriter::new(catalog);
+    writer.push_file_dictionary(&dictionary);
     writer.push_extra_section(lookup_index_section());
     writer.push_segment(segment);
     writer.write().unwrap()
@@ -5734,9 +6218,9 @@ fn stable_fsst_descriptor() -> CodecExtensionDescriptorV2 {
         name: "fsst-utf8".into(),
         version_major: 2,
         version_minor: 0,
-        codec_family: 1,
-        logical_type_mask: u64::MAX,
-        physical_kind_mask: u64::MAX,
+        codec_family: 0,
+        logical_type_mask: 1u64 << (CoveLogicalType::Utf8 as u32),
+        physical_kind_mask: 1u64 << (CovePhysicalKind::VarBytes as u32),
         requirement: CodecRequirementV2::OptionalWithFallback,
         fallback_policy: CodecFallbackPolicyV2::CoreEncodingPayloadPresent,
         parameter_schema_kind: 0,
@@ -5820,10 +6304,22 @@ fn swapped_dictionary() -> FileDictionary {
 
 fn inline_utf8_entry(value: &str) -> FileDictionaryIndexEntryV1 {
     let canonical = canonical_utf8(value);
+    inline_canonical_entry(ValueTag::Utf8, &canonical)
+}
+
+fn inline_bool_entry(value_tag: ValueTag) -> FileDictionaryIndexEntryV1 {
+    assert!(matches!(
+        value_tag,
+        ValueTag::BoolFalse | ValueTag::BoolTrue
+    ));
+    inline_canonical_entry(value_tag, &[])
+}
+
+fn inline_canonical_entry(value_tag: ValueTag, canonical: &[u8]) -> FileDictionaryIndexEntryV1 {
     let mut inline_data = [0u8; 16];
     inline_data[..canonical.len()].copy_from_slice(&canonical);
     FileDictionaryIndexEntryV1 {
-        value_tag: ValueTag::Utf8 as u16,
+        value_tag: value_tag as u16,
         storage_class: StorageClass::Inline as u8,
         flags: 0,
         inline_len: canonical.len() as u8,

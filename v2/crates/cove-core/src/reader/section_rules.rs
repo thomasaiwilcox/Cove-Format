@@ -202,7 +202,8 @@ fn operation_requires_section(operation: OperationKindV2, kind: SectionKind) -> 
         OperationKindV2::RedactionPolicyEvaluation => kind == SectionKind::RedactionManifest,
         OperationKindV2::MappingReplay
         | OperationKindV2::MappingExplanation
-        | OperationKindV2::ProjectionReadback => is_map_section(kind),
+        | OperationKindV2::ProjectionReadback
+        | OperationKindV2::EvidenceReadback => is_map_section(kind),
         OperationKindV2::HarborMount => is_harbor_section(kind),
         _ => false,
     }
@@ -360,6 +361,29 @@ mod tests {
             assert!(
                 operation_requires_section(OperationKindV2::EngineExecutionMapping, kind),
                 "{kind:?} should be required for engine execution mapping"
+            );
+        }
+    }
+
+    #[test]
+    fn map_readback_operations_require_cove_map_sections() {
+        for operation in [
+            OperationKindV2::MappingReplay,
+            OperationKindV2::MappingExplanation,
+            OperationKindV2::ProjectionReadback,
+            OperationKindV2::EvidenceReadback,
+        ] {
+            assert!(
+                operation_requires_section(operation, SectionKind::MapEvidenceIndex),
+                "{operation:?} should require COVE-MAP evidence metadata"
+            );
+            assert!(
+                operation_requires_section(operation, SectionKind::MapProjectionCatalog),
+                "{operation:?} should require COVE-MAP projection metadata"
+            );
+            assert!(
+                !operation_requires_section(operation, SectionKind::ObjectTypeCatalog),
+                "{operation:?} should not use COVE-O object sections as MAP metadata"
             );
         }
     }

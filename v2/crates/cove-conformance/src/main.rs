@@ -566,7 +566,7 @@ fn validate_coverage_proof_fixture(bytes: &[u8]) -> Result<(), CoveError> {
         if selected_snapshot > u32::MAX as u64
             || selected_snapshot as u32 != record.snapshot_validity_ref
         {
-            return Err(CoveError::BadCoverage);
+            return Err(CoveError::CoverageStale);
         }
     }
 
@@ -1657,7 +1657,9 @@ fn synthetic_error_surface_error(code: &str) -> Option<CoveError> {
         "COVE_E_BAD_LAYOUT_PLAN" => Some(CoveError::BadLayoutPlan),
         "COVE_E_RUNTIME_HINT_UNSUPPORTED" => Some(CoveError::RuntimeHintUnsupported),
         "COVE_E_BAD_COVERAGE" => Some(CoveError::BadCoverage),
+        "COVE_E_COVERAGE_STALE" => Some(CoveError::CoverageStale),
         "COVE_E_BAD_COVI" => Some(CoveError::BadCovi),
+        "COVE_E_INDEX_ONLY_UNSAFE" => Some(CoveError::IndexOnlyUnsafe),
         "COVE_E_CACHE_STALE" => Some(CoveError::CacheStale),
         _ => None,
     }

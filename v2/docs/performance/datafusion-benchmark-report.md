@@ -130,8 +130,10 @@ The benchmark includes default COVE and Parquet tracks, plus explicit opt-in Fil
 - Some M7 tracks show wide confidence intervals and outliers. Treat those as directional until repeated on a controlled machine.
 - The `ci` benchmark profile is synthetic and intentionally small enough to run in PR/release gates. The `standard` and `publication` profiles increase row counts but remain deterministic generated corpora, not real customer datasets.
 - Object-store cold/warm coverage uses the deterministic offline object-store harness in `cove-bench`, so release gates record object GETs, range GETs, bytes requested/returned, cold/warm cache state, and coalescing decisions without requiring S3 or MinIO.
+- Lakehouse visibility coverage in this repository is fixture-backed. These benchmark and conformance results do not claim production Iceberg, Delta, Hudi, Hive, Unity, or other catalog-client behavior.
 - FileCode dictionary output is opt-in. It is currently retained for correctness and engine-integration testing, not enabled as the default performance path.
 - The production-safe FileCode dictionary fix may trade speed for correctness when a file dictionary contains entries from multiple logical domains.
+- Native nested conversion results cover the supported Arrow/Parquet List, Struct, and Map shapes. Unsupported nested child shapes are reported as explicit JSON fallback conversions.
 
 ## 6. Verification Results
 

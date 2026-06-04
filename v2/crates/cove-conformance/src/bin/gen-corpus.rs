@@ -46,11 +46,11 @@ use cove_core::{
         PrimaryProfile, SectionKind, StorageClass, ValueTag, FEATURE_CODEC_EXTENSION_REGISTRY,
         FEATURE_CODEC_LZ4, FEATURE_CODEC_ZSTD, FEATURE_COLUMN_DOMAINS, FEATURE_ENGINE_PROFILE,
         FEATURE_EXTENDED_FEATURE_SET, FEATURE_FILE_DICTIONARY, FEATURE_HARBOR_PROFILE,
-        FEATURE_LAYOUT_PLAN, FEATURE_OBJECT_PROFILE, FEATURE_PAGE_PAYLOAD_ELISION,
-        FEATURE_REGISTERED_ENCODINGS, FEATURE_RUNTIME_COMPATIBILITY_HINTS,
-        FEATURE_SECONDARY_INDEX_ARTIFACT, FEATURE_SEMANTIC_MAP, FEATURE_TABLE_PROFILE,
-        FEATURE_TRUST_CHAIN, FEATURE_ZERO_COPY_BUFFER_MAP, MAGIC_COVI, POSTSCRIPT_VERSION_V1,
-        VERSION_MAJOR_V1,
+        FEATURE_INDEX_ONLY_CAPABILITY, FEATURE_LAYOUT_PLAN, FEATURE_OBJECT_PROFILE,
+        FEATURE_PAGE_PAYLOAD_ELISION, FEATURE_REGISTERED_ENCODINGS,
+        FEATURE_RUNTIME_COMPATIBILITY_HINTS, FEATURE_SECONDARY_INDEX_ARTIFACT,
+        FEATURE_SEMANTIC_MAP, FEATURE_TABLE_PROFILE, FEATURE_TRUST_CHAIN,
+        FEATURE_ZERO_COPY_BUFFER_MAP, MAGIC_COVI, POSTSCRIPT_VERSION_V1, VERSION_MAJOR_V1,
     },
     dictionary::{FileDictionary, FileDictionaryHeaderV1, FileDictionaryIndexEntryV1},
     digest::{compute_digest, DigestEntry, DigestManifest, DigestScope, DigestTargetKind},
@@ -1171,8 +1171,8 @@ fn main() {
         ),
         encoding_fixture_bytes(json!({
             "encoding": "plain_varint",
-            "payload": PlainVarintPayload { values: vec![0, -1, 1, -2, 2] }.encode(),
-            "expect_values": [0, -1, 1, -2, 2]
+            "payload": PlainVarintPayload { values: vec![0, 1, 2, 127, 128] }.encode(),
+            "expect_values": [0, 1, 2, 127, 128]
         })),
     );
 
@@ -4139,7 +4139,7 @@ fn main() {
         ),
         encoding_fixture_bytes(json!({
             "encoding": "plain_varint",
-            "payload": 1u32.to_le_bytes().to_vec(),
+            "payload": [0x80u8],
             "expect_values": []
         })),
     );
@@ -5194,7 +5194,15 @@ fn main() {
             "reject/error_surface_bad_coverage.json",
             "COVE_E_BAD_COVERAGE",
         ),
+        (
+            "reject/error_surface_coverage_stale.json",
+            "COVE_E_COVERAGE_STALE",
+        ),
         ("reject/error_surface_bad_covi.json", "COVE_E_BAD_COVI"),
+        (
+            "reject/error_surface_index_only_unsafe.json",
+            "COVE_E_INDEX_ONLY_UNSAFE",
+        ),
         (
             "reject/error_surface_cache_stale.json",
             "COVE_E_CACHE_STALE",
@@ -6425,7 +6433,7 @@ fn write_v2_profile_fixtures(root: &Path, entries: &mut Vec<Value>) {
             "coverage/coverage_proof_record_stale_snapshot_reject.json",
             "coverage_proof_case",
             "reject",
-            Some("COVE_E_BAD_COVERAGE"),
+            Some("COVE_E_COVERAGE_STALE"),
             &["§29.3.3"],
         ),
         coverage_proof_case_payload(CoverageProofFixtureCase::StaleSnapshot),
@@ -7130,9 +7138,9 @@ fn stable_fsst_descriptor_payload() -> Vec<u8> {
         name: "fsst-utf8".into(),
         version_major: 2,
         version_minor: 0,
-        codec_family: 1,
-        logical_type_mask: u64::MAX,
-        physical_kind_mask: u64::MAX,
+        codec_family: 0,
+        logical_type_mask: 1u64 << (CoveLogicalType::Utf8 as u32),
+        physical_kind_mask: 1u64 << (CovePhysicalKind::VarBytes as u32),
         requirement: CodecRequirementV2::OptionalWithFallback,
         fallback_policy: CodecFallbackPolicyV2::CoreEncodingPayloadPresent,
         parameter_schema_kind: 0,
@@ -8122,7 +8130,7 @@ fn covi_hardening_cases() -> Vec<CoviHardeningCase> {
         CoviHardeningCase {
             path: "covi/approximate_index_only_exact_reject.json",
             expect: "reject",
-            error_code: Some("COVE_E_BAD_COVI"),
+            error_code: Some("COVE_E_INDEX_ONLY_UNSAFE"),
             sections: &["§33.2"],
             payload: covi_case_payload(
                 covi_index_only_artifact(IndexCapabilityExactnessV2::Approximate),
@@ -8993,6 +9001,16 @@ fn covi_artifact_from_blocks(
             optional_features: 0,
         });
     }
+    if overrides.supports_index_only {
+        sections.push(CoviSectionPayloadV2 {
+            section_id: 6,
+            section_kind: CoviSectionKindV2::IndexOnlyCapabilities,
+            payload: covi_count_index_only_capability_payload(0, 0),
+            item_count: 1,
+            required_features: 0,
+            optional_features: FEATURE_INDEX_ONLY_CAPABILITY,
+        });
+    }
     if overrides.unchecked_artifact {
         return serialize_covi_artifact_unchecked(
             covi_test_file_id(),
@@ -9017,6 +9035,26 @@ fn covi_artifact_from_blocks(
         &sections,
     )
     .unwrap()
+}
+
+fn covi_count_index_only_capability_payload(
+    capability_id: u32,
+    snapshot_validity_ref: u32,
+) -> Vec<u8> {
+    IndexOnlyCapabilityV2 {
+        capability_id,
+        aggregate_kind: 0,
+        predicate_supported: 0,
+        exactness: IndexCapabilityExactnessV2::Exact,
+        null_semantics: 0,
+        flags: 0,
+        snapshot_validity_ref,
+        required_visibility_overlay_ref: u32::MAX,
+        checksum: 0,
+    }
+    .serialize()
+    .unwrap()
+    .to_vec()
 }
 
 struct UncheckedCoviArtifactRefs<'a> {

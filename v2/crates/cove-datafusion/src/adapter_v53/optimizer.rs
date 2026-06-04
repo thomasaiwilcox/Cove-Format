@@ -14,7 +14,7 @@ use datafusion::{
 
 #[cfg(feature = "covi")]
 use crate::metadata_aggregate::{
-    exact_covi_unfiltered_distinct_counts, exact_covi_unfiltered_min_max,
+    exact_covi_unfiltered_distinct_counts, exact_covi_unfiltered_scalar_values,
 };
 use crate::{
     adapter_v53::{
@@ -152,15 +152,18 @@ fn metadata_aggregate_plan(
                 }
             }
 
-            let min_max_requests = aggregate
+            let scalar_value_requests = aggregate
                 .aggr_expr
                 .iter()
-                .map(|expr| min_max_request(expr, provider))
+                .map(|expr| index_only_scalar_value_request(expr, provider))
                 .collect::<Option<Vec<_>>>();
-            if let Some(min_max_requests) = min_max_requests {
-                if !min_max_requests.is_empty() {
-                    return exact_covi_unfiltered_min_max(provider.state(), &min_max_requests)
-                        .map_err(crate::adapter_v53::cove_to_datafusion);
+            if let Some(scalar_value_requests) = scalar_value_requests {
+                if !scalar_value_requests.is_empty() {
+                    return exact_covi_unfiltered_scalar_values(
+                        provider.state(),
+                        &scalar_value_requests,
+                    )
+                    .map_err(crate::adapter_v53::cove_to_datafusion);
                 }
             }
         }
@@ -269,9 +272,9 @@ fn filecode_filter(provider: &CoveTableProvider, expr: &Expr) -> Option<(usize, 
     match filter.predicate {
         Some(CovePredicate::FileCodeIn {
             column_index,
-            canonical_values,
+            canonical_keys,
             ..
-        }) if !canonical_values.is_empty() => Some((column_index, canonical_values)),
+        }) if !canonical_keys.is_empty() => Some((column_index, canonical_keys)),
         _ => None,
     }
 }
@@ -312,7 +315,7 @@ fn synopsis_aggregate_request(
 
 #[cfg(feature = "covi")]
 #[allow(deprecated)]
-fn min_max_request(
+fn index_only_scalar_value_request(
     expr: &Expr,
     provider: &CoveTableProvider,
 ) -> Option<(usize, CoviAggregateKindV2)> {
@@ -326,12 +329,17 @@ fn min_max_request(
         CoviAggregateKindV2::Min
     } else if func.func.name().eq_ignore_ascii_case("max") {
         CoviAggregateKindV2::Max
+    } else if func.func.name().eq_ignore_ascii_case("sum") {
+        CoviAggregateKindV2::Sum
+    } else if func.func.name().eq_ignore_ascii_case("avg") {
+        CoviAggregateKindV2::Avg
     } else {
         return None;
     };
-    let [Expr::Column(column)] = func.params.args.as_slice() else {
+    let [arg] = func.params.args.as_slice() else {
         return None;
     };
+    let column = aggregate_column_arg(arg)?;
     provider
         .state()
         .table()
@@ -339,6 +347,15 @@ fn min_max_request(
         .iter()
         .position(|candidate| candidate.name == column.name)
         .map(|column_index| (column_index, aggregate_kind))
+}
+
+#[cfg(feature = "covi")]
+fn aggregate_column_arg(expr: &Expr) -> Option<&datafusion::common::Column> {
+    match expr {
+        Expr::Column(column) => Some(column),
+        Expr::Cast(cast) => aggregate_column_arg(cast.expr.as_ref()),
+        _ => None,
+    }
 }
 
 fn record_batch_for_metadata_plan(

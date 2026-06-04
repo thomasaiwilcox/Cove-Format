@@ -465,7 +465,7 @@ fn build_filter_plan(state: &DatasetState, filter: &FilterDsl) -> Result<FilterP
                 let canonical = canonical_literal(column.logical, value)?;
                 for file_ordinal in 0..state.file_count() {
                     if let Some(file_code) =
-                        state.file_code_for_canonical(file_ordinal, &canonical.payload)?
+                        state.file_code_for_canonical_key(file_ordinal, &canonical.key)?
                     {
                         file_codes.push(file_code);
                     }
@@ -487,7 +487,7 @@ fn build_filter_plan(state: &DatasetState, filter: &FilterDsl) -> Result<FilterP
             let mut file_codes = Vec::new();
             for file_ordinal in 0..state.file_count() {
                 if let Some(file_code) =
-                    state.file_code_for_canonical(file_ordinal, &canonical.payload)?
+                    state.file_code_for_canonical_key(file_ordinal, &canonical.key)?
                 {
                     file_codes.push(file_code);
                 }

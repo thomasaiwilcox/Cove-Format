@@ -8,14 +8,17 @@ use crate::{
     CoviKeyBlockHeaderV2, CoviKeyBlockV2, CoviKeyEncodingKindV2, CoviPostingRepresentationV2,
     CoviPostingsBlockHeaderV2, CoviPostingsBlockV2, CoviPostingsHeaderV2, CoviReferencedFileV2,
     CoviRowRangePostingV2, CoviSectionKindV2, CoviSectionPayloadV2, CoviSnapshotValidityV2,
-    IndexCapabilityExactnessV2, IndexCapabilityV2,
+    IndexCapabilityExactnessV2, IndexCapabilityV2, IndexOnlyCapabilityV2,
 };
 use cove_core::{
     array::{CoveArrayValue, EncodedArray},
     canonical::CanonicalValue,
     checksum,
     compression::{column_page_payload, section_payload},
-    constants::{CoveLogicalType, CovePhysicalKind, DigestAlgorithm, SectionKind, ValueTag},
+    constants::{
+        CoveLogicalType, CovePhysicalKind, DigestAlgorithm, SectionKind, ValueTag,
+        FEATURE_INDEX_ONLY_CAPABILITY,
+    },
     dictionary::DictionaryValue,
     digest::compute_digest,
     materialize_stats_only_constant_page_payload,
@@ -41,6 +44,7 @@ pub struct CoviBuildOptions {
     pub include_index_only_min_max: bool,
     pub include_index_only_distinct_count: bool,
     pub include_index_only_exists: bool,
+    pub include_index_only_sum_avg: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -98,8 +102,10 @@ struct AggregateAnswerBlockParams<'a> {
     logical_type: CoveLogicalType,
     options: &'a CoviBuildOptions,
     include_min_max_answers: bool,
+    include_sum_avg_answers: bool,
     min_key: Option<&'a [u8]>,
     max_key: Option<&'a [u8]>,
+    sum_payload: Option<&'a [u8]>,
 }
 
 pub fn build_covi_from_cove_bytes(
@@ -172,6 +178,7 @@ pub fn build_covi_from_cove_bytes(
     };
     let mut roots = Vec::new();
     let mut capabilities = Vec::new();
+    let mut index_only_capabilities = Vec::new();
     let mut section_payloads = vec![CoviSectionPayloadV2 {
         section_id: 1,
         section_kind: CoviSectionKindV2::StringTable,
@@ -199,10 +206,14 @@ pub fn build_covi_from_cove_bytes(
             && aggregate_min_max_answer_supported(column.logical)
             && built_index.min_key.is_some()
             && built_index.max_key.is_some();
+        let include_sum_avg_answers = options.include_index_only_sum_avg
+            && aggregate_sum_answer_supported(column.logical)
+            && (built_index.sum_payload.is_some() || built_index.null_count == table.row_count);
         let include_aggregate_block = options.include_index_only_counts
             || include_min_max_answers
             || options.include_index_only_distinct_count
-            || options.include_index_only_exists;
+            || options.include_index_only_exists
+            || include_sum_avg_answers;
         let aggregate_block_section_id = if include_aggregate_block {
             aggregate_section_id
         } else {
@@ -211,6 +222,13 @@ pub fn build_covi_from_cove_bytes(
         if include_aggregate_block {
             built_index.entry_block =
                 entry_block_with_aggregate_block_id(&built_index.entry_block, root_id)?;
+            append_index_only_capabilities(
+                &mut index_only_capabilities,
+                root_id,
+                options,
+                include_min_max_answers,
+                include_sum_avg_answers,
+            );
         }
         let target = indexed_target_metadata(options.target, table.table_id, column.column_id);
         roots.push(CoviIndexRootV2 {
@@ -258,11 +276,13 @@ pub fn build_covi_from_cove_bytes(
             supports_prefix: 0,
             supports_contains: 0,
             supports_count: u8::from(
-                options.include_index_only_counts || options.include_index_only_exists,
+                options.include_index_only_counts
+                    || options.include_index_only_exists
+                    || include_sum_avg_answers,
             ),
             supports_min: u8::from(include_min_max_answers),
             supports_max: u8::from(include_min_max_answers),
-            supports_sum: 0,
+            supports_sum: u8::from(include_sum_avg_answers),
             supports_distinct_count: u8::from(options.include_index_only_distinct_count),
             supports_join_coverage: 0,
             supports_index_only: u8::from(include_aggregate_block),
@@ -309,18 +329,42 @@ pub fn build_covi_from_cove_bytes(
                 logical_type: column.logical,
                 options,
                 include_min_max_answers,
+                include_sum_avg_answers,
                 min_key: built_index.min_key.as_deref(),
                 max_key: built_index.max_key.as_deref(),
+                sum_payload: built_index.sum_payload.as_deref(),
             })?;
             section_payloads.push(CoviSectionPayloadV2 {
                 section_id: aggregate_section_id,
                 section_kind: CoviSectionKindV2::AggregateAnswerBlock,
                 payload: aggregate_block,
-                item_count: 1,
+                item_count: aggregate_answer_count(
+                    options,
+                    include_min_max_answers,
+                    include_sum_avg_answers,
+                ) as u64,
                 required_features: 0,
                 optional_features: 0,
             });
         }
+    }
+    if !index_only_capabilities.is_empty() {
+        let section_id = 2u32
+            .checked_add(
+                u32::try_from(columns.len())
+                    .map_err(|_| CoveError::ArithOverflow)?
+                    .checked_mul(4)
+                    .ok_or(CoveError::ArithOverflow)?,
+            )
+            .ok_or(CoveError::ArithOverflow)?;
+        section_payloads.push(CoviSectionPayloadV2 {
+            section_id,
+            section_kind: CoviSectionKindV2::IndexOnlyCapabilities,
+            payload: index_only_capability_payload(&index_only_capabilities)?,
+            item_count: index_only_capabilities.len() as u64,
+            required_features: 0,
+            optional_features: FEATURE_INDEX_ONLY_CAPABILITY,
+        });
     }
 
     let bytes = CoviArtifactV2::serialize_with_sections(
@@ -334,6 +378,83 @@ pub fn build_covi_from_cove_bytes(
     )?;
     CoviArtifactV2::parse(&bytes)?;
     Ok(bytes)
+}
+
+fn append_index_only_capabilities(
+    out: &mut Vec<IndexOnlyCapabilityV2>,
+    capability_id: u32,
+    options: &CoviBuildOptions,
+    include_min_max_answers: bool,
+    include_sum_avg_answers: bool,
+) {
+    if options.include_index_only_counts {
+        out.push(index_only_capability(
+            capability_id,
+            CoviAggregateKindV2::Count,
+        ));
+    }
+    if options.include_index_only_exists {
+        out.push(index_only_capability(
+            capability_id,
+            CoviAggregateKindV2::Exists,
+        ));
+    }
+    if include_min_max_answers {
+        out.push(index_only_capability(
+            capability_id,
+            CoviAggregateKindV2::Min,
+        ));
+        out.push(index_only_capability(
+            capability_id,
+            CoviAggregateKindV2::Max,
+        ));
+    }
+    if options.include_index_only_distinct_count {
+        out.push(index_only_capability(
+            capability_id,
+            CoviAggregateKindV2::DistinctCount,
+        ));
+    }
+    if include_sum_avg_answers {
+        out.push(index_only_capability(
+            capability_id,
+            CoviAggregateKindV2::Sum,
+        ));
+        out.push(index_only_capability(
+            capability_id,
+            CoviAggregateKindV2::Avg,
+        ));
+    }
+}
+
+fn index_only_capability(
+    capability_id: u32,
+    aggregate_kind: CoviAggregateKindV2,
+) -> IndexOnlyCapabilityV2 {
+    IndexOnlyCapabilityV2 {
+        capability_id,
+        aggregate_kind: aggregate_kind as u16,
+        predicate_supported: 0,
+        exactness: IndexCapabilityExactnessV2::Exact,
+        null_semantics: 0,
+        flags: 0,
+        snapshot_validity_ref: 0,
+        required_visibility_overlay_ref: u32::MAX,
+        checksum: 0,
+    }
+}
+
+fn index_only_capability_payload(records: &[IndexOnlyCapabilityV2]) -> Result<Vec<u8>, CoveError> {
+    let mut payload = Vec::with_capacity(
+        records
+            .len()
+            .checked_mul(IndexOnlyCapabilityV2::LEN)
+            .ok_or(CoveError::ArithOverflow)?,
+    );
+    for record in records {
+        payload.extend_from_slice(&record.serialize()?);
+    }
+    Ok(payload)
 }
 
 fn indexed_target_metadata(
@@ -445,6 +566,7 @@ struct BuiltColumnIndex {
     max_key_ref: u32,
     min_key: Option<Vec<u8>>,
     max_key: Option<Vec<u8>>,
+    sum_payload: Option<Vec<u8>>,
 }
 
 fn build_column_index(
@@ -612,7 +734,8 @@ fn build_column_index(
         index_kind = CoviIndexKindV2::Hash;
         supports_range = false;
     }
-    build_blocks_from_keys(
+    let sum_payload = index_only_sum_payload_from_keys(column.logical, &keys)?;
+    let mut built = build_blocks_from_keys(
         keys,
         BuildBlocksParams {
             root_id,
@@ -624,7 +747,9 @@ fn build_column_index(
             null_count,
             aggregate_block_id,
         },
-    )
+    )?;
+    built.sum_payload = sum_payload;
+    Ok(built)
 }
 
 fn build_blocks_from_keys(
@@ -786,6 +911,7 @@ fn build_blocks_from_keys(
         max_key_ref,
         min_key,
         max_key,
+        sum_payload: None,
     })
 }
 
@@ -805,6 +931,87 @@ fn canonical_float_keys_contain_nan(
         }
     }
     Ok(false)
+}
+
+fn index_only_sum_payload_from_keys(
+    logical_type: CoveLogicalType,
+    keys: &KeyPostingMap,
+) -> Result<Option<Vec<u8>>, CoveError> {
+    if keys.is_empty() || !aggregate_sum_answer_supported(logical_type) {
+        return Ok(None);
+    }
+    match logical_type {
+        CoveLogicalType::Int8
+        | CoveLogicalType::Int16
+        | CoveLogicalType::Int32
+        | CoveLogicalType::Int64 => index_only_signed_sum_payload(keys),
+        CoveLogicalType::UInt8
+        | CoveLogicalType::UInt16
+        | CoveLogicalType::UInt32
+        | CoveLogicalType::UInt64 => index_only_unsigned_sum_payload(keys),
+        _ => Ok(None),
+    }
+}
+
+fn index_only_signed_sum_payload(keys: &KeyPostingMap) -> Result<Option<Vec<u8>>, CoveError> {
+    let mut total = 0i128;
+    for (key, ranges) in keys {
+        let value = i128::from(signed_i64_payload_from_key(key)?);
+        let count = i128::from(row_count_for_ranges(ranges)?);
+        let contribution = value.checked_mul(count).ok_or(CoveError::ArithOverflow)?;
+        total = total
+            .checked_add(contribution)
+            .ok_or(CoveError::ArithOverflow)?;
+    }
+    let total = i64::try_from(total).map_err(|_| CoveError::ArithOverflow)?;
+    Ok(Some(total.to_le_bytes().to_vec()))
+}
+
+fn index_only_unsigned_sum_payload(keys: &KeyPostingMap) -> Result<Option<Vec<u8>>, CoveError> {
+    let mut total = 0u128;
+    for (key, ranges) in keys {
+        let value = u128::from(unsigned_u64_payload_from_key(key)?);
+        let count = u128::from(row_count_for_ranges(ranges)?);
+        let contribution = value.checked_mul(count).ok_or(CoveError::ArithOverflow)?;
+        total = total
+            .checked_add(contribution)
+            .ok_or(CoveError::ArithOverflow)?;
+    }
+    let total = u64::try_from(total).map_err(|_| CoveError::ArithOverflow)?;
+    Ok(Some(total.to_le_bytes().to_vec()))
+}
+
+fn row_count_for_ranges(ranges: &[CoviRowRangePostingV2]) -> Result<u64, CoveError> {
+    ranges.iter().try_fold(0u64, |total, range| {
+        total
+            .checked_add(range.row_count)
+            .ok_or(CoveError::ArithOverflow)
+    })
+}
+
+fn signed_i64_payload_from_key(key: &[u8]) -> Result<i64, CoveError> {
+    let (tag, payload) = tagged_key_payload(key)?;
+    if tag != ValueTag::Int64 || payload.len() != 8 {
+        return Err(CoveError::BadCovi);
+    }
+    Ok(i64::from_le_bytes(payload.try_into().unwrap()))
+}
+
+fn unsigned_u64_payload_from_key(key: &[u8]) -> Result<u64, CoveError> {
+    let (tag, payload) = tagged_key_payload(key)?;
+    if tag != ValueTag::UInt64 || payload.len() != 8 {
+        return Err(CoveError::BadCovi);
+    }
+    Ok(u64::from_le_bytes(payload.try_into().unwrap()))
+}
+
+fn tagged_key_payload(key: &[u8]) -> Result<(ValueTag, &[u8]), CoveError> {
+    let (tag, consumed) = wire::decode_u64_leb128(key)?;
+    let tag = u16::try_from(tag)
+        .ok()
+        .and_then(ValueTag::from_u16)
+        .ok_or(CoveError::BadCovi)?;
+    Ok((tag, &key[consumed..]))
 }
 
 fn canonical_float_key_is_nan(
@@ -873,8 +1080,10 @@ fn aggregate_answer_block(params: AggregateAnswerBlockParams<'_>) -> Result<Vec<
         logical_type,
         options,
         include_min_max_answers,
+        include_sum_avg_answers,
         min_key,
         max_key,
+        sum_payload,
     } = params;
     let non_null_count = row_count
         .checked_sub(null_count)
@@ -946,6 +1155,28 @@ fn aggregate_answer_block(params: AggregateAnswerBlockParams<'_>) -> Result<Vec<
             Some(&distinct_payload),
         )?;
     }
+    if include_sum_avg_answers {
+        push_aggregate_answer(
+            &mut answers,
+            &mut payload,
+            root_id,
+            CoviAggregateKindV2::Sum,
+            row_count,
+            null_count,
+            non_null_count,
+            sum_payload,
+        )?;
+        push_aggregate_answer(
+            &mut answers,
+            &mut payload,
+            root_id,
+            CoviAggregateKindV2::Avg,
+            row_count,
+            null_count,
+            non_null_count,
+            sum_payload,
+        )?;
+    }
     CoviAggregateAnswerBlockV2 {
         header: CoviAggregateAnswerBlockHeaderV2 {
             magic: CoviAggregateAnswerBlockHeaderV2::MAGIC,
@@ -968,6 +1199,18 @@ fn aggregate_answer_block(params: AggregateAnswerBlockParams<'_>) -> Result<Vec<
     .serialize()
 }
 
+fn aggregate_answer_count(
+    options: &CoviBuildOptions,
+    include_min_max_answers: bool,
+    include_sum_avg_answers: bool,
+) -> usize {
+    usize::from(options.include_index_only_counts)
+        + usize::from(options.include_index_only_exists)
+        + usize::from(include_min_max_answers) * 2
+        + usize::from(options.include_index_only_distinct_count)
+        + usize::from(include_sum_avg_answers) * 2
+}
+
 fn aggregate_min_max_answer_supported(logical_type: CoveLogicalType) -> bool {
     !matches!(
         logical_type,
@@ -976,6 +1219,20 @@ fn aggregate_min_max_answer_supported(logical_type: CoveLogicalType) -> bool {
             | CoveLogicalType::List
             | CoveLogicalType::Struct
             | CoveLogicalType::Map
+    )
+}
+
+fn aggregate_sum_answer_supported(logical_type: CoveLogicalType) -> bool {
+    matches!(
+        logical_type,
+        CoveLogicalType::Int8
+            | CoveLogicalType::Int16
+            | CoveLogicalType::Int32
+            | CoveLogicalType::Int64
+            | CoveLogicalType::UInt8
+            | CoveLogicalType::UInt16
+            | CoveLogicalType::UInt32
+            | CoveLogicalType::UInt64
     )
 }
 
@@ -1583,8 +1840,10 @@ mod tests {
                 ..CoviBuildOptions::default()
             },
             include_min_max_answers: true,
+            include_sum_avg_answers: false,
             min_key: Some(&min_key),
             max_key: Some(&max_key),
+            sum_payload: None,
         })
         .unwrap();
         let block = CoviAggregateAnswerBlockV2::parse(&bytes).unwrap();
@@ -1623,8 +1882,10 @@ mod tests {
                 ..CoviBuildOptions::default()
             },
             include_min_max_answers: false,
+            include_sum_avg_answers: false,
             min_key: None,
             max_key: None,
+            sum_payload: None,
         })
         .unwrap();
         let block = CoviAggregateAnswerBlockV2::parse(&bytes).unwrap();
@@ -1642,6 +1903,75 @@ mod tests {
         assert_eq!(answer.non_null_count, 3);
         assert_eq!(answer.value_ref, 0);
         assert_eq!(block.payload, 2u64.to_le_bytes());
+    }
+
+    #[test]
+    fn build_covi_emits_checked_integer_sum_and_avg_answers() {
+        let built = build_covi_from_cove_bytes(
+            &one_column_two_morsel_scan_file(),
+            &CoviBuildOptions {
+                all_columns: true,
+                include_index_only_sum_avg: true,
+                ..CoviBuildOptions::default()
+            },
+        )
+        .unwrap();
+        let artifact = CoviArtifactV2::parse(&built).unwrap();
+
+        assert_eq!(artifact.capabilities[0].supports_sum, 1);
+        assert_eq!(artifact.capabilities[0].supports_count, 1);
+        assert_eq!(artifact.capabilities[0].supports_index_only, 1);
+        assert!(artifact.index_only_capabilities.iter().any(|capability| {
+            CoviAggregateKindV2::from_u16(capability.aggregate_kind)
+                == Some(CoviAggregateKindV2::Sum)
+        }));
+        assert!(artifact.index_only_capabilities.iter().any(|capability| {
+            CoviAggregateKindV2::from_u16(capability.aggregate_kind)
+                == Some(CoviAggregateKindV2::Avg)
+        }));
+
+        let block = artifact.aggregate_answer_blocks.first().unwrap();
+        assert_eq!(block.header.aggregate_answer_count, 2);
+        let sum = block
+            .answers
+            .iter()
+            .find(|answer| {
+                CoviAggregateKindV2::from_u16(answer.aggregate_kind)
+                    == Some(CoviAggregateKindV2::Sum)
+            })
+            .unwrap();
+        let avg = block
+            .answers
+            .iter()
+            .find(|answer| {
+                CoviAggregateKindV2::from_u16(answer.aggregate_kind)
+                    == Some(CoviAggregateKindV2::Avg)
+            })
+            .unwrap();
+        assert_eq!(sum.row_count, 2);
+        assert_eq!(sum.non_null_count, 2);
+        assert_eq!(sum.value_ref, 0);
+        assert_eq!(avg.value_ref, 8);
+        assert_eq!(&block.payload[0..8], &3i64.to_le_bytes());
+        assert_eq!(&block.payload[8..16], &3i64.to_le_bytes());
+    }
+
+    #[test]
+    fn build_covi_does_not_emit_bool_sum_or_avg_answers() {
+        let built = build_covi_from_cove_bytes(
+            &bool_scan_file(),
+            &CoviBuildOptions {
+                all_columns: true,
+                include_index_only_sum_avg: true,
+                ..CoviBuildOptions::default()
+            },
+        )
+        .unwrap();
+        let artifact = CoviArtifactV2::parse(&built).unwrap();
+
+        assert!(artifact.aggregate_answer_blocks.is_empty());
+        assert_eq!(artifact.capabilities[0].supports_sum, 0);
+        assert_eq!(artifact.capabilities[0].supports_index_only, 0);
     }
 
     #[test]

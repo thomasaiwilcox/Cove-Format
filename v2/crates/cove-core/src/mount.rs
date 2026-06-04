@@ -165,6 +165,7 @@ pub enum SidecarValidationStatus {
 /// Canonical-value to FileCode reverse lookup built from the file dictionary.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReverseLookup {
+    /// Tagged canonical key `[value_tag: varint][canonical_payload]`.
     pub by_canonical_value: BTreeMap<Vec<u8>, u32>,
     pub redacted_filecodes: Vec<u32>,
 }
@@ -344,7 +345,11 @@ pub fn build_reverse_lookup(dictionary: &FileDictionary) -> Result<ReverseLookup
     for file_code in 0..dictionary.len() {
         match dictionary.decode_value(file_code)? {
             DictionaryValue::RawBytes(bytes) => {
-                if lookup.by_canonical_value.insert(bytes, file_code).is_some() {
+                let value_tag = dictionary.get_entry(file_code)?.value_tag;
+                let mut key = Vec::new();
+                crate::wire::append_u64_leb128(&mut key, u64::from(value_tag));
+                key.extend_from_slice(&bytes);
+                if lookup.by_canonical_value.insert(key, file_code).is_some() {
                     return Err(CoveError::BadSection(
                         "dictionary contains duplicate canonical values".into(),
                     ));
@@ -1090,8 +1095,45 @@ mod tests {
         let lookup = mounted.reverse_lookup.unwrap();
         assert_eq!(lookup.by_canonical_value.len(), 2);
         assert_eq!(
-            lookup.by_canonical_value.get(&canonical_utf8("red")),
+            lookup
+                .by_canonical_value
+                .get(&tagged_key(ValueTag::Utf8, &canonical_utf8("red"))),
             Some(&0)
+        );
+    }
+
+    #[test]
+    fn reverse_lookup_distinguishes_tag_only_canonical_values() {
+        let dictionary = FileDictionary {
+            header: FileDictionaryHeaderV1 {
+                entry_count: 2,
+                flags: 0,
+                index_entry_len: FileDictionaryHeaderV1::INDEX_ENTRY_LEN,
+                value_hash_algorithm: 0,
+                payload_length: 0,
+                reserved: [0; 24],
+            },
+            entries: vec![
+                inline_canonical_entry(ValueTag::BoolFalse, &[]),
+                inline_canonical_entry(ValueTag::BoolTrue, &[]),
+            ],
+            payload: Vec::new(),
+        };
+
+        let lookup = build_reverse_lookup(&dictionary).unwrap();
+
+        assert_eq!(lookup.by_canonical_value.len(), 2);
+        assert_eq!(
+            lookup
+                .by_canonical_value
+                .get(&tagged_key(ValueTag::BoolFalse, &[])),
+            Some(&0)
+        );
+        assert_eq!(
+            lookup
+                .by_canonical_value
+                .get(&tagged_key(ValueTag::BoolTrue, &[])),
+            Some(&1)
         );
     }
 
@@ -1429,10 +1471,14 @@ mod tests {
 
     fn inline_utf8_entry(value: &str) -> FileDictionaryIndexEntryV1 {
         let canonical = canonical_utf8(value);
+        inline_canonical_entry(ValueTag::Utf8, &canonical)
+    }
+
+    fn inline_canonical_entry(value_tag: ValueTag, canonical: &[u8]) -> FileDictionaryIndexEntryV1 {
         let mut inline_data = [0u8; 16];
         inline_data[..canonical.len()].copy_from_slice(&canonical);
         FileDictionaryIndexEntryV1 {
-            value_tag: ValueTag::Utf8 as u16,
+            value_tag: value_tag as u16,
             storage_class: StorageClass::Inline as u8,
             flags: 0,
             inline_len: canonical.len() as u8,
@@ -1449,5 +1495,12 @@ mod tests {
         let mut canonical = wire::encode_u64_leb128(value.len() as u64);
         canonical.extend_from_slice(value.as_bytes());
         canonical
+    }
+
+    fn tagged_key(tag: ValueTag, payload: &[u8]) -> Vec<u8> {
+        let mut key = Vec::new();
+        wire::append_u64_leb128(&mut key, tag as u64);
+        key.extend_from_slice(payload);
+        key
     }
 }

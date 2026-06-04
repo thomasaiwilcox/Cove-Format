@@ -907,6 +907,31 @@ pub fn encoded_columns_to_arrow_arrays_with_owners_options(
     })
 }
 
+/// Export owner-backed named COVE array views as an Arrow [`RecordBatch`].
+pub fn encoded_columns_to_record_batch_with_owners_options(
+    columns: &[ArrowEncodedColumn<'_, '_, '_>],
+    selection: ArrowRowSelection<'_>,
+    options: ArrowExportOptions,
+) -> Result<ArrowExportResult<RecordBatch>, CoveError> {
+    let result = encoded_columns_to_arrow_arrays_with_owners_options(columns, selection, options)?;
+    let mut fields = Vec::with_capacity(columns.len());
+    for (column, arrow_array) in columns.iter().zip(result.value.iter()) {
+        fields.push(arrow_field_for_cove(
+            column.name,
+            arrow_array.data_type().clone(),
+            column.array.validity.is_some() || column.array.logical == CoveLogicalType::Null,
+            column.array.logical,
+            options,
+        ));
+    }
+    let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), result.value)
+        .map_err(|err| CoveError::BadSection(format!("Arrow RecordBatch export failed: {err}")))?;
+    Ok(ArrowExportResult {
+        value: batch,
+        report: result.report,
+    })
+}
+
 /// Export named COVE array views as an Arrow [`RecordBatch`].
 pub fn encoded_columns_to_record_batch(
     columns: &[(&str, &EncodedArray<'_>)],

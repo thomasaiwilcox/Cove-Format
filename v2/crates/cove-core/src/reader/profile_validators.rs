@@ -749,6 +749,7 @@ struct CoveTCrossSectionRefs<'a, 'data> {
     registered_page_scope: RegisteredPageValidationScope<'a>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_cove_t_cross_sections(
     catalogs: &[(u32, TableCatalog)],
     nested_schemas: &[(u32, NestedSchemaSectionV1)],
@@ -1228,6 +1229,7 @@ fn read_i128_exact(bytes: &[u8]) -> Result<i128, CoveError> {
     Ok(i128::from_le_bytes(bytes.try_into().unwrap()))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_zone_stats_against_table_scoped(
     tables: &BTreeMap<u32, &TableEntry>,
     segment_index: &TableSegmentIndex,
@@ -1250,6 +1252,7 @@ fn validate_zone_stats_against_table_scoped(
             tables,
             segment_index,
             payloads_by_key,
+            u32::try_from(stats_index).map_err(|_| CoveError::ArithOverflow)?,
             &scoped.value,
             validated_domains,
         ) {
@@ -1264,10 +1267,17 @@ fn validate_zone_stats_against_table_scoped(
                 if policy == OptionalPushdownPolicy::FailOpen
                     && is_optional_advisory_entry(header, &scoped.entry)
                 {
-                    validated.push((scoped.entry.section_id, scoped.value.clone()));
-                } else {
-                    return Err(error);
+                    optional_section_parse_error(
+                        header,
+                        &scoped.entry,
+                        policy,
+                        ignored_optional_sections,
+                        error,
+                    )?;
+                    validated.retain(|(section_id, _)| *section_id != scoped.entry.section_id);
+                    continue;
                 }
+                return Err(error);
             }
         }
     }
@@ -1306,6 +1316,7 @@ fn validate_one_zone_stat_against_table(
     tables: &BTreeMap<u32, &TableEntry>,
     segment_index: &TableSegmentIndex,
     payloads_by_key: &SegmentPayloadByKey<'_>,
+    stats_ref: u32,
     entry: &ZoneStatsEntry,
     validated_domains: &ValidatedDomainMap,
 ) -> Result<(), CoveError> {
@@ -1328,23 +1339,75 @@ fn validate_one_zone_stat_against_table(
         .find(|column| column.column_id == entry.column_id)
         .ok_or(CoveError::BadStats)?;
     validate_zone_stat_scalar_binding(column, entry, validated_domains)?;
-    if entry.morsel_id == u32::MAX {
+    let scoped_result = if entry.morsel_id == u32::MAX {
         let segment = segments
             .get(&(entry.table_id, entry.segment_id))
             .ok_or(CoveError::BadStats)?;
         if entry.stats.row_count != u64::from(segment.row_count) {
-            return Err(CoveError::BadStats);
+            Err(CoveError::BadStats)
+        } else {
+            Ok(())
         }
+    } else {
+        let morsel_row_count = morsel_rows
+            .get(&(entry.table_id, entry.segment_id, entry.morsel_id))
+            .copied()
+            .ok_or(CoveError::BadStats)?;
+        if entry.stats.row_count != u64::from(morsel_row_count) {
+            Err(CoveError::BadStats)
+        } else {
+            Ok(())
+        }
+    };
+    if scoped_result.is_ok() {
         return Ok(());
     }
-    let morsel_row_count = morsel_rows
-        .get(&(entry.table_id, entry.segment_id, entry.morsel_id))
-        .copied()
-        .ok_or(CoveError::BadStats)?;
-    if entry.stats.row_count != u64::from(morsel_row_count) {
-        return Err(CoveError::BadStats);
+
+    validate_page_level_zone_stat(payloads_by_key, stats_ref, entry)
+}
+
+fn validate_page_level_zone_stat(
+    payloads_by_key: &SegmentPayloadByKey<'_>,
+    stats_ref: u32,
+    entry: &ZoneStatsEntry,
+) -> Result<(), CoveError> {
+    let mut found_ref = false;
+    for ((table_id, segment_id), (_, _, payload, segment_bytes)) in payloads_by_key {
+        for column in &payload.columns {
+            let start =
+                usize::try_from(column.page_index_offset).map_err(|_| CoveError::OffsetRange)?;
+            let length =
+                usize::try_from(column.page_index_length).map_err(|_| CoveError::OffsetRange)?;
+            let end = start.checked_add(length).ok_or(CoveError::ArithOverflow)?;
+            if end > segment_bytes.len() {
+                return Err(CoveError::OffsetRange);
+            }
+            let page_index = ColumnPageIndex::parse(&segment_bytes[start..end])?;
+            for page in page_index
+                .entries
+                .iter()
+                .filter(|page| page.stats_ref == stats_ref)
+            {
+                found_ref = true;
+                if entry.table_id != *table_id
+                    || entry.segment_id != *segment_id
+                    || entry.morsel_id != page.morsel_id
+                    || entry.column_id != column.column_id
+                    || entry.column_id != page.column_id
+                    || entry.stats.row_count != u64::from(page.row_count)
+                    || entry.stats.null_count != u64::from(page.null_count)
+                    || entry.non_null_count != page.non_null_count
+                {
+                    return Err(CoveError::BadStats);
+                }
+            }
+        }
     }
-    Ok(())
+    if found_ref {
+        Ok(())
+    } else {
+        Err(CoveError::BadStats)
+    }
 }
 
 fn validate_zone_stat_scalar_binding(
@@ -1532,7 +1595,7 @@ fn validate_declared_primary_sort_order(
 }
 
 fn unsupported_sort_claim(column: &ColumnEntry) -> CoveError {
-    CoveError::UnsupportedEncoding(format!(
+    CoveError::BadSchema(format!(
         "declared primary sort key column {} uses unsupported validation semantics",
         column.column_id
     ))
@@ -2766,6 +2829,7 @@ pub(super) fn request_requires_map_profile(request: &FeatureUseRequestV2) -> boo
                 OperationKindV2::MappingReplay
                     | OperationKindV2::MappingExplanation
                     | OperationKindV2::ProjectionReadback
+                    | OperationKindV2::EvidenceReadback
             )
         )
 }
@@ -2777,6 +2841,14 @@ mod tests {
 
     use crate::dictionary::{
         FileDictionaryHeaderV1, FileDictionaryIndexEntryV1, DICT_INDEX_ENTRY_SIZE,
+    };
+    use crate::{
+        page::ColumnPageIndexEntryV1,
+        segment::{
+            RowMorselDirectory, RowMorselEntryV1, TableColumnDirectoryEntryV1,
+            TableSegmentHeaderV1, TableSegmentPayloadV1,
+        },
+        zone_stats::{ZoneScope, ZoneStats},
     };
 
     #[test]
@@ -2811,7 +2883,7 @@ mod tests {
         let payloads = std::collections::BTreeMap::new();
         assert!(matches!(
             validate_declared_primary_sort_order(&table, &segment_index, &payloads, &[]),
-            Err(CoveError::UnsupportedEncoding(_))
+            Err(CoveError::BadSchema(_))
         ));
     }
 
@@ -2942,6 +3014,19 @@ mod tests {
         assert!(validated.contains_key(&(1, 1)));
     }
 
+    #[test]
+    fn page_level_zone_stats_validate_page_counts_when_not_morsel_scoped() {
+        let (payloads_by_key, _payload, _bytes) = one_page_payloads_by_key(0, 3, 2, 1);
+        let entry = zone_stat_entry(3, 2, 1);
+
+        assert!(validate_page_level_zone_stat(&payloads_by_key, 0, &entry).is_ok());
+        let bad = zone_stat_entry(4, 3, 1);
+        assert_eq!(
+            validate_page_level_zone_stat(&payloads_by_key, 0, &bad),
+            Err(CoveError::BadStats)
+        );
+    }
+
     fn sort_test_table(column: ColumnEntry) -> TableEntry {
         TableEntry {
             table_id: 1,
@@ -2998,6 +3083,100 @@ mod tests {
                     flags: 0,
                 }],
             }],
+        }
+    }
+
+    fn one_page_payloads_by_key(
+        stats_ref: u32,
+        row_count: u32,
+        non_null_count: u32,
+        null_count: u32,
+    ) -> (
+        SegmentPayloadByKey<'static>,
+        &'static TableSegmentPayloadV1,
+        &'static Vec<u8>,
+    ) {
+        let page = ColumnPageIndexEntryV1 {
+            column_id: 1,
+            morsel_id: 0,
+            row_count,
+            non_null_count,
+            null_count,
+            encoding_root: 0,
+            page_offset: 0,
+            page_length: 1,
+            uncompressed_length: 1,
+            stats_ref,
+            flags: 0,
+            checksum: 0,
+        };
+        let bytes: &'static Vec<u8> = Box::leak(Box::new(page.serialize().to_vec()));
+        let payload: &'static TableSegmentPayloadV1 = Box::leak(Box::new(TableSegmentPayloadV1 {
+            header: TableSegmentHeaderV1 {
+                table_id: 1,
+                segment_id: 1,
+                row_start: 0,
+                row_count: 8,
+                morsel_count: 1,
+                morsel_row_count: 8,
+                column_count: 1,
+                morsel_directory_offset: 0,
+                column_directory_offset: 0,
+                page_index_offset: 0,
+                data_offset: 0,
+                flags: 0,
+                checksum: 0,
+            },
+            morsels: RowMorselDirectory {
+                entries: vec![RowMorselEntryV1 {
+                    morsel_id: 0,
+                    first_row_in_segment: 0,
+                    row_count: 8,
+                    flags: 0,
+                    stats_ref: u32::MAX,
+                    checksum: 0,
+                }],
+            },
+            columns: vec![TableColumnDirectoryEntryV1 {
+                column_id: 1,
+                logical_type: CoveLogicalType::Int64,
+                physical_kind: CovePhysicalKind::NumCode,
+                flags: 0,
+                page_index_offset: 0,
+                page_index_length: crate::page::COLUMN_PAGE_INDEX_ENTRY_LEN as u64,
+                data_offset: 0,
+                data_length: 0,
+                stats_ref: u32::MAX,
+                domain_ref: u32::MAX,
+                checksum: 0,
+            }],
+        }));
+        let mut payloads_by_key = BTreeMap::new();
+        payloads_by_key.insert((1, 1), (1, 0, payload, bytes));
+        (payloads_by_key, payload, bytes)
+    }
+
+    fn zone_stat_entry(row_count: u64, non_null_count: u32, null_count: u64) -> ZoneStatsEntry {
+        ZoneStatsEntry {
+            table_id: 1,
+            segment_id: 1,
+            morsel_id: 0,
+            column_id: 1,
+            non_null_count,
+            distinct_count: 0,
+            run_count: 0,
+            stats: ZoneStats {
+                scope: ZoneScope::Page,
+                row_count,
+                null_count,
+                min: None,
+                max: None,
+                flags: ZoneStatFlags::empty(),
+            },
+            min_domain_rank: 0,
+            max_domain_rank: 0,
+            exact_set_ref: u32::MAX,
+            bloom_ref: u32::MAX,
         }
     }
 

@@ -2608,10 +2608,13 @@ fn coverage_cache_fixture() -> Result<CoverageCacheFixture, String> {
     let cove_bytes = primitive_events_file_with_name_gamma_coverage(false);
     let state = cove_datafusion::bootstrap::bootstrap_bytes("synthetic-cache", cove_bytes.clone())
         .map_err(|err| err.to_string())?;
-    let mut seed = Vec::with_capacity(28);
+    let file_digest =
+        compute_digest(DigestAlgorithm::Sha256, &cove_bytes).map_err(|err| err.to_string())?;
+    let mut seed = Vec::with_capacity(28 + file_digest.len());
     seed.extend_from_slice(state.file_id());
     seed.extend_from_slice(&state.file_len().to_le_bytes());
     seed.extend_from_slice(&state.footer_crc32c().to_le_bytes());
+    seed.extend_from_slice(&file_digest);
     let digest = compute_digest(DigestAlgorithm::Sha256, &seed).map_err(|err| err.to_string())?;
     let mut snapshot_id = [0u8; 16];
     snapshot_id.copy_from_slice(&digest[..16]);

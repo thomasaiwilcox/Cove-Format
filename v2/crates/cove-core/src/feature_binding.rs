@@ -82,6 +82,7 @@ pub enum OperationKindV2 {
     CoveragePlanning = 11,
     ZeroCopyExport = 12,
     RuntimeAdapterSelection = 13,
+    EvidenceReadback = 14,
     VendorDefined = 255,
 }
 
@@ -102,6 +103,7 @@ impl OperationKindV2 {
             11 => Some(Self::CoveragePlanning),
             12 => Some(Self::ZeroCopyExport),
             13 => Some(Self::RuntimeAdapterSelection),
+            14 => Some(Self::EvidenceReadback),
             255 => Some(Self::VendorDefined),
             _ => None,
         }
@@ -787,6 +789,32 @@ mod tests {
             parsed.bindings[0].operation_kind,
             OperationKindV2::CoveragePlanning
         );
+    }
+
+    #[test]
+    fn operation_kind_from_u16_covers_known_v2_operations() {
+        for (raw, expected) in [
+            (0, OperationKindV2::None),
+            (1, OperationKindV2::OrdinaryTableScan),
+            (2, OperationKindV2::ObjectReconstruction),
+            (3, OperationKindV2::MappingReplay),
+            (4, OperationKindV2::MappingExplanation),
+            (5, OperationKindV2::ProjectionReadback),
+            (6, OperationKindV2::TrustVerification),
+            (7, OperationKindV2::RedactionPolicyEvaluation),
+            (8, OperationKindV2::HarborMount),
+            (9, OperationKindV2::EngineExecutionMapping),
+            (10, OperationKindV2::IndexOnlyAnswer),
+            (11, OperationKindV2::CoveragePlanning),
+            (12, OperationKindV2::ZeroCopyExport),
+            (13, OperationKindV2::RuntimeAdapterSelection),
+            (14, OperationKindV2::EvidenceReadback),
+            (255, OperationKindV2::VendorDefined),
+        ] {
+            assert_eq!(OperationKindV2::from_u16(raw), Some(expected));
+            assert_eq!(expected as u16, raw);
+        }
+        assert_eq!(OperationKindV2::from_u16(15), None);
     }
 
     #[test]

@@ -129,6 +129,7 @@ fn parse_operation_kind(value: &str) -> Result<OperationKindV2, String> {
         "mapping_replay" => Ok(OperationKindV2::MappingReplay),
         "mapping_explanation" => Ok(OperationKindV2::MappingExplanation),
         "projection_readback" => Ok(OperationKindV2::ProjectionReadback),
+        "evidence_readback" => Ok(OperationKindV2::EvidenceReadback),
         "trust_verification" => Ok(OperationKindV2::TrustVerification),
         "redaction_policy_evaluation" => Ok(OperationKindV2::RedactionPolicyEvaluation),
         "harbor_mount" => Ok(OperationKindV2::HarborMount),
@@ -237,6 +238,21 @@ mod tests {
         assert!(feature_use.needed_page_refs.contains(
             &cove_core::feature_scope::FeatureTargetRefV2::cove_t_column_page(10, 11, 12)
         ));
+    }
+
+    #[test]
+    fn parses_evidence_readback_operation_name() {
+        let args = parse_args([
+            "--requested-operation".to_string(),
+            "evidence-readback".to_string(),
+            "fixture.cove".to_string(),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            args.feature_use.unwrap().requested_operation,
+            Some(cove_core::feature_binding::OperationKindV2::EvidenceReadback)
+        );
     }
 
     #[test]

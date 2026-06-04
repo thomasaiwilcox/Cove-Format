@@ -84,6 +84,7 @@ pub struct ProjectionBatchOptions {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProjectionFilterOp {
     Eq,
+    Ne,
     Lt,
     LtEq,
     Gt,
@@ -498,6 +499,7 @@ impl ProjectionAccessPlan {
             include_association_object_types: self.include_association_object_types,
             include_records: self.include_records,
             include_evidence_index: self.include_evidence_index,
+            redaction_read_policy: Default::default(),
         }
     }
 }
@@ -3014,6 +3016,8 @@ impl ProjectionFilter {
                 let value = row.get(column).unwrap_or(&Value::Null);
                 match op {
                     ProjectionFilterOp::Eq => projection_filter_eq(value, literal),
+                    ProjectionFilterOp::Ne => projection_filter_cmp(value, literal)
+                        .is_some_and(|ordering| !ordering.is_eq()),
                     ProjectionFilterOp::Lt => projection_filter_cmp(value, literal)
                         .is_some_and(|ordering| ordering.is_lt()),
                     ProjectionFilterOp::LtEq => projection_filter_cmp(value, literal)
@@ -3040,6 +3044,41 @@ impl ProjectionFilter {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn projection_not_equal_filter_matches_non_null_unequal_values_only() {
+        let filter = ProjectionFilter::Compare {
+            column: "status".into(),
+            op: ProjectionFilterOp::Ne,
+            literal: ProjectionFilterLiteral::Utf8("closed".into()),
+        };
+
+        let mut open = Map::new();
+        open.insert("status".into(), Value::String("open".into()));
+        assert!(row_matches_projection_filters(
+            &open,
+            std::slice::from_ref(&filter)
+        ));
+
+        let mut closed = Map::new();
+        closed.insert("status".into(), Value::String("closed".into()));
+        assert!(!row_matches_projection_filters(
+            &closed,
+            std::slice::from_ref(&filter)
+        ));
+
+        let mut null = Map::new();
+        null.insert("status".into(), Value::Null);
+        assert!(!row_matches_projection_filters(
+            &null,
+            std::slice::from_ref(&filter)
+        ));
     }
 }
 

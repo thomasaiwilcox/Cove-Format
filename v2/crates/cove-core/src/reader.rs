@@ -80,9 +80,7 @@ fn validate_required_feature_implementation(header: &CoveHeaderV1) -> Result<(),
         unsupported_required |= FEATURE_CODEC_ZSTD;
     }
     if unsupported_required != 0 {
-        return Err(CoveError::UnsupportedEncoding(format!(
-            "required codec feature bits are unsupported by this build: 0x{unsupported_required:016x}"
-        )));
+        return Err(CoveError::CodecUnsupported);
     }
     Ok(())
 }
@@ -1875,11 +1873,11 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(report.ignored_optional_sections.is_empty());
+        assert_eq!(report.ignored_optional_sections.len(), 1);
     }
 
     #[test]
-    fn fail_open_preserves_zone_stats_refs_for_required_stats_only_page() {
+    fn fail_open_rejects_zone_stats_refs_for_required_stats_only_page() {
         let catalog = single_column_catalog(
             crate::constants::CoveLogicalType::Int64,
             crate::constants::CovePhysicalKind::NumCode,
@@ -1927,7 +1925,7 @@ mod tests {
             CoveError::BadStats
         );
 
-        let report = validate_bytes_with_options(
+        let err = validate_bytes_with_options(
             &bytes,
             ValidationOptions {
                 semantic: true,
@@ -1936,8 +1934,8 @@ mod tests {
                 optional_pushdown_policy: OptionalPushdownPolicy::FailOpen,
             },
         )
-        .unwrap();
-        assert!(report.ignored_optional_sections.is_empty());
+        .unwrap_err();
+        assert_eq!(err, CoveError::PageCorrupt);
     }
 
     #[test]

@@ -190,6 +190,7 @@ pub enum CoviSectionKindV2 {
     CoverageSetBlock = 12,
     DimensionalBucketBlock = 13,
     ObjectPathBlock = 14,
+    IndexOnlyCapabilities = 15,
     ExtensionBlock = 255,
 }
 
@@ -211,6 +212,7 @@ impl CoviSectionKindV2 {
             12 => Some(Self::CoverageSetBlock),
             13 => Some(Self::DimensionalBucketBlock),
             14 => Some(Self::ObjectPathBlock),
+            15 => Some(Self::IndexOnlyCapabilities),
             255 => Some(Self::ExtensionBlock),
             _ => None,
         }
@@ -479,6 +481,13 @@ pub struct IndexOnlyCapabilityV2 {
     pub checksum: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexOnlyCapabilityUseContextV2 {
+    pub selected_snapshot_validity_ref: u32,
+    pub active_visibility_overlay_ref: Option<u32>,
+    pub require_exact: bool,
+}
+
 impl IndexOnlyCapabilityV2 {
     pub const LEN: usize = INDEX_ONLY_CAPABILITY_LEN;
 
@@ -511,7 +520,7 @@ impl IndexOnlyCapabilityV2 {
         let mut capabilities = Vec::new();
         for chunk in bytes.chunks_exact(Self::LEN) {
             let capability = Self::parse(chunk)?;
-            if !ids.insert(capability.capability_id) {
+            if !ids.insert((capability.capability_id, capability.aggregate_kind)) {
                 return Err(CoveError::BadCovi);
             }
             capabilities.push(capability);
@@ -539,6 +548,31 @@ impl IndexOnlyCapabilityV2 {
         validate_bool(self.predicate_supported)?;
         if crate::execution::CoviAggregateKindV2::from_u16(self.aggregate_kind).is_none() {
             return Err(CoveError::BadCovi);
+        }
+        if self.flags != 0 {
+            return Err(CoveError::BadCovi);
+        }
+        Ok(())
+    }
+
+    pub fn validate_for_use_context(
+        &self,
+        context: &IndexOnlyCapabilityUseContextV2,
+    ) -> Result<(), CoveError> {
+        self.validate()?;
+        if context.require_exact && self.exactness != IndexCapabilityExactnessV2::Exact {
+            return Err(CoveError::IndexOnlyUnsafe);
+        }
+        if self.snapshot_validity_ref != context.selected_snapshot_validity_ref {
+            return Err(CoveError::IndexOnlyUnsafe);
+        }
+        match (
+            self.required_visibility_overlay_ref,
+            context.active_visibility_overlay_ref,
+        ) {
+            (ABSENT_U32, None) => {}
+            (required, Some(active)) if required == active => {}
+            _ => return Err(CoveError::IndexOnlyUnsafe),
         }
         Ok(())
     }
@@ -2807,6 +2841,7 @@ pub struct CoviArtifactV2 {
     pub snapshot_validity: Vec<CoviSnapshotValidityV2>,
     pub index_roots: Vec<CoviIndexRootV2>,
     pub capabilities: Vec<IndexCapabilityV2>,
+    pub index_only_capabilities: Vec<IndexOnlyCapabilityV2>,
     pub key_blocks: Vec<CoviKeyBlockV2>,
     pub entry_blocks: Vec<CoviEntryBlockV2>,
     pub postings_blocks: Vec<CoviPostingsBlockV2>,
@@ -2891,6 +2926,7 @@ impl CoviArtifactV2 {
         let mut entry_blocks = Vec::new();
         let mut postings_blocks = Vec::new();
         let mut aggregate_answer_blocks = Vec::new();
+        let mut index_only_capabilities = Vec::new();
         for section in &sections {
             let payload = covi_section_payload(bytes, section)?;
             match section.section_kind {
@@ -2904,6 +2940,9 @@ impl CoviArtifactV2 {
                 CoviSectionKindV2::AggregateAnswerBlock => {
                     aggregate_answer_blocks.push(CoviAggregateAnswerBlockV2::parse(&payload)?)
                 }
+                CoviSectionKindV2::IndexOnlyCapabilities => {
+                    index_only_capabilities.extend(IndexOnlyCapabilityV2::parse_many(&payload)?)
+                }
                 _ => {}
             }
         }
@@ -2915,6 +2954,7 @@ impl CoviArtifactV2 {
             snapshot_validity,
             index_roots,
             capabilities,
+            index_only_capabilities,
             key_blocks,
             entry_blocks,
             postings_blocks,
@@ -2978,6 +3018,7 @@ impl CoviArtifactV2 {
             snapshot_validity: Vec::new(),
             index_roots: Vec::new(),
             capabilities: Vec::new(),
+            index_only_capabilities: Vec::new(),
             key_blocks: Vec::new(),
             entry_blocks: Vec::new(),
             postings_blocks: Vec::new(),
@@ -2991,6 +3032,7 @@ impl CoviArtifactV2 {
             || !self.snapshot_validity.is_empty()
             || !self.index_roots.is_empty()
             || !self.capabilities.is_empty()
+            || !self.index_only_capabilities.is_empty()
             || !self.key_blocks.is_empty()
             || !self.entry_blocks.is_empty()
             || !self.postings_blocks.is_empty()
@@ -3730,6 +3772,36 @@ mod tests {
         assert!(capability.serialize().is_ok());
         capability.aggregate_kind = 8;
         assert!(matches!(capability.serialize(), Err(CoveError::BadCovi)));
+    }
+
+    #[test]
+    fn index_only_capability_use_context_requires_exact_snapshot_and_overlay() {
+        let mut capability = index_only_capability(1);
+        let context = IndexOnlyCapabilityUseContextV2 {
+            selected_snapshot_validity_ref: 1,
+            active_visibility_overlay_ref: None,
+            require_exact: true,
+        };
+        assert!(capability.validate_for_use_context(&context).is_ok());
+
+        capability.exactness = IndexCapabilityExactnessV2::Approximate;
+        assert!(matches!(
+            capability.validate_for_use_context(&context),
+            Err(CoveError::IndexOnlyUnsafe)
+        ));
+        capability.exactness = IndexCapabilityExactnessV2::Exact;
+        capability.required_visibility_overlay_ref = 9;
+        assert!(matches!(
+            capability.validate_for_use_context(&context),
+            Err(CoveError::IndexOnlyUnsafe)
+        ));
+        let overlay_context = IndexOnlyCapabilityUseContextV2 {
+            active_visibility_overlay_ref: Some(9),
+            ..context
+        };
+        assert!(capability
+            .validate_for_use_context(&overlay_context)
+            .is_ok());
     }
 
     #[test]

@@ -81,8 +81,12 @@ pub enum CoveError {
     RuntimeHintUnsupported,
     /// COVE-COVERAGE provider, predicate form, coverage set, or proof record is invalid.
     BadCoverage,
+    /// COVE-COVERAGE artifact is stale for the selected snapshot, schema, digest, or overlay.
+    CoverageStale,
     /// COVE-I secondary index artifact is malformed, stale, corrupt, or unsupported.
     BadCovi,
+    /// Requested metadata/index-only answer is not exact or not valid for the use context.
+    IndexOnlyUnsafe,
     /// COVE-CACHE entry is stale, corrupt, or incompatible with the requested operation.
     CacheStale,
     /// Input buffer is too short to parse the requested structure.
@@ -220,9 +224,17 @@ impl fmt::Display for CoveError {
                 f,
                 "COVE_E_BAD_COVERAGE: coverage provider, predicate form, coverage set, or proof invalid"
             ),
+            CoveError::CoverageStale => write!(
+                f,
+                "COVE_E_COVERAGE_STALE: coverage artifact does not match selected context"
+            ),
             CoveError::BadCovi => write!(
                 f,
                 "COVE_E_BAD_COVI: secondary index artifact malformed, stale, corrupt, or unsupported"
+            ),
+            CoveError::IndexOnlyUnsafe => write!(
+                f,
+                "COVE_E_INDEX_ONLY_UNSAFE: requested index-only answer is not exact or not valid for context"
             ),
             CoveError::CacheStale => write!(
                 f,
@@ -245,7 +257,7 @@ impl fmt::Display for CoveError {
 
 impl CoveError {
     /// Complete Spec §76 code inventory surfaced by [`Self::spec_code`].
-    pub const ALL_SPEC_CODES: [&'static str; 38] = [
+    pub const ALL_SPEC_CODES: [&'static str; 40] = [
         "COVE_E_BAD_MAGIC",
         "COVE_E_BAD_VERSION",
         "COVE_E_UNKNOWN_REQUIRED_FEATURE",
@@ -282,7 +294,9 @@ impl CoveError {
         "COVE_E_BAD_LAYOUT_PLAN",
         "COVE_E_RUNTIME_HINT_UNSUPPORTED",
         "COVE_E_BAD_COVERAGE",
+        "COVE_E_COVERAGE_STALE",
         "COVE_E_BAD_COVI",
+        "COVE_E_INDEX_ONLY_UNSAFE",
         "COVE_E_CACHE_STALE",
     ];
 
@@ -329,7 +343,9 @@ impl CoveError {
             CoveError::BadLayoutPlan => Some("COVE_E_BAD_LAYOUT_PLAN"),
             CoveError::RuntimeHintUnsupported => Some("COVE_E_RUNTIME_HINT_UNSUPPORTED"),
             CoveError::BadCoverage => Some("COVE_E_BAD_COVERAGE"),
+            CoveError::CoverageStale => Some("COVE_E_COVERAGE_STALE"),
             CoveError::BadCovi => Some("COVE_E_BAD_COVI"),
+            CoveError::IndexOnlyUnsafe => Some("COVE_E_INDEX_ONLY_UNSAFE"),
             CoveError::CacheStale => Some("COVE_E_CACHE_STALE"),
             CoveError::Io(_) | CoveError::UnsupportedEncoding(_) => None,
         }
@@ -387,7 +403,10 @@ mod tests {
         assert!(unique.contains("COVE_E_SIDECAR_STALE"));
         assert!(unique.contains("COVE_E_MAP_EVIDENCE_INVALID"));
         assert!(unique.contains("COVE_E_BAD_COVERAGE"));
+        assert!(unique.contains("COVE_E_COVERAGE_STALE"));
         assert!(unique.contains("COVE_E_BAD_COVI"));
+        assert!(unique.contains("COVE_E_INDEX_ONLY_UNSAFE"));
+        assert_eq!(unique.len(), 40);
     }
 
     #[test]
@@ -462,7 +481,9 @@ impl PartialEq for CoveError {
             | (BadLayoutPlan, BadLayoutPlan)
             | (RuntimeHintUnsupported, RuntimeHintUnsupported)
             | (BadCoverage, BadCoverage)
+            | (CoverageStale, CoverageStale)
             | (BadCovi, BadCovi)
+            | (IndexOnlyUnsafe, IndexOnlyUnsafe)
             | (CacheStale, CacheStale)
             | (BufferTooShort, BufferTooShort)
             | (ReservedNotZero, ReservedNotZero) => true,

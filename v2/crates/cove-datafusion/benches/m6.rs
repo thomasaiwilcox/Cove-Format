@@ -26,6 +26,7 @@ use cove_core::artifact::covm::{CovmFile, CovmFileEntryV1, CovmHeaderV1, CovmPos
 #[cfg(feature = "covm")]
 use cove_core::constants::DigestAlgorithm;
 use cove_core::{
+    collation::CollationKind,
     constants::{
         CoveEncodingKind, CoveLogicalType, CovePhysicalKind, PrimaryProfile, SectionKind,
         StorageClass, ValueTag, FEATURE_SEMANTIC_MAP,
@@ -1574,6 +1575,14 @@ fn primitive_events_file() -> Vec<u8> {
 }
 
 fn dictionary_items_file_with_domain() -> Vec<u8> {
+    let mut name_column = column(
+        1,
+        "name",
+        CoveLogicalType::Utf8,
+        CovePhysicalKind::FileCode,
+        false,
+    );
+    name_column.collation_id = CollationKind::Utf8Bytewise.id();
     let catalog = TableCatalog {
         flags: 0,
         tables: vec![TableEntry {
@@ -1585,13 +1594,7 @@ fn dictionary_items_file_with_domain() -> Vec<u8> {
             clustering_key_count: 0,
             flags: 0,
             columns: vec![
-                column(
-                    1,
-                    "name",
-                    CoveLogicalType::Utf8,
-                    CovePhysicalKind::FileCode,
-                    false,
-                ),
+                name_column,
                 column(
                     2,
                     "payload",
@@ -2979,7 +2982,7 @@ fn column_domain_section() -> SectionPayload {
         7,
         1,
         CoveLogicalType::Utf8 as u16,
-        0,
+        CollationKind::Utf8Bytewise.id(),
         0,
     )
     .expect("column domain");

@@ -106,7 +106,7 @@ fn encoding_fast_paths_match_canonical_decode_for_generated_payloads() {
     })
     .unwrap();
     assert_parity::<PlainVarint>(&PlainVarintPayload {
-        values: vec![i64::MIN, -123, 0, 456, i64::MAX],
+        values: vec![0, 123, 456, i64::MAX as u64],
     })
     .unwrap();
     assert_parity::<Rle>(&RlePayload {

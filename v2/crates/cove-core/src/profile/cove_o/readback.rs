@@ -7,7 +7,7 @@ use crate::{
     array::{CoveArrayValue, EncodedArray},
     codec::CodecExtensionDescriptorV2,
     compression,
-    constants::{CoveLogicalType, CovePhysicalKind, SectionKind, ValueTag},
+    constants::{CompressionCodec, CoveLogicalType, CovePhysicalKind, SectionKind, ValueTag},
     dictionary::{DictionaryValue, FileDictionary},
     page::{PAGE_FLAG_ALL_NULL, PAGE_FLAG_STATS_ONLY_CONSTANT},
     page_payload::PageBufferKind,
@@ -17,14 +17,15 @@ use crate::{
         },
         cove_o::{
             CoveRecordRefV1, ObjectTypeCatalog, ObjectTypeEntryV1, PropertyEntryV1, RecordKind,
-            TemporalPropertyColumn, TemporalSegmentData, TemporalSegmentHeaderV1,
-            OBJECT_TYPE_FLAG_ASSOCIATION_OBJECT, OBJECT_TYPE_FLAG_LINK_OBJECT,
-            PROPERTY_FLAG_ASSOCIATION_FROM_GOID, PROPERTY_FLAG_ASSOCIATION_TO_GOID,
-            PROPERTY_FLAG_ASSOCIATION_TYPE, PROPERTY_FLAG_EVIDENCE_REF,
-            PROPERTY_FLAG_MAPPING_RULE_REF,
+            RetainedTemporalSegmentData, TemporalBloomIndex, TemporalPropertyColumn,
+            TemporalSegmentData, TemporalSegmentHeaderV1, OBJECT_TYPE_FLAG_ASSOCIATION_OBJECT,
+            OBJECT_TYPE_FLAG_LINK_OBJECT, PROPERTY_FLAG_ASSOCIATION_FROM_GOID,
+            PROPERTY_FLAG_ASSOCIATION_TO_GOID, PROPERTY_FLAG_ASSOCIATION_TYPE,
+            PROPERTY_FLAG_EVIDENCE_REF, PROPERTY_FLAG_MAPPING_RULE_REF,
         },
     },
     reader::{validate_bytes_with_options, ValidationOptions},
+    retained_bytes::RetainedBytes,
     types::logical_type_from_name as parse_logical_type_name,
     utility::hex_encode,
     validity::ValidityBitmap,
@@ -69,6 +70,7 @@ pub struct CoveObjectPropertyValue {
     pub physical_kind: CovePhysicalKind,
     pub flags: u32,
     pub value: Value,
+    pub redacted: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,6 +93,251 @@ pub struct CoveObjectReadOptions {
     pub include_association_object_types: bool,
     pub include_records: bool,
     pub include_evidence_index: bool,
+    pub redaction_read_policy: CoveObjectRedactionReadPolicy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoveObjectRedactionReadPolicy {
+    Refuse,
+    PreserveMarker,
+}
+
+impl Default for CoveObjectRedactionReadPolicy {
+    fn default() -> Self {
+        Self::Refuse
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct DecodedPropertyValue {
+    value: Value,
+    redacted: bool,
+}
+
+impl DecodedPropertyValue {
+    fn plain(value: Value) -> Self {
+        Self {
+            value,
+            redacted: false,
+        }
+    }
+
+    fn redacted_marker() -> Self {
+        Self {
+            value: redacted_value_marker(),
+            redacted: true,
+        }
+    }
+}
+
+fn redacted_value_marker() -> Value {
+    json!({
+        "policy": "redacted",
+        "status": "redacted",
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoveObjectReadPushdownOptions {
+    pub enabled: bool,
+    pub temporal_cut: Option<CoveObjectTemporalCut>,
+    pub branch_key: Option<u64>,
+    pub candidate_goids: Vec<[u8; 16]>,
+    pub include_tombstones: Option<bool>,
+    pub association_endpoint_candidates: Vec<CoveObjectAssociationEndpointCandidate>,
+    pub property_candidates: Vec<CoveObjectPropertyPredicateCandidate>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoveObjectPropertyPredicateOp {
+    Eq,
+    Ne,
+    Lt,
+    LtEq,
+    Gt,
+    GtEq,
+    IsNull,
+    IsNotNull,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CoveObjectPropertyPredicateLiteral {
+    Null,
+    Bool(bool),
+    I64(i64),
+    U64(u64),
+    F64Bits(u64),
+    String(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoveObjectPropertyPredicateCandidate {
+    pub object_type_id: u32,
+    pub property_id: u32,
+    pub logical_type: CoveLogicalType,
+    pub physical_kind: CovePhysicalKind,
+    pub collation_id: Option<u16>,
+    pub null_policy: Option<String>,
+    pub op: CoveObjectPropertyPredicateOp,
+    pub literal: Option<CoveObjectPropertyPredicateLiteral>,
+    pub proof_state: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoveObjectAssociationEndpointCandidate {
+    pub association_type_id: u32,
+    pub direction: Option<String>,
+    pub endpoint_role: String,
+    pub branch_key: Option<u64>,
+    pub temporal_cut: Option<CoveObjectTemporalCut>,
+    pub candidate_goid: Option<[u8; 16]>,
+    pub include_tombstones: Option<bool>,
+}
+
+impl Default for CoveObjectReadPushdownOptions {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            temporal_cut: None,
+            branch_key: None,
+            candidate_goids: Vec::new(),
+            include_tombstones: None,
+            association_endpoint_candidates: Vec::new(),
+            property_candidates: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoveObjectReadWithPushdownOptions {
+    pub read: CoveObjectReadOptions,
+    pub pushdown: CoveObjectReadPushdownOptions,
+}
+
+impl Default for CoveObjectReadWithPushdownOptions {
+    fn default() -> Self {
+        Self {
+            read: CoveObjectReadOptions::default(),
+            pushdown: CoveObjectReadPushdownOptions::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CoveObjectReadPushdownReport {
+    pub enabled: bool,
+    pub segments_seen: usize,
+    pub segments_skipped: usize,
+    pub rows_seen: usize,
+    pub rows_candidates: usize,
+    pub rows_skipped_by_property_candidates: usize,
+    pub property_columns_requested: usize,
+    pub decisions: Vec<CoveObjectReadPushdownDecision>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoveObjectReadPushdownDecision {
+    pub kind: String,
+    pub outcome: String,
+    pub reason: String,
+    pub redacted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CoveObjectReadResult {
+    pub surface: CoveObjectSurface,
+    pub pushdown_report: CoveObjectReadPushdownReport,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CoveObjectRetainedTemporalReadResult {
+    pub catalog: ObjectTypeCatalog,
+    pub segments: Vec<RetainedTemporalSegmentData>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoveObjectKernelReadOptions {
+    pub read: CoveObjectReadWithPushdownOptions,
+}
+
+impl Default for CoveObjectKernelReadOptions {
+    fn default() -> Self {
+        Self {
+            read: CoveObjectReadWithPushdownOptions::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CoveObjectKernelReadResult {
+    pub kernel_surface: CoveObjectKernelSurface,
+    pub materialized_surface: CoveObjectSurface,
+    pub pushdown_report: CoveObjectReadPushdownReport,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CoveObjectKernelSurface {
+    pub object_types: Vec<ObjectTypeEntryV1>,
+    pub system: CoveObjectKernelSystemLanes,
+    pub property_lanes: Vec<CoveObjectKernelPropertyLane>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CoveObjectKernelSystemLanes {
+    pub object_type_ids: Vec<u32>,
+    pub segment_ids: Vec<u32>,
+    pub row_indices: Vec<u32>,
+    pub timestamp_us: Vec<i64>,
+    pub csn: Vec<u64>,
+    pub branch_keys: Vec<u64>,
+    pub goids: Vec<[u8; 16]>,
+    pub record_ids: Vec<[u8; 16]>,
+    pub record_kinds: Vec<RecordKind>,
+    pub prev_refs: Vec<Option<CoveRecordRefV1>>,
+}
+
+impl CoveObjectKernelSystemLanes {
+    pub fn len(&self) -> usize {
+        self.object_type_ids.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.object_type_ids.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CoveObjectKernelPropertyLane {
+    pub object_type_id: u32,
+    pub property_id: u32,
+    pub property_name: String,
+    pub logical_type: CoveLogicalType,
+    pub physical_kind: CovePhysicalKind,
+    pub flags: u32,
+    pub values: CoveObjectKernelPropertyValues,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum CoveObjectKernelPropertyValues {
+    Bool(Vec<Option<bool>>),
+    I64(Vec<Option<i64>>),
+    U64(Vec<Option<u64>>),
+    F64(Vec<Option<f64>>),
+    String(Vec<Option<String>>),
+    Json(Vec<Value>),
+}
+
+impl CoveObjectKernelPropertyValues {
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Bool(values) => values.len(),
+            Self::I64(values) => values.len(),
+            Self::U64(values) => values.len(),
+            Self::F64(values) => values.len(),
+            Self::String(values) => values.len(),
+            Self::Json(values) => values.len(),
+        }
+    }
 }
 
 impl Default for CoveObjectReadOptions {
@@ -105,6 +352,7 @@ impl Default for CoveObjectReadOptions {
             include_association_object_types: false,
             include_records: true,
             include_evidence_index: true,
+            redaction_read_policy: CoveObjectRedactionReadPolicy::Refuse,
         }
     }
 }
@@ -125,6 +373,7 @@ impl CoveObjectReadOptions {
             include_association_object_types: false,
             include_records: true,
             include_evidence_index: true,
+            redaction_read_policy: CoveObjectRedactionReadPolicy::Refuse,
         }
     }
 
@@ -141,6 +390,7 @@ impl CoveObjectReadOptions {
             include_association_object_types: false,
             include_records: true,
             include_evidence_index: true,
+            redaction_read_policy: CoveObjectRedactionReadPolicy::Refuse,
         }
     }
 
@@ -157,6 +407,7 @@ impl CoveObjectReadOptions {
             include_association_object_types: false,
             include_records: true,
             include_evidence_index: true,
+            redaction_read_policy: CoveObjectRedactionReadPolicy::Refuse,
         }
     }
 
@@ -242,6 +493,83 @@ pub fn read_object_surface_from_bytes_with_options(
     bytes: &[u8],
     options: &CoveObjectReadOptions,
 ) -> Result<CoveObjectSurface, CoveError> {
+    Ok(read_object_surface_from_bytes_with_pushdown_options(
+        bytes,
+        &CoveObjectReadWithPushdownOptions {
+            read: options.clone(),
+            pushdown: CoveObjectReadPushdownOptions::default(),
+        },
+    )?
+    .surface)
+}
+
+pub fn read_retained_object_temporal_segments(
+    data: impl Into<RetainedBytes>,
+    validation_options: ValidationOptions,
+) -> Result<CoveObjectRetainedTemporalReadResult, CoveError> {
+    let data = data.into();
+    let report = validate_bytes_with_options(data.as_slice(), validation_options)?;
+    let mut catalog = None;
+    let mut temporal_segment_entries = Vec::new();
+    let mut codec_descriptors = Vec::<CodecExtensionDescriptorV2>::new();
+
+    for entry in &report.validated.footer.sections {
+        let Some(kind) = SectionKind::from_u16(entry.section_kind) else {
+            continue;
+        };
+        match kind {
+            SectionKind::ObjectTypeCatalog => {
+                let payload = compression::section_payload(data.as_slice(), entry)?;
+                catalog = Some(ObjectTypeCatalog::parse(payload.as_ref())?);
+            }
+            SectionKind::TemporalSegmentData => {
+                temporal_segment_entries.push(entry.clone());
+            }
+            SectionKind::CodecExtensionRegistry => {
+                let payload = compression::section_payload(data.as_slice(), entry)?;
+                codec_descriptors.extend(CodecExtensionDescriptorV2::parse_many(payload.as_ref())?);
+            }
+            _ => {}
+        }
+    }
+
+    let catalog = catalog.ok_or_else(|| {
+        CoveError::BadSchema("retained COVE-O readback requires OBJECT_TYPE_CATALOG".into())
+    })?;
+    let mut segments = Vec::with_capacity(temporal_segment_entries.len());
+    for entry in temporal_segment_entries {
+        let codec = CompressionCodec::from_u8(entry.compression)
+            .ok_or_else(|| CoveError::BadSection("unknown temporal segment codec".into()))?;
+        if codec != CompressionCodec::None || entry.length != entry.uncompressed_length {
+            return Err(CoveError::UnsupportedEncoding(
+                "retained COVE-O zero-copy requires uncompressed temporal segment sections".into(),
+            ));
+        }
+        let offset = usize::try_from(entry.offset).map_err(|_| CoveError::OffsetRange)?;
+        let length = usize::try_from(entry.length).map_err(|_| CoveError::OffsetRange)?;
+        let section = data.slice(offset, length)?;
+        segments.push(
+            RetainedTemporalSegmentData::parse_after_semantic_validation_with_codec_descriptors(
+                section,
+                report.validated.header.required_features,
+                &codec_descriptors,
+            )?,
+        );
+    }
+
+    Ok(CoveObjectRetainedTemporalReadResult { catalog, segments })
+}
+
+pub fn read_object_surface_from_bytes_with_pushdown_options(
+    bytes: &[u8],
+    options: &CoveObjectReadWithPushdownOptions,
+) -> Result<CoveObjectReadResult, CoveError> {
+    let read_options = &options.read;
+    let pushdown_options = &options.pushdown;
+    let mut pushdown_report = CoveObjectReadPushdownReport {
+        enabled: pushdown_options.enabled,
+        ..CoveObjectReadPushdownReport::default()
+    };
     let report = validate_bytes_with_options(
         bytes,
         ValidationOptions {
@@ -261,6 +589,7 @@ pub fn read_object_surface_from_bytes_with_options(
     let mut dictionary_payload = None::<Vec<u8>>;
     let mut zone_stats = Vec::<ZoneStatsEntry>::new();
     let mut temporal_segment_entries = Vec::new();
+    let mut temporal_bloom_index = None::<TemporalBloomIndex>;
     let mut codec_descriptors = Vec::<CodecExtensionDescriptorV2>::new();
 
     for entry in &report.validated.footer.sections {
@@ -275,6 +604,9 @@ pub fn read_object_surface_from_bytes_with_options(
             SectionKind::TemporalSegmentData => {
                 temporal_segment_entries.push(entry.clone());
             }
+            SectionKind::TemporalBloomIndex => {
+                temporal_bloom_index = Some(TemporalBloomIndex::parse(payload.as_ref())?);
+            }
             SectionKind::FileDictionaryIndex => {
                 dictionary_index = Some(payload.as_ref().to_vec());
             }
@@ -288,14 +620,14 @@ pub fn read_object_surface_from_bytes_with_options(
                 codec_descriptors.extend(CodecExtensionDescriptorV2::parse_many(payload.as_ref())?);
             }
             SectionKind::MapProjectionCatalog => {
-                if options.include_projection_catalog {
+                if read_options.include_projection_catalog {
                     let catalog = MapProjectionCatalog::parse(payload.as_ref())?;
                     projection_catalog = Some(catalog.clone());
                     embedded_map_sections.push(EmbeddedMapSection::ProjectionCatalog(catalog));
                 }
             }
             SectionKind::MapFunctionRegistry => {
-                if options.include_function_registry {
+                if read_options.include_function_registry {
                     let registry = MapFunctionRegistry::parse(payload.as_ref())?;
                     embedded_function_ids.extend(
                         registry
@@ -307,10 +639,10 @@ pub fn read_object_surface_from_bytes_with_options(
                 }
             }
             SectionKind::MapEvidenceIndex => {
-                if options.include_evidence_index {
+                if read_options.include_evidence_index {
                     let index = MapEvidenceIndex::parse_with_requested_operation_metadata_keys(
                         payload.as_ref(),
-                        &options.requested_evidence_metadata_keys,
+                        &read_options.requested_evidence_metadata_keys,
                     )?;
                     evidence_index = Some(index.clone());
                     embedded_map_sections.push(EmbeddedMapSection::EvidenceIndex(index));
@@ -342,7 +674,8 @@ pub fn read_object_surface_from_bytes_with_options(
         .map(|ty| (ty.object_type_id, ty))
         .collect::<BTreeMap<_, _>>();
     let mut records = Vec::new();
-    if options.include_records {
+    record_pushdown_fallbacks(pushdown_options, &mut pushdown_report);
+    if read_options.include_records {
         for entry in temporal_segment_entries {
             let payload = compression::section_payload(bytes, &entry)?;
             let header = TemporalSegmentHeaderV1::parse(payload.as_ref())?;
@@ -355,7 +688,25 @@ pub fn read_object_surface_from_bytes_with_options(
                         header.object_type_id
                     ))
                 })?;
-            if !options.requests_object_type(object_type) {
+            if !read_options.requests_object_type(object_type) {
+                continue;
+            }
+            pushdown_report.segments_seen += 1;
+            if pushdown_options.enabled
+                && segment_excluded_by_pushdown(&header, pushdown_options, &mut pushdown_report)
+            {
+                pushdown_report.segments_skipped += 1;
+                continue;
+            }
+            if pushdown_options.enabled
+                && segment_excluded_by_temporal_bloom(
+                    &header,
+                    temporal_bloom_index.as_ref(),
+                    pushdown_options,
+                    &mut pushdown_report,
+                )
+            {
+                pushdown_report.segments_skipped += 1;
                 continue;
             }
             let segment =
@@ -369,7 +720,9 @@ pub fn read_object_surface_from_bytes_with_options(
                 object_type,
                 dictionary.as_ref(),
                 &zone_stats,
-                options,
+                read_options,
+                pushdown_options,
+                &mut pushdown_report,
             )?);
         }
         if let Some(catalog) = &projection_catalog {
@@ -377,14 +730,332 @@ pub fn read_object_surface_from_bytes_with_options(
         }
     }
 
-    Ok(CoveObjectSurface {
-        object_types: catalog.types,
-        records,
-        projection_catalog,
-        evidence_index,
-        embedded_function_ids,
-        embedded_map_sections,
+    Ok(CoveObjectReadResult {
+        surface: CoveObjectSurface {
+            object_types: catalog.types,
+            records,
+            projection_catalog,
+            evidence_index,
+            embedded_function_ids,
+            embedded_map_sections,
+        },
+        pushdown_report,
     })
+}
+
+pub fn read_object_kernel_surface_from_bytes_with_options(
+    bytes: &[u8],
+    options: &CoveObjectKernelReadOptions,
+) -> Result<CoveObjectKernelReadResult, CoveError> {
+    let read = read_object_surface_from_bytes_with_pushdown_options(bytes, &options.read)?;
+    let kernel_surface = kernel_surface_from_materialized(&read.surface)?;
+    Ok(CoveObjectKernelReadResult {
+        kernel_surface,
+        materialized_surface: read.surface,
+        pushdown_report: read.pushdown_report,
+    })
+}
+
+fn kernel_surface_from_materialized(
+    surface: &CoveObjectSurface,
+) -> Result<CoveObjectKernelSurface, CoveError> {
+    let mut system = CoveObjectKernelSystemLanes::default();
+    for record in &surface.records {
+        system.object_type_ids.push(record.object_type_id);
+        system.segment_ids.push(record.segment_id);
+        system.row_indices.push(record.row_index);
+        system.timestamp_us.push(record.timestamp_us);
+        system.csn.push(record.csn);
+        system.branch_keys.push(record.branch_key);
+        system.goids.push(record.goid);
+        system.record_ids.push(record.record_id);
+        system.record_kinds.push(record.record_kind);
+        system.prev_refs.push(record.prev_ref);
+    }
+
+    let mut lane_keys =
+        BTreeMap::<(u32, u32), (String, CoveLogicalType, CovePhysicalKind, u32)>::new();
+    for record in &surface.records {
+        for property in &record.properties {
+            lane_keys
+                .entry((record.object_type_id, property.property_id))
+                .or_insert_with(|| {
+                    (
+                        property.property_name.clone(),
+                        property.logical_type,
+                        property.physical_kind,
+                        property.flags,
+                    )
+                });
+        }
+    }
+
+    let mut property_lanes = Vec::with_capacity(lane_keys.len());
+    for ((object_type_id, property_id), (property_name, logical_type, physical_kind, flags)) in
+        lane_keys
+    {
+        let values = surface
+            .records
+            .iter()
+            .map(|record| {
+                if record.object_type_id != object_type_id {
+                    return Value::Null;
+                }
+                record
+                    .properties
+                    .iter()
+                    .find(|property| property.property_id == property_id)
+                    .map(|property| property.value.clone())
+                    .unwrap_or(Value::Null)
+            })
+            .collect::<Vec<_>>();
+        property_lanes.push(CoveObjectKernelPropertyLane {
+            object_type_id,
+            property_id,
+            property_name,
+            logical_type,
+            physical_kind,
+            flags,
+            values: kernel_property_values(values),
+        });
+    }
+
+    Ok(CoveObjectKernelSurface {
+        object_types: surface.object_types.clone(),
+        system,
+        property_lanes,
+    })
+}
+
+fn kernel_property_values(values: Vec<Value>) -> CoveObjectKernelPropertyValues {
+    if values
+        .iter()
+        .all(|value| value.is_null() || value.as_bool().is_some())
+    {
+        return CoveObjectKernelPropertyValues::Bool(
+            values.into_iter().map(|value| value.as_bool()).collect(),
+        );
+    }
+    if values
+        .iter()
+        .all(|value| value.is_null() || value.as_i64().is_some())
+    {
+        return CoveObjectKernelPropertyValues::I64(
+            values.into_iter().map(|value| value.as_i64()).collect(),
+        );
+    }
+    if values
+        .iter()
+        .all(|value| value.is_null() || value.as_u64().is_some())
+    {
+        return CoveObjectKernelPropertyValues::U64(
+            values.into_iter().map(|value| value.as_u64()).collect(),
+        );
+    }
+    if values
+        .iter()
+        .all(|value| value.is_null() || value.as_f64().is_some())
+    {
+        return CoveObjectKernelPropertyValues::F64(
+            values.into_iter().map(|value| value.as_f64()).collect(),
+        );
+    }
+    if values
+        .iter()
+        .all(|value| value.is_null() || value.as_str().is_some())
+    {
+        return CoveObjectKernelPropertyValues::String(
+            values
+                .into_iter()
+                .map(|value| value.as_str().map(str::to_string))
+                .collect(),
+        );
+    }
+    CoveObjectKernelPropertyValues::Json(values)
+}
+
+fn segment_excluded_by_pushdown(
+    header: &TemporalSegmentHeaderV1,
+    pushdown: &CoveObjectReadPushdownOptions,
+    report: &mut CoveObjectReadPushdownReport,
+) -> bool {
+    match pushdown.temporal_cut {
+        Some(CoveObjectTemporalCut::Csn(csn)) if header.csn_min > csn => {
+            report.decisions.push(CoveObjectReadPushdownDecision {
+                kind: "temporal_segment_prune".into(),
+                outcome: "applied".into(),
+                reason: "segment csn_min is after the requested asOf cut".into(),
+                redacted: true,
+            });
+            true
+        }
+        Some(CoveObjectTemporalCut::TimestampUs(timestamp_us))
+            if header.time_range_start_us > timestamp_us =>
+        {
+            report.decisions.push(CoveObjectReadPushdownDecision {
+                kind: "temporal_segment_prune".into(),
+                outcome: "applied".into(),
+                reason: "segment time_range_start_us is after the requested asOf cut".into(),
+                redacted: true,
+            });
+            true
+        }
+        _ => false,
+    }
+}
+
+fn segment_excluded_by_temporal_bloom(
+    header: &TemporalSegmentHeaderV1,
+    bloom: Option<&TemporalBloomIndex>,
+    pushdown: &CoveObjectReadPushdownOptions,
+    report: &mut CoveObjectReadPushdownReport,
+) -> bool {
+    let Some(CoveObjectTemporalCut::TimestampUs(timestamp_us)) = pushdown.temporal_cut else {
+        return false;
+    };
+    let Some(bloom) = bloom else {
+        report.decisions.push(CoveObjectReadPushdownDecision {
+            kind: "temporal_bloom_ignored".into(),
+            outcome: "residual".into(),
+            reason: "temporal bloom index is absent; segment header and row residual checks remain authoritative".into(),
+            redacted: true,
+        });
+        return false;
+    };
+    let entries = bloom
+        .entries
+        .iter()
+        .filter(|entry| entry.segment_id == header.segment_id)
+        .collect::<Vec<_>>();
+    if entries.is_empty() {
+        return false;
+    }
+    if entries.iter().any(|entry| {
+        entry.time_bucket_start_us <= timestamp_us && timestamp_us <= entry.time_bucket_end_us
+    }) {
+        return false;
+    }
+    report.decisions.push(CoveObjectReadPushdownDecision {
+        kind: "temporal_bloom_prune".into(),
+        outcome: "applied".into(),
+        reason: "temporal bloom buckets prove this segment has no rows in the requested timestamp bucket".into(),
+        redacted: true,
+    });
+    true
+}
+
+fn row_matches_pushdown(
+    row: &crate::profile::cove_o::TemporalRowEntryV1,
+    object_type: &ObjectTypeEntryV1,
+    pushdown: &CoveObjectReadPushdownOptions,
+) -> bool {
+    if !pushdown.enabled {
+        return true;
+    }
+    if let Some(branch_key) = pushdown.branch_key {
+        if row.branch_key != branch_key {
+            return false;
+        }
+    }
+    if let Some(cut) = pushdown.temporal_cut {
+        match cut {
+            CoveObjectTemporalCut::LatestCommitted => {}
+            CoveObjectTemporalCut::TimestampUs(timestamp_us) if row.timestamp_us > timestamp_us => {
+                return false;
+            }
+            CoveObjectTemporalCut::Csn(csn) if row.csn > csn => return false,
+            _ => {}
+        }
+    }
+    let endpoint_candidates_apply = object_type_is_association_like(object_type)
+        && pushdown
+            .association_endpoint_candidates
+            .iter()
+            .any(|candidate| {
+                candidate.association_type_id == object_type.object_type_id
+                    && candidate.candidate_goid.is_some()
+            });
+    if !endpoint_candidates_apply
+        && !pushdown.candidate_goids.is_empty()
+        && !pushdown.candidate_goids.contains(&row.goid)
+    {
+        return false;
+    }
+    true
+}
+
+fn record_pushdown_fallbacks(
+    pushdown: &CoveObjectReadPushdownOptions,
+    report: &mut CoveObjectReadPushdownReport,
+) {
+    if pushdown.include_tombstones == Some(false) {
+        report.decisions.push(CoveObjectReadPushdownDecision {
+            kind: "tombstone_candidate".into(),
+            outcome: "residual".into(),
+            reason: "tombstone rows are retained before reconstruction to preserve record-chain correctness".into(),
+            redacted: false,
+        });
+    }
+    if !pushdown.association_endpoint_candidates.is_empty() {
+        let applied = pushdown
+            .association_endpoint_candidates
+            .iter()
+            .any(|candidate| candidate.candidate_goid.is_some());
+        report.decisions.push(CoveObjectReadPushdownDecision {
+            kind: "association_endpoint_candidate".into(),
+            outcome: if applied { "applied" } else { "residual" }.into(),
+            reason: if applied {
+                "association endpoint candidates narrowed segment-local association keys; materialized endpoint verification remains authoritative".into()
+            } else {
+                "association endpoint candidates can narrow scheduling candidates only when a concrete GOID is available; materialized endpoint verification remains authoritative".into()
+            },
+            redacted: true,
+        });
+    }
+    if !pushdown.property_candidates.is_empty() {
+        let applied = pushdown
+            .property_candidates
+            .iter()
+            .any(|candidate| candidate.proof_state == "proven_exact");
+        report.decisions.push(CoveObjectReadPushdownDecision {
+            kind: "property_predicate_candidate".into(),
+            outcome: if applied { "applied" } else { "residual" }.into(),
+            reason: if applied {
+                "proven property predicate candidates narrowed segment-local rows; materialized residual verification remains authoritative".into()
+            } else {
+                "property predicate candidates were not proven exact and remain residual".into()
+            },
+            redacted: true,
+        });
+    }
+}
+
+fn property_columns_requested(
+    segment: &TemporalSegmentData,
+    object_type: &ObjectTypeEntryV1,
+    options: &CoveObjectReadOptions,
+) -> Result<usize, CoveError> {
+    let properties_by_id = object_type
+        .properties
+        .iter()
+        .map(|property| (property.property_id, property))
+        .collect::<BTreeMap<_, _>>();
+    let mut count = 0usize;
+    for column in &segment.property_columns {
+        let property = properties_by_id
+            .get(&column.directory.column_id)
+            .copied()
+            .ok_or_else(|| {
+                CoveError::BadSchema(format!(
+                    "temporal property column references missing property_id {}",
+                    column.directory.column_id
+                ))
+            })?;
+        if options.requests_property(property) {
+            count += 1;
+        }
+    }
+    Ok(count)
 }
 
 fn object_type_is_association_like(object_type: &ObjectTypeEntryV1) -> bool {
@@ -398,7 +1069,11 @@ fn records_from_segment(
     dictionary: Option<&FileDictionary>,
     zone_stats: &[ZoneStatsEntry],
     options: &CoveObjectReadOptions,
+    pushdown: &CoveObjectReadPushdownOptions,
+    report: &mut CoveObjectReadPushdownReport,
 ) -> Result<Vec<CoveObjectRecord>, CoveError> {
+    report.rows_seen += segment.rows.len();
+    report.property_columns_requested += property_columns_requested(segment, object_type, options)?;
     let mut values_by_row = vec![Vec::new(); segment.rows.len()];
     let properties_by_id = object_type
         .properties
@@ -419,7 +1094,14 @@ fn records_from_segment(
         if !options.requests_property(property) {
             continue;
         }
-        let values = decode_property_column(segment, property, column, dictionary, zone_stats)?;
+        let values = decode_property_column(
+            segment,
+            property,
+            column,
+            dictionary,
+            zone_stats,
+            options.redaction_read_policy,
+        )?;
         for (row_values, value) in values_by_row.iter_mut().zip(values) {
             row_values.push(CoveObjectPropertyValue {
                 property_id: property.property_id,
@@ -427,13 +1109,33 @@ fn records_from_segment(
                 logical_type: property.logical_type,
                 physical_kind: property.physical_kind,
                 flags: property.flags,
-                value,
+                value: value.value,
+                redacted: value.redacted,
             });
         }
     }
 
+    let endpoint_candidate_record_goids =
+        endpoint_candidate_record_goids(object_type, &values_by_row, &segment.rows, pushdown);
     let mut records = Vec::with_capacity(segment.rows.len());
     for (row_index, row) in segment.rows.iter().enumerate() {
+        if !row_matches_pushdown(row, object_type, pushdown) {
+            continue;
+        }
+        if let Some(candidate_goids) = &endpoint_candidate_record_goids {
+            if !candidate_goids.contains(&row.goid) {
+                continue;
+            }
+        }
+        if !property_candidates_match(
+            object_type.object_type_id,
+            &values_by_row[row_index],
+            pushdown,
+        ) {
+            report.rows_skipped_by_property_candidates += 1;
+            continue;
+        }
+        report.rows_candidates += 1;
         let properties = std::mem::take(&mut values_by_row[row_index]);
         let association = association_metadata(object_type, &properties);
         records.push(CoveObjectRecord {
@@ -454,6 +1156,179 @@ fn records_from_segment(
         });
     }
     Ok(records)
+}
+
+fn property_candidates_match(
+    object_type_id: u32,
+    values: &[CoveObjectPropertyValue],
+    pushdown: &CoveObjectReadPushdownOptions,
+) -> bool {
+    for candidate in pushdown
+        .property_candidates
+        .iter()
+        .filter(|candidate| candidate.object_type_id == object_type_id)
+    {
+        if candidate.proof_state != "proven_exact" {
+            continue;
+        }
+        let value = values
+            .iter()
+            .find(|value| value.property_id == candidate.property_id)
+            .map(|value| &value.value)
+            .unwrap_or(&Value::Null);
+        if !property_candidate_value_matches(value, candidate) {
+            return false;
+        }
+    }
+    true
+}
+
+fn property_candidate_value_matches(
+    value: &Value,
+    candidate: &CoveObjectPropertyPredicateCandidate,
+) -> bool {
+    match candidate.op {
+        CoveObjectPropertyPredicateOp::IsNull => value.is_null(),
+        CoveObjectPropertyPredicateOp::IsNotNull => !value.is_null(),
+        CoveObjectPropertyPredicateOp::Eq
+        | CoveObjectPropertyPredicateOp::Ne
+        | CoveObjectPropertyPredicateOp::Lt
+        | CoveObjectPropertyPredicateOp::LtEq
+        | CoveObjectPropertyPredicateOp::Gt
+        | CoveObjectPropertyPredicateOp::GtEq => {
+            let Some(literal) = candidate.literal.as_ref() else {
+                return true;
+            };
+            let Some(ordering) = compare_property_value_literal(value, literal) else {
+                return true;
+            };
+            match candidate.op {
+                CoveObjectPropertyPredicateOp::Eq => ordering == std::cmp::Ordering::Equal,
+                CoveObjectPropertyPredicateOp::Ne => ordering != std::cmp::Ordering::Equal,
+                CoveObjectPropertyPredicateOp::Lt => ordering == std::cmp::Ordering::Less,
+                CoveObjectPropertyPredicateOp::LtEq => {
+                    matches!(
+                        ordering,
+                        std::cmp::Ordering::Less | std::cmp::Ordering::Equal
+                    )
+                }
+                CoveObjectPropertyPredicateOp::Gt => ordering == std::cmp::Ordering::Greater,
+                CoveObjectPropertyPredicateOp::GtEq => {
+                    matches!(
+                        ordering,
+                        std::cmp::Ordering::Greater | std::cmp::Ordering::Equal
+                    )
+                }
+                CoveObjectPropertyPredicateOp::IsNull
+                | CoveObjectPropertyPredicateOp::IsNotNull => true,
+            }
+        }
+    }
+}
+
+fn compare_property_value_literal(
+    value: &Value,
+    literal: &CoveObjectPropertyPredicateLiteral,
+) -> Option<std::cmp::Ordering> {
+    match literal {
+        CoveObjectPropertyPredicateLiteral::Null => {
+            value.is_null().then_some(std::cmp::Ordering::Equal)
+        }
+        CoveObjectPropertyPredicateLiteral::Bool(expected) => {
+            value.as_bool().map(|actual| actual.cmp(expected))
+        }
+        CoveObjectPropertyPredicateLiteral::I64(expected) => {
+            value.as_i64().map(|actual| actual.cmp(expected))
+        }
+        CoveObjectPropertyPredicateLiteral::U64(expected) => {
+            value.as_u64().map(|actual| actual.cmp(expected))
+        }
+        CoveObjectPropertyPredicateLiteral::F64Bits(expected_bits) => {
+            let expected = f64::from_bits(*expected_bits);
+            if expected.is_nan() {
+                return None;
+            }
+            value
+                .as_f64()
+                .filter(|actual| !actual.is_nan())
+                .and_then(|actual| actual.partial_cmp(&expected))
+        }
+        CoveObjectPropertyPredicateLiteral::String(expected) => {
+            value.as_str().map(|actual| actual.cmp(expected.as_str()))
+        }
+    }
+}
+
+fn endpoint_candidate_record_goids(
+    object_type: &ObjectTypeEntryV1,
+    values_by_row: &[Vec<CoveObjectPropertyValue>],
+    rows: &[crate::profile::cove_o::TemporalRowEntryV1],
+    pushdown: &CoveObjectReadPushdownOptions,
+) -> Option<BTreeSet<[u8; 16]>> {
+    if !object_type_is_association_like(object_type) {
+        return None;
+    }
+    let candidates = pushdown
+        .association_endpoint_candidates
+        .iter()
+        .filter(|candidate| {
+            candidate.association_type_id == object_type.object_type_id
+                && candidate.candidate_goid.is_some()
+        })
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return None;
+    }
+
+    let mut retained = BTreeSet::new();
+    for (row, properties) in rows.iter().zip(values_by_row) {
+        let association = association_metadata(object_type, properties);
+        match association_endpoint_candidate_match(association.as_ref(), &candidates) {
+            EndpointCandidateMatch::Match | EndpointCandidateMatch::Inconclusive => {
+                retained.insert(row.goid);
+            }
+            EndpointCandidateMatch::Miss => {}
+        }
+    }
+    Some(retained)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EndpointCandidateMatch {
+    Match,
+    Miss,
+    Inconclusive,
+}
+
+fn association_endpoint_candidate_match(
+    association: Option<&CoveAssociationMetadata>,
+    candidates: &[&CoveObjectAssociationEndpointCandidate],
+) -> EndpointCandidateMatch {
+    let Some(association) = association else {
+        return EndpointCandidateMatch::Inconclusive;
+    };
+    let Some(source) = association.source_goid.as_deref() else {
+        return EndpointCandidateMatch::Inconclusive;
+    };
+    let Some(target) = association.target_goid.as_deref() else {
+        return EndpointCandidateMatch::Inconclusive;
+    };
+    for candidate in candidates {
+        let Some(candidate_goid) = candidate.candidate_goid else {
+            return EndpointCandidateMatch::Inconclusive;
+        };
+        let candidate_goid = hex_encode(&candidate_goid);
+        let matched = match candidate.endpoint_role.as_str() {
+            "source" => source == candidate_goid,
+            "target" => target == candidate_goid,
+            "either" => source == candidate_goid || target == candidate_goid,
+            _ => return EndpointCandidateMatch::Inconclusive,
+        };
+        if matched {
+            return EndpointCandidateMatch::Match;
+        }
+    }
+    EndpointCandidateMatch::Miss
 }
 
 #[derive(Debug, Clone)]
@@ -913,8 +1788,9 @@ fn decode_property_column(
     column: &TemporalPropertyColumn,
     dictionary: Option<&FileDictionary>,
     zone_stats: &[ZoneStatsEntry],
-) -> Result<Vec<Value>, CoveError> {
-    let mut values = vec![Value::Null; segment.rows.len()];
+    redaction_policy: CoveObjectRedactionReadPolicy,
+) -> Result<Vec<DecodedPropertyValue>, CoveError> {
+    let mut values = vec![DecodedPropertyValue::plain(Value::Null); segment.rows.len()];
     for page in &column.pages {
         let page_row_count = page.index_entry.row_count as usize;
         let row_start = (page.index_entry.morsel_id as usize)
@@ -941,6 +1817,7 @@ fn decode_property_column(
                     &page.index_entry,
                     dictionary,
                     zone_stats,
+                    redaction_policy,
                 )?;
                 for row in &mut values[row_start..row_end] {
                     *row = value.clone();
@@ -981,6 +1858,7 @@ fn decode_property_column(
                 property,
                 prepared.decode_row(u64::from(local_row))?,
                 dictionary,
+                redaction_policy,
             )?;
         }
     }
@@ -991,24 +1869,34 @@ fn decode_property_value(
     property: &PropertyEntryV1,
     value: CoveArrayValue<'_>,
     dictionary: Option<&FileDictionary>,
-) -> Result<Value, CoveError> {
+    redaction_policy: CoveObjectRedactionReadPolicy,
+) -> Result<DecodedPropertyValue, CoveError> {
     match value {
-        CoveArrayValue::Null => Ok(Value::Null),
+        CoveArrayValue::Null => Ok(DecodedPropertyValue::plain(Value::Null)),
         CoveArrayValue::Boolean(value) | CoveArrayValue::ValidityBit(value) => {
-            Ok(Value::Bool(value))
+            Ok(DecodedPropertyValue::plain(Value::Bool(value)))
         }
-        CoveArrayValue::NumCode(value) | CoveArrayValue::Varint(value) => Ok(json!(value)),
-        CoveArrayValue::Int64(value) => Ok(Value::Number(Number::from(value))),
-        CoveArrayValue::Bytes(bytes) => decode_bytes_value(property, bytes),
-        CoveArrayValue::OwnedBytes(bytes) => decode_bytes_value(property, &bytes),
-        CoveArrayValue::FileCode(code) => decode_file_code_value(property, code, dictionary),
+        CoveArrayValue::NumCode(value) | CoveArrayValue::Varint(value) => {
+            Ok(DecodedPropertyValue::plain(json!(value)))
+        }
+        CoveArrayValue::Int64(value) => Ok(DecodedPropertyValue::plain(Value::Number(
+            Number::from(value),
+        ))),
+        CoveArrayValue::Bytes(bytes) => {
+            decode_bytes_value(property, bytes).map(DecodedPropertyValue::plain)
+        }
+        CoveArrayValue::OwnedBytes(bytes) => {
+            decode_bytes_value(property, &bytes).map(DecodedPropertyValue::plain)
+        }
+        CoveArrayValue::FileCode(code) => {
+            decode_file_code_value(property, code, dictionary, redaction_policy)
+        }
         CoveArrayValue::DictValue(DictionaryValue::RawBytes(bytes)) => {
             decode_canonical_dictionary_bytes(property, property.logical_type, &bytes)
+                .map(DecodedPropertyValue::plain)
         }
         CoveArrayValue::DictValue(DictionaryValue::RedactedPresent) => {
-            Err(CoveError::UnsupportedEncoding(
-                "COVE-O readback refuses to expose redacted FileCode payload bytes".into(),
-            ))
+            redacted_property_value(redaction_policy)
         }
     }
 }
@@ -1017,17 +1905,31 @@ fn decode_file_code_value(
     property: &PropertyEntryV1,
     code: u32,
     dictionary: Option<&FileDictionary>,
-) -> Result<Value, CoveError> {
+    redaction_policy: CoveObjectRedactionReadPolicy,
+) -> Result<DecodedPropertyValue, CoveError> {
     let dictionary = dictionary.ok_or_else(|| {
         CoveError::UnsupportedEncoding("FileCode property requires FILE_DICTIONARY sections".into())
     })?;
     let entry = dictionary.get_entry(code)?;
     let value_tag = ValueTag::from_u16(entry.value_tag).ok_or(CoveError::BadFileCode)?;
     match dictionary.decode_value(code)? {
-        DictionaryValue::RawBytes(bytes) => decode_canonical_value_tag(property, value_tag, &bytes),
-        DictionaryValue::RedactedPresent => Err(CoveError::UnsupportedEncoding(
+        DictionaryValue::RawBytes(bytes) => {
+            decode_canonical_value_tag(property, value_tag, &bytes).map(DecodedPropertyValue::plain)
+        }
+        DictionaryValue::RedactedPresent => redacted_property_value(redaction_policy),
+    }
+}
+
+fn redacted_property_value(
+    redaction_policy: CoveObjectRedactionReadPolicy,
+) -> Result<DecodedPropertyValue, CoveError> {
+    match redaction_policy {
+        CoveObjectRedactionReadPolicy::Refuse => Err(CoveError::UnsupportedEncoding(
             "COVE-O readback refuses to expose redacted FileCode payload bytes".into(),
         )),
+        CoveObjectRedactionReadPolicy::PreserveMarker => {
+            Ok(DecodedPropertyValue::redacted_marker())
+        }
     }
 }
 
@@ -1037,12 +1939,13 @@ fn stats_only_constant_value(
     page: &crate::page::ColumnPageIndexEntryV1,
     dictionary: Option<&FileDictionary>,
     zone_stats: &[ZoneStatsEntry],
-) -> Result<Value, CoveError> {
+    redaction_policy: CoveObjectRedactionReadPolicy,
+) -> Result<DecodedPropertyValue, CoveError> {
     if page.non_null_count == 0
         || page.null_count == page.row_count
         || page.flags & PAGE_FLAG_ALL_NULL != 0
     {
-        return Ok(Value::Null);
+        return Ok(DecodedPropertyValue::plain(Value::Null));
     }
     let stats_ref = usize::try_from(page.stats_ref).map_err(|_| CoveError::ArithOverflow)?;
     let entry = zone_stats.get(stats_ref).ok_or_else(|| {
@@ -1077,22 +1980,23 @@ fn stats_only_constant_value(
             "COVE-O readback refuses ambiguous or truncated stats-only property values".into(),
         ));
     }
-    decode_stat_scalar_value(property, min, dictionary)
+    decode_stat_scalar_value(property, min, dictionary, redaction_policy)
 }
 
 fn decode_stat_scalar_value(
     property: &PropertyEntryV1,
     scalar: &StatScalar,
     dictionary: Option<&FileDictionary>,
-) -> Result<Value, CoveError> {
+    redaction_policy: CoveObjectRedactionReadPolicy,
+) -> Result<DecodedPropertyValue, CoveError> {
     match scalar.kind {
         StatKind::Int64 | StatKind::TimestampMicros | StatKind::TimestampNanos => {
             if scalar.bytes.len() != 8 {
                 return Err(CoveError::BadStats);
             }
-            Ok(json!(i64::from_le_bytes(
+            Ok(DecodedPropertyValue::plain(json!(i64::from_le_bytes(
                 scalar.bytes[..8].try_into().unwrap()
-            )))
+            ))))
         }
         StatKind::UInt64 => {
             if scalar.bytes.len() != 8 {
@@ -1101,16 +2005,16 @@ fn decode_stat_scalar_value(
             let value = u64::from_le_bytes(scalar.bytes[..8].try_into().unwrap());
             if property.physical_kind == CovePhysicalKind::Boolean {
                 return match value {
-                    0 => Ok(Value::Bool(false)),
-                    1 => Ok(Value::Bool(true)),
+                    0 => Ok(DecodedPropertyValue::plain(Value::Bool(false))),
+                    1 => Ok(DecodedPropertyValue::plain(Value::Bool(true))),
                     _ => Err(CoveError::BadStats),
                 };
             }
             if property.physical_kind == CovePhysicalKind::FileCode {
                 let code = u32::try_from(value).map_err(|_| CoveError::BadFileCode)?;
-                return decode_file_code_value(property, code, dictionary);
+                return decode_file_code_value(property, code, dictionary, redaction_policy);
             }
-            Ok(json!(value))
+            Ok(DecodedPropertyValue::plain(json!(value)))
         }
         StatKind::Float64Bits => {
             if scalar.bytes.len() != 8 {
@@ -1119,26 +2023,29 @@ fn decode_stat_scalar_value(
             let value = f64::from_bits(u64::from_le_bytes(scalar.bytes[..8].try_into().unwrap()));
             Number::from_f64(value)
                 .map(Value::Number)
+                .map(DecodedPropertyValue::plain)
                 .ok_or(CoveError::BadStats)
         }
         StatKind::Decimal128 => {
             if scalar.bytes.len() != 16 {
                 return Err(CoveError::BadStats);
             }
-            Ok(Value::String(
+            Ok(DecodedPropertyValue::plain(Value::String(
                 i128::from_le_bytes(scalar.bytes[..16].try_into().unwrap()).to_string(),
-            ))
+            )))
         }
         StatKind::DateDays => {
             if scalar.bytes.len() != 4 {
                 return Err(CoveError::BadStats);
             }
-            Ok(json!(i32::from_le_bytes(
+            Ok(DecodedPropertyValue::plain(json!(i32::from_le_bytes(
                 scalar.bytes[..4].try_into().unwrap()
-            )))
+            ))))
         }
-        StatKind::FixedBytes => decode_bytes_value(property, &scalar.bytes),
-        StatKind::None => Ok(Value::Null),
+        StatKind::FixedBytes => {
+            decode_bytes_value(property, &scalar.bytes).map(DecodedPropertyValue::plain)
+        }
+        StatKind::None => Ok(DecodedPropertyValue::plain(Value::Null)),
     }
 }
 
@@ -1562,6 +2469,10 @@ fn json_value_to_string(value: &Value) -> Option<String> {
 mod tests {
     use super::*;
     use crate::canonical::{CanonicalField, CanonicalValue};
+    use crate::{
+        constants::StorageClass,
+        dictionary::{FileDictionaryHeaderV1, FileDictionaryIndexEntryV1},
+    };
 
     fn property(id: u32, name: &str, value: Value) -> CoveObjectPropertyValue {
         CoveObjectPropertyValue {
@@ -1571,6 +2482,7 @@ mod tests {
             physical_kind: CovePhysicalKind::VarBytes,
             flags: 0,
             value,
+            redacted: false,
         }
     }
 
@@ -1598,6 +2510,67 @@ mod tests {
         wire::append_u64_leb128(&mut out, payload.len() as u64);
         out.extend_from_slice(payload);
         out
+    }
+
+    fn redacted_dictionary() -> FileDictionary {
+        let entry = FileDictionaryIndexEntryV1 {
+            value_tag: ValueTag::Utf8 as u16,
+            storage_class: StorageClass::Redacted as u8,
+            flags: 0,
+            inline_len: 0,
+            reserved0: [0; 3],
+            inline_data: [0; 16],
+            payload_offset: 0,
+            payload_length: 0,
+            canonical_hash64: 0,
+            reserved1: 0,
+        };
+        let header = FileDictionaryHeaderV1 {
+            entry_count: 1,
+            flags: 0,
+            index_entry_len: FileDictionaryHeaderV1::INDEX_ENTRY_LEN,
+            value_hash_algorithm: 0,
+            payload_length: 0,
+            reserved: [0; 24],
+        };
+        let mut index = Vec::new();
+        index.extend_from_slice(&header.serialize());
+        index.extend_from_slice(&entry.serialize());
+        FileDictionary::parse(&index, &[]).unwrap()
+    }
+
+    #[test]
+    fn redacted_filecode_read_policy_refuses_by_default() {
+        let property = property_entry(CoveLogicalType::Utf8);
+        let dictionary = redacted_dictionary();
+        let err = decode_file_code_value(
+            &property,
+            0,
+            Some(&dictionary),
+            CoveObjectRedactionReadPolicy::Refuse,
+        )
+        .unwrap_err();
+
+        assert!(format!("{err}").contains("redacted FileCode payload bytes"));
+    }
+
+    #[test]
+    fn redacted_filecode_read_policy_preserves_safe_marker() {
+        let property = property_entry(CoveLogicalType::Utf8);
+        let dictionary = redacted_dictionary();
+        let decoded = decode_file_code_value(
+            &property,
+            0,
+            Some(&dictionary),
+            CoveObjectRedactionReadPolicy::PreserveMarker,
+        )
+        .unwrap();
+
+        assert!(decoded.redacted);
+        assert_eq!(
+            decoded.value,
+            json!({"policy": "redacted", "status": "redacted"})
+        );
     }
 
     fn record(
@@ -1701,6 +2674,28 @@ mod tests {
             reconstruct_object_states(&surface(vec![delta]), &Default::default()),
             Err(CoveError::RefInvalid)
         ));
+    }
+
+    #[test]
+    fn readback_pushdown_entrypoint_reports_temporal_segment_pruning() {
+        let bytes = include_bytes!("../../../../../conformance/accept/cove_o_temporal_valid.cove");
+        let result = read_object_surface_from_bytes_with_pushdown_options(
+            bytes,
+            &CoveObjectReadWithPushdownOptions {
+                read: CoveObjectReadOptions::requested_object_type_names(["Thing"]),
+                pushdown: CoveObjectReadPushdownOptions {
+                    enabled: true,
+                    temporal_cut: Some(CoveObjectTemporalCut::Csn(0)),
+                    ..CoveObjectReadPushdownOptions::default()
+                },
+            },
+        )
+        .unwrap();
+
+        assert!(result.pushdown_report.enabled);
+        assert!(result.pushdown_report.segments_seen >= 1);
+        assert!(result.pushdown_report.segments_skipped >= 1);
+        assert!(result.surface.records.is_empty());
     }
 
     #[test]
