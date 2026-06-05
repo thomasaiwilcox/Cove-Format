@@ -6,14 +6,17 @@ use cove_core::profile::cove_o::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use crate::{ResolvedExpr, ResolvedPath, ResolvedSystemField};
 
 pub(crate) const INTERNAL_PROJECTION_FIELD_PREFIX: &str = "__coveql_";
 
 pub(crate) fn window_function_key(name: &str, args: &[ResolvedExpr]) -> String {
-    let args = serde_json::to_string(args).unwrap_or_else(|_| "[]".into());
-    format!("{INTERNAL_PROJECTION_FIELD_PREFIX}window:{name}:{args}")
+    let args = serde_json::to_vec(args).unwrap_or_else(|_| format!("{args:?}").into_bytes());
+    let digest = Sha256::digest(&args);
+    let args_hash = hex(&digest[..16]);
+    format!("{INTERNAL_PROJECTION_FIELD_PREFIX}window:{name}:{args_hash}")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -592,5 +595,22 @@ fn tombstone_status_for_record(kind: RecordKind) -> CoveObjectTombstoneStatus {
         CoveObjectTombstoneStatus::Tombstoned
     } else {
         CoveObjectTombstoneStatus::Live
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn window_function_key_uses_stable_short_argument_hash() {
+        let key = window_function_key("row_number", &[]);
+        let Some(hash) = key.strip_prefix("__coveql_window:row_number:") else {
+            panic!("unexpected window key: {key}");
+        };
+        assert_eq!(hash.len(), 32);
+        assert!(hash.chars().all(|ch| ch.is_ascii_hexdigit()));
+        assert!(!key.contains('['));
+        assert!(!key.contains('"'));
     }
 }

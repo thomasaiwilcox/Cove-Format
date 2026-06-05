@@ -543,13 +543,13 @@ fn query_builder_matches_handwritten_query_fingerprints() {
             None::<&str>,
             "people_step",
             None::<&str>,
-            "id",
+            "row-key",
             4,
         )
         .select(["id"]);
     let parsed_built = recursive_built.parse(ParseOptions::default()).unwrap();
     let parsed_handwritten = coveql::parse_query(
-        "table(people).withRecursive(name: reach, seed: table(people), step: table(people_step), key: id, maxIterations: 4).select(id)",
+        "table(people).withRecursive(name: reach, seed: table(people), step: table(people_step), key: `row-key`, maxIterations: 4).select(id)",
         ParseOptions::default(),
     )
     .unwrap();
@@ -1514,6 +1514,13 @@ fn registered_materialized_table_authority_executes_without_projection_catalog()
         json!("materialized_table")
     );
     assert_eq!(table_contract["authority_fingerprint"], json!("people:v1"));
+    assert_eq!(
+        table_contract["execution_authority"],
+        json!({
+            "kind": "materialized_rows",
+            "row_count": 2,
+        })
+    );
 }
 
 #[test]

@@ -883,7 +883,7 @@ impl CoveQlQueryBuilder {
             coveql_identifier(name.as_ref()),
             coveql_table_binding(seed_table, seed_alias),
             coveql_table_binding(step_table, step_alias),
-            key.as_ref()
+            coveql_identifier(key.as_ref())
         ));
         self
     }

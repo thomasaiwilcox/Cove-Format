@@ -793,7 +793,7 @@ fn execution_code_domains(
         Ok(_) => vec![default_execution_code_domain(
             planned,
             false,
-            Some(format!("no {source} execution-code metadata found")),
+            Some(format!("no execution-code metadata found in {source}")),
         )],
         Err(error) => vec![default_execution_code_domain(
             planned,

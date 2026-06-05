@@ -1594,7 +1594,7 @@ fn query_specific_profile_contract_json(
                 "authority_kind": table.table_surface_contract.authority_kind,
                 "authority_fingerprint": table.table_surface_contract.authority_fingerprint,
                 "schema_fingerprint": table.table_surface_contract.schema_fingerprint,
-                "execution_authority": table.execution_authority,
+                "execution_authority": table_execution_authority_summary(&table.execution_authority),
                 "row_grain": table.table_surface_contract.row_grain,
                 "row_identity": table.table_surface_contract.row_identity,
                 "canonical_order": table.table_surface_contract.canonical_order,
@@ -1682,6 +1682,28 @@ fn query_specific_profile_contract_json(
             }))
         }
         crate::CoveQlProfileId::Object => None,
+    }
+}
+
+fn table_execution_authority_summary(authority: &crate::TableExecutionAuthority) -> Value {
+    match authority {
+        crate::TableExecutionAuthority::DeterministicProjection { projection_id } => json!({
+            "kind": "deterministic_projection",
+            "projection_id": projection_id,
+        }),
+        crate::TableExecutionAuthority::MaterializedRows { rows } => json!({
+            "kind": "materialized_rows",
+            "row_count": rows.len(),
+        }),
+        crate::TableExecutionAuthority::RawRows { rows } => json!({
+            "kind": "raw_rows",
+            "row_count": rows.len(),
+        }),
+        crate::TableExecutionAuthority::ExternalRows { provider_id, rows } => json!({
+            "kind": "external_rows",
+            "provider_id": provider_id,
+            "row_count": rows.len(),
+        }),
     }
 }
 
