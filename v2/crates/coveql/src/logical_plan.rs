@@ -5,8 +5,8 @@ use crate::{
         LogicalPredicateForm, LogicalPredicateKind, PredicatePlanning, RepresentationClass,
     },
     AggregateDisclosurePolicy, AstHistoryMode, AstNullOrdering, AstOrderDirection,
-    BuildResolvedQueryError, CoveOqlOutputMode, CoveOqlSelectedOperation, DiagnosticSeverity,
-    ExplainMode, MetadataDisclosurePolicy, OqlDiagnostic, ParseOptions, RedactionReference,
+    BuildResolvedQueryError, CoveQlDiagnostic, CoveQlOutputMode, CoveQlSelectedOperation,
+    DiagnosticSeverity, ExplainMode, MetadataDisclosurePolicy, ParseOptions, RedactionReference,
     ResolveOptions, ResolvedExpr, ResolvedPath, ResolvedPredicate, ResolvedQuery, ResolvedRoot,
     SecurityContext, TemporalContext, TombstoneContext, VisibilityReference,
 };
@@ -43,7 +43,7 @@ pub struct PlanContext {
     pub temporal: TemporalContext,
     pub branch: crate::BranchContext,
     pub tombstone: TombstoneContext,
-    pub output_mode: CoveOqlOutputMode,
+    pub output_mode: CoveQlOutputMode,
     pub explain_mode: Option<ExplainMode>,
     pub visibility: VisibilityReference,
     pub redaction: RedactionReference,
@@ -65,6 +65,9 @@ pub struct ExprContext {
 pub enum LogicalRootKind {
     Object,
     Association,
+    Node,
+    Edge,
+    Table,
     Projection,
     Evidence,
 }
@@ -79,8 +82,12 @@ pub enum ScanGrain {
     ChangeRecord,
     ChangeStateTransition,
     ChangePropertyDiff,
+    #[serde(rename = "change_final_row", alias = "change_final_object")]
     ChangeFinalObject,
     AssociationState,
+    NodeState,
+    EdgeState,
+    TableRow,
     ProjectionRow,
     EvidenceRow,
 }
@@ -106,6 +113,7 @@ pub struct CoveOLogicalPlan {
     pub predicate_forms: Vec<LogicalPredicateForm>,
     pub decode_boundaries: Vec<String>,
     pub residual_predicates: Vec<LogicalPredicateForm>,
+    pub canonical_order: Vec<String>,
     pub default_ordering_applied: bool,
     pub logical_plan_fingerprint: LogicalPlanFingerprint,
 }
@@ -211,7 +219,7 @@ pub enum LogicalPlanNodeKind {
         optional_metadata_candidates: Vec<String>,
     },
     OutputBoundary {
-        output_mode: CoveOqlOutputMode,
+        output_mode: CoveQlOutputMode,
     },
 }
 
@@ -241,8 +249,8 @@ pub struct LogicalPlanDiagnostic {
     pub redacted: bool,
 }
 
-impl From<OqlDiagnostic> for LogicalPlanDiagnostic {
-    fn from(diagnostic: OqlDiagnostic) -> Self {
+impl From<CoveQlDiagnostic> for LogicalPlanDiagnostic {
+    fn from(diagnostic: CoveQlDiagnostic) -> Self {
         Self {
             code: diagnostic.code,
             severity: diagnostic.severity,
@@ -333,7 +341,7 @@ impl fmt::Display for BuildLogicalPlanError {
         if let Some(diagnostic) = self.diagnostics.first() {
             write!(f, "{}: {}", diagnostic.code, diagnostic.message)
         } else {
-            write!(f, "Cove-OQL logical plan build failed")
+            write!(f, "CoveQL logical plan build failed")
         }
     }
 }
@@ -467,6 +475,7 @@ pub fn build_logical_plan(
         items: select_projection_items(&resolved),
     });
     let (sort_keys, defaulted) = sort_keys(&resolved);
+    let canonical_order = canonical_order_fields(&sort_keys);
     nodes.push(LogicalPlanNodeKind::Sort {
         keys: sort_keys,
         stable_tiebreaker: stable_tiebreaker(&resolved.root, context.scan_grain),
@@ -512,6 +521,7 @@ pub fn build_logical_plan(
         predicate_forms: predicate_plan.all_forms,
         decode_boundaries: predicate_plan.decode_boundaries,
         residual_predicates: predicate_plan.residual,
+        canonical_order,
         default_ordering_applied: defaulted,
         logical_plan_fingerprint: String::new(),
     };
@@ -881,6 +891,17 @@ fn sort_keys(resolved: &ResolvedQuery) -> (Vec<LogicalSortKey>, bool) {
     )
 }
 
+fn canonical_order_fields(sort_keys: &[LogicalSortKey]) -> Vec<String> {
+    sort_keys
+        .iter()
+        .map(|key| {
+            key.field.clone().unwrap_or_else(|| {
+                serde_json::to_string(&key.expr).unwrap_or_else(|_| "expression_order".into())
+            })
+        })
+        .collect()
+}
+
 fn path_from_expr(expr: &ResolvedExpr) -> Option<&ResolvedPath> {
     match expr {
         ResolvedExpr::Path(path) => Some(path),
@@ -897,7 +918,7 @@ fn stable_tiebreaker(root: &ResolvedRoot, grain: ScanGrain) -> Vec<String> {
 
 fn default_order_fields(resolved: &ResolvedQuery) -> Vec<String> {
     let mut fields = Vec::new();
-    if let ResolvedRoot::Projection(projection) = &resolved.root {
+    if let Some(projection) = projection_contract_root(&resolved.root) {
         fields.extend(
             projection
                 .ordering
@@ -905,6 +926,18 @@ fn default_order_fields(resolved: &ResolvedQuery) -> Vec<String> {
                 .filter(|field| !field.trim().is_empty())
                 .cloned(),
         );
+    }
+    if let ResolvedRoot::Table(table) = &resolved.root {
+        for field in &table.canonical_order {
+            if !field.trim().is_empty() && !fields.iter().any(|existing| existing == field) {
+                fields.push(field.clone());
+            }
+        }
+        for field in &table.row_identity {
+            if !field.trim().is_empty() && !fields.iter().any(|existing| existing == field) {
+                fields.push(field.clone());
+            }
+        }
     }
     for field in fallback_default_order_fields(&resolved.root, scan_grain(resolved)) {
         if !fields.iter().any(|existing| existing == field) {
@@ -962,6 +995,16 @@ fn fallback_default_order_fields(root: &ResolvedRoot, grain: ScanGrain) -> Vec<&
             "csn",
             "record_id",
         ],
+        (ResolvedRoot::Node(_), _) => vec!["node_label", "branch_key", "goid"],
+        (ResolvedRoot::Edge(_), _) => vec![
+            "edge_label",
+            "branch_key",
+            "source_goid",
+            "target_goid",
+            "edge_goid",
+            "csn",
+            "record_id",
+        ],
         (ResolvedRoot::Evidence(_), _) => vec![
             "target_id",
             "grain",
@@ -969,6 +1012,13 @@ fn fallback_default_order_fields(root: &ResolvedRoot, grain: ScanGrain) -> Vec<&
             "source_row_identity",
             "evidence_id",
         ],
+        (ResolvedRoot::Table(table), _) => {
+            if table.row_identity.is_empty() {
+                vec!["projection_row_identity", "source_canonical_row_identity"]
+            } else {
+                Vec::new()
+            }
+        }
         (ResolvedRoot::Projection(_), _) => {
             vec!["projection_row_identity", "source_canonical_row_identity"]
         }
@@ -980,6 +1030,9 @@ fn root_kind(root: &ResolvedRoot) -> LogicalRootKind {
     match root {
         ResolvedRoot::Object(_) => LogicalRootKind::Object,
         ResolvedRoot::Association(_) => LogicalRootKind::Association,
+        ResolvedRoot::Node(_) => LogicalRootKind::Node,
+        ResolvedRoot::Edge(_) => LogicalRootKind::Edge,
+        ResolvedRoot::Table(_) => LogicalRootKind::Table,
         ResolvedRoot::Projection(_) => LogicalRootKind::Projection,
         ResolvedRoot::Evidence(_) => LogicalRootKind::Evidence,
     }
@@ -987,6 +1040,9 @@ fn root_kind(root: &ResolvedRoot) -> LogicalRootKind {
 
 fn scan_grain(resolved: &ResolvedQuery) -> ScanGrain {
     match &resolved.root {
+        ResolvedRoot::Node(_) => ScanGrain::NodeState,
+        ResolvedRoot::Edge(_) => ScanGrain::EdgeState,
+        ResolvedRoot::Table(_) => ScanGrain::TableRow,
         ResolvedRoot::Projection(_) => ScanGrain::ProjectionRow,
         ResolvedRoot::Evidence(_) => ScanGrain::EvidenceRow,
         ResolvedRoot::Association(_) => {
@@ -1029,20 +1085,34 @@ fn scan_grain_for_change_mode(mode: crate::AstChangeMode) -> ScanGrain {
         crate::AstChangeMode::Records => ScanGrain::ChangeRecord,
         crate::AstChangeMode::StateTransitions => ScanGrain::ChangeStateTransition,
         crate::AstChangeMode::PropertyDiffs => ScanGrain::ChangePropertyDiff,
-        crate::AstChangeMode::FinalObjects => ScanGrain::ChangeFinalObject,
+        crate::AstChangeMode::FinalRows => ScanGrain::ChangeFinalObject,
     }
 }
 
 fn reconstruction_required(root: &ResolvedRoot) -> bool {
-    matches!(root, ResolvedRoot::Object(_) | ResolvedRoot::Association(_))
+    matches!(
+        root,
+        ResolvedRoot::Object(_)
+            | ResolvedRoot::Association(_)
+            | ResolvedRoot::Node(_)
+            | ResolvedRoot::Edge(_)
+    )
+}
+
+fn projection_contract_root(root: &ResolvedRoot) -> Option<&crate::ResolvedProjectionRoot> {
+    match root {
+        ResolvedRoot::Projection(projection) => Some(projection),
+        ResolvedRoot::Table(table) => Some(&table.projection),
+        _ => None,
+    }
 }
 
 fn index_only_requested(resolved: &ResolvedQuery) -> bool {
     matches!(
         resolved.operation_context.request.selected_operation,
-        CoveOqlSelectedOperation::IndexOnlyAnswer
-            | CoveOqlSelectedOperation::Explain {
-                target: crate::CoveOqlExplainTarget::IndexOnlyAnswer,
+        CoveQlSelectedOperation::IndexOnlyAnswer
+            | CoveQlSelectedOperation::Explain {
+                target: crate::CoveQlExplainTarget::IndexOnlyAnswer,
                 ..
             }
     )
@@ -1092,6 +1162,7 @@ fn fingerprint(plan: &CoveOLogicalPlan, dependencies: &LogicalPlanDependencySet)
         "predicate_forms": plan.predicate_forms,
         "decode_boundaries": plan.decode_boundaries,
         "residual_predicates": plan.residual_predicates,
+        "canonical_order": plan.canonical_order,
         "default_ordering_applied": plan.default_ordering_applied,
         "dependencies": dependencies,
     });

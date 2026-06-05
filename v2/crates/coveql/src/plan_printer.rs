@@ -56,6 +56,7 @@ pub fn logical_plan_text(plan: &CoveOLogicalPlan, disclosure: MetadataDisclosure
         "context root={:?} grain={:?} output={:?}",
         plan.context.root_kind, plan.context.scan_grain, plan.context.output_mode
     ));
+    lines.push(format!("canonical_order={:?}", plan.canonical_order));
     for node in &plan.nodes {
         let name = serde_json::to_value(&node.kind)
             .ok()

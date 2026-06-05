@@ -1,4 +1,4 @@
-//! Cove-OQL operation context, parser, resolver, planner, and materialized executor.
+//! CoveQL operation context, parser, resolver, planner, and materialized executor.
 //!
 //! Materialized COVE-O and COVE-MAP readback remains the correctness baseline.
 //! The crate covers Phase 0 through Phase 8 surfaces: operation-context
@@ -23,13 +23,37 @@
 //! candidates stay fail-closed or diagnostic-only unless a runtime branch proves
 //! equivalence to the materialized executor.
 
+#![allow(
+    clippy::cloned_ref_to_slice_refs,
+    clippy::collapsible_match,
+    clippy::derivable_impls,
+    clippy::field_reassign_with_default,
+    clippy::if_same_then_else,
+    clippy::items_after_test_module,
+    clippy::large_enum_variant,
+    clippy::len_zero,
+    clippy::manual_inspect,
+    clippy::manual_is_multiple_of,
+    clippy::manual_map,
+    clippy::match_like_matches_macro,
+    clippy::needless_borrow,
+    clippy::needless_lifetimes,
+    clippy::redundant_closure,
+    clippy::too_many_arguments,
+    clippy::trim_split_whitespace,
+    clippy::type_complexity,
+    clippy::unnecessary_lazy_evaluations,
+    clippy::unnecessary_map_or
+)]
+
 mod arrow_output;
 mod association_opt;
 mod ast;
 mod builder;
-#[cfg(feature = "datafusion")]
-mod datafusion;
 mod dependencies;
+#[cfg(feature = "datafusion")]
+#[path = "datafusion.rs"]
+mod df_provider;
 mod evidence_opt;
 mod execution;
 mod explain;
@@ -88,18 +112,19 @@ pub use association_opt::{
 };
 pub use ast::*;
 pub use builder::*;
-#[cfg(feature = "datafusion")]
-pub use datafusion::{
-    datafusion_dataset_provider_for_plan, datafusion_manifest_oql_provider_for_plan,
-    datafusion_object_pushdown_report_for_plan, datafusion_oql_provider_for_plan,
-    datafusion_projection_pushdown_report_for_plan, datafusion_row_pushdown_report_for_plan,
-    register_datafusion_dataset_for_plan, register_datafusion_manifest_oql_provider_for_plan,
-    register_datafusion_oql_memtable_for_plan, register_datafusion_oql_provider_for_plan,
-    register_datafusion_projection_for_plan, DataFusionOqlFilterOutcome,
-    DataFusionOqlFilterOutcomeKind, DataFusionOqlProviderReport, DataFusionOqlPushdownReport,
-    DataFusionOqlScanNegotiationReport, ManifestOqlTableProvider, OqlTableProvider,
-};
 pub use dependencies::*;
+#[cfg(feature = "datafusion")]
+pub use df_provider::{
+    datafusion_coveql_provider_for_plan, datafusion_dataset_provider_for_plan,
+    datafusion_manifest_coveql_provider_for_plan, datafusion_object_pushdown_report_for_plan,
+    datafusion_projection_pushdown_report_for_plan, datafusion_row_pushdown_report_for_plan,
+    register_datafusion_coveql_memtable_for_plan, register_datafusion_coveql_provider_for_plan,
+    register_datafusion_dataset_for_plan, register_datafusion_manifest_coveql_provider_for_plan,
+    register_datafusion_projection_for_plan, CoveQlTableProvider, DataFusionCoveQlFilterOutcome,
+    DataFusionCoveQlFilterOutcomeKind, DataFusionCoveQlProviderReport,
+    DataFusionCoveQlPushdownReport, DataFusionCoveQlScanNegotiationReport,
+    ManifestCoveQlTableProvider,
+};
 pub use evidence_opt::{
     EvidenceGrainIndexReport, EvidenceGrainKind, EvidenceOptimizationReport,
     EvidenceTargetIndexKind,
@@ -107,8 +132,8 @@ pub use evidence_opt::{
 pub use execution::{
     execute_manifest_planned_query, execute_manifest_planned_query_retained, execute_planned_query,
     execute_planned_query_retained, execute_planned_query_stream,
-    parse_resolve_plan_and_execute_query, BuildExecutionError, CoveOqlExecutionResult,
-    CoveOqlResultStream, CoveOqlRetainedInput, CoveOqlRetainedManifestMember, EvidenceAuthority,
+    parse_resolve_plan_and_execute_query, BuildExecutionError, CoveQlExecutionResult,
+    CoveQlResultStream, CoveQlRetainedInput, CoveQlRetainedManifestMember, EvidenceAuthority,
     ExecutedQuery, ExecutionAuthorityReport, ExecutionAuthoritySource, ExecutionDiagnostic,
     ExecutionOptions, ExecutionRowCounts, VisibilityOverlay,
 };
@@ -130,7 +155,7 @@ pub use lineage::LineageReuseReport;
 pub use logical_plan::{
     build_logical_plan, parse_resolve_and_plan_query, BuildLogicalPlanError, CoveOLogicalPlan,
     ExprContext, LogicalNodeId, LogicalPlanDiagnostic, LogicalPlanFingerprint, LogicalPlanNode,
-    LogicalPlanNodeKind, PlanContext, PlanOptions, PlannedQuery,
+    LogicalPlanNodeKind, LogicalRootKind, PlanContext, PlanOptions, PlannedQuery, ScanGrain,
 };
 pub use materialized::{
     MaterializedAssociationRow, MaterializedChangeDetail, MaterializedChangeDiffKind,
@@ -165,36 +190,421 @@ pub use pushdown::{
 };
 pub use resolver::{parse_and_resolve_query, resolve_query, BuildResolvedQueryError};
 
-pub const COVE_OQL_LANGUAGE_VERSION: &str = "0.1";
-pub const COVE_OQL_GRAMMAR_VERSION: &str = "0.1";
+pub const COVEQL_LANGUAGE_VERSION: &str = "0.1";
+pub const COVEQL_CORE_VERSION: &str = "0.1";
+pub const COVEQL_GRAMMAR_VERSION: &str = "0.1";
 pub const RESOLVED_AST_VERSION: &str = "0.1";
 pub const LOGICAL_PLAN_VERSION: &str = "0.1";
 pub const PHYSICAL_PLAN_VERSION: &str = "0.1";
 pub const EXPLAIN_JSON_SCHEMA_VERSION: &str = "0.1";
+pub const COVEQL_PROFILE_CONTRACT_VERSION: &str = "0.1";
+pub const COVEQL_BRIDGE_CONTRACT_VERSION: &str = "0.1";
+pub const COVEQL_OBJECT_PROFILE_VERSION: &str = "0.1";
+pub const COVEQL_TABLE_PROFILE_VERSION: &str = "0.1";
+pub const COVEQL_GRAPH_PROFILE_VERSION: &str = "0.1";
 pub const PROJECTION_DEPENDENCY_CONTRACT_VERSION: &str = "0.3";
 pub const PREDICATE_NORMAL_FORM_VERSION: &str = "0.1";
 pub const CODED_OPERATOR_CONTRACT_VERSION: &str = "0.1";
 pub const PREDICATE_REPRESENTATION_CONTRACT_VERSION: &str = "0.1";
 pub const PHYSICAL_OPERATOR_CONTRACT_VERSION: &str = "0.1";
 pub const PHYSICAL_SIDECAR_VALIDATION_VERSION: &str = "0.1";
-pub const DATAFUSION_OQL_REPORT_VERSION: &str = "0.1";
+pub const DATAFUSION_COVEQL_REPORT_VERSION: &str = "0.1";
 pub const DATAFUSION_PUSH_FILTER_UNSAFE_DIAGNOSTIC_CODE: &str = "E_DATAFUSION_PUSH_FILTER_UNSAFE";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CoveQlProfileId {
+    Object,
+    Table,
+    Graph,
+}
+
+impl CoveQlProfileId {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Object => "object",
+            Self::Table => "table",
+            Self::Graph => "graph",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "object" => Some(Self::Object),
+            "table" => Some(Self::Table),
+            "graph" => Some(Self::Graph),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CoveQlRootKind {
+    Object,
+    Association,
+    Evidence,
+    Projection,
+    Table,
+    Node,
+    Edge,
+    Path,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CoveQlInputGrain {
+    ObjectState,
+    AssociationState,
+    EvidenceRow,
+    ProjectionRow,
+    TableRow,
+    NodeState,
+    EdgeState,
+    PathBinding,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct CoveOqlConformanceProfile {
+pub struct CoveQlCoreContract {
     pub language_version: &'static str,
+    pub core_version: &'static str,
     pub grammar_version: &'static str,
     pub resolved_ast_version: &'static str,
     pub logical_plan_version: &'static str,
     pub physical_plan_version: &'static str,
     pub explain_json_schema_version: &'static str,
+    pub profile_contract_version: &'static str,
+    pub bridge_contract_version: &'static str,
+    pub primary_profiles: &'static [CoveQlProfileId],
+    pub common_roots: &'static [CoveQlRootKind],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CoveQlProfileContract {
+    pub profile_id: CoveQlProfileId,
+    pub profile_version: &'static str,
+    pub implemented: bool,
+    pub supported_roots: &'static [CoveQlRootKind],
+    pub input_grains: &'static [CoveQlInputGrain],
+    pub root_authority: &'static [&'static str],
+    pub identity_model: &'static [&'static str],
+    pub canonical_order: &'static [&'static str],
+    pub temporal_capabilities: &'static [&'static str],
+    pub evidence_targets: &'static [&'static str],
+    pub relationship_capabilities: &'static [&'static str],
+    pub profile_methods: &'static [&'static str],
+    pub bridge_requirements: &'static [&'static str],
+    pub aggregate_rules: &'static [&'static str],
+    pub null_missing_nan_rules: &'static [&'static str],
+    pub security_barriers: &'static [&'static str],
+    pub materialization_boundaries: &'static [&'static str],
+    pub output_modes: &'static [&'static str],
+    pub fingerprint_fields: &'static [&'static str],
+    pub explain_fields: &'static [&'static str],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CoveQlBridgeContract {
+    pub bridge_version: &'static str,
+    pub source_profile: CoveQlProfileId,
+    pub target_profile: CoveQlProfileId,
+    pub requires_validated_bridge_or_materialized_fallback: bool,
+}
+
+pub const COVEQL_CORE_CONTRACT: CoveQlCoreContract = CoveQlCoreContract {
+    language_version: COVEQL_LANGUAGE_VERSION,
+    core_version: COVEQL_CORE_VERSION,
+    grammar_version: COVEQL_GRAMMAR_VERSION,
+    resolved_ast_version: RESOLVED_AST_VERSION,
+    logical_plan_version: LOGICAL_PLAN_VERSION,
+    physical_plan_version: PHYSICAL_PLAN_VERSION,
+    explain_json_schema_version: EXPLAIN_JSON_SCHEMA_VERSION,
+    profile_contract_version: COVEQL_PROFILE_CONTRACT_VERSION,
+    bridge_contract_version: COVEQL_BRIDGE_CONTRACT_VERSION,
+    primary_profiles: &[
+        CoveQlProfileId::Object,
+        CoveQlProfileId::Table,
+        CoveQlProfileId::Graph,
+    ],
+    common_roots: &[CoveQlRootKind::Projection, CoveQlRootKind::Evidence],
+};
+
+pub const COVEQL_OBJECT_PROFILE_CONTRACT: CoveQlProfileContract = CoveQlProfileContract {
+    profile_id: CoveQlProfileId::Object,
+    profile_version: COVEQL_OBJECT_PROFILE_VERSION,
+    implemented: true,
+    supported_roots: &[
+        CoveQlRootKind::Object,
+        CoveQlRootKind::Association,
+        CoveQlRootKind::Projection,
+        CoveQlRootKind::Evidence,
+    ],
+    input_grains: &[
+        CoveQlInputGrain::ObjectState,
+        CoveQlInputGrain::AssociationState,
+        CoveQlInputGrain::ProjectionRow,
+        CoveQlInputGrain::EvidenceRow,
+    ],
+    root_authority: &[
+        "cove_o_object_catalog",
+        "cove_map_projection_catalog",
+        "cove_map_evidence_index",
+    ],
+    identity_model: &[
+        "object_goid",
+        "association_endpoint_identity",
+        "projection_row_identity",
+    ],
+    canonical_order: &[
+        "object_type_id",
+        "branch_key",
+        "goid",
+        "projection_declared_ordering",
+    ],
+    temporal_capabilities: &["latest", "as_of", "history", "changes"],
+    evidence_targets: &["object", "property", "association", "projection", "source"],
+    relationship_capabilities: &[
+        "association_exists",
+        "association_count",
+        "object_relative_association",
+    ],
+    profile_methods: &[],
+    bridge_requirements: &[
+        "object_graph_identity_bridge",
+        "object_table_optional_identity_bridge",
+    ],
+    aggregate_rules: &[
+        "visible_grain_after_visibility_and_redaction",
+        "aggregate_disclosure_policy",
+    ],
+    null_missing_nan_rules: &[
+        "missing_property_unknown",
+        "null_three_valued_logic",
+        "nan_ordering_requires_policy",
+    ],
+    security_barriers: &[
+        "visibility",
+        "redaction",
+        "metadata_disclosure",
+        "aggregate_disclosure",
+    ],
+    materialization_boundaries: &[
+        "final_output",
+        "unsupported_udf",
+        "unsafe_collation",
+        "unproven_code_domain",
+    ],
+    output_modes: &[
+        "object_rows",
+        "association_rows",
+        "projection_rows",
+        "evidence_rows",
+        "json_rows",
+        "arrow_record_batch",
+        "datafusion_table_provider",
+        "explain_json",
+    ],
+    fingerprint_fields: &["profile_id", "profile_version", "root", "grain"],
+    explain_fields: &[
+        "primary_profile",
+        "profiles",
+        "root",
+        "grain",
+        "operation",
+        "temporal_mode",
+    ],
+};
+
+pub const COVEQL_TABLE_PROFILE_CONTRACT: CoveQlProfileContract = CoveQlProfileContract {
+    profile_id: CoveQlProfileId::Table,
+    profile_version: COVEQL_TABLE_PROFILE_VERSION,
+    implemented: true,
+    supported_roots: &[CoveQlRootKind::Table],
+    input_grains: &[CoveQlInputGrain::TableRow],
+    root_authority: &[
+        "deterministic_cove_map_projection",
+        "validated_table_surface_contract",
+    ],
+    identity_model: &[
+        "declared_projection_row_identity",
+        "canonical_physical_row_identity_fallback",
+    ],
+    canonical_order: &[
+        "declared_projection_ordering",
+        "canonical_row_identity",
+        "manifest_or_file_ordinal_then_source_row_ordinal",
+    ],
+    temporal_capabilities: &["latest", "as_of_when_projection_is_recomputable"],
+    evidence_targets: &["row", "column", "projection", "source", "root_binding"],
+    relationship_capabilities: &[
+        "lookup_left_preserving",
+        "lookup_exists_semijoin",
+        "lookup_cardinality_contract",
+    ],
+    profile_methods: &["lookup"],
+    bridge_requirements: &[
+        "validated_bridge_or_materialized_canonical_values_for_cross_profile_or_cross_file_codes",
+    ],
+    aggregate_rules: &[
+        "visible_table_row_grain",
+        "logical_value_grouping",
+        "aggregate_disclosure_policy",
+    ],
+    null_missing_nan_rules: &[
+        "sql_style_three_valued_predicates",
+        "missing_base_column_rejects",
+        "nan_ordering_requires_policy",
+    ],
+    security_barriers: &[
+        "visibility",
+        "redaction",
+        "metadata_disclosure",
+        "aggregate_disclosure",
+    ],
+    materialization_boundaries: &[
+        "final_output",
+        "unsupported_general_join_without_lookup_contract",
+        "unsafe_code_domain",
+        "unsafe_collation",
+        "raw_table_surface_requires_table_contract",
+    ],
+    output_modes: &[
+        "json_rows",
+        "arrow_record_batch",
+        "datafusion_table_provider",
+        "explain_json",
+    ],
+    fingerprint_fields: &["profile_id", "profile_version", "root", "grain"],
+    explain_fields: &["profiles", "root", "grain", "diagnostics"],
+};
+
+pub const COVEQL_GRAPH_PROFILE_CONTRACT: CoveQlProfileContract = CoveQlProfileContract {
+    profile_id: CoveQlProfileId::Graph,
+    profile_version: COVEQL_GRAPH_PROFILE_VERSION,
+    implemented: true,
+    supported_roots: &[
+        CoveQlRootKind::Node,
+        CoveQlRootKind::Edge,
+        CoveQlRootKind::Path,
+    ],
+    input_grains: &[
+        CoveQlInputGrain::NodeState,
+        CoveQlInputGrain::EdgeState,
+        CoveQlInputGrain::PathBinding,
+    ],
+    root_authority: &["cove_o_object_catalog", "cove_o_association_catalog"],
+    identity_model: &[
+        "node_object_goid",
+        "edge_association_identity",
+        "path_binding_identity",
+    ],
+    canonical_order: &["node_identity", "edge_identity", "path_identity"],
+    temporal_capabilities: &["latest", "as_of"],
+    evidence_targets: &["node", "edge", "path", "source"],
+    relationship_capabilities: &[
+        "in_edge",
+        "out_edge",
+        "either_edge",
+        "one_hop_traverse",
+        "chained_traverse",
+        "multi_hop_path_binding",
+        "finite_variable_length_traverse_with_graph_traversal_contract",
+        "relationship_exists",
+        "relationship_count_exists_distinct_count",
+        "relationship_target_node_filter",
+    ],
+    profile_methods: &["traverse"],
+    bridge_requirements: &[
+        "object_graph_identity_bridge",
+        "association_graph_edge_identity_bridge",
+    ],
+    aggregate_rules: &[
+        "visible_node_edge_path_grain",
+        "aggregate_disclosure_policy",
+    ],
+    null_missing_nan_rules: &[
+        "missing_property_unknown",
+        "null_three_valued_logic",
+        "nan_ordering_requires_policy",
+    ],
+    security_barriers: &[
+        "visibility",
+        "redaction",
+        "metadata_disclosure",
+        "hidden_endpoint_suppression",
+    ],
+    materialization_boundaries: &[
+        "hidden_endpoint_policy",
+        "unsafe_code_domain",
+        "variable_length_traversal_requires_explicit_contract",
+    ],
+    output_modes: &["json_rows", "datafusion_table_provider", "explain_json"],
+    fingerprint_fields: &["profile_id", "profile_version", "root", "grain"],
+    explain_fields: &["profiles", "root", "grain", "diagnostics"],
+};
+
+pub const COVEQL_BUILTIN_PROFILE_CONTRACTS: &[CoveQlProfileContract] = &[
+    COVEQL_OBJECT_PROFILE_CONTRACT,
+    COVEQL_TABLE_PROFILE_CONTRACT,
+    COVEQL_GRAPH_PROFILE_CONTRACT,
+];
+
+pub const COVEQL_COMMON_BRIDGE_CONTRACTS: &[CoveQlBridgeContract] = &[
+    CoveQlBridgeContract {
+        bridge_version: COVEQL_BRIDGE_CONTRACT_VERSION,
+        source_profile: CoveQlProfileId::Object,
+        target_profile: CoveQlProfileId::Table,
+        requires_validated_bridge_or_materialized_fallback: true,
+    },
+    CoveQlBridgeContract {
+        bridge_version: COVEQL_BRIDGE_CONTRACT_VERSION,
+        source_profile: CoveQlProfileId::Object,
+        target_profile: CoveQlProfileId::Graph,
+        requires_validated_bridge_or_materialized_fallback: true,
+    },
+];
+
+pub fn coveql_core_contract() -> &'static CoveQlCoreContract {
+    &COVEQL_CORE_CONTRACT
+}
+
+pub fn builtin_coveql_profile_contracts() -> &'static [CoveQlProfileContract] {
+    COVEQL_BUILTIN_PROFILE_CONTRACTS
+}
+
+pub fn builtin_coveql_bridge_contracts() -> &'static [CoveQlBridgeContract] {
+    COVEQL_COMMON_BRIDGE_CONTRACTS
+}
+
+pub fn coveql_profile_contract(profile: CoveQlProfileId) -> &'static CoveQlProfileContract {
+    match profile {
+        CoveQlProfileId::Object => &COVEQL_OBJECT_PROFILE_CONTRACT,
+        CoveQlProfileId::Table => &COVEQL_TABLE_PROFILE_CONTRACT,
+        CoveQlProfileId::Graph => &COVEQL_GRAPH_PROFILE_CONTRACT,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CoveQlConformanceProfile {
+    pub language_version: &'static str,
+    pub core_version: &'static str,
+    pub grammar_version: &'static str,
+    pub resolved_ast_version: &'static str,
+    pub logical_plan_version: &'static str,
+    pub physical_plan_version: &'static str,
+    pub explain_json_schema_version: &'static str,
+    pub profile_contract_version: &'static str,
+    pub bridge_contract_version: &'static str,
+    pub object_profile_version: &'static str,
+    pub table_profile_version: &'static str,
+    pub graph_profile_version: &'static str,
     pub projection_dependency_contract_version: &'static str,
     pub predicate_normal_form_version: &'static str,
     pub coded_operator_contract_version: &'static str,
     pub predicate_representation_contract_version: &'static str,
     pub physical_operator_contract_version: &'static str,
     pub physical_sidecar_validation_version: &'static str,
-    pub datafusion_oql_report_version: &'static str,
+    pub datafusion_coveql_report_version: &'static str,
     pub mandatory_history_modes: &'static [&'static str],
     pub mandatory_change_modes: &'static [&'static str],
     pub mandatory_functions: &'static [&'static str],
@@ -208,11 +618,11 @@ pub struct CoveOqlConformanceProfile {
     pub required_datafusion_scan_negotiation_fields: &'static [&'static str],
     pub required_diagnostic_fields: &'static [&'static str],
     pub required_diagnostic_codes: &'static [&'static str],
-    pub conformance_tiers: &'static [CoveOqlConformanceTier],
+    pub conformance_tiers: &'static [CoveQlConformanceTier],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub struct CoveOqlConformanceTier {
+pub struct CoveQlConformanceTier {
     pub tier: u8,
     pub name: &'static str,
     pub authority: &'static str,
@@ -220,26 +630,32 @@ pub struct CoveOqlConformanceTier {
     pub required_invariant: &'static str,
 }
 
-pub const COVE_OQL_CONFORMANCE_PROFILE: CoveOqlConformanceProfile = CoveOqlConformanceProfile {
-    language_version: COVE_OQL_LANGUAGE_VERSION,
-    grammar_version: COVE_OQL_GRAMMAR_VERSION,
+pub const COVEQL_CONFORMANCE_PROFILE: CoveQlConformanceProfile = CoveQlConformanceProfile {
+    language_version: COVEQL_LANGUAGE_VERSION,
+    core_version: COVEQL_CORE_VERSION,
+    grammar_version: COVEQL_GRAMMAR_VERSION,
     resolved_ast_version: RESOLVED_AST_VERSION,
     logical_plan_version: LOGICAL_PLAN_VERSION,
     physical_plan_version: PHYSICAL_PLAN_VERSION,
     explain_json_schema_version: EXPLAIN_JSON_SCHEMA_VERSION,
+    profile_contract_version: COVEQL_PROFILE_CONTRACT_VERSION,
+    bridge_contract_version: COVEQL_BRIDGE_CONTRACT_VERSION,
+    object_profile_version: COVEQL_OBJECT_PROFILE_VERSION,
+    table_profile_version: COVEQL_TABLE_PROFILE_VERSION,
+    graph_profile_version: COVEQL_GRAPH_PROFILE_VERSION,
     projection_dependency_contract_version: PROJECTION_DEPENDENCY_CONTRACT_VERSION,
     predicate_normal_form_version: PREDICATE_NORMAL_FORM_VERSION,
     coded_operator_contract_version: CODED_OPERATOR_CONTRACT_VERSION,
     predicate_representation_contract_version: PREDICATE_REPRESENTATION_CONTRACT_VERSION,
     physical_operator_contract_version: PHYSICAL_OPERATOR_CONTRACT_VERSION,
     physical_sidecar_validation_version: PHYSICAL_SIDECAR_VALIDATION_VERSION,
-    datafusion_oql_report_version: DATAFUSION_OQL_REPORT_VERSION,
+    datafusion_coveql_report_version: DATAFUSION_COVEQL_REPORT_VERSION,
     mandatory_history_modes: &["records", "states", "records_and_states"],
     mandatory_change_modes: &[
         "records",
         "state_transitions",
         "property_diffs",
-        "final_objects",
+        "final_rows",
     ],
     mandatory_functions: &[
         "isNull",
@@ -262,6 +678,7 @@ pub const COVE_OQL_CONFORMANCE_PROFILE: CoveOqlConformanceProfile = CoveOqlConfo
         "evidence()",
         "evidence(self)",
         "evidence(path)",
+        "evidence(root as binding)",
         "evidence(association(...))",
         "evidence(projection(...))",
     ],
@@ -329,7 +746,7 @@ pub const COVE_OQL_CONFORMANCE_PROFILE: CoveOqlConformanceProfile = CoveOqlConfo
         "dataset_file_count",
         "received_projection_columns",
         "projection_pushdown_supported",
-        "projection_pushed_to_oql",
+        "projection_pushed_to_coveql",
         "pushed_projection_columns",
         "received_filters",
         "filter_outcomes",
@@ -337,11 +754,11 @@ pub const COVE_OQL_CONFORMANCE_PROFILE: CoveOqlConformanceProfile = CoveOqlConfo
         "trusted_filters",
         "residual_filters",
         "rejected_filters",
-        "lowered_oql_predicates",
+        "lowered_coveql_predicates",
         "proof_states",
         "filters_trusted_exact",
         "received_limit",
-        "limit_pushed_to_oql",
+        "limit_pushed_to_coveql",
         "pushed_limit",
         "residual_filter_authority",
         "scan_execution_policy",
@@ -379,12 +796,20 @@ pub const COVE_OQL_CONFORMANCE_PROFILE: CoveOqlConformanceProfile = CoveOqlConfo
         "E_INDEX_ONLY_FORBIDDEN",
         "E_ZERO_COPY_FORBIDDEN",
         "E_DATAFUSION_PUSH_FILTER_UNSAFE",
+        "E_UNSUPPORTED_PROFILE",
+        "E_UNSUPPORTED_PROFILE_METHOD",
+        "E_UNKNOWN_TABLE_SURFACE",
+        "E_UNKNOWN_GRAPH_LABEL",
+        "E_UNKNOWN_BRIDGE",
+        "E_AMBIGUOUS_PROFILE",
+        "E_UNKNOWN_BINDING",
+        "E_BINDING_OUT_OF_SCOPE",
     ],
     conformance_tiers: &[
-        CoveOqlConformanceTier {
+        CoveQlConformanceTier {
             tier: 0,
             name: "semantic_correctness",
-            authority: "materialized_oql",
+            authority: "materialized_coveql",
             required_surfaces: &[
                 "object",
                 "association",
@@ -397,12 +822,12 @@ pub const COVE_OQL_CONFORMANCE_PROFILE: CoveOqlConformanceProfile = CoveOqlConfo
                 "explain",
             ],
             required_invariant:
-                "valid Cove-OQL semantics match materialized COVE-O/COVE-MAP readback without relying on optional accelerators",
+                "valid CoveQL semantics match materialized COVE-O/COVE-MAP readback without relying on optional accelerators",
         },
-        CoveOqlConformanceTier {
+        CoveQlConformanceTier {
             tier: 1,
             name: "fallback_invariance",
-            authority: "materialized_oql_with_explicit_fallbacks",
+            authority: "materialized_coveql_with_explicit_fallbacks",
             required_surfaces: &[
                 "absent_optional_metadata",
                 "valid_optional_metadata",
@@ -414,7 +839,7 @@ pub const COVE_OQL_CONFORMANCE_PROFILE: CoveOqlConformanceProfile = CoveOqlConfo
             required_invariant:
                 "optional metadata may change plans and diagnostics but not visible rows unless policy requires a structured rejection",
         },
-        CoveOqlConformanceTier {
+        CoveQlConformanceTier {
             tier: 2,
             name: "acceleration_proof",
             authority: "optimized_output_compared_or_proven_equivalent",
@@ -433,8 +858,8 @@ pub const COVE_OQL_CONFORMANCE_PROFILE: CoveOqlConformanceProfile = CoveOqlConfo
     ],
 };
 
-pub fn conformance_profile() -> &'static CoveOqlConformanceProfile {
-    &COVE_OQL_CONFORMANCE_PROFILE
+pub fn conformance_profile() -> &'static CoveQlConformanceProfile {
+    &COVEQL_CONFORMANCE_PROFILE
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -455,6 +880,18 @@ pub const EXPLAIN_JSON_SCHEMA: ExplainJsonSchema = ExplainJsonSchema {
     required_top_level_fields: &[
         "schema_version",
         "mode",
+        "coveql_version",
+        "core_version",
+        "primary_profile",
+        "profiles",
+        "profile_contracts",
+        "root",
+        "grain",
+        "operation",
+        "temporal_mode",
+        "canonical_order",
+        "visibility_applied",
+        "redaction_applied",
         "fingerprints",
         "operation_context",
         "logical_plan",
@@ -475,6 +912,7 @@ pub const EXPLAIN_JSON_SCHEMA: ExplainJsonSchema = ExplainJsonSchema {
     ],
     required_operation_context_fields: &[
         "language_version",
+        "core_version",
         "grammar_version",
         "resolved_ast_version",
         "logical_plan_version",
@@ -482,6 +920,8 @@ pub const EXPLAIN_JSON_SCHEMA: ExplainJsonSchema = ExplainJsonSchema {
         "projection_dependency_contract_version",
         "predicate_normal_form_version",
         "explain_json_schema_version",
+        "profile_contract_version",
+        "bridge_contract_version",
         "operation",
         "file_len",
         "file_id",
@@ -503,12 +943,12 @@ pub const EXPLAIN_JSON_SCHEMA: ExplainJsonSchema = ExplainJsonSchema {
         "redaction_applied",
         "security",
     ],
-    required_coded_execution_fields: COVE_OQL_CONFORMANCE_PROFILE.required_coded_explain_fields,
-    required_coded_operator_contract_fields: COVE_OQL_CONFORMANCE_PROFILE
+    required_coded_execution_fields: COVEQL_CONFORMANCE_PROFILE.required_coded_explain_fields,
+    required_coded_operator_contract_fields: COVEQL_CONFORMANCE_PROFILE
         .required_coded_operator_contract_fields,
-    required_physical_sidecar_validation_fields: COVE_OQL_CONFORMANCE_PROFILE
+    required_physical_sidecar_validation_fields: COVEQL_CONFORMANCE_PROFILE
         .required_physical_sidecar_validation_fields,
-    required_physical_plan_sidecar_fields: COVE_OQL_CONFORMANCE_PROFILE
+    required_physical_plan_sidecar_fields: COVEQL_CONFORMANCE_PROFILE
         .required_physical_plan_sidecar_fields,
 };
 
@@ -517,9 +957,9 @@ pub fn explain_json_schema() -> &'static ExplainJsonSchema {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CoveOqlOperationRequest {
-    pub selected_operation: CoveOqlSelectedOperation,
-    pub output_mode: CoveOqlOutputMode,
+pub struct CoveQlOperationRequest {
+    pub selected_operation: CoveQlSelectedOperation,
+    pub output_mode: CoveQlOutputMode,
     pub temporal: TemporalContext,
     pub branch: BranchContext,
     pub tombstone: TombstoneContext,
@@ -534,11 +974,11 @@ pub struct CoveOqlOperationRequest {
     pub cache_hook: Option<CacheHookRef>,
 }
 
-impl Default for CoveOqlOperationRequest {
+impl Default for CoveQlOperationRequest {
     fn default() -> Self {
         Self {
-            selected_operation: CoveOqlSelectedOperation::Object,
-            output_mode: CoveOqlOutputMode::ObjectRows,
+            selected_operation: CoveQlSelectedOperation::Object,
+            output_mode: CoveQlOutputMode::ObjectRows,
             temporal: TemporalContext::default(),
             branch: BranchContext::default(),
             tombstone: TombstoneContext::default(),
@@ -557,9 +997,12 @@ impl Default for CoveOqlOperationRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum CoveOqlSelectedOperation {
+pub enum CoveQlSelectedOperation {
     Object,
     Association,
+    GraphNode,
+    GraphEdge,
+    Table,
     Projection,
     Evidence,
     IndexOnlyAnswer,
@@ -567,16 +1010,19 @@ pub enum CoveOqlSelectedOperation {
         zero_copy_requested: bool,
     },
     Explain {
-        target: CoveOqlExplainTarget,
+        target: CoveQlExplainTarget,
         mode: ExplainMode,
     },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum CoveOqlExplainTarget {
+pub enum CoveQlExplainTarget {
     Object,
     Association,
+    GraphNode,
+    GraphEdge,
+    Table,
     Projection,
     Evidence,
     IndexOnlyAnswer,
@@ -585,7 +1031,7 @@ pub enum CoveOqlExplainTarget {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum CoveOqlOutputMode {
+pub enum CoveQlOutputMode {
     ObjectRows,
     AssociationRows,
     EvidenceRows,
@@ -624,6 +1070,7 @@ pub enum TemporalMode {
     ChangesRecords,
     ChangesStateTransitions,
     ChangesPropertyDiffs,
+    #[serde(rename = "changes_final_rows", alias = "changes_final_objects")]
     ChangesFinalObjects,
 }
 
@@ -804,6 +1251,10 @@ pub struct ResourceBudgetPolicy {
     pub maximum_rows_without_explicit_take: usize,
     pub maximum_decode_bytes: usize,
     pub maximum_range_requests: usize,
+    pub maximum_graph_traversal_depth: u32,
+    pub maximum_graph_traversal_fanout: usize,
+    pub maximum_graph_traversal_paths: usize,
+    pub maximum_graph_traversal_frontier: usize,
     pub maximum_planning_time_ms: u64,
     pub maximum_execution_time_ms: u64,
 }
@@ -821,6 +1272,10 @@ impl Default for ResourceBudgetPolicy {
             maximum_rows_without_explicit_take: 10_000,
             maximum_decode_bytes: 512 * 1024 * 1024,
             maximum_range_requests: 10_000,
+            maximum_graph_traversal_depth: 8,
+            maximum_graph_traversal_fanout: 10_000,
+            maximum_graph_traversal_paths: 100_000,
+            maximum_graph_traversal_frontier: 100_000,
             maximum_planning_time_ms: 5_000,
             maximum_execution_time_ms: 60_000,
         }
@@ -839,6 +1294,10 @@ pub struct ResourceUseEstimate {
     pub rows_without_explicit_take: Option<usize>,
     pub decode_bytes: Option<usize>,
     pub range_requests: Option<usize>,
+    pub graph_traversal_depth: Option<u32>,
+    pub graph_traversal_fanout: Option<usize>,
+    pub graph_traversal_paths: Option<usize>,
+    pub graph_traversal_frontier: Option<usize>,
     pub planning_time_ms: Option<u64>,
     pub execution_time_ms: Option<u64>,
 }
@@ -851,14 +1310,17 @@ pub struct CacheHookRef {
 #[derive(Debug, Clone)]
 pub struct OperationContext {
     pub language_version: &'static str,
+    pub core_version: &'static str,
     pub grammar_version: &'static str,
     pub resolved_ast_version: &'static str,
     pub logical_plan_version: &'static str,
     pub physical_plan_version: &'static str,
     pub explain_json_schema_version: &'static str,
+    pub profile_contract_version: &'static str,
+    pub bridge_contract_version: &'static str,
     pub projection_dependency_contract_version: &'static str,
     pub predicate_normal_form_version: &'static str,
-    pub request: CoveOqlOperationRequest,
+    pub request: CoveQlOperationRequest,
     pub selected_feature_uses: Vec<FeatureUseRequestV2>,
     pub file: ValidatedFileIdentity,
     pub dataset: DatasetScopeContext,
@@ -874,7 +1336,7 @@ pub struct OperationContext {
     pub optional_metadata: Vec<OptionalMetadataOutcome>,
     pub fallbacks: Vec<FallbackReport>,
     pub rejections: Vec<RejectionReport>,
-    pub diagnostics: Vec<OqlDiagnostic>,
+    pub diagnostics: Vec<CoveQlDiagnostic>,
 }
 
 impl OperationContext {
@@ -894,7 +1356,7 @@ pub struct DatasetOperationContext {
     pub explain_json_schema_version: &'static str,
     pub projection_dependency_contract_version: &'static str,
     pub predicate_normal_form_version: &'static str,
-    pub request: CoveOqlOperationRequest,
+    pub request: CoveQlOperationRequest,
     pub dataset: DatasetScopeContext,
     pub temporal: TemporalContext,
     pub branch: BranchContext,
@@ -903,7 +1365,7 @@ pub struct DatasetOperationContext {
     pub resource_budget: ResourceBudgetPolicy,
     pub fallbacks: Vec<FallbackReport>,
     pub rejections: Vec<RejectionReport>,
-    pub diagnostics: Vec<OqlDiagnostic>,
+    pub diagnostics: Vec<CoveQlDiagnostic>,
 }
 
 #[cfg(feature = "datafusion")]
@@ -928,7 +1390,7 @@ impl DatasetOperationContext {
             },
             "fallbacks": self.fallbacks.iter().map(FallbackReport::to_json).collect::<Vec<_>>(),
             "rejections": self.rejections.iter().map(RejectionReport::to_json).collect::<Vec<_>>(),
-            "diagnostics": self.diagnostics.iter().map(OqlDiagnostic::to_json).collect::<Vec<_>>(),
+            "diagnostics": self.diagnostics.iter().map(CoveQlDiagnostic::to_json).collect::<Vec<_>>(),
         })
     }
 }
@@ -936,7 +1398,7 @@ impl DatasetOperationContext {
 #[cfg(feature = "datafusion")]
 pub fn build_dataset_operation_context(
     dataset: &cove_datafusion::dataset_state::DatasetState,
-    request: CoveOqlOperationRequest,
+    request: CoveQlOperationRequest,
 ) -> Result<DatasetOperationContext, BuildOperationContextError> {
     check_resource_budget(&request)?;
 
@@ -946,8 +1408,8 @@ pub fn build_dataset_operation_context(
     let dataset = dataset_scope_context_from_state(dataset);
 
     Ok(DatasetOperationContext {
-        language_version: COVE_OQL_LANGUAGE_VERSION,
-        grammar_version: COVE_OQL_GRAMMAR_VERSION,
+        language_version: COVEQL_LANGUAGE_VERSION,
+        grammar_version: COVEQL_GRAMMAR_VERSION,
         resolved_ast_version: RESOLVED_AST_VERSION,
         logical_plan_version: LOGICAL_PLAN_VERSION,
         physical_plan_version: PHYSICAL_PLAN_VERSION,
@@ -1564,7 +2026,7 @@ pub enum DiagnosticSeverity {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OqlDiagnostic {
+pub struct CoveQlDiagnostic {
     pub code: String,
     pub severity: DiagnosticSeverity,
     pub message: String,
@@ -1573,7 +2035,7 @@ pub struct OqlDiagnostic {
     pub redacted: bool,
 }
 
-impl OqlDiagnostic {
+impl CoveQlDiagnostic {
     fn error(
         code: impl Into<String>,
         message: impl Into<String>,
@@ -1619,13 +2081,13 @@ impl OqlDiagnostic {
 
 #[derive(Debug, Clone)]
 pub struct BuildOperationContextError {
-    pub diagnostics: Vec<OqlDiagnostic>,
+    pub diagnostics: Vec<CoveQlDiagnostic>,
     pub rejections: Vec<RejectionReport>,
     pub source: Option<String>,
 }
 
 impl BuildOperationContextError {
-    fn single(diagnostic: OqlDiagnostic, rejection: RejectionReport) -> Self {
+    fn single(diagnostic: CoveQlDiagnostic, rejection: RejectionReport) -> Self {
         Self {
             diagnostics: vec![diagnostic],
             rejections: vec![rejection],
@@ -1638,7 +2100,7 @@ impl BuildOperationContextError {
             "operation_context",
             self.diagnostics
                 .iter()
-                .map(OqlDiagnostic::to_json)
+                .map(CoveQlDiagnostic::to_json)
                 .collect(),
             self.rejections
                 .iter()
@@ -1653,7 +2115,7 @@ impl fmt::Display for BuildOperationContextError {
         if let Some(diagnostic) = self.diagnostics.first() {
             write!(f, "{}: {}", diagnostic.code, diagnostic.message)
         } else {
-            write!(f, "Cove-OQL operation context build failed")
+            write!(f, "CoveQL operation context build failed")
         }
     }
 }
@@ -1662,7 +2124,7 @@ impl Error for BuildOperationContextError {}
 
 pub fn build_operation_context(
     bytes: &[u8],
-    request: CoveOqlOperationRequest,
+    request: CoveQlOperationRequest,
     validation_options: ValidationOptions,
 ) -> Result<OperationContext, BuildOperationContextError> {
     check_resource_budget(&request)?;
@@ -1693,7 +2155,7 @@ pub fn build_operation_context(
 
     let first_report = first_report.ok_or_else(|| {
         BuildOperationContextError::single(
-            OqlDiagnostic::error(
+            CoveQlDiagnostic::error(
                 "E_UNSUPPORTED_CONSTRUCT",
                 "selected operation produced no feature-use request",
                 "operation_context",
@@ -1739,12 +2201,15 @@ pub fn build_operation_context(
     );
 
     Ok(OperationContext {
-        language_version: COVE_OQL_LANGUAGE_VERSION,
-        grammar_version: COVE_OQL_GRAMMAR_VERSION,
+        language_version: COVEQL_LANGUAGE_VERSION,
+        core_version: COVEQL_CORE_VERSION,
+        grammar_version: COVEQL_GRAMMAR_VERSION,
         resolved_ast_version: RESOLVED_AST_VERSION,
         logical_plan_version: LOGICAL_PLAN_VERSION,
         physical_plan_version: PHYSICAL_PLAN_VERSION,
         explain_json_schema_version: EXPLAIN_JSON_SCHEMA_VERSION,
+        profile_contract_version: COVEQL_PROFILE_CONTRACT_VERSION,
+        bridge_contract_version: COVEQL_BRIDGE_CONTRACT_VERSION,
         projection_dependency_contract_version: PROJECTION_DEPENDENCY_CONTRACT_VERSION,
         predicate_normal_form_version: PREDICATE_NORMAL_FORM_VERSION,
         selected_feature_uses: feature_uses,
@@ -1769,7 +2234,7 @@ pub fn build_operation_context(
 
 fn execution_code_domain_contexts(
     bytes: &[u8],
-    request: &CoveOqlOperationRequest,
+    request: &CoveQlOperationRequest,
     validation_options: &ValidationOptions,
     dataset: &DatasetScopeContext,
 ) -> Vec<ExecutionCodeDomainContext> {
@@ -2074,7 +2539,7 @@ fn parse_first_map_section<T>(
         })
 }
 
-pub fn selected_feature_uses(request: &CoveOqlOperationRequest) -> Vec<FeatureUseRequestV2> {
+pub fn selected_feature_uses(request: &CoveQlOperationRequest) -> Vec<FeatureUseRequestV2> {
     let mut uses = Vec::new();
     append_operation_feature_uses(&request.selected_operation, &request.output_mode, &mut uses);
     if request.execution_code_mapping_requested {
@@ -2091,17 +2556,20 @@ pub fn selected_feature_uses(request: &CoveOqlOperationRequest) -> Vec<FeatureUs
 }
 
 fn append_operation_feature_uses(
-    selected_operation: &CoveOqlSelectedOperation,
-    output_mode: &CoveOqlOutputMode,
+    selected_operation: &CoveQlSelectedOperation,
+    output_mode: &CoveQlOutputMode,
     out: &mut Vec<FeatureUseRequestV2>,
 ) {
     match selected_operation {
-        CoveOqlSelectedOperation::Object => push_object(out),
-        CoveOqlSelectedOperation::Association => push_object(out),
-        CoveOqlSelectedOperation::Projection => push_projection(out),
-        CoveOqlSelectedOperation::Evidence => push_evidence(out),
-        CoveOqlSelectedOperation::IndexOnlyAnswer => push_index_only(out),
-        CoveOqlSelectedOperation::ArrowExport {
+        CoveQlSelectedOperation::Object => push_object(out),
+        CoveQlSelectedOperation::Association => push_object(out),
+        CoveQlSelectedOperation::GraphNode => push_object(out),
+        CoveQlSelectedOperation::GraphEdge => push_object(out),
+        CoveQlSelectedOperation::Table => push_projection(out),
+        CoveQlSelectedOperation::Projection => push_projection(out),
+        CoveQlSelectedOperation::Evidence => push_evidence(out),
+        CoveQlSelectedOperation::IndexOnlyAnswer => push_index_only(out),
+        CoveQlSelectedOperation::ArrowExport {
             zero_copy_requested,
         } => {
             push_object(out);
@@ -2109,7 +2577,7 @@ fn append_operation_feature_uses(
                 push_zero_copy(out);
             }
         }
-        CoveOqlSelectedOperation::Explain { target, .. } => {
+        CoveQlSelectedOperation::Explain { target, .. } => {
             append_explain_target_feature_uses(target, out);
             append_explain_mapping_feature_uses(target, out);
             push_profile_and_operation(
@@ -2120,7 +2588,7 @@ fn append_operation_feature_uses(
         }
     }
 
-    if let CoveOqlOutputMode::ArrowRecordBatch {
+    if let CoveQlOutputMode::ArrowRecordBatch {
         zero_copy_requested: true,
     } = output_mode
     {
@@ -2129,30 +2597,34 @@ fn append_operation_feature_uses(
 }
 
 fn append_explain_mapping_feature_uses(
-    target: &CoveOqlExplainTarget,
+    target: &CoveQlExplainTarget,
     out: &mut Vec<FeatureUseRequestV2>,
 ) {
     match target {
-        CoveOqlExplainTarget::Projection | CoveOqlExplainTarget::Evidence => {
-            push_mapping_explanation(out)
-        }
-        CoveOqlExplainTarget::Object
-        | CoveOqlExplainTarget::Association
-        | CoveOqlExplainTarget::IndexOnlyAnswer
-        | CoveOqlExplainTarget::ArrowExport { .. } => {}
+        CoveQlExplainTarget::Table
+        | CoveQlExplainTarget::Projection
+        | CoveQlExplainTarget::Evidence => push_mapping_explanation(out),
+        CoveQlExplainTarget::Object
+        | CoveQlExplainTarget::Association
+        | CoveQlExplainTarget::GraphNode
+        | CoveQlExplainTarget::GraphEdge
+        | CoveQlExplainTarget::IndexOnlyAnswer
+        | CoveQlExplainTarget::ArrowExport { .. } => {}
     }
 }
 
 fn append_explain_target_feature_uses(
-    target: &CoveOqlExplainTarget,
+    target: &CoveQlExplainTarget,
     out: &mut Vec<FeatureUseRequestV2>,
 ) {
     match target {
-        CoveOqlExplainTarget::Object | CoveOqlExplainTarget::Association => push_object(out),
-        CoveOqlExplainTarget::Projection => push_projection(out),
-        CoveOqlExplainTarget::Evidence => push_evidence(out),
-        CoveOqlExplainTarget::IndexOnlyAnswer => push_index_only(out),
-        CoveOqlExplainTarget::ArrowExport {
+        CoveQlExplainTarget::Object | CoveQlExplainTarget::Association => push_object(out),
+        CoveQlExplainTarget::GraphNode | CoveQlExplainTarget::GraphEdge => push_object(out),
+        CoveQlExplainTarget::Table => push_projection(out),
+        CoveQlExplainTarget::Projection => push_projection(out),
+        CoveQlExplainTarget::Evidence => push_evidence(out),
+        CoveQlExplainTarget::IndexOnlyAnswer => push_index_only(out),
+        CoveQlExplainTarget::ArrowExport {
             zero_copy_requested,
         } => {
             push_object(out);
@@ -2259,15 +2731,15 @@ fn feature_use_key(
 }
 
 fn enforce_security_gates(
-    request: &CoveOqlOperationRequest,
-    diagnostics: &mut Vec<OqlDiagnostic>,
+    request: &CoveQlOperationRequest,
+    diagnostics: &mut Vec<CoveQlDiagnostic>,
     fallbacks: &mut Vec<FallbackReport>,
 ) -> Result<(), BuildOperationContextError> {
     if selected_operation_requires_index_only(&request.selected_operation)
         && !request.security.index_only_answer_permission
     {
         return Err(BuildOperationContextError::single(
-            OqlDiagnostic::error(
+            CoveQlDiagnostic::error(
                 "E_INDEX_ONLY_FORBIDDEN",
                 "index-only answers are not permitted by the active security context",
                 "security",
@@ -2282,7 +2754,7 @@ fn enforce_security_gates(
     if zero_copy_requested(request) && !request.security.zero_copy_permission {
         match request.fallback_policy {
             FallbackPolicy::AllowMaterializedFallback => {
-                diagnostics.push(OqlDiagnostic::warning(
+                diagnostics.push(CoveQlDiagnostic::warning(
                     "E_ZERO_COPY_FORBIDDEN",
                     "zero-copy output is not permitted; materialized owned buffers are required",
                     "security",
@@ -2295,7 +2767,7 @@ fn enforce_security_gates(
             }
             FallbackPolicy::RejectOnFallback => {
                 return Err(BuildOperationContextError::single(
-                    OqlDiagnostic::error(
+                    CoveQlDiagnostic::error(
                         "E_ZERO_COPY_FORBIDDEN",
                         "zero-copy output is not permitted by the active security context",
                         "security",
@@ -2320,7 +2792,7 @@ fn enforce_security_gates(
                 | ExplainMode::Forensic
         ) && !protected_allowed
         {
-            diagnostics.push(OqlDiagnostic::warning(
+            diagnostics.push(CoveQlDiagnostic::warning(
                 "E_SECURITY_DISCLOSURE_FORBIDDEN",
                 "protected explain metadata will be redacted",
                 "security",
@@ -2332,7 +2804,7 @@ fn enforce_security_gates(
 }
 
 fn check_resource_budget(
-    request: &CoveOqlOperationRequest,
+    request: &CoveQlOperationRequest,
 ) -> Result<(), BuildOperationContextError> {
     let budget = &request.resource_budget;
     let usage = &request.resource_use;
@@ -2382,6 +2854,26 @@ fn check_resource_budget(
         budget.maximum_range_requests,
         "maximum_range_requests",
     )?;
+    check_u32(
+        usage.graph_traversal_depth,
+        budget.maximum_graph_traversal_depth,
+        "maximum_graph_traversal_depth",
+    )?;
+    check_usize(
+        usage.graph_traversal_fanout,
+        budget.maximum_graph_traversal_fanout,
+        "maximum_graph_traversal_fanout",
+    )?;
+    check_usize(
+        usage.graph_traversal_paths,
+        budget.maximum_graph_traversal_paths,
+        "maximum_graph_traversal_paths",
+    )?;
+    check_usize(
+        usage.graph_traversal_frontier,
+        budget.maximum_graph_traversal_frontier,
+        "maximum_graph_traversal_frontier",
+    )?;
     check_u64(
         usage.planning_time_ms,
         budget.maximum_planning_time_ms,
@@ -2398,6 +2890,23 @@ fn check_resource_budget(
 fn check_usize(
     value: Option<usize>,
     limit: usize,
+    field: &str,
+) -> Result<(), BuildOperationContextError> {
+    if let Some(value) = value {
+        if value > limit {
+            return Err(resource_budget_error(
+                field,
+                value.to_string(),
+                limit.to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn check_u32(
+    value: Option<u32>,
+    limit: u32,
     field: &str,
 ) -> Result<(), BuildOperationContextError> {
     if let Some(value) = value {
@@ -2431,7 +2940,7 @@ fn check_u64(
 
 fn resource_budget_error(field: &str, value: String, limit: String) -> BuildOperationContextError {
     BuildOperationContextError::single(
-        OqlDiagnostic::error(
+        CoveQlDiagnostic::error(
             "E_RESOURCE_BUDGET_EXCEEDED",
             format!("{field} budget exceeded: {value} > {limit}"),
             "planning",
@@ -2447,7 +2956,7 @@ fn validation_error(error: CoveError, phase: &'static str) -> BuildOperationCont
     let code = diagnostic_code_for_error(&error);
     let message = error.to_string();
     BuildOperationContextError::single(
-        OqlDiagnostic::error(code, message.clone(), phase),
+        CoveQlDiagnostic::error(code, message.clone(), phase),
         RejectionReport {
             kind: RejectionKind::FeatureValidation,
             reason: message,
@@ -2581,41 +3090,41 @@ fn optional_kind_for_section(kind: SectionKind) -> Option<OptionalMetadataKind> 
     }
 }
 
-fn selected_operation_requires_index_only(operation: &CoveOqlSelectedOperation) -> bool {
-    matches!(operation, CoveOqlSelectedOperation::IndexOnlyAnswer)
+fn selected_operation_requires_index_only(operation: &CoveQlSelectedOperation) -> bool {
+    matches!(operation, CoveQlSelectedOperation::IndexOnlyAnswer)
         || matches!(
             operation,
-            CoveOqlSelectedOperation::Explain {
-                target: CoveOqlExplainTarget::IndexOnlyAnswer,
+            CoveQlSelectedOperation::Explain {
+                target: CoveQlExplainTarget::IndexOnlyAnswer,
                 ..
             }
         )
 }
 
-fn zero_copy_requested(request: &CoveOqlOperationRequest) -> bool {
+fn zero_copy_requested(request: &CoveQlOperationRequest) -> bool {
     match &request.selected_operation {
-        CoveOqlSelectedOperation::ArrowExport {
+        CoveQlSelectedOperation::ArrowExport {
             zero_copy_requested: true,
         } => true,
-        CoveOqlSelectedOperation::Explain {
+        CoveQlSelectedOperation::Explain {
             target:
-                CoveOqlExplainTarget::ArrowExport {
+                CoveQlExplainTarget::ArrowExport {
                     zero_copy_requested: true,
                 },
             ..
         } => true,
         _ => matches!(
             request.output_mode,
-            CoveOqlOutputMode::ArrowRecordBatch {
+            CoveQlOutputMode::ArrowRecordBatch {
                 zero_copy_requested: true
             }
         ),
     }
 }
 
-fn requested_explain_mode(operation: &CoveOqlSelectedOperation) -> Option<ExplainMode> {
+fn requested_explain_mode(operation: &CoveQlSelectedOperation) -> Option<ExplainMode> {
     match operation {
-        CoveOqlSelectedOperation::Explain { mode, .. } => Some(*mode),
+        CoveQlSelectedOperation::Explain { mode, .. } => Some(*mode),
         _ => None,
     }
 }
@@ -2689,7 +3198,7 @@ impl From<&ValidatedCoveFile> for ValidatedFileIdentity {
 
 fn manifest_scope_error(message: String) -> BuildOperationContextError {
     BuildOperationContextError::single(
-        OqlDiagnostic::error(
+        CoveQlDiagnostic::error(
             "E_UNSUPPORTED_DATASET_SCOPE",
             message.clone(),
             "dataset_manifest",
@@ -3327,7 +3836,7 @@ fn code_domain_bridges_from_state(
                 security_scope_id: None,
                 exact: !multi_file,
                 reason: if multi_file {
-                    "multi-file OQL scope exposes matching domain metadata, but raw FileCode equality is not trusted without an explicit canonical remap under the query snapshot".into()
+                    "multi-file CoveQL scope exposes matching domain metadata, but raw FileCode equality is not trusted without an explicit canonical remap under the query snapshot".into()
                 } else {
                     "single-file scope keeps FileCode comparisons within one file-local domain".into()
                 },
@@ -3338,15 +3847,18 @@ fn code_domain_bridges_from_state(
 }
 
 #[cfg(feature = "datafusion")]
-fn selected_operation_name(operation: &CoveOqlSelectedOperation) -> &'static str {
+fn selected_operation_name(operation: &CoveQlSelectedOperation) -> &'static str {
     match operation {
-        CoveOqlSelectedOperation::Object => "object",
-        CoveOqlSelectedOperation::Association => "association",
-        CoveOqlSelectedOperation::Projection => "projection",
-        CoveOqlSelectedOperation::Evidence => "evidence",
-        CoveOqlSelectedOperation::IndexOnlyAnswer => "index_only_answer",
-        CoveOqlSelectedOperation::ArrowExport { .. } => "arrow_export",
-        CoveOqlSelectedOperation::Explain { .. } => "explain",
+        CoveQlSelectedOperation::Object => "object",
+        CoveQlSelectedOperation::Association => "association",
+        CoveQlSelectedOperation::GraphNode => "graph_node",
+        CoveQlSelectedOperation::GraphEdge => "graph_edge",
+        CoveQlSelectedOperation::Table => "table",
+        CoveQlSelectedOperation::Projection => "projection",
+        CoveQlSelectedOperation::Evidence => "evidence",
+        CoveQlSelectedOperation::IndexOnlyAnswer => "index_only_answer",
+        CoveQlSelectedOperation::ArrowExport { .. } => "arrow_export",
+        CoveQlSelectedOperation::Explain { .. } => "explain",
     }
 }
 
@@ -3354,16 +3866,16 @@ fn selected_operation_name(operation: &CoveOqlSelectedOperation) -> &'static str
 mod tests {
     use super::*;
 
-    fn request(selected_operation: CoveOqlSelectedOperation) -> CoveOqlOperationRequest {
-        CoveOqlOperationRequest {
+    fn request(selected_operation: CoveQlSelectedOperation) -> CoveQlOperationRequest {
+        CoveQlOperationRequest {
             selected_operation,
-            ..CoveOqlOperationRequest::default()
+            ..CoveQlOperationRequest::default()
         }
     }
 
     #[test]
     fn object_maps_to_object_reconstruction() {
-        let uses = selected_feature_uses(&request(CoveOqlSelectedOperation::Object));
+        let uses = selected_feature_uses(&request(CoveQlSelectedOperation::Object));
         assert_eq!(uses.len(), 2);
         assert!(uses.iter().any(|feature_use| {
             feature_use.requested_operation == Some(OperationKindV2::ObjectReconstruction)
@@ -3375,12 +3887,12 @@ mod tests {
 
     #[test]
     fn projection_uses_map_and_evidence_uses_object_and_map_metadata() {
-        let projection = selected_feature_uses(&request(CoveOqlSelectedOperation::Projection));
+        let projection = selected_feature_uses(&request(CoveQlSelectedOperation::Projection));
         assert!(projection.iter().any(|feature_use| {
             feature_use.requested_operation == Some(OperationKindV2::ProjectionReadback)
         }));
 
-        let evidence = selected_feature_uses(&request(CoveOqlSelectedOperation::Evidence));
+        let evidence = selected_feature_uses(&request(CoveQlSelectedOperation::Evidence));
         assert!(evidence.iter().any(|feature_use| {
             feature_use.requested_operation == Some(OperationKindV2::ObjectReconstruction)
         }));
@@ -3397,7 +3909,7 @@ mod tests {
 
     #[test]
     fn evidence_helper_request_adds_map_metadata() {
-        let mut req = request(CoveOqlSelectedOperation::Object);
+        let mut req = request(CoveQlSelectedOperation::Object);
         req.evidence_metadata_requested = true;
         let uses = selected_feature_uses(&req);
         assert!(uses.iter().any(|feature_use| {
@@ -3410,7 +3922,7 @@ mod tests {
 
     #[test]
     fn arrow_zero_copy_adds_layout_feature_use() {
-        let uses = selected_feature_uses(&request(CoveOqlSelectedOperation::ArrowExport {
+        let uses = selected_feature_uses(&request(CoveQlSelectedOperation::ArrowExport {
             zero_copy_requested: true,
         }));
         assert_eq!(uses.len(), 4);
@@ -3426,8 +3938,8 @@ mod tests {
 
     #[test]
     fn explain_adds_target_and_coverage_feature_use() {
-        let uses = selected_feature_uses(&request(CoveOqlSelectedOperation::Explain {
-            target: CoveOqlExplainTarget::Projection,
+        let uses = selected_feature_uses(&request(CoveQlSelectedOperation::Explain {
+            target: CoveQlExplainTarget::Projection,
             mode: ExplainMode::Proof,
         }));
         assert_eq!(uses.len(), 5);
@@ -3447,8 +3959,8 @@ mod tests {
 
     #[test]
     fn object_explain_does_not_request_map_metadata_without_map_target_or_helper() {
-        let uses = selected_feature_uses(&request(CoveOqlSelectedOperation::Explain {
-            target: CoveOqlExplainTarget::Object,
+        let uses = selected_feature_uses(&request(CoveQlSelectedOperation::Explain {
+            target: CoveQlExplainTarget::Object,
             mode: ExplainMode::Proof,
         }));
         assert!(uses
@@ -3473,8 +3985,8 @@ mod tests {
 
     #[test]
     fn evidence_explain_requests_evidence_readback_and_mapping_explanation() {
-        let uses = selected_feature_uses(&request(CoveOqlSelectedOperation::Explain {
-            target: CoveOqlExplainTarget::Evidence,
+        let uses = selected_feature_uses(&request(CoveQlSelectedOperation::Explain {
+            target: CoveQlExplainTarget::Evidence,
             mode: ExplainMode::Coded,
         }));
         assert!(uses
@@ -3493,7 +4005,7 @@ mod tests {
 
     #[test]
     fn execution_code_mapping_is_explicit_only() {
-        let mut req = request(CoveOqlSelectedOperation::Object);
+        let mut req = request(CoveQlSelectedOperation::Object);
         assert!(!selected_feature_uses(&req).iter().any(|feature_use| {
             feature_use.requested_operation == Some(OperationKindV2::EngineExecutionMapping)
         }));
@@ -3505,7 +4017,7 @@ mod tests {
 
     #[test]
     fn denied_zero_copy_falls_back_when_allowed() {
-        let mut req = request(CoveOqlSelectedOperation::ArrowExport {
+        let mut req = request(CoveQlSelectedOperation::ArrowExport {
             zero_copy_requested: true,
         });
         let mut diagnostics = Vec::new();
@@ -3521,15 +4033,15 @@ mod tests {
 
     #[test]
     fn denied_index_only_rejects() {
-        let req = request(CoveOqlSelectedOperation::IndexOnlyAnswer);
+        let req = request(CoveQlSelectedOperation::IndexOnlyAnswer);
         let err = enforce_security_gates(&req, &mut Vec::new(), &mut Vec::new()).unwrap_err();
         assert_eq!(err.diagnostics[0].code, "E_INDEX_ONLY_FORBIDDEN");
     }
 
     #[test]
     fn proof_explain_redacts_without_metadata_permission() {
-        let req = request(CoveOqlSelectedOperation::Explain {
-            target: CoveOqlExplainTarget::Object,
+        let req = request(CoveQlSelectedOperation::Explain {
+            target: CoveQlExplainTarget::Object,
             mode: ExplainMode::Proof,
         });
         let mut diagnostics = Vec::new();
@@ -3612,6 +4124,34 @@ mod tests {
                 },
             ),
             (
+                "maximum_graph_traversal_depth",
+                ResourceUseEstimate {
+                    graph_traversal_depth: Some(2),
+                    ..ResourceUseEstimate::default()
+                },
+            ),
+            (
+                "maximum_graph_traversal_fanout",
+                ResourceUseEstimate {
+                    graph_traversal_fanout: Some(2),
+                    ..ResourceUseEstimate::default()
+                },
+            ),
+            (
+                "maximum_graph_traversal_paths",
+                ResourceUseEstimate {
+                    graph_traversal_paths: Some(2),
+                    ..ResourceUseEstimate::default()
+                },
+            ),
+            (
+                "maximum_graph_traversal_frontier",
+                ResourceUseEstimate {
+                    graph_traversal_frontier: Some(2),
+                    ..ResourceUseEstimate::default()
+                },
+            ),
+            (
                 "maximum_planning_time_ms",
                 ResourceUseEstimate {
                     planning_time_ms: Some(2),
@@ -3628,7 +4168,7 @@ mod tests {
         ];
 
         for (field, usage) in cases {
-            let mut req = CoveOqlOperationRequest::default();
+            let mut req = CoveQlOperationRequest::default();
             req.resource_budget = ResourceBudgetPolicy {
                 maximum_query_bytes: 1,
                 maximum_ast_depth: 1,
@@ -3640,6 +4180,10 @@ mod tests {
                 maximum_rows_without_explicit_take: 1,
                 maximum_decode_bytes: 1,
                 maximum_range_requests: 1,
+                maximum_graph_traversal_depth: 1,
+                maximum_graph_traversal_fanout: 1,
+                maximum_graph_traversal_paths: 1,
+                maximum_graph_traversal_frontier: 1,
                 maximum_planning_time_ms: 1,
                 maximum_execution_time_ms: 1,
             };

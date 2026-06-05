@@ -20,9 +20,9 @@ use cove_core::{
     reader::ValidationOptions,
     writer::{MinimalCoveWriter, SectionPayload},
 };
-use cove_oql::{
+use coveql::{
     parse_resolve_and_plan_query, parse_resolve_plan_build_physical_and_execute_query,
-    AssociationOptimizationReport, CoveOqlOutputMode, EvidenceOptimizationReport, ExecutionOptions,
+    AssociationOptimizationReport, CoveQlOutputMode, EvidenceOptimizationReport, ExecutionOptions,
     KernelExecutionMode, KernelExecutionOptions, MaterializedAssociationRow, OutputGrain,
     ParseOptions, PhysicalPlanOptions, PlanOptions, ResolveOptions, SecurityContext,
 };
@@ -244,16 +244,16 @@ fn percent(count: usize, total: usize) -> f64 {
 
 fn json_resolve_options() -> ResolveOptions {
     ResolveOptions {
-        output_mode: Some(CoveOqlOutputMode::JsonRows),
+        output_mode: Some(CoveQlOutputMode::JsonRows),
         ..ResolveOptions::default()
     }
 }
 
 fn protected_json_resolve_options() -> ResolveOptions {
     ResolveOptions {
-        output_mode: Some(CoveOqlOutputMode::JsonRows),
+        output_mode: Some(CoveQlOutputMode::JsonRows),
         security: SecurityContext {
-            metadata_disclosure_policy: cove_oql::MetadataDisclosurePolicy::AllowProtected,
+            metadata_disclosure_policy: coveql::MetadataDisclosurePolicy::AllowProtected,
             ..SecurityContext::default()
         },
         ..ResolveOptions::default()

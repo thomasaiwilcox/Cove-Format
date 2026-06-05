@@ -29,7 +29,7 @@ use serde_json::json;
 use crate::{
     physical_predicate::{default_execution_code_domain, PhysicalExecutionCodeDomainDescriptor},
     physical_sidecars::{PhysicalSidecarInputs, PhysicalSidecarValidation},
-    CoveOqlOutputMode, PlannedQuery,
+    CoveQlOutputMode, PlannedQuery,
 };
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -487,7 +487,7 @@ fn zero_copy_report(
 ) -> ZeroCopyEligibilityReport {
     let requested = matches!(
         planned.resolved.output_mode,
-        CoveOqlOutputMode::ArrowRecordBatch {
+        CoveQlOutputMode::ArrowRecordBatch {
             zero_copy_requested: true
         }
     );
@@ -881,7 +881,7 @@ fn runtime_report(
     if unsupported_required_hint_count > 0 {
         PhysicalSidecarValidation::ignored(
             "cove_r",
-            "runtime compatibility hints include required capabilities unsupported by the default Cove-OQL runtime; hints cannot authorize optimized execution",
+            "runtime compatibility hints include required capabilities unsupported by the default CoveQL runtime; hints cannot authorize optimized execution",
             details,
         )
     } else {

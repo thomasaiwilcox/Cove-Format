@@ -1,4 +1,7 @@
-use std::{cmp::Ordering, collections::BTreeSet};
+use std::{
+    cmp::Ordering,
+    collections::{BTreeMap, BTreeSet},
+};
 
 use cove_core::collation::{CollationKind, Ordering3};
 use serde_json::{json, Number, Value};
@@ -9,9 +12,12 @@ use crate::{
         AssociationEdgeTable,
     },
     evidence_opt::EvidenceGrainIndex,
-    materialized::{ExecutionRow, MaterializedAssociationRow, MaterializedEvidenceRow},
+    materialized::{
+        ExecutionRow, MaterializedAssociationRow, MaterializedEvidenceRow, MaterializedObjectRow,
+        MaterializedProjectionRow,
+    },
     AstCompareOp, ResolvedAssociationRoot, ResolvedEvidenceRoot, ResolvedExpr, ResolvedLiteral,
-    ResolvedLiteralValue, ResolvedPath, ResolvedPredicate,
+    ResolvedLiteralValue, ResolvedPath, ResolvedPredicate, ResolvedTableExists,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,6 +43,8 @@ enum Truth {
 pub(crate) struct EvalContext<'a> {
     association_edges: AssociationEdgeTable,
     evidence_index: EvidenceGrainIndex,
+    visible_object_keys: BTreeSet<(Option<usize>, u32, String)>,
+    table_exists_rows: BTreeMap<String, &'a [MaterializedProjectionRow]>,
     _marker: std::marker::PhantomData<&'a ()>,
 }
 
@@ -46,13 +54,61 @@ impl<'a> EvalContext<'a> {
         evidence_rows: &'a [MaterializedEvidenceRow],
         planned: &crate::PlannedQuery,
     ) -> Self {
-        Self::with_association_valid_at(associations, evidence_rows, association_valid_at(planned))
+        Self::for_plan_with_objects(associations, evidence_rows, &[], planned)
+    }
+
+    pub(crate) fn for_plan_with_objects(
+        associations: &'a [MaterializedAssociationRow],
+        evidence_rows: &'a [MaterializedEvidenceRow],
+        object_rows: &[MaterializedObjectRow],
+        planned: &crate::PlannedQuery,
+    ) -> Self {
+        Self::for_plan_with_objects_and_table_exists_rows(
+            associations,
+            evidence_rows,
+            object_rows,
+            planned,
+            BTreeMap::new(),
+        )
+    }
+
+    pub(crate) fn for_plan_with_table_exists_rows(
+        associations: &'a [MaterializedAssociationRow],
+        evidence_rows: &'a [MaterializedEvidenceRow],
+        planned: &crate::PlannedQuery,
+        table_exists_rows: BTreeMap<String, &'a [MaterializedProjectionRow]>,
+    ) -> Self {
+        Self::for_plan_with_objects_and_table_exists_rows(
+            associations,
+            evidence_rows,
+            &[],
+            planned,
+            table_exists_rows,
+        )
+    }
+
+    pub(crate) fn for_plan_with_objects_and_table_exists_rows(
+        associations: &'a [MaterializedAssociationRow],
+        evidence_rows: &'a [MaterializedEvidenceRow],
+        object_rows: &[MaterializedObjectRow],
+        planned: &crate::PlannedQuery,
+        table_exists_rows: BTreeMap<String, &'a [MaterializedProjectionRow]>,
+    ) -> Self {
+        Self::with_association_valid_at(
+            associations,
+            evidence_rows,
+            object_rows,
+            association_valid_at(planned),
+            table_exists_rows,
+        )
     }
 
     fn with_association_valid_at(
         associations: &'a [MaterializedAssociationRow],
         evidence_rows: &'a [MaterializedEvidenceRow],
+        object_rows: &[MaterializedObjectRow],
         association_valid_at: Option<i64>,
+        table_exists_rows: BTreeMap<String, &'a [MaterializedProjectionRow]>,
     ) -> Self {
         Self {
             association_edges: AssociationEdgeTable::from_rows_with_association_valid_at(
@@ -60,6 +116,17 @@ impl<'a> EvalContext<'a> {
                 association_valid_at,
             ),
             evidence_index: EvidenceGrainIndex::from_rows(evidence_rows),
+            visible_object_keys: object_rows
+                .iter()
+                .map(|row| {
+                    (
+                        row.dataset_file_ordinal,
+                        row.object_type_id,
+                        row.goid.clone(),
+                    )
+                })
+                .collect(),
+            table_exists_rows,
             _marker: std::marker::PhantomData,
         }
     }
@@ -71,10 +138,11 @@ impl<'a> EvalContext<'a> {
     ) -> usize {
         current_row_goid(row)
             .map(|goid| {
-                self.association_edges.count_for_scoped(
+                self.association_edges.count_for_scoped_with_target_objects(
                     current_row_dataset_file_ordinal(row),
                     goid,
                     association,
+                    &self.visible_object_keys,
                 )
             })
             .unwrap_or(0)
@@ -87,11 +155,13 @@ impl<'a> EvalContext<'a> {
     ) -> BTreeSet<String> {
         current_row_goid(row)
             .map(|goid| {
-                self.association_edges.opposite_endpoints_for_scoped(
-                    current_row_dataset_file_ordinal(row),
-                    goid,
-                    association,
-                )
+                self.association_edges
+                    .opposite_endpoints_for_scoped_with_target_objects(
+                        current_row_dataset_file_ordinal(row),
+                        goid,
+                        association,
+                        &self.visible_object_keys,
+                    )
             })
             .unwrap_or_default()
     }
@@ -111,6 +181,44 @@ impl<'a> EvalContext<'a> {
     ) -> BTreeSet<String> {
         self.evidence_index.identities_for(row, evidence)
     }
+
+    fn table_exists_for(
+        &self,
+        row: &ExecutionRow,
+        exists: &ResolvedTableExists,
+    ) -> Result<bool, EvalError> {
+        let Some(right_rows) = self.table_exists_rows.get(&exists.right.table_id) else {
+            return Ok(false);
+        };
+        for right in *right_rows {
+            let candidate = merge_projection_rows_for_exists(row, right);
+            if eval_predicate(&exists.on, &candidate, self)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+}
+
+fn merge_projection_rows_for_exists(
+    left: &ExecutionRow,
+    right: &MaterializedProjectionRow,
+) -> ExecutionRow {
+    let mut values = match left {
+        ExecutionRow::Projection(row) => row.values.clone(),
+        _ => BTreeMap::new(),
+    };
+    for (key, value) in &right.values {
+        if key.contains('.') {
+            values.insert(key.clone(), value.clone());
+        } else {
+            values.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+    }
+    ExecutionRow::Projection(MaterializedProjectionRow {
+        projection_id: right.projection_id.clone(),
+        values,
+    })
 }
 
 pub(crate) fn eval_predicate(
@@ -228,6 +336,7 @@ pub(crate) fn eval_expr(
         )),
         ResolvedExpr::Association(_) => Ok(Value::Null),
         ResolvedExpr::Evidence(_) => Ok(Value::Null),
+        ResolvedExpr::TableExists(_) => Ok(Value::Null),
         ResolvedExpr::Conditional {
             predicate,
             then_expr,
@@ -462,14 +571,18 @@ fn exists_expr(
     let found = match expr {
         ResolvedExpr::Association(association) => current_row_goid(row)
             .map(|goid| {
-                context.association_edges.exists_for_scoped(
-                    current_row_dataset_file_ordinal(row),
-                    goid,
-                    association,
-                )
+                context
+                    .association_edges
+                    .exists_for_scoped_with_target_objects(
+                        current_row_dataset_file_ordinal(row),
+                        goid,
+                        association,
+                        &context.visible_object_keys,
+                    )
             })
             .unwrap_or(false),
         ResolvedExpr::Evidence(evidence) => context.evidence_index.exists_for(row, evidence),
+        ResolvedExpr::TableExists(exists) => context.table_exists_for(row, exists)?,
         _ => false,
     };
     Ok(if found { Truth::True } else { Truth::False })
@@ -559,7 +672,9 @@ pub(crate) fn expr_logical_type(expr: &ResolvedExpr) -> Option<&str> {
         ResolvedExpr::FunctionCall { logical_type, .. }
         | ResolvedExpr::AggregateCall { logical_type, .. }
         | ResolvedExpr::Conditional { logical_type, .. } => Some(logical_type.as_str()),
-        ResolvedExpr::Association(_) | ResolvedExpr::Evidence(_) => None,
+        ResolvedExpr::Association(_) | ResolvedExpr::Evidence(_) | ResolvedExpr::TableExists(_) => {
+            None
+        }
     }
 }
 

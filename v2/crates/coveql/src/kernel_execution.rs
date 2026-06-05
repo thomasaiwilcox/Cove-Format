@@ -35,7 +35,7 @@ use cove_index::execution::{
 use cove_index::{CoviRowRangePostingV2, IndexCapabilityExactnessV2};
 use serde_json::{json, Value};
 
-use crate::CoveOqlRetainedInput;
+use crate::CoveQlRetainedInput;
 use crate::{
     association_opt::{
         association_row_matches_temporal, association_valid_at, current_row_dataset_file_ordinal,
@@ -81,7 +81,7 @@ use crate::{
     },
     parse_resolve_plan_and_build_physical_plan, pushdown, AggregateDisclosurePolicy,
     AstAggregateName, AstCompareOp, AstNullOrdering, AstOrderDirection, BuildExecutionError,
-    CoveOqlExecutionResult, ExecutedQuery, ExecutionAuthorityReport, ExecutionDiagnostic,
+    CoveQlExecutionResult, ExecutedQuery, ExecutionAuthorityReport, ExecutionDiagnostic,
     ExecutionOptions, ExecutionRowCounts, ManifestDatasetMember, MetadataDisclosurePolicy,
     ParseOptions, PhysicalPlanOptions, PhysicalPlannedQuery, PlanOptions, ResolveOptions,
     ResolvedExpr, ResolvedLiteral, ResolvedLiteralValue, ResolvedPath, ResolvedPredicate,
@@ -159,7 +159,7 @@ pub fn parse_resolve_plan_build_physical_and_execute_query(
 }
 
 pub fn parse_resolve_plan_build_physical_and_execute_query_retained(
-    input: CoveOqlRetainedInput,
+    input: CoveQlRetainedInput,
     text: &str,
     parse_options: ParseOptions,
     resolve_options: ResolveOptions,
@@ -204,7 +204,7 @@ pub fn execute_physical_planned_query(
 ) -> Result<KernelExecutedQuery, BuildExecutionError> {
     if matches!(
         physical.planned.resolved.output_mode,
-        crate::CoveOqlOutputMode::ExplainJson
+        crate::CoveQlOutputMode::ExplainJson
     ) {
         return execute_physical_explain_only(physical, kernel_options);
     }
@@ -414,14 +414,14 @@ pub fn execute_physical_planned_query(
 }
 
 pub fn execute_physical_planned_query_retained(
-    input: CoveOqlRetainedInput,
+    input: CoveQlRetainedInput,
     physical: PhysicalPlannedQuery,
     execution_options: ExecutionOptions,
     kernel_options: KernelExecutionOptions,
 ) -> Result<KernelExecutedQuery, BuildExecutionError> {
     if matches!(
         physical.planned.resolved.output_mode,
-        crate::CoveOqlOutputMode::ExplainJson
+        crate::CoveQlOutputMode::ExplainJson
     ) {
         return execute_physical_explain_only(physical, kernel_options);
     }
@@ -489,7 +489,7 @@ pub fn execute_manifest_physical_planned_query(
 ) -> Result<KernelExecutedQuery, BuildExecutionError> {
     if matches!(
         physical.planned.resolved.output_mode,
-        crate::CoveOqlOutputMode::ExplainJson
+        crate::CoveQlOutputMode::ExplainJson
     ) {
         return execute_physical_explain_only(physical, kernel_options);
     }
@@ -825,7 +825,7 @@ fn manifest_native_shape_supported(planned: &crate::PlannedQuery) -> bool {
 
 #[derive(Debug, Clone)]
 struct ManifestNativeResult {
-    result: CoveOqlExecutionResult,
+    result: CoveQlExecutionResult,
     row_counts: ExecutionRowCounts,
     kind: &'static str,
     diagnostic_code: &'static str,
@@ -1071,14 +1071,14 @@ fn manifest_kernel_row_source(
     for member in members {
         check_time(&options.resource_budget, started)?;
         let member_plan = manifest_member_plan(planned, member);
-        if let ResolvedRoot::Projection(root) = &member_plan.resolved.root {
+        if let Some(projection_id) = projection_backed_root_id(&member_plan.resolved.root) {
             let file_id = hex(&member.scope.file_id);
             let rows = projection_root_execution_rows(
                 member.bytes,
                 &member_plan,
                 options,
                 started,
-                &root.projection_id,
+                projection_id,
             )?
             .into_iter()
             .map(|row| {
@@ -1278,6 +1278,32 @@ fn manifest_kernel_row_source(
                 .cloned()
                 .map(ExecutionRow::Association)
                 .collect::<Vec<_>>(),
+            ResolvedRoot::Node(root) => states
+                .iter()
+                .filter(|state| state.object_type_id == root.object.object_type_id)
+                .map(MaterializedObjectRow::from_state)
+                .map(|row| {
+                    row.with_dataset_member(
+                        member.scope.ordinal,
+                        &member.scope.source,
+                        file_id.clone(),
+                    )
+                })
+                .map(ExecutionRow::Object)
+                .collect::<Vec<_>>(),
+            ResolvedRoot::Edge(root) => associations
+                .iter()
+                .filter(|association| association.object_type_id == root.association.object_type_id)
+                .filter(|association| {
+                    association_row_matches_temporal(
+                        association,
+                        &root.association,
+                        association_valid_at(&member_plan),
+                    )
+                })
+                .cloned()
+                .map(ExecutionRow::Association)
+                .collect::<Vec<_>>(),
             ResolvedRoot::Evidence(_) => evidence_execution_rows
                 .into_iter()
                 .map(|row| {
@@ -1288,6 +1314,11 @@ fn manifest_kernel_row_source(
                     )
                 })
                 .collect(),
+            ResolvedRoot::Table(_) => return Err(exec_error(
+                "E_MANIFEST_KERNEL_UNSUPPORTED",
+                "table roots require projection-backed table execution and are not supported by manifest native direct-projection execution",
+                json!({ "source": member.scope.source }),
+            )),
             ResolvedRoot::Projection(_) => return Err(exec_error(
                 "E_MANIFEST_KERNEL_UNSUPPORTED",
                 "projection roots are not supported by manifest native direct-projection execution",
@@ -1353,8 +1384,7 @@ fn try_covi_empty_lookup_executed_query(
         || planned.resolved.method_chain.changes.is_some()
         || matches!(
             planned.resolved.output_mode,
-            crate::CoveOqlOutputMode::DataFusionTableProvider
-                | crate::CoveOqlOutputMode::ExplainJson
+            crate::CoveQlOutputMode::DataFusionTableProvider | crate::CoveQlOutputMode::ExplainJson
         )
     {
         return Ok(None);
@@ -1377,7 +1407,7 @@ fn try_covi_empty_lookup_executed_query(
     validate_security_scope(planned, options)?;
     validate_execution_grain(planned)?;
     let (result, row_counts) =
-        finish_materialized_rows(Vec::new(), &[], &[], planned, options, started)?;
+        finish_materialized_rows(Vec::new(), &[], &[], &[], planned, options, started)?;
     enforce_result_budgets(&result, &row_counts, planned, options, started)?;
     let output_fingerprint = result_fingerprint(&result)?;
     let mut diagnostics = execution_diagnostics_for_physical(physical);
@@ -1596,8 +1626,7 @@ fn try_coverage_row_range_prune(
         || planned.resolved.method_chain.where_predicate.is_none()
         || matches!(
             planned.resolved.output_mode,
-            crate::CoveOqlOutputMode::DataFusionTableProvider
-                | crate::CoveOqlOutputMode::ExplainJson
+            crate::CoveQlOutputMode::DataFusionTableProvider | crate::CoveQlOutputMode::ExplainJson
         )
     {
         return Ok(None);
@@ -1742,8 +1771,7 @@ fn try_covi_row_range_prune(
         || planned.resolved.method_chain.changes.is_some()
         || matches!(
             planned.resolved.output_mode,
-            crate::CoveOqlOutputMode::DataFusionTableProvider
-                | crate::CoveOqlOutputMode::ExplainJson
+            crate::CoveQlOutputMode::DataFusionTableProvider | crate::CoveQlOutputMode::ExplainJson
         )
     {
         return Ok(None);
@@ -1907,8 +1935,7 @@ fn try_execution_code_filecode_prune(
         || planned.resolved.method_chain.changes.is_some()
         || matches!(
             planned.resolved.output_mode,
-            crate::CoveOqlOutputMode::DataFusionTableProvider
-                | crate::CoveOqlOutputMode::ExplainJson
+            crate::CoveQlOutputMode::DataFusionTableProvider | crate::CoveQlOutputMode::ExplainJson
         )
         || !physical
             .physical_plan
@@ -2043,8 +2070,7 @@ fn try_file_code_literal_prune(
         || planned.resolved.method_chain.changes.is_some()
         || matches!(
             planned.resolved.output_mode,
-            crate::CoveOqlOutputMode::DataFusionTableProvider
-                | crate::CoveOqlOutputMode::ExplainJson
+            crate::CoveQlOutputMode::DataFusionTableProvider | crate::CoveQlOutputMode::ExplainJson
         )
     {
         return Ok(None);
@@ -2471,12 +2497,12 @@ fn unsigned_execution_code(
         ExecutionCodeValue::Unsigned(value) => Ok(*value),
         ExecutionCodeValue::Signed(_) | ExecutionCodeValue::Bytes(_) => Err(exec_error(
             "E_EXECUTION_CODE_MAP",
-            "Cove-OQL FileCode predicates require unsigned COVE-E execution codes",
+            "CoveQL FileCode predicates require unsigned COVE-E execution codes",
             json!({ "file_code": file_code }),
         )),
         _ => Err(exec_error(
             "E_EXECUTION_CODE_MAP",
-            "Cove-OQL FileCode predicates received an unsupported COVE-E execution code kind",
+            "CoveQL FileCode predicates received an unsupported COVE-E execution code kind",
             json!({ "file_code": file_code }),
         )),
     }
@@ -3295,7 +3321,7 @@ fn try_index_only_executed_query(
             .unwrap_or_else(|| aggregate_output_name(*name).into()),
         disclosed,
     );
-    let result = CoveOqlExecutionResult::JsonRows(vec![Value::Object(object)]);
+    let result = CoveQlExecutionResult::JsonRows(vec![Value::Object(object)]);
     let output_fingerprint = result_fingerprint(&result)?;
     let input_rows = usize::try_from(answer.row_count).map_err(|_| {
         exec_error(
@@ -3566,7 +3592,7 @@ fn decode_index_only_numeric_sum_value(
         }
         _ => Err(exec_error(
             "E_INDEX_ONLY_UNSAFE",
-            "logical type is not supported for OQL index-only sum/avg output",
+            "logical type is not supported for CoveQL index-only sum/avg output",
             json!({ "logical_type": logical_type }),
         )),
     }
@@ -3704,12 +3730,12 @@ fn decode_index_only_min_max_value(
         }
         "binary" | "decimal128" | "bool" | "null" | "list" | "struct" | "map" => Err(exec_error(
             "E_INDEX_ONLY_UNSAFE",
-            "logical type is not supported for OQL index-only min/max output",
+            "logical type is not supported for CoveQL index-only min/max output",
             json!({ "logical_type": logical_type }),
         )),
         _ => Err(exec_error(
             "E_INDEX_ONLY_UNSAFE",
-            "unknown logical type for OQL index-only min/max output",
+            "unknown logical type for CoveQL index-only min/max output",
             json!({ "logical_type": logical_type }),
         )),
     }
@@ -3789,7 +3815,7 @@ fn try_native_bool_group_count_result(
     started: Instant,
 ) -> Result<
     Option<(
-        CoveOqlExecutionResult,
+        CoveQlExecutionResult,
         ExecutionRowCounts,
         NativeBoolGroupCountReport,
     )>,
@@ -3896,7 +3922,7 @@ fn try_native_grouped_helper_aggregate_result(
     started: Instant,
 ) -> Result<
     Option<(
-        CoveOqlExecutionResult,
+        CoveQlExecutionResult,
         ExecutionRowCounts,
         NativeGroupedHelperAggregateReport,
     )>,
@@ -4093,7 +4119,7 @@ fn try_native_direct_aggregate_result(
     started: Instant,
 ) -> Result<
     Option<(
-        CoveOqlExecutionResult,
+        CoveQlExecutionResult,
         ExecutionRowCounts,
         NativeDirectAggregateReport,
     )>,
@@ -4161,7 +4187,7 @@ fn try_native_helper_aggregate_result(
     started: Instant,
 ) -> Result<
     Option<(
-        CoveOqlExecutionResult,
+        CoveQlExecutionResult,
         ExecutionRowCounts,
         NativeHelperAggregateReport,
     )>,
@@ -4295,7 +4321,7 @@ fn try_native_root_scan_result(
     _started: Instant,
 ) -> Result<
     Option<(
-        CoveOqlExecutionResult,
+        CoveQlExecutionResult,
         ExecutionRowCounts,
         NativeRootScanReport,
     )>,
@@ -4328,7 +4354,7 @@ fn try_native_root_scan_result(
             output_rows: out.len(),
         };
         return Ok(Some((
-            CoveOqlExecutionResult::AssociationRows(out),
+            CoveQlExecutionResult::AssociationRows(out),
             row_counts,
             NativeRootScanReport {
                 root_kind: "association",
@@ -4351,7 +4377,7 @@ fn try_native_root_scan_result(
             output_rows: out.len(),
         };
         return Ok(Some((
-            CoveOqlExecutionResult::EvidenceRows(out),
+            CoveQlExecutionResult::EvidenceRows(out),
             row_counts,
             NativeRootScanReport {
                 root_kind: "evidence",
@@ -4370,7 +4396,7 @@ fn try_native_projection_root_scan_result(
     started: Instant,
 ) -> Result<
     Option<(
-        CoveOqlExecutionResult,
+        CoveQlExecutionResult,
         ExecutionRowCounts,
         NativeProjectionRootScanReport,
     )>,
@@ -4379,7 +4405,7 @@ fn try_native_projection_root_scan_result(
     if !native_projection_root_scan_shape(planned) {
         return Ok(None);
     }
-    let ResolvedRoot::Projection(root) = &planned.resolved.root else {
+    let Some(projection_id) = projection_backed_root_id(&planned.resolved.root) else {
         return Ok(None);
     };
     if !rows
@@ -4389,12 +4415,12 @@ fn try_native_projection_root_scan_result(
         return Ok(None);
     }
     let (result, row_counts) =
-        finish_materialized_rows(rows.to_vec(), &[], &[], planned, options, started)?;
+        finish_materialized_rows(rows.to_vec(), &[], &[], &[], planned, options, started)?;
     Ok(Some((
         result,
         row_counts,
         NativeProjectionRootScanReport {
-            projection_id: root.projection_id.clone(),
+            projection_id: projection_id.to_string(),
             rows_returned: rows.len(),
         },
     )))
@@ -4410,7 +4436,7 @@ fn try_native_direct_projection_result(
     runtime_exact_helper_projection: bool,
 ) -> Result<
     Option<(
-        CoveOqlExecutionResult,
+        CoveQlExecutionResult,
         ExecutionRowCounts,
         NativeDirectProjectionReport,
     )>,
@@ -4746,8 +4772,19 @@ fn native_root_kind_name(root: &ResolvedRoot) -> &'static str {
     match root {
         ResolvedRoot::Object(_) => "object",
         ResolvedRoot::Association(_) => "association",
+        ResolvedRoot::Node(_) => "node",
+        ResolvedRoot::Edge(_) => "edge",
+        ResolvedRoot::Table(_) => "table",
         ResolvedRoot::Evidence(_) => "evidence",
         ResolvedRoot::Projection(_) => "projection",
+    }
+}
+
+fn projection_backed_root_id(root: &ResolvedRoot) -> Option<&str> {
+    match root {
+        ResolvedRoot::Projection(root) => Some(root.projection_id.as_str()),
+        ResolvedRoot::Table(root) => Some(root.projection.projection_id.as_str()),
+        _ => None,
     }
 }
 
@@ -5112,7 +5149,7 @@ fn try_native_typed_order_result(
     started: Instant,
 ) -> Result<
     Option<(
-        CoveOqlExecutionResult,
+        CoveQlExecutionResult,
         ExecutionRowCounts,
         NativeTypedOrderReport,
     )>,
@@ -5266,7 +5303,7 @@ fn execute_physical_explain_only(
     physical: PhysicalPlannedQuery,
     kernel_options: KernelExecutionOptions,
 ) -> Result<KernelExecutedQuery, BuildExecutionError> {
-    let result = CoveOqlExecutionResult::ExplainJson(physical.explain_json());
+    let result = CoveQlExecutionResult::ExplainJson(physical.explain_json());
     let output_fingerprint = result_fingerprint(&result)?;
     let executed = ExecutedQuery {
         planned: physical.planned.clone(),
@@ -5574,7 +5611,7 @@ fn execute_kernel_object(
         diagnostics.push(warning);
     }
 
-    if let ResolvedRoot::Projection(root) = &planned.resolved.root {
+    if let Some(projection_id) = projection_backed_root_id(&planned.resolved.root) {
         let exact_projection_scan = crate::kernel_plan::native_projection_root_scan_shape(planned)
             && !shape.public.residual_verification_required;
         let (result, row_counts) = crate::execution::execute_projection_root(
@@ -5582,7 +5619,7 @@ fn execute_kernel_object(
             planned,
             options,
             started,
-            &root.projection_id,
+            projection_id,
         )?;
         enforce_result_budgets(&result, &row_counts, planned, options, started)?;
         let output_fingerprint = result_fingerprint(&result)?;
@@ -5591,7 +5628,7 @@ fn execute_kernel_object(
                 "W_KERNEL_NATIVE_PROJECTION_READBACK_EXECUTED",
                 "projection root executed through an exact COVE-MAP projection provider scan",
                 json!({
-                    "projection_id": root.projection_id,
+                    "projection_id": projection_id,
                     "residual_verification": false,
                 }),
             ));
@@ -5600,7 +5637,7 @@ fn execute_kernel_object(
                 "W_KERNEL_PROJECTION_MATERIALIZED_READBACK_EXECUTED",
                 "projection root executed through COVE-MAP materialized readback inside the kernel wrapper",
                 json!({
-                    "projection_id": root.projection_id,
+                    "projection_id": projection_id,
                     "fallback_boundary": "projection_materialized_readback",
                     "residual_verification": true,
                 }),
@@ -5640,7 +5677,7 @@ fn execute_kernel_object(
             if exact_projection_scan {
                 json!({
                     "kernel_shape": shape.public,
-                    "projection_id": root.projection_id,
+                    "projection_id": projection_id,
                     "residual_verification": false,
                     "pushed_filters": "primitive_projection_filters",
                     "pushed_columns": "selected_projection_columns",
@@ -5648,7 +5685,7 @@ fn execute_kernel_object(
             } else {
                 json!({
                     "kernel_shape": shape.public,
-                    "projection_id": root.projection_id,
+                    "projection_id": projection_id,
                     "residual_verification": true,
                     "fallback_boundary": "projection_materialized_readback",
                 })
@@ -5914,7 +5951,29 @@ fn execute_kernel_object(
             .cloned()
             .map(ExecutionRow::Association)
             .collect::<Vec<_>>(),
+        ResolvedRoot::Node(root) => states
+            .iter()
+            .filter(|state| state.object_type_id == root.object.object_type_id)
+            .map(MaterializedObjectRow::from_state)
+            .map(ExecutionRow::Object)
+            .collect::<Vec<_>>(),
+        ResolvedRoot::Edge(root) => associations
+            .iter()
+            .filter(|association| association.object_type_id == root.association.object_type_id)
+            .filter(|association| {
+                association_row_matches_temporal(
+                    association,
+                    &root.association,
+                    association_valid_at(planned),
+                )
+            })
+            .cloned()
+            .map(ExecutionRow::Association)
+            .collect::<Vec<_>>(),
         ResolvedRoot::Evidence(_) => evidence_execution_rows,
+        ResolvedRoot::Table(_) => {
+            unreachable!("table roots are handled before object kernel readback")
+        }
         ResolvedRoot::Projection(_) => {
             unreachable!("projection roots are handled before object kernel readback")
         }
@@ -6228,6 +6287,7 @@ fn execute_kernel_object(
             rows,
             &associations,
             &evidence_rows,
+            &[],
             planned,
             options,
             started,

@@ -54,8 +54,9 @@ pub use api::{
     projected_output_from_paths, projected_record_batch_from_cove_o_bytes,
     projected_record_batches_from_cove_o_bytes,
     projected_record_batches_from_cove_o_bytes_with_catalog, projected_rows_from_cove_o_path,
-    projected_rows_from_paths, projection_arrow_schema, projection_descriptors_from_cove_o_path,
-    projection_read_requirements_for_catalog, ProjectionColumnDescriptor, ProjectionDescriptor,
+    projected_rows_from_paths, projection_arrow_schema, projection_catalog_from_cove_o_bytes,
+    projection_descriptors_from_cove_o_path, projection_read_requirements_for_catalog,
+    ProjectionColumnDescriptor, ProjectionDescriptor,
 };
 pub(crate) use api::{parse_map, plan_keys, preview};
 pub(crate) use context::{mapping_context, MappingContext};
@@ -2574,7 +2575,7 @@ mod tests {
     use super::*;
     use std::{fs, sync::Arc};
 
-    use arrow_array::{RecordBatch, StringArray};
+    use arrow_array::{Array, Int64Array, RecordBatch, StringArray};
     use arrow_ipc::writer::FileWriter as IpcFileWriter;
     use cove_core::{
         artifact::covemap::{
@@ -2921,6 +2922,235 @@ mod tests {
                 values: BTreeMap::from([("id".into(), json!("1")), ("name".into(), support_name)]),
             },
         ]
+    }
+
+    fn primitive_projection_map() -> CovemapFile {
+        test_covemap(vec![
+            test_section(
+                SectionKind::MapSourceCatalog,
+                json!({
+                    "mapping_id": "people-map",
+                    "mapping_version": "test/v1",
+                    "sources": [{
+                        "source_id": "people",
+                        "row_identity_rules": ["person_by_id"]
+                    }]
+                }),
+            ),
+            test_section(
+                SectionKind::MapFunctionRegistry,
+                json!({
+                    "mapping_id": "people-map",
+                    "mapping_version": "test/v1",
+                    "functions": [{
+                        "function_id": "identity",
+                        "version": "1",
+                        "deterministic": true,
+                        "dependency": "pure"
+                    }]
+                }),
+            ),
+            test_section(
+                SectionKind::MapIdentityRuleCatalog,
+                json!({
+                    "mapping_id": "people-map",
+                    "mapping_version": "test/v1",
+                    "identity_rules": [{
+                        "rule_id": "person_by_id",
+                        "object_type": "Person",
+                        "semantic_role": "subject",
+                        "confidence_class": "authoritative",
+                        "candidate_only": false,
+                        "property_conflicts_declared": true,
+                        "function_ids": ["identity"],
+                        "join_keys": [{
+                            "role_id": "person_id",
+                            "source_column": "id",
+                            "logical_type": "utf8",
+                            "canonicalization": "identity",
+                            "null_policy": "reject",
+                            "ordering": "declared"
+                        }]
+                    }],
+                    "do_not_merge": []
+                }),
+            ),
+            test_section(
+                SectionKind::MapRowSemanticsCatalog,
+                json!({
+                    "mapping_id": "people-map",
+                    "mapping_version": "test/v1",
+                    "rules": [{
+                        "rule_id": "person_row",
+                        "source_id": "people",
+                        "identity_rule_id": "person_by_id",
+                        "row_semantics_kind": "Object",
+                        "assertion_kinds": ["object", "property", "evidence"],
+                        "function_ids": ["identity"],
+                        "output_assertion_ids": [],
+                        "association_endpoints": [],
+                        "property_bindings": [
+                            {
+                                "assertion_id": "active",
+                                "property_id": "active",
+                                "property_name": "active",
+                                "source_column": "active",
+                                "logical_type": "bool",
+                                "nullable": true,
+                                "conflict_policy": "reject_conflict"
+                            },
+                            {
+                                "assertion_id": "score",
+                                "property_id": "score",
+                                "property_name": "score",
+                                "source_column": "score",
+                                "logical_type": "int64",
+                                "nullable": true,
+                                "conflict_policy": "reject_conflict"
+                            },
+                            {
+                                "assertion_id": "rating",
+                                "property_id": "rating",
+                                "property_name": "rating",
+                                "source_column": "rating",
+                                "logical_type": "int64",
+                                "nullable": true,
+                                "conflict_policy": "reject_conflict"
+                            },
+                            {
+                                "assertion_id": "status",
+                                "property_id": "status",
+                                "property_name": "status",
+                                "source_column": "status",
+                                "logical_type": "utf8",
+                                "nullable": true,
+                                "conflict_policy": "reject_conflict"
+                            },
+                            {
+                                "assertion_id": "nickname",
+                                "property_id": "nickname",
+                                "property_name": "nickname",
+                                "source_column": "nickname",
+                                "logical_type": "utf8",
+                                "nullable": true,
+                                "conflict_policy": "reject_conflict"
+                            }
+                        ]
+                    }]
+                }),
+            ),
+            test_section(
+                SectionKind::MapProjectionCatalog,
+                json!({
+                    "mapping_id": "people-map",
+                    "mapping_version": "test/v1",
+                    "projections": [
+                        {
+                            "projection_id": "people_primitives.v1",
+                            "output_table": "people_primitives",
+                            "row_grain": "one_row_per_object",
+                            "anchor": {"object_type": "Person"},
+                            "temporal_mode": {"as_of": "latest_committed"},
+                            "multi_value_policy": "reject",
+                            "columns": [
+                                {"name": "goid", "value": "object.goid", "logical_type": "uuid"},
+                                {"name": "active", "value": "property.active", "logical_type": "bool"},
+                                {"name": "score", "value": "score", "logical_type": "int64"},
+                                {"name": "rating", "value": "rating", "logical_type": "int64"},
+                                {"name": "status", "value": "status", "logical_type": "utf8"},
+                                {"name": "nickname", "value": "nickname", "logical_type": "utf8"}
+                            ],
+                            "output_modes": ["arrow"]
+                        },
+                        {
+                            "projection_id": "people_primitives_ordered.v1",
+                            "output_table": "people_primitives",
+                            "row_grain": "one_row_per_object",
+                            "anchor": {"object_type": "Person"},
+                            "temporal_mode": {"as_of": "latest_committed"},
+                            "multi_value_policy": "reject",
+                            "columns": [
+                                {"name": "active", "value": "property.active", "logical_type": "bool"},
+                                {"name": "score", "value": "score", "logical_type": "int64"},
+                                {"name": "status", "value": "status", "logical_type": "utf8"}
+                            ],
+                            "ordering": ["score asc"],
+                            "output_modes": ["arrow"]
+                        }
+                    ]
+                }),
+            ),
+        ])
+    }
+
+    fn primitive_projection_rows() -> Vec<SourceRow> {
+        vec![
+            SourceRow {
+                source_id: "people".into(),
+                row_index: 0,
+                values: BTreeMap::from([
+                    ("id".into(), json!("p1")),
+                    ("active".into(), json!(true)),
+                    ("score".into(), json!(10)),
+                    ("rating".into(), json!(15)),
+                    ("status".into(), json!("open")),
+                    ("nickname".into(), json!("alpha")),
+                ]),
+            },
+            SourceRow {
+                source_id: "people".into(),
+                row_index: 1,
+                values: BTreeMap::from([
+                    ("id".into(), json!("p2")),
+                    ("active".into(), json!(false)),
+                    ("score".into(), json!(20)),
+                    ("rating".into(), json!(25)),
+                    ("status".into(), json!("closed")),
+                    ("nickname".into(), Value::Null),
+                ]),
+            },
+            SourceRow {
+                source_id: "people".into(),
+                row_index: 2,
+                values: BTreeMap::from([
+                    ("id".into(), json!("p3")),
+                    ("active".into(), json!(true)),
+                    ("score".into(), json!(30)),
+                    ("rating".into(), json!(35)),
+                    ("status".into(), json!("open")),
+                ]),
+            },
+            SourceRow {
+                source_id: "people".into(),
+                row_index: 3,
+                values: BTreeMap::from([
+                    ("id".into(), json!("p4")),
+                    ("active".into(), json!(true)),
+                    ("score".into(), json!(40)),
+                    ("rating".into(), json!(45)),
+                    ("status".into(), Value::Null),
+                    ("nickname".into(), json!("delta")),
+                ]),
+            },
+        ]
+    }
+
+    fn int64_column_values(batches: &[RecordBatch], column_name: &str) -> Vec<i64> {
+        let mut out = Vec::new();
+        for batch in batches {
+            let index = batch.schema().index_of(column_name).unwrap();
+            let array = batch
+                .column(index)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            for row in 0..array.len() {
+                if array.is_valid(row) {
+                    out.push(array.value(row));
+                }
+            }
+        }
+        out
     }
 
     fn association_readback_map() -> CovemapFile {
@@ -3813,6 +4043,157 @@ mod tests {
         assert_eq!(batches.len(), 2);
         assert_eq!(batches[0].num_rows(), 1);
         assert_eq!(batches[1].num_rows(), 1);
+    }
+
+    #[test]
+    fn projected_record_batches_filter_primitives_without_leaking_filter_columns() {
+        let file = primitive_projection_map();
+        let rows = primitive_projection_rows();
+        let bytes = build_cove_o(&file, &rows).unwrap();
+        let batches = projected_record_batches_from_cove_o_bytes(
+            &bytes,
+            None,
+            "people_primitives.v1",
+            &ProjectionBatchOptions {
+                output_columns: Some(vec!["score".into()]),
+                pushed_filters: vec![ProjectionFilter::Compare {
+                    column: "active".into(),
+                    op: ProjectionFilterOp::Eq,
+                    literal: ProjectionFilterLiteral::Boolean(true),
+                }],
+                ..ProjectionBatchOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(int64_column_values(&batches, "score"), vec![10, 30, 40]);
+        for batch in batches {
+            assert_eq!(batch.schema().fields().len(), 1);
+            assert_eq!(batch.schema().field(0).name(), "score");
+        }
+    }
+
+    #[test]
+    fn projected_record_batches_filter_primitives_match_ordered_fallback() {
+        let file = primitive_projection_map();
+        let rows = primitive_projection_rows();
+        let bytes = build_cove_o(&file, &rows).unwrap();
+        let options = ProjectionBatchOptions {
+            output_columns: Some(vec!["score".into()]),
+            pushed_filters: vec![ProjectionFilter::Compare {
+                column: "active".into(),
+                op: ProjectionFilterOp::Eq,
+                literal: ProjectionFilterLiteral::Boolean(true),
+            }],
+            ..ProjectionBatchOptions::default()
+        };
+        let fast = projected_record_batches_from_cove_o_bytes(
+            &bytes,
+            None,
+            "people_primitives.v1",
+            &options,
+        )
+        .unwrap();
+        let fallback = projected_record_batches_from_cove_o_bytes(
+            &bytes,
+            None,
+            "people_primitives_ordered.v1",
+            &options,
+        )
+        .unwrap();
+
+        assert_eq!(
+            int64_column_values(&fast, "score"),
+            int64_column_values(&fallback, "score")
+        );
+    }
+
+    #[test]
+    fn projected_record_batches_filter_primitives_honor_limit_after_filtering() {
+        let file = primitive_projection_map();
+        let rows = primitive_projection_rows();
+        let bytes = build_cove_o(&file, &rows).unwrap();
+        let batches = projected_record_batches_from_cove_o_bytes(
+            &bytes,
+            None,
+            "people_primitives.v1",
+            &ProjectionBatchOptions {
+                max_rows: Some(2),
+                output_columns: Some(vec!["score".into()]),
+                pushed_filters: vec![ProjectionFilter::Compare {
+                    column: "active".into(),
+                    op: ProjectionFilterOp::Eq,
+                    literal: ProjectionFilterLiteral::Boolean(true),
+                }],
+                batch_size: Some(1),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(batches.len(), 2);
+        assert_eq!(int64_column_values(&batches, "score"), vec![10, 30]);
+    }
+
+    #[test]
+    fn projected_record_batches_filter_primitives_cover_exact_ops_and_nulls() {
+        let file = primitive_projection_map();
+        let rows = primitive_projection_rows();
+        let bytes = build_cove_o(&file, &rows).unwrap();
+        let cases = [
+            (
+                ProjectionFilter::Compare {
+                    column: "score".into(),
+                    op: ProjectionFilterOp::GtEq,
+                    literal: ProjectionFilterLiteral::Int64(30),
+                },
+                vec![30, 40],
+            ),
+            (
+                ProjectionFilter::Compare {
+                    column: "score".into(),
+                    op: ProjectionFilterOp::Lt,
+                    literal: ProjectionFilterLiteral::Float64(30.0),
+                },
+                vec![10, 20],
+            ),
+            (
+                ProjectionFilter::Compare {
+                    column: "status".into(),
+                    op: ProjectionFilterOp::Ne,
+                    literal: ProjectionFilterLiteral::Utf8("closed".into()),
+                },
+                vec![10, 30],
+            ),
+            (
+                ProjectionFilter::InList {
+                    column: "status".into(),
+                    literals: vec![ProjectionFilterLiteral::Utf8("open".into())],
+                },
+                vec![10, 30],
+            ),
+            (
+                ProjectionFilter::IsNull {
+                    column: "nickname".into(),
+                    negated: false,
+                },
+                vec![20, 30],
+            ),
+        ];
+
+        for (filter, expected) in cases {
+            let batches = projected_record_batches_from_cove_o_bytes(
+                &bytes,
+                None,
+                "people_primitives.v1",
+                &ProjectionBatchOptions {
+                    output_columns: Some(vec!["score".into()]),
+                    pushed_filters: vec![filter],
+                    ..ProjectionBatchOptions::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(int64_column_values(&batches, "score"), expected);
+        }
     }
 
     #[test]

@@ -6317,7 +6317,7 @@ fn inline_bool_entry(value_tag: ValueTag) -> FileDictionaryIndexEntryV1 {
 
 fn inline_canonical_entry(value_tag: ValueTag, canonical: &[u8]) -> FileDictionaryIndexEntryV1 {
     let mut inline_data = [0u8; 16];
-    inline_data[..canonical.len()].copy_from_slice(&canonical);
+    inline_data[..canonical.len()].copy_from_slice(canonical);
     FileDictionaryIndexEntryV1 {
         value_tag: value_tag as u16,
         storage_class: StorageClass::Inline as u8,

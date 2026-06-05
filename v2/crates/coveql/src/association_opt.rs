@@ -266,6 +266,21 @@ impl AssociationEdgeTable {
         current_goid: &str,
         association: &ResolvedAssociationRoot,
     ) -> bool {
+        self.exists_for_scoped_with_target_objects(
+            dataset_file_ordinal,
+            current_goid,
+            association,
+            &BTreeSet::new(),
+        )
+    }
+
+    pub(crate) fn exists_for_scoped_with_target_objects(
+        &self,
+        dataset_file_ordinal: Option<usize>,
+        current_goid: &str,
+        association: &ResolvedAssociationRoot,
+        visible_object_keys: &BTreeSet<(Option<usize>, u32, String)>,
+    ) -> bool {
         self.candidate_edges(dataset_file_ordinal, current_goid, association)
             .any(|edge| {
                 edge.matches(
@@ -273,6 +288,12 @@ impl AssociationEdgeTable {
                     current_goid,
                     association,
                     self.association_valid_at,
+                ) && edge.target_node_matches(
+                    dataset_file_ordinal,
+                    current_goid,
+                    association,
+                    self.association_valid_at,
+                    visible_object_keys,
                 )
             })
     }
@@ -292,6 +313,21 @@ impl AssociationEdgeTable {
         current_goid: &str,
         association: &ResolvedAssociationRoot,
     ) -> usize {
+        self.count_for_scoped_with_target_objects(
+            dataset_file_ordinal,
+            current_goid,
+            association,
+            &BTreeSet::new(),
+        )
+    }
+
+    pub(crate) fn count_for_scoped_with_target_objects(
+        &self,
+        dataset_file_ordinal: Option<usize>,
+        current_goid: &str,
+        association: &ResolvedAssociationRoot,
+        visible_object_keys: &BTreeSet<(Option<usize>, u32, String)>,
+    ) -> usize {
         self.candidate_edges(dataset_file_ordinal, current_goid, association)
             .filter(|edge| {
                 edge.matches(
@@ -299,6 +335,12 @@ impl AssociationEdgeTable {
                     current_goid,
                     association,
                     self.association_valid_at,
+                ) && edge.target_node_matches(
+                    dataset_file_ordinal,
+                    current_goid,
+                    association,
+                    self.association_valid_at,
+                    visible_object_keys,
                 )
             })
             .count()
@@ -319,6 +361,21 @@ impl AssociationEdgeTable {
         current_goid: &str,
         association: &ResolvedAssociationRoot,
     ) -> BTreeSet<String> {
+        self.opposite_endpoints_for_scoped_with_target_objects(
+            dataset_file_ordinal,
+            current_goid,
+            association,
+            &BTreeSet::new(),
+        )
+    }
+
+    pub(crate) fn opposite_endpoints_for_scoped_with_target_objects(
+        &self,
+        dataset_file_ordinal: Option<usize>,
+        current_goid: &str,
+        association: &ResolvedAssociationRoot,
+        visible_object_keys: &BTreeSet<(Option<usize>, u32, String)>,
+    ) -> BTreeSet<String> {
         self.candidate_edges(dataset_file_ordinal, current_goid, association)
             .filter(|edge| {
                 edge.matches(
@@ -326,6 +383,12 @@ impl AssociationEdgeTable {
                     current_goid,
                     association,
                     self.association_valid_at,
+                ) && edge.target_node_matches(
+                    dataset_file_ordinal,
+                    current_goid,
+                    association,
+                    self.association_valid_at,
+                    visible_object_keys,
                 )
             })
             .filter_map(|edge| {
@@ -501,6 +564,28 @@ impl AssociationEdge {
             Some(ordinal) => format!("{ordinal}:{endpoint}"),
             None => endpoint.to_string(),
         })
+    }
+
+    fn target_node_matches(
+        &self,
+        dataset_file_ordinal: Option<usize>,
+        current_goid: &str,
+        association: &ResolvedAssociationRoot,
+        association_valid_at: Option<i64>,
+        visible_object_keys: &BTreeSet<(Option<usize>, u32, String)>,
+    ) -> bool {
+        let Some(target_type_id) = association.target_node_object_type_id else {
+            return true;
+        };
+        let Some(endpoint) = self.opposite_endpoint(
+            dataset_file_ordinal,
+            current_goid,
+            association,
+            association_valid_at,
+        ) else {
+            return false;
+        };
+        visible_object_keys.contains(&(dataset_file_ordinal, target_type_id, endpoint.to_string()))
     }
 }
 
@@ -768,6 +853,8 @@ mod tests {
             },
             disclosure_outcome: crate::AssociationDisclosureOutcome::Public,
             object_relative: true,
+            target_node_object_type_id: None,
+            target_node_label: None,
         }
     }
 

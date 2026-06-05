@@ -9,6 +9,8 @@ use serde_json::{json, Value};
 
 use crate::{ResolvedPath, ResolvedSystemField};
 
+pub(crate) const INTERNAL_PROJECTION_FIELD_PREFIX: &str = "__coveql_";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OutputGrain {
@@ -427,7 +429,13 @@ impl MaterializedEvidenceRow {
 impl MaterializedProjectionRow {
     pub(crate) fn value_for_path(&self, path: &ResolvedPath) -> Value {
         if let Some(column) = &path.projection_column {
-            return self.values.get(column).cloned().unwrap_or(Value::Null);
+            if let Some(value) = self.values.get(column) {
+                return value.clone();
+            }
+            if let Some((_, unqualified)) = column.rsplit_once('.') {
+                return self.values.get(unqualified).cloned().unwrap_or(Value::Null);
+            }
+            return Value::Null;
         }
         self.values
             .get(&path.display_name)
@@ -436,9 +444,15 @@ impl MaterializedProjectionRow {
     }
 
     pub(crate) fn to_json(&self) -> Value {
+        let values = self
+            .values
+            .iter()
+            .filter(|(key, _)| !key.starts_with(INTERNAL_PROJECTION_FIELD_PREFIX))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<BTreeMap<_, _>>();
         json!({
             "projection_id": self.projection_id,
-            "values": self.values,
+            "values": values,
         })
     }
 }

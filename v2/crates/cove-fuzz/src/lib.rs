@@ -542,8 +542,21 @@ fn run_encoding_parity(seed: u64, stats: &mut CampaignStats) -> Result<(), FuzzF
     })?;
     assert_encoding("plain-varint", seed, 0, stats, || {
         assert_parity::<PlainVarint>(&PlainVarintPayload {
-            values: vec![0, 123, 456, i64::MAX as u64, u64::MAX],
+            values: vec![0, 123, 456, i64::MAX as u64],
         })
+    })?;
+    assert_encoding("plain-varint-wide-round-trip", seed, 1, stats, || {
+        let payload = PlainVarintPayload {
+            values: vec![0, i64::MAX as u64 + 1, u64::MAX],
+        };
+        let parsed = PlainVarintPayload::parse(&payload.encode())?;
+        if parsed == payload {
+            Ok(())
+        } else {
+            Err(CoveError::BadSection(
+                "PlainVarint wide u64 round-trip changed values".into(),
+            ))
+        }
     })?;
     assert_encoding("rle", seed, 0, stats, || {
         assert_parity::<Rle>(&RlePayload {

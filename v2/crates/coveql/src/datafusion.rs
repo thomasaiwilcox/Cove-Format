@@ -4,17 +4,21 @@ use arrow_array::RecordBatch;
 use arrow_schema::Schema;
 use arrow_schema::{DataType, SchemaRef};
 use async_trait::async_trait;
+use cove_core::profile::cove_map::MapProjectionCatalog;
 use cove_datafusion::{
-    adapter_v53::table_provider::CoveTableProvider, dataset_state::DatasetState,
-    projection_provider, register,
+    adapter_v53::table_provider::CoveTableProvider,
+    dataset_state::DatasetState,
+    projection_provider,
+    register::{self, df},
 };
 use cove_map::{
-    projected_record_batches_from_cove_o_bytes, ProjectionBatchOptions, ProjectionFilter,
-    ProjectionFilterLiteral, ProjectionFilterOp,
+    projected_record_batches_from_cove_o_bytes,
+    projected_record_batches_from_cove_o_bytes_with_catalog, projection_catalog_from_cove_o_bytes,
+    ProjectionBatchOptions, ProjectionFilter, ProjectionFilterLiteral, ProjectionFilterOp,
 };
-use datafusion::datasource::MemTable;
-use datafusion::logical_expr::Expr;
-use datafusion::{
+use df::datasource::MemTable;
+use df::logical_expr::Expr;
+use df::{
     catalog::{Session, TableProvider},
     common::{stats::Precision, DataFusionError, Result, Statistics},
     execution::{context::SessionContext, SendableRecordBatchStream, TaskContext},
@@ -37,15 +41,15 @@ use crate::{
         classify_predicate, classify_predicate_for_dataset, LogicalPredicateForm,
         PredicateProofState, RepresentationClass,
     },
-    AstCompareOp, AstLiteral, CodeDomainId, CoveOqlExecutionResult, CoveOqlRetainedInput,
-    CoveOqlRetainedManifestMember, ExecutionAuthoritySource, ExecutionOptions,
+    AstCompareOp, AstLiteral, CodeDomainId, CoveQlExecutionResult, CoveQlRetainedInput,
+    CoveQlRetainedManifestMember, ExecutionAuthoritySource, ExecutionOptions,
     KernelExecutionOptions, PhysicalPlanOptions, PlannedQuery, ResolvedExpr, ResolvedLiteral,
     ResolvedLiteralValue, ResolvedPath, ResolvedPathRootKind, ResolvedPredicate, ResolvedRoot,
     ResolvedSelectItem,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DataFusionOqlPushdownReport {
+pub struct DataFusionCoveQlPushdownReport {
     pub report_version: String,
     pub projection_id: String,
     pub root_kind: String,
@@ -53,12 +57,12 @@ pub struct DataFusionOqlPushdownReport {
     pub supported_filter_count: usize,
     pub residual_filter_count: usize,
     pub received_filters: Vec<String>,
-    pub filter_outcomes: Vec<DataFusionOqlFilterOutcome>,
+    pub filter_outcomes: Vec<DataFusionCoveQlFilterOutcome>,
     pub pushed_filters: Vec<String>,
     pub trusted_filters: Vec<String>,
     pub residual_filters: Vec<String>,
     pub rejected_filters: Vec<String>,
-    pub lowered_oql_predicates: Vec<String>,
+    pub lowered_coveql_predicates: Vec<String>,
     pub proof_states: Vec<PredicateProofState>,
     pub decode_boundaries: Vec<String>,
     pub trusted: bool,
@@ -66,10 +70,10 @@ pub struct DataFusionOqlPushdownReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DataFusionOqlFilterOutcome {
+pub struct DataFusionCoveQlFilterOutcome {
     pub received_filter: String,
-    pub outcome: DataFusionOqlFilterOutcomeKind,
-    pub lowered_oql_predicates: Vec<String>,
+    pub outcome: DataFusionCoveQlFilterOutcomeKind,
+    pub lowered_coveql_predicates: Vec<String>,
     pub proof_state: PredicateProofState,
     pub trusted: bool,
     pub diagnostic_code: Option<String>,
@@ -78,30 +82,30 @@ pub struct DataFusionOqlFilterOutcome {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum DataFusionOqlFilterOutcomeKind {
+pub enum DataFusionCoveQlFilterOutcomeKind {
     TrustedExact,
     PushedInexact,
     ResidualRejected,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DataFusionOqlProviderReport {
+pub struct DataFusionCoveQlProviderReport {
     pub report_version: String,
     pub provider_kind: String,
     pub root_kind: String,
     pub root_id: Option<String>,
     pub dataset_file_count: usize,
-    pub planned_output_mode: crate::CoveOqlOutputMode,
-    pub materialized_oql_before_registration: bool,
+    pub planned_output_mode: crate::CoveQlOutputMode,
+    pub materialized_coveql_before_registration: bool,
     pub residual_verification: bool,
     pub scan_residual_verification_required: bool,
     pub scan_filter_pushdown_supported: bool,
     pub scan_projection_pushdown_supported: bool,
     pub residual_filter_authority: String,
-    pub oql_scan_authority_source: ExecutionAuthoritySource,
-    pub oql_scan_materialized_fallback: bool,
-    pub oql_scan_residual_required: bool,
-    pub oql_scan_compared_with_materialized: bool,
+    pub coveql_scan_authority_source: ExecutionAuthoritySource,
+    pub coveql_scan_materialized_fallback: bool,
+    pub coveql_scan_residual_required: bool,
+    pub coveql_scan_compared_with_materialized: bool,
     pub scan_execution_policy: String,
     pub limit_pushdown_policy: String,
     pub unhandled_residuals: Vec<String>,
@@ -111,7 +115,7 @@ pub struct DataFusionOqlProviderReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DataFusionOqlScanNegotiationReport {
+pub struct DataFusionCoveQlScanNegotiationReport {
     pub report_version: String,
     pub provider_kind: String,
     pub root_kind: String,
@@ -119,19 +123,19 @@ pub struct DataFusionOqlScanNegotiationReport {
     pub dataset_file_count: usize,
     pub received_projection_columns: Option<Vec<String>>,
     pub projection_pushdown_supported: bool,
-    pub projection_pushed_to_oql: bool,
+    pub projection_pushed_to_coveql: bool,
     pub pushed_projection_columns: Vec<String>,
     pub received_filters: Vec<String>,
-    pub filter_outcomes: Vec<DataFusionOqlFilterOutcome>,
+    pub filter_outcomes: Vec<DataFusionCoveQlFilterOutcome>,
     pub pushed_filters: Vec<String>,
     pub trusted_filters: Vec<String>,
     pub residual_filters: Vec<String>,
     pub rejected_filters: Vec<String>,
-    pub lowered_oql_predicates: Vec<String>,
+    pub lowered_coveql_predicates: Vec<String>,
     pub proof_states: Vec<PredicateProofState>,
     pub filters_trusted_exact: bool,
     pub received_limit: Option<usize>,
-    pub limit_pushed_to_oql: bool,
+    pub limit_pushed_to_coveql: bool,
     pub pushed_limit: Option<usize>,
     pub residual_filter_authority: String,
     pub scan_execution_policy: String,
@@ -140,10 +144,11 @@ pub struct DataFusionOqlScanNegotiationReport {
 }
 
 #[derive(Debug)]
-pub struct OqlTableProvider {
+pub struct CoveQlTableProvider {
     bytes: Arc<Vec<u8>>,
     planned: PlannedQuery,
     options: ExecutionOptions,
+    projection_catalog: Option<Arc<MapProjectionCatalog>>,
     schema: SchemaRef,
     schema_probe_rows: usize,
     schema_probe_batches: usize,
@@ -153,21 +158,26 @@ pub struct OqlTableProvider {
     schema_probe_compared_with_materialized: bool,
 }
 
-impl OqlTableProvider {
+impl CoveQlTableProvider {
     pub fn try_new(
         bytes: Arc<Vec<u8>>,
         planned: PlannedQuery,
         options: ExecutionOptions,
     ) -> Result<Self> {
-        validate_oql_table_provider_scope(&planned)?;
-        let probe = execute_oql_arrow(bytes.as_slice(), &planned, &options)?;
+        validate_coveql_table_provider_scope(&planned)?;
+        let projection_catalog = cached_projection_catalog_for_plan(
+            bytes.as_slice(),
+            &planned,
+            options.mapping_path.as_deref(),
+        )?;
+        let probe = execute_coveql_arrow(bytes.as_slice(), &planned, &options)?;
         let schema = probe
             .batches
             .first()
             .map(|batch| batch.schema())
             .ok_or_else(|| {
                 DataFusionError::Execution(
-                    "OQL DataFusion provider could not infer an Arrow schema from planned output"
+                    "CoveQL DataFusion provider could not infer an Arrow schema from planned output"
                         .into(),
                 )
             })?;
@@ -175,6 +185,7 @@ impl OqlTableProvider {
             bytes,
             planned,
             options,
+            projection_catalog,
             schema,
             schema_probe_rows: probe.row_count,
             schema_probe_batches: probe.batches.len(),
@@ -185,46 +196,49 @@ impl OqlTableProvider {
         })
     }
 
-    pub fn report(&self) -> DataFusionOqlProviderReport {
+    pub fn report(&self) -> DataFusionCoveQlProviderReport {
         let scan_filter_pushdown_supported = can_apply_datafusion_scan_filters(&self.planned);
         let scan_projection_pushdown_supported =
             can_apply_datafusion_scan_projection(&self.planned);
-        DataFusionOqlProviderReport {
-            report_version: crate::DATAFUSION_OQL_REPORT_VERSION.into(),
-            provider_kind: "oql_table_provider".into(),
+        DataFusionCoveQlProviderReport {
+            report_version: crate::DATAFUSION_COVEQL_REPORT_VERSION.into(),
+            provider_kind: "coveql_table_provider".into(),
             root_kind: resolved_root_name(&self.planned.resolved.root).into(),
             root_id: datafusion_pushdown_report_root_id(&self.planned.resolved.root),
             dataset_file_count: self.planned.resolved.operation_context.dataset.files.len(),
             planned_output_mode: self.planned.resolved.output_mode.clone(),
-            materialized_oql_before_registration: false,
+            materialized_coveql_before_registration: false,
             residual_verification: true,
             scan_residual_verification_required: self.schema_probe_residual_required,
             scan_filter_pushdown_supported,
             scan_projection_pushdown_supported,
             residual_filter_authority:
-                "DataFusion retains SQL filters as residuals unless Cove-OQL reports TrustedExact and the scan projection contract is unambiguous; inexact pushdown or multi-column row-root projection guards still require DataFusion residual verification".into(),
-            oql_scan_authority_source: self.schema_probe_authority_source,
-            oql_scan_materialized_fallback: self.schema_probe_materialized_fallback,
-            oql_scan_residual_required: self.schema_probe_residual_required,
-            oql_scan_compared_with_materialized: self.schema_probe_compared_with_materialized,
+                "DataFusion retains SQL filters as residuals unless CoveQL reports TrustedExact and the scan projection contract is unambiguous; inexact pushdown or multi-column row-root projection guards still require DataFusion residual verification".into(),
+            coveql_scan_authority_source: self.schema_probe_authority_source,
+            coveql_scan_materialized_fallback: self.schema_probe_materialized_fallback,
+            coveql_scan_residual_required: self.schema_probe_residual_required,
+            coveql_scan_compared_with_materialized: self.schema_probe_compared_with_materialized,
             scan_execution_policy: provider_scan_execution_policy(&self.planned, false).into(),
             limit_pushdown_policy: if scan_filter_pushdown_supported {
                 "scan limit is pushed when no DataFusion filter is present or every pushed filter is proven trusted exact; scans with residual or inexact filters leave limit to DataFusion residual order".into()
             } else {
-                "scan limit may be pushed for filterless scans; residual DataFusion filters or non-lowerable OQL operators keep limit outside Cove-OQL when they can affect row order/count".into()
+                "scan limit may be pushed for filterless scans; residual DataFusion filters or non-lowerable CoveQL operators keep limit outside CoveQL when they can affect row order/count".into()
             },
             unhandled_residuals: provider_residuals(&self.planned),
             row_count: self.schema_probe_rows,
             batch_count: self.schema_probe_batches,
             notes: vec![
-                "planned OQL semantics execute inside the DataFusion provider scan path".into(),
-                "direct projection-root filters can be lowered as TrustedExact when the COVE-MAP projection-column proof is exact; direct object/association/evidence filters can be lowered as TrustedExact only when OQL predicate proofs are exact, but multi-column row-root table scans report DataFusion Inexact support to preserve residual projection semantics".into(),
-                "planned OQL physical execution is attempted inside the provider scan; materialized OQL remains the fallback authority for residual predicates, unproven temporal shapes, visibility, and redaction".into(),
+                "planned CoveQL semantics execute inside the DataFusion provider scan path".into(),
+                "direct projection-root filters can be lowered as TrustedExact when the COVE-MAP projection-column proof is exact; direct object/association/evidence filters can be lowered as TrustedExact only when CoveQL predicate proofs are exact, but multi-column row-root table scans report DataFusion Inexact support to preserve residual projection semantics".into(),
+                "planned CoveQL physical execution is attempted inside the provider scan; materialized CoveQL remains the fallback authority for residual predicates, unproven temporal shapes, visibility, and redaction".into(),
             ],
         }
     }
 
-    pub fn filter_pushdown_report(&self, filters: &[Expr]) -> Result<DataFusionOqlPushdownReport> {
+    pub fn filter_pushdown_report(
+        &self,
+        filters: &[Expr],
+    ) -> Result<DataFusionCoveQlPushdownReport> {
         datafusion_pushdown_report_for_plan(&self.schema, filters, &self.planned)
     }
 
@@ -233,9 +247,9 @@ impl OqlTableProvider {
         projection: Option<&[usize]>,
         filters: &[Expr],
         limit: Option<usize>,
-    ) -> Result<DataFusionOqlScanNegotiationReport> {
+    ) -> Result<DataFusionCoveQlScanNegotiationReport> {
         datafusion_scan_negotiation_report(
-            "oql_table_provider",
+            "coveql_table_provider",
             &self.schema,
             &self.planned,
             projection,
@@ -247,8 +261,8 @@ impl OqlTableProvider {
 }
 
 #[derive(Debug)]
-pub struct ManifestOqlTableProvider {
-    members: Vec<CoveOqlRetainedManifestMember>,
+pub struct ManifestCoveQlTableProvider {
+    members: Vec<CoveQlRetainedManifestMember>,
     planned: PlannedQuery,
     options: ExecutionOptions,
     schema: SchemaRef,
@@ -260,21 +274,21 @@ pub struct ManifestOqlTableProvider {
     schema_probe_compared_with_materialized: bool,
 }
 
-impl ManifestOqlTableProvider {
+impl ManifestCoveQlTableProvider {
     pub fn try_new(
-        members: Vec<CoveOqlRetainedManifestMember>,
+        members: Vec<CoveQlRetainedManifestMember>,
         planned: PlannedQuery,
         options: ExecutionOptions,
     ) -> Result<Self> {
-        validate_manifest_oql_table_provider_scope(&planned, &members)?;
-        let probe = execute_manifest_oql_arrow(&members, &planned, &options)?;
+        validate_manifest_coveql_table_provider_scope(&planned, &members)?;
+        let probe = execute_manifest_coveql_arrow(&members, &planned, &options)?;
         let schema = probe
             .batches
             .first()
             .map(|batch| batch.schema())
             .ok_or_else(|| {
                 DataFusionError::Execution(
-                    "manifest OQL DataFusion provider could not infer an Arrow schema from planned output"
+                    "manifest CoveQL DataFusion provider could not infer an Arrow schema from planned output"
                         .into(),
                 )
             })?;
@@ -292,46 +306,49 @@ impl ManifestOqlTableProvider {
         })
     }
 
-    pub fn report(&self) -> DataFusionOqlProviderReport {
+    pub fn report(&self) -> DataFusionCoveQlProviderReport {
         let scan_filter_pushdown_supported = can_apply_datafusion_scan_filters(&self.planned);
         let scan_projection_pushdown_supported =
             can_apply_datafusion_scan_projection(&self.planned);
-        DataFusionOqlProviderReport {
-            report_version: crate::DATAFUSION_OQL_REPORT_VERSION.into(),
-            provider_kind: "manifest_oql_table_provider".into(),
+        DataFusionCoveQlProviderReport {
+            report_version: crate::DATAFUSION_COVEQL_REPORT_VERSION.into(),
+            provider_kind: "manifest_coveql_table_provider".into(),
             root_kind: resolved_root_name(&self.planned.resolved.root).into(),
             root_id: datafusion_pushdown_report_root_id(&self.planned.resolved.root),
             dataset_file_count: self.planned.resolved.operation_context.dataset.files.len(),
             planned_output_mode: self.planned.resolved.output_mode.clone(),
-            materialized_oql_before_registration: false,
+            materialized_coveql_before_registration: false,
             residual_verification: true,
             scan_residual_verification_required: self.schema_probe_residual_required,
             scan_filter_pushdown_supported,
             scan_projection_pushdown_supported,
             residual_filter_authority:
-                "manifest DataFusion filters may be lowered into the manifest physical OQL kernel when an exact shape is proven, otherwise they execute through the materialized OQL oracle; inexact or rejected filters remain DataFusion residuals, and coded cross-file comparisons remain disabled without exact bridge proofs".into(),
-            oql_scan_authority_source: self.schema_probe_authority_source,
-            oql_scan_materialized_fallback: self.schema_probe_materialized_fallback,
-            oql_scan_residual_required: self.schema_probe_residual_required,
-            oql_scan_compared_with_materialized: self.schema_probe_compared_with_materialized,
+                "manifest DataFusion filters may be lowered into the manifest physical CoveQL kernel when an exact shape is proven, otherwise they execute through the materialized CoveQL oracle; inexact or rejected filters remain DataFusion residuals, and coded cross-file comparisons remain disabled without exact bridge proofs".into(),
+            coveql_scan_authority_source: self.schema_probe_authority_source,
+            coveql_scan_materialized_fallback: self.schema_probe_materialized_fallback,
+            coveql_scan_residual_required: self.schema_probe_residual_required,
+            coveql_scan_compared_with_materialized: self.schema_probe_compared_with_materialized,
             scan_execution_policy: provider_scan_execution_policy(&self.planned, true).into(),
             limit_pushdown_policy: if scan_filter_pushdown_supported {
-                "scan limit is pushed inside manifest OQL only when no DataFusion filter is present or every pushed filter is proven trusted exact; scans with residual or inexact filters leave limit to DataFusion residual order".into()
+                "scan limit is pushed inside manifest CoveQL only when no DataFusion filter is present or every pushed filter is proven trusted exact; scans with residual or inexact filters leave limit to DataFusion residual order".into()
             } else {
-                "scan limit may be pushed inside manifest OQL for filterless scans; residual DataFusion filters or non-lowerable OQL operators keep limit outside manifest OQL when they can affect row order/count".into()
+                "scan limit may be pushed inside manifest CoveQL for filterless scans; residual DataFusion filters or non-lowerable CoveQL operators keep limit outside manifest CoveQL when they can affect row order/count".into()
             },
             unhandled_residuals: provider_residuals(&self.planned),
             row_count: self.schema_probe_rows,
             batch_count: self.schema_probe_batches,
             notes: vec![
-                "planned OQL semantics execute across validated COVM members inside the DataFusion provider scan path".into(),
-                "materialized manifest OQL execution remains the fallback authority for cross-file ordering, visibility, redaction, association/evidence helper scope, and pagination when no exact manifest physical kernel path is selected".into(),
+                "planned CoveQL semantics execute across validated COVM members inside the DataFusion provider scan path".into(),
+                "materialized manifest CoveQL execution remains the fallback authority for cross-file ordering, visibility, redaction, association/evidence helper scope, and pagination when no exact manifest physical kernel path is selected".into(),
                 "raw local codes from different files are never compared by this provider; coded pushdown requires exact manifest bridge proofs and a selected manifest physical kernel path".into(),
             ],
         }
     }
 
-    pub fn filter_pushdown_report(&self, filters: &[Expr]) -> Result<DataFusionOqlPushdownReport> {
+    pub fn filter_pushdown_report(
+        &self,
+        filters: &[Expr],
+    ) -> Result<DataFusionCoveQlPushdownReport> {
         datafusion_pushdown_report_for_plan(&self.schema, filters, &self.planned)
     }
 
@@ -340,9 +357,9 @@ impl ManifestOqlTableProvider {
         projection: Option<&[usize]>,
         filters: &[Expr],
         limit: Option<usize>,
-    ) -> Result<DataFusionOqlScanNegotiationReport> {
+    ) -> Result<DataFusionCoveQlScanNegotiationReport> {
         datafusion_scan_negotiation_report(
-            "manifest_oql_table_provider",
+            "manifest_coveql_table_provider",
             &self.schema,
             &self.planned,
             projection,
@@ -361,57 +378,58 @@ fn datafusion_scan_negotiation_report(
     filters: &[Expr],
     limit: Option<usize>,
     manifest: bool,
-) -> Result<DataFusionOqlScanNegotiationReport> {
+) -> Result<DataFusionCoveQlScanNegotiationReport> {
     let filter_report = datafusion_pushdown_report_for_plan(schema, filters, planned)?;
     let scan_filters = classify_scan_projection_filters(schema, filters, planned)?;
     let projection_pushdown_supported = can_apply_datafusion_scan_projection(planned);
-    let push_projection_to_oql =
+    let push_projection_to_coveql =
         projection_pushdown_supported && (filters.is_empty() || filter_report.trusted);
     let received_projection_columns = projection
         .map(|projection| projection_column_names(schema, Some(projection)))
         .transpose()?;
-    let pushed_projection_columns = if push_projection_to_oql {
+    let pushed_projection_columns = if push_projection_to_coveql {
         received_projection_columns.clone().unwrap_or_default()
     } else {
         Vec::new()
     };
-    let projection_pushed_to_oql = push_projection_to_oql && !pushed_projection_columns.is_empty();
-    let limit_pushed_to_oql = filters.is_empty() || filter_report.trusted;
+    let projection_pushed_to_coveql =
+        push_projection_to_coveql && !pushed_projection_columns.is_empty();
+    let limit_pushed_to_coveql = filters.is_empty() || filter_report.trusted;
     let mut unhandled_residuals = provider_residuals(planned);
     if !filter_report.residual_filters.is_empty() {
         unhandled_residuals.push(format!(
-            "{} DataFusion filter(s) remain residual outside Cove-OQL pushdown",
+            "{} DataFusion filter(s) remain residual outside CoveQL pushdown",
             filter_report.residual_filters.len()
         ));
     }
     if !filter_report.rejected_filters.is_empty() {
         unhandled_residuals.push(format!(
-            "{} DataFusion filter(s) were rejected for Cove-OQL pushdown",
+            "{} DataFusion filter(s) were rejected for CoveQL pushdown",
             filter_report.rejected_filters.len()
         ));
     }
-    if received_projection_columns.is_some() && !projection_pushed_to_oql {
+    if received_projection_columns.is_some() && !projection_pushed_to_coveql {
         unhandled_residuals.push(
-            "DataFusion scan projection remains outside Cove-OQL because filters are residual/inexact or the planned OQL shape cannot prove equivalent projection pushdown"
+            "DataFusion scan projection remains outside CoveQL because filters are residual/inexact or the planned CoveQL shape cannot prove equivalent projection pushdown"
                 .into(),
         );
     }
-    if limit.is_some() && !limit_pushed_to_oql {
+    if limit.is_some() && !limit_pushed_to_coveql {
         unhandled_residuals.push(
-            "DataFusion scan limit remains outside Cove-OQL because residual or inexact filters can affect row count/order"
+            "DataFusion scan limit remains outside CoveQL because residual or inexact filters can affect row count/order"
                 .into(),
         );
     }
     let residual_filter_authority = residual_filter_authority_label(&filter_report).into();
-    Ok(DataFusionOqlScanNegotiationReport {
-        report_version: crate::DATAFUSION_OQL_REPORT_VERSION.into(),
+    Ok(DataFusionCoveQlScanNegotiationReport {
+        report_version: crate::DATAFUSION_COVEQL_REPORT_VERSION.into(),
         provider_kind: provider_kind.into(),
         root_kind: resolved_root_name(&planned.resolved.root).into(),
         root_id: datafusion_pushdown_report_root_id(&planned.resolved.root),
         dataset_file_count: planned.resolved.operation_context.dataset.files.len(),
         received_projection_columns,
         projection_pushdown_supported,
-        projection_pushed_to_oql,
+        projection_pushed_to_coveql,
         pushed_projection_columns,
         received_filters: filter_report.received_filters,
         filter_outcomes: filter_report.filter_outcomes,
@@ -419,64 +437,86 @@ fn datafusion_scan_negotiation_report(
         trusted_filters: filter_report.trusted_filters,
         residual_filters: filter_report.residual_filters,
         rejected_filters: filter_report.rejected_filters,
-        lowered_oql_predicates: filter_report.lowered_oql_predicates,
+        lowered_coveql_predicates: filter_report.lowered_coveql_predicates,
         proof_states: filter_report.proof_states,
         filters_trusted_exact: filter_report.trusted,
         received_limit: limit,
-        limit_pushed_to_oql,
-        pushed_limit: limit_pushed_to_oql.then_some(limit).flatten(),
+        limit_pushed_to_coveql,
+        pushed_limit: limit_pushed_to_coveql.then_some(limit).flatten(),
         residual_filter_authority,
         scan_execution_policy: exec_scan_execution_policy(
             planned,
             manifest,
-            projection_pushed_to_oql,
+            projection_pushed_to_coveql,
             !scan_filters.is_empty(),
         )
         .into(),
         unhandled_residuals,
         notes: vec![
             "scan negotiation report is computed with the same projection/filter/limit decisions used by the DataFusion TableProvider scan".into(),
-            "projection and limit pushdown require either no DataFusion filters or filters proven TrustedExact under Cove-OQL predicate semantics".into(),
+            "projection and limit pushdown require either no DataFusion filters or filters proven TrustedExact under CoveQL predicate semantics".into(),
         ],
     })
 }
 
-fn validate_manifest_oql_table_provider_scope(
+fn validate_manifest_coveql_table_provider_scope(
     planned: &PlannedQuery,
-    members: &[CoveOqlRetainedManifestMember],
+    members: &[CoveQlRetainedManifestMember],
 ) -> Result<()> {
-    if planned.resolved.output_mode != crate::CoveOqlOutputMode::DataFusionTableProvider {
+    if planned.resolved.output_mode != crate::CoveQlOutputMode::DataFusionTableProvider {
         return Err(DataFusionError::Plan(
-            "manifest OQL DataFusion provider requires DataFusionTableProvider output mode".into(),
+            "manifest CoveQL DataFusion provider requires DataFusionTableProvider output mode"
+                .into(),
         ));
     }
     let file_count = planned.resolved.operation_context.dataset.files.len();
     if file_count == 0 {
         return Err(DataFusionError::Plan(
-            "manifest OQL DataFusion provider requires a resolved dataset scope".into(),
+            "manifest CoveQL DataFusion provider requires a resolved dataset scope".into(),
         ));
     }
     if file_count != members.len() {
         return Err(DataFusionError::Plan(format!(
-            "manifest OQL DataFusion provider member count mismatch: resolved scope has {file_count}, provider received {}",
+            "manifest CoveQL DataFusion provider member count mismatch: resolved scope has {file_count}, provider received {}",
             members.len()
         )));
     }
     Ok(())
 }
 
-fn validate_oql_table_provider_scope(planned: &PlannedQuery) -> Result<()> {
+fn validate_coveql_table_provider_scope(planned: &PlannedQuery) -> Result<()> {
     let file_count = planned.resolved.operation_context.dataset.files.len();
     if file_count <= 1 {
         return Ok(());
     }
     Err(DataFusionError::Plan(format!(
-        "Cove-OQL OqlTableProvider accepts one retained COVE file; manifest-scoped plans with {file_count} members require manifest-member execution or a dedicated manifest DataFusion provider"
+        "CoveQL CoveQlTableProvider accepts one retained COVE file; manifest-scoped plans with {file_count} members require manifest-member execution or a dedicated manifest DataFusion provider"
     )))
 }
 
+fn cached_projection_catalog_for_plan(
+    bytes: &[u8],
+    planned: &PlannedQuery,
+    mapping: Option<&Path>,
+) -> Result<Option<Arc<MapProjectionCatalog>>> {
+    if !matches!(
+        planned.resolved.root,
+        ResolvedRoot::Projection(_) | ResolvedRoot::Table(_)
+    ) {
+        return Ok(None);
+    }
+    projection_catalog_from_cove_o_bytes(bytes, mapping)
+        .map(Arc::new)
+        .map(Some)
+        .map_err(|err| {
+            DataFusionError::Execution(format!(
+                "CoveQL DataFusion provider could not cache projection catalog: {err}"
+            ))
+        })
+}
+
 #[async_trait]
-impl TableProvider for ManifestOqlTableProvider {
+impl TableProvider for ManifestCoveQlTableProvider {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -499,18 +539,22 @@ impl TableProvider for ManifestOqlTableProvider {
         let scan_filters = classify_scan_projection_filters(&self.schema, filters, &self.planned)?;
         let scan_report =
             datafusion_pushdown_report_for_plan(&self.schema, filters, &self.planned)?;
-        let push_scan_projection_to_oql = can_apply_datafusion_scan_projection(&self.planned)
+        let push_scan_projection_to_coveql = can_apply_datafusion_scan_projection(&self.planned)
             && (filters.is_empty() || scan_report.trusted);
-        let push_scan_limit_to_oql = filters.is_empty() || scan_report.trusted;
+        let push_scan_limit_to_coveql = filters.is_empty() || scan_report.trusted;
         let received_limit = limit;
-        let limit = if push_scan_limit_to_oql { limit } else { None };
-        ManifestOqlExec::try_new(
+        let limit = if push_scan_limit_to_coveql {
+            limit
+        } else {
+            None
+        };
+        ManifestCoveQlExec::try_new(
             self.members.clone(),
             self.planned.clone(),
             self.options.clone(),
             Arc::clone(&self.schema),
             projection.cloned(),
-            push_scan_projection_to_oql,
+            push_scan_projection_to_coveql,
             scan_filters,
             scan_report,
             self.schema_probe_authority_source,
@@ -542,7 +586,7 @@ impl TableProvider for ManifestOqlTableProvider {
 }
 
 #[async_trait]
-impl TableProvider for OqlTableProvider {
+impl TableProvider for CoveQlTableProvider {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -565,18 +609,23 @@ impl TableProvider for OqlTableProvider {
         let scan_filters = classify_scan_projection_filters(&self.schema, filters, &self.planned)?;
         let scan_report =
             datafusion_pushdown_report_for_plan(&self.schema, filters, &self.planned)?;
-        let push_scan_projection_to_oql = can_apply_datafusion_scan_projection(&self.planned)
+        let push_scan_projection_to_coveql = can_apply_datafusion_scan_projection(&self.planned)
             && (filters.is_empty() || scan_report.trusted);
-        let push_scan_limit_to_oql = filters.is_empty() || scan_report.trusted;
+        let push_scan_limit_to_coveql = filters.is_empty() || scan_report.trusted;
         let received_limit = limit;
-        let limit = if push_scan_limit_to_oql { limit } else { None };
-        OqlExec::try_new(
+        let limit = if push_scan_limit_to_coveql {
+            limit
+        } else {
+            None
+        };
+        CoveQlExec::try_new(
             Arc::clone(&self.bytes),
             self.planned.clone(),
             self.options.clone(),
+            self.projection_catalog.as_ref().map(Arc::clone),
             Arc::clone(&self.schema),
             projection.cloned(),
-            push_scan_projection_to_oql,
+            push_scan_projection_to_coveql,
             scan_filters,
             scan_report,
             self.schema_probe_authority_source,
@@ -608,17 +657,18 @@ impl TableProvider for OqlTableProvider {
 }
 
 #[derive(Debug)]
-struct OqlExec {
+struct CoveQlExec {
     bytes: Arc<Vec<u8>>,
     planned: PlannedQuery,
     options: ExecutionOptions,
+    projection_catalog: Option<Arc<MapProjectionCatalog>>,
     base_schema: SchemaRef,
     schema: SchemaRef,
     projection: Option<Vec<usize>>,
-    scan_projection_pushed_to_oql: bool,
+    scan_projection_pushed_to_coveql: bool,
     pushed_projection_columns: Vec<String>,
     scan_filters: Vec<ProjectionFilter>,
-    scan_report: DataFusionOqlPushdownReport,
+    scan_report: DataFusionCoveQlPushdownReport,
     schema_probe_authority_source: ExecutionAuthoritySource,
     schema_probe_materialized_fallback: bool,
     schema_probe_residual_required: bool,
@@ -629,16 +679,17 @@ struct OqlExec {
     metrics: ExecutionPlanMetricsSet,
 }
 
-impl OqlExec {
+impl CoveQlExec {
     fn try_new(
         bytes: Arc<Vec<u8>>,
         planned: PlannedQuery,
         options: ExecutionOptions,
+        projection_catalog: Option<Arc<MapProjectionCatalog>>,
         base_schema: SchemaRef,
         projection: Option<Vec<usize>>,
-        push_scan_projection_to_oql: bool,
+        push_scan_projection_to_coveql: bool,
         scan_filters: Vec<ProjectionFilter>,
-        scan_report: DataFusionOqlPushdownReport,
+        scan_report: DataFusionCoveQlPushdownReport,
         schema_probe_authority_source: ExecutionAuthoritySource,
         schema_probe_materialized_fallback: bool,
         schema_probe_residual_required: bool,
@@ -647,12 +698,12 @@ impl OqlExec {
         limit: Option<usize>,
     ) -> Result<Self> {
         let schema = projected_schema(&base_schema, projection.as_deref())?;
-        let pushed_projection_columns = if push_scan_projection_to_oql {
+        let pushed_projection_columns = if push_scan_projection_to_coveql {
             projection_column_names(&base_schema, projection.as_deref())?
         } else {
             Vec::new()
         };
-        let scan_projection_pushed_to_oql = push_scan_projection_to_oql
+        let scan_projection_pushed_to_coveql = push_scan_projection_to_coveql
             && projection.is_some()
             && !pushed_projection_columns.is_empty();
         let properties = Arc::new(PlanProperties::new(
@@ -665,10 +716,11 @@ impl OqlExec {
             bytes,
             planned,
             options,
+            projection_catalog,
             base_schema,
             schema,
             projection,
-            scan_projection_pushed_to_oql,
+            scan_projection_pushed_to_coveql,
             pushed_projection_columns,
             scan_filters,
             scan_report,
@@ -684,15 +736,15 @@ impl OqlExec {
     }
 }
 
-impl DisplayAs for OqlExec {
+impl DisplayAs for CoveQlExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => write!(
                 f,
-                "OqlExec: root={}, projection={:?}, projection_pushed_to_oql={}, pushed_projection_columns={:?}, pushed_filters={}, trusted_filters={}, residual_filters={}, rejected_filters={}, received_filters={}, trusted={}, received_limit={:?}, limit_pushed_to_oql={}, limit={:?}, scan_execution_policy={}, residual_filter_authority={}, oql_scan_authority_probe={:?}, oql_scan_materialized_fallback={}, oql_scan_residual_required={}, oql_scan_compared_with_materialized={}",
+                "CoveQlExec: root={}, projection={:?}, projection_pushed_to_coveql={}, pushed_projection_columns={:?}, pushed_filters={}, trusted_filters={}, residual_filters={}, rejected_filters={}, received_filters={}, trusted={}, received_limit={:?}, limit_pushed_to_coveql={}, limit={:?}, scan_execution_policy={}, residual_filter_authority={}, coveql_scan_authority_probe={:?}, coveql_scan_materialized_fallback={}, coveql_scan_residual_required={}, coveql_scan_compared_with_materialized={}",
                 resolved_root_name(&self.planned.resolved.root),
                 self.projection,
-                self.scan_projection_pushed_to_oql,
+                self.scan_projection_pushed_to_coveql,
                 self.pushed_projection_columns,
                 self.scan_report.pushed_filters.len(),
                 self.scan_report.trusted_filters.len(),
@@ -706,7 +758,7 @@ impl DisplayAs for OqlExec {
                 exec_scan_execution_policy(
                     &self.planned,
                     false,
-                    self.scan_projection_pushed_to_oql,
+                    self.scan_projection_pushed_to_coveql,
                     !self.scan_filters.is_empty()
                 ),
                 residual_filter_authority_label(&self.scan_report),
@@ -715,14 +767,14 @@ impl DisplayAs for OqlExec {
                 self.schema_probe_residual_required,
                 self.schema_probe_compared_with_materialized
             ),
-            DisplayFormatType::TreeRender => write!(f, "OqlExec"),
+            DisplayFormatType::TreeRender => write!(f, "CoveQlExec"),
         }
     }
 }
 
-impl ExecutionPlan for OqlExec {
+impl ExecutionPlan for CoveQlExec {
     fn name(&self) -> &str {
-        "OqlExec"
+        "CoveQlExec"
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -743,7 +795,7 @@ impl ExecutionPlan for OqlExec {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         if !children.is_empty() {
             return Err(DataFusionError::Internal(
-                "OqlExec is a leaf execution plan".into(),
+                "CoveQlExec is a leaf execution plan".into(),
             ));
         }
         Ok(self)
@@ -756,29 +808,30 @@ impl ExecutionPlan for OqlExec {
     ) -> Result<SendableRecordBatchStream> {
         if partition != 0 {
             return Err(DataFusionError::Internal(format!(
-                "OqlExec has one partition, got partition {partition}"
+                "CoveQlExec has one partition, got partition {partition}"
             )));
         }
-        let metrics = OqlExecMetrics::new(&self.metrics, partition);
+        let metrics = CoveQlExecMetrics::new(&self.metrics, partition);
         let pushed_projection = self
-            .scan_projection_pushed_to_oql
+            .scan_projection_pushed_to_coveql
             .then(|| self.projection.as_deref())
             .flatten();
-        let arrow = execute_oql_arrow_with_scan_filters(
+        let arrow = execute_coveql_arrow_with_scan_filters(
             self.bytes.as_slice(),
             &self.planned,
             &self.options,
+            self.projection_catalog.as_deref(),
             &self.base_schema,
             pushed_projection,
             &self.scan_filters,
             self.limit,
         )?;
-        let project_after_oql = if self.scan_projection_pushed_to_oql {
+        let project_after_coveql = if self.scan_projection_pushed_to_coveql {
             None
         } else {
             self.projection.as_deref()
         };
-        let batches = project_and_limit_batches(arrow.batches, project_after_oql, self.limit)?;
+        let batches = project_and_limit_batches(arrow.batches, project_after_coveql, self.limit)?;
         metrics.record(
             arrow.row_count,
             batches.iter().map(RecordBatch::num_rows).sum(),
@@ -798,7 +851,7 @@ impl ExecutionPlan for OqlExec {
         if let Some(partition) = partition {
             if partition != 0 {
                 return Err(DataFusionError::Internal(format!(
-                    "OqlExec has one partition, got partition {partition}"
+                    "CoveQlExec has one partition, got partition {partition}"
                 )));
             }
         }
@@ -809,40 +862,41 @@ impl ExecutionPlan for OqlExec {
     }
 }
 
-struct OqlExecMetrics {
+struct CoveQlExecMetrics {
     scans: Count,
-    rows_from_oql: Count,
+    rows_from_coveql: Count,
     rows_emitted: Count,
 }
 
-impl OqlExecMetrics {
+impl CoveQlExecMetrics {
     fn new(metrics: &ExecutionPlanMetricsSet, partition: usize) -> Self {
         Self {
-            scans: MetricBuilder::new(metrics).counter("oql_scans", partition),
-            rows_from_oql: MetricBuilder::new(metrics).counter("oql_rows_from_oql", partition),
-            rows_emitted: MetricBuilder::new(metrics).counter("oql_rows_emitted", partition),
+            scans: MetricBuilder::new(metrics).counter("coveql_scans", partition),
+            rows_from_coveql: MetricBuilder::new(metrics)
+                .counter("coveql_rows_from_coveql", partition),
+            rows_emitted: MetricBuilder::new(metrics).counter("coveql_rows_emitted", partition),
         }
     }
 
-    fn record(&self, rows_from_oql: usize, rows_emitted: usize) {
+    fn record(&self, rows_from_coveql: usize, rows_emitted: usize) {
         self.scans.add(1);
-        self.rows_from_oql.add(rows_from_oql);
+        self.rows_from_coveql.add(rows_from_coveql);
         self.rows_emitted.add(rows_emitted);
     }
 }
 
 #[derive(Debug)]
-struct ManifestOqlExec {
-    members: Vec<CoveOqlRetainedManifestMember>,
+struct ManifestCoveQlExec {
+    members: Vec<CoveQlRetainedManifestMember>,
     planned: PlannedQuery,
     options: ExecutionOptions,
     base_schema: SchemaRef,
     schema: SchemaRef,
     projection: Option<Vec<usize>>,
-    scan_projection_pushed_to_oql: bool,
+    scan_projection_pushed_to_coveql: bool,
     pushed_projection_columns: Vec<String>,
     scan_filters: Vec<ProjectionFilter>,
-    scan_report: DataFusionOqlPushdownReport,
+    scan_report: DataFusionCoveQlPushdownReport,
     schema_probe_authority_source: ExecutionAuthoritySource,
     schema_probe_materialized_fallback: bool,
     schema_probe_residual_required: bool,
@@ -853,16 +907,16 @@ struct ManifestOqlExec {
     metrics: ExecutionPlanMetricsSet,
 }
 
-impl ManifestOqlExec {
+impl ManifestCoveQlExec {
     fn try_new(
-        members: Vec<CoveOqlRetainedManifestMember>,
+        members: Vec<CoveQlRetainedManifestMember>,
         planned: PlannedQuery,
         options: ExecutionOptions,
         base_schema: SchemaRef,
         projection: Option<Vec<usize>>,
-        push_scan_projection_to_oql: bool,
+        push_scan_projection_to_coveql: bool,
         scan_filters: Vec<ProjectionFilter>,
-        scan_report: DataFusionOqlPushdownReport,
+        scan_report: DataFusionCoveQlPushdownReport,
         schema_probe_authority_source: ExecutionAuthoritySource,
         schema_probe_materialized_fallback: bool,
         schema_probe_residual_required: bool,
@@ -871,12 +925,12 @@ impl ManifestOqlExec {
         limit: Option<usize>,
     ) -> Result<Self> {
         let schema = projected_schema(&base_schema, projection.as_deref())?;
-        let pushed_projection_columns = if push_scan_projection_to_oql {
+        let pushed_projection_columns = if push_scan_projection_to_coveql {
             projection_column_names(&base_schema, projection.as_deref())?
         } else {
             Vec::new()
         };
-        let scan_projection_pushed_to_oql = push_scan_projection_to_oql
+        let scan_projection_pushed_to_coveql = push_scan_projection_to_coveql
             && projection.is_some()
             && !pushed_projection_columns.is_empty();
         let properties = Arc::new(PlanProperties::new(
@@ -892,7 +946,7 @@ impl ManifestOqlExec {
             base_schema,
             schema,
             projection,
-            scan_projection_pushed_to_oql,
+            scan_projection_pushed_to_coveql,
             pushed_projection_columns,
             scan_filters,
             scan_report,
@@ -908,16 +962,16 @@ impl ManifestOqlExec {
     }
 }
 
-impl DisplayAs for ManifestOqlExec {
+impl DisplayAs for ManifestCoveQlExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => write!(
                 f,
-                "ManifestOqlExec: root={}, files={}, projection={:?}, projection_pushed_to_oql={}, pushed_projection_columns={:?}, pushed_filters={}, trusted_filters={}, residual_filters={}, rejected_filters={}, received_filters={}, trusted={}, received_limit={:?}, limit_pushed_to_oql={}, limit={:?}, scan_execution_policy={}, residual_filter_authority={}, oql_scan_authority_probe={:?}, oql_scan_materialized_fallback={}, oql_scan_residual_required={}, oql_scan_compared_with_materialized={}",
+                "ManifestCoveQlExec: root={}, files={}, projection={:?}, projection_pushed_to_coveql={}, pushed_projection_columns={:?}, pushed_filters={}, trusted_filters={}, residual_filters={}, rejected_filters={}, received_filters={}, trusted={}, received_limit={:?}, limit_pushed_to_coveql={}, limit={:?}, scan_execution_policy={}, residual_filter_authority={}, coveql_scan_authority_probe={:?}, coveql_scan_materialized_fallback={}, coveql_scan_residual_required={}, coveql_scan_compared_with_materialized={}",
                 resolved_root_name(&self.planned.resolved.root),
                 self.members.len(),
                 self.projection,
-                self.scan_projection_pushed_to_oql,
+                self.scan_projection_pushed_to_coveql,
                 self.pushed_projection_columns,
                 self.scan_report.pushed_filters.len(),
                 self.scan_report.trusted_filters.len(),
@@ -931,7 +985,7 @@ impl DisplayAs for ManifestOqlExec {
                 exec_scan_execution_policy(
                     &self.planned,
                     true,
-                    self.scan_projection_pushed_to_oql,
+                    self.scan_projection_pushed_to_coveql,
                     !self.scan_filters.is_empty()
                 ),
                 residual_filter_authority_label(&self.scan_report),
@@ -940,14 +994,14 @@ impl DisplayAs for ManifestOqlExec {
                 self.schema_probe_residual_required,
                 self.schema_probe_compared_with_materialized
             ),
-            DisplayFormatType::TreeRender => write!(f, "ManifestOqlExec"),
+            DisplayFormatType::TreeRender => write!(f, "ManifestCoveQlExec"),
         }
     }
 }
 
-impl ExecutionPlan for ManifestOqlExec {
+impl ExecutionPlan for ManifestCoveQlExec {
     fn name(&self) -> &str {
-        "ManifestOqlExec"
+        "ManifestCoveQlExec"
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -968,7 +1022,7 @@ impl ExecutionPlan for ManifestOqlExec {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         if !children.is_empty() {
             return Err(DataFusionError::Internal(
-                "ManifestOqlExec is a leaf execution plan".into(),
+                "ManifestCoveQlExec is a leaf execution plan".into(),
             ));
         }
         Ok(self)
@@ -981,15 +1035,15 @@ impl ExecutionPlan for ManifestOqlExec {
     ) -> Result<SendableRecordBatchStream> {
         if partition != 0 {
             return Err(DataFusionError::Internal(format!(
-                "ManifestOqlExec has one partition, got partition {partition}"
+                "ManifestCoveQlExec has one partition, got partition {partition}"
             )));
         }
-        let metrics = OqlExecMetrics::new(&self.metrics, partition);
+        let metrics = CoveQlExecMetrics::new(&self.metrics, partition);
         let pushed_projection = self
-            .scan_projection_pushed_to_oql
+            .scan_projection_pushed_to_coveql
             .then(|| self.projection.as_deref())
             .flatten();
-        let arrow = execute_manifest_oql_arrow_with_scan_filters(
+        let arrow = execute_manifest_coveql_arrow_with_scan_filters(
             &self.members,
             &self.planned,
             &self.options,
@@ -998,12 +1052,12 @@ impl ExecutionPlan for ManifestOqlExec {
             &self.scan_filters,
             self.limit,
         )?;
-        let project_after_oql = if self.scan_projection_pushed_to_oql {
+        let project_after_coveql = if self.scan_projection_pushed_to_coveql {
             None
         } else {
             self.projection.as_deref()
         };
-        let batches = project_and_limit_batches(arrow.batches, project_after_oql, self.limit)?;
+        let batches = project_and_limit_batches(arrow.batches, project_after_coveql, self.limit)?;
         metrics.record(
             arrow.row_count,
             batches.iter().map(RecordBatch::num_rows).sum(),
@@ -1023,7 +1077,7 @@ impl ExecutionPlan for ManifestOqlExec {
         if let Some(partition) = partition {
             if partition != 0 {
                 return Err(DataFusionError::Internal(format!(
-                    "ManifestOqlExec has one partition, got partition {partition}"
+                    "ManifestCoveQlExec has one partition, got partition {partition}"
                 )));
             }
         }
@@ -1034,7 +1088,7 @@ impl ExecutionPlan for ManifestOqlExec {
     }
 }
 
-struct OqlArrowExecution {
+struct CoveQlArrowExecution {
     batches: Vec<RecordBatch>,
     row_count: usize,
     authority_source: ExecutionAuthoritySource,
@@ -1043,28 +1097,28 @@ struct OqlArrowExecution {
     compared_with_materialized: bool,
 }
 
-fn execute_manifest_oql_arrow_with_scan_filters(
-    members: &[CoveOqlRetainedManifestMember],
+fn execute_manifest_coveql_arrow_with_scan_filters(
+    members: &[CoveQlRetainedManifestMember],
     planned: &PlannedQuery,
     options: &ExecutionOptions,
     base_schema: &SchemaRef,
     pushed_projection: Option<&[usize]>,
     scan_filters: &[ProjectionFilter],
     limit: Option<usize>,
-) -> Result<OqlArrowExecution> {
+) -> Result<CoveQlArrowExecution> {
     if (scan_filters.is_empty() && pushed_projection.is_none())
         || !can_apply_datafusion_scan_filters(planned)
     {
         let limited = planned_with_scan_limit(planned, limit);
-        return execute_manifest_oql_arrow(members, &limited, options);
+        return execute_manifest_coveql_arrow(members, &limited, options);
     }
     match &planned.resolved.root {
-        ResolvedRoot::Projection(_) => {
+        ResolvedRoot::Projection(_) | ResolvedRoot::Table(_) => {
             let mut planned =
                 planned_with_projection_scan_filters(planned, base_schema, scan_filters)
                     .ok_or_else(|| {
                         DataFusionError::Execution(
-                    "manifest OQL DataFusion provider could not lower projection scan filters"
+                    "manifest CoveQL DataFusion provider could not lower projection scan filters"
                         .into(),
                 )
                     })?;
@@ -1072,13 +1126,17 @@ fn execute_manifest_oql_arrow_with_scan_filters(
                 apply_projection_scan_projection(&mut planned, base_schema, projection)?;
             }
             apply_scan_limit(&mut planned, limit);
-            execute_manifest_oql_arrow(members, &planned, options)
+            execute_manifest_coveql_arrow(members, &planned, options)
         }
-        ResolvedRoot::Object(_) | ResolvedRoot::Association(_) | ResolvedRoot::Evidence(_) => {
+        ResolvedRoot::Object(_)
+        | ResolvedRoot::Association(_)
+        | ResolvedRoot::Node(_)
+        | ResolvedRoot::Edge(_)
+        | ResolvedRoot::Evidence(_) => {
             let mut planned =
                 planned_with_row_scan_filters(planned, scan_filters).ok_or_else(|| {
                     DataFusionError::Execution(
-                        "manifest OQL DataFusion provider could not lower row-root scan filters"
+                        "manifest CoveQL DataFusion provider could not lower row-root scan filters"
                             .into(),
                     )
                 })?;
@@ -1086,35 +1144,35 @@ fn execute_manifest_oql_arrow_with_scan_filters(
                 apply_row_scan_projection(&mut planned, base_schema, projection)?;
             }
             apply_scan_limit(&mut planned, limit);
-            execute_manifest_oql_arrow(members, &planned, options)
+            execute_manifest_coveql_arrow(members, &planned, options)
         }
     }
 }
 
-fn execute_manifest_oql_arrow(
-    members: &[CoveOqlRetainedManifestMember],
+fn execute_manifest_coveql_arrow(
+    members: &[CoveQlRetainedManifestMember],
     planned: &PlannedQuery,
     options: &ExecutionOptions,
-) -> Result<OqlArrowExecution> {
+) -> Result<CoveQlArrowExecution> {
     let mut arrow_planned = planned.clone();
-    arrow_planned.resolved.output_mode = crate::CoveOqlOutputMode::ArrowRecordBatch {
+    arrow_planned.resolved.output_mode = crate::CoveQlOutputMode::ArrowRecordBatch {
         zero_copy_requested: false,
     };
-    arrow_planned.logical_plan.context.output_mode = crate::CoveOqlOutputMode::ArrowRecordBatch {
+    arrow_planned.logical_plan.context.output_mode = crate::CoveQlOutputMode::ArrowRecordBatch {
         zero_copy_requested: false,
     };
-    let executed = execute_manifest_oql_arrow_physical_or_materialized(
+    let executed = execute_manifest_coveql_arrow_physical_or_materialized(
         members,
         arrow_planned,
         options.clone(),
     )?;
     let authority = executed.authority.clone();
-    let CoveOqlExecutionResult::ArrowRecordBatches(batches) = executed.result else {
+    let CoveQlExecutionResult::ArrowRecordBatches(batches) = executed.result else {
         return Err(DataFusionError::Execution(
-            "manifest OQL DataFusion provider requires ArrowRecordBatch output".into(),
+            "manifest CoveQL DataFusion provider requires ArrowRecordBatch output".into(),
         ));
     };
-    Ok(OqlArrowExecution {
+    Ok(CoveQlArrowExecution {
         row_count: batches.iter().map(RecordBatch::num_rows).sum(),
         batches,
         authority_source: authority.source,
@@ -1125,8 +1183,8 @@ fn execute_manifest_oql_arrow(
     })
 }
 
-fn execute_manifest_oql_arrow_physical_or_materialized(
-    members: &[CoveOqlRetainedManifestMember],
+fn execute_manifest_coveql_arrow_physical_or_materialized(
+    members: &[CoveQlRetainedManifestMember],
     arrow_planned: PlannedQuery,
     options: ExecutionOptions,
 ) -> Result<crate::ExecutedQuery> {
@@ -1139,7 +1197,7 @@ fn execute_manifest_oql_arrow_physical_or_materialized(
         ) {
             let borrowed = members
                 .iter()
-                .map(CoveOqlRetainedManifestMember::as_manifest_member)
+                .map(CoveQlRetainedManifestMember::as_manifest_member)
                 .collect::<Vec<_>>();
             let kernel = execute_manifest_physical_planned_query(
                 &borrowed,
@@ -1155,27 +1213,27 @@ fn execute_manifest_oql_arrow_physical_or_materialized(
         .map_err(|err| DataFusionError::Execution(err.to_string()))
 }
 
-fn execute_oql_arrow(
+fn execute_coveql_arrow(
     bytes: &[u8],
     planned: &PlannedQuery,
     options: &ExecutionOptions,
-) -> Result<OqlArrowExecution> {
+) -> Result<CoveQlArrowExecution> {
     let mut arrow_planned = planned.clone();
-    arrow_planned.resolved.output_mode = crate::CoveOqlOutputMode::ArrowRecordBatch {
+    arrow_planned.resolved.output_mode = crate::CoveQlOutputMode::ArrowRecordBatch {
         zero_copy_requested: false,
     };
-    arrow_planned.logical_plan.context.output_mode = crate::CoveOqlOutputMode::ArrowRecordBatch {
+    arrow_planned.logical_plan.context.output_mode = crate::CoveQlOutputMode::ArrowRecordBatch {
         zero_copy_requested: false,
     };
     let executed =
-        execute_oql_arrow_physical_or_materialized(bytes, arrow_planned, options.clone())?;
+        execute_coveql_arrow_physical_or_materialized(bytes, arrow_planned, options.clone())?;
     let authority = executed.authority.clone();
-    let CoveOqlExecutionResult::ArrowRecordBatches(batches) = executed.result else {
+    let CoveQlExecutionResult::ArrowRecordBatches(batches) = executed.result else {
         return Err(DataFusionError::Execution(
-            "OQL DataFusion provider requires ArrowRecordBatch output".into(),
+            "CoveQL DataFusion provider requires ArrowRecordBatch output".into(),
         ));
     };
-    Ok(OqlArrowExecution {
+    Ok(CoveQlArrowExecution {
         row_count: batches.iter().map(RecordBatch::num_rows).sum(),
         batches,
         authority_source: authority.source,
@@ -1186,7 +1244,7 @@ fn execute_oql_arrow(
     })
 }
 
-fn execute_oql_arrow_physical_or_materialized(
+fn execute_coveql_arrow_physical_or_materialized(
     bytes: &[u8],
     arrow_planned: PlannedQuery,
     options: ExecutionOptions,
@@ -1207,79 +1265,127 @@ fn execute_oql_arrow_physical_or_materialized(
         return Ok(kernel.executed);
     }
     execute_planned_query_retained(
-        CoveOqlRetainedInput::from_vec(bytes.to_vec()),
+        CoveQlRetainedInput::from_vec(bytes.to_vec()),
         arrow_planned,
         options,
     )
     .map_err(|err| DataFusionError::Execution(err.to_string()))
 }
 
-fn execute_oql_arrow_with_scan_filters(
+fn execute_coveql_arrow_with_scan_filters(
     bytes: &[u8],
     planned: &PlannedQuery,
     options: &ExecutionOptions,
+    projection_catalog: Option<&MapProjectionCatalog>,
     base_schema: &SchemaRef,
     pushed_projection: Option<&[usize]>,
     scan_filters: &[ProjectionFilter],
     limit: Option<usize>,
-) -> Result<OqlArrowExecution> {
+) -> Result<CoveQlArrowExecution> {
     if (scan_filters.is_empty() && pushed_projection.is_none())
         || !can_apply_datafusion_scan_filters(planned)
     {
         let limited = planned_with_scan_limit(planned, limit);
-        return execute_oql_arrow(bytes, &limited, options);
+        return execute_coveql_arrow(bytes, &limited, options);
     }
     match &planned.resolved.root {
-        ResolvedRoot::Projection(root) => {
-            let output_columns = if let Some(projection) = pushed_projection {
-                projection_column_names(base_schema, Some(projection))?
-            } else {
-                base_schema
-                    .fields()
-                    .iter()
-                    .map(|field| field.name().clone())
-                    .collect()
-            };
-            let projection_options = ProjectionBatchOptions {
-                max_rows: scan_limit_for_projection_readback(planned, limit),
-                output_columns: Some(output_columns),
-                pushed_filters: scan_filters.to_vec(),
-                batch_size: options.batch_size,
-            };
-            let batches = projected_record_batches_from_cove_o_bytes(
-                bytes,
-                options.mapping_path.as_deref(),
-                &root.projection_id,
-                &projection_options,
-            )
-            .map_err(|err| {
-                DataFusionError::Execution(format!(
-                    "OQL DataFusion provider projection-filter readback failed: {err}"
-                ))
-            })?;
-            Ok(OqlArrowExecution {
-                row_count: batches.iter().map(RecordBatch::num_rows).sum(),
-                batches,
-                authority_source: ExecutionAuthoritySource::DataFusionProvider,
-                materialized_fallback: false,
-                residual_required: false,
-                compared_with_materialized: false,
-            })
-        }
-        ResolvedRoot::Object(_) | ResolvedRoot::Association(_) | ResolvedRoot::Evidence(_) => {
+        ResolvedRoot::Projection(root) => execute_projection_scan_arrow(
+            bytes,
+            planned,
+            options,
+            projection_catalog,
+            base_schema,
+            pushed_projection,
+            scan_filters,
+            limit,
+            &root.projection_id,
+        ),
+        ResolvedRoot::Table(root) => execute_projection_scan_arrow(
+            bytes,
+            planned,
+            options,
+            projection_catalog,
+            base_schema,
+            pushed_projection,
+            scan_filters,
+            limit,
+            &root.projection.projection_id,
+        ),
+        ResolvedRoot::Object(_)
+        | ResolvedRoot::Association(_)
+        | ResolvedRoot::Node(_)
+        | ResolvedRoot::Edge(_)
+        | ResolvedRoot::Evidence(_) => {
             let mut planned =
                 planned_with_row_scan_filters(planned, scan_filters).ok_or_else(|| {
                     DataFusionError::Execution(
-                        "OQL DataFusion provider could not lower row-root scan filters".into(),
+                        "CoveQL DataFusion provider could not lower row-root scan filters".into(),
                     )
                 })?;
             if let Some(projection) = pushed_projection {
                 apply_row_scan_projection(&mut planned, base_schema, projection)?;
             }
             apply_scan_limit(&mut planned, limit);
-            execute_oql_arrow(bytes, &planned, options)
+            execute_coveql_arrow(bytes, &planned, options)
         }
     }
+}
+
+fn execute_projection_scan_arrow(
+    bytes: &[u8],
+    planned: &PlannedQuery,
+    options: &ExecutionOptions,
+    projection_catalog: Option<&MapProjectionCatalog>,
+    base_schema: &SchemaRef,
+    pushed_projection: Option<&[usize]>,
+    scan_filters: &[ProjectionFilter],
+    limit: Option<usize>,
+    projection_id: &str,
+) -> Result<CoveQlArrowExecution> {
+    let output_columns = if let Some(projection) = pushed_projection {
+        projection_column_names(base_schema, Some(projection))?
+    } else {
+        base_schema
+            .fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .collect()
+    };
+    let projection_options = ProjectionBatchOptions {
+        max_rows: scan_limit_for_projection_readback(planned, limit),
+        output_columns: Some(output_columns),
+        pushed_filters: scan_filters.to_vec(),
+        batch_size: options.batch_size,
+    };
+    let batches = if let Some(catalog) = projection_catalog {
+        projected_record_batches_from_cove_o_bytes_with_catalog(
+            bytes,
+            options.mapping_path.as_deref(),
+            catalog,
+            projection_id,
+            &projection_options,
+        )
+    } else {
+        projected_record_batches_from_cove_o_bytes(
+            bytes,
+            options.mapping_path.as_deref(),
+            projection_id,
+            &projection_options,
+        )
+    }
+    .map_err(|err| {
+        DataFusionError::Execution(format!(
+            "CoveQL DataFusion provider projection-filter readback failed: {err}"
+        ))
+    })?;
+    Ok(CoveQlArrowExecution {
+        row_count: batches.iter().map(RecordBatch::num_rows).sum(),
+        batches,
+        authority_source: ExecutionAuthoritySource::DataFusionProvider,
+        materialized_fallback: false,
+        residual_required: false,
+        compared_with_materialized: false,
+    })
 }
 
 fn planned_with_scan_limit(planned: &PlannedQuery, limit: Option<usize>) -> PlannedQuery {
@@ -1324,7 +1430,10 @@ fn can_apply_datafusion_scan_projection(planned: &PlannedQuery) -> bool {
 }
 
 fn can_apply_datafusion_projection_filters(planned: &PlannedQuery) -> bool {
-    matches!(planned.resolved.root, ResolvedRoot::Projection(_))
+    matches!(
+        planned.resolved.root,
+        ResolvedRoot::Projection(_) | ResolvedRoot::Table(_)
+    ) && coveql_plan_is_simple_scan_shape(planned)
         && projection_select_is_direct_unaliased_columns(planned)
         && planned.resolved.method_chain.where_predicate.is_none()
         && planned.resolved.method_chain.group_by.is_none()
@@ -1343,7 +1452,10 @@ fn projection_select_is_direct_unaliased_columns(planned: &PlannedQuery) -> bool
         let ResolvedExpr::Path(path) = &item.expr else {
             return false;
         };
-        if path.root_kind != ResolvedPathRootKind::Projection {
+        if !matches!(
+            path.root_kind,
+            ResolvedPathRootKind::Projection | ResolvedPathRootKind::Table
+        ) {
             return false;
         }
         let Some(column) = &path.projection_column else {
@@ -1361,7 +1473,10 @@ fn can_apply_datafusion_row_filters(planned: &PlannedQuery) -> bool {
     let Some(root_kind) = path_root_kind_for_resolved_root(&planned.resolved.root) else {
         return false;
     };
-    !matches!(planned.resolved.root, ResolvedRoot::Projection(_))
+    !matches!(
+        planned.resolved.root,
+        ResolvedRoot::Projection(_) | ResolvedRoot::Table(_)
+    ) && coveql_plan_is_simple_scan_shape(planned)
         && planned.resolved.method_chain.where_predicate.is_none()
         && planned.resolved.method_chain.group_by.is_none()
         && planned.resolved.method_chain.order_by.is_none()
@@ -1382,6 +1497,70 @@ fn can_apply_datafusion_row_filters(planned: &PlannedQuery) -> bool {
                     )
                 })
             })
+}
+
+fn coveql_plan_is_simple_scan_shape(planned: &PlannedQuery) -> bool {
+    let chain = &planned.resolved.method_chain;
+    chain.lookups.is_empty()
+        && chain.traversals.is_empty()
+        && chain
+            .where_predicate
+            .as_ref()
+            .is_none_or(|predicate| !predicate_contains_table_exists(predicate))
+        && chain.select.as_ref().is_none_or(|select| {
+            select
+                .iter()
+                .all(|item| !expr_contains_table_exists(&item.expr))
+        })
+        && chain
+            .order_by
+            .as_ref()
+            .is_none_or(|order| !expr_contains_table_exists(&order.expr))
+        && chain
+            .group_by
+            .as_ref()
+            .is_none_or(|group| group.iter().all(|expr| !expr_contains_table_exists(expr)))
+}
+
+fn predicate_contains_table_exists(predicate: &ResolvedPredicate) -> bool {
+    match predicate {
+        ResolvedPredicate::Exists(ResolvedExpr::TableExists(_)) => true,
+        ResolvedPredicate::Compare { left, right, .. } => {
+            expr_contains_table_exists(left) || expr_contains_table_exists(right)
+        }
+        ResolvedPredicate::InList { expr, .. }
+        | ResolvedPredicate::NullCheck { expr, .. }
+        | ResolvedPredicate::BoolExpr(expr)
+        | ResolvedPredicate::Exists(expr) => expr_contains_table_exists(expr),
+        ResolvedPredicate::Not(inner) => predicate_contains_table_exists(inner),
+        ResolvedPredicate::And(parts) | ResolvedPredicate::Or(parts) => {
+            parts.iter().any(predicate_contains_table_exists)
+        }
+    }
+}
+
+fn expr_contains_table_exists(expr: &ResolvedExpr) -> bool {
+    match expr {
+        ResolvedExpr::TableExists(_) => true,
+        ResolvedExpr::FunctionCall { args, .. } => args.iter().any(expr_contains_table_exists),
+        ResolvedExpr::AggregateCall { arg, .. } => {
+            arg.as_deref().is_some_and(expr_contains_table_exists)
+        }
+        ResolvedExpr::Conditional {
+            predicate,
+            then_expr,
+            else_expr,
+            ..
+        } => {
+            predicate_contains_table_exists(predicate)
+                || expr_contains_table_exists(then_expr)
+                || expr_contains_table_exists(else_expr)
+        }
+        ResolvedExpr::Path(_)
+        | ResolvedExpr::Literal(_)
+        | ResolvedExpr::Association(_)
+        | ResolvedExpr::Evidence(_) => false,
+    }
 }
 
 fn classify_scan_projection_filters(
@@ -1418,7 +1597,7 @@ fn scan_filter_pushdown_support(
         || report.filter_outcomes.iter().any(|outcome| {
             matches!(
                 outcome.outcome,
-                DataFusionOqlFilterOutcomeKind::ResidualRejected
+                DataFusionCoveQlFilterOutcomeKind::ResidualRejected
             )
         })
     {
@@ -1427,7 +1606,7 @@ fn scan_filter_pushdown_support(
     if report.filter_outcomes.iter().all(|outcome| {
         matches!(
             outcome.outcome,
-            DataFusionOqlFilterOutcomeKind::TrustedExact
+            DataFusionCoveQlFilterOutcomeKind::TrustedExact
         )
     }) {
         if row_root_exact_filter_needs_datafusion_projection_guard(schema, planned) {
@@ -1446,7 +1625,11 @@ fn row_root_exact_filter_needs_datafusion_projection_guard(
 ) -> bool {
     matches!(
         planned.resolved.root,
-        ResolvedRoot::Object(_) | ResolvedRoot::Association(_) | ResolvedRoot::Evidence(_)
+        ResolvedRoot::Object(_)
+            | ResolvedRoot::Association(_)
+            | ResolvedRoot::Node(_)
+            | ResolvedRoot::Edge(_)
+            | ResolvedRoot::Evidence(_)
     ) && schema.fields().len() > 1
 }
 
@@ -1524,7 +1707,12 @@ fn apply_projection_scan_projection(
     base_schema: &SchemaRef,
     projection: &[usize],
 ) -> Result<()> {
-    if projection.is_empty() || !matches!(planned.resolved.root, ResolvedRoot::Projection(_)) {
+    if projection.is_empty()
+        || !matches!(
+            planned.resolved.root,
+            ResolvedRoot::Projection(_) | ResolvedRoot::Table(_)
+        )
+    {
         return Ok(());
     }
     let requested_columns = projection_column_names(base_schema, Some(projection))?;
@@ -1537,7 +1725,7 @@ fn apply_projection_scan_projection(
                 .is_some()
             {
                 return Err(DataFusionError::Plan(format!(
-                    "manifest OQL DataFusion provider cannot push ambiguous duplicate projection column {output_name:?}"
+                    "manifest CoveQL DataFusion provider cannot push ambiguous duplicate projection column {output_name:?}"
                 )));
             }
         }
@@ -1568,7 +1756,11 @@ fn apply_row_scan_projection(
     if projection.is_empty()
         || !matches!(
             planned.resolved.root,
-            ResolvedRoot::Object(_) | ResolvedRoot::Association(_) | ResolvedRoot::Evidence(_)
+            ResolvedRoot::Object(_)
+                | ResolvedRoot::Association(_)
+                | ResolvedRoot::Node(_)
+                | ResolvedRoot::Edge(_)
+                | ResolvedRoot::Evidence(_)
         )
     {
         return Ok(());
@@ -1581,7 +1773,7 @@ fn apply_row_scan_projection(
         .as_ref()
         .ok_or_else(|| {
             DataFusionError::Execution(
-                "OQL DataFusion provider cannot push row projection without selected row fields"
+                "CoveQL DataFusion provider cannot push row projection without selected row fields"
                     .into(),
             )
         })?;
@@ -1593,7 +1785,7 @@ fn apply_row_scan_projection(
             .is_some()
         {
             return Err(DataFusionError::Plan(format!(
-                "OQL DataFusion provider cannot push ambiguous duplicate output column {output_name:?}"
+                "CoveQL DataFusion provider cannot push ambiguous duplicate output column {output_name:?}"
             )));
         }
     }
@@ -1602,7 +1794,7 @@ fn apply_row_scan_projection(
         .map(|column| {
             by_output_name.get(column).cloned().ok_or_else(|| {
                 DataFusionError::Plan(format!(
-                    "OQL DataFusion provider cannot map projected column {column:?} to a selected row field"
+                    "CoveQL DataFusion provider cannot map projected column {column:?} to a selected row field"
                 ))
             })
         })
@@ -1625,6 +1817,7 @@ fn resolved_expr_output_name(expr: &ResolvedExpr) -> String {
         ResolvedExpr::Literal(_) => "literal".into(),
         ResolvedExpr::Association(association) => association.type_name.clone(),
         ResolvedExpr::Evidence(_) => "evidence".into(),
+        ResolvedExpr::TableExists(_) => "exists".into(),
         ResolvedExpr::Conditional { .. } => "if".into(),
     }
 }
@@ -1676,6 +1869,9 @@ fn path_root_kind_for_resolved_root(root: &ResolvedRoot) -> Option<ResolvedPathR
     match root {
         ResolvedRoot::Object(_) => Some(ResolvedPathRootKind::Object),
         ResolvedRoot::Association(_) => Some(ResolvedPathRootKind::Association),
+        ResolvedRoot::Node(_) => Some(ResolvedPathRootKind::Node),
+        ResolvedRoot::Edge(_) => Some(ResolvedPathRootKind::Edge),
+        ResolvedRoot::Table(_) => Some(ResolvedPathRootKind::Table),
         ResolvedRoot::Evidence(_) => Some(ResolvedPathRootKind::Evidence),
         ResolvedRoot::Projection(_) => None,
     }
@@ -1748,111 +1944,111 @@ fn project_and_limit_batches(
     Ok(out)
 }
 
-pub fn datafusion_oql_provider_for_plan(
+pub fn datafusion_coveql_provider_for_plan(
     bytes: Arc<Vec<u8>>,
     planned: &PlannedQuery,
     options: ExecutionOptions,
-) -> Result<Arc<OqlTableProvider>> {
-    OqlTableProvider::try_new(bytes, planned.clone(), options).map(Arc::new)
+) -> Result<Arc<CoveQlTableProvider>> {
+    CoveQlTableProvider::try_new(bytes, planned.clone(), options).map(Arc::new)
 }
 
-pub fn datafusion_manifest_oql_provider_for_plan(
-    members: Vec<CoveOqlRetainedManifestMember>,
+pub fn datafusion_manifest_coveql_provider_for_plan(
+    members: Vec<CoveQlRetainedManifestMember>,
     planned: &PlannedQuery,
     options: ExecutionOptions,
-) -> Result<Arc<ManifestOqlTableProvider>> {
-    ManifestOqlTableProvider::try_new(members, planned.clone(), options).map(Arc::new)
+) -> Result<Arc<ManifestCoveQlTableProvider>> {
+    ManifestCoveQlTableProvider::try_new(members, planned.clone(), options).map(Arc::new)
 }
 
-pub fn register_datafusion_oql_provider_for_plan(
+pub fn register_datafusion_coveql_provider_for_plan(
     ctx: &SessionContext,
     table_name: &str,
     bytes: Arc<Vec<u8>>,
     planned: &PlannedQuery,
     options: ExecutionOptions,
-) -> Result<DataFusionOqlProviderReport> {
-    let provider = datafusion_oql_provider_for_plan(bytes, planned, options)?;
+) -> Result<DataFusionCoveQlProviderReport> {
+    let provider = datafusion_coveql_provider_for_plan(bytes, planned, options)?;
     let report = provider.report();
     ctx.register_table(table_name, provider as Arc<dyn TableProvider>)?;
     Ok(report)
 }
 
-pub fn register_datafusion_manifest_oql_provider_for_plan(
+pub fn register_datafusion_manifest_coveql_provider_for_plan(
     ctx: &SessionContext,
     table_name: &str,
-    members: Vec<CoveOqlRetainedManifestMember>,
+    members: Vec<CoveQlRetainedManifestMember>,
     planned: &PlannedQuery,
     options: ExecutionOptions,
-) -> Result<DataFusionOqlProviderReport> {
-    let provider = datafusion_manifest_oql_provider_for_plan(members, planned, options)?;
+) -> Result<DataFusionCoveQlProviderReport> {
+    let provider = datafusion_manifest_coveql_provider_for_plan(members, planned, options)?;
     let report = provider.report();
     ctx.register_table(table_name, provider as Arc<dyn TableProvider>)?;
     Ok(report)
 }
 
-pub fn register_datafusion_oql_memtable_for_plan(
+pub fn register_datafusion_coveql_memtable_for_plan(
     ctx: &SessionContext,
     table_name: &str,
     bytes: Vec<u8>,
     planned: &PlannedQuery,
     options: ExecutionOptions,
-) -> Result<DataFusionOqlProviderReport> {
+) -> Result<DataFusionCoveQlProviderReport> {
     let mut arrow_planned = planned.clone();
-    arrow_planned.resolved.output_mode = crate::CoveOqlOutputMode::ArrowRecordBatch {
+    arrow_planned.resolved.output_mode = crate::CoveQlOutputMode::ArrowRecordBatch {
         zero_copy_requested: false,
     };
-    arrow_planned.logical_plan.context.output_mode = crate::CoveOqlOutputMode::ArrowRecordBatch {
+    arrow_planned.logical_plan.context.output_mode = crate::CoveQlOutputMode::ArrowRecordBatch {
         zero_copy_requested: false,
     };
     let executed = execute_planned_query_retained(
-        CoveOqlRetainedInput::from_vec(bytes),
+        CoveQlRetainedInput::from_vec(bytes),
         arrow_planned,
         options,
     )
-    .map_err(|err| datafusion::common::DataFusionError::Execution(err.to_string()))?;
+    .map_err(|err| DataFusionError::Execution(err.to_string()))?;
     let authority = executed.authority.clone();
-    let CoveOqlExecutionResult::ArrowRecordBatches(batches) = executed.result else {
-        return Err(datafusion::common::DataFusionError::Execution(
-            "OQL DataFusion MemTable registration requires ArrowRecordBatch output".into(),
+    let CoveQlExecutionResult::ArrowRecordBatches(batches) = executed.result else {
+        return Err(DataFusionError::Execution(
+            "CoveQL DataFusion MemTable registration requires ArrowRecordBatch output".into(),
         ));
     };
     let schema = batches.first().map(|batch| batch.schema()).ok_or_else(|| {
-        datafusion::common::DataFusionError::Execution(
-            "OQL DataFusion MemTable registration produced no Arrow batches".into(),
+        DataFusionError::Execution(
+            "CoveQL DataFusion MemTable registration produced no Arrow batches".into(),
         )
     })?;
     let row_count = batches.iter().map(|batch| batch.num_rows()).sum();
     let batch_count = batches.len();
     let provider = MemTable::try_new(schema, vec![batches])?;
     ctx.register_table(table_name, Arc::new(provider) as Arc<dyn TableProvider>)?;
-    Ok(DataFusionOqlProviderReport {
-        report_version: crate::DATAFUSION_OQL_REPORT_VERSION.into(),
-        provider_kind: "oql_memtable".into(),
+    Ok(DataFusionCoveQlProviderReport {
+        report_version: crate::DATAFUSION_COVEQL_REPORT_VERSION.into(),
+        provider_kind: "coveql_memtable".into(),
         root_kind: resolved_root_name(&planned.resolved.root).into(),
         root_id: datafusion_pushdown_report_root_id(&planned.resolved.root),
         dataset_file_count: planned.resolved.operation_context.dataset.files.len(),
         planned_output_mode: planned.resolved.output_mode.clone(),
-        materialized_oql_before_registration: true,
+        materialized_coveql_before_registration: true,
         residual_verification: true,
         scan_residual_verification_required: authority.residual_required,
         scan_filter_pushdown_supported: false,
         scan_projection_pushdown_supported: false,
         residual_filter_authority:
-            "DataFusion evaluates filters against the materialized OQL Arrow MemTable".into(),
-        oql_scan_authority_source: authority.source,
-        oql_scan_materialized_fallback: authority.materialized_fallback
+            "DataFusion evaluates filters against the materialized CoveQL Arrow MemTable".into(),
+        coveql_scan_authority_source: authority.source,
+        coveql_scan_materialized_fallback: authority.materialized_fallback
             || authority.source == ExecutionAuthoritySource::MaterializedBaseline,
-        oql_scan_residual_required: authority.residual_required,
-        oql_scan_compared_with_materialized: authority.compared_with_materialized,
+        coveql_scan_residual_required: authority.residual_required,
+        coveql_scan_compared_with_materialized: authority.compared_with_materialized,
         scan_execution_policy: "materialized_arrow_memtable_before_datafusion".into(),
         limit_pushdown_policy:
-            "DataFusion applies limit against the materialized OQL Arrow MemTable".into(),
+            "DataFusion applies limit against the materialized CoveQL Arrow MemTable".into(),
         unhandled_residuals: provider_residuals(planned),
         row_count,
         batch_count,
         notes: vec![
-            "planned OQL semantics were executed before DataFusion registration; DataFusion scans a materialized Arrow MemTable".into(),
-            "materialized OQL execution remains the semantic authority for residual predicates, temporal handling, visibility, and redaction".into(),
+            "planned CoveQL semantics were executed before DataFusion registration; DataFusion scans a materialized Arrow MemTable".into(),
+            "materialized CoveQL execution remains the semantic authority for residual predicates, temporal handling, visibility, and redaction".into(),
         ],
     })
 }
@@ -1869,6 +2065,9 @@ fn resolved_root_name(root: &ResolvedRoot) -> &'static str {
     match root {
         ResolvedRoot::Object(_) => "object",
         ResolvedRoot::Association(_) => "association",
+        ResolvedRoot::Node(_) => "node",
+        ResolvedRoot::Edge(_) => "edge",
+        ResolvedRoot::Table(_) => "table",
         ResolvedRoot::Projection(_) => "projection",
         ResolvedRoot::Evidence(_) => "evidence",
     }
@@ -1879,48 +2078,52 @@ fn provider_scan_execution_policy(planned: &PlannedQuery, manifest: bool) -> &'s
         if can_apply_datafusion_scan_filters(planned)
             || can_apply_datafusion_scan_projection(planned)
         {
-            "manifest_oql_physical_or_materialized_scan"
+            "manifest_coveql_physical_or_materialized_scan"
         } else {
-            "manifest_planned_oql_scan"
+            "manifest_planned_coveql_scan"
         }
-    } else if matches!(planned.resolved.root, ResolvedRoot::Projection(_))
-        && (can_apply_datafusion_projection_filters(planned)
-            || can_apply_datafusion_scan_projection(planned))
+    } else if matches!(
+        planned.resolved.root,
+        ResolvedRoot::Projection(_) | ResolvedRoot::Table(_)
+    ) && (can_apply_datafusion_projection_filters(planned)
+        || can_apply_datafusion_scan_projection(planned))
     {
         "datafusion_projection_readback_fast_path_when_negotiated"
     } else if can_apply_datafusion_scan_filters(planned)
         || can_apply_datafusion_scan_projection(planned)
     {
-        "oql_physical_or_materialized_scan"
+        "coveql_physical_or_materialized_scan"
     } else {
-        "planned_oql_scan"
+        "planned_coveql_scan"
     }
 }
 
 fn exec_scan_execution_policy(
     planned: &PlannedQuery,
     manifest: bool,
-    projection_pushed_to_oql: bool,
-    filters_pushed_to_oql: bool,
+    projection_pushed_to_coveql: bool,
+    filters_pushed_to_coveql: bool,
 ) -> &'static str {
     if manifest {
-        if projection_pushed_to_oql || filters_pushed_to_oql {
-            "manifest_oql_physical_or_materialized_scan"
+        if projection_pushed_to_coveql || filters_pushed_to_coveql {
+            "manifest_coveql_physical_or_materialized_scan"
         } else {
-            "manifest_planned_oql_scan"
+            "manifest_planned_coveql_scan"
         }
-    } else if matches!(planned.resolved.root, ResolvedRoot::Projection(_))
-        && (projection_pushed_to_oql || filters_pushed_to_oql)
+    } else if matches!(
+        planned.resolved.root,
+        ResolvedRoot::Projection(_) | ResolvedRoot::Table(_)
+    ) && (projection_pushed_to_coveql || filters_pushed_to_coveql)
     {
         "datafusion_projection_readback_fast_path"
-    } else if projection_pushed_to_oql || filters_pushed_to_oql {
-        "oql_physical_or_materialized_scan"
+    } else if projection_pushed_to_coveql || filters_pushed_to_coveql {
+        "coveql_physical_or_materialized_scan"
     } else {
-        "planned_oql_scan"
+        "planned_coveql_scan"
     }
 }
 
-fn residual_filter_authority_label(report: &DataFusionOqlPushdownReport) -> &'static str {
+fn residual_filter_authority_label(report: &DataFusionCoveQlPushdownReport) -> &'static str {
     if report.received_filters.is_empty() {
         "no_datafusion_filters"
     } else if report.trusted
@@ -1928,7 +2131,7 @@ fn residual_filter_authority_label(report: &DataFusionOqlPushdownReport) -> &'st
         && report.residual_filters.is_empty()
         && report.rejected_filters.is_empty()
     {
-        "trusted_exact_oql_pushdown"
+        "trusted_exact_coveql_pushdown"
     } else {
         "datafusion_residual_verification"
     }
@@ -1952,31 +2155,35 @@ pub fn register_datafusion_projection_for_plan(
     mapping_path: Option<&Path>,
     planned: &PlannedQuery,
 ) -> Result<()> {
-    let ResolvedRoot::Projection(root) = &planned.resolved.root else {
-        return Err(datafusion::common::DataFusionError::Execution(
-            "Cove-OQL DataFusion registration requires a projection-root plan".into(),
+    if !can_apply_datafusion_projection_filters(planned) {
+        return Err(DataFusionError::Execution(
+            "CoveQL raw DataFusion projection registration requires a trivial projection-backed plan; use register_datafusion_coveql_provider_for_plan for planned CoveQL semantics"
+                .into(),
         ));
+    }
+    let projection_id = match &planned.resolved.root {
+        ResolvedRoot::Projection(root) => root.projection_id.as_str(),
+        ResolvedRoot::Table(root) => root.projection.projection_id.as_str(),
+        _ => {
+            return Err(DataFusionError::Execution(
+                "CoveQL DataFusion registration requires a projection-backed plan".into(),
+            ));
+        }
     };
-    register::register_cove_o_projection(
-        ctx,
-        table_name,
-        object_path,
-        mapping_path,
-        &root.projection_id,
-    )
-    .map(|_| ())
+    register::register_cove_o_projection(ctx, table_name, object_path, mapping_path, projection_id)
+        .map(|_| ())
 }
 
 fn validate_dataset_datafusion_plan(planned: &PlannedQuery) -> Result<()> {
-    if planned.resolved.output_mode != crate::CoveOqlOutputMode::DataFusionTableProvider {
-        return Err(datafusion::common::DataFusionError::Plan(
-            "Cove-OQL dataset DataFusion provider requires DataFusionTableProvider output mode"
+    if planned.resolved.output_mode != crate::CoveQlOutputMode::DataFusionTableProvider {
+        return Err(DataFusionError::Plan(
+            "CoveQL dataset DataFusion provider requires DataFusionTableProvider output mode"
                 .into(),
         ));
     }
     if !matches!(planned.resolved.root, ResolvedRoot::Object(_)) {
-        return Err(datafusion::common::DataFusionError::Plan(
-            "Cove-OQL dataset DataFusion provider currently supports object-root table exposure only"
+        return Err(DataFusionError::Plan(
+            "CoveQL dataset DataFusion provider exposes object-root table scans; use the planned manifest CoveQL provider for other roots"
                 .into(),
         ));
     }
@@ -1989,8 +2196,8 @@ fn validate_dataset_datafusion_plan(planned: &PlannedQuery) -> Result<()> {
         || chain.history.is_some()
         || chain.changes.is_some()
     {
-        return Err(datafusion::common::DataFusionError::Plan(
-            "Cove-OQL dataset DataFusion provider only exposes ungated object-root scans until OQL residual execution is attached"
+        return Err(DataFusionError::Plan(
+            "CoveQL dataset DataFusion provider only exposes ungated object-root scans until CoveQL residual execution is attached"
                 .into(),
         ));
     }
@@ -2001,15 +2208,21 @@ pub fn datafusion_pushdown_report_for_plan(
     schema: &SchemaRef,
     filters: &[Expr],
     planned: &PlannedQuery,
-) -> Result<DataFusionOqlPushdownReport> {
-    if matches!(planned.resolved.root, ResolvedRoot::Projection(_))
-        && can_apply_datafusion_projection_filters(planned)
+) -> Result<DataFusionCoveQlPushdownReport> {
+    if matches!(
+        planned.resolved.root,
+        ResolvedRoot::Projection(_) | ResolvedRoot::Table(_)
+    ) && can_apply_datafusion_projection_filters(planned)
     {
         return datafusion_projection_pushdown_report_for_plan(schema, filters, planned);
     }
     if matches!(
         planned.resolved.root,
-        ResolvedRoot::Object(_) | ResolvedRoot::Association(_) | ResolvedRoot::Evidence(_)
+        ResolvedRoot::Object(_)
+            | ResolvedRoot::Association(_)
+            | ResolvedRoot::Node(_)
+            | ResolvedRoot::Edge(_)
+            | ResolvedRoot::Evidence(_)
     ) && can_apply_datafusion_row_filters(planned)
     {
         return datafusion_row_pushdown_report_for_plan(schema, filters, planned);
@@ -2021,11 +2234,15 @@ pub fn datafusion_projection_pushdown_report_for_plan(
     schema: &SchemaRef,
     filters: &[Expr],
     planned: &PlannedQuery,
-) -> Result<DataFusionOqlPushdownReport> {
-    let ResolvedRoot::Projection(root) = &planned.resolved.root else {
-        return Err(datafusion::common::DataFusionError::Execution(
-            "Cove-OQL DataFusion pushdown reporting requires a projection-root plan".into(),
-        ));
+) -> Result<DataFusionCoveQlPushdownReport> {
+    let projection_id = match &planned.resolved.root {
+        ResolvedRoot::Projection(root) => root.projection_id.clone(),
+        ResolvedRoot::Table(root) => root.projection.projection_id.clone(),
+        _ => {
+            return Err(DataFusionError::Execution(
+                "CoveQL DataFusion pushdown reporting requires a projection-backed plan".into(),
+            ));
+        }
     };
     let report = projection_provider::classify_projection_filters_report(schema, filters)?;
     let lowered_forms = report
@@ -2033,10 +2250,10 @@ pub fn datafusion_projection_pushdown_report_for_plan(
         .iter()
         .map(|filter| projection_filter_logical_form(filter, schema, &planned.resolved.root))
         .collect::<Vec<_>>();
-    let lowered_oql_predicates = report
+    let lowered_coveql_predicates = report
         .pushed_filters
         .iter()
-        .map(projection_filter_oql_summary)
+        .map(projection_filter_coveql_summary)
         .collect::<Vec<_>>();
     let proof_states = lowered_forms
         .iter()
@@ -2080,9 +2297,9 @@ pub fn datafusion_projection_pushdown_report_for_plan(
         && proof_states
             .iter()
             .all(|state| *state == PredicateProofState::ProvenExact);
-    Ok(DataFusionOqlPushdownReport {
-        report_version: crate::DATAFUSION_OQL_REPORT_VERSION.into(),
-        projection_id: root.projection_id.clone(),
+    Ok(DataFusionCoveQlPushdownReport {
+        report_version: crate::DATAFUSION_COVEQL_REPORT_VERSION.into(),
+        projection_id,
         root_kind: resolved_root_name(&planned.resolved.root).into(),
         root_id: datafusion_pushdown_report_root_id(&planned.resolved.root),
         supported_filter_count: report.pushed_filters.len(),
@@ -2093,15 +2310,15 @@ pub fn datafusion_projection_pushdown_report_for_plan(
         trusted_filters,
         residual_filters,
         rejected_filters,
-        lowered_oql_predicates,
+        lowered_coveql_predicates,
         proof_states,
         decode_boundaries,
         trusted,
         notes: if trusted {
-            vec!["all DataFusion filters lowered to proven-exact Cove-OQL predicates".into()]
+            vec!["all DataFusion filters lowered to proven-exact CoveQL predicates".into()]
         } else if all_supported {
             vec![
-                "DataFusion filters lowered to Cove-OQL projection predicates, but no proof made them trusted exact; residual verification remains required".into(),
+                "DataFusion filters lowered to CoveQL projection predicates, but no proof made them trusted exact; residual verification remains required".into(),
             ]
         } else {
             vec![
@@ -2115,7 +2332,7 @@ pub fn datafusion_object_pushdown_report_for_plan(
     schema: &SchemaRef,
     filters: &[Expr],
     planned: &PlannedQuery,
-) -> Result<DataFusionOqlPushdownReport> {
+) -> Result<DataFusionCoveQlPushdownReport> {
     datafusion_row_pushdown_report_for_plan(schema, filters, planned)
 }
 
@@ -2123,7 +2340,7 @@ pub fn datafusion_row_pushdown_report_for_plan(
     schema: &SchemaRef,
     filters: &[Expr],
     planned: &PlannedQuery,
-) -> Result<DataFusionOqlPushdownReport> {
+) -> Result<DataFusionCoveQlPushdownReport> {
     let report = projection_provider::classify_projection_filters_report(schema, filters)?;
     let received_filters = filters
         .iter()
@@ -2132,7 +2349,7 @@ pub fn datafusion_row_pushdown_report_for_plan(
     let filter_outcomes = row_filter_outcomes(schema, filters, planned);
     let mut pushed_filters = Vec::new();
     let mut trusted_filters = Vec::new();
-    let mut lowered_oql_predicates = Vec::new();
+    let mut lowered_coveql_predicates = Vec::new();
     let mut proof_states = Vec::new();
     let mut decode_boundaries = report.residual_filters.clone();
     for filter in &report.pushed_filters {
@@ -2149,7 +2366,7 @@ pub fn datafusion_row_pushdown_report_for_plan(
             if proof_state == PredicateProofState::ProvenExact {
                 trusted_filters.push(filter_text);
             }
-            lowered_oql_predicates.push(scan_filter_oql_summary(
+            lowered_coveql_predicates.push(scan_filter_coveql_summary(
                 resolved_root_name(&planned.resolved.root),
                 filter,
             ));
@@ -2181,14 +2398,14 @@ pub fn datafusion_row_pushdown_report_for_plan(
     let notes = if trusted {
         vec![
             format!(
-                "{}-root DataFusion filters lowered to exact Cove-OQL predicates over direct selected paths; DataFusion still retains residual verification",
+                "{}-root DataFusion filters lowered to exact CoveQL predicates over direct selected paths; DataFusion still retains residual verification",
                 resolved_root_name(&planned.resolved.root)
             ),
         ]
     } else if residual_filters.is_empty() && !pushed_filters.is_empty() {
         vec![
             format!(
-                "{}-root DataFusion filters lowered to Cove-OQL predicates, but proof contracts require DataFusion residual verification",
+                "{}-root DataFusion filters lowered to CoveQL predicates, but proof contracts require DataFusion residual verification",
                 resolved_root_name(&planned.resolved.root)
             ),
         ]
@@ -2200,8 +2417,8 @@ pub fn datafusion_row_pushdown_report_for_plan(
             ),
         ]
     };
-    Ok(DataFusionOqlPushdownReport {
-        report_version: crate::DATAFUSION_OQL_REPORT_VERSION.into(),
+    Ok(DataFusionCoveQlPushdownReport {
+        report_version: crate::DATAFUSION_COVEQL_REPORT_VERSION.into(),
         projection_id: String::new(),
         root_kind: resolved_root_name(&planned.resolved.root).into(),
         root_id: datafusion_pushdown_report_root_id(&planned.resolved.root),
@@ -2213,7 +2430,7 @@ pub fn datafusion_row_pushdown_report_for_plan(
         trusted_filters,
         residual_filters: residual_filters.clone(),
         rejected_filters,
-        lowered_oql_predicates,
+        lowered_coveql_predicates,
         proof_states,
         decode_boundaries,
         trusted,
@@ -2221,7 +2438,7 @@ pub fn datafusion_row_pushdown_report_for_plan(
     })
 }
 
-fn residual_filters_from_outcomes(outcomes: &[DataFusionOqlFilterOutcome]) -> Vec<String> {
+fn residual_filters_from_outcomes(outcomes: &[DataFusionCoveQlFilterOutcome]) -> Vec<String> {
     outcomes
         .iter()
         .filter(|outcome| !outcome.trusted)
@@ -2229,13 +2446,13 @@ fn residual_filters_from_outcomes(outcomes: &[DataFusionOqlFilterOutcome]) -> Ve
         .collect()
 }
 
-fn rejected_filters_from_outcomes(outcomes: &[DataFusionOqlFilterOutcome]) -> Vec<String> {
+fn rejected_filters_from_outcomes(outcomes: &[DataFusionCoveQlFilterOutcome]) -> Vec<String> {
     outcomes
         .iter()
         .filter(|outcome| {
             matches!(
                 outcome.outcome,
-                DataFusionOqlFilterOutcomeKind::ResidualRejected
+                DataFusionCoveQlFilterOutcomeKind::ResidualRejected
             )
         })
         .map(|outcome| outcome.received_filter.clone())
@@ -2245,15 +2462,16 @@ fn rejected_filters_from_outcomes(outcomes: &[DataFusionOqlFilterOutcome]) -> Ve
 fn datafusion_residual_pushdown_report(
     filters: &[Expr],
     planned: &PlannedQuery,
-) -> DataFusionOqlPushdownReport {
+) -> DataFusionCoveQlPushdownReport {
     let residual_filters = filters
         .iter()
         .map(|filter| format!("{filter:?}"))
         .collect::<Vec<_>>();
-    DataFusionOqlPushdownReport {
-        report_version: crate::DATAFUSION_OQL_REPORT_VERSION.into(),
+    DataFusionCoveQlPushdownReport {
+        report_version: crate::DATAFUSION_COVEQL_REPORT_VERSION.into(),
         projection_id: match &planned.resolved.root {
             ResolvedRoot::Projection(root) => root.projection_id.clone(),
+            ResolvedRoot::Table(root) => root.projection.projection_id.clone(),
             _ => String::new(),
         },
         root_kind: resolved_root_name(&planned.resolved.root).into(),
@@ -2263,10 +2481,10 @@ fn datafusion_residual_pushdown_report(
         received_filters: residual_filters.clone(),
         filter_outcomes: residual_filters
             .iter()
-            .map(|filter| DataFusionOqlFilterOutcome {
+            .map(|filter| DataFusionCoveQlFilterOutcome {
                 received_filter: filter.clone(),
-                outcome: DataFusionOqlFilterOutcomeKind::ResidualRejected,
-                lowered_oql_predicates: Vec::new(),
+                outcome: DataFusionCoveQlFilterOutcomeKind::ResidualRejected,
+                lowered_coveql_predicates: Vec::new(),
                 proof_state: PredicateProofState::DecodeRequired,
                 trusted: false,
                 diagnostic_code: Some(
@@ -2282,20 +2500,20 @@ fn datafusion_residual_pushdown_report(
         trusted_filters: Vec::new(),
         residual_filters: residual_filters.clone(),
         rejected_filters: residual_filters.clone(),
-        lowered_oql_predicates: Vec::new(),
+        lowered_coveql_predicates: Vec::new(),
         proof_states: vec![PredicateProofState::DecodeRequired; filters.len()],
         decode_boundaries: if residual_filters.is_empty() {
             Vec::new()
         } else {
             vec![format!(
-                "{} DataFusion filter(s) remain residual outside Cove-OQL pushdown for {} root",
+                "{} DataFusion filter(s) remain residual outside CoveQL pushdown for {} root",
                 residual_filters.len(),
                 resolved_root_name(&planned.resolved.root)
             )]
         },
         trusted: false,
         notes: vec![
-            "DataFusion filters were not translated into Cove-OQL predicate forms for this plan; DataFusion must evaluate them as residual filters".into(),
+            "DataFusion filters were not translated into CoveQL predicate forms for this plan; DataFusion must evaluate them as residual filters".into(),
         ],
     }
 }
@@ -2304,6 +2522,9 @@ fn datafusion_pushdown_report_root_id(root: &ResolvedRoot) -> Option<String> {
     match root {
         ResolvedRoot::Object(root) => Some(root.type_name.clone()),
         ResolvedRoot::Association(root) => Some(root.type_name.clone()),
+        ResolvedRoot::Node(root) => Some(root.label.clone()),
+        ResolvedRoot::Edge(root) => Some(root.label.clone()),
+        ResolvedRoot::Table(root) => Some(root.table_name.clone()),
         ResolvedRoot::Projection(root) => Some(root.projection_id.clone()),
         ResolvedRoot::Evidence(_) => None,
     }
@@ -2313,47 +2534,47 @@ fn projection_filter_outcomes(
     schema: &SchemaRef,
     filters: &[Expr],
     root: &ResolvedRoot,
-) -> Vec<DataFusionOqlFilterOutcome> {
+) -> Vec<DataFusionCoveQlFilterOutcome> {
     filters
         .iter()
         .map(|filter| {
             let received_filter = format!("{filter:?}");
             let Some(lowered_filters) = projection_provider::classify_projection_filter(schema, filter)
             else {
-                return DataFusionOqlFilterOutcome {
+                return DataFusionCoveQlFilterOutcome {
                     received_filter,
-                    outcome: DataFusionOqlFilterOutcomeKind::ResidualRejected,
-                    lowered_oql_predicates: Vec::new(),
+                    outcome: DataFusionCoveQlFilterOutcomeKind::ResidualRejected,
+                    lowered_coveql_predicates: Vec::new(),
                     proof_state: PredicateProofState::DecodeRequired,
                     trusted: false,
                     diagnostic_code: Some(
                         crate::DATAFUSION_PUSH_FILTER_UNSAFE_DIAGNOSTIC_CODE.into(),
                     ),
                     reason:
-                        "DataFusion expression is not equivalent to a supported Cove-OQL scan predicate"
+                        "DataFusion expression is not equivalent to a supported CoveQL scan predicate"
                             .into(),
                 };
             };
             let proof_state = combined_projection_proof_state(schema, root, &lowered_filters);
             let trusted = proof_state == PredicateProofState::ProvenExact;
-            DataFusionOqlFilterOutcome {
+            DataFusionCoveQlFilterOutcome {
                 received_filter,
                 outcome: if trusted {
-                    DataFusionOqlFilterOutcomeKind::TrustedExact
+                    DataFusionCoveQlFilterOutcomeKind::TrustedExact
                 } else {
-                    DataFusionOqlFilterOutcomeKind::PushedInexact
+                    DataFusionCoveQlFilterOutcomeKind::PushedInexact
                 },
-                lowered_oql_predicates: lowered_filters
+                lowered_coveql_predicates: lowered_filters
                     .iter()
-                    .map(projection_filter_oql_summary)
+                    .map(projection_filter_coveql_summary)
                     .collect(),
                 proof_state,
                 trusted,
                 diagnostic_code: None,
                 reason: if trusted {
-                    "DataFusion filter lowered to a proven-exact Cove-OQL predicate".into()
+                    "DataFusion filter lowered to a proven-exact CoveQL predicate".into()
                 } else {
-                    "DataFusion filter lowered to Cove-OQL scan predicates, but residual verification remains required".into()
+                    "DataFusion filter lowered to CoveQL scan predicates, but residual verification remains required".into()
                 },
             }
         })
@@ -2364,54 +2585,54 @@ fn row_filter_outcomes(
     schema: &SchemaRef,
     filters: &[Expr],
     planned: &PlannedQuery,
-) -> Vec<DataFusionOqlFilterOutcome> {
+) -> Vec<DataFusionCoveQlFilterOutcome> {
     filters
         .iter()
         .map(|filter| {
             let received_filter = format!("{filter:?}");
             let Some(lowered_filters) = projection_provider::classify_projection_filter(schema, filter)
             else {
-                return DataFusionOqlFilterOutcome {
+                return DataFusionCoveQlFilterOutcome {
                     received_filter,
-                    outcome: DataFusionOqlFilterOutcomeKind::ResidualRejected,
-                    lowered_oql_predicates: Vec::new(),
+                    outcome: DataFusionCoveQlFilterOutcomeKind::ResidualRejected,
+                    lowered_coveql_predicates: Vec::new(),
                     proof_state: PredicateProofState::DecodeRequired,
                     trusted: false,
                     diagnostic_code: Some(
                         crate::DATAFUSION_PUSH_FILTER_UNSAFE_DIAGNOSTIC_CODE.into(),
                     ),
                     reason:
-                        "DataFusion expression is not equivalent to a supported Cove-OQL row predicate"
+                        "DataFusion expression is not equivalent to a supported CoveQL row predicate"
                             .into(),
                 };
             };
-            let lowered_oql_predicates = lowered_filters
+            let lowered_coveql_predicates = lowered_filters
                 .iter()
                 .filter(|filter| row_predicate_from_scan_filter(planned, filter).is_some())
                 .map(|filter| {
-                    scan_filter_oql_summary(resolved_root_name(&planned.resolved.root), filter)
+                    scan_filter_coveql_summary(resolved_root_name(&planned.resolved.root), filter)
                 })
                 .collect::<Vec<_>>();
             let proof_state = combined_row_proof_state(planned, &lowered_filters);
             let all_row_filters =
-                !lowered_filters.is_empty() && lowered_oql_predicates.len() == lowered_filters.len();
+                !lowered_filters.is_empty() && lowered_coveql_predicates.len() == lowered_filters.len();
             let trusted = all_row_filters && proof_state == PredicateProofState::ProvenExact;
             let outcome = if trusted {
-                DataFusionOqlFilterOutcomeKind::TrustedExact
+                DataFusionCoveQlFilterOutcomeKind::TrustedExact
             } else if all_row_filters {
-                DataFusionOqlFilterOutcomeKind::PushedInexact
+                DataFusionCoveQlFilterOutcomeKind::PushedInexact
             } else {
-                DataFusionOqlFilterOutcomeKind::ResidualRejected
+                DataFusionCoveQlFilterOutcomeKind::ResidualRejected
             };
-            DataFusionOqlFilterOutcome {
+            DataFusionCoveQlFilterOutcome {
                 received_filter,
                 outcome,
-                lowered_oql_predicates,
+                lowered_coveql_predicates,
                 proof_state,
                 trusted,
                 diagnostic_code: if matches!(
                     outcome,
-                    DataFusionOqlFilterOutcomeKind::ResidualRejected
+                    DataFusionCoveQlFilterOutcomeKind::ResidualRejected
                 ) {
                     Some(crate::DATAFUSION_PUSH_FILTER_UNSAFE_DIAGNOSTIC_CODE.into())
                 } else {
@@ -2419,12 +2640,12 @@ fn row_filter_outcomes(
                 },
                 reason: if trusted {
                     format!(
-                        "DataFusion filter lowered to exact Cove-OQL {}-root predicates over direct selected paths",
+                        "DataFusion filter lowered to exact CoveQL {}-root predicates over direct selected paths",
                         resolved_root_name(&planned.resolved.root)
                     )
                 } else if all_row_filters {
                     format!(
-                        "DataFusion filter lowered to Cove-OQL {}-root predicates, but residual verification remains required by the predicate proof contract",
+                        "DataFusion filter lowered to CoveQL {}-root predicates, but residual verification remains required by the predicate proof contract",
                         resolved_root_name(&planned.resolved.root)
                     )
                 } else {
@@ -2503,19 +2724,39 @@ fn provider_residuals(planned: &PlannedQuery) -> Vec<String> {
     let mut residuals = Vec::new();
     if chain.where_predicate.is_some() {
         residuals
-            .push("planned Cove-OQL where predicate executes before DataFusion scan output".into());
+            .push("planned CoveQL where predicate executes before DataFusion scan output".into());
+    }
+    if !chain.lookups.is_empty() {
+        residuals.push(
+            "planned CoveQL table lookup joins execute inside materialized table semantics".into(),
+        );
+    }
+    if chain
+        .where_predicate
+        .as_ref()
+        .is_some_and(predicate_contains_table_exists)
+    {
+        residuals.push(
+            "planned CoveQL table exists semi/anti join executes inside materialized table semantics"
+                .into(),
+        );
+    }
+    if !chain.traversals.is_empty() {
+        residuals.push(
+            "planned CoveQL graph traversal executes inside materialized graph semantics".into(),
+        );
     }
     if chain.group_by.is_some() {
         residuals
-            .push("planned Cove-OQL grouping executes inside materialized OQL semantics".into());
+            .push("planned CoveQL grouping executes inside materialized CoveQL semantics".into());
     }
     if chain.order_by.is_some() {
         residuals
-            .push("planned Cove-OQL ordering executes inside materialized OQL semantics".into());
+            .push("planned CoveQL ordering executes inside materialized CoveQL semantics".into());
     }
     if chain.skip.is_some() || chain.take.is_some() {
         residuals
-            .push("planned Cove-OQL pagination executes inside materialized OQL semantics".into());
+            .push("planned CoveQL pagination executes inside materialized CoveQL semantics".into());
     }
     if chain.history.is_some() || chain.changes.is_some() {
         residuals.push(
@@ -2692,11 +2933,11 @@ fn physical_kind_for_logical_name(logical: &str) -> &'static str {
     }
 }
 
-fn projection_filter_oql_summary(filter: &ProjectionFilter) -> String {
-    scan_filter_oql_summary("projection", filter)
+fn projection_filter_coveql_summary(filter: &ProjectionFilter) -> String {
+    scan_filter_coveql_summary("projection", filter)
 }
 
-fn scan_filter_oql_summary(root: &str, filter: &ProjectionFilter) -> String {
+fn scan_filter_coveql_summary(root: &str, filter: &ProjectionFilter) -> String {
     match filter {
         ProjectionFilter::Compare {
             column,

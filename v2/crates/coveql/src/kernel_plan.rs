@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     kernel_metrics::KernelFallbackReason, kernel_predicate::compile_kernel_predicates,
-    AggregateDisclosurePolicy, AstAggregateName, AstChangeMode, AstHistoryMode, CoveOqlOutputMode,
+    AggregateDisclosurePolicy, AstAggregateName, AstChangeMode, AstHistoryMode, CoveQlOutputMode,
     MetadataDisclosurePolicy, PhysicalPlannedQuery, ResolvedExpr, ResolvedPath, ResolvedPredicate,
     ResolvedRoot, TemporalMode, TemporalRole,
 };
@@ -13,7 +13,7 @@ pub struct KernelShape {
     pub root_kind: KernelRootKind,
     pub root_object_type_id: u32,
     pub root_type_name: String,
-    pub output_mode: CoveOqlOutputMode,
+    pub output_mode: CoveQlOutputMode,
     pub direct_projection: bool,
     pub predicate_count: usize,
     pub operator_contracts: Vec<CodedOperatorContract>,
@@ -56,7 +56,7 @@ impl CodedOperatorContract {
             residual_required,
             row_grain: "visible_rows_after_reconstruction".into(),
             proof_obligation: if exact {
-                format!("{operator} has an explicit OQL-equivalence proof for this shape")
+                format!("{operator} has an explicit CoveQL-equivalence proof for this shape")
             } else {
                 format!(
                     "{operator} must prove row-grain, null, type, collation, and security semantics before becoming authoritative"
@@ -113,6 +113,7 @@ pub enum CodedRepresentationClass {
 pub enum KernelRootKind {
     Object,
     Association,
+    Table,
     Evidence,
     Projection,
 }
@@ -138,39 +139,54 @@ pub(crate) fn compile_kernel_shape(
             root.object_type_id,
             root.type_name.clone(),
         ),
+        ResolvedRoot::Node(root) => (
+            KernelRootKind::Object,
+            root.object.object_type_id,
+            format!("node:{}", root.label),
+        ),
+        ResolvedRoot::Edge(root) => (
+            KernelRootKind::Association,
+            root.association.object_type_id,
+            format!("edge:{}", root.label),
+        ),
         ResolvedRoot::Evidence(_) => (KernelRootKind::Evidence, 0, "evidence".into()),
+        ResolvedRoot::Table(root) => (
+            KernelRootKind::Table,
+            0,
+            format!("{}:{}", root.table_name, root.projection.projection_id),
+        ),
         ResolvedRoot::Projection(root) => {
             (KernelRootKind::Projection, 0, root.projection_id.clone())
         }
     };
     if !matches!(
         planned.resolved.output_mode,
-        CoveOqlOutputMode::ObjectRows
-            | CoveOqlOutputMode::AssociationRows
-            | CoveOqlOutputMode::EvidenceRows
-            | CoveOqlOutputMode::ProjectionRows
-            | CoveOqlOutputMode::JsonRows
-            | CoveOqlOutputMode::ArrowRecordBatch { .. }
+        CoveQlOutputMode::ObjectRows
+            | CoveQlOutputMode::AssociationRows
+            | CoveQlOutputMode::EvidenceRows
+            | CoveQlOutputMode::ProjectionRows
+            | CoveQlOutputMode::JsonRows
+            | CoveQlOutputMode::ArrowRecordBatch { .. }
     ) {
         return Err(KernelFallbackReason::UnsupportedOutputMode);
     }
     if root_kind == KernelRootKind::Object
         && matches!(
             planned.resolved.output_mode,
-            CoveOqlOutputMode::AssociationRows
+            CoveQlOutputMode::AssociationRows
         )
     {
         return Err(KernelFallbackReason::UnsupportedOutputMode);
     }
     if root_kind == KernelRootKind::Association
-        && matches!(planned.resolved.output_mode, CoveOqlOutputMode::ObjectRows)
+        && matches!(planned.resolved.output_mode, CoveQlOutputMode::ObjectRows)
     {
         return Err(KernelFallbackReason::UnsupportedOutputMode);
     }
     if root_kind == KernelRootKind::Evidence
         && matches!(
             planned.resolved.output_mode,
-            CoveOqlOutputMode::ObjectRows | CoveOqlOutputMode::AssociationRows
+            CoveQlOutputMode::ObjectRows | CoveQlOutputMode::AssociationRows
         )
     {
         return Err(KernelFallbackReason::UnsupportedOutputMode);
@@ -183,6 +199,18 @@ pub(crate) fn compile_kernel_shape(
         && !native_role_bound_direct_projection_shape(planned)
     {
         return Err(KernelFallbackReason::UnsupportedTemporalMode);
+    }
+    if !planned.resolved.method_chain.lookups.is_empty()
+        || !planned.resolved.method_chain.traversals.is_empty()
+        || planned
+            .resolved
+            .method_chain
+            .where_predicate
+            .as_ref()
+            .is_some_and(predicate_contains_table_exists)
+        || planned_contains_target_node_association(planned)
+    {
+        return Err(KernelFallbackReason::UnsupportedProjection);
     }
     if predicate_contains_unsafe_coded(
         planned,
@@ -261,6 +289,13 @@ pub(crate) fn compile_kernel_shape(
                         "eligible evidence-root direct scan shape with exact native kernel authority"
                     }
                 }
+                KernelRootKind::Table => {
+                    if residual_verification_required {
+                        "table root uses a deterministic projection readback boundary with residual verification"
+                    } else {
+                        "eligible projection-backed table scan with exact COVE-MAP provider authority"
+                    }
+                }
                 KernelRootKind::Projection => {
                     if residual_verification_required {
                         "projection root uses an explicit COVE-MAP materialized readback boundary inside the kernel wrapper"
@@ -290,7 +325,22 @@ pub(crate) fn diagnostic_kernel_shape_for_plan(
             root.object_type_id,
             root.type_name.clone(),
         ),
+        ResolvedRoot::Node(root) => (
+            KernelRootKind::Object,
+            root.object.object_type_id,
+            format!("node:{}", root.label),
+        ),
+        ResolvedRoot::Edge(root) => (
+            KernelRootKind::Association,
+            root.association.object_type_id,
+            format!("edge:{}", root.label),
+        ),
         ResolvedRoot::Evidence(_) => (KernelRootKind::Evidence, 0, "evidence".into()),
+        ResolvedRoot::Table(root) => (
+            KernelRootKind::Table,
+            0,
+            format!("{}:{}", root.table_name, root.projection.projection_id),
+        ),
         ResolvedRoot::Projection(root) => {
             (KernelRootKind::Projection, 0, root.projection_id.clone())
         }
@@ -345,7 +395,7 @@ fn coded_operator_contracts(planned: &crate::PlannedQuery) -> Vec<CodedOperatorC
     let exact_cross_file_bridge =
         dataset_has_exact_code_domain_bridge(&planned.resolved.operation_context.dataset);
     let root_scan_exact = match planned.resolved.root {
-        ResolvedRoot::Projection(_) => native_projection_root_scan,
+        ResolvedRoot::Table(_) | ResolvedRoot::Projection(_) => native_projection_root_scan,
         ResolvedRoot::Association(_) => {
             (!multi_file || exact_cross_file_bridge)
                 && (native_association_root_scan
@@ -361,7 +411,10 @@ fn coded_operator_contracts(planned: &crate::PlannedQuery) -> Vec<CodedOperatorC
     contracts.push(
         CodedOperatorContract::new(
             "root_scan",
-            if matches!(planned.resolved.root, ResolvedRoot::Projection(_))
+            if matches!(
+                planned.resolved.root,
+                ResolvedRoot::Table(_) | ResolvedRoot::Projection(_)
+            )
                 && native_projection_root_scan
             {
                 CodedRepresentationClass::DecodeBoundary
@@ -380,18 +433,21 @@ fn coded_operator_contracts(planned: &crate::PlannedQuery) -> Vec<CodedOperatorC
                 )
             {
                 "association/evidence root scans are exact only for direct point-in-time row-output scans or direct selected projections; other root forms keep materialized semantics"
-            } else if matches!(planned.resolved.root, ResolvedRoot::Projection(_))
+            } else if matches!(
+                planned.resolved.root,
+                ResolvedRoot::Table(_) | ResolvedRoot::Projection(_)
+            )
                 && !native_projection_root_scan
             {
-                "projection root scans are exact only when COVE-MAP can satisfy direct selected columns and primitive pushed filters without residual OQL operators"
+                "projection-backed root scans are exact only when COVE-MAP can satisfy direct selected columns and primitive pushed filters without residual CoveQL operators"
             } else if native_projection_root_scan {
-                "projection root scan uses exact COVE-MAP projection batches with direct selected columns and primitive pushed filters; manifest projection scans merge logical provider rows without comparing raw local codes"
+                "projection-backed root scan uses exact COVE-MAP projection batches with direct selected columns and primitive pushed filters; manifest scans merge logical provider rows without comparing raw local codes"
             } else if multi_file && exact_cross_file_bridge {
                 "multi-file scope has an exact manifest code-domain bridge; raw code comparison remains scoped to that validated bridge"
             } else if multi_file {
                 "multi-file scope requires an exact manifest bridge before raw code comparison"
             } else if native_temporal_direct_projection {
-                "temporal history/changes direct projection uses exact OQL temporal row-grain reconstruction before final selected-output materialization"
+                "temporal history/changes direct projection uses exact CoveQL temporal row-grain reconstruction before final selected-output materialization"
             } else if native_association_root_scan {
                 "association root scan returns reconstructed visible association states without predicate, aggregate, sort, or pagination residuals"
             } else if native_evidence_root_scan {
@@ -471,7 +527,7 @@ fn coded_operator_contracts(planned: &crate::PlannedQuery) -> Vec<CodedOperatorC
                         "typed_value_lane",
                     ])
                     .with_proof_obligation(
-                        "grouped direct aggregates are exact because they evaluate selected reconstructed rows in each direct value-domain group after OQL visibility and temporal reconstruction",
+                        "grouped direct aggregates are exact because they evaluate selected reconstructed rows in each direct value-domain group after CoveQL visibility and temporal reconstruction",
                     ),
                 );
             } else if native_grouped_helper_aggregate {
@@ -533,7 +589,7 @@ fn coded_operator_contracts(planned: &crate::PlannedQuery) -> Vec<CodedOperatorC
                         "aggregate_disclosure_policy",
                     ])
                     .with_proof_obligation(format!(
-                        "{helper_kind} helper count/exists/distinct_count is exact because it evaluates scoped edge/grain-index matches only after OQL visibility and temporal reconstruction, under protected metadata disclosure"
+                        "{helper_kind} helper count/exists/distinct_count is exact because it evaluates scoped edge/grain-index matches only after CoveQL visibility and temporal reconstruction, under protected metadata disclosure"
                     )),
                 );
             } else if native_direct_aggregate {
@@ -557,7 +613,7 @@ fn coded_operator_contracts(planned: &crate::PlannedQuery) -> Vec<CodedOperatorC
                         "aggregate_disclosure_policy",
                     ])
                     .with_proof_obligation(
-                        "direct count/exists/distinct_count/min/max/sum/avg is exact because it evaluates row counts, non-null direct-path values, logical distinct keys, typed min/max order, and exact numeric accumulators after OQL visibility and temporal reconstruction",
+                        "direct count/exists/distinct_count/min/max/sum/avg is exact because it evaluates row counts, non-null direct-path values, logical distinct keys, typed min/max order, and exact numeric accumulators after CoveQL visibility and temporal reconstruction",
                     ),
                 );
             } else if (native_direct_projection
@@ -597,7 +653,7 @@ fn coded_operator_contracts(planned: &crate::PlannedQuery) -> Vec<CodedOperatorC
                         "final_materialization_boundary",
                     ])
                     .with_proof_obligation(
-                        "direct projection is exact because OQL visibility, temporal selection, redaction policy, and row ordering have already been applied; variable-width values may decode only at the final output boundary and do not create a residual truth check",
+                        "direct projection is exact because CoveQL visibility, temporal selection, redaction policy, and row ordering have already been applied; variable-width values may decode only at the final output boundary and do not create a residual truth check",
                     ),
                 );
             } else {
@@ -636,7 +692,7 @@ fn coded_operator_contracts(planned: &crate::PlannedQuery) -> Vec<CodedOperatorC
                         "null_policy",
                     ])
                     .with_proof_obligation(
-                            "GROUP BY is exact because the direct group key has stable OQL equality semantics; FileCode keys are grouped only inside a single validated file/domain scope or through an exact manifest code-domain bridge, never by comparing raw local codes across files",
+                            "GROUP BY is exact because the direct group key has stable CoveQL equality semantics; FileCode keys are grouped only inside a single validated file/domain scope or through an exact manifest code-domain bridge, never by comparing raw local codes across files",
                     ),
                 );
             } else {
@@ -659,9 +715,9 @@ fn coded_operator_contracts(planned: &crate::PlannedQuery) -> Vec<CodedOperatorC
                     true,
                     false,
                     if uses_file_code_sort_key {
-                        "direct FileCode order key materializes a decoded value sort key under the effective string collation and OQL null-order policy"
+                        "direct FileCode order key materializes a decoded value sort key under the effective string collation and CoveQL null-order policy"
                     } else {
-                        "direct typed order key uses a bool/numeric/date/time/string value lane and OQL null-order policy"
+                        "direct typed order key uses a bool/numeric/date/time/string value lane and CoveQL null-order policy"
                     },
                 )
                 .with_required_metadata(if uses_file_code_sort_key {
@@ -693,9 +749,9 @@ fn coded_operator_contracts(planned: &crate::PlannedQuery) -> Vec<CodedOperatorC
                     &["typed_value_lane", "null_policy", "stable_row_identity"]
                 })
                 .with_proof_obligation(if uses_file_code_sort_key {
-                    "ORDER BY over FileCode strings is exact because raw dictionary code order is ignored, values are decoded into sort keys under the declared supported collation, null placement is explicit/defaulted by OQL, and ties use stable row identity"
+                    "ORDER BY over FileCode strings is exact because raw dictionary code order is ignored, values are decoded into sort keys under the declared supported collation, null placement is explicit/defaulted by CoveQL, and ties use stable row identity"
                 } else {
-                    "ORDER BY over direct bool/numeric/date/time/string lanes is exact because the typed comparator defines value order, null placement is explicit/defaulted by OQL, and ties use stable row identity"
+                    "ORDER BY over direct bool/numeric/date/time/string lanes is exact because the typed comparator defines value order, null placement is explicit/defaulted by CoveQL, and ties use stable row identity"
                 }),
             );
         } else {
@@ -739,9 +795,9 @@ fn coded_operator_contracts(planned: &crate::PlannedQuery) -> Vec<CodedOperatorC
                 })
                 .with_proof_obligation(
                     if explicit_order {
-                        "limit/offset is exact because native direct projection applies proven OQL ordering before pagination and before final projection"
+                        "limit/offset is exact because native direct projection applies proven CoveQL ordering before pagination and before final projection"
                     } else {
-                        "limit/offset is exact because native direct projection applies OQL default ordering before pagination and before final projection"
+                        "limit/offset is exact because native direct projection applies CoveQL default ordering before pagination and before final projection"
                     },
                 ),
             );
@@ -756,7 +812,7 @@ fn coded_operator_contracts(planned: &crate::PlannedQuery) -> Vec<CodedOperatorC
                 )
                 .with_required_metadata(&["declared_projection_ordering"])
                 .with_proof_obligation(
-                    "projection-root limit/offset is exact because COVE-MAP declares the ordering key, the key is retained in the provider output columns, and pagination runs after OQL default ordering before final projection",
+                    "projection-root limit/offset is exact because COVE-MAP declares the ordering key, the key is retained in the provider output columns, and pagination runs after CoveQL default ordering before final projection",
                 ),
             );
         } else if native_typed_order {
@@ -782,11 +838,11 @@ fn coded_operator_contracts(planned: &crate::PlannedQuery) -> Vec<CodedOperatorC
                     CodedRepresentationClass::MaterializedResidual,
                     false,
                     true,
-                    "skip/take is applied after stable OQL ordering and residual filtering",
+                    "skip/take is applied after stable CoveQL ordering and residual filtering",
                 )
                 .with_required_metadata(&["stable_order_contract"])
                 .with_proof_obligation(
-                    "limit/offset is authoritative only after the OQL ordering contract and residual predicates are complete",
+                    "limit/offset is authoritative only after the CoveQL ordering contract and residual predicates are complete",
                 )
                 .with_fallback_boundary("materialized_ordered_pagination"),
             );
@@ -817,7 +873,7 @@ fn append_temporal_grain_contract(
                 )
             } else {
                 format!(
-                    "history(mode: {}) currently uses materialized temporal row reconstruction as the authority",
+                    "history(mode: {}) uses materialized temporal row reconstruction as the authority without an exact temporal row-grain proof",
                     history_mode_name(history_mode)
                 )
             },
@@ -830,7 +886,7 @@ fn append_temporal_grain_contract(
             "stable_default_order_contract",
         ])
         .with_proof_obligation(if native_temporal_direct_projection {
-            "history direct projection is exact because it uses the same temporal record/state grain reconstruction, tombstone policy, branch policy, default ordering, and final projection boundary as materialized OQL execution"
+            "history direct projection is exact because it uses the same temporal record/state grain reconstruction, tombstone policy, branch policy, default ordering, and final projection boundary as materialized CoveQL execution"
         } else {
             "native history execution must prove record/state output grain, tombstone policy, branch policy, default ordering, and stable row identity before it can bypass materialized reconstruction"
         });
@@ -857,7 +913,7 @@ fn append_temporal_grain_contract(
                 )
             } else {
                 format!(
-                    "changes(mode: {}) currently uses materialized temporal diff/reconstruction as the authority",
+                    "changes(mode: {}) uses materialized temporal diff/reconstruction as the authority without an exact temporal row-grain proof",
                     change_mode_name(changes.mode)
                 )
             },
@@ -870,7 +926,7 @@ fn append_temporal_grain_contract(
             "stable_default_order_contract",
         ])
         .with_proof_obligation(if native_temporal_direct_projection {
-            "changes direct projection is exact because it uses the same interval bounds, state transition, property diff, final-object reconstruction, branch policy, output ordering, and final projection boundary as materialized OQL execution"
+            "changes direct projection is exact because it uses the same interval bounds, state transition, property diff, final-object reconstruction, branch policy, output ordering, and final projection boundary as materialized CoveQL execution"
         } else {
             "native changes execution must prove interval bounds, state transitions, property-level diffs, final-object reconstruction, branch policy, and output ordering before it can bypass materialized reconstruction"
         });
@@ -903,7 +959,7 @@ fn change_mode_name(mode: AstChangeMode) -> &'static str {
         AstChangeMode::Records => "records",
         AstChangeMode::StateTransitions => "state_transitions",
         AstChangeMode::PropertyDiffs => "property_diffs",
-        AstChangeMode::FinalObjects => "final_objects",
+        AstChangeMode::FinalRows => "final_rows",
     }
 }
 
@@ -912,7 +968,7 @@ fn change_row_grain(mode: AstChangeMode) -> &'static str {
         AstChangeMode::Records => "change_record",
         AstChangeMode::StateTransitions => "change_state_transition",
         AstChangeMode::PropertyDiffs => "change_property_diff",
-        AstChangeMode::FinalObjects => "change_final_object",
+        AstChangeMode::FinalRows => "change_final_row",
     }
 }
 
@@ -975,12 +1031,15 @@ fn kernel_shape_residual_verification_required(
 pub(crate) fn native_direct_projection_shape(planned: &crate::PlannedQuery) -> bool {
     if !matches!(
         planned.resolved.output_mode,
-        CoveOqlOutputMode::JsonRows | CoveOqlOutputMode::ArrowRecordBatch { .. }
+        CoveQlOutputMode::JsonRows | CoveQlOutputMode::ArrowRecordBatch { .. }
     ) || !native_direct_root_scan_common(planned, true, true, true)
     {
         return false;
     }
-    if matches!(planned.resolved.root, ResolvedRoot::Projection(_)) {
+    if matches!(
+        planned.resolved.root,
+        ResolvedRoot::Table(_) | ResolvedRoot::Projection(_)
+    ) {
         return false;
     }
     if matches!(planned.resolved.root, ResolvedRoot::Evidence(_))
@@ -999,7 +1058,7 @@ pub(crate) fn native_direct_projection_shape(planned: &crate::PlannedQuery) -> b
 pub(crate) fn native_temporal_direct_projection_shape(planned: &crate::PlannedQuery) -> bool {
     if !matches!(
         planned.resolved.output_mode,
-        CoveOqlOutputMode::JsonRows | CoveOqlOutputMode::ArrowRecordBatch { .. }
+        CoveQlOutputMode::JsonRows | CoveQlOutputMode::ArrowRecordBatch { .. }
     ) || !(planned.resolved.method_chain.history.is_some()
         || planned.resolved.method_chain.changes.is_some())
         || planned.resolved.method_chain.where_predicate.is_some()
@@ -1041,7 +1100,7 @@ pub(crate) fn native_temporal_direct_projection_shape(planned: &crate::PlannedQu
 pub(crate) fn native_role_bound_direct_projection_shape(planned: &crate::PlannedQuery) -> bool {
     if !matches!(
         planned.resolved.output_mode,
-        CoveOqlOutputMode::JsonRows | CoveOqlOutputMode::ArrowRecordBatch { .. }
+        CoveQlOutputMode::JsonRows | CoveQlOutputMode::ArrowRecordBatch { .. }
     ) || planned.resolved.method_chain.where_predicate.is_some()
         || planned.resolved.method_chain.group_by.is_some()
         || planned.resolved.method_chain.order_by.is_some()
@@ -1088,7 +1147,7 @@ pub(crate) fn native_role_bound_direct_projection_shape(planned: &crate::Planned
 }
 
 pub(crate) fn native_helper_exists_direct_projection_shape(planned: &crate::PlannedQuery) -> bool {
-    if !matches!(planned.resolved.output_mode, CoveOqlOutputMode::JsonRows)
+    if !matches!(planned.resolved.output_mode, CoveQlOutputMode::JsonRows)
         || planned.resolved.method_chain.group_by.is_some()
         || planned.resolved.method_chain.order_by.is_some()
         || planned.resolved.method_chain.take.is_some()
@@ -1140,7 +1199,7 @@ pub(crate) fn native_helper_exists_direct_projection_shape(planned: &crate::Plan
 pub(crate) fn native_evidence_exists_direct_projection_candidate_shape(
     planned: &crate::PlannedQuery,
 ) -> bool {
-    if !matches!(planned.resolved.output_mode, CoveOqlOutputMode::JsonRows)
+    if !matches!(planned.resolved.output_mode, CoveQlOutputMode::JsonRows)
         || planned.resolved.method_chain.group_by.is_some()
         || planned.resolved.method_chain.order_by.is_some()
         || planned.resolved.method_chain.take.is_some()
@@ -1196,20 +1255,23 @@ pub(crate) fn native_evidence_exists_direct_projection_candidate_shape(
 }
 
 pub(crate) fn native_projection_root_scan_shape(planned: &crate::PlannedQuery) -> bool {
-    if !matches!(planned.resolved.root, ResolvedRoot::Projection(_))
-        || !matches!(
-            planned.resolved.output_mode,
-            CoveOqlOutputMode::ProjectionRows
-                | CoveOqlOutputMode::JsonRows
-                | CoveOqlOutputMode::ArrowRecordBatch { .. }
-        )
-        || planned.resolved.method_chain.group_by.is_some()
+    if !matches!(
+        planned.resolved.root,
+        ResolvedRoot::Table(_) | ResolvedRoot::Projection(_)
+    ) || !matches!(
+        planned.resolved.output_mode,
+        CoveQlOutputMode::ProjectionRows
+            | CoveQlOutputMode::JsonRows
+            | CoveQlOutputMode::ArrowRecordBatch { .. }
+    ) || planned.resolved.method_chain.group_by.is_some()
         || planned.resolved.method_chain.order_by.is_some()
         || ((planned.resolved.method_chain.take.is_some()
             || planned.resolved.method_chain.skip.is_some())
             && !projection_root_pagination_has_exact_declared_ordering(planned))
         || planned.resolved.method_chain.history.is_some()
         || planned.resolved.method_chain.changes.is_some()
+        || !planned.resolved.method_chain.lookups.is_empty()
+        || !planned.resolved.method_chain.traversals.is_empty()
         || planned.resolved.temporal.role_binding.is_some()
         || !planned.resolved.temporal.mode.is_point_in_time()
         || !matches!(
@@ -1249,8 +1311,10 @@ pub(crate) fn native_projection_root_scan_shape(planned: &crate::PlannedQuery) -
 }
 
 fn projection_root_pagination_has_exact_declared_ordering(planned: &crate::PlannedQuery) -> bool {
-    if !matches!(planned.resolved.root, ResolvedRoot::Projection(_))
-        || planned.resolved.method_chain.order_by.is_some()
+    if !matches!(
+        planned.resolved.root,
+        ResolvedRoot::Table(_) | ResolvedRoot::Projection(_)
+    ) || planned.resolved.method_chain.order_by.is_some()
     {
         return false;
     }
@@ -1277,7 +1341,7 @@ pub(crate) fn native_association_root_scan_shape(planned: &crate::PlannedQuery) 
     if !native_direct_root_scan_common(planned, false, false, false)
         || !matches!(
             planned.resolved.output_mode,
-            CoveOqlOutputMode::AssociationRows
+            CoveQlOutputMode::AssociationRows
         )
     {
         return false;
@@ -1293,10 +1357,7 @@ pub(crate) fn native_evidence_root_scan_shape(planned: &crate::PlannedQuery) -> 
             .security
             .metadata_disclosure_policy
             != MetadataDisclosurePolicy::AllowProtected
-        || !matches!(
-            planned.resolved.output_mode,
-            CoveOqlOutputMode::EvidenceRows
-        )
+        || !matches!(planned.resolved.output_mode, CoveQlOutputMode::EvidenceRows)
     {
         return false;
     }
@@ -1314,6 +1375,8 @@ fn native_direct_root_scan_common(
         || (allow_object_where
             && where_predicate.is_some()
             && !native_direct_projection_predicate_is_exact(planned, where_predicate))
+        || !planned.resolved.method_chain.lookups.is_empty()
+        || !planned.resolved.method_chain.traversals.is_empty()
         || planned.resolved.method_chain.group_by.is_some()
         || (!allow_order && planned.resolved.method_chain.order_by.is_some())
         || (allow_order
@@ -1365,12 +1428,127 @@ fn native_direct_projection_order_is_exact(planned: &crate::PlannedQuery) -> boo
         ResolvedRoot::Association(_) => {
             matches!(path.root_kind, crate::ResolvedPathRootKind::Association)
         }
+        ResolvedRoot::Node(_) => matches!(path.root_kind, crate::ResolvedPathRootKind::Node),
+        ResolvedRoot::Edge(_) => matches!(path.root_kind, crate::ResolvedPathRootKind::Edge),
         ResolvedRoot::Evidence(_) => {
             matches!(path.root_kind, crate::ResolvedPathRootKind::Evidence)
         }
-        ResolvedRoot::Object(_) | ResolvedRoot::Projection(_) => false,
+        ResolvedRoot::Object(_) | ResolvedRoot::Table(_) | ResolvedRoot::Projection(_) => false,
     };
     root_matches && native_typed_order_path_is_exact(path)
+}
+
+fn predicate_contains_table_exists(predicate: &ResolvedPredicate) -> bool {
+    match predicate {
+        ResolvedPredicate::Exists(ResolvedExpr::TableExists(_)) => true,
+        ResolvedPredicate::Compare { left, right, .. } => {
+            expr_contains_table_exists(left) || expr_contains_table_exists(right)
+        }
+        ResolvedPredicate::InList { expr, .. }
+        | ResolvedPredicate::NullCheck { expr, .. }
+        | ResolvedPredicate::BoolExpr(expr)
+        | ResolvedPredicate::Exists(expr) => expr_contains_table_exists(expr),
+        ResolvedPredicate::Not(inner) => predicate_contains_table_exists(inner),
+        ResolvedPredicate::And(parts) | ResolvedPredicate::Or(parts) => {
+            parts.iter().any(predicate_contains_table_exists)
+        }
+    }
+}
+
+fn expr_contains_table_exists(expr: &ResolvedExpr) -> bool {
+    match expr {
+        ResolvedExpr::TableExists(_) => true,
+        ResolvedExpr::FunctionCall { args, .. } => args.iter().any(expr_contains_table_exists),
+        ResolvedExpr::AggregateCall { arg, .. } => {
+            arg.as_deref().is_some_and(expr_contains_table_exists)
+        }
+        ResolvedExpr::Conditional {
+            predicate,
+            then_expr,
+            else_expr,
+            ..
+        } => {
+            predicate_contains_table_exists(predicate)
+                || expr_contains_table_exists(then_expr)
+                || expr_contains_table_exists(else_expr)
+        }
+        ResolvedExpr::Path(_)
+        | ResolvedExpr::Literal(_)
+        | ResolvedExpr::Association(_)
+        | ResolvedExpr::Evidence(_) => false,
+    }
+}
+
+fn planned_contains_target_node_association(planned: &crate::PlannedQuery) -> bool {
+    planned
+        .resolved
+        .method_chain
+        .where_predicate
+        .as_ref()
+        .is_some_and(predicate_contains_target_node_association)
+        || planned
+            .resolved
+            .method_chain
+            .select
+            .as_ref()
+            .is_some_and(|select| {
+                select
+                    .iter()
+                    .any(|item| expr_contains_target_node_association(&item.expr))
+            })
+        || planned
+            .resolved
+            .method_chain
+            .order_by
+            .as_ref()
+            .is_some_and(|order| expr_contains_target_node_association(&order.expr))
+        || planned
+            .resolved
+            .method_chain
+            .group_by
+            .as_ref()
+            .is_some_and(|exprs| exprs.iter().any(expr_contains_target_node_association))
+}
+
+fn predicate_contains_target_node_association(predicate: &ResolvedPredicate) -> bool {
+    match predicate {
+        ResolvedPredicate::Compare { left, right, .. } => {
+            expr_contains_target_node_association(left)
+                || expr_contains_target_node_association(right)
+        }
+        ResolvedPredicate::InList { expr, .. }
+        | ResolvedPredicate::NullCheck { expr, .. }
+        | ResolvedPredicate::BoolExpr(expr)
+        | ResolvedPredicate::Exists(expr) => expr_contains_target_node_association(expr),
+        ResolvedPredicate::Not(inner) => predicate_contains_target_node_association(inner),
+        ResolvedPredicate::And(parts) | ResolvedPredicate::Or(parts) => {
+            parts.iter().any(predicate_contains_target_node_association)
+        }
+    }
+}
+
+fn expr_contains_target_node_association(expr: &ResolvedExpr) -> bool {
+    match expr {
+        ResolvedExpr::Association(association) => association.target_node_object_type_id.is_some(),
+        ResolvedExpr::FunctionCall { args, .. } => {
+            args.iter().any(expr_contains_target_node_association)
+        }
+        ResolvedExpr::AggregateCall { arg, .. } => arg
+            .as_deref()
+            .is_some_and(expr_contains_target_node_association),
+        ResolvedExpr::TableExists(exists) => predicate_contains_target_node_association(&exists.on),
+        ResolvedExpr::Conditional {
+            predicate,
+            then_expr,
+            else_expr,
+            ..
+        } => {
+            predicate_contains_target_node_association(predicate)
+                || expr_contains_target_node_association(then_expr)
+                || expr_contains_target_node_association(else_expr)
+        }
+        ResolvedExpr::Path(_) | ResolvedExpr::Literal(_) | ResolvedExpr::Evidence(_) => false,
+    }
 }
 
 pub(crate) fn native_projection_expr_is_exact(expr: &ResolvedExpr) -> bool {
@@ -1389,6 +1567,7 @@ pub(crate) fn native_projection_expr_is_exact(expr: &ResolvedExpr) -> bool {
         ResolvedExpr::AggregateCall { .. }
         | ResolvedExpr::Association(_)
         | ResolvedExpr::Evidence(_)
+        | ResolvedExpr::TableExists(_)
         | ResolvedExpr::Conditional { .. } => false,
     }
 }
@@ -1399,10 +1578,16 @@ fn native_direct_projection_predicate_is_exact(
 ) -> bool {
     match &planned.resolved.root {
         ResolvedRoot::Object(_) => compile_kernel_predicates(predicate).is_ok(),
+        ResolvedRoot::Node(_) => compile_kernel_predicates(predicate).is_ok(),
         ResolvedRoot::Association(_) | ResolvedRoot::Evidence(_) => {
             predicate.is_some_and(|predicate| row_root_predicate_is_direct_safe(planned, predicate))
         }
-        ResolvedRoot::Projection(_) => predicate.is_some_and(projection_root_predicate_is_exact),
+        ResolvedRoot::Edge(_) => {
+            predicate.is_some_and(|predicate| row_root_predicate_is_direct_safe(planned, predicate))
+        }
+        ResolvedRoot::Table(_) | ResolvedRoot::Projection(_) => {
+            predicate.is_some_and(projection_root_predicate_is_exact)
+        }
     }
 }
 
@@ -1417,6 +1602,7 @@ fn projection_root_expr_is_provider_exact(expr: &ResolvedExpr) -> bool {
         | ResolvedExpr::AggregateCall { .. }
         | ResolvedExpr::Association(_)
         | ResolvedExpr::Evidence(_)
+        | ResolvedExpr::TableExists(_)
         | ResolvedExpr::Conditional { .. } => false,
     }
 }
@@ -1618,15 +1804,17 @@ fn row_root_path_matches_root(planned: &crate::PlannedQuery, path: &ResolvedPath
         ResolvedRoot::Association(_) => {
             matches!(path.root_kind, crate::ResolvedPathRootKind::Association)
         }
+        ResolvedRoot::Node(_) => matches!(path.root_kind, crate::ResolvedPathRootKind::Node),
+        ResolvedRoot::Edge(_) => matches!(path.root_kind, crate::ResolvedPathRootKind::Edge),
         ResolvedRoot::Evidence(_) => {
             matches!(path.root_kind, crate::ResolvedPathRootKind::Evidence)
         }
-        ResolvedRoot::Object(_) | ResolvedRoot::Projection(_) => false,
+        ResolvedRoot::Object(_) | ResolvedRoot::Table(_) | ResolvedRoot::Projection(_) => false,
     }
 }
 
 pub(crate) fn native_bool_group_count_shape(planned: &crate::PlannedQuery) -> bool {
-    if !matches!(planned.resolved.output_mode, CoveOqlOutputMode::JsonRows)
+    if !matches!(planned.resolved.output_mode, CoveQlOutputMode::JsonRows)
         || planned.resolved.method_chain.where_predicate.is_some()
         || planned.resolved.method_chain.order_by.is_some()
         || planned.resolved.method_chain.take.is_some()
@@ -1704,7 +1892,7 @@ pub(crate) fn native_bool_group_count_path(planned: &crate::PlannedQuery) -> Opt
 }
 
 pub(crate) fn native_direct_aggregate_shape(planned: &crate::PlannedQuery) -> bool {
-    if !matches!(planned.resolved.output_mode, CoveOqlOutputMode::JsonRows)
+    if !matches!(planned.resolved.output_mode, CoveQlOutputMode::JsonRows)
         || planned.resolved.method_chain.where_predicate.is_some()
         || planned.resolved.method_chain.group_by.is_some()
         || planned.resolved.method_chain.order_by.is_some()
@@ -1798,7 +1986,7 @@ pub(crate) fn native_direct_aggregate_path(planned: &crate::PlannedQuery) -> Opt
 }
 
 pub(crate) fn native_helper_aggregate_shape(planned: &crate::PlannedQuery) -> bool {
-    if !matches!(planned.resolved.output_mode, CoveOqlOutputMode::JsonRows)
+    if !matches!(planned.resolved.output_mode, CoveQlOutputMode::JsonRows)
         || planned.resolved.method_chain.where_predicate.is_some()
         || planned.resolved.method_chain.group_by.is_some()
         || planned.resolved.method_chain.order_by.is_some()
@@ -1863,7 +2051,7 @@ pub(crate) fn native_helper_aggregate_shape(planned: &crate::PlannedQuery) -> bo
 }
 
 pub(crate) fn native_grouped_helper_aggregate_shape(planned: &crate::PlannedQuery) -> bool {
-    if !matches!(planned.resolved.output_mode, CoveOqlOutputMode::JsonRows)
+    if !matches!(planned.resolved.output_mode, CoveQlOutputMode::JsonRows)
         || planned.resolved.method_chain.where_predicate.is_some()
         || planned.resolved.method_chain.order_by.is_some()
         || planned.resolved.method_chain.take.is_some()
@@ -2089,7 +2277,7 @@ pub(crate) fn paths_same_value_domain(left: &ResolvedPath, right: &ResolvedPath)
 }
 
 pub(crate) fn native_typed_order_shape(planned: &crate::PlannedQuery) -> bool {
-    if !matches!(planned.resolved.output_mode, CoveOqlOutputMode::JsonRows)
+    if !matches!(planned.resolved.output_mode, CoveQlOutputMode::JsonRows)
         || planned.resolved.method_chain.where_predicate.is_some()
         || planned.resolved.method_chain.group_by.is_some()
         || planned.resolved.method_chain.history.is_some()
@@ -2565,7 +2753,7 @@ fn append_predicate_contracts(
                     kernel_safe,
                     !kernel_safe,
                 if kernel_safe {
-                    "NOT preserves the OQL three-valued truth table inside the kernel predicate tree"
+                    "NOT preserves the CoveQL three-valued truth table inside the kernel predicate tree"
                 } else {
                     "complement semantics require three-valued-logic proof before coded pruning"
                 },
@@ -2590,7 +2778,7 @@ fn append_predicate_contracts(
                         kernel_safe,
                         !kernel_safe,
                     if kernel_safe {
-                        "OR preserves the OQL three-valued truth table inside the kernel predicate tree"
+                        "OR preserves the CoveQL three-valued truth table inside the kernel predicate tree"
                     } else {
                         "OR proof composition remains residual unless no-false-negative proof metadata is available"
                     },
@@ -2660,9 +2848,9 @@ fn append_expr_contract(
                         _ => &["null_policy"],
                     })
                     .with_proof_obligation(if operator == "group_by" {
-                        "GROUP BY over a path can become coded only after code equality is proven to match OQL grouping equality at the reconstructed row grain"
+                        "GROUP BY over a path can become coded only after code equality is proven to match CoveQL grouping equality at the reconstructed row grain"
                     } else {
-                        "path expression uses its physical-kind contract plus OQL null/type semantics"
+                        "path expression uses its physical-kind contract plus CoveQL null/type semantics"
                     }),
             );
         }
@@ -2794,6 +2982,24 @@ fn append_expr_contract(
                 .with_fallback_boundary("materialized_metadata_readback"),
             );
         }
+        ResolvedExpr::TableExists(exists) => {
+            append_predicate_contracts(planned, &exists.on, contracts);
+            contracts.push(
+                CodedOperatorContract::new(
+                    "predicate_exists:table",
+                    CodedRepresentationClass::MaterializedResidual,
+                    false,
+                    true,
+                    "table exists semi/anti join uses projection-backed materialized rows unless an exact coded lookup-join proof is available",
+                )
+                .with_row_grain("visible_table_rows")
+                .with_required_metadata(&["projection_catalog", "table_lookup_contract"])
+                .with_proof_obligation(
+                    "table semi/anti joins need exact key-domain, duplicate-row, visibility, and null-semantics proof before native coded execution",
+                )
+                .with_fallback_boundary("materialized_table_exists_evaluation"),
+            );
+        }
         ResolvedExpr::Conditional {
             predicate,
             then_expr,
@@ -2870,7 +3076,7 @@ fn append_coded_function_arg_contract(
             )
             .with_required_metadata(&["function_contract", "literal_type", "null_policy"])
             .with_proof_obligation(
-                "literal function arguments are exact because their OQL literal type and null semantics are fixed during resolution",
+                "literal function arguments are exact because their CoveQL literal type and null semantics are fixed during resolution",
             ),
         ),
         ResolvedExpr::FunctionCall {
@@ -3179,6 +3385,7 @@ fn expression_contains_unsupported_coded(expr: &ResolvedExpr) -> bool {
                 })
         }
         ResolvedExpr::Conditional { .. } => true,
+        ResolvedExpr::TableExists(_) => true,
         ResolvedExpr::Association(_) | ResolvedExpr::Evidence(_) => false,
         ResolvedExpr::AggregateCall { .. } | ResolvedExpr::Literal(_) => false,
     }

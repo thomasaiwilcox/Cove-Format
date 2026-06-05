@@ -307,7 +307,7 @@ fn classify_predicate_scoped(
                 let classification = child.classification;
                 let mut representation = child.representation.clone();
                 representation.reason =
-                    "NOT complement over an exact pre-reconstruction predicate preserves OQL three-valued truth semantics".into();
+                    "NOT complement over an exact pre-reconstruction predicate preserves CoveQL three-valued truth semantics".into();
                 return LogicalPredicateForm {
                     kind: LogicalPredicateKind::Not(Box::new(child)),
                     placement: PredicatePlacement::PreReconstruction,
@@ -375,7 +375,7 @@ fn classify_predicate_scoped(
                         security_scope,
                     ),
                     residual_reason: Some(
-                        "GOID OR candidate union still requires materialized OQL truth verification"
+                        "GOID OR candidate union still requires materialized CoveQL truth verification"
                             .into(),
                     ),
                 };
@@ -447,7 +447,7 @@ fn exact_same_path_or_contract(
     .then_some((
         classification,
         RepresentationContract {
-            reason: "same-path equality/IN disjunction is equivalent to one OQL IN predicate and preserves three-valued null semantics".into(),
+            reason: "same-path equality/IN disjunction is equivalent to one CoveQL IN predicate and preserves three-valued null semantics".into(),
             ..representation
         },
     ))
@@ -755,7 +755,7 @@ fn coded_function_compare_contract<'a>(
             Some((
                 Some(path),
                 RepresentationClass::CodePure,
-                "null-check function comparison uses validity/null lanes with OQL two-valued function semantics",
+                "null-check function comparison uses validity/null lanes with CoveQL two-valued function semantics",
             ))
         }
         "identity" if bool_literal(literal).is_some() => {
@@ -777,7 +777,7 @@ fn coded_function_compare_contract<'a>(
         "coalesce" if bool_literal(literal).is_some() && coalesce_bool_args_are_safe(args) => Some((
             first_path_arg(args),
             RepresentationClass::CodePure,
-            "coalesce boolean comparison uses boolean/null lanes and literal defaults with OQL null semantics",
+            "coalesce boolean comparison uses boolean/null lanes and literal defaults with CoveQL null semantics",
         )),
         _ => None,
     }
@@ -808,7 +808,7 @@ fn coded_bool_function_contract(
         "isNull" | "isNotNull" => Some((
             Some(single_non_execution_path_arg(args)?),
             RepresentationClass::CodePure,
-            "null-check predicate uses validity/null lanes with OQL two-valued function semantics",
+            "null-check predicate uses validity/null lanes with CoveQL two-valued function semantics",
         )),
         "identity" => Some((
             Some(single_bool_path_arg(args)?),
@@ -823,7 +823,7 @@ fn coded_bool_function_contract(
         "coalesce" if coalesce_bool_args_are_safe(args) => Some((
             first_path_arg(args),
             RepresentationClass::CodePure,
-            "coalesce boolean predicate uses boolean/null lanes and literal defaults with OQL null semantics",
+            "coalesce boolean predicate uses boolean/null lanes and literal defaults with CoveQL null semantics",
         )),
         _ => None,
     }
@@ -983,7 +983,7 @@ fn classify_path_predicate(
                                 path,
                                 RepresentationClass::CodePure,
                                 true,
-                                "single-file FileCode equality uses one validated file dictionary/code domain and preserves OQL null semantics",
+                                "single-file FileCode equality uses one validated file dictionary/code domain and preserves CoveQL null semantics",
                                 security_scope,
                             ),
                             None,
@@ -1280,6 +1280,7 @@ pub fn expr_label(expr: &ResolvedExpr) -> String {
         ResolvedExpr::AggregateCall { name, .. } => format!("aggregate:{name:?}"),
         ResolvedExpr::Association(association) => format!("association:{}", association.type_name),
         ResolvedExpr::Evidence(evidence) => format!("evidence:{:?}", evidence.grain),
+        ResolvedExpr::TableExists(exists) => format!("exists:{}", exists.right.table_name),
         ResolvedExpr::Conditional { .. } => "if".into(),
     }
 }

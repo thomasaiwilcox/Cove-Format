@@ -918,31 +918,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cove-oql"
-version = "0.1.0"
-dependencies = [
- "arrow-array",
- "arrow-schema",
- "async-trait",
- "cove-arrow",
- "cove-cache",
- "cove-core",
- "cove-coverage",
- "cove-datafusion",
- "cove-index",
- "cove-layout",
- "cove-map",
- "cove-profile-validation",
- "cove-runtime",
- "datafusion",
- "serde",
- "serde_json",
- "sha2",
- "time",
- "tokio",
-]
-
-[[package]]
 name = "cove-profile-validation"
 version = "0.1.0"
 dependencies = [
@@ -984,6 +959,31 @@ name = "cove-writer"
 version = "0.1.0"
 dependencies = [
  "cove-core",
+]
+
+[[package]]
+name = "coveql"
+version = "0.1.0"
+dependencies = [
+ "arrow-array",
+ "arrow-data",
+ "arrow-schema",
+ "async-trait",
+ "cove-arrow",
+ "cove-cache",
+ "cove-core",
+ "cove-coverage",
+ "cove-datafusion",
+ "cove-index",
+ "cove-layout",
+ "cove-map",
+ "cove-profile-validation",
+ "cove-runtime",
+ "serde",
+ "serde_json",
+ "sha2",
+ "time",
+ "tokio",
 ]
 
 [[package]]
