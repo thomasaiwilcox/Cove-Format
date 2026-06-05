@@ -7,9 +7,14 @@ use cove_core::profile::cove_o::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::{ResolvedPath, ResolvedSystemField};
+use crate::{ResolvedExpr, ResolvedPath, ResolvedSystemField};
 
 pub(crate) const INTERNAL_PROJECTION_FIELD_PREFIX: &str = "__coveql_";
+
+pub(crate) fn window_function_key(name: &str, args: &[ResolvedExpr]) -> String {
+    let args = serde_json::to_string(args).unwrap_or_else(|_| "[]".into());
+    format!("{INTERNAL_PROJECTION_FIELD_PREFIX}window:{name}:{args}")
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -514,6 +519,13 @@ impl ExecutionRow {
             ExecutionRow::Association(row) => row.value_for_path(path),
             ExecutionRow::Evidence(row) => row.value_for_path(path),
             ExecutionRow::Projection(row) => row.value_for_path(path),
+        }
+    }
+
+    pub(crate) fn window_value(&self, field: &str) -> Value {
+        match self {
+            ExecutionRow::Projection(row) => row.values.get(field).cloned().unwrap_or(Value::Null),
+            _ => Value::Null,
         }
     }
 

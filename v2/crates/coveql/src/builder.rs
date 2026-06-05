@@ -823,6 +823,279 @@ impl CoveQlQueryBuilder {
         self
     }
 
+    pub fn join_table(
+        mut self,
+        table: impl AsRef<str>,
+        alias: Option<impl AsRef<str>>,
+        on: impl AsRef<str>,
+        kind: crate::TableJoinKind,
+    ) -> Self {
+        self.methods.push(format!(
+            "join({}, on: {}, kind: {})",
+            coveql_table_binding(table, alias),
+            on.as_ref(),
+            table_join_kind_name(kind)
+        ));
+        self
+    }
+
+    pub fn with_table(
+        mut self,
+        name: impl AsRef<str>,
+        table: impl AsRef<str>,
+        alias: Option<impl AsRef<str>>,
+    ) -> Self {
+        self.methods.push(format!(
+            "with({}: {})",
+            coveql_identifier(name.as_ref()),
+            coveql_table_binding(table, alias)
+        ));
+        self
+    }
+
+    pub fn with_recursive_table(
+        mut self,
+        name: impl AsRef<str>,
+        table: impl AsRef<str>,
+        alias: Option<impl AsRef<str>>,
+        max_iterations: usize,
+    ) -> Self {
+        self.methods.push(format!(
+            "withRecursive(name: {}, seed: {}, maxIterations: {max_iterations})",
+            coveql_identifier(name.as_ref()),
+            coveql_table_binding(table, alias)
+        ));
+        self
+    }
+
+    pub fn with_recursive_table_step(
+        mut self,
+        name: impl AsRef<str>,
+        seed_table: impl AsRef<str>,
+        seed_alias: Option<impl AsRef<str>>,
+        step_table: impl AsRef<str>,
+        step_alias: Option<impl AsRef<str>>,
+        key: impl AsRef<str>,
+        max_iterations: usize,
+    ) -> Self {
+        self.methods.push(format!(
+            "withRecursive(name: {}, seed: {}, step: {}, key: {}, maxIterations: {max_iterations})",
+            coveql_identifier(name.as_ref()),
+            coveql_table_binding(seed_table, seed_alias),
+            coveql_table_binding(step_table, step_alias),
+            key.as_ref()
+        ));
+        self
+    }
+
+    pub fn semi_join_table(
+        mut self,
+        table: impl AsRef<str>,
+        alias: Option<impl AsRef<str>>,
+        on: impl AsRef<str>,
+    ) -> Self {
+        self.methods.push(format!(
+            "semiJoin({}, on: {})",
+            coveql_table_binding(table, alias),
+            on.as_ref()
+        ));
+        self
+    }
+
+    pub fn anti_join_table(
+        mut self,
+        table: impl AsRef<str>,
+        alias: Option<impl AsRef<str>>,
+        on: impl AsRef<str>,
+    ) -> Self {
+        self.methods.push(format!(
+            "antiJoin({}, on: {})",
+            coveql_table_binding(table, alias),
+            on.as_ref()
+        ));
+        self
+    }
+
+    pub fn union_table(
+        self,
+        table: impl AsRef<str>,
+        alias: Option<impl AsRef<str>>,
+        all: bool,
+    ) -> Self {
+        self.set_operation_table("union", table, alias, all)
+    }
+
+    pub fn intersect_table(
+        self,
+        table: impl AsRef<str>,
+        alias: Option<impl AsRef<str>>,
+        all: bool,
+    ) -> Self {
+        self.set_operation_table("intersect", table, alias, all)
+    }
+
+    pub fn except_table(
+        self,
+        table: impl AsRef<str>,
+        alias: Option<impl AsRef<str>>,
+        all: bool,
+    ) -> Self {
+        self.set_operation_table("except", table, alias, all)
+    }
+
+    fn set_operation_table(
+        mut self,
+        method: &'static str,
+        table: impl AsRef<str>,
+        alias: Option<impl AsRef<str>>,
+        all: bool,
+    ) -> Self {
+        self.methods.push(format!(
+            "{method}({}, all: {all})",
+            coveql_table_binding(table, alias)
+        ));
+        self
+    }
+
+    pub fn window(
+        mut self,
+        partition_by: Option<impl AsRef<str>>,
+        order_by: Option<impl AsRef<str>>,
+    ) -> Self {
+        let mut args = Vec::new();
+        if let Some(partition_by) = partition_by {
+            args.push(format!("partitionBy: {}", partition_by.as_ref()));
+        }
+        if let Some(order_by) = order_by {
+            args.push(format!("orderBy: {}", order_by.as_ref()));
+        }
+        self.methods.push(format!("window({})", args.join(", ")));
+        self
+    }
+
+    pub fn graph_algorithm(
+        mut self,
+        name: impl AsRef<str>,
+        relationship: Option<impl AsRef<str>>,
+    ) -> Self {
+        let args = relationship
+            .map(|relationship| relationship.as_ref().to_string())
+            .unwrap_or_default();
+        self.methods.push(format!("{}({})", name.as_ref(), args));
+        self
+    }
+
+    pub fn graph_algorithm_with_args<I, K, V>(
+        mut self,
+        name: impl AsRef<str>,
+        relationship: Option<impl AsRef<str>>,
+        args: I,
+    ) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: AsRef<str>,
+    {
+        let mut rendered = Vec::new();
+        if let Some(relationship) = relationship {
+            rendered.push(relationship.as_ref().to_string());
+        }
+        rendered.extend(args.into_iter().map(|(name, value)| {
+            format!("{}: {}", coveql_identifier(name.as_ref()), value.as_ref())
+        }));
+        self.methods
+            .push(format!("{}({})", name.as_ref(), rendered.join(", ")));
+        self
+    }
+
+    pub fn reachable(self, relationship: Option<impl AsRef<str>>) -> Self {
+        self.graph_algorithm("reachable", relationship)
+    }
+
+    pub fn shortest_path(self, relationship: Option<impl AsRef<str>>) -> Self {
+        self.graph_algorithm("shortestPath", relationship)
+    }
+
+    pub fn all_paths(self, relationship: Option<impl AsRef<str>>) -> Self {
+        self.graph_algorithm("allPaths", relationship)
+    }
+
+    pub fn k_shortest_paths(self, relationship: Option<impl AsRef<str>>) -> Self {
+        self.graph_algorithm("kShortestPaths", relationship)
+    }
+
+    pub fn connected_components(self, relationship: Option<impl AsRef<str>>) -> Self {
+        self.graph_algorithm("connectedComponents", relationship)
+    }
+
+    pub fn connected_components_kind(
+        self,
+        relationship: Option<impl AsRef<str>>,
+        kind: impl AsRef<str>,
+    ) -> Self {
+        self.graph_algorithm_with_args("connectedComponents", relationship, [("kind", kind)])
+    }
+
+    pub fn degree(self, relationship: Option<impl AsRef<str>>) -> Self {
+        self.graph_algorithm("degree", relationship)
+    }
+
+    pub fn degree_kind(self, relationship: Option<impl AsRef<str>>, kind: impl AsRef<str>) -> Self {
+        self.graph_algorithm_with_args("degree", relationship, [("kind", kind)])
+    }
+
+    pub fn page_rank(self, relationship: Option<impl AsRef<str>>) -> Self {
+        self.graph_algorithm("pageRank", relationship)
+    }
+
+    pub fn hits(self, relationship: Option<impl AsRef<str>>) -> Self {
+        self.graph_algorithm("hits", relationship)
+    }
+
+    pub fn centrality(self, relationship: Option<impl AsRef<str>>) -> Self {
+        self.graph_algorithm("centrality", relationship)
+    }
+
+    pub fn centrality_kind(
+        self,
+        relationship: Option<impl AsRef<str>>,
+        kind: impl AsRef<str>,
+    ) -> Self {
+        self.graph_algorithm_with_args("centrality", relationship, [("kind", kind)])
+    }
+
+    pub fn triangle_count(self, relationship: Option<impl AsRef<str>>) -> Self {
+        self.graph_algorithm("triangleCount", relationship)
+    }
+
+    pub fn clustering_coefficient(self, relationship: Option<impl AsRef<str>>) -> Self {
+        self.graph_algorithm("clusteringCoefficient", relationship)
+    }
+
+    pub fn community(self, relationship: Option<impl AsRef<str>>) -> Self {
+        self.graph_algorithm("community", relationship)
+    }
+
+    pub fn community_kind(
+        self,
+        relationship: Option<impl AsRef<str>>,
+        kind: impl AsRef<str>,
+    ) -> Self {
+        self.graph_algorithm_with_args("community", relationship, [("kind", kind)])
+    }
+
+    pub fn spanning_tree(self, relationship: Option<impl AsRef<str>>) -> Self {
+        self.graph_algorithm("spanningTree", relationship)
+    }
+
+    pub fn spanning_tree_kind(
+        self,
+        relationship: Option<impl AsRef<str>>,
+        kind: impl AsRef<str>,
+    ) -> Self {
+        self.graph_algorithm_with_args("spanningTree", relationship, [("kind", kind)])
+    }
+
     pub fn explain(mut self, mode: ExplainMode) -> Self {
         self.methods.push(format!(
             "explain({})",
@@ -959,6 +1232,14 @@ pub fn coveql_graph_edge_expr(
     out
 }
 
+pub fn coveql_table_binding(table: impl AsRef<str>, alias: Option<impl AsRef<str>>) -> String {
+    let mut out = format!("table({})", coveql_identifier(table.as_ref()));
+    if let Some(alias) = alias {
+        out.push_str(&format!(" as {}", coveql_identifier(alias.as_ref())));
+    }
+    out
+}
+
 pub fn coveql_relationship_expr(
     direction: AstAssociationDirection,
     edge_label: impl AsRef<str>,
@@ -1017,6 +1298,17 @@ fn association_expression(
         ));
     }
     format!("association({})", args.join(", "))
+}
+
+fn table_join_kind_name(kind: crate::TableJoinKind) -> &'static str {
+    match kind {
+        crate::TableJoinKind::Inner => "inner",
+        crate::TableJoinKind::Left => "left",
+        crate::TableJoinKind::Right => "right",
+        crate::TableJoinKind::Full => "full",
+        crate::TableJoinKind::Semi => "semi",
+        crate::TableJoinKind::Anti => "anti",
+    }
 }
 
 fn time_bound(bound: AstTimeBound) -> String {

@@ -114,12 +114,21 @@ impl LogicalPlanDependencySet {
         if let Some(predicate) = &resolved.method_chain.where_predicate {
             dependencies.record_predicate(predicate);
         }
+        for cte in &resolved.method_chain.ctes {
+            dependencies.record_table_root(&cte.table);
+            if let Some(key) = &cte.key {
+                dependencies.record_expr(key);
+            }
+        }
         for lookup in &resolved.method_chain.lookups {
             dependencies.record_table_root(&lookup.right);
             dependencies.record_predicate(&lookup.on);
         }
         for traversal in &resolved.method_chain.traversals {
             dependencies.record_graph_traversal(traversal);
+        }
+        for algorithm in &resolved.method_chain.graph_algorithms {
+            dependencies.record_graph_algorithm(algorithm);
         }
         if let Some(select) = &resolved.method_chain.select {
             for item in select {
@@ -280,6 +289,20 @@ impl LogicalPlanDependencySet {
             self.object_type_ids.insert(target.object.object_type_id);
             self.object_type_names
                 .insert(target.object.type_name.clone());
+        }
+    }
+
+    fn record_graph_algorithm(&mut self, algorithm: &crate::ResolvedGraphAlgorithm) {
+        if let Some(edge) = &algorithm.edge {
+            self.record_association_root(&edge.association);
+        }
+        if let Some(target) = &algorithm.target {
+            self.object_type_ids.insert(target.object.object_type_id);
+            self.object_type_names
+                .insert(target.object.type_name.clone());
+        }
+        if let Some(weight) = &algorithm.weight {
+            self.record_expr(weight);
         }
     }
 

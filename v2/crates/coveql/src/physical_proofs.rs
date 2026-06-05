@@ -146,6 +146,7 @@ pub(crate) fn validate_sidecars(
     reports.zero_copy = zero_copy_report(bytes, planned, inputs, flags, validation_options);
     reports.execution_code_domains = execution_code_domains(
         bytes,
+        inputs,
         planned,
         flags.enable_execution_code,
         validation_options,
@@ -729,6 +730,7 @@ fn object_zero_copy_segment_authority(
 
 fn execution_code_domains(
     bytes: &[u8],
+    inputs: &PhysicalSidecarInputs,
     planned: &PlannedQuery,
     enabled: bool,
     validation_options: &ValidationOptions,
@@ -740,8 +742,13 @@ fn execution_code_domains(
             Some("execution-code candidate planning disabled".into()),
         )];
     }
+    let (metadata_bytes, source) = inputs
+        .cove_e_artifact_bytes
+        .as_deref()
+        .map(|bytes| (bytes, "supplied COVE-E sidecar"))
+        .unwrap_or((bytes, "embedded COVE-E metadata"));
     match mount_cove_file(
-        bytes,
+        metadata_bytes,
         MountOptions {
             representation: OutputRepresentation::DecodeToValue,
             verify_digests: validation_options.verify_digests,
@@ -778,16 +785,15 @@ fn execution_code_domains(
                 semantic_domain_id: None,
                 security_scope: crate::physical_predicate::security_scope_descriptor(planned),
                 validated: true,
-                fallback_reason: Some(
-                    "execution-code metadata was validated; runtime execution still requires a per-operation remap proof gate"
-                        .into(),
-                ),
+                fallback_reason: Some(format!(
+                    "{source} was validated; runtime execution still requires a per-operation remap proof gate"
+                )),
             }]
         }
         Ok(_) => vec![default_execution_code_domain(
             planned,
             false,
-            Some("no embedded COVE-E execution-code metadata found".into()),
+            Some(format!("no {source} execution-code metadata found")),
         )],
         Err(error) => vec![default_execution_code_domain(
             planned,

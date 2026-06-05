@@ -13,8 +13,8 @@ use crate::{
     },
     evidence_opt::EvidenceGrainIndex,
     materialized::{
-        ExecutionRow, MaterializedAssociationRow, MaterializedEvidenceRow, MaterializedObjectRow,
-        MaterializedProjectionRow,
+        window_function_key, ExecutionRow, MaterializedAssociationRow, MaterializedEvidenceRow,
+        MaterializedObjectRow, MaterializedProjectionRow,
     },
     AstCompareOp, ResolvedAssociationRoot, ResolvedEvidenceRoot, ResolvedExpr, ResolvedLiteral,
     ResolvedLiteralValue, ResolvedPath, ResolvedPredicate, ResolvedTableExists,
@@ -455,6 +455,10 @@ fn eval_function(
             Ok(Value::Bool(
                 !value.is_null() && !matches!(&value, Value::Array(values) if values.is_empty()),
             ))
+        }
+        "row_number" | "rank" | "dense_rank" | "lag" | "lead" | "first_value" | "last_value"
+        | "sum" | "avg" | "min" | "max" | "count" => {
+            Ok(row.window_value(&window_function_key(name, args)))
         }
         other => Err(EvalError::new(format!(
             "deterministic function '{other}' has no Phase 3 executable body"

@@ -71,7 +71,11 @@ pub struct ResolveOptions {
     pub cache_hook: Option<crate::CacheHookRef>,
     pub execution_code_mapping_requested: bool,
     pub table_surface_contracts: BTreeMap<String, TableSurfaceContract>,
+    pub table_authorities: BTreeMap<String, TableSurfaceAuthority>,
     pub graph_traversal_contract: Option<GraphTraversalContract>,
+    pub graph_traversal_contracts: BTreeMap<String, GraphTraversalContract>,
+    pub graph_algorithm_contracts: BTreeMap<String, GraphAlgorithmContract>,
+    pub bridge_contracts: Vec<CoveQlBridgeRegistration>,
     pub branch_aliases: BTreeMap<String, u64>,
     pub ambiguous_branch_aliases: BTreeMap<String, Vec<u64>>,
     pub temporal_role_bindings: BTreeMap<crate::TemporalRole, String>,
@@ -88,7 +92,11 @@ impl Default for ResolveOptions {
             cache_hook: None,
             execution_code_mapping_requested: false,
             table_surface_contracts: BTreeMap::new(),
+            table_authorities: BTreeMap::new(),
             graph_traversal_contract: None,
+            graph_traversal_contracts: BTreeMap::new(),
+            graph_algorithm_contracts: BTreeMap::new(),
+            bridge_contracts: Vec::new(),
             branch_aliases: BTreeMap::new(),
             ambiguous_branch_aliases: BTreeMap::new(),
             temporal_role_bindings: BTreeMap::new(),
@@ -99,6 +107,56 @@ impl Default for ResolveOptions {
             ],
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TableSurfaceAuthority {
+    pub contract: TableSurfaceContract,
+    pub execution_authority: TableExecutionAuthority,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "value")]
+pub enum TableExecutionAuthority {
+    DeterministicProjection {
+        projection_id: String,
+    },
+    MaterializedRows {
+        rows: Vec<TableSurfaceRow>,
+    },
+    RawRows {
+        rows: Vec<TableSurfaceRow>,
+    },
+    ExternalRows {
+        provider_id: String,
+        rows: Vec<TableSurfaceRow>,
+    },
+}
+
+pub type TableSurfaceRow = BTreeMap<String, Value>;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoveQlBridgeRegistration {
+    pub bridge_id: String,
+    pub bridge_version: String,
+    pub source_profile: crate::CoveQlProfileId,
+    pub target_profile: crate::CoveQlProfileId,
+    pub source_grain: String,
+    pub target_grain: String,
+    pub identity_mapping: Vec<CoveQlBridgeIdentityMapping>,
+    pub temporal_alignment: String,
+    pub null_missing_policy: String,
+    pub code_domain_policy: String,
+    pub visibility_compatibility: String,
+    pub redaction_compatibility: String,
+    pub fallback_behavior: String,
+    pub exact: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoveQlBridgeIdentityMapping {
+    pub source: String,
+    pub target: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1136,6 +1194,7 @@ pub struct ResolvedTableRoot {
     pub temporal_authority: TableTemporalAuthority,
     pub evidence_capabilities: Vec<AstEvidenceGrain>,
     pub table_surface_contract: TableSurfaceContract,
+    pub execution_authority: TableExecutionAuthority,
     pub projection: ResolvedProjectionRoot,
 }
 
@@ -1266,8 +1325,13 @@ pub enum ResolvedEvidenceTarget {
 pub struct ResolvedMethodChain {
     pub where_predicate: Option<ResolvedPredicate>,
     pub select: Option<Vec<ResolvedSelectItem>>,
+    pub ctes: Vec<ResolvedCommonTableExpression>,
     pub lookups: Vec<ResolvedTableLookup>,
+    pub joins: Vec<ResolvedTableJoin>,
+    pub set_operations: Vec<ResolvedSetOperation>,
+    pub windows: Vec<ResolvedWindowSpec>,
     pub traversals: Vec<ResolvedGraphTraversal>,
+    pub graph_algorithms: Vec<ResolvedGraphAlgorithm>,
     pub order_by: Option<ResolvedOrderClause>,
     pub group_by: Option<Vec<ResolvedExpr>>,
     pub take: Option<u64>,
@@ -1275,6 +1339,17 @@ pub struct ResolvedMethodChain {
     pub explain: Option<crate::ExplainMode>,
     pub history: Option<AstHistoryMode>,
     pub changes: Option<ResolvedChanges>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedCommonTableExpression {
+    pub name: String,
+    pub table: ResolvedTableRoot,
+    pub recursive: bool,
+    pub max_iterations: Option<usize>,
+    pub step_table: Option<ResolvedTableRoot>,
+    pub key: Option<ResolvedExpr>,
+    pub execution_authority: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1286,6 +1361,60 @@ pub struct ResolvedTableLookup {
     pub unmatched_policy: TableLookupUnmatchedPolicy,
     pub duplicate_policy: TableLookupDuplicatePolicy,
     pub nulls_match: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedTableJoin {
+    pub right: ResolvedTableRoot,
+    pub on: ResolvedPredicate,
+    pub join_kind: TableJoinKind,
+    pub cardinality: TableLookupCardinality,
+    pub unmatched_policy: TableLookupUnmatchedPolicy,
+    pub duplicate_policy: TableLookupDuplicatePolicy,
+    pub nulls_match: bool,
+    pub bridge_contract: Option<CoveQlBridgeRegistration>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TableJoinKind {
+    Inner,
+    Left,
+    Right,
+    Full,
+    Semi,
+    Anti,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedSetOperation {
+    pub kind: SetOperationKind,
+    pub right: ResolvedTableRoot,
+    pub all: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SetOperationKind {
+    Union,
+    Intersect,
+    Except,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedWindowSpec {
+    pub partition_by: Vec<ResolvedExpr>,
+    pub order_by: Option<ResolvedOrderClause>,
+    pub frame: WindowFrameKind,
+    pub start: String,
+    pub end: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowFrameKind {
+    Rows,
+    Range,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1382,6 +1511,76 @@ pub struct GraphTraversalContract {
     pub hidden_endpoint_policy: String,
     pub ordering_policy: String,
     pub execution_authority: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphAlgorithmContract {
+    pub contract_version: String,
+    pub allowed_algorithms: Vec<GraphAlgorithmKind>,
+    pub direction_policy: String,
+    pub weight_policy: String,
+    pub temporal_policy: String,
+    pub visibility_authority: String,
+    pub redaction_authority: String,
+    pub max_depth: u32,
+    pub max_paths: usize,
+    pub max_iterations: usize,
+    pub disclosure_policy: String,
+    pub ordering_policy: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedGraphAlgorithm {
+    pub kind: GraphAlgorithmKind,
+    pub variant: String,
+    pub direction: AstAssociationDirection,
+    pub edge: Option<ResolvedGraphEdgeRoot>,
+    pub target: Option<ResolvedGraphNodeRoot>,
+    pub weight: Option<ResolvedExpr>,
+    pub max_depth: Option<u32>,
+    pub max_paths: Option<usize>,
+    pub max_iterations: Option<usize>,
+    pub tolerance: Option<String>,
+    pub approx: bool,
+    pub contract: GraphAlgorithmContract,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphAlgorithmKind {
+    Reachable,
+    ShortestPath,
+    AllPaths,
+    KShortestPaths,
+    ConnectedComponents,
+    Degree,
+    PageRank,
+    Hits,
+    Centrality,
+    TriangleCount,
+    ClusteringCoefficient,
+    Community,
+    SpanningTree,
+}
+
+impl GraphAlgorithmKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Reachable => "reachable",
+            Self::ShortestPath => "shortestPath",
+            Self::AllPaths => "allPaths",
+            Self::KShortestPaths => "kShortestPaths",
+            Self::ConnectedComponents => "connectedComponents",
+            Self::Degree => "degree",
+            Self::PageRank => "pageRank",
+            Self::Hits => "hits",
+            Self::Centrality => "centrality",
+            Self::TriangleCount => "triangleCount",
+            Self::ClusteringCoefficient => "clusteringCoefficient",
+            Self::Community => "community",
+            Self::SpanningTree => "spanningTree",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

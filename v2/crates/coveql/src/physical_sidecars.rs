@@ -22,6 +22,8 @@ pub struct PhysicalSidecarInputs {
     pub zero_copy_buffer_map_bytes: Option<Vec<u8>>,
     #[serde(skip)]
     pub coverage_cache_bytes: Option<Vec<u8>>,
+    #[serde(skip)]
+    pub cove_e_artifact_bytes: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

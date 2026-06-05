@@ -46,9 +46,11 @@
     clippy::unnecessary_map_or
 )]
 
+mod acceleration;
 mod arrow_output;
 mod association_opt;
 mod ast;
+mod beginner;
 mod builder;
 mod dependencies;
 #[cfg(feature = "datafusion")]
@@ -107,10 +109,19 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+pub use acceleration::{
+    acceleration_report_json, apply_acceleration_bundle, discover_acceleration_bundle,
+    generate_acceleration_sidecars, plan_acceleration, AccelerationBundleOptions,
+    CoveAccelerationBundle, CoveAccelerationDiagnostic, CoveAccelerationSidecar,
+    CoveAccelerationSidecarStatus, CoveGeneratedSidecar, CoveOptimizationAction,
+    CoveOptimizationOptions, CoveOptimizationPlan, CoveOptimizationStep, CoveOptimizeReport,
+    CoveSkippedSidecar,
+};
 pub use association_opt::{
     AssociationDirectionPlan, AssociationOptimizationDecision, AssociationOptimizationReport,
 };
 pub use ast::*;
+pub use beginner::*;
 pub use builder::*;
 pub use dependencies::*;
 #[cfg(feature = "datafusion")]
@@ -440,8 +451,23 @@ pub const COVEQL_TABLE_PROFILE_CONTRACT: CoveQlProfileContract = CoveQlProfileCo
         "lookup_left_preserving",
         "lookup_exists_semijoin",
         "lookup_cardinality_contract",
+        "materialized_inner_left_right_full_join",
+        "materialized_semijoin_antijoin",
+        "bag_and_distinct_set_operations",
+        "materialized_window_rows",
     ],
-    profile_methods: &["lookup"],
+    profile_methods: &[
+        "lookup",
+        "join",
+        "semiJoin",
+        "antiJoin",
+        "union",
+        "intersect",
+        "except",
+        "window",
+        "with",
+        "withRecursive",
+    ],
     bridge_requirements: &[
         "validated_bridge_or_materialized_canonical_values_for_cross_profile_or_cross_file_codes",
     ],
@@ -512,8 +538,24 @@ pub const COVEQL_GRAPH_PROFILE_CONTRACT: CoveQlProfileContract = CoveQlProfileCo
         "relationship_exists",
         "relationship_count_exists_distinct_count",
         "relationship_target_node_filter",
+        "materialized_graph_algorithm_oracle",
     ],
-    profile_methods: &["traverse"],
+    profile_methods: &[
+        "traverse",
+        "reachable",
+        "shortestPath",
+        "allPaths",
+        "kShortestPaths",
+        "connectedComponents",
+        "degree",
+        "pageRank",
+        "hits",
+        "centrality",
+        "triangleCount",
+        "clusteringCoefficient",
+        "community",
+        "spanningTree",
+    ],
     bridge_requirements: &[
         "object_graph_identity_bridge",
         "association_graph_edge_identity_bridge",
@@ -558,8 +600,38 @@ pub const COVEQL_COMMON_BRIDGE_CONTRACTS: &[CoveQlBridgeContract] = &[
     },
     CoveQlBridgeContract {
         bridge_version: COVEQL_BRIDGE_CONTRACT_VERSION,
+        source_profile: CoveQlProfileId::Table,
+        target_profile: CoveQlProfileId::Object,
+        requires_validated_bridge_or_materialized_fallback: true,
+    },
+    CoveQlBridgeContract {
+        bridge_version: COVEQL_BRIDGE_CONTRACT_VERSION,
         source_profile: CoveQlProfileId::Object,
         target_profile: CoveQlProfileId::Graph,
+        requires_validated_bridge_or_materialized_fallback: true,
+    },
+    CoveQlBridgeContract {
+        bridge_version: COVEQL_BRIDGE_CONTRACT_VERSION,
+        source_profile: CoveQlProfileId::Graph,
+        target_profile: CoveQlProfileId::Object,
+        requires_validated_bridge_or_materialized_fallback: true,
+    },
+    CoveQlBridgeContract {
+        bridge_version: COVEQL_BRIDGE_CONTRACT_VERSION,
+        source_profile: CoveQlProfileId::Table,
+        target_profile: CoveQlProfileId::Graph,
+        requires_validated_bridge_or_materialized_fallback: true,
+    },
+    CoveQlBridgeContract {
+        bridge_version: COVEQL_BRIDGE_CONTRACT_VERSION,
+        source_profile: CoveQlProfileId::Graph,
+        target_profile: CoveQlProfileId::Table,
+        requires_validated_bridge_or_materialized_fallback: true,
+    },
+    CoveQlBridgeContract {
+        bridge_version: COVEQL_BRIDGE_CONTRACT_VERSION,
+        source_profile: CoveQlProfileId::Table,
+        target_profile: CoveQlProfileId::Table,
         requires_validated_bridge_or_materialized_fallback: true,
     },
 ];

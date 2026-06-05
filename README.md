@@ -95,10 +95,52 @@ Key paths:
 - [`v2/crates/coveql`](./v2/crates/coveql): parser, resolver, planner,
   materialized/coded execution, explain output, Arrow output, and DataFusion
   integration.
+- [`v2/crates/cove-cli`](./v2/crates/cove-cli): beginner-friendly `cove`
+  terminal entry point for inspecting artifacts, discovering query surfaces, and
+  running CoveQL without writing Rust, including relational table methods,
+  graph methods, explain output, physical/kernel execution modes, and sidecar
+  inputs.
+- [`v2/docs/coveql-quickstart.md`](./v2/docs/coveql-quickstart.md): start here
+  to inspect sample COVE files, run table/object/projection/evidence queries,
+  export JSONL/CSV, and read explain output.
+- [`v2/examples/coveql`](./v2/examples/coveql): tiny checked-in COVE-O,
+  COVE-T, source, and COVE-MAP samples for the quickstart.
 - [`v2/docs/proposals/coveql-object-query-language.md`](./v2/docs/proposals/coveql-object-query-language.md):
   CoveQL/Object proposal and conformance decisions.
 - [`v2/docs/proposals/coveql-query-profiles.md`](./v2/docs/proposals/coveql-query-profiles.md):
   CoveQL-Core, Object, Table, and Graph profile contract RFC.
+
+Try the beginner CLI from `v2/`:
+
+```bash
+cargo run -p cove-cli -- inspect examples/coveql/people.cove --queries
+cargo run -p cove-cli -- optimize examples/coveql/events.cove
+cargo run -p cove-cli -- inspect examples/coveql/events.cove --performance
+cargo run -p cove-cli -- query examples/coveql/events.cove \
+  'table(events).where(score >= 20).select(id, score)'
+cargo run -p cove-cli -- query examples/coveql/events.cove --perf-report \
+  'table(events).where(score >= 20).select(id, score)'
+cargo run -p cove-cli -- query examples/coveql/people.cove \
+  'table(people).select(score, status, nickname).take(5)'
+cargo run -p cove-cli -- query examples/coveql/events.cove --engine compare \
+  'table(events).where(score >= 20).select(id, score)'
+cargo run -p cove-cli -- query --external-table people=/tmp/people.csv \
+  'table(people).where(score >= 20).select(id, score)'
+cargo run -p cove-cli -- query examples/coveql/people.cove \
+  'node(Person) as p.degree(kind: total).select(id: p.goid, degree).take(3)'
+```
+
+Longer CoveQL snippets can be supplied with `--query-file <path>` or
+`--query-file -` for stdin, and terminal tables support `--max-cell-width`.
+`cove query` uses safe-auto execution by default: validated acceleration
+sidecars are used when available, and materialized CoveQL remains the semantic
+authority. Use `cove optimize` to create sibling `.covperf.json`, COVE-I/COVX,
+COVE-E, and COVE-L sidecars without rewriting the source file. Use
+`--engine physical`, `--engine compare`, `--force-kernel`,
+`--strict-performance`, or `--perf-report` to inspect and control optimized
+execution; use `--enable-graph-traversal` with bounded graph budgets for
+variable-length traversals. Use `--external-table name=path` to mount CSV, JSON
+array, or JSONL rows as file-backed `ExternalRegisteredTable` providers.
 
 ## Repository Status
 
