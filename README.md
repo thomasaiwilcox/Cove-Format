@@ -10,6 +10,12 @@ transaction protocol. The file is a queryable persistent data structure: values,
 encodings, dictionaries, indexes, coverage metadata, checksums, and feature
 declarations are all part of the read contract.
 
+CoveQL is the optional query layer that sits next to the format. It is not
+required to read or write COVE files, but it is a first-class companion for
+projects that want object, association, evidence, projection, table, graph,
+temporal, explain, Arrow, DataFusion, and coded-execution semantics over COVE's
+validated metadata.
+
 ## Long-Term Direction
 
 COVE's long-term goal is to make archived tabular data both physically
@@ -49,6 +55,50 @@ only when the spec defines the proof semantics and the reader validates the
 metadata under the relevant logical type, collation, null semantics, feature
 scope, and snapshot. Advisory metadata can help planning, but it must not change
 query results.
+
+## CoveQL Companion Query Layer
+
+CoveQL is a substantial but optional addition to the COVE ecosystem. The core
+format remains useful without it: baseline readers can validate files, decode
+values, scan COVE-T segments, export Arrow arrays, and use proof-safe metadata
+without implementing a query language. CoveQL is for the next layer up: engines
+and tools that want a portable way to ask semantic questions over mapped COVE
+data.
+
+The current `coveql` crate implements CoveQL/Core plus CoveQL/Object, with
+profile contracts for Object, Table, and Graph. It can parse and resolve
+queries over objects, associations, evidence, projections, projection-backed
+tables, graph nodes/edges/paths, temporal cuts, history, changes, grouping,
+aggregates, ordering, pagination, and explain modes. It also exposes builder
+APIs, Arrow output, manifest-aware planning, and DataFusion table-provider
+integration.
+
+CoveQL follows the same authority model as the file format. Materialized
+readback is the semantic oracle. Coded execution, projection pushdown,
+DataFusion pushdown, graph traversal, index-only answers, and multi-file
+bridges are allowed only when their contracts prove the result is equivalent;
+otherwise they must fall back or reject with structured diagnostics and explain
+output.
+
+That makes CoveQL useful for higher-level workflows without making it mandatory
+for basic interoperability:
+
+- applications can use COVE as a compact immutable archive and ignore CoveQL;
+- SQL engines can register COVE files directly through the DataFusion adapter;
+- semantic applications can use CoveQL for object, association, evidence, and
+  projection-aware reads;
+- implementers can adopt individual CoveQL profiles as their COVE-O and
+  COVE-MAP support matures.
+
+Key paths:
+
+- [`v2/crates/coveql`](./v2/crates/coveql): parser, resolver, planner,
+  materialized/coded execution, explain output, Arrow output, and DataFusion
+  integration.
+- [`v2/docs/proposals/coveql-object-query-language.md`](./v2/docs/proposals/coveql-object-query-language.md):
+  CoveQL/Object proposal and conformance decisions.
+- [`v2/docs/proposals/coveql-query-profiles.md`](./v2/docs/proposals/coveql-query-profiles.md):
+  CoveQL-Core, Object, Table, and Graph profile contract RFC.
 
 ## Repository Status
 
@@ -134,11 +184,9 @@ or AI-based schema matching. Those systems may produce inputs, but COVE-MAP's
 portable contract is deterministic replay, explanation, evidence, and
 projection semantics.
 
-Cove-OQL is the read/query layer over that semantic surface. It provides a
-compact object query language for object, association, evidence, projection,
-temporal, aggregate, Arrow, and DataFusion-backed reads while keeping
-materialized object reconstruction as the semantic authority for any optimized
-or coded path that cannot prove equivalence.
+CoveQL is the optional read/query layer over that semantic surface. It is
+described above because it is a companion to COVE-O and COVE-MAP rather than a
+requirement for basic COVE file interoperability.
 
 ### Object Storage and Cheaper Reads
 
@@ -186,6 +234,9 @@ independently.
   segments, deltas, branches, tombstones, and trust surfaces.
 - **COVE-MAP**: optional semantic mapping from source rows into objects,
   associations, evidence, and deterministic projection readback.
+- **CoveQL**: optional semantic query layer over COVE-O/COVE-MAP and
+  projection-backed table/graph profiles, with materialized readback as the
+  authority and proof-gated optimized execution.
 - **COVE-CX**: registered codec-extension framework with stable COVE-owned v2
   bitstream identities for FSST-style UTF-8, ALP-style floats, and
   FastLanes-style integers, plus mandatory fallback-equivalence validation.
@@ -215,14 +266,16 @@ Important v2 paths:
   bootstrap paths, and benchmarks.
 - [`v2/crates/cove-map`](./v2/crates/cove-map): reference COVE-MAP execution,
   materialization, evidence, and projection helpers.
-- [`v2/crates/cove-oql`](./v2/crates/cove-oql): Cove-OQL parser, builder API,
+- [`v2/crates/coveql`](./v2/crates/coveql): CoveQL parser, builder API,
   resolver, dependency contracts, materialized and coded execution, stable
   explain output, Arrow output, manifest-aware planning, and DataFusion table
   provider integration for COVE-O reads.
 - [`v2/docs/mapped-cove-o-datafusion-showcase.md`](./v2/docs/mapped-cove-o-datafusion-showcase.md):
   end-to-end multi-source mapped COVE-O showcase through DataFusion SQL.
-- [`v2/docs/proposals/cove-o-query-language.md`](./v2/docs/proposals/cove-o-query-language.md):
-  Cove-OQL proposal and conformance decisions.
+- [`v2/docs/proposals/coveql-object-query-language.md`](./v2/docs/proposals/coveql-object-query-language.md):
+  CoveQL/Object proposal and conformance decisions.
+- [`v2/docs/proposals/coveql-query-profiles.md`](./v2/docs/proposals/coveql-query-profiles.md):
+  CoveQL-Core, Object, Table, and Graph profile contract RFC.
 - [`v2/crates/cove-codec`](./v2/crates/cove-codec): COVE-CX descriptor and
   registered-envelope validation.
 - [`v2/crates/cove-coverage`](./v2/crates/cove-coverage): COVE-COVERAGE
@@ -304,10 +357,10 @@ Run the conformance corpus directly:
 cargo run -p cove-conformance --bin cove-conformance -- conformance/
 ```
 
-Run the Cove-OQL suite:
+Run the CoveQL suite:
 
 ```sh
-cargo test -p cove-oql --all-features
+cargo test -p coveql --all-features
 ```
 
 Run the smaller implementer-kernel subset:
@@ -359,11 +412,11 @@ path can be omitted. Projection tables register from the declared
 `output_table` name when present, otherwise from the projection id; an optional
 prefix produces deterministic names like `<prefix>__people`.
 
-Execute a Cove-OQL query directly against mapped `COVE-O` bytes:
+Execute a CoveQL query directly against mapped `COVE-O` bytes:
 
 ```rust
 use cove_core::reader::ValidationOptions;
-use cove_oql::{
+use coveql::{
     parse_resolve_plan_and_execute_query, ExecutionOptions, ParseOptions,
     PlanOptions, ResolveOptions,
 };
@@ -371,7 +424,7 @@ use cove_oql::{
 let bytes = std::fs::read("people.cove")?;
 let executed = parse_resolve_plan_and_execute_query(
     &bytes,
-    r#"Person.where(active == true).select(person_id, full_name).explain("coded")"#,
+    r#"object(Person).where(active == true).select(person_id, full_name).explain("coded")"#,
     ParseOptions::default(),
     ResolveOptions::default(),
     PlanOptions::default(),

@@ -216,6 +216,7 @@ fn output_name_for_expr(expr: &ResolvedExpr) -> String {
         ResolvedExpr::Literal(_) => "literal".into(),
         ResolvedExpr::Association(association) => association.type_name.clone(),
         ResolvedExpr::Evidence(_) => "evidence".into(),
+        ResolvedExpr::TableExists(_) => "exists".into(),
         ResolvedExpr::Conditional { .. } => "if".into(),
     }
 }

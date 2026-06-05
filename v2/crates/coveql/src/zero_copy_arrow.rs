@@ -25,21 +25,21 @@ use serde_json::json;
 
 use crate::{
     execution::{check_time, enforce_result_budgets, exec_error, exec_warning, result_fingerprint},
-    BuildExecutionError, CoveOqlExecutionResult, CoveOqlOutputMode, CoveOqlRetainedInput,
+    BuildExecutionError, CoveQlExecutionResult, CoveQlOutputMode, CoveQlRetainedInput,
     ExecutedQuery, ExecutionAuthorityReport, ExecutionDiagnostic, ExecutionOptions,
     ExecutionRowCounts, FallbackPolicy, MetadataDisclosurePolicy, PhysicalPlannedQuery,
     ResolvedExpr, ResolvedRoot, TemporalMode, VisibilityPolicy,
 };
 
 pub(crate) fn try_execute_retained_zero_copy_arrow(
-    input: &CoveOqlRetainedInput,
+    input: &CoveQlRetainedInput,
     physical: &PhysicalPlannedQuery,
     options: &ExecutionOptions,
 ) -> Result<Option<ExecutedQuery>, BuildExecutionError> {
     let planned = &physical.planned;
     if !matches!(
         planned.resolved.output_mode,
-        CoveOqlOutputMode::ArrowRecordBatch {
+        CoveQlOutputMode::ArrowRecordBatch {
             zero_copy_requested: true
         }
     ) {
@@ -115,7 +115,7 @@ pub(crate) fn try_execute_retained_zero_copy_arrow(
             }
         };
     let row_count = batch.num_rows();
-    let result = CoveOqlExecutionResult::ArrowRecordBatches(vec![batch]);
+    let result = CoveQlExecutionResult::ArrowRecordBatches(vec![batch]);
     let row_counts = ExecutionRowCounts {
         input_rows: row_count,
         filtered_rows: row_count,

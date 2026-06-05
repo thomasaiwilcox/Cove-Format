@@ -1,20 +1,20 @@
 # CoveQL: Unified Cove Query Language Profiles
 
-Status: architecture RFC draft
+Status: implemented CoveQL 0.1 baseline
 
-Related proposal: [Cove-OQL: Cove Object Query Language](./cove-o-query-language.md)
+Related proposal: [CoveQL: Cove Object Query Language](./coveql-object-query-language.md)
 
 Owning profiles: COVE-O / COVE-MAP / COVE-COVERAGE / COVE-I / COVE-E
 
 ## Summary
 
-This follow-up proposes renaming the query-language family from **Cove-OQL** to
-**CoveQL**, short for **Cove Query Language**.
+This follow-up broadens the object-native query work into **CoveQL**, short
+for **Cove Query Language**.
 
-The name change reflects a broader goal: keep the object-native syntax and
-proof-safe execution model from CoveQL/Object, formerly Cove-OQL, but define
-CoveQL as a profiled query language that can address object, graph, and
-table-shaped Cove data without pretending every shape is SQL.
+The broader goal is to keep the object-native syntax and proof-safe execution
+model from CoveQL/Object while defining CoveQL as a profiled query language
+that can address object, graph, and table-shaped Cove data without pretending
+every shape is SQL.
 
 The proposed profiles are:
 
@@ -68,22 +68,20 @@ Profile crates/modules:
 The current object-language proposal becomes the object profile:
 
 ```text
-Cove-OQL -> CoveQL/Object
+Object query surface -> CoveQL/Object
 ```
 
-The term Cove-OQL may appear in migration notes and historical references, but
-new specification text, crate names, examples, persisted queries, and
+New specification text, crate names, examples, persisted queries, and
 conformance suites should use CoveQL and the profile names. Avoid **CQL** as a
 public abbreviation because it is too generic and likely to collide with other
 query languages.
 
 ## Motivation
 
-The CoveQL/Object design, formerly Cove-OQL, already points toward a
-root-surface language rather than a single object-only language. It has object
-roots, association roots, evidence roots, projection roots, temporal
-semantics, proof-safe planning, policy-aware explain, fallback boundaries, and
-late materialization.
+The CoveQL/Object design already points toward a root-surface language rather
+than a single object-only language. It has object roots, association roots,
+evidence roots, projection roots, temporal semantics, proof-safe planning,
+policy-aware explain, fallback boundaries, and late materialization.
 
 Those same mechanics can apply to graph and table data:
 
@@ -838,7 +836,7 @@ If multiple bindings are in scope, the query must name the evidence target.
 
 ## Null, Missing, And NaN Conformance
 
-CoveQL-Core should define the truth-table format. Each profile fills in the
+CoveQL-Core defines the truth-table format. Each profile fills in the
 concrete logical rules for its grain and value model.
 
 Baseline rules:
@@ -886,7 +884,7 @@ Rules:
 
 ## CoveQL/Object Profile
 
-CoveQL/Object, formerly Cove-OQL, is the direct object query profile.
+CoveQL/Object is the direct object query profile.
 
 Example:
 
@@ -1021,11 +1019,94 @@ TableSurface {
 }
 ```
 
+### TableSurfaceContract Decision
+
+Raw tables, materialized projections, and external registered tables become
+CoveQL/Table surfaces only after they provide a `TableSurfaceContract`.
+Until then, they remain available through lower-level readers or SQL/DataFusion
+interop, but not through `table(name)`.
+
+```text
+TableSurfaceContract {
+  table_id,
+  table_name,
+  contract_version,
+  authority_kind,
+  authority_fingerprint,
+  schema_fingerprint,
+  logical_column_map,
+  row_grain,
+  row_identity,
+  canonical_order,
+  visibility_authority,
+  redaction_authority,
+  temporal_authority,
+  evidence_capabilities,
+  null_missing_nan_policy,
+  collation_policy,
+  code_domain_contexts,
+  code_domain_bridges,
+  projection_dependency_contract?,
+  datafusion_interop_contract?,
+}
+```
+
+Required semantics:
+
+- `row_identity` must identify one logical table row across the selected
+  snapshot, branch, tenant, and temporal cut. If no non-redacted stable row
+  identity exists, `table(name)` rejects.
+- `canonical_order` must be total and deterministic. The preferred order is
+  declared table order, then row identity. Manifest/file ordinal plus source row
+  ordinal is allowed only when the manifest declares it as a stable fallback.
+- `visibility_authority` and `redaction_authority` apply before filters, joins,
+  grouping, evidence helpers, counts, and explain disclosures.
+- `temporal_authority` must declare whether `asOf`, `history`, and `changes`
+  are native, recomputable, snapshot-only, or unavailable. Snapshot-only tables
+  reject temporal methods.
+- `logical_column_map` maps user-facing column names to logical types, null
+  policy, collation, COVE path/projection source, and optional code-domain
+  metadata. Missing base columns reject; nullable projection outputs are allowed
+  only when declared.
+- Raw codes from table pages, dictionaries, projections, external engines, or
+  manifest members are never comparable by integer value unless
+  `code_domain_contexts` prove a shared domain or `code_domain_bridges` provide
+  an exact remap. Otherwise planning must decode to canonical logical values or
+  reject if policy forbids decode.
+- Coded filters, grouping, distinct, ordering, lookup joins, semi-joins, and
+  anti-joins require proof over logical values, not local physical codes.
+- DataFusion pushdown is advisory until translated through the
+  `datafusion_interop_contract` and proven equivalent under CoveQL null, type,
+  collation, temporal, visibility, and redaction rules.
+
+Fallback and rejection:
+
+- Missing `TableSurfaceContract`: reject `table(name)` with
+  `E_UNKNOWN_TABLE_SURFACE` or a redacted capability diagnostic.
+- Missing row identity: reject.
+- Missing canonical order: reject any query whose result order matters,
+  including implicit default order, `skip`, `take`, and lookup expansion.
+- Missing visibility/redaction authority: reject unless the operation context
+  explicitly selects an internal trusted mode.
+- Missing evidence capability: evidence helpers over the table reject; ordinary
+  row scans may continue.
+- Unsafe code domain, stale dictionary epoch, missing bridge, or unsafe
+  collation: decode to canonical values when policy allows; otherwise reject.
+- Coded execution is optional. Materialized execution remains the semantic
+  authority until the exact table-surface proof exists for the operator.
+
+Explain output for table surfaces must include the table-surface contract
+version, authority kind, authority fingerprint, row identity class, canonical
+order, visibility/redaction authorities, temporal authority, evidence
+capabilities, code-domain bridge decisions, pushed/residual filters, pushed
+columns, fallback/decode boundaries, and DataFusion interop decisions when
+policy allows.
+
 `projection(name)` remains the direct deterministic projection surface.
-`table(name)` is the user-facing table surface chosen by the catalog. Initially
-it should support deterministic COVE-MAP projections and existing table
-readback surfaces. Raw table sections can be added when they expose the row
-identity, ordering, evidence, and temporal capability contract.
+`table(name)` is the user-facing table surface chosen by the catalog. CoveQL
+0.1 supports deterministic COVE-MAP projections and existing table readback
+surfaces. Raw table sections are enabled after they expose the full
+`TableSurfaceContract`.
 
 Temporal rules:
 
@@ -1036,7 +1117,7 @@ Temporal rules:
 - `asOf`, `history`, and `changes` reject for `materialized_snapshot_only`,
   `external_snapshot_only`, and `none`.
 
-First CoveQL/Table conformance should require deterministic COVE-MAP
+First CoveQL/Table conformance requires deterministic COVE-MAP
 projections and existing table readback surfaces that declare row identity and
 canonical order. Materialized projections, external registered tables, and raw
 table sections can remain optional until they expose the full table-surface
@@ -1044,8 +1125,8 @@ contract.
 
 ## CoveQL/Table Profile
 
-The table profile should provide a Cove-native row query surface. It should
-not try to replace SQL for all relational analytics. Instead, it should make
+The table profile provides a Cove-native row query surface. It does not try to
+replace SQL for all relational analytics. Instead, it makes
 Cove-specific table reads safer, more explainable, and more directly
 optimizable.
 
@@ -1240,7 +1321,7 @@ These map cleanly to:
 - semi-join;
 - anti-join.
 
-The join contract should require:
+The join contract requires:
 
 - explicit join keys;
 - declared null semantics;
@@ -1286,7 +1367,7 @@ reason to own them directly.
 
 ## Table Profile Semantics
 
-CoveQL/Table should define the following before implementation:
+CoveQL/Table defines the following profile rules:
 
 | Concern | Rule |
 | --- | --- |
@@ -1305,7 +1386,7 @@ CoveQL/Table should define the following before implementation:
 
 ## Graph Profile Semantics
 
-CoveQL/Graph should define the following before implementation:
+CoveQL/Graph defines the following profile rules:
 
 | Concern | Rule |
 | --- | --- |
@@ -1323,7 +1404,7 @@ CoveQL/Graph should define the following before implementation:
 
 ## Graph Path Semantics
 
-CoveQL/Graph should use explicit path terminology:
+CoveQL/Graph uses explicit path terminology:
 
 - walk: nodes and edges may repeat;
 - trail: edges may not repeat;
@@ -1359,7 +1440,14 @@ node(Customer) as c
   .select(c.goid, o.goid, o.total)
 ```
 
-Future variable-length traversal:
+### GraphTraversalContract Decision
+
+Variable-length traversal becomes valid when the Graph profile exposes a
+`GraphTraversalContract`. Without that contract, CoveQL 0.1 keeps the existing
+fixed-hop behavior: omitted traversal bounds mean `min: 1`, `max: 1`,
+`mode: walk`, and any other depth is rejected.
+
+Accepted variable-length syntax:
 
 ```coveql
 node(Person) as p
@@ -1367,13 +1455,105 @@ node(Person) as p
     out(edge(Knows)).to(node(Person) as friend),
     min: 1,
     max: 3,
-    mode: simple_path
+    mode: simple_path,
+    distinct: none
   )
 ```
 
+```text
+GraphTraversalContract {
+  contract_version,
+  root_node_identity,
+  edge_identity,
+  path_identity,
+  supported_modes,
+  default_mode,
+  min_depth_required_for_variable,
+  max_depth_required_for_variable,
+  max_depth_policy,
+  fanout_budget_policy,
+  path_count_budget_policy,
+  frontier_budget_policy,
+  traversal_time_budget_policy,
+  duplicate_path_policy,
+  canonical_path_order,
+  visibility_authority,
+  redaction_authority,
+  temporal_alignment_policy,
+  relationship_index_authority?,
+  explain_disclosure_policy,
+}
+```
+
+Required semantics:
+
+- `min` and `max` are finite unsigned depths. `max` must be greater than or
+  equal to `min`. `max` must be less than or equal to the operation-context
+  maximum depth. Unbounded traversal is invalid.
+- Omitting both `min` and `max` is the fixed-hop shorthand for `min: 1`,
+  `max: 1`. Supplying one bound for variable-length traversal without the
+  other rejects.
+- `mode` is one of `walk`, `trail`, or `simple_path`.
+- `walk` allows repeated nodes and edges.
+- `trail` allows repeated nodes but not repeated edge identities in one path.
+- `simple_path` allows neither repeated node identities nor repeated edge
+  identities in one path.
+- `distinct` is one of `none`, `path`, or `end_node`; default is `none`.
+  `path` deduplicates by path identity. `end_node` deduplicates by start node,
+  end node, depth, relationship expression, and temporal cut, preserving the
+  first path under canonical path order.
+- Path identity is the start node identity plus the ordered sequence of
+  direction-qualified edge identities and node identities, the relationship
+  expression fingerprint, mode, distinct policy, and temporal cut.
+- Canonical path order is depth ascending, start node identity, then each hop's
+  direction, edge identity, and target node identity. Implementations may use
+  another order only if the contract declares it and explain reports it.
+- Every node and edge in a path must be visible at the selected temporal cut.
+  Hidden start nodes, hidden edges, hidden intermediate nodes, hidden end nodes,
+  and redacted endpoints suppress the entire path.
+- Counts, aggregates, negation, `exists`, and explain output must not reveal
+  hidden labels, endpoint identities, fanout, suppressed path counts, or which
+  budget was consumed by hidden data.
+- `asOf` applies the same temporal cut to all nodes and edges unless an
+  explicit temporal alignment policy declares otherwise. `history` and
+  `changes` over variable-length paths require a separate path-history
+  contract and otherwise reject.
+- Relationship indexes may accelerate traversal only when they prove direction,
+  endpoint role, temporal validity, visibility, redaction, and association type
+  compatibility. Otherwise traversal falls back to the materialized graph
+  oracle or rejects if the operation forbids fallback.
+
+Resource limits:
+
+- Planning rejects when static `max` exceeds the allowed maximum depth.
+- Runtime must enforce maximum fanout per node, paths emitted, frontier size,
+  and traversal time. If a budget is exceeded, the query fails with a resource
+  diagnostic and emits no partial externally visible result.
+- Explain may disclose configured budgets and consumed budgets only according
+  to the explain disclosure policy. Protected graph structure must remain
+  redacted.
+
+Execution strategy:
+
+- The semantic oracle is a materialized visible-graph traversal that applies
+  temporal, visibility, redaction, mode, distinct, ordering, and budget rules.
+- Native/indexed traversal may return results only when its output fingerprint
+  is equivalent to the materialized oracle for the same snapshot and operation
+  context. Debug/test mode should compare optimized path fingerprints against
+  the materialized oracle.
+- Coded execution may keep node and edge identities coded when those identities
+  are protected identity tokens, but ordering and equality must use the graph
+  identity contract rather than arbitrary dictionary or local shadow code order.
+
+Explain output for variable-length traversal must include the traversal
+contract version, min/max depth, mode, distinct policy, path identity class,
+canonical path order, temporal alignment, visibility/redaction policy,
+effective budgets, index/native acceleration decisions, residual/fallback
+boundaries, and redacted resource-limit diagnostics.
+
 ## Mixed-Profile Query Rules
 
-A CoveQL query should have one primary profile. Common roots such as
+A CoveQL query has one primary profile. Common roots such as
 `projection(...)` and `evidence(...)` may be used by all profiles when their
 contracts allow it.
 
@@ -1395,7 +1575,7 @@ table(orders) as o
   .where(exists(edge(CustomerPlacedOrder) as e, on: o.order_id == e.target_goid))
 ```
 
-Bridge contracts should declare:
+Bridge contracts declare:
 
 - source and target profiles;
 - identity mapping;
@@ -1684,7 +1864,7 @@ sidecar metadata unless the active disclosure policy allows it.
 
 ## Fingerprints
 
-CoveQL should define canonical fingerprints for:
+CoveQL defines canonical fingerprints for:
 
 - `QueryTextFingerprint`;
 - `DirectiveFingerprint`;
@@ -1715,12 +1895,18 @@ Profile-specific fallback behavior should extend the core fallback matrix:
 | Unknown profile method | Reject with `E_UNSUPPORTED_PROFILE_METHOD`. |
 | Profile method used after `groupBy` without aggregate-grain support | Reject. |
 | `lookup` without bridge from current profile | Reject. |
+| `table(name)` resolves to a raw/external surface without `TableSurfaceContract` | Reject. |
 | Table surface lacks row identity | Reject table root. |
-| Table surface lacks canonical order and query uses unordered `take` | Reject. |
+| Table surface lacks canonical order | Reject any query whose result order matters, including default output order, `skip`, `take`, and lookup expansion. |
+| Table surface lacks visibility/redaction authority | Reject unless a trusted internal mode is explicitly selected. |
+| Table evidence helper used without table evidence capability | Reject. |
 | `asOf` on materialized snapshot table | Reject. |
 | `history` or `changes` on a surface without temporal capability | Reject. |
 | Mixed `changes` bound kinds or temporal roles | Reject unless the profile declares exact conversion. |
-| Graph traversal exceeds max depth | Reject at planning if known; cancel safely at execution otherwise. |
+| Variable-length graph traversal without `GraphTraversalContract` | Reject. |
+| Variable-length graph traversal omits `min` or `max` | Reject. |
+| Graph traversal exceeds max depth | Reject at planning if known; fail safely at execution otherwise with no partial externally visible results. |
+| Graph traversal exceeds fanout, path-count, frontier, or time budget | Fail safely with a resource diagnostic and no partial externally visible results. |
 | Relationship expression used outside a relationship-capable profile | Reject. |
 | Hidden graph endpoint | Suppress path. |
 | Hidden right-side table row | Treat as absent. |
@@ -1734,7 +1920,7 @@ Profile-specific fallback behavior should extend the core fallback matrix:
 
 ## Resource Budgets
 
-CoveQL-Core should define concrete parse, plan, execution, output, join, and
+CoveQL-Core defines concrete parse, plan, execution, output, join, and
 traversal budgets:
 
 ```text
@@ -1797,7 +1983,7 @@ Before any future external streaming mode is accepted, it must define:
 
 ## Conformance Profiles
 
-CoveQL conformance should be split by profile and shared layers:
+CoveQL conformance is split by profile and shared layers:
 
 ```text
 CoveQL-Core:
@@ -1824,7 +2010,7 @@ First mixed-profile conformance requires object to graph node identity and
 association to graph edge identity bridges. Object/table and table/graph
 bridges are optional unless the fixture declares explicit bridge metadata.
 
-Minimum CoveQL 0.1 parser conformance should cover:
+Minimum CoveQL 0.1 parser conformance covers:
 
 - directives;
 - explicit roots and aliases;
@@ -1838,7 +2024,7 @@ Minimum CoveQL 0.1 parser conformance should cover:
 - literals, comparisons, `&&`, `||`, `!`, `in`, `isNull`, and `isNotNull`;
 - `count`, `sum`, `avg`, `min`, `max`, and `distinct_count`.
 
-CoveQL 0.1 should require the following extension shapes at parser level:
+CoveQL 0.1 requires the following extension shapes at parser level:
 
 ```text
 methods:
@@ -1857,7 +2043,7 @@ expressions:
 Profile semantics may reject these constructs when the active profile or bridge
 contract does not declare support.
 
-`history` and `changes` parser conformance should cover all declared modes:
+`history` and `changes` parser conformance covers all declared modes:
 
 ```text
 history(mode: records)
@@ -1870,7 +2056,7 @@ changes(..., mode: property_diffs)
 changes(..., mode: final_rows)
 ```
 
-First semantic conformance should require:
+First semantic conformance requires:
 
 - CoveQL/Object: `history(mode: states)` and
   `changes(..., mode: final_rows)`;
@@ -1882,7 +2068,7 @@ First semantic conformance should require:
   change grain.
 
 Semantic conformance can still reject unsupported profile features with
-structured diagnostics. Parser conformance should keep the grammar stable even
+structured diagnostics. Parser conformance keeps the grammar stable even
 when execution support is staged.
 
 Parser-positive fixture examples:
@@ -1935,42 +2121,74 @@ Each profile should run the same three conformance tiers:
 
 The practical sequence is:
 
-1. Rename the language family to CoveQL in new docs and module names.
+1. Rename the language family to CoveQL in docs and module names.
 2. Define the CoveQL-Core and CoveQL profile contracts.
-3. Rename the existing object-language proposal to CoveQL/Object and preserve
-   its acceptance criteria.
+3. Classify the existing object-language proposal as CoveQL/Object and
+   preserve its acceptance criteria.
 4. Extract CoveQL-Core from the object proposal:
-   parser shell, method chain, diagnostics, operation context, explain JSON,
+   parser, method chain, diagnostics, operation context, explain JSON,
    fingerprints, fallback matrix, security context, resource budgets, and
    profile contract loading.
-5. Build coded/proof-safe physical-plan interfaces early: operator structs,
-   profile/bridge fingerprints, explain placeholders, and fallback boundaries.
-   Keep accelerator execution authority disabled until conformance and
-   fallback-invariance tests pass.
+5. Build coded/proof-safe physical-plan interfaces: operator structs,
+   profile/bridge fingerprints, explain fields, fallback boundaries, and
+   materialized-oracle comparison hooks for accelerated paths.
 6. Add explicit root tags: `object`, `association`, `node`, `edge`, `path`,
    `table`, `projection`, and `evidence`.
 7. Implement the CoveQL/Object compatibility path first so the rename does not
    weaken existing object semantics.
-8. Implement CoveQL/Table over existing projection/table readback:
-   `table`, `where`, `select`, `groupBy`, `orderBy`, `take`, `explain`.
-9. Add table temporal reads where the underlying table/projection has temporal
-   roles.
+8. Implement CoveQL/Table over deterministic COVE-MAP projection/table
+   readback: `table`, `where`, `select`, `groupBy`, `orderBy`, `take`, and
+   `explain`.
+9. Add table temporal reads where the underlying table/projection declares
+   recomputable temporal authority.
 10. Add row/column evidence for table roots.
 11. Add constrained table joins: lookup, semi-join, anti-join.
 12. Add CoveQL/Graph roots by mapping COVE-O objects and associations into
    nodes and edges.
-13. Add path bindings and traversal resource budgets.
-14. Enable shared coded/proof-safe physical execution across profiles after the
-   corresponding semantic and fallback tests pass.
+13. Add path bindings, chained fixed-hop traversal, and explicit rejection for
+   variable-length traversal until a graph traversal contract declares it.
+14. Add `TableSurfaceContract` registration and validation for raw tables,
+    materialized projections, and external registered tables. Keep
+    deterministic projection-backed tables as the first authority.
+15. Add `GraphTraversalContract` registration and validation for finite
+    variable-length traversal, then implement the materialized oracle before
+    indexed/native acceleration.
+16. Enable shared coded/proof-safe physical execution across profiles after
+   the corresponding semantic and fallback tests pass.
 
-## Open Questions
+## Settled Milestone Decisions
 
-Can remain open longer:
+The CoveQL 0.1 baseline uses one public crate, `coveql`. CoveQL/Object is
+semantically implemented. CoveQL/Table is implemented for deterministic
+COVE-MAP projection-backed table surfaces, row/column evidence targets,
+grouping/aggregation, DataFusion scan interop, lookup joins, semi-joins, and
+anti-joins. CoveQL/Graph is implemented for COVE-O object-backed nodes,
+association-backed edges, fixed-hop path bindings, chained `traverse`, graph
+relationship helpers, and node/edge/path evidence target contracts. Advanced
+graph algorithms, variable-length traversal, raw table sections without a
+table-surface contract, and broad SQL features remain outside CoveQL 0.1.
 
-- Whether the old Cove-OQL name remains as a compatibility alias.
-- Whether CoveQL profiles are separate crates or one crate with feature flags.
-- Whether advanced graph algorithms belong in CoveQL or in a separate library.
-- Whether broad SQL features should ever be represented directly in CoveQL.
+## Completion Decisions For Post-0.1 Implementation
+
+The next implementation work can proceed without further semantic decisions if
+it follows these contracts:
+
+1. `TableSurfaceContract` is the gate for raw table sections, materialized
+   projections, and external registered tables. Implement validation first,
+   materialized authority second, then coded/DataFusion pushdown only after
+   exact equivalence tests pass.
+2. `GraphTraversalContract` is the gate for variable-length traversal.
+   Implement the materialized visible-graph oracle first, including path
+   identity, ordering, visibility, redaction, temporal alignment, dedupe, and
+   budgets. Add indexed/native traversal only after debug/test comparison
+   proves equivalence.
+3. The materialized CoveQL path remains authoritative for both contracts until
+   each optimized operator reports a proof and fallback boundary in explain
+   output.
+4. Security-sensitive metadata remains gated: table code-domain contexts,
+   bridge proofs, dictionary epochs, graph fanout, hidden endpoints, suppressed
+   paths, and budget consumption must be redacted unless policy explicitly
+   allows disclosure.
 
 ## Recommendation
 

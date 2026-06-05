@@ -1,12 +1,12 @@
 use serde_json::{json, Map, Value};
 
 use crate::{
-    diagnostic_severity_name, plan_printer, CoveOqlExecutionResult, CoveOqlOutputMode,
-    CoveOqlSelectedOperation, DiagnosticSeverity, EvidenceAuthority, ExecutedQuery,
-    ExecutionDiagnostic, ExplainDisclosurePolicy, ExplainMode, FallbackReport,
+    diagnostic_severity_name, plan_printer, CoveQlDiagnostic, CoveQlExecutionResult,
+    CoveQlOutputMode, CoveQlSelectedOperation, DiagnosticSeverity, EvidenceAuthority,
+    ExecutedQuery, ExecutionDiagnostic, ExplainDisclosurePolicy, ExplainMode, FallbackReport,
     KernelFallbackReason, LogicalPlanDiagnostic, MetadataDisclosurePolicy, OperationContext,
-    OptionalMetadataStatus, OqlDiagnostic, PhysicalPlanDiagnostic, PhysicalPlannedQuery,
-    PlannedQuery, PredicatePlacement, RejectionReport, ResolvedQuery, TemporalMode,
+    OptionalMetadataStatus, PhysicalPlanDiagnostic, PhysicalPlannedQuery, PlannedQuery,
+    PredicatePlacement, RejectionReport, ResolvedQuery, ResolvedRoot, TemporalMode,
 };
 
 pub fn render_explain_text(value: &Value) -> String {
@@ -115,7 +115,7 @@ pub(crate) fn operation_context_explain_json(context: &OperationContext) -> Valu
     let mut diagnostics = context
         .diagnostics
         .iter()
-        .map(|diagnostic| oql_diagnostic_json(diagnostic, allow_protected))
+        .map(|diagnostic| coveql_diagnostic_json(diagnostic, allow_protected))
         .collect::<Vec<_>>();
     diagnostics.extend(mode_policy_diagnostics(
         requested_mode,
@@ -126,6 +126,12 @@ pub(crate) fn operation_context_explain_json(context: &OperationContext) -> Valu
     let mut value = explain_document(ExplainDocumentParts {
         schema_version: context.explain_json_schema_version.into(),
         mode: explain_mode_name(effective_mode).into(),
+        primary_profile: Value::String("object".into()),
+        profiles: json!(["object"]),
+        profile_contracts: default_profile_contracts_json(),
+        root: Value::Null,
+        grain: Value::Null,
+        canonical_order: json!([]),
         fingerprints: fingerprints_json(context, None, None, None, None, None, None),
         operation_context: operation_context_json(context),
         logical_plan: json!([]),
@@ -164,7 +170,7 @@ pub(crate) fn resolved_query_explain_json(resolved: &ResolvedQuery) -> Value {
     let mut diagnostics = resolved
         .diagnostics
         .iter()
-        .map(|diagnostic| oql_diagnostic_json(diagnostic, allow_protected))
+        .map(|diagnostic| coveql_diagnostic_json(diagnostic, allow_protected))
         .collect::<Vec<_>>();
     diagnostics.extend(mode_policy_diagnostics(
         requested_mode,
@@ -175,6 +181,12 @@ pub(crate) fn resolved_query_explain_json(resolved: &ResolvedQuery) -> Value {
     let mut value = explain_document(ExplainDocumentParts {
         schema_version: context.explain_json_schema_version.into(),
         mode: explain_mode_name(effective_mode).into(),
+        primary_profile: primary_profile_json(resolved),
+        profiles: profiles_json(resolved),
+        profile_contracts: profile_contracts_json(resolved),
+        root: root_json(&resolved.root),
+        grain: resolved_grain_json(&resolved.root),
+        canonical_order: json!([]),
         fingerprints: fingerprints_json(
             context,
             Some(&resolved.resolved_query_fingerprint),
@@ -233,6 +245,12 @@ pub(crate) fn planned_query_explain_json(planned: &PlannedQuery) -> Value {
     let mut value = explain_document(ExplainDocumentParts {
         schema_version: context.explain_json_schema_version.into(),
         mode: explain_mode_name(effective_mode).into(),
+        primary_profile: primary_profile_json(&planned.resolved),
+        profiles: profiles_json(&planned.resolved),
+        profile_contracts: profile_contracts_json(&planned.resolved),
+        root: serde_json::to_value(planned.logical_plan.context.root_kind).unwrap_or(Value::Null),
+        grain: serde_json::to_value(planned.logical_plan.context.scan_grain).unwrap_or(Value::Null),
+        canonical_order: json!(planned.logical_plan.canonical_order.clone()),
         fingerprints: fingerprints_json(
             context,
             Some(&planned.resolved.resolved_query_fingerprint),
@@ -278,7 +296,7 @@ pub(crate) fn planned_query_explain_json(planned: &PlannedQuery) -> Value {
 }
 
 pub(crate) fn executed_query_explain_json(executed: &ExecutedQuery) -> Value {
-    if let CoveOqlExecutionResult::ExplainJson(value) = &executed.result {
+    if let CoveQlExecutionResult::ExplainJson(value) = &executed.result {
         return value.clone();
     }
 
@@ -302,6 +320,12 @@ pub(crate) fn executed_query_explain_json(executed: &ExecutedQuery) -> Value {
     let mut value = explain_document(ExplainDocumentParts {
         schema_version: context.explain_json_schema_version.into(),
         mode: explain_mode_name(effective_mode).into(),
+        primary_profile: primary_profile_json(&planned.resolved),
+        profiles: profiles_json(&planned.resolved),
+        profile_contracts: profile_contracts_json(&planned.resolved),
+        root: serde_json::to_value(planned.logical_plan.context.root_kind).unwrap_or(Value::Null),
+        grain: serde_json::to_value(planned.logical_plan.context.scan_grain).unwrap_or(Value::Null),
+        canonical_order: json!(planned.logical_plan.canonical_order.clone()),
         fingerprints: fingerprints_json(
             context,
             Some(&planned.resolved.resolved_query_fingerprint),
@@ -367,6 +391,12 @@ pub(crate) fn physical_planned_query_explain_json(physical: &PhysicalPlannedQuer
     let mut value = explain_document(ExplainDocumentParts {
         schema_version: context.explain_json_schema_version.into(),
         mode: explain_mode_name(effective_mode).into(),
+        primary_profile: primary_profile_json(&planned.resolved),
+        profiles: profiles_json(&planned.resolved),
+        profile_contracts: profile_contracts_json(&planned.resolved),
+        root: serde_json::to_value(planned.logical_plan.context.root_kind).unwrap_or(Value::Null),
+        grain: serde_json::to_value(planned.logical_plan.context.scan_grain).unwrap_or(Value::Null),
+        canonical_order: json!(planned.logical_plan.canonical_order.clone()),
         fingerprints: fingerprints_json(
             context,
             Some(&planned.resolved.resolved_query_fingerprint),
@@ -426,6 +456,12 @@ pub(crate) fn error_explain_json(
     let mut value = explain_document(ExplainDocumentParts {
         schema_version: crate::EXPLAIN_JSON_SCHEMA_VERSION.into(),
         mode: "public".into(),
+        primary_profile: Value::Null,
+        profiles: json!([]),
+        profile_contracts: json!([]),
+        root: Value::Null,
+        grain: Value::Null,
+        canonical_order: json!([]),
         fingerprints: object([
             ("query_text", Value::Null),
             ("parsed_ast", Value::Null),
@@ -482,6 +518,12 @@ pub(crate) fn redact_explain_value(value: &mut Value) -> bool {
 struct ExplainDocumentParts {
     schema_version: Value,
     mode: Value,
+    primary_profile: Value,
+    profiles: Value,
+    profile_contracts: Value,
+    root: Value,
+    grain: Value,
+    canonical_order: Value,
     fingerprints: Value,
     operation_context: Value,
     logical_plan: Value,
@@ -502,9 +544,47 @@ struct ExplainDocumentParts {
 }
 
 fn explain_document(parts: ExplainDocumentParts) -> Value {
+    let operation = parts
+        .operation_context
+        .get("operation")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let temporal_mode = parts
+        .operation_context
+        .get("temporal_mode")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let visibility_applied = parts
+        .operation_context
+        .get("visibility_applied")
+        .cloned()
+        .unwrap_or(Value::Bool(false));
+    let redaction_applied = parts
+        .operation_context
+        .get("redaction_applied")
+        .cloned()
+        .unwrap_or(Value::Bool(false));
     object([
         ("schema_version", parts.schema_version),
         ("mode", parts.mode),
+        (
+            "coveql_version",
+            Value::String(crate::COVEQL_LANGUAGE_VERSION.into()),
+        ),
+        (
+            "core_version",
+            Value::String(crate::COVEQL_CORE_VERSION.into()),
+        ),
+        ("primary_profile", parts.primary_profile),
+        ("profiles", parts.profiles),
+        ("profile_contracts", parts.profile_contracts),
+        ("root", parts.root),
+        ("grain", parts.grain),
+        ("operation", operation),
+        ("temporal_mode", temporal_mode),
+        ("canonical_order", parts.canonical_order),
+        ("visibility_applied", visibility_applied),
+        ("redaction_applied", redaction_applied),
         ("fingerprints", parts.fingerprints),
         ("operation_context", parts.operation_context),
         ("logical_plan", parts.logical_plan),
@@ -634,6 +714,7 @@ fn operation_context_json(context: &OperationContext) -> Value {
             "language_version",
             Value::String(context.language_version.into()),
         ),
+        ("core_version", Value::String(context.core_version.into())),
         (
             "grammar_version",
             Value::String(context.grammar_version.into()),
@@ -661,6 +742,14 @@ fn operation_context_json(context: &OperationContext) -> Value {
         (
             "explain_json_schema_version",
             Value::String(context.explain_json_schema_version.into()),
+        ),
+        (
+            "profile_contract_version",
+            Value::String(context.profile_contract_version.into()),
+        ),
+        (
+            "bridge_contract_version",
+            Value::String(context.bridge_contract_version.into()),
         ),
         (
             "operation",
@@ -1266,7 +1355,10 @@ fn physical_storage_diagnostics_json(
 
 fn materialization_boundaries_json(planned: &PlannedQuery) -> Value {
     let readback = match &planned.resolved.root {
+        crate::ResolvedRoot::Table(_) => "coveql_table_projection_readback",
         crate::ResolvedRoot::Projection(_) => "cove_map_projection_readback",
+        crate::ResolvedRoot::Node(_) => "coveql_graph_node_object_readback",
+        crate::ResolvedRoot::Edge(_) => "coveql_graph_edge_association_readback",
         crate::ResolvedRoot::Object(_)
         | crate::ResolvedRoot::Association(_)
         | crate::ResolvedRoot::Evidence(_) => "cove_o_materialized_readback",
@@ -1279,7 +1371,7 @@ fn materialization_boundaries_json(planned: &PlannedQuery) -> Value {
     ])
 }
 
-fn output_mode_json(mode: &CoveOqlOutputMode) -> Value {
+fn output_mode_json(mode: &CoveQlOutputMode) -> Value {
     serde_json::to_value(mode).unwrap_or(Value::Null)
 }
 
@@ -1287,7 +1379,7 @@ fn output_grain_json(planned: &PlannedQuery) -> Value {
     serde_json::to_value(planned.logical_plan.context.scan_grain).unwrap_or(Value::Null)
 }
 
-fn oql_diagnostic_json(diagnostic: &OqlDiagnostic, allow_protected: bool) -> Value {
+fn coveql_diagnostic_json(diagnostic: &CoveQlDiagnostic, allow_protected: bool) -> Value {
     diagnostic_json(
         &diagnostic.code,
         diagnostic.severity,
@@ -1396,7 +1488,7 @@ fn mode_policy_diagnostics(
 
 fn requested_mode(context: &OperationContext) -> ExplainMode {
     match &context.request.selected_operation {
-        CoveOqlSelectedOperation::Explain { mode, .. } => *mode,
+        CoveQlSelectedOperation::Explain { mode, .. } => *mode,
         _ => ExplainMode::Public,
     }
 }
@@ -1427,21 +1519,182 @@ fn disclosure_policy(allow_protected: bool) -> MetadataDisclosurePolicy {
     }
 }
 
-fn selected_operation_name(operation: &CoveOqlSelectedOperation) -> &'static str {
+fn profiles_json(resolved: &ResolvedQuery) -> Value {
+    json!(resolved
+        .parsed
+        .profiles
+        .iter()
+        .map(|profile| profile.as_str())
+        .collect::<Vec<_>>())
+}
+
+fn primary_profile_json(resolved: &ResolvedQuery) -> Value {
+    resolved
+        .parsed
+        .profiles
+        .first()
+        .map(|profile| Value::String(profile.as_str().into()))
+        .unwrap_or(Value::Null)
+}
+
+fn profile_contracts_json(resolved: &ResolvedQuery) -> Value {
+    json!(resolved
+        .parsed
+        .profiles
+        .iter()
+        .map(|profile| {
+            let contract = crate::coveql_profile_contract(*profile);
+            let mut contract_json = json!({
+                "profile_id": profile.as_str(),
+                "profile_version": contract.profile_version,
+                "implemented": contract.implemented,
+                "supported_roots": contract.supported_roots,
+                "input_grains": contract.input_grains,
+                "root_authority": contract.root_authority,
+                "identity_model": contract.identity_model,
+                "canonical_order": contract.canonical_order,
+                "temporal_capabilities": contract.temporal_capabilities,
+                "evidence_targets": contract.evidence_targets,
+                "relationship_capabilities": contract.relationship_capabilities,
+                "profile_methods": contract.profile_methods,
+                "bridge_requirements": contract.bridge_requirements,
+                "aggregate_rules": contract.aggregate_rules,
+                "null_missing_nan_rules": contract.null_missing_nan_rules,
+                "security_barriers": contract.security_barriers,
+                "materialization_boundaries": contract.materialization_boundaries,
+                "output_modes": contract.output_modes,
+            });
+            if let Some(object) = contract_json.as_object_mut() {
+                if let Some(details) = query_specific_profile_contract_json(resolved, *profile) {
+                    object.insert("query_contract".into(), details);
+                }
+            }
+            contract_json
+        })
+        .collect::<Vec<_>>())
+}
+
+fn query_specific_profile_contract_json(
+    resolved: &ResolvedQuery,
+    profile: crate::CoveQlProfileId,
+) -> Option<Value> {
+    match profile {
+        crate::CoveQlProfileId::Table => {
+            let crate::ResolvedRoot::Table(table) = &resolved.root else {
+                return None;
+            };
+            Some(json!({
+                "table_id": table.table_surface_contract.table_id,
+                "table_name": table.table_surface_contract.table_name,
+                "contract_version": table.table_surface_contract.contract_version,
+                "authority_kind": table.table_surface_contract.authority_kind,
+                "row_grain": table.table_surface_contract.row_grain,
+                "row_identity": table.table_surface_contract.row_identity,
+                "canonical_order": table.table_surface_contract.canonical_order,
+                "temporal_authority": table.table_surface_contract.temporal_authority,
+                "evidence_capabilities": table.table_surface_contract.evidence_capabilities,
+                "projection_dependency_contract_id": table.table_surface_contract.projection_dependency_contract_id,
+                "datafusion_interop_contract": table.table_surface_contract.datafusion_interop_contract,
+            }))
+        }
+        crate::CoveQlProfileId::Graph => {
+            if resolved.method_chain.traversals.is_empty() {
+                return None;
+            }
+            Some(json!({
+                "traversals": resolved.method_chain.traversals.iter().map(|traversal| {
+                    json!({
+                        "direction": traversal.direction,
+                        "edge_type": traversal.edge.association.type_name,
+                        "target_label": traversal.target.as_ref().map(|target| target.label.clone()),
+                        "min_depth": traversal.min_depth,
+                        "max_depth": traversal.max_depth,
+                        "mode": traversal.mode.as_str(),
+                        "distinct": traversal.distinct.as_str(),
+                        "contract_present": traversal.contract.is_some(),
+                        "contract": traversal.contract.as_ref().map(|contract| {
+                            json!({
+                                "contract_version": contract.contract_version,
+                                "allow_variable_length": contract.allow_variable_length,
+                                "supported_modes": contract.supported_modes,
+                                "supported_distinct_policies": contract.supported_distinct_policies,
+                                "max_depth": contract.max_depth,
+                                "max_fanout_per_node": contract.max_fanout_per_node,
+                                "max_paths": contract.max_paths,
+                                "max_frontier": contract.max_frontier,
+                                "path_identity": contract.path_identity,
+                                "hidden_endpoint_policy": contract.hidden_endpoint_policy,
+                                "ordering_policy": contract.ordering_policy,
+                                "execution_authority": contract.execution_authority,
+                            })
+                        }),
+                    })
+                }).collect::<Vec<_>>()
+            }))
+        }
+        crate::CoveQlProfileId::Object => None,
+    }
+}
+
+fn default_profile_contracts_json() -> Value {
+    json!([{
+        "profile_id": crate::CoveQlProfileId::Object.as_str(),
+        "profile_version": crate::COVEQL_OBJECT_PROFILE_VERSION,
+        "implemented": true,
+    }])
+}
+
+fn root_json(root: &ResolvedRoot) -> Value {
+    Value::String(
+        match root {
+            ResolvedRoot::Object(_) => "object",
+            ResolvedRoot::Association(_) => "association",
+            ResolvedRoot::Node(_) => "node",
+            ResolvedRoot::Edge(_) => "edge",
+            ResolvedRoot::Table(_) => "table",
+            ResolvedRoot::Projection(_) => "projection",
+            ResolvedRoot::Evidence(_) => "evidence",
+        }
+        .into(),
+    )
+}
+
+fn resolved_grain_json(root: &ResolvedRoot) -> Value {
+    Value::String(
+        match root {
+            ResolvedRoot::Object(_) => "object_state",
+            ResolvedRoot::Association(_) => "association_state",
+            ResolvedRoot::Node(_) => "graph_node_state",
+            ResolvedRoot::Edge(_) => "graph_edge_state",
+            ResolvedRoot::Table(_) => "visible_table_row",
+            ResolvedRoot::Projection(_) => "projection_row",
+            ResolvedRoot::Evidence(_) => "evidence_row",
+        }
+        .into(),
+    )
+}
+
+fn selected_operation_name(operation: &CoveQlSelectedOperation) -> &'static str {
     match operation {
-        CoveOqlSelectedOperation::Object => "object_reconstruction",
-        CoveOqlSelectedOperation::Association => "association_read",
-        CoveOqlSelectedOperation::Projection => "projection_read",
-        CoveOqlSelectedOperation::Evidence => "evidence_read",
-        CoveOqlSelectedOperation::IndexOnlyAnswer => "index_only_answer",
-        CoveOqlSelectedOperation::ArrowExport { .. } => "arrow_export",
-        CoveOqlSelectedOperation::Explain { target, .. } => match target {
-            crate::CoveOqlExplainTarget::Object => "explain_object",
-            crate::CoveOqlExplainTarget::Association => "explain_association",
-            crate::CoveOqlExplainTarget::Projection => "explain_projection",
-            crate::CoveOqlExplainTarget::Evidence => "explain_evidence",
-            crate::CoveOqlExplainTarget::IndexOnlyAnswer => "explain_index_only_answer",
-            crate::CoveOqlExplainTarget::ArrowExport { .. } => "explain_arrow_export",
+        CoveQlSelectedOperation::Object => "object_reconstruction",
+        CoveQlSelectedOperation::Association => "association_read",
+        CoveQlSelectedOperation::GraphNode => "graph_node_read",
+        CoveQlSelectedOperation::GraphEdge => "graph_edge_read",
+        CoveQlSelectedOperation::Table => "table_scan",
+        CoveQlSelectedOperation::Projection => "projection_read",
+        CoveQlSelectedOperation::Evidence => "evidence_read",
+        CoveQlSelectedOperation::IndexOnlyAnswer => "index_only_answer",
+        CoveQlSelectedOperation::ArrowExport { .. } => "arrow_export",
+        CoveQlSelectedOperation::Explain { target, .. } => match target {
+            crate::CoveQlExplainTarget::Object => "explain_object",
+            crate::CoveQlExplainTarget::Association => "explain_association",
+            crate::CoveQlExplainTarget::GraphNode => "explain_graph_node",
+            crate::CoveQlExplainTarget::GraphEdge => "explain_graph_edge",
+            crate::CoveQlExplainTarget::Table => "explain_table",
+            crate::CoveQlExplainTarget::Projection => "explain_projection",
+            crate::CoveQlExplainTarget::Evidence => "explain_evidence",
+            crate::CoveQlExplainTarget::IndexOnlyAnswer => "explain_index_only_answer",
+            crate::CoveQlExplainTarget::ArrowExport { .. } => "explain_arrow_export",
         },
     }
 }
@@ -1457,7 +1710,7 @@ fn temporal_mode_name(mode: &TemporalMode) -> &'static str {
         TemporalMode::ChangesRecords => "changes_records",
         TemporalMode::ChangesStateTransitions => "changes_state_transitions",
         TemporalMode::ChangesPropertyDiffs => "changes_property_diffs",
-        TemporalMode::ChangesFinalObjects => "changes_final_objects",
+        TemporalMode::ChangesFinalObjects => "changes_final_rows",
     }
 }
 

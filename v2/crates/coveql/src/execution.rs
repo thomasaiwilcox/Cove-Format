@@ -8,13 +8,15 @@ use std::{
     time::Instant,
 };
 
-use arrow_array::RecordBatch;
+use arrow_array::{Array, RecordBatch};
+use arrow_data::ArrayData;
+use arrow_schema::DataType;
 use cove_core::{
     profile::cove_o::{
         read_object_surface_from_bytes_with_pushdown_options, reconstruct_object_states,
-        CoveObjectPropertyValue, CoveObjectReadOptions, CoveObjectReadWithPushdownOptions,
-        CoveObjectReconstructionOptions, CoveObjectRecord, CoveObjectRedactionReadPolicy,
-        CoveObjectState, CoveObjectSurface, CoveObjectTemporalCut,
+        CoveObjectPropertyValue, CoveObjectReadOptions, CoveObjectReadPushdownOptions,
+        CoveObjectReadWithPushdownOptions, CoveObjectReconstructionOptions, CoveObjectRecord,
+        CoveObjectRedactionReadPolicy, CoveObjectState, CoveObjectSurface, CoveObjectTemporalCut,
         OBJECT_TYPE_FLAG_EVIDENCE_OBJECT, PROPERTY_FLAG_EVIDENCE_REF,
         PROPERTY_FLAG_MAPPING_RULE_REF,
     },
@@ -40,25 +42,34 @@ use crate::{
     materialized::{
         hex, ExecutionRow, MaterializedAssociationRow, MaterializedChangeDetail,
         MaterializedChangeDiffKind, MaterializedEvidenceRow, MaterializedObjectRow,
-        MaterializedProjectionRow, OutputGrain,
+        MaterializedProjectionRow, OutputGrain, INTERNAL_PROJECTION_FIELD_PREFIX,
     },
     parse_resolve_and_plan_query,
+    predicate::classify_predicate,
     pushdown::{self, PushdownOptions, PushdownReport},
     AggregateDisclosurePolicy, AstAggregateName, AstChangeMode, AstCompareOp, AstHistoryMode,
-    AstNullOrdering, AstOrderDirection, BuildLogicalPlanError, CoveOqlOutputMode,
-    DatasetFileIdentity, DiagnosticSeverity, FallbackPolicy, LogicalPlanDiagnostic,
-    ManifestDatasetMember, MetadataDisclosurePolicy, ParseOptions, PlanOptions, PlannedQuery,
-    RedactionPolicy, ResolveOptions, ResolvedExpr, ResolvedLiteral, ResolvedLiteralValue,
-    ResolvedMethodChain, ResolvedPath, ResolvedPredicate, ResolvedRoot, ResolvedTimeBound,
-    ResourceBudgetPolicy, TemporalMode, TemporalRole, ValidatedFileIdentity, VisibilityPolicy,
+    AstNullOrdering, AstOrderDirection, BuildLogicalPlanError, CodeDomainId, CoveQlOutputMode,
+    DatasetFileIdentity, DiagnosticSeverity, FallbackPolicy, GraphTraversalDistinctPolicy,
+    GraphTraversalMode, LogicalPlanDiagnostic, ManifestDatasetMember, MetadataDisclosurePolicy,
+    ParseOptions, PlanOptions, PlannedQuery, PredicateProofState, RedactionPolicy, ResolveOptions,
+    ResolvedExpr, ResolvedLiteral, ResolvedLiteralValue, ResolvedMethodChain, ResolvedPath,
+    ResolvedPathRootKind, ResolvedPredicate, ResolvedRoot, ResolvedTimeBound, ResourceBudgetPolicy,
+    TableLookupCardinality, TableLookupDuplicatePolicy, TableLookupUnmatchedPolicy, TemporalMode,
+    TemporalRole, ValidatedFileIdentity, VisibilityPolicy,
 };
 
+const GRAPH_CURRENT_GOID_FIELD: &str = "__coveql_current_goid";
+const GRAPH_PATH_START_GOID_FIELD: &str = "__coveql_path_start_goid";
+const GRAPH_PATH_NODE_GOIDS_FIELD: &str = "__coveql_path_node_goids";
+const GRAPH_PATH_EDGE_GOIDS_FIELD: &str = "__coveql_path_edge_goids";
+const GRAPH_PATH_DEPTH_FIELD: &str = "__coveql_path_depth";
+
 #[derive(Debug, Clone)]
-pub struct CoveOqlRetainedInput {
+pub struct CoveQlRetainedInput {
     bytes: RetainedBytes,
 }
 
-impl CoveOqlRetainedInput {
+impl CoveQlRetainedInput {
     pub fn from_vec(bytes: Vec<u8>) -> Self {
         Self {
             bytes: RetainedBytes::from_vec(bytes),
@@ -85,12 +96,12 @@ impl CoveOqlRetainedInput {
 }
 
 #[derive(Debug, Clone)]
-pub struct CoveOqlRetainedManifestMember {
+pub struct CoveQlRetainedManifestMember {
     source: String,
     bytes: RetainedBytes,
 }
 
-impl CoveOqlRetainedManifestMember {
+impl CoveQlRetainedManifestMember {
     pub fn from_vec(source: impl Into<String>, bytes: Vec<u8>) -> Self {
         Self {
             source: source.into(),
@@ -257,7 +268,7 @@ pub enum ExecutionAuthoritySource {
 #[derive(Debug, Clone)]
 pub struct ExecutedQuery {
     pub planned: PlannedQuery,
-    pub result: CoveOqlExecutionResult,
+    pub result: CoveQlExecutionResult,
     pub diagnostics: Vec<ExecutionDiagnostic>,
     pub row_counts: ExecutionRowCounts,
     pub output_fingerprint: String,
@@ -277,19 +288,19 @@ impl ExecutedQuery {
 }
 
 #[derive(Debug, Clone)]
-pub struct CoveOqlResultStream {
+pub struct CoveQlResultStream {
     bytes: Vec<u8>,
     planned: PlannedQuery,
     options: ExecutionOptions,
     executed: Option<ExecutedQuery>,
-    batches: Vec<CoveOqlExecutionResult>,
+    batches: Vec<CoveQlExecutionResult>,
     next_batch: usize,
     row_stream: Option<MaterializedRowStreamState>,
     blocking_reason: Option<String>,
     cancelled: bool,
 }
 
-impl CoveOqlResultStream {
+impl CoveQlResultStream {
     pub fn executed(&self) -> Option<&ExecutedQuery> {
         self.executed.as_ref()
     }
@@ -307,7 +318,7 @@ impl CoveOqlResultStream {
         self.batches.clear();
     }
 
-    pub fn next_batch(&mut self) -> Result<Option<CoveOqlExecutionResult>, BuildExecutionError> {
+    pub fn next_batch(&mut self) -> Result<Option<CoveQlExecutionResult>, BuildExecutionError> {
         if self.blocking_reason.is_none() {
             return self.next_streaming_batch();
         }
@@ -332,7 +343,7 @@ impl CoveOqlResultStream {
 
     fn next_streaming_batch(
         &mut self,
-    ) -> Result<Option<CoveOqlExecutionResult>, BuildExecutionError> {
+    ) -> Result<Option<CoveQlExecutionResult>, BuildExecutionError> {
         if self.cancelled {
             return Err(exec_error(
                 "E_STREAM_CANCELLED",
@@ -444,7 +455,13 @@ impl MaterializedRowStreamState {
         validate_security_scope(&planned, &options)?;
         validate_execution_grain(&planned)?;
         let mut source = object_backed_row_source(bytes, &planned, &options, started)?;
-        let context = EvalContext::for_plan(&source.associations, &source.evidence_rows, &planned);
+        source.object_rows = filter_object_context_rows(&source.object_rows, &planned, &options);
+        let context = EvalContext::for_plan_with_objects(
+            &source.associations,
+            &source.evidence_rows,
+            &source.object_rows,
+            &planned,
+        );
         sort_rows(&mut source.rows, &planned, &context)?;
         Ok(Self {
             planned,
@@ -463,7 +480,7 @@ impl MaterializedRowStreamState {
         })
     }
 
-    fn next_batch(&mut self) -> Result<Option<CoveOqlExecutionResult>, BuildExecutionError> {
+    fn next_batch(&mut self) -> Result<Option<CoveQlExecutionResult>, BuildExecutionError> {
         if self.finished {
             return Ok(None);
         }
@@ -496,9 +513,10 @@ impl MaterializedRowStreamState {
                 continue;
             }
             self.input_rows += 1;
-            let context = EvalContext::for_plan(
+            let context = EvalContext::for_plan_with_objects(
                 &self.source.associations,
                 &self.source.evidence_rows,
+                &self.source.object_rows,
                 &self.planned,
             );
             if !predicate_matches(&row, &self.planned, &context)? {
@@ -506,7 +524,7 @@ impl MaterializedRowStreamState {
             }
             self.filtered_rows += 1;
             let emitted = match (&self.planned.resolved.output_mode, row) {
-                (CoveOqlOutputMode::JsonRows, row) => {
+                (CoveQlOutputMode::JsonRows, row) => {
                     let value =
                         select_json_rows(std::slice::from_ref(&row), &self.planned, &context)?
                             .into_iter()
@@ -516,17 +534,17 @@ impl MaterializedRowStreamState {
                     self.json_output.push(value);
                     true
                 }
-                (CoveOqlOutputMode::ObjectRows, ExecutionRow::Object(row)) => {
+                (CoveQlOutputMode::ObjectRows, ExecutionRow::Object(row)) => {
                     object_batch.push(row.clone());
                     self.object_output.push(row);
                     true
                 }
-                (CoveOqlOutputMode::AssociationRows, ExecutionRow::Association(row)) => {
+                (CoveQlOutputMode::AssociationRows, ExecutionRow::Association(row)) => {
                     association_batch.push(row.clone());
                     self.association_output.push(row);
                     true
                 }
-                (CoveOqlOutputMode::EvidenceRows, ExecutionRow::Evidence(row)) => {
+                (CoveQlOutputMode::EvidenceRows, ExecutionRow::Evidence(row)) => {
                     evidence_batch.push(row.clone());
                     self.evidence_output.push(row);
                     true
@@ -551,12 +569,12 @@ impl MaterializedRowStreamState {
             return Ok(None);
         }
         Ok(Some(match &self.planned.resolved.output_mode {
-            CoveOqlOutputMode::JsonRows => CoveOqlExecutionResult::JsonRows(json_batch),
-            CoveOqlOutputMode::ObjectRows => CoveOqlExecutionResult::ObjectRows(object_batch),
-            CoveOqlOutputMode::AssociationRows => {
-                CoveOqlExecutionResult::AssociationRows(association_batch)
+            CoveQlOutputMode::JsonRows => CoveQlExecutionResult::JsonRows(json_batch),
+            CoveQlOutputMode::ObjectRows => CoveQlExecutionResult::ObjectRows(object_batch),
+            CoveQlOutputMode::AssociationRows => {
+                CoveQlExecutionResult::AssociationRows(association_batch)
             }
-            CoveOqlOutputMode::EvidenceRows => CoveOqlExecutionResult::EvidenceRows(evidence_batch),
+            CoveQlOutputMode::EvidenceRows => CoveQlExecutionResult::EvidenceRows(evidence_batch),
             _ => unreachable!("non-streamable output modes are blocked before streaming"),
         }))
     }
@@ -564,17 +582,15 @@ impl MaterializedRowStreamState {
     fn finish(&mut self) -> Result<ExecutedQuery, BuildExecutionError> {
         while self.next_batch()?.is_some() {}
         let result = match &self.planned.resolved.output_mode {
-            CoveOqlOutputMode::JsonRows => {
-                CoveOqlExecutionResult::JsonRows(self.json_output.clone())
+            CoveQlOutputMode::JsonRows => CoveQlExecutionResult::JsonRows(self.json_output.clone()),
+            CoveQlOutputMode::ObjectRows => {
+                CoveQlExecutionResult::ObjectRows(self.object_output.clone())
             }
-            CoveOqlOutputMode::ObjectRows => {
-                CoveOqlExecutionResult::ObjectRows(self.object_output.clone())
+            CoveQlOutputMode::AssociationRows => {
+                CoveQlExecutionResult::AssociationRows(self.association_output.clone())
             }
-            CoveOqlOutputMode::AssociationRows => {
-                CoveOqlExecutionResult::AssociationRows(self.association_output.clone())
-            }
-            CoveOqlOutputMode::EvidenceRows => {
-                CoveOqlExecutionResult::EvidenceRows(self.evidence_output.clone())
+            CoveQlOutputMode::EvidenceRows => {
+                CoveQlExecutionResult::EvidenceRows(self.evidence_output.clone())
             }
             _ => unreachable!("non-streamable output modes are blocked before streaming"),
         };
@@ -652,8 +668,8 @@ fn stream_row_visible(
         .is_some_and(|overlay| row_visible_in_overlay(row, overlay))
 }
 
-impl Iterator for CoveOqlResultStream {
-    type Item = Result<CoveOqlExecutionResult, BuildExecutionError>;
+impl Iterator for CoveQlResultStream {
+    type Item = Result<CoveQlExecutionResult, BuildExecutionError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.next_batch().transpose()
@@ -661,7 +677,7 @@ impl Iterator for CoveOqlResultStream {
 }
 
 #[derive(Debug, Clone)]
-pub enum CoveOqlExecutionResult {
+pub enum CoveQlExecutionResult {
     ObjectRows(Vec<MaterializedObjectRow>),
     AssociationRows(Vec<MaterializedAssociationRow>),
     EvidenceRows(Vec<MaterializedEvidenceRow>),
@@ -740,7 +756,7 @@ impl fmt::Display for BuildExecutionError {
         if let Some(diagnostic) = self.diagnostics.first() {
             write!(f, "{}: {}", diagnostic.code, diagnostic.message)
         } else {
-            write!(f, "Cove-OQL materialized execution failed")
+            write!(f, "CoveQL materialized execution failed")
         }
     }
 }
@@ -811,16 +827,16 @@ pub fn execute_planned_query(
 
     let (result, row_counts, pushdown_report, evidence_authority) =
         match &planned.resolved.output_mode {
-        CoveOqlOutputMode::ExplainJson => {
+        CoveQlOutputMode::ExplainJson => {
             let explain = planned.explain_json();
             (
-                CoveOqlExecutionResult::ExplainJson(explain),
+                CoveQlExecutionResult::ExplainJson(explain),
                 ExecutionRowCounts::default(),
                 PushdownReport::not_executed(&options.pushdown),
                 None,
             )
         }
-        CoveOqlOutputMode::DataFusionTableProvider => {
+        CoveQlOutputMode::DataFusionTableProvider => {
             return Err(exec_error(
                 "E_UNSUPPORTED_OUTPUT",
                 "DataFusion output is exposed through the Phase 3 registration helper, not execute_planned_query",
@@ -847,7 +863,7 @@ pub fn execute_planned_query(
 }
 
 pub fn execute_planned_query_retained(
-    input: CoveOqlRetainedInput,
+    input: CoveQlRetainedInput,
     planned: PlannedQuery,
     options: ExecutionOptions,
 ) -> Result<ExecutedQuery, BuildExecutionError> {
@@ -864,11 +880,11 @@ pub fn execute_manifest_planned_query(
     validate_execution_output_mode(&planned)?;
     if matches!(
         planned.resolved.output_mode,
-        CoveOqlOutputMode::DataFusionTableProvider
+        CoveQlOutputMode::DataFusionTableProvider
     ) {
         return Err(exec_error(
             "E_UNSUPPORTED_OUTPUT",
-            "manifest execution returns materialized OQL output; register an OQL DataFusion provider separately",
+            "manifest execution returns materialized CoveQL output; register an CoveQL DataFusion provider separately",
             json!({}),
         ));
     }
@@ -883,9 +899,9 @@ pub fn execute_manifest_planned_query(
     let (exact_bridge_count, inexact_bridge_count) =
         manifest_code_domain_bridge_counts(&planned.resolved.operation_context.dataset);
     let manifest_fallback_reason = if exact_bridge_count > 0 {
-        "manifest member execution validated exact COVM code-domain bridge proofs, but this logical executor used the materialized OQL oracle across members because no manifest physical kernel path was selected"
+        "manifest member execution validated exact COVM code-domain bridge proofs, but this logical executor used the materialized CoveQL oracle across members because no manifest physical kernel path was selected"
     } else {
-        "manifest member execution used the materialized OQL oracle across validated COVM members because cross-file coded acceleration requires exact bridge proofs and a manifest physical kernel path"
+        "manifest member execution used the materialized CoveQL oracle across validated COVM members because cross-file coded acceleration requires exact bridge proofs and a manifest physical kernel path"
     };
     diagnostics.push(exec_warning(
         "W_MATERIALIZED_MANIFEST_BASELINE",
@@ -908,16 +924,16 @@ pub fn execute_manifest_planned_query(
 
     let (result, row_counts, pushdown_report, evidence_authority) =
         match &planned.resolved.output_mode {
-            CoveOqlOutputMode::ExplainJson => {
+            CoveQlOutputMode::ExplainJson => {
                 let explain = planned.explain_json();
                 (
-                    CoveOqlExecutionResult::ExplainJson(explain),
+                    CoveQlExecutionResult::ExplainJson(explain),
                     ExecutionRowCounts::default(),
                     PushdownReport::not_executed(&options.pushdown),
                     None,
                 )
             }
-            CoveOqlOutputMode::DataFusionTableProvider => unreachable!("handled above"),
+            CoveQlOutputMode::DataFusionTableProvider => unreachable!("handled above"),
             _ => execute_manifest_rows(&ordered_members, &planned, &options, started)?,
         };
 
@@ -938,13 +954,13 @@ pub fn execute_manifest_planned_query(
 }
 
 pub fn execute_manifest_planned_query_retained(
-    members: &[CoveOqlRetainedManifestMember],
+    members: &[CoveQlRetainedManifestMember],
     planned: PlannedQuery,
     options: ExecutionOptions,
 ) -> Result<ExecutedQuery, BuildExecutionError> {
     let borrowed = members
         .iter()
-        .map(CoveOqlRetainedManifestMember::as_manifest_member)
+        .map(CoveQlRetainedManifestMember::as_manifest_member)
         .collect::<Vec<_>>();
     execute_manifest_planned_query(&borrowed, planned, options)
 }
@@ -963,8 +979,8 @@ pub fn execute_planned_query_stream(
     bytes: &[u8],
     planned: PlannedQuery,
     options: ExecutionOptions,
-) -> Result<CoveOqlResultStream, BuildExecutionError> {
-    Ok(CoveOqlResultStream {
+) -> Result<CoveQlResultStream, BuildExecutionError> {
+    Ok(CoveQlResultStream {
         bytes: bytes.to_vec(),
         blocking_reason: stream_blocking_reason(&planned),
         planned,
@@ -980,10 +996,10 @@ pub fn execute_planned_query_stream(
 fn stream_blocking_reason(planned: &PlannedQuery) -> Option<String> {
     if matches!(
         planned.resolved.output_mode,
-        CoveOqlOutputMode::ArrowRecordBatch { .. }
-            | CoveOqlOutputMode::ExplainJson
-            | CoveOqlOutputMode::DataFusionTableProvider
-            | CoveOqlOutputMode::ProjectionRows
+        CoveQlOutputMode::ArrowRecordBatch { .. }
+            | CoveQlOutputMode::ExplainJson
+            | CoveQlOutputMode::DataFusionTableProvider
+            | CoveQlOutputMode::ProjectionRows
     ) {
         return Some("output mode requires whole-result materialization".into());
     }
@@ -1002,37 +1018,34 @@ fn stream_blocking_reason(planned: &PlannedQuery) -> Option<String> {
     None
 }
 
-fn result_batches(
-    result: &CoveOqlExecutionResult,
-    batch_size: usize,
-) -> Vec<CoveOqlExecutionResult> {
+fn result_batches(result: &CoveQlExecutionResult, batch_size: usize) -> Vec<CoveQlExecutionResult> {
     match result {
-        CoveOqlExecutionResult::ObjectRows(rows) => rows
+        CoveQlExecutionResult::ObjectRows(rows) => rows
             .chunks(batch_size)
-            .map(|chunk| CoveOqlExecutionResult::ObjectRows(chunk.to_vec()))
+            .map(|chunk| CoveQlExecutionResult::ObjectRows(chunk.to_vec()))
             .collect(),
-        CoveOqlExecutionResult::AssociationRows(rows) => rows
+        CoveQlExecutionResult::AssociationRows(rows) => rows
             .chunks(batch_size)
-            .map(|chunk| CoveOqlExecutionResult::AssociationRows(chunk.to_vec()))
+            .map(|chunk| CoveQlExecutionResult::AssociationRows(chunk.to_vec()))
             .collect(),
-        CoveOqlExecutionResult::EvidenceRows(rows) => rows
+        CoveQlExecutionResult::EvidenceRows(rows) => rows
             .chunks(batch_size)
-            .map(|chunk| CoveOqlExecutionResult::EvidenceRows(chunk.to_vec()))
+            .map(|chunk| CoveQlExecutionResult::EvidenceRows(chunk.to_vec()))
             .collect(),
-        CoveOqlExecutionResult::ProjectionRows(rows) => rows
+        CoveQlExecutionResult::ProjectionRows(rows) => rows
             .chunks(batch_size)
-            .map(|chunk| CoveOqlExecutionResult::ProjectionRows(chunk.to_vec()))
+            .map(|chunk| CoveQlExecutionResult::ProjectionRows(chunk.to_vec()))
             .collect(),
-        CoveOqlExecutionResult::ArrowRecordBatches(batches) => batches
+        CoveQlExecutionResult::ArrowRecordBatches(batches) => batches
             .chunks(batch_size)
-            .map(|chunk| CoveOqlExecutionResult::ArrowRecordBatches(chunk.to_vec()))
+            .map(|chunk| CoveQlExecutionResult::ArrowRecordBatches(chunk.to_vec()))
             .collect(),
-        CoveOqlExecutionResult::JsonRows(rows) => rows
+        CoveQlExecutionResult::JsonRows(rows) => rows
             .chunks(batch_size)
-            .map(|chunk| CoveOqlExecutionResult::JsonRows(chunk.to_vec()))
+            .map(|chunk| CoveQlExecutionResult::JsonRows(chunk.to_vec()))
             .collect(),
-        CoveOqlExecutionResult::ExplainJson(value) => {
-            vec![CoveOqlExecutionResult::ExplainJson(value.clone())]
+        CoveQlExecutionResult::ExplainJson(value) => {
+            vec![CoveQlExecutionResult::ExplainJson(value.clone())]
         }
     }
 }
@@ -1044,7 +1057,7 @@ fn execute_rows(
     started: Instant,
 ) -> Result<
     (
-        CoveOqlExecutionResult,
+        CoveQlExecutionResult,
         ExecutionRowCounts,
         PushdownReport,
         Option<EvidenceAuthority>,
@@ -1058,8 +1071,38 @@ fn execute_rows(
             let report = projection_readback_pushdown_report(planned, options, &row_counts);
             Ok((result, row_counts, report, None))
         }
-        ResolvedRoot::Object(_) | ResolvedRoot::Association(_) | ResolvedRoot::Evidence(_) => {
-            execute_object_backed_root(bytes, planned, options, started)
+        ResolvedRoot::Table(root) => {
+            let (result, row_counts) = if table_relation_context_required(planned) {
+                execute_table_relation_root(bytes, planned, options, started, root)?
+            } else {
+                execute_projection_root(
+                    bytes,
+                    planned,
+                    options,
+                    started,
+                    &root.projection.projection_id,
+                )?
+            };
+            let report = projection_readback_pushdown_report(planned, options, &row_counts);
+            Ok((result, row_counts, report, None))
+        }
+        ResolvedRoot::Object(_)
+        | ResolvedRoot::Association(_)
+        | ResolvedRoot::Edge(_)
+        | ResolvedRoot::Evidence(_) => execute_object_backed_root(bytes, planned, options, started),
+        ResolvedRoot::Node(root) => {
+            if planned.resolved.method_chain.traversals.is_empty() {
+                execute_object_backed_root(bytes, planned, options, started)
+            } else {
+                let (result, row_counts) =
+                    execute_graph_traverse_root(bytes, planned, options, started, root)?;
+                Ok((
+                    result,
+                    row_counts,
+                    PushdownReport::not_executed(&options.pushdown),
+                    None,
+                ))
+            }
         }
     }
 }
@@ -1071,7 +1114,7 @@ fn execute_object_backed_root(
     started: Instant,
 ) -> Result<
     (
-        CoveOqlExecutionResult,
+        CoveQlExecutionResult,
         ExecutionRowCounts,
         PushdownReport,
         Option<EvidenceAuthority>,
@@ -1084,6 +1127,7 @@ fn execute_object_backed_root(
         source.rows,
         &source.associations,
         &source.evidence_rows,
+        &source.object_rows,
         planned,
         options,
         started,
@@ -1102,6 +1146,7 @@ struct MaterializedRowSource {
     rows: Vec<ExecutionRow>,
     associations: Vec<MaterializedAssociationRow>,
     evidence_rows: Vec<MaterializedEvidenceRow>,
+    object_rows: Vec<MaterializedObjectRow>,
     pushdown_report: PushdownReport,
     evidence_authority: Option<EvidenceAuthority>,
 }
@@ -1232,7 +1277,7 @@ fn execute_manifest_rows(
     started: Instant,
 ) -> Result<
     (
-        CoveOqlExecutionResult,
+        CoveQlExecutionResult,
         ExecutionRowCounts,
         PushdownReport,
         Option<EvidenceAuthority>,
@@ -1241,7 +1286,11 @@ fn execute_manifest_rows(
 > {
     if matches!(
         planned.resolved.root,
-        ResolvedRoot::Projection(_) | ResolvedRoot::Evidence(_)
+        ResolvedRoot::Node(_)
+            | ResolvedRoot::Edge(_)
+            | ResolvedRoot::Table(_)
+            | ResolvedRoot::Projection(_)
+            | ResolvedRoot::Evidence(_)
     ) && (planned.resolved.method_chain.history.is_some()
         || planned.resolved.method_chain.changes.is_some())
     {
@@ -1254,6 +1303,7 @@ fn execute_manifest_rows(
     let mut rows = Vec::new();
     let mut associations = Vec::new();
     let mut evidence_rows = Vec::new();
+    let mut object_rows = Vec::new();
     let mut evidence_authorities = Vec::new();
     for member in members {
         check_time(&options.resource_budget, started)?;
@@ -1279,7 +1329,30 @@ fn execute_manifest_rows(
                     }),
                 );
             }
-            ResolvedRoot::Object(_) | ResolvedRoot::Association(_) | ResolvedRoot::Evidence(_) => {
+            ResolvedRoot::Table(root) => {
+                rows.extend(
+                    projection_root_execution_rows(
+                        member.bytes,
+                        &member_plan,
+                        options,
+                        started,
+                        &root.projection.projection_id,
+                    )?
+                    .into_iter()
+                    .map(|row| {
+                        row.with_dataset_member(
+                            member.scope.ordinal,
+                            &member.scope.source,
+                            file_id.clone(),
+                        )
+                    }),
+                );
+            }
+            ResolvedRoot::Object(_)
+            | ResolvedRoot::Association(_)
+            | ResolvedRoot::Node(_)
+            | ResolvedRoot::Edge(_)
+            | ResolvedRoot::Evidence(_) => {
                 let source =
                     object_backed_row_source(member.bytes, &member_plan, options, started)?;
                 rows.extend(source.rows.into_iter().map(|row| {
@@ -1290,6 +1363,13 @@ fn execute_manifest_rows(
                     )
                 }));
                 associations.extend(source.associations.into_iter().map(|row| {
+                    row.with_dataset_member(
+                        member.scope.ordinal,
+                        &member.scope.source,
+                        file_id.clone(),
+                    )
+                }));
+                object_rows.extend(source.object_rows.into_iter().map(|row| {
                     row.with_dataset_member(
                         member.scope.ordinal,
                         &member.scope.source,
@@ -1318,6 +1398,7 @@ fn execute_manifest_rows(
         rows,
         &associations,
         &evidence_rows,
+        &object_rows,
         planned,
         options,
         started,
@@ -1354,10 +1435,13 @@ fn manifest_materialized_pushdown_report(
     PushdownReport::not_applicable(
         &options.pushdown,
         format!(
-            "manifest execution read {file_count} validated member files and applied global materialized OQL residual semantics for {} root",
+            "manifest execution read {file_count} validated member files and applied global materialized CoveQL residual semantics for {} root",
             match planned.resolved.root {
                 ResolvedRoot::Object(_) => "object",
                 ResolvedRoot::Association(_) => "association",
+                ResolvedRoot::Node(_) => "node",
+                ResolvedRoot::Edge(_) => "edge",
+                ResolvedRoot::Table(_) => "table",
                 ResolvedRoot::Evidence(_) => "evidence",
                 ResolvedRoot::Projection(_) => "projection",
             }
@@ -1403,6 +1487,11 @@ fn object_backed_row_source(
         .merge_core_report(read_result.pushdown_report);
     let surface = read_result.surface;
     let states = object_states_for_temporal_context(&surface, planned)?;
+    let object_rows = states
+        .iter()
+        .map(MaterializedObjectRow::from_state)
+        .map(|row| row.with_output_grain(OutputGrain::LatestState))
+        .collect::<Vec<_>>();
     let associations = states
         .iter()
         .filter_map(MaterializedAssociationRow::from_state)
@@ -1455,11 +1544,10 @@ fn object_backed_row_source(
         {
             temporal_association_rows(&surface, planned, root.object_type_id)?
         }
-        ResolvedRoot::Object(root) => states
+        ResolvedRoot::Object(root) => object_rows
             .iter()
             .filter(|state| state.object_type_id == root.object_type_id)
-            .map(MaterializedObjectRow::from_state)
-            .map(|row| row.with_output_grain(OutputGrain::LatestState))
+            .cloned()
             .map(ExecutionRow::Object)
             .collect::<Vec<_>>(),
         ResolvedRoot::Association(root) => associations
@@ -1471,13 +1559,36 @@ fn object_backed_row_source(
             .cloned()
             .map(ExecutionRow::Association)
             .collect::<Vec<_>>(),
+        ResolvedRoot::Node(root) => object_rows
+            .iter()
+            .filter(|state| state.object_type_id == root.object.object_type_id)
+            .cloned()
+            .map(ExecutionRow::Object)
+            .collect::<Vec<_>>(),
+        ResolvedRoot::Edge(root) => associations
+            .iter()
+            .filter(|association| association.object_type_id == root.association.object_type_id)
+            .filter(|association| {
+                association_row_matches_temporal(
+                    association,
+                    &root.association,
+                    association_valid_at(planned),
+                )
+            })
+            .cloned()
+            .map(ExecutionRow::Association)
+            .collect::<Vec<_>>(),
         ResolvedRoot::Evidence(_) => evidence_execution_rows,
+        ResolvedRoot::Table(_) => {
+            unreachable!("table roots are handled through projection readback")
+        }
         ResolvedRoot::Projection(_) => unreachable!("projection handled separately"),
     };
     Ok(MaterializedRowSource {
         rows: all_rows,
         associations: context_associations,
         evidence_rows: context_evidence_rows,
+        object_rows,
         pushdown_report: pushdown_plan.report,
         evidence_authority,
     })
@@ -1524,7 +1635,7 @@ pub(crate) fn temporal_object_rows(
                 object_type_id,
                 OutputGrain::ChangeStateTransition,
             ),
-            AstChangeMode::FinalObjects => {
+            AstChangeMode::FinalRows => {
                 final_object_rows_for_change_window(surface, planned, object_type_id)
             }
         };
@@ -1590,7 +1701,7 @@ pub(crate) fn temporal_association_rows(
                 object_type_id,
                 OutputGrain::ChangeStateTransition,
             ),
-            AstChangeMode::FinalObjects => {
+            AstChangeMode::FinalRows => {
                 final_association_rows_for_change_window(surface, planned, object_type_id)
             }
         };
@@ -2334,14 +2445,14 @@ pub(crate) fn execute_projection_root(
     options: &ExecutionOptions,
     started: Instant,
     projection_id: &str,
-) -> Result<(CoveOqlExecutionResult, ExecutionRowCounts), BuildExecutionError> {
+) -> Result<(CoveQlExecutionResult, ExecutionRowCounts), BuildExecutionError> {
     check_time(&options.resource_budget, started)?;
     let pushed_filters = projection_filters_for_plan(planned);
     let output_columns = projection_output_columns_for_plan(planned);
     let projection_options = ProjectionBatchOptions {
         max_rows: None,
         output_columns,
-        pushed_filters,
+        pushed_filters: pushed_filters.clone(),
         batch_size: options.batch_size,
     };
     let batches = projected_record_batches_from_cove_o_bytes(
@@ -2357,18 +2468,18 @@ pub(crate) fn execute_projection_root(
             json!({ "projection_id": projection_id }),
         )
     })?;
-    if matches!(
-        planned.resolved.output_mode,
-        CoveOqlOutputMode::ArrowRecordBatch { .. }
-    ) && planned.resolved.method_chain.where_predicate.is_none()
-        && planned.resolved.method_chain.order_by.is_none()
-        && planned.resolved.method_chain.group_by.is_none()
-        && planned.resolved.method_chain.skip.is_none()
-        && planned.resolved.method_chain.take.is_none()
+    if let Some(batches) = projection_arrow_passthrough_batches(planned, &batches, &pushed_filters)
+        .map_err(|err| {
+            exec_error(
+                "E_ARROW_OUTPUT",
+                format!("projection Arrow passthrough failed: {err}"),
+                json!({ "projection_id": projection_id }),
+            )
+        })?
     {
         let row_count = batches.iter().map(RecordBatch::num_rows).sum();
         return Ok((
-            CoveOqlExecutionResult::ArrowRecordBatches(batches),
+            CoveQlExecutionResult::ArrowRecordBatches(batches),
             ExecutionRowCounts {
                 input_rows: row_count,
                 filtered_rows: row_count,
@@ -2387,7 +2498,268 @@ pub(crate) fn execute_projection_root(
         .into_iter()
         .map(ExecutionRow::Projection)
         .collect::<Vec<_>>();
-    finish_materialized_rows(rows, &[], &[], planned, options, started)
+    finish_materialized_rows(rows, &[], &[], &[], planned, options, started)
+}
+
+fn projection_arrow_passthrough_batches(
+    planned: &PlannedQuery,
+    batches: &[RecordBatch],
+    pushed_filters: &[ProjectionFilter],
+) -> Result<Option<Vec<RecordBatch>>, String> {
+    if !projection_arrow_passthrough_shape(planned) {
+        return Ok(None);
+    }
+    let Some(schema) = batches.first().map(RecordBatch::schema) else {
+        return Ok(None);
+    };
+    if !projection_arrow_filters_are_exact(planned, schema.as_ref(), pushed_filters) {
+        return Ok(None);
+    }
+    let Some(final_projection) = projection_arrow_final_projection(planned, schema.as_ref()) else {
+        return Ok(None);
+    };
+    if let Some(indices) = final_projection {
+        return batches
+            .iter()
+            .map(|batch| batch.project(&indices).map_err(|err| err.to_string()))
+            .collect::<Result<Vec<_>, _>>()
+            .map(Some);
+    }
+    Ok(Some(batches.to_vec()))
+}
+
+fn projection_arrow_passthrough_shape(planned: &PlannedQuery) -> bool {
+    if !matches!(
+        planned.resolved.output_mode,
+        CoveQlOutputMode::ArrowRecordBatch { .. }
+    ) {
+        return false;
+    }
+    let chain = &planned.resolved.method_chain;
+    chain.lookups.is_empty()
+        && chain.traversals.is_empty()
+        && chain.group_by.is_none()
+        && chain.order_by.is_none()
+        && chain.skip.is_none()
+        && chain.take.is_none()
+        && chain.history.is_none()
+        && chain.changes.is_none()
+}
+
+fn projection_arrow_filters_are_exact(
+    planned: &PlannedQuery,
+    schema: &arrow_schema::Schema,
+    pushed_filters: &[ProjectionFilter],
+) -> bool {
+    let Some(predicate) = &planned.resolved.method_chain.where_predicate else {
+        return true;
+    };
+    if pushed_filters.is_empty() || projection_filters_for_predicate(predicate).is_none() {
+        return false;
+    }
+    let root = projection_contract_root(&planned.resolved.root);
+    pushed_filters.iter().all(|filter| {
+        let predicate = projection_predicate_for_schema(schema, filter);
+        let form = classify_predicate(&predicate, &root, "projection_readback");
+        form.representation.proof_state == PredicateProofState::ProvenExact
+            && form.residual_reason.is_none()
+    })
+}
+
+fn projection_contract_root(root: &ResolvedRoot) -> ResolvedRoot {
+    match root {
+        ResolvedRoot::Table(root) => ResolvedRoot::Projection(root.projection.clone()),
+        ResolvedRoot::Projection(root) => ResolvedRoot::Projection(root.clone()),
+        other => other.clone(),
+    }
+}
+
+fn projection_arrow_final_projection(
+    planned: &PlannedQuery,
+    schema: &arrow_schema::Schema,
+) -> Option<Option<Vec<usize>>> {
+    let Some(select) = &planned.resolved.method_chain.select else {
+        return Some(None);
+    };
+    let mut indices = Vec::with_capacity(select.len());
+    for item in select {
+        let ResolvedExpr::Path(path) = &item.expr else {
+            return None;
+        };
+        path.projection_column.as_ref()?;
+        let column = projection_column(path);
+        if item.alias.as_ref().is_some_and(|alias| alias != &column) {
+            return None;
+        }
+        let index = schema.index_of(&column).ok()?;
+        indices.push(index);
+    }
+    Some(Some(indices))
+}
+
+fn projection_predicate_for_schema(
+    schema: &arrow_schema::Schema,
+    filter: &ProjectionFilter,
+) -> ResolvedPredicate {
+    match filter {
+        ProjectionFilter::Compare {
+            column,
+            op,
+            literal,
+        } => ResolvedPredicate::Compare {
+            left: ResolvedExpr::Path(projection_filter_resolved_path(schema, column)),
+            op: projection_ast_op(*op),
+            right: ResolvedExpr::Literal(projection_filter_resolved_literal(literal)),
+        },
+        ProjectionFilter::InList { column, literals } => ResolvedPredicate::InList {
+            expr: ResolvedExpr::Path(projection_filter_resolved_path(schema, column)),
+            values: literals
+                .iter()
+                .map(projection_filter_resolved_literal)
+                .collect(),
+        },
+        ProjectionFilter::IsNull { column, negated } => ResolvedPredicate::NullCheck {
+            expr: ResolvedExpr::Path(projection_filter_resolved_path(schema, column)),
+            negated: *negated,
+        },
+    }
+}
+
+fn projection_filter_resolved_path(schema: &arrow_schema::Schema, column: &str) -> ResolvedPath {
+    let (logical_type, nullable) = schema
+        .field_with_name(column)
+        .map(|field| {
+            (
+                logical_type_for_arrow(field.data_type()).to_string(),
+                field.is_nullable(),
+            )
+        })
+        .unwrap_or_else(|_| ("utf8".into(), true));
+    ResolvedPath {
+        display_name: column.into(),
+        root_kind: ResolvedPathRootKind::Projection,
+        object_type_id: None,
+        property_id: None,
+        association_type_id: None,
+        evidence_field_id: None,
+        projection_id: None,
+        projection_column: Some(column.into()),
+        system_field: None,
+        logical_type: logical_type.clone(),
+        physical_kind: physical_kind_for_logical_name(&logical_type).into(),
+        collation_id: None,
+        nullable,
+        null_policy: if nullable { "allow" } else { "reject" }.into(),
+        temporal_role: None,
+        code_domain_id: CodeDomainId::Placeholder {
+            root: "projection".into(),
+            object_type_id: None,
+            property_id: None,
+            projection_id: None,
+            field: Some(column.into()),
+        },
+    }
+}
+
+fn projection_filter_resolved_literal(literal: &ProjectionFilterLiteral) -> ResolvedLiteral {
+    match literal {
+        ProjectionFilterLiteral::Null => ResolvedLiteral {
+            literal: crate::AstLiteral::Null,
+            logical_type: "null".into(),
+            canonical: "null".into(),
+            typed_value: ResolvedLiteralValue::Null,
+            precision: None,
+            scale: None,
+        },
+        ProjectionFilterLiteral::Boolean(value) => ResolvedLiteral {
+            literal: crate::AstLiteral::Boolean(*value),
+            logical_type: "bool".into(),
+            canonical: value.to_string(),
+            typed_value: ResolvedLiteralValue::Boolean(*value),
+            precision: None,
+            scale: None,
+        },
+        ProjectionFilterLiteral::Int64(value) => ResolvedLiteral {
+            literal: crate::AstLiteral::Integer(value.to_string()),
+            logical_type: "int64".into(),
+            canonical: value.to_string(),
+            typed_value: ResolvedLiteralValue::SignedInteger(*value),
+            precision: None,
+            scale: None,
+        },
+        ProjectionFilterLiteral::UInt64(value) => ResolvedLiteral {
+            literal: crate::AstLiteral::Integer(value.to_string()),
+            logical_type: "uint64".into(),
+            canonical: value.to_string(),
+            typed_value: ResolvedLiteralValue::UnsignedInteger(*value),
+            precision: None,
+            scale: None,
+        },
+        ProjectionFilterLiteral::Float64(value) => ResolvedLiteral {
+            literal: crate::AstLiteral::Decimal(value.to_string()),
+            logical_type: "float64".into(),
+            canonical: value.to_string(),
+            typed_value: ResolvedLiteralValue::Decimal {
+                canonical: value.to_string(),
+                precision: 0,
+                scale: 0,
+            },
+            precision: None,
+            scale: None,
+        },
+        ProjectionFilterLiteral::Utf8(value) => ResolvedLiteral {
+            literal: crate::AstLiteral::String(value.clone()),
+            logical_type: "utf8".into(),
+            canonical: value.clone(),
+            typed_value: ResolvedLiteralValue::String(value.clone()),
+            precision: None,
+            scale: None,
+        },
+    }
+}
+
+fn projection_ast_op(op: ProjectionFilterOp) -> AstCompareOp {
+    match op {
+        ProjectionFilterOp::Eq => AstCompareOp::Eq,
+        ProjectionFilterOp::Ne => AstCompareOp::Ne,
+        ProjectionFilterOp::Lt => AstCompareOp::Lt,
+        ProjectionFilterOp::LtEq => AstCompareOp::Le,
+        ProjectionFilterOp::Gt => AstCompareOp::Gt,
+        ProjectionFilterOp::GtEq => AstCompareOp::Ge,
+    }
+}
+
+fn logical_type_for_arrow(data_type: &DataType) -> &'static str {
+    match data_type {
+        DataType::Boolean => "bool",
+        DataType::Int8 => "int8",
+        DataType::Int16 => "int16",
+        DataType::Int32 => "int32",
+        DataType::Int64 => "int64",
+        DataType::UInt8 => "uint8",
+        DataType::UInt16 => "uint16",
+        DataType::UInt32 => "uint32",
+        DataType::UInt64 => "uint64",
+        DataType::Float32 => "float32",
+        DataType::Float64 => "float64",
+        DataType::Date32 => "date_days",
+        DataType::Timestamp(_, _) => "timestamp_micros",
+        _ => "utf8",
+    }
+}
+
+fn physical_kind_for_logical_name(logical: &str) -> &'static str {
+    match logical {
+        "bool" | "boolean" => "boolean",
+        "int8" | "int16" | "int32" | "int64" | "uint8" | "uint16" | "uint32" | "uint64"
+        | "float32" | "float64" | "decimal64" | "date_days" | "timestamp_micros"
+        | "timestamp_nanos" => "num_code",
+        "uuid" | "decimal128" => "fixed_bytes",
+        "list" => "list",
+        "struct" => "struct",
+        "map" => "map",
+        _ => "var_bytes",
+    }
 }
 
 pub(crate) fn projection_root_execution_rows(
@@ -2429,6 +2801,882 @@ pub(crate) fn projection_root_execution_rows(
     Ok(rows.into_iter().map(ExecutionRow::Projection).collect())
 }
 
+fn projection_rows_all_columns(
+    bytes: &[u8],
+    options: &ExecutionOptions,
+    started: Instant,
+    projection_id: &str,
+) -> Result<Vec<MaterializedProjectionRow>, BuildExecutionError> {
+    check_time(&options.resource_budget, started)?;
+    let projection_options = ProjectionBatchOptions {
+        max_rows: None,
+        output_columns: None,
+        pushed_filters: Vec::new(),
+        batch_size: options.batch_size,
+    };
+    let batches = projected_record_batches_from_cove_o_bytes(
+        bytes,
+        options.mapping_path.as_deref(),
+        projection_id,
+        &projection_options,
+    )
+    .map_err(|err| {
+        exec_error(
+            "E_PROJECTION_READBACK",
+            format!("COVE-MAP projection readback failed: {err}"),
+            json!({ "projection_id": projection_id }),
+        )
+    })?;
+    record_batches_to_projection_rows(projection_id, &batches).map_err(|err| {
+        exec_error(
+            "E_PROJECTION_READBACK",
+            format!("cannot materialize projection rows: {err}"),
+            json!({ "projection_id": projection_id }),
+        )
+    })
+}
+
+fn table_relation_context_required(planned: &PlannedQuery) -> bool {
+    !planned.resolved.method_chain.lookups.is_empty()
+        || planned
+            .resolved
+            .method_chain
+            .where_predicate
+            .as_ref()
+            .is_some_and(predicate_contains_table_exists)
+}
+
+fn predicate_contains_table_exists(predicate: &ResolvedPredicate) -> bool {
+    match predicate {
+        ResolvedPredicate::Exists(ResolvedExpr::TableExists(_)) => true,
+        ResolvedPredicate::Compare { left, right, .. } => {
+            expr_contains_table_exists(left) || expr_contains_table_exists(right)
+        }
+        ResolvedPredicate::InList { expr, .. }
+        | ResolvedPredicate::NullCheck { expr, .. }
+        | ResolvedPredicate::BoolExpr(expr)
+        | ResolvedPredicate::Exists(expr) => expr_contains_table_exists(expr),
+        ResolvedPredicate::Not(inner) => predicate_contains_table_exists(inner),
+        ResolvedPredicate::And(parts) | ResolvedPredicate::Or(parts) => {
+            parts.iter().any(predicate_contains_table_exists)
+        }
+    }
+}
+
+fn expr_contains_table_exists(expr: &ResolvedExpr) -> bool {
+    match expr {
+        ResolvedExpr::TableExists(_) => true,
+        ResolvedExpr::FunctionCall { args, .. } => args.iter().any(expr_contains_table_exists),
+        ResolvedExpr::AggregateCall { arg, .. } => {
+            arg.as_deref().is_some_and(expr_contains_table_exists)
+        }
+        ResolvedExpr::Conditional {
+            predicate,
+            then_expr,
+            else_expr,
+            ..
+        } => {
+            predicate_contains_table_exists(predicate)
+                || expr_contains_table_exists(then_expr)
+                || expr_contains_table_exists(else_expr)
+        }
+        ResolvedExpr::Path(_)
+        | ResolvedExpr::Literal(_)
+        | ResolvedExpr::Association(_)
+        | ResolvedExpr::Evidence(_) => false,
+    }
+}
+
+fn execute_table_relation_root(
+    bytes: &[u8],
+    planned: &PlannedQuery,
+    options: &ExecutionOptions,
+    started: Instant,
+    table: &crate::ResolvedTableRoot,
+) -> Result<(CoveQlExecutionResult, ExecutionRowCounts), BuildExecutionError> {
+    let left_rows =
+        projection_rows_all_columns(bytes, options, started, &table.projection.projection_id)?;
+    let mut joined_rows = left_rows
+        .into_iter()
+        .map(|row| namespace_table_projection_row(row, table))
+        .collect::<Vec<_>>();
+    let context = EvalContext::for_plan(&[], &[], planned);
+    for lookup in &planned.resolved.method_chain.lookups {
+        let right_rows = projection_rows_all_columns(
+            bytes,
+            options,
+            started,
+            &lookup.right.projection.projection_id,
+        )?
+        .into_iter()
+        .map(|row| namespace_table_projection_row(row, &lookup.right))
+        .collect::<Vec<_>>();
+        let mut next_rows = Vec::new();
+        for left in joined_rows {
+            let mut matches = Vec::new();
+            for right in &right_rows {
+                let candidate = merge_lookup_projection_rows(&left, right);
+                let row = ExecutionRow::Projection(candidate.clone());
+                let predicate_matches =
+                    eval_predicate(&lookup.on, &row, &context).map_err(|err| {
+                        exec_error(
+                            "E_EXPRESSION",
+                            format!("lookup predicate evaluation failed: {}", err.message),
+                            json!({}),
+                        )
+                    })?;
+                if predicate_matches
+                    || (lookup.nulls_match && lookup_join_keys_are_both_null(&lookup.on, &row))
+                {
+                    matches.push(candidate);
+                }
+            }
+            if matches.is_empty() {
+                match lookup.unmatched_policy {
+                    TableLookupUnmatchedPolicy::Nulls => next_rows.push(left),
+                    TableLookupUnmatchedPolicy::Reject => {
+                        return Err(exec_error(
+                            "E_LOOKUP_UNMATCHED_ROW",
+                            "lookup unmatched: reject encountered a visible left row without a visible matching right row",
+                            json!({
+                                "right_table": lookup.right.table_name,
+                                "cardinality": format!("{:?}", lookup.cardinality),
+                            }),
+                        ));
+                    }
+                }
+                continue;
+            }
+            if lookup.cardinality == TableLookupCardinality::One
+                && matches.len() > 1
+                && lookup.duplicate_policy == TableLookupDuplicatePolicy::Reject
+            {
+                return Err(exec_error(
+                    "E_LOOKUP_DUPLICATE_MATCH",
+                    "lookup cardinality: one found more than one visible right-side match",
+                    json!({
+                        "right_table": lookup.right.table_name,
+                        "match_count": matches.len(),
+                    }),
+                ));
+            }
+            match lookup.cardinality {
+                TableLookupCardinality::One => {
+                    next_rows.push(matches.into_iter().next().expect("non-empty matches"));
+                }
+                TableLookupCardinality::Many => {
+                    next_rows.extend(matches);
+                }
+            }
+        }
+        joined_rows = next_rows;
+    }
+    let table_exists_storage = table_exists_row_storage(bytes, planned, options, started)?;
+    let table_exists_refs = table_exists_storage
+        .iter()
+        .map(|(table_id, rows)| (table_id.clone(), rows.as_slice()))
+        .collect::<BTreeMap<_, _>>();
+    let context =
+        EvalContext::for_plan_with_table_exists_rows(&[], &[], planned, table_exists_refs);
+    let rows = joined_rows
+        .into_iter()
+        .map(ExecutionRow::Projection)
+        .collect::<Vec<_>>();
+    finish_materialized_rows_with_context(rows, planned, options, started, &context)
+}
+
+fn lookup_join_keys_are_both_null(predicate: &ResolvedPredicate, row: &ExecutionRow) -> bool {
+    let ResolvedPredicate::Compare {
+        left,
+        op: AstCompareOp::Eq,
+        right,
+    } = predicate
+    else {
+        return false;
+    };
+    let (ResolvedExpr::Path(left), ResolvedExpr::Path(right)) = (left, right) else {
+        return false;
+    };
+    row.value_for_path(left).is_null() && row.value_for_path(right).is_null()
+}
+
+fn table_exists_row_storage(
+    bytes: &[u8],
+    planned: &PlannedQuery,
+    options: &ExecutionOptions,
+    started: Instant,
+) -> Result<Vec<(String, Vec<MaterializedProjectionRow>)>, BuildExecutionError> {
+    let mut roots = Vec::new();
+    if let Some(predicate) = &planned.resolved.method_chain.where_predicate {
+        collect_table_exists_roots(predicate, &mut roots);
+    }
+    roots
+        .into_iter()
+        .map(|root| {
+            let rows = projection_rows_all_columns(
+                bytes,
+                options,
+                started,
+                &root.projection.projection_id,
+            )?
+            .into_iter()
+            .map(|row| namespace_table_projection_row(row, &root))
+            .collect::<Vec<_>>();
+            Ok((root.table_id, rows))
+        })
+        .collect()
+}
+
+fn collect_table_exists_roots(
+    predicate: &ResolvedPredicate,
+    out: &mut Vec<crate::ResolvedTableRoot>,
+) {
+    match predicate {
+        ResolvedPredicate::Exists(ResolvedExpr::TableExists(exists)) => {
+            if !out
+                .iter()
+                .any(|root| root.table_id == exists.right.table_id)
+            {
+                out.push(exists.right.clone());
+            }
+        }
+        ResolvedPredicate::Compare { left, right, .. } => {
+            collect_table_exists_expr_roots(left, out);
+            collect_table_exists_expr_roots(right, out);
+        }
+        ResolvedPredicate::InList { expr, .. }
+        | ResolvedPredicate::NullCheck { expr, .. }
+        | ResolvedPredicate::BoolExpr(expr)
+        | ResolvedPredicate::Exists(expr) => collect_table_exists_expr_roots(expr, out),
+        ResolvedPredicate::Not(inner) => collect_table_exists_roots(inner, out),
+        ResolvedPredicate::And(parts) | ResolvedPredicate::Or(parts) => {
+            for part in parts {
+                collect_table_exists_roots(part, out);
+            }
+        }
+    }
+}
+
+fn collect_table_exists_expr_roots(expr: &ResolvedExpr, out: &mut Vec<crate::ResolvedTableRoot>) {
+    match expr {
+        ResolvedExpr::TableExists(exists) => {
+            if !out
+                .iter()
+                .any(|root| root.table_id == exists.right.table_id)
+            {
+                out.push(exists.right.clone());
+            }
+        }
+        ResolvedExpr::FunctionCall { args, .. } => {
+            for arg in args {
+                collect_table_exists_expr_roots(arg, out);
+            }
+        }
+        ResolvedExpr::AggregateCall { arg, .. } => {
+            if let Some(arg) = arg.as_deref() {
+                collect_table_exists_expr_roots(arg, out);
+            }
+        }
+        ResolvedExpr::Conditional {
+            predicate,
+            then_expr,
+            else_expr,
+            ..
+        } => {
+            collect_table_exists_roots(predicate, out);
+            collect_table_exists_expr_roots(then_expr, out);
+            collect_table_exists_expr_roots(else_expr, out);
+        }
+        ResolvedExpr::Path(_)
+        | ResolvedExpr::Literal(_)
+        | ResolvedExpr::Association(_)
+        | ResolvedExpr::Evidence(_) => {}
+    }
+}
+
+fn namespace_table_projection_row(
+    mut row: MaterializedProjectionRow,
+    table: &crate::ResolvedTableRoot,
+) -> MaterializedProjectionRow {
+    let base = row.values.clone();
+    for label in table_binding_labels(table) {
+        for (column, value) in &base {
+            row.values
+                .insert(format!("{label}.{column}"), value.clone());
+        }
+    }
+    row.projection_id = table.table_id.clone();
+    row
+}
+
+fn table_binding_labels(table: &crate::ResolvedTableRoot) -> Vec<String> {
+    let mut labels = Vec::new();
+    if let Some(alias) = &table.binding_name {
+        labels.push(alias.clone());
+    }
+    if !labels.iter().any(|label| label == &table.table_name) {
+        labels.push(table.table_name.clone());
+    }
+    labels
+}
+
+fn merge_lookup_projection_rows(
+    left: &MaterializedProjectionRow,
+    right: &MaterializedProjectionRow,
+) -> MaterializedProjectionRow {
+    let mut values = left.values.clone();
+    for (key, value) in &right.values {
+        if key.contains('.') {
+            values.insert(key.clone(), value.clone());
+        } else {
+            values.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+    }
+    MaterializedProjectionRow {
+        projection_id: format!("lookup:{}:{}", left.projection_id, right.projection_id),
+        values,
+    }
+}
+
+fn execute_graph_traverse_root(
+    bytes: &[u8],
+    planned: &PlannedQuery,
+    options: &ExecutionOptions,
+    started: Instant,
+    root: &crate::ResolvedGraphNodeRoot,
+) -> Result<(CoveQlExecutionResult, ExecutionRowCounts), BuildExecutionError> {
+    check_time(&options.resource_budget, started)?;
+    let read_result = read_object_surface_from_bytes_with_pushdown_options(
+        bytes,
+        &CoveObjectReadWithPushdownOptions {
+            read: object_read_options(planned),
+            pushdown: CoveObjectReadPushdownOptions::default(),
+        },
+    )
+    .map_err(|err| {
+        exec_error(
+            "E_READBACK",
+            format!("COVE-O materialized readback failed: {err}"),
+            json!({}),
+        )
+    })?;
+    let surface = read_result.surface;
+    let states = object_states_for_temporal_context(&surface, planned)?;
+    let object_rows = states
+        .iter()
+        .map(MaterializedObjectRow::from_state)
+        .collect::<Vec<_>>();
+    let visible_object_rows = filter_object_context_rows(&object_rows, planned, options);
+    let associations = states
+        .iter()
+        .filter_map(MaterializedAssociationRow::from_state)
+        .collect::<Vec<_>>();
+    let visible_associations = filter_association_context_rows(&associations, planned, options);
+    let mut by_type_and_goid = BTreeMap::<(u32, String), MaterializedObjectRow>::new();
+    let object_goids = object_rows
+        .iter()
+        .map(|row| row.goid.clone())
+        .collect::<BTreeSet<_>>();
+    let mut visible_object_goids = BTreeSet::<String>::new();
+    for row in &visible_object_rows {
+        visible_object_goids.insert(row.goid.clone());
+        by_type_and_goid.insert((row.object_type_id, row.goid.clone()), row.clone());
+    }
+    let mut rows = visible_object_rows
+        .iter()
+        .filter(|row| row.object_type_id == root.object.object_type_id)
+        .map(|row| {
+            let state = GraphPathState::new(row.goid.clone());
+            with_graph_path_state(namespace_graph_node_projection_row(row, root, true), &state)
+        })
+        .collect::<Vec<_>>();
+    for traversal in &planned.resolved.method_chain.traversals {
+        rows = expand_graph_traversal_rows(
+            &rows,
+            traversal,
+            root,
+            &visible_associations,
+            &by_type_and_goid,
+            &object_goids,
+            &visible_object_goids,
+            planned,
+            options,
+            started,
+        )?;
+    }
+    let rows = rows
+        .into_iter()
+        .map(ExecutionRow::Projection)
+        .collect::<Vec<_>>();
+    let context = EvalContext::for_plan_with_objects(
+        &visible_associations,
+        &[],
+        &visible_object_rows,
+        planned,
+    );
+    finish_materialized_rows_with_context(rows, planned, options, started, &context)
+}
+
+#[derive(Debug, Clone)]
+struct GraphPathState {
+    start_goid: String,
+    current_goid: String,
+    node_goids: Vec<String>,
+    edge_goids: Vec<String>,
+    depth: u32,
+}
+
+impl GraphPathState {
+    fn new(start_goid: String) -> Self {
+        Self {
+            start_goid: start_goid.clone(),
+            current_goid: start_goid.clone(),
+            node_goids: vec![start_goid],
+            edge_goids: Vec::new(),
+            depth: 0,
+        }
+    }
+
+    fn extend(&self, edge_goid: String, target_goid: String) -> Self {
+        let mut node_goids = self.node_goids.clone();
+        node_goids.push(target_goid.clone());
+        let mut edge_goids = self.edge_goids.clone();
+        edge_goids.push(edge_goid);
+        Self {
+            start_goid: self.start_goid.clone(),
+            current_goid: target_goid,
+            node_goids,
+            edge_goids,
+            depth: self.depth + 1,
+        }
+    }
+}
+
+fn expand_graph_traversal_rows(
+    rows: &[MaterializedProjectionRow],
+    traversal: &crate::ResolvedGraphTraversal,
+    root: &crate::ResolvedGraphNodeRoot,
+    visible_associations: &[MaterializedAssociationRow],
+    by_type_and_goid: &BTreeMap<(u32, String), MaterializedObjectRow>,
+    object_goids: &BTreeSet<String>,
+    visible_object_goids: &BTreeSet<String>,
+    planned: &PlannedQuery,
+    options: &ExecutionOptions,
+    started: Instant,
+) -> Result<Vec<MaterializedProjectionRow>, BuildExecutionError> {
+    let fanout_limit = traversal
+        .contract
+        .as_ref()
+        .map(|contract| contract.max_fanout_per_node)
+        .unwrap_or(options.resource_budget.maximum_graph_traversal_fanout)
+        .min(options.resource_budget.maximum_graph_traversal_fanout);
+    let path_limit = traversal
+        .contract
+        .as_ref()
+        .map(|contract| contract.max_paths)
+        .unwrap_or(options.resource_budget.maximum_graph_traversal_paths)
+        .min(options.resource_budget.maximum_graph_traversal_paths);
+    let frontier_limit = traversal
+        .contract
+        .as_ref()
+        .map(|contract| contract.max_frontier)
+        .unwrap_or(options.resource_budget.maximum_graph_traversal_frontier)
+        .min(options.resource_budget.maximum_graph_traversal_frontier);
+    let mut emitted = Vec::new();
+    let mut seen = BTreeSet::<String>::new();
+    if traversal.min_depth == 0 {
+        for row in rows {
+            if let Some(state) = graph_row_path_state(row, root) {
+                push_graph_emitted_row(
+                    row.clone(),
+                    &state,
+                    traversal.distinct,
+                    &mut seen,
+                    &mut emitted,
+                );
+            }
+        }
+    }
+    let mut frontier = rows.to_vec();
+    for depth in 1..=traversal.max_depth {
+        check_time(&options.resource_budget, started)?;
+        let mut next = Vec::new();
+        for row in &frontier {
+            let Some(state) = graph_row_path_state(row, root) else {
+                continue;
+            };
+            let mut fanout = 0usize;
+            for association in visible_associations.iter().filter(|association| {
+                association.object_type_id == traversal.edge.association.object_type_id
+                    && association_row_matches_temporal(
+                        association,
+                        &traversal.edge.association,
+                        association_valid_at(planned),
+                    )
+            }) {
+                let Some((target_goid, source_matches)) =
+                    traversal_target_goid(&state.current_goid, association, traversal.direction)
+                else {
+                    continue;
+                };
+                if !source_matches
+                    || (object_goids.contains(&target_goid)
+                        && !visible_object_goids.contains(&target_goid))
+                {
+                    continue;
+                }
+                let edge_goid = association.goid.clone();
+                if !graph_traversal_mode_allows(&state, &edge_goid, &target_goid, traversal.mode) {
+                    continue;
+                }
+                fanout += 1;
+                if fanout > fanout_limit {
+                    return Err(resource_error("maximum_graph_traversal_fanout", fanout));
+                }
+                let mut candidate = merge_lookup_projection_rows(
+                    row,
+                    &namespace_graph_edge_projection_row(association, &traversal.edge),
+                );
+                if let Some(target) = &traversal.target {
+                    let Some(target_row) =
+                        by_type_and_goid.get(&(target.object.object_type_id, target_goid.clone()))
+                    else {
+                        continue;
+                    };
+                    candidate = merge_lookup_projection_rows(
+                        &candidate,
+                        &namespace_graph_node_projection_row(target_row, target, false),
+                    );
+                }
+                let next_state = state.extend(edge_goid, target_goid);
+                candidate = with_graph_path_state(candidate, &next_state);
+                if depth >= traversal.min_depth {
+                    push_graph_emitted_row(
+                        candidate.clone(),
+                        &next_state,
+                        traversal.distinct,
+                        &mut seen,
+                        &mut emitted,
+                    );
+                    if emitted.len() > path_limit {
+                        return Err(resource_error(
+                            "maximum_graph_traversal_paths",
+                            emitted.len(),
+                        ));
+                    }
+                }
+                next.push(candidate);
+                if next.len() > frontier_limit {
+                    return Err(resource_error(
+                        "maximum_graph_traversal_frontier",
+                        next.len(),
+                    ));
+                }
+            }
+        }
+        frontier = next;
+        if frontier.is_empty() {
+            break;
+        }
+    }
+    Ok(emitted)
+}
+
+fn graph_traversal_mode_allows(
+    state: &GraphPathState,
+    edge_goid: &str,
+    target_goid: &str,
+    mode: GraphTraversalMode,
+) -> bool {
+    match mode {
+        GraphTraversalMode::Walk => true,
+        GraphTraversalMode::Trail => !state.edge_goids.iter().any(|edge| edge == edge_goid),
+        GraphTraversalMode::SimplePath => {
+            !state.edge_goids.iter().any(|edge| edge == edge_goid)
+                && !state.node_goids.iter().any(|node| node == target_goid)
+        }
+    }
+}
+
+fn push_graph_emitted_row(
+    row: MaterializedProjectionRow,
+    state: &GraphPathState,
+    distinct: GraphTraversalDistinctPolicy,
+    seen: &mut BTreeSet<String>,
+    emitted: &mut Vec<MaterializedProjectionRow>,
+) {
+    let key = match distinct {
+        GraphTraversalDistinctPolicy::None => None,
+        GraphTraversalDistinctPolicy::Path => Some(format!(
+            "{}|{}",
+            state.start_goid,
+            state.edge_goids.join(">")
+        )),
+        GraphTraversalDistinctPolicy::EndNode => {
+            Some(format!("{}|{}", state.start_goid, state.current_goid))
+        }
+    };
+    if let Some(key) = key {
+        if !seen.insert(key) {
+            return;
+        }
+    }
+    emitted.push(row);
+}
+
+fn graph_row_path_state(
+    row: &MaterializedProjectionRow,
+    root: &crate::ResolvedGraphNodeRoot,
+) -> Option<GraphPathState> {
+    let current_goid = graph_row_current_goid(row, root)?;
+    let start_goid = row
+        .values
+        .get(GRAPH_PATH_START_GOID_FIELD)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| current_goid.clone());
+    let node_goids = graph_string_array_field(row, GRAPH_PATH_NODE_GOIDS_FIELD)
+        .unwrap_or_else(|| vec![current_goid.clone()]);
+    let edge_goids = graph_string_array_field(row, GRAPH_PATH_EDGE_GOIDS_FIELD).unwrap_or_default();
+    let depth = row
+        .values
+        .get(GRAPH_PATH_DEPTH_FIELD)
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or(edge_goids.len() as u32);
+    Some(GraphPathState {
+        start_goid,
+        current_goid,
+        node_goids,
+        edge_goids,
+        depth,
+    })
+}
+
+fn graph_string_array_field(row: &MaterializedProjectionRow, field: &str) -> Option<Vec<String>> {
+    row.values
+        .get(field)
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+}
+
+fn graph_row_current_goid(
+    row: &MaterializedProjectionRow,
+    root: &crate::ResolvedGraphNodeRoot,
+) -> Option<String> {
+    if let Some(goid) = row
+        .values
+        .get(GRAPH_CURRENT_GOID_FIELD)
+        .and_then(Value::as_str)
+    {
+        return Some(goid.to_string());
+    }
+    table_binding_labels_for_graph_node(root)
+        .into_iter()
+        .find_map(|label| {
+            row.values
+                .get(&format!("{label}.goid"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .or_else(|| {
+            row.values
+                .get("goid")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+}
+
+fn with_graph_current_goid(
+    mut row: MaterializedProjectionRow,
+    goid: &str,
+) -> MaterializedProjectionRow {
+    debug_assert!(GRAPH_CURRENT_GOID_FIELD.starts_with(INTERNAL_PROJECTION_FIELD_PREFIX));
+    row.values.insert(
+        GRAPH_CURRENT_GOID_FIELD.into(),
+        Value::String(goid.to_string()),
+    );
+    row
+}
+
+fn with_graph_path_state(
+    mut row: MaterializedProjectionRow,
+    state: &GraphPathState,
+) -> MaterializedProjectionRow {
+    row = with_graph_current_goid(row, &state.current_goid);
+    row.values.insert(
+        GRAPH_PATH_START_GOID_FIELD.into(),
+        Value::String(state.start_goid.clone()),
+    );
+    row.values.insert(
+        GRAPH_PATH_NODE_GOIDS_FIELD.into(),
+        Value::Array(
+            state
+                .node_goids
+                .iter()
+                .map(|goid| Value::String(goid.clone()))
+                .collect(),
+        ),
+    );
+    row.values.insert(
+        GRAPH_PATH_EDGE_GOIDS_FIELD.into(),
+        Value::Array(
+            state
+                .edge_goids
+                .iter()
+                .map(|goid| Value::String(goid.clone()))
+                .collect(),
+        ),
+    );
+    row.values
+        .insert(GRAPH_PATH_DEPTH_FIELD.into(), json!(state.depth));
+    row
+}
+
+fn traversal_target_goid(
+    current_goid: &str,
+    association: &MaterializedAssociationRow,
+    direction: crate::AstAssociationDirection,
+) -> Option<(String, bool)> {
+    let source = association.source_goid.as_deref();
+    let target = association.target_goid.as_deref();
+    match direction {
+        crate::AstAssociationDirection::Out => Some((target?.to_string(), source? == current_goid)),
+        crate::AstAssociationDirection::In => Some((source?.to_string(), target? == current_goid)),
+        crate::AstAssociationDirection::Either => {
+            if source? == current_goid {
+                Some((target?.to_string(), true))
+            } else if target? == current_goid {
+                Some((source?.to_string(), true))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+fn namespace_graph_node_projection_row(
+    row: &MaterializedObjectRow,
+    node: &crate::ResolvedGraphNodeRoot,
+    include_unqualified: bool,
+) -> MaterializedProjectionRow {
+    let base = object_projection_values(row);
+    let mut values = if include_unqualified {
+        base.clone()
+    } else {
+        BTreeMap::new()
+    };
+    for label in table_binding_labels_for_graph_node(node) {
+        for (field, value) in &base {
+            values.insert(format!("{label}.{field}"), value.clone());
+        }
+    }
+    MaterializedProjectionRow {
+        projection_id: format!("node:{}", node.label),
+        values,
+    }
+}
+
+fn namespace_graph_edge_projection_row(
+    row: &MaterializedAssociationRow,
+    edge: &crate::ResolvedGraphEdgeRoot,
+) -> MaterializedProjectionRow {
+    let base = association_projection_values(row);
+    let mut values = BTreeMap::new();
+    for label in table_binding_labels_for_graph_edge(edge) {
+        for (field, value) in &base {
+            values.insert(format!("{label}.{field}"), value.clone());
+        }
+    }
+    MaterializedProjectionRow {
+        projection_id: format!("edge:{}", edge.label),
+        values,
+    }
+}
+
+fn table_binding_labels_for_graph_node(root: &crate::ResolvedGraphNodeRoot) -> Vec<String> {
+    let mut labels = Vec::new();
+    if let Some(alias) = &root.binding_name {
+        labels.push(alias.clone());
+    }
+    if !labels.iter().any(|label| label == &root.label) {
+        labels.push(root.label.clone());
+    }
+    labels
+}
+
+fn table_binding_labels_for_graph_edge(root: &crate::ResolvedGraphEdgeRoot) -> Vec<String> {
+    let mut labels = Vec::new();
+    if let Some(alias) = &root.binding_name {
+        labels.push(alias.clone());
+    }
+    if !labels.iter().any(|label| label == &root.label) {
+        labels.push(root.label.clone());
+    }
+    labels
+}
+
+fn object_projection_values(row: &MaterializedObjectRow) -> BTreeMap<String, Value> {
+    let mut values = BTreeMap::new();
+    values.insert("object_type_id".into(), json!(row.object_type_id));
+    values.insert(
+        "object_type_name".into(),
+        Value::String(row.object_type_name.clone()),
+    );
+    values.insert("branch_key".into(), json!(row.branch_key));
+    values.insert("goid".into(), Value::String(row.goid.clone()));
+    values.insert("record_id".into(), Value::String(row.record_id.clone()));
+    values.insert("timestamp_us".into(), json!(row.timestamp_us));
+    values.insert("csn".into(), json!(row.csn));
+    values.insert("record_kind".into(), Value::String(row.record_kind.clone()));
+    for (property, value) in &row.properties {
+        values.insert(property.clone(), value.clone());
+    }
+    values
+}
+
+fn association_projection_values(row: &MaterializedAssociationRow) -> BTreeMap<String, Value> {
+    let mut values = BTreeMap::new();
+    values.insert("association_type_id".into(), json!(row.object_type_id));
+    values.insert(
+        "association_type".into(),
+        row.association_type
+            .as_ref()
+            .map(|value| Value::String(value.clone()))
+            .unwrap_or(Value::Null),
+    );
+    values.insert("branch_key".into(), json!(row.branch_key));
+    values.insert("goid".into(), Value::String(row.goid.clone()));
+    values.insert("association_goid".into(), Value::String(row.goid.clone()));
+    values.insert("record_id".into(), Value::String(row.record_id.clone()));
+    values.insert(
+        "source_goid".into(),
+        row.source_goid
+            .as_ref()
+            .map(|value| Value::String(value.clone()))
+            .unwrap_or(Value::Null),
+    );
+    values.insert(
+        "target_goid".into(),
+        row.target_goid
+            .as_ref()
+            .map(|value| Value::String(value.clone()))
+            .unwrap_or(Value::Null),
+    );
+    values.insert("timestamp_us".into(), json!(row.timestamp_us));
+    values.insert("csn".into(), json!(row.csn));
+    for (property, value) in &row.properties {
+        values.insert(property.clone(), value.clone());
+    }
+    values
+}
+
 pub(crate) fn projection_readback_pushdown_report(
     planned: &PlannedQuery,
     options: &ExecutionOptions,
@@ -2447,7 +3695,10 @@ pub(crate) fn projection_readback_pushdown_report(
 }
 
 fn projection_filters_for_plan(planned: &PlannedQuery) -> Vec<ProjectionFilter> {
-    if !matches!(planned.resolved.root, ResolvedRoot::Projection(_)) {
+    if !matches!(
+        planned.resolved.root,
+        ResolvedRoot::Projection(_) | ResolvedRoot::Table(_)
+    ) {
         return Vec::new();
     }
     let Some(predicate) = &planned.resolved.method_chain.where_predicate else {
@@ -2464,7 +3715,7 @@ fn projection_output_columns_for_parts(
     root: &ResolvedRoot,
     method_chain: &ResolvedMethodChain,
 ) -> Option<Vec<String>> {
-    if !matches!(root, ResolvedRoot::Projection(_)) {
+    if !matches!(root, ResolvedRoot::Projection(_) | ResolvedRoot::Table(_)) {
         return None;
     }
     let Some(select) = &method_chain.select else {
@@ -2536,6 +3787,9 @@ fn collect_projection_expr_column(expr: &ResolvedExpr, columns: &mut BTreeSet<St
             collect_projection_predicate_columns(predicate, columns);
             collect_projection_expr_column(then_expr, columns);
             collect_projection_expr_column(else_expr, columns);
+        }
+        ResolvedExpr::TableExists(exists) => {
+            collect_projection_predicate_columns(&exists.on, columns);
         }
         ResolvedExpr::Association(_) | ResolvedExpr::Evidence(_) | ResolvedExpr::Literal(_) => {}
     }
@@ -2762,9 +4016,18 @@ fn projection_path(expr: &ResolvedExpr) -> Option<&ResolvedPath> {
 }
 
 fn projection_column(path: &ResolvedPath) -> String {
-    path.projection_column
+    let column = path
+        .projection_column
         .clone()
-        .unwrap_or_else(|| path.display_name.clone())
+        .unwrap_or_else(|| path.display_name.clone());
+    if matches!(path.root_kind, crate::ResolvedPathRootKind::Table) {
+        column
+            .rsplit_once('.')
+            .map(|(_, unqualified)| unqualified.to_string())
+            .unwrap_or(column)
+    } else {
+        column
+    }
 }
 
 fn projection_filter_op(op: AstCompareOp) -> Option<ProjectionFilterOp> {
@@ -2840,13 +4103,30 @@ pub(crate) fn finish_materialized_rows(
     rows: Vec<ExecutionRow>,
     associations: &[MaterializedAssociationRow],
     evidence_rows: &[MaterializedEvidenceRow],
+    object_rows: &[MaterializedObjectRow],
     planned: &PlannedQuery,
     options: &ExecutionOptions,
     started: Instant,
-) -> Result<(CoveOqlExecutionResult, ExecutionRowCounts), BuildExecutionError> {
+) -> Result<(CoveQlExecutionResult, ExecutionRowCounts), BuildExecutionError> {
     let context_associations = filter_association_context_rows(associations, planned, options);
     let context_evidence_rows = filter_evidence_context_rows(evidence_rows, planned, options);
-    let context = EvalContext::for_plan(&context_associations, &context_evidence_rows, planned);
+    let context_object_rows = filter_object_context_rows(object_rows, planned, options);
+    let context = EvalContext::for_plan_with_objects(
+        &context_associations,
+        &context_evidence_rows,
+        &context_object_rows,
+        planned,
+    );
+    finish_materialized_rows_with_context(rows, planned, options, started, &context)
+}
+
+fn finish_materialized_rows_with_context(
+    rows: Vec<ExecutionRow>,
+    planned: &PlannedQuery,
+    options: &ExecutionOptions,
+    started: Instant,
+    context: &EvalContext<'_>,
+) -> Result<(CoveQlExecutionResult, ExecutionRowCounts), BuildExecutionError> {
     let rows = apply_visibility_overlay(rows, planned, options);
     let rows = enforce_redaction_policy(rows, planned)?;
     let rows = enforce_materialized_branch_policy(rows, planned)?;
@@ -2876,8 +4156,8 @@ pub(crate) fn finish_materialized_rows(
     let rows = apply_skip_take(rows, planned);
     let output_rows = rows.len();
     match &planned.resolved.output_mode {
-        CoveOqlOutputMode::ObjectRows => Ok((
-            CoveOqlExecutionResult::ObjectRows(
+        CoveQlOutputMode::ObjectRows => Ok((
+            CoveQlExecutionResult::ObjectRows(
                 rows.into_iter()
                     .filter_map(|row| match row {
                         ExecutionRow::Object(row) => Some(row),
@@ -2891,8 +4171,8 @@ pub(crate) fn finish_materialized_rows(
                 output_rows,
             },
         )),
-        CoveOqlOutputMode::AssociationRows => Ok((
-            CoveOqlExecutionResult::AssociationRows(
+        CoveQlOutputMode::AssociationRows => Ok((
+            CoveQlExecutionResult::AssociationRows(
                 rows.into_iter()
                     .filter_map(|row| match row {
                         ExecutionRow::Association(row) => Some(row),
@@ -2906,8 +4186,8 @@ pub(crate) fn finish_materialized_rows(
                 output_rows,
             },
         )),
-        CoveOqlOutputMode::EvidenceRows => Ok((
-            CoveOqlExecutionResult::EvidenceRows(
+        CoveQlOutputMode::EvidenceRows => Ok((
+            CoveQlExecutionResult::EvidenceRows(
                 rows.into_iter()
                     .filter_map(|row| match row {
                         ExecutionRow::Evidence(row) => Some(row),
@@ -2921,8 +4201,8 @@ pub(crate) fn finish_materialized_rows(
                 output_rows,
             },
         )),
-        CoveOqlOutputMode::ProjectionRows => Ok((
-            CoveOqlExecutionResult::ProjectionRows(
+        CoveQlOutputMode::ProjectionRows => Ok((
+            CoveQlExecutionResult::ProjectionRows(
                 rows.into_iter()
                     .filter_map(|row| match row {
                         ExecutionRow::Projection(row) => Some(row),
@@ -2936,7 +4216,7 @@ pub(crate) fn finish_materialized_rows(
                 output_rows,
             },
         )),
-        CoveOqlOutputMode::JsonRows => {
+        CoveQlOutputMode::JsonRows => {
             let json_rows = select_json_rows(&rows, planned, &context)?;
             finish_json_rows(
                 json_rows,
@@ -2947,7 +4227,7 @@ pub(crate) fn finish_materialized_rows(
                 started,
             )
         }
-        CoveOqlOutputMode::ArrowRecordBatch { .. } => {
+        CoveQlOutputMode::ArrowRecordBatch { .. } => {
             let batch =
                 crate::kernel_arrow::execution_rows_to_owned_record_batch(&rows, planned, &context)
                     .map_err(|err| {
@@ -2958,7 +4238,7 @@ pub(crate) fn finish_materialized_rows(
                         )
                     })?;
             Ok((
-                CoveOqlExecutionResult::ArrowRecordBatches(vec![batch]),
+                CoveQlExecutionResult::ArrowRecordBatches(vec![batch]),
                 ExecutionRowCounts {
                     input_rows,
                     filtered_rows,
@@ -2966,7 +4246,7 @@ pub(crate) fn finish_materialized_rows(
                 },
             ))
         }
-        CoveOqlOutputMode::ExplainJson | CoveOqlOutputMode::DataFusionTableProvider => {
+        CoveQlOutputMode::ExplainJson | CoveQlOutputMode::DataFusionTableProvider => {
             unreachable!("handled before row execution")
         }
     }
@@ -3097,6 +4377,20 @@ fn filter_evidence_context_rows(
         .collect()
 }
 
+fn filter_object_context_rows(
+    rows: &[MaterializedObjectRow],
+    planned: &PlannedQuery,
+    options: &ExecutionOptions,
+) -> Vec<MaterializedObjectRow> {
+    let Some(overlay) = active_visibility_overlay(planned, options) else {
+        return rows.to_vec();
+    };
+    rows.iter()
+        .filter(|row| object_row_visible_in_overlay(row, overlay))
+        .cloned()
+        .collect()
+}
+
 fn active_visibility_overlay<'a>(
     planned: &PlannedQuery,
     options: &'a ExecutionOptions,
@@ -3118,6 +4412,10 @@ fn association_row_visible_in_overlay(
     row: &MaterializedAssociationRow,
     overlay: &VisibilityOverlay,
 ) -> bool {
+    overlay.visible_goids.contains(&row.goid) || overlay.visible_record_ids.contains(&row.record_id)
+}
+
+fn object_row_visible_in_overlay(row: &MaterializedObjectRow, overlay: &VisibilityOverlay) -> bool {
     overlay.visible_goids.contains(&row.goid) || overlay.visible_record_ids.contains(&row.record_id)
 }
 
@@ -3156,12 +4454,12 @@ pub(crate) fn finish_json_rows(
     planned: &PlannedQuery,
     options: &ExecutionOptions,
     started: Instant,
-) -> Result<(CoveOqlExecutionResult, ExecutionRowCounts), BuildExecutionError> {
+) -> Result<(CoveQlExecutionResult, ExecutionRowCounts), BuildExecutionError> {
     check_time(&options.resource_budget, started)?;
     let output_rows = json_rows.len();
     if matches!(
         planned.resolved.output_mode,
-        CoveOqlOutputMode::ArrowRecordBatch { .. }
+        CoveQlOutputMode::ArrowRecordBatch { .. }
     ) {
         let batch =
             crate::kernel_arrow::json_rows_to_owned_record_batch_for_plan(&json_rows, planned)
@@ -3173,7 +4471,7 @@ pub(crate) fn finish_json_rows(
                     )
                 })?;
         Ok((
-            CoveOqlExecutionResult::ArrowRecordBatches(vec![batch]),
+            CoveQlExecutionResult::ArrowRecordBatches(vec![batch]),
             ExecutionRowCounts {
                 input_rows,
                 filtered_rows,
@@ -3182,7 +4480,7 @@ pub(crate) fn finish_json_rows(
         ))
     } else {
         Ok((
-            CoveOqlExecutionResult::JsonRows(json_rows),
+            CoveQlExecutionResult::JsonRows(json_rows),
             ExecutionRowCounts {
                 input_rows,
                 filtered_rows,
@@ -3985,7 +5283,7 @@ pub(crate) fn zero_copy_owned_fallback_warning(
         let reason = zero_copy_owned_fallback_reason(planned);
         Some(exec_warning(
             "W_ZERO_COPY_MATERIALIZED_FALLBACK",
-            "zero-copy Arrow output was requested, but Cove-OQL execution emitted owned materialized buffers",
+            "zero-copy Arrow output was requested, but CoveQL execution emitted owned materialized buffers",
             json!({ "fallback": "materialized_owned_arrow_buffers", "reason": reason }),
         ))
     } else {
@@ -4034,7 +5332,7 @@ fn zero_copy_owned_fallback_reason(planned: &PlannedQuery) -> String {
 fn zero_copy_arrow_requested(planned: &PlannedQuery) -> bool {
     matches!(
         planned.resolved.output_mode,
-        CoveOqlOutputMode::ArrowRecordBatch {
+        CoveQlOutputMode::ArrowRecordBatch {
             zero_copy_requested: true
         }
     )
@@ -4159,12 +5457,12 @@ pub(crate) fn validate_execution_grain(planned: &PlannedQuery) -> Result<(), Bui
     if planned.resolved.operation_context.dataset.files.len() > 1
         && !matches!(
             planned.resolved.output_mode,
-            CoveOqlOutputMode::ExplainJson | CoveOqlOutputMode::DataFusionTableProvider
+            CoveQlOutputMode::ExplainJson | CoveQlOutputMode::DataFusionTableProvider
         )
     {
         return Err(exec_error(
             "E_UNSUPPORTED_DATASET_SCOPE",
-            "multi-file dataset scopes require manifest-member execution; the single-input OQL executor refuses to run a manifest-scoped plan against one file",
+            "multi-file dataset scopes require manifest-member execution; the single-input CoveQL executor refuses to run a manifest-scoped plan against one file",
             json!({
                 "dataset_id": planned.resolved.operation_context.dataset.dataset_id.clone(),
                 "manifest_id": planned.resolved.operation_context.dataset.manifest_id.clone(),
@@ -4176,7 +5474,7 @@ pub(crate) fn validate_execution_grain(planned: &PlannedQuery) -> Result<(), Bui
 
     if matches!(
         planned.resolved.root,
-        ResolvedRoot::Projection(_) | ResolvedRoot::Evidence(_)
+        ResolvedRoot::Table(_) | ResolvedRoot::Projection(_) | ResolvedRoot::Evidence(_)
     ) && (planned.resolved.method_chain.history.is_some()
         || planned.resolved.method_chain.changes.is_some())
     {
@@ -4193,14 +5491,15 @@ pub(crate) fn validate_execution_output_mode(
     planned: &PlannedQuery,
 ) -> Result<(), BuildExecutionError> {
     let output_valid = match (&planned.resolved.root, &planned.resolved.output_mode) {
-        (_, CoveOqlOutputMode::JsonRows)
-        | (_, CoveOqlOutputMode::ArrowRecordBatch { .. })
-        | (_, CoveOqlOutputMode::ExplainJson) => true,
-        (ResolvedRoot::Object(_), CoveOqlOutputMode::ObjectRows) => true,
-        (ResolvedRoot::Association(_), CoveOqlOutputMode::AssociationRows) => true,
-        (ResolvedRoot::Evidence(_), CoveOqlOutputMode::EvidenceRows) => true,
-        (ResolvedRoot::Projection(_), CoveOqlOutputMode::ProjectionRows) => true,
-        (_, CoveOqlOutputMode::DataFusionTableProvider) => true,
+        (_, CoveQlOutputMode::JsonRows)
+        | (_, CoveQlOutputMode::ArrowRecordBatch { .. })
+        | (_, CoveQlOutputMode::ExplainJson) => true,
+        (ResolvedRoot::Object(_), CoveQlOutputMode::ObjectRows) => true,
+        (ResolvedRoot::Association(_), CoveQlOutputMode::AssociationRows) => true,
+        (ResolvedRoot::Evidence(_), CoveQlOutputMode::EvidenceRows) => true,
+        (ResolvedRoot::Projection(_), CoveQlOutputMode::ProjectionRows) => true,
+        (ResolvedRoot::Table(_), CoveQlOutputMode::ProjectionRows) => true,
+        (_, CoveQlOutputMode::DataFusionTableProvider) => true,
         _ => false,
     };
     if !output_valid {
@@ -4232,13 +5531,16 @@ fn execution_root_kind_name(root: &ResolvedRoot) -> &'static str {
     match root {
         ResolvedRoot::Object(_) => "object",
         ResolvedRoot::Association(_) => "association",
+        ResolvedRoot::Node(_) => "node",
+        ResolvedRoot::Edge(_) => "edge",
+        ResolvedRoot::Table(_) => "table",
         ResolvedRoot::Projection(_) => "projection",
         ResolvedRoot::Evidence(_) => "evidence",
     }
 }
 
 pub(crate) fn enforce_result_budgets(
-    result: &CoveOqlExecutionResult,
+    result: &CoveQlExecutionResult,
     row_counts: &ExecutionRowCounts,
     planned: &PlannedQuery,
     options: &ExecutionOptions,
@@ -4253,9 +5555,7 @@ pub(crate) fn enforce_result_budgets(
             row_counts.output_rows,
         ));
     }
-    let decode_bytes = serde_json::to_vec(&result_json(result)?)
-        .map_err(|err| exec_error("E_OUTPUT", err.to_string(), json!({})))?
-        .len();
+    let decode_bytes = result_decode_size(result)?;
     if decode_bytes > options.resource_budget.maximum_decode_bytes {
         return Err(resource_error("maximum_decode_bytes", decode_bytes));
     }
@@ -4280,44 +5580,125 @@ pub(crate) fn check_time(
 }
 
 pub(crate) fn result_fingerprint(
-    result: &CoveOqlExecutionResult,
+    result: &CoveQlExecutionResult,
 ) -> Result<String, BuildExecutionError> {
+    if let CoveQlExecutionResult::ArrowRecordBatches(batches) = result {
+        return Ok(arrow_record_batches_fingerprint(batches));
+    }
     let value = result_json(result)?;
     let bytes = serde_json::to_vec(&value)
         .map_err(|err| exec_error("E_OUTPUT", err.to_string(), json!({})))?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 
-pub(crate) fn result_json(result: &CoveOqlExecutionResult) -> Result<Value, BuildExecutionError> {
+fn result_decode_size(result: &CoveQlExecutionResult) -> Result<usize, BuildExecutionError> {
+    if let CoveQlExecutionResult::ArrowRecordBatches(batches) = result {
+        return Ok(arrow_record_batches_memory_size(batches));
+    }
+    serde_json::to_vec(&result_json(result)?)
+        .map(|bytes| bytes.len())
+        .map_err(|err| exec_error("E_OUTPUT", err.to_string(), json!({})))
+}
+
+fn arrow_record_batches_memory_size(batches: &[RecordBatch]) -> usize {
+    batches.iter().map(RecordBatch::get_array_memory_size).sum()
+}
+
+fn arrow_record_batches_fingerprint(batches: &[RecordBatch]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"coveql-arrow-record-batches-v1");
+    hash_usize(&mut hasher, batches.len());
+    for batch in batches {
+        hash_usize(&mut hasher, batch.num_rows());
+        hash_usize(&mut hasher, batch.num_columns());
+        hash_arrow_schema(&mut hasher, batch.schema().as_ref());
+        for column in batch.columns() {
+            hash_arrow_array_data(&mut hasher, &column.to_data());
+        }
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn hash_arrow_schema(hasher: &mut Sha256, schema: &arrow_schema::Schema) {
+    hash_usize(hasher, schema.fields().len());
+    for field in schema.fields() {
+        hash_str(hasher, field.name());
+        hash_str(hasher, &format!("{:?}", field.data_type()));
+        hasher.update([u8::from(field.is_nullable())]);
+        let mut metadata = field.metadata().iter().collect::<Vec<_>>();
+        metadata.sort_by(|left, right| left.0.cmp(right.0));
+        hash_usize(hasher, metadata.len());
+        for (key, value) in metadata {
+            hash_str(hasher, key);
+            hash_str(hasher, value);
+        }
+    }
+}
+
+fn hash_arrow_array_data(hasher: &mut Sha256, data: &ArrayData) {
+    hash_str(hasher, &format!("{:?}", data.data_type()));
+    hash_usize(hasher, data.len());
+    hash_usize(hasher, data.offset());
+    if let Some(nulls) = data.nulls() {
+        hasher.update([1]);
+        hash_usize(hasher, nulls.len());
+        hash_usize(hasher, nulls.offset());
+        hash_usize(hasher, nulls.null_count());
+        hash_usize(hasher, nulls.validity().len());
+        hasher.update(nulls.validity());
+    } else {
+        hasher.update([0]);
+    }
+    hash_usize(hasher, data.buffers().len());
+    for buffer in data.buffers() {
+        hash_usize(hasher, buffer.len());
+        hasher.update(buffer.as_slice());
+    }
+    hash_usize(hasher, data.child_data().len());
+    for child in data.child_data() {
+        hash_arrow_array_data(hasher, child);
+    }
+}
+
+fn hash_str(hasher: &mut Sha256, value: &str) {
+    hash_usize(hasher, value.len());
+    hasher.update(value.as_bytes());
+}
+
+fn hash_usize(hasher: &mut Sha256, value: usize) {
+    hasher.update((value as u64).to_le_bytes());
+}
+
+pub(crate) fn result_json(result: &CoveQlExecutionResult) -> Result<Value, BuildExecutionError> {
     Ok(match result {
-        CoveOqlExecutionResult::ObjectRows(rows) => {
+        CoveQlExecutionResult::ObjectRows(rows) => {
             Value::Array(rows.iter().map(MaterializedObjectRow::to_json).collect())
         }
-        CoveOqlExecutionResult::AssociationRows(rows) => Value::Array(
+        CoveQlExecutionResult::AssociationRows(rows) => Value::Array(
             rows.iter()
                 .map(MaterializedAssociationRow::to_json)
                 .collect(),
         ),
-        CoveOqlExecutionResult::EvidenceRows(rows) => {
+        CoveQlExecutionResult::EvidenceRows(rows) => {
             Value::Array(rows.iter().map(MaterializedEvidenceRow::to_json).collect())
         }
-        CoveOqlExecutionResult::ProjectionRows(rows) => Value::Array(
+        CoveQlExecutionResult::ProjectionRows(rows) => Value::Array(
             rows.iter()
                 .map(MaterializedProjectionRow::to_json)
                 .collect(),
         ),
-        CoveOqlExecutionResult::ArrowRecordBatches(batches) => Value::Array(
+        CoveQlExecutionResult::ArrowRecordBatches(batches) => Value::Array(
             record_batches_to_json_rows(batches)
                 .map_err(|err| exec_error("E_ARROW_OUTPUT", err, json!({})))?,
         ),
-        CoveOqlExecutionResult::JsonRows(rows) => Value::Array(rows.clone()),
-        CoveOqlExecutionResult::ExplainJson(value) => value.clone(),
+        CoveQlExecutionResult::JsonRows(rows) => Value::Array(rows.clone()),
+        CoveQlExecutionResult::ExplainJson(value) => value.clone(),
     })
 }
 
-fn max_output_columns(result: &CoveOqlExecutionResult) -> Result<usize, BuildExecutionError> {
+fn max_output_columns(result: &CoveQlExecutionResult) -> Result<usize, BuildExecutionError> {
     let rows = match result {
-        CoveOqlExecutionResult::ArrowRecordBatches(batches) => {
+        CoveQlExecutionResult::ArrowRecordBatches(batches) => {
             return Ok(batches
                 .iter()
                 .map(|batch| batch.num_columns())
@@ -4345,6 +5726,7 @@ fn output_name_for_expr(expr: &ResolvedExpr) -> String {
         ResolvedExpr::Literal(_) => "literal".into(),
         ResolvedExpr::Association(association) => association.type_name.clone(),
         ResolvedExpr::Evidence(_) => "evidence".into(),
+        ResolvedExpr::TableExists(_) => "exists".into(),
         ResolvedExpr::Conditional { .. } => "if".into(),
     }
 }

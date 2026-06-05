@@ -1,5 +1,5 @@
 use crate::{
-    BranchContext, CoveOqlOutputMode, FallbackPolicy, OperationContext, ResourceBudgetPolicy,
+    BranchContext, CoveQlOutputMode, FallbackPolicy, OperationContext, ResourceBudgetPolicy,
     ResourceUseEstimate, SecurityContext, TemporalContext, TombstoneContext,
 };
 use serde::{Deserialize, Serialize};
@@ -67,12 +67,15 @@ pub struct ResolveOptions {
     pub security: SecurityContext,
     pub fallback_policy: FallbackPolicy,
     pub resource_budget: ResourceBudgetPolicy,
-    pub output_mode: Option<CoveOqlOutputMode>,
+    pub output_mode: Option<CoveQlOutputMode>,
     pub cache_hook: Option<crate::CacheHookRef>,
     pub execution_code_mapping_requested: bool,
+    pub table_surface_contracts: BTreeMap<String, TableSurfaceContract>,
+    pub graph_traversal_contract: Option<GraphTraversalContract>,
     pub branch_aliases: BTreeMap<String, u64>,
     pub ambiguous_branch_aliases: BTreeMap<String, Vec<u64>>,
     pub temporal_role_bindings: BTreeMap<crate::TemporalRole, String>,
+    pub enabled_profiles: Vec<crate::CoveQlProfileId>,
 }
 
 impl Default for ResolveOptions {
@@ -84,9 +87,16 @@ impl Default for ResolveOptions {
             output_mode: None,
             cache_hook: None,
             execution_code_mapping_requested: false,
+            table_surface_contracts: BTreeMap::new(),
+            graph_traversal_contract: None,
             branch_aliases: BTreeMap::new(),
             ambiguous_branch_aliases: BTreeMap::new(),
             temporal_role_bindings: BTreeMap::new(),
+            enabled_profiles: vec![
+                crate::CoveQlProfileId::Object,
+                crate::CoveQlProfileId::Table,
+                crate::CoveQlProfileId::Graph,
+            ],
         }
     }
 }
@@ -94,7 +104,10 @@ impl Default for ResolveOptions {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParsedQuery {
     pub language_version: String,
+    pub directives: Vec<AstDirective>,
+    pub profiles: Vec<crate::CoveQlProfileId>,
     pub root: Spanned<AstRoot>,
+    pub root_alias: Option<AstIdentifier>,
     pub methods: Vec<Spanned<AstMethod>>,
     #[serde(skip)]
     pub span: SourceSpan,
@@ -105,11 +118,24 @@ pub struct ParsedQuery {
 
 impl ParsedQuery {
     pub fn to_canonical_query(&self) -> String {
-        let mut query = format!(
-            "# cove-oql:{}\n{}",
-            self.language_version,
-            render_root(&self.root.node)
-        );
+        let mut query = format!("# coveql:{}\n", self.language_version);
+        if !self.profiles.is_empty() {
+            query.push_str("# profiles: ");
+            query.push_str(
+                &self
+                    .profiles
+                    .iter()
+                    .map(|profile| profile.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
+            query.push('\n');
+        }
+        query.push_str(&render_root(&self.root.node));
+        if let Some(alias) = &self.root_alias {
+            query.push_str(" as ");
+            query.push_str(&render_identifier(alias));
+        }
         for method in &self.methods {
             query.push('.');
             query.push_str(&render_method(&method.node));
@@ -135,12 +161,22 @@ impl AstIdentifier {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AstDirective {
+    pub name: AstIdentifier,
+    pub values: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind", content = "value")]
 pub enum AstRoot {
     Object(AstIdentifier),
     Association(AstAssociationExpr),
     Evidence(AstEvidenceExpr),
     Projection(AstIdentifier),
+    Table(AstIdentifier),
+    Node(AstIdentifier),
+    Edge(AstGraphEdgeExpr),
+    Path(AstPathRootExpr),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -162,6 +198,29 @@ pub enum AstMethod {
     Skip(u64),
     GroupBy(Vec<Spanned<AstExpr>>),
     Explain(crate::ExplainMode),
+    ProfileCall {
+        name: AstIdentifier,
+        args: Vec<AstProfileArgument>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AstRootBinding {
+    pub root: Box<Spanned<AstRoot>>,
+    pub alias: Option<AstIdentifier>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AstProfileArgument {
+    pub name: Option<AstIdentifier>,
+    pub value: AstProfileArgumentValue,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "value")]
+pub enum AstProfileArgumentValue {
+    Expr(Spanned<AstExpr>),
+    Predicate(Spanned<AstPredicate>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -220,7 +279,10 @@ pub enum AstPredicate {
         expr: Spanned<AstExpr>,
         negated: bool,
     },
-    Exists(Spanned<AstExpr>),
+    Exists {
+        target: Spanned<AstExpr>,
+        args: Vec<AstProfileArgument>,
+    },
     BoolExpr(Spanned<AstExpr>),
     Not(Box<Spanned<AstPredicate>>),
     And(Vec<Spanned<AstPredicate>>),
@@ -253,6 +315,8 @@ pub enum AstExpr {
         star: bool,
     },
     Association(AstAssociationExpr),
+    Relationship(AstRelationshipExpr),
+    RootBinding(Box<AstRootBinding>),
     Evidence(AstEvidenceExpr),
     Conditional {
         predicate: Box<Spanned<AstPredicate>>,
@@ -299,6 +363,27 @@ pub struct AstAssociationExpr {
     pub role_name: Option<AstIdentifier>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AstGraphEdgeExpr {
+    pub type_name: AstIdentifier,
+    pub role: Option<AstAssociationRole>,
+    pub role_name: Option<AstIdentifier>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AstRelationshipExpr {
+    pub direction: AstAssociationDirection,
+    pub edge: AstGraphEdgeExpr,
+    pub edge_alias: Option<AstIdentifier>,
+    pub target: Option<Box<AstRootBinding>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AstPathRootExpr {
+    pub start: AstRootBinding,
+    pub relationships: Vec<AstRelationshipExpr>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AstAssociationDirection {
@@ -326,6 +411,7 @@ pub struct AstEvidenceExpr {
 pub enum AstEvidenceTarget {
     SelfTarget,
     Path(AstPath),
+    RootBinding(Box<AstRootBinding>),
     Association(Box<AstAssociationExpr>),
     Projection(AstIdentifier),
 }
@@ -337,6 +423,11 @@ pub enum AstEvidenceGrain {
     Property,
     Association,
     Row,
+    Column,
+    Projection,
+    Node,
+    Edge,
+    Path,
     Source,
 }
 
@@ -414,7 +505,7 @@ pub enum AstChangeMode {
     Records,
     StateTransitions,
     PropertyDiffs,
-    FinalObjects,
+    FinalRows,
 }
 
 impl Default for AstChangeMode {
@@ -425,7 +516,7 @@ impl Default for AstChangeMode {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParseError {
-    pub diagnostic: crate::OqlDiagnostic,
+    pub diagnostic: crate::CoveQlDiagnostic,
     pub span: Option<SourceSpan>,
 }
 
@@ -439,7 +530,7 @@ impl Error for ParseError {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolveError {
-    pub diagnostic: crate::OqlDiagnostic,
+    pub diagnostic: crate::CoveQlDiagnostic,
     pub span: Option<SourceSpan>,
 }
 
@@ -453,10 +544,14 @@ impl Error for ResolveError {}
 
 fn render_root(root: &AstRoot) -> String {
     match root {
-        AstRoot::Object(identifier) => render_identifier(identifier),
+        AstRoot::Object(identifier) => format!("object({})", render_identifier(identifier)),
         AstRoot::Association(association) => render_association_expr(association),
         AstRoot::Evidence(evidence) => render_evidence_expr(evidence),
         AstRoot::Projection(identifier) => format!("projection({})", render_identifier(identifier)),
+        AstRoot::Table(identifier) => format!("table({})", render_identifier(identifier)),
+        AstRoot::Node(identifier) => format!("node({})", render_identifier(identifier)),
+        AstRoot::Edge(edge) => render_graph_edge_expr(edge),
+        AstRoot::Path(path) => render_path_root_expr(path),
     }
 }
 
@@ -500,6 +595,34 @@ fn render_method(method: &AstMethod) -> String {
             format!("groupBy({exprs})")
         }
         AstMethod::Explain(mode) => format!("explain({})", render_explain_mode(*mode)),
+        AstMethod::ProfileCall { name, args } => {
+            let args = args
+                .iter()
+                .map(render_profile_argument)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{}({args})", render_identifier(name))
+        }
+    }
+}
+
+fn render_root_binding(binding: &AstRootBinding) -> String {
+    let mut out = render_root(&binding.root.node);
+    if let Some(alias) = &binding.alias {
+        out.push_str(" as ");
+        out.push_str(&render_identifier(alias));
+    }
+    out
+}
+
+fn render_profile_argument(arg: &AstProfileArgument) -> String {
+    let value = match &arg.value {
+        AstProfileArgumentValue::Expr(expr) => render_expr(expr),
+        AstProfileArgumentValue::Predicate(predicate) => render_predicate(predicate),
+    };
+    match &arg.name {
+        Some(name) => format!("{}: {value}", render_identifier(name)),
+        None => value,
     }
 }
 
@@ -532,7 +655,11 @@ fn render_predicate(predicate: &Spanned<AstPredicate>) -> String {
             let name = if *negated { "isNotNull" } else { "isNull" };
             format!("{}.{}()", render_expr(expr), name)
         }
-        AstPredicate::Exists(expr) => format!("exists({})", render_expr(expr)),
+        AstPredicate::Exists { target, args } => {
+            let mut parts = vec![render_expr(target)];
+            parts.extend(args.iter().map(render_profile_argument));
+            format!("exists({})", parts.join(", "))
+        }
         AstPredicate::BoolExpr(expr) => render_expr(expr),
         AstPredicate::Not(inner) => format!("!({})", render_predicate(inner)),
         AstPredicate::And(parts) => parts
@@ -565,6 +692,8 @@ fn render_expr(expr: &Spanned<AstExpr>) -> String {
             format!("{}({arg})", render_aggregate_name(*name))
         }
         AstExpr::Association(association) => render_association_expr(association),
+        AstExpr::Relationship(relationship) => render_relationship_expr(relationship),
+        AstExpr::RootBinding(binding) => render_root_binding(binding),
         AstExpr::Evidence(evidence) => render_evidence_expr(evidence),
         AstExpr::Conditional {
             predicate,
@@ -610,6 +739,45 @@ fn render_association_expr(association: &AstAssociationExpr) -> String {
     }
 }
 
+fn render_graph_edge_expr(edge: &AstGraphEdgeExpr) -> String {
+    let mut args = vec![render_identifier(&edge.type_name)];
+    if let (Some(role), Some(role_name)) = (edge.role, edge.role_name.as_ref()) {
+        args.push(format!(
+            "{}: {}",
+            render_association_role(role),
+            render_identifier(role_name)
+        ));
+    }
+    format!("edge({})", args.join(", "))
+}
+
+fn render_relationship_expr(relationship: &AstRelationshipExpr) -> String {
+    let mut inner = render_graph_edge_expr(&relationship.edge);
+    if let Some(alias) = &relationship.edge_alias {
+        inner.push_str(" as ");
+        inner.push_str(&render_identifier(alias));
+    }
+    let mut out = format!(
+        "{}({inner})",
+        render_association_direction(relationship.direction)
+    );
+    if let Some(target) = &relationship.target {
+        out.push_str(".to(");
+        out.push_str(&render_root_binding(target));
+        out.push(')');
+    }
+    out
+}
+
+fn render_path_root_expr(path: &AstPathRootExpr) -> String {
+    let mut inner = render_root_binding(&path.start);
+    for relationship in &path.relationships {
+        inner.push('.');
+        inner.push_str(&render_relationship_expr(relationship));
+    }
+    format!("path({inner})")
+}
+
 fn render_evidence_expr(evidence: &AstEvidenceExpr) -> String {
     let mut args = Vec::new();
     if let Some(target) = &evidence.target {
@@ -625,6 +793,7 @@ fn render_evidence_target(target: &AstEvidenceTarget) -> String {
     match target {
         AstEvidenceTarget::SelfTarget => "self".into(),
         AstEvidenceTarget::Path(path) => render_path(path),
+        AstEvidenceTarget::RootBinding(binding) => render_root_binding(binding),
         AstEvidenceTarget::Association(association) => render_association_expr(association),
         AstEvidenceTarget::Projection(identifier) => {
             format!("projection({})", render_identifier(identifier))
@@ -731,6 +900,11 @@ fn render_evidence_grain(grain: AstEvidenceGrain) -> &'static str {
         AstEvidenceGrain::Property => "property",
         AstEvidenceGrain::Association => "association",
         AstEvidenceGrain::Row => "row",
+        AstEvidenceGrain::Column => "column",
+        AstEvidenceGrain::Projection => "projection",
+        AstEvidenceGrain::Node => "node",
+        AstEvidenceGrain::Edge => "edge",
+        AstEvidenceGrain::Path => "path",
         AstEvidenceGrain::Source => "source",
     }
 }
@@ -759,7 +933,7 @@ fn render_change_mode(mode: AstChangeMode) -> &'static str {
         AstChangeMode::Records => "records",
         AstChangeMode::StateTransitions => "state_transitions",
         AstChangeMode::PropertyDiffs => "property_diffs",
-        AstChangeMode::FinalObjects => "final_objects",
+        AstChangeMode::FinalRows => "final_rows",
     }
 }
 
@@ -801,7 +975,12 @@ fn identifier_requires_quote(value: &str) -> bool {
     matches!(
         value,
         "association"
+            | "object"
             | "evidence"
+            | "table"
+            | "node"
+            | "edge"
+            | "path"
             | "projection"
             | "where"
             | "select"
@@ -823,6 +1002,9 @@ fn identifier_requires_quote(value: &str) -> bool {
             | "in"
             | "out"
             | "either"
+            | "as"
+            | "lookup"
+            | "traverse"
             | "self"
             | "grain"
     )
@@ -834,7 +1016,7 @@ pub struct ResolvedQuery {
     pub operation_context: OperationContext,
     pub root: ResolvedRoot,
     pub method_chain: ResolvedMethodChain,
-    pub output_mode: CoveOqlOutputMode,
+    pub output_mode: CoveQlOutputMode,
     pub temporal: TemporalContext,
     pub branch: BranchContext,
     pub tombstone: TombstoneContext,
@@ -843,7 +1025,7 @@ pub struct ResolvedQuery {
     pub diagnostic_policy: DiagnosticPolicy,
     pub resource_use: ResourceUseEstimate,
     pub resolved_query_fingerprint: String,
-    pub diagnostics: Vec<crate::OqlDiagnostic>,
+    pub diagnostics: Vec<crate::CoveQlDiagnostic>,
 }
 
 impl ResolvedQuery {
@@ -857,7 +1039,10 @@ impl ResolvedQuery {
 pub enum ResolvedRoot {
     Object(ResolvedObjectRoot),
     Association(ResolvedAssociationRoot),
+    Node(ResolvedGraphNodeRoot),
+    Edge(ResolvedGraphEdgeRoot),
     Projection(ResolvedProjectionRoot),
+    Table(ResolvedTableRoot),
     Evidence(ResolvedEvidenceRoot),
 }
 
@@ -883,6 +1068,24 @@ pub struct ResolvedAssociationRoot {
     pub endpoint_role: AssociationEndpointRole,
     pub disclosure_outcome: AssociationDisclosureOutcome,
     pub object_relative: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_node_object_type_id: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_node_label: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedGraphNodeRoot {
+    pub label: String,
+    pub binding_name: Option<String>,
+    pub object: ResolvedObjectRoot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedGraphEdgeRoot {
+    pub label: String,
+    pub binding_name: Option<String>,
+    pub association: ResolvedAssociationRoot,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -919,6 +1122,72 @@ pub struct ResolvedProjectionRoot {
     pub evidence_policy: String,
     pub output_modes: Vec<String>,
     pub column_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedTableRoot {
+    pub table_name: String,
+    pub binding_name: Option<String>,
+    pub table_id: String,
+    pub authority_kind: TableSurfaceAuthorityKind,
+    pub row_grain: String,
+    pub row_identity: Vec<String>,
+    pub canonical_order: Vec<String>,
+    pub temporal_authority: TableTemporalAuthority,
+    pub evidence_capabilities: Vec<AstEvidenceGrain>,
+    pub table_surface_contract: TableSurfaceContract,
+    pub projection: ResolvedProjectionRoot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TableSurfaceAuthorityKind {
+    DeterministicProjection,
+    MaterializedTable,
+    RawTable,
+    ExternalRegisteredTable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TableTemporalAuthority {
+    RecomputableProjectionAtTemporalCut,
+    MaterializedSnapshotOnly,
+    StaticTableSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TableSurfaceContract {
+    pub table_id: String,
+    pub table_name: String,
+    pub contract_version: String,
+    pub authority_kind: TableSurfaceAuthorityKind,
+    pub authority_fingerprint: String,
+    pub schema_fingerprint: String,
+    pub logical_column_map: Vec<TableSurfaceColumnContract>,
+    pub row_grain: String,
+    pub row_identity: Vec<String>,
+    pub canonical_order: Vec<String>,
+    pub visibility_authority: String,
+    pub redaction_authority: String,
+    pub temporal_authority: TableTemporalAuthority,
+    pub evidence_capabilities: Vec<AstEvidenceGrain>,
+    pub null_missing_nan_policy: String,
+    pub collation_policy: String,
+    pub code_domain_contexts: Vec<String>,
+    pub code_domain_bridges: Vec<String>,
+    pub projection_dependency_contract_id: Option<String>,
+    pub datafusion_interop_contract: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TableSurfaceColumnContract {
+    pub name: String,
+    pub logical_type: Option<String>,
+    pub nullable: bool,
+    pub source_path: Option<String>,
+    pub code_domain: Option<String>,
+    pub collation: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -961,6 +1230,31 @@ pub enum ResolvedEvidenceTarget {
     Projection {
         projection_id: String,
     },
+    TableRow {
+        table_id: String,
+        table_name: String,
+        projection_id: String,
+    },
+    TableColumn {
+        table_id: String,
+        table_name: String,
+        projection_id: String,
+        column_name: String,
+    },
+    GraphNode {
+        object_type_id: u32,
+        type_name: String,
+        label: String,
+    },
+    GraphEdge {
+        object_type_id: u32,
+        type_name: String,
+        label: String,
+    },
+    GraphPath {
+        start_object_type_id: u32,
+        start_label: String,
+    },
     Property {
         object_type_id: Option<u32>,
         property_id: u32,
@@ -972,6 +1266,8 @@ pub enum ResolvedEvidenceTarget {
 pub struct ResolvedMethodChain {
     pub where_predicate: Option<ResolvedPredicate>,
     pub select: Option<Vec<ResolvedSelectItem>>,
+    pub lookups: Vec<ResolvedTableLookup>,
+    pub traversals: Vec<ResolvedGraphTraversal>,
     pub order_by: Option<ResolvedOrderClause>,
     pub group_by: Option<Vec<ResolvedExpr>>,
     pub take: Option<u64>,
@@ -979,6 +1275,140 @@ pub struct ResolvedMethodChain {
     pub explain: Option<crate::ExplainMode>,
     pub history: Option<AstHistoryMode>,
     pub changes: Option<ResolvedChanges>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedTableLookup {
+    pub right: ResolvedTableRoot,
+    pub on: ResolvedPredicate,
+    pub join_kind: TableLookupJoinKind,
+    pub cardinality: TableLookupCardinality,
+    pub unmatched_policy: TableLookupUnmatchedPolicy,
+    pub duplicate_policy: TableLookupDuplicatePolicy,
+    pub nulls_match: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedTableExists {
+    pub right: ResolvedTableRoot,
+    pub on: Box<ResolvedPredicate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedGraphTraversal {
+    pub direction: AstAssociationDirection,
+    pub edge: ResolvedGraphEdgeRoot,
+    pub target: Option<ResolvedGraphNodeRoot>,
+    pub min_depth: u32,
+    pub max_depth: u32,
+    pub mode: GraphTraversalMode,
+    pub distinct: GraphTraversalDistinctPolicy,
+    pub contract: Option<GraphTraversalContract>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphTraversalMode {
+    Walk,
+    Trail,
+    SimplePath,
+}
+
+impl GraphTraversalMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Walk => "walk",
+            Self::Trail => "trail",
+            Self::SimplePath => "simple_path",
+        }
+    }
+}
+
+impl std::str::FromStr for GraphTraversalMode {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "walk" => Ok(Self::Walk),
+            "trail" => Ok(Self::Trail),
+            "simple_path" => Ok(Self::SimplePath),
+            _ => Err(()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphTraversalDistinctPolicy {
+    None,
+    Path,
+    EndNode,
+}
+
+impl GraphTraversalDistinctPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Path => "path",
+            Self::EndNode => "end_node",
+        }
+    }
+}
+
+impl std::str::FromStr for GraphTraversalDistinctPolicy {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "none" => Ok(Self::None),
+            "path" => Ok(Self::Path),
+            "end_node" => Ok(Self::EndNode),
+            _ => Err(()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphTraversalContract {
+    pub contract_version: String,
+    pub allow_variable_length: bool,
+    pub supported_modes: Vec<GraphTraversalMode>,
+    pub supported_distinct_policies: Vec<GraphTraversalDistinctPolicy>,
+    pub max_depth: u32,
+    pub max_fanout_per_node: usize,
+    pub max_paths: usize,
+    pub max_frontier: usize,
+    pub path_identity: Vec<String>,
+    pub hidden_endpoint_policy: String,
+    pub ordering_policy: String,
+    pub execution_authority: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TableLookupJoinKind {
+    LeftPreserving,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TableLookupCardinality {
+    One,
+    Many,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TableLookupUnmatchedPolicy {
+    Nulls,
+    Reject,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TableLookupDuplicatePolicy {
+    Reject,
+    EmitAll,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1047,6 +1477,7 @@ pub enum ResolvedExpr {
     },
     Association(ResolvedAssociationRoot),
     Evidence(ResolvedEvidenceRoot),
+    TableExists(ResolvedTableExists),
     Conditional {
         predicate: Box<ResolvedPredicate>,
         then_expr: Box<ResolvedExpr>,
@@ -1097,6 +1528,9 @@ pub struct ResolvedPath {
 pub enum ResolvedPathRootKind {
     Object,
     Association,
+    Node,
+    Edge,
+    Table,
     Projection,
     Evidence,
 }

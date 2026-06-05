@@ -65,14 +65,15 @@ use cove_layout::{
     ZeroCopyNullBitmapPolarityV2, ZeroCopySourceBufferRoleV2, ZeroCopyTargetBufferRoleV2,
     ZeroCopyTargetV2,
 };
-use cove_oql::{
+use cove_runtime::{RuntimeCompatibilityHintV2, RuntimeHintKindV2};
+use coveql::{
     build_operation_context, build_physical_plan, execute_manifest_physical_planned_query,
     execute_planned_query, execute_planned_query_stream, parse_and_resolve_query,
     parse_resolve_and_plan_query, parse_resolve_plan_and_build_physical_plan,
     parse_resolve_plan_and_execute_query, parse_resolve_plan_build_physical_and_execute_query,
     parse_resolve_plan_build_physical_and_execute_query_retained, render_explain_text,
-    AggregateDisclosurePolicy, AssociationEndpointRole, AstCompareOp, CoveOqlExecutionResult,
-    CoveOqlOperationRequest, CoveOqlOutputMode, CoveOqlRetainedInput, CoveOqlSelectedOperation,
+    AggregateDisclosurePolicy, AssociationEndpointRole, AstCompareOp, CoveQlExecutionResult,
+    CoveQlOperationRequest, CoveQlOutputMode, CoveQlRetainedInput, CoveQlSelectedOperation,
     ExecutionOptions, ExplainDisclosurePolicy, ExplainMode, FallbackPolicy, FilterClassification,
     KernelDecisionKind, KernelExecutionMode, KernelExecutionOptions, KernelFallbackReason,
     LogicalPlanNodeKind, LogicalPredicateKind, MaterializedChangeDiffKind,
@@ -84,7 +85,6 @@ use cove_oql::{
     ResolvedLiteralValue, ResolvedPredicate, ResolvedRoot, SecurityContext, TemporalRole,
     VisibilityOverlay, VisibilityPolicy,
 };
-use cove_runtime::{RuntimeCompatibilityHintV2, RuntimeHintKindV2};
 use serde_json::{json, Value};
 
 fn validation_options() -> ValidationOptions {
@@ -93,6 +93,68 @@ fn validation_options() -> ValidationOptions {
         verify_digests: false,
         allow_unknown_optional_extensions: true,
         optional_pushdown_policy: OptionalPushdownPolicy::Strict,
+    }
+}
+
+fn projection_backed_thing_table_contract() -> coveql::TableSurfaceContract {
+    coveql::TableSurfaceContract {
+        table_id: "projection:thing_projection".into(),
+        table_name: "thing_projection".into(),
+        contract_version: coveql::COVEQL_PROFILE_CONTRACT_VERSION.into(),
+        authority_kind: coveql::TableSurfaceAuthorityKind::DeterministicProjection,
+        authority_fingerprint: "thing_projection".into(),
+        schema_fingerprint: "thing_projection".into(),
+        logical_column_map: vec![coveql::TableSurfaceColumnContract {
+            name: "active".into(),
+            logical_type: Some("bool".into()),
+            nullable: true,
+            source_path: Some("active".into()),
+            code_domain: None,
+            collation: None,
+        }],
+        row_grain: "one_row_per_object".into(),
+        row_identity: vec!["projection_row_identity".into()],
+        canonical_order: vec!["projection_row_identity".into()],
+        visibility_authority: "cove_o_visibility".into(),
+        redaction_authority: "cove_o_redaction".into(),
+        temporal_authority: coveql::TableTemporalAuthority::MaterializedSnapshotOnly,
+        evidence_capabilities: vec![
+            coveql::AstEvidenceGrain::Row,
+            coveql::AstEvidenceGrain::Column,
+            coveql::AstEvidenceGrain::Projection,
+            coveql::AstEvidenceGrain::Source,
+        ],
+        null_missing_nan_policy: "projection_contract".into(),
+        collation_policy: "projection_contract".into(),
+        code_domain_contexts: Vec::new(),
+        code_domain_bridges: Vec::new(),
+        projection_dependency_contract_id: Some("thing_projection".into()),
+        datafusion_interop_contract: Some("coveql_table_projection_provider".into()),
+    }
+}
+
+fn graph_traversal_contract() -> coveql::GraphTraversalContract {
+    coveql::GraphTraversalContract {
+        contract_version: coveql::COVEQL_PROFILE_CONTRACT_VERSION.into(),
+        allow_variable_length: true,
+        supported_modes: vec![
+            coveql::GraphTraversalMode::Walk,
+            coveql::GraphTraversalMode::Trail,
+            coveql::GraphTraversalMode::SimplePath,
+        ],
+        supported_distinct_policies: vec![
+            coveql::GraphTraversalDistinctPolicy::None,
+            coveql::GraphTraversalDistinctPolicy::Path,
+            coveql::GraphTraversalDistinctPolicy::EndNode,
+        ],
+        max_depth: 4,
+        max_fanout_per_node: 16,
+        max_paths: 64,
+        max_frontier: 64,
+        path_identity: vec!["start_goid".into(), "edge_goids".into(), "end_goid".into()],
+        hidden_endpoint_policy: "suppress_hidden_endpoints".into(),
+        ordering_policy: "breadth_first_canonical_association_order".into(),
+        execution_authority: "visible_materialized_graph_oracle".into(),
     }
 }
 
@@ -107,52 +169,67 @@ fn assert_unique_contract_fields(label: &str, fields: &[&str]) {
 }
 
 #[test]
-fn conformance_profile_declares_full_oql_surface_defaults() {
-    let profile = cove_oql::conformance_profile();
+fn conformance_profile_declares_full_coveql_surface_defaults() {
+    let profile = coveql::conformance_profile();
 
+    assert_eq!(profile.language_version, coveql::COVEQL_LANGUAGE_VERSION);
+    assert_eq!(profile.core_version, coveql::COVEQL_CORE_VERSION);
+    assert_eq!(profile.grammar_version, coveql::COVEQL_GRAMMAR_VERSION);
     assert_eq!(
-        profile.language_version,
-        cove_oql::COVE_OQL_LANGUAGE_VERSION
+        profile.profile_contract_version,
+        coveql::COVEQL_PROFILE_CONTRACT_VERSION
     );
-    assert_eq!(profile.grammar_version, cove_oql::COVE_OQL_GRAMMAR_VERSION);
-    assert_eq!(profile.resolved_ast_version, cove_oql::RESOLVED_AST_VERSION);
-    assert_eq!(profile.logical_plan_version, cove_oql::LOGICAL_PLAN_VERSION);
     assert_eq!(
-        profile.physical_plan_version,
-        cove_oql::PHYSICAL_PLAN_VERSION
+        profile.bridge_contract_version,
+        coveql::COVEQL_BRIDGE_CONTRACT_VERSION
     );
+    assert_eq!(
+        profile.object_profile_version,
+        coveql::COVEQL_OBJECT_PROFILE_VERSION
+    );
+    assert_eq!(
+        profile.table_profile_version,
+        coveql::COVEQL_TABLE_PROFILE_VERSION
+    );
+    assert_eq!(
+        profile.graph_profile_version,
+        coveql::COVEQL_GRAPH_PROFILE_VERSION
+    );
+    assert_eq!(profile.resolved_ast_version, coveql::RESOLVED_AST_VERSION);
+    assert_eq!(profile.logical_plan_version, coveql::LOGICAL_PLAN_VERSION);
+    assert_eq!(profile.physical_plan_version, coveql::PHYSICAL_PLAN_VERSION);
     assert_eq!(
         profile.projection_dependency_contract_version,
-        cove_oql::PROJECTION_DEPENDENCY_CONTRACT_VERSION
+        coveql::PROJECTION_DEPENDENCY_CONTRACT_VERSION
     );
     assert_eq!(
         profile.predicate_normal_form_version,
-        cove_oql::PREDICATE_NORMAL_FORM_VERSION
+        coveql::PREDICATE_NORMAL_FORM_VERSION
     );
     assert_eq!(
         profile.coded_operator_contract_version,
-        cove_oql::CODED_OPERATOR_CONTRACT_VERSION
+        coveql::CODED_OPERATOR_CONTRACT_VERSION
     );
     assert_eq!(
         profile.predicate_representation_contract_version,
-        cove_oql::PREDICATE_REPRESENTATION_CONTRACT_VERSION
+        coveql::PREDICATE_REPRESENTATION_CONTRACT_VERSION
     );
     assert_eq!(
         profile.physical_operator_contract_version,
-        cove_oql::PHYSICAL_OPERATOR_CONTRACT_VERSION
+        coveql::PHYSICAL_OPERATOR_CONTRACT_VERSION
     );
     assert_eq!(
         profile.physical_sidecar_validation_version,
-        cove_oql::PHYSICAL_SIDECAR_VALIDATION_VERSION
+        coveql::PHYSICAL_SIDECAR_VALIDATION_VERSION
     );
     assert_eq!(
-        profile.datafusion_oql_report_version,
-        cove_oql::DATAFUSION_OQL_REPORT_VERSION
+        profile.datafusion_coveql_report_version,
+        coveql::DATAFUSION_COVEQL_REPORT_VERSION
     );
     assert!(profile
         .mandatory_history_modes
         .contains(&"records_and_states"));
-    assert!(profile.mandatory_change_modes.contains(&"final_objects"));
+    assert!(profile.mandatory_change_modes.contains(&"final_rows"));
     assert!(profile.mandatory_functions.contains(&"coalesce"));
     assert!(profile.mandatory_functions.contains(&"length"));
     assert!(profile
@@ -161,6 +238,9 @@ fn conformance_profile_declares_full_oql_surface_defaults() {
     assert!(profile
         .evidence_shorthands
         .contains(&"evidence(projection(...))"));
+    assert!(profile
+        .evidence_shorthands
+        .contains(&"evidence(root as binding)"));
     assert!(profile
         .required_fingerprint_fields
         .contains(&"predicate_ast"));
@@ -199,10 +279,10 @@ fn conformance_profile_declares_full_oql_surface_defaults() {
         .contains(&"codec_compatibility"));
     assert!(profile
         .required_datafusion_scan_negotiation_fields
-        .contains(&"projection_pushed_to_oql"));
+        .contains(&"projection_pushed_to_coveql"));
     assert!(profile
         .required_datafusion_scan_negotiation_fields
-        .contains(&"limit_pushed_to_oql"));
+        .contains(&"limit_pushed_to_coveql"));
     assert!(profile
         .required_datafusion_scan_negotiation_fields
         .contains(&"unhandled_residuals"));
@@ -212,9 +292,18 @@ fn conformance_profile_declares_full_oql_surface_defaults() {
     assert!(profile
         .required_diagnostic_codes
         .contains(&"E_DATAFUSION_PUSH_FILTER_UNSAFE"));
+    assert!(profile
+        .required_diagnostic_codes
+        .contains(&"E_UNSUPPORTED_PROFILE_METHOD"));
+    assert!(profile
+        .required_diagnostic_codes
+        .contains(&"E_UNKNOWN_TABLE_SURFACE"));
     assert_eq!(profile.conformance_tiers.len(), 3);
     assert_eq!(profile.conformance_tiers[0].name, "semantic_correctness");
-    assert_eq!(profile.conformance_tiers[0].authority, "materialized_oql");
+    assert_eq!(
+        profile.conformance_tiers[0].authority,
+        "materialized_coveql"
+    );
     assert!(profile.conformance_tiers[0]
         .required_surfaces
         .contains(&"datafusion"));
@@ -261,28 +350,100 @@ fn conformance_profile_declares_full_oql_surface_defaults() {
         "required_diagnostic_codes",
         profile.required_diagnostic_codes,
     );
+
+    let core_contract = coveql::coveql_core_contract();
+    assert_eq!(core_contract.core_version, coveql::COVEQL_CORE_VERSION);
+    assert!(core_contract
+        .primary_profiles
+        .contains(&coveql::CoveQlProfileId::Object));
+    assert!(core_contract
+        .primary_profiles
+        .contains(&coveql::CoveQlProfileId::Table));
+    assert!(core_contract
+        .primary_profiles
+        .contains(&coveql::CoveQlProfileId::Graph));
+
+    let contracts = coveql::builtin_coveql_profile_contracts();
+    assert_eq!(contracts.len(), 3);
+    assert!(coveql::coveql_profile_contract(coveql::CoveQlProfileId::Object).implemented);
+    let table_contract = coveql::coveql_profile_contract(coveql::CoveQlProfileId::Table);
+    assert!(table_contract.implemented);
+    assert!(table_contract
+        .materialization_boundaries
+        .contains(&"raw_table_surface_requires_table_contract"));
+    let graph_contract = coveql::coveql_profile_contract(coveql::CoveQlProfileId::Graph);
+    assert!(graph_contract.implemented);
+    assert!(graph_contract
+        .relationship_capabilities
+        .contains(&"chained_traverse"));
+    assert!(graph_contract
+        .relationship_capabilities
+        .contains(&"multi_hop_path_binding"));
+    assert!(graph_contract
+        .materialization_boundaries
+        .contains(&"variable_length_traversal_requires_explicit_contract"));
 }
 
 #[test]
 fn query_builder_matches_handwritten_query_fingerprints() {
-    let built = cove_oql::CoveOqlQueryBuilder::object("Person")
+    let built = coveql::CoveQlQueryBuilder::object("Person")
         .where_predicate("active == true")
         .select(["active"])
         .as_of_csn(7)
         .order_by(
             "active",
-            cove_oql::AstOrderDirection::Desc,
-            cove_oql::AstNullOrdering::Default,
+            coveql::AstOrderDirection::Desc,
+            coveql::AstNullOrdering::Default,
         )
         .take(10)
         .explain(ExplainMode::Coded);
     let parsed_built = built.parse(ParseOptions::default()).unwrap();
-    let parsed_handwritten = cove_oql::parse_query(
+    let parsed_handwritten = coveql::parse_query(
         "Person.where(active == true).select(active).asOf(csn: 7).orderBy(active, desc).take(10).explain(\"coded\")",
         ParseOptions::default(),
     )
     .unwrap();
 
+    assert_eq!(
+        parsed_built.parsed_ast_fingerprint,
+        parsed_handwritten.parsed_ast_fingerprint
+    );
+}
+
+#[test]
+fn query_builder_matches_table_and_graph_profile_syntax() {
+    let table_built = coveql::CoveQlQueryBuilder::table("thing_projection")
+        .alias("l")
+        .lookup_many("thing_projection", "r", "l.active == r.active")
+        .select(["left_active: l.active", "right_active: r.active"]);
+    let parsed_built = table_built.parse(ParseOptions::default()).unwrap();
+    let parsed_handwritten = coveql::parse_query(
+        "table(thing_projection) as l.lookup(table(thing_projection) as r, on: l.active == r.active, cardinality: many, unmatched: nulls, duplicate: many, nulls_match: false).select(left_active: l.active, right_active: r.active)",
+        ParseOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        parsed_built.parsed_ast_fingerprint,
+        parsed_handwritten.parsed_ast_fingerprint
+    );
+
+    let relationship = coveql::coveql_relationship_expr_to_node(
+        coveql::AstAssociationDirection::Out,
+        "CustomerPlacedOrder",
+        Some("placed"),
+        "Order",
+        Some("o"),
+    );
+    let graph_built = coveql::CoveQlQueryBuilder::node("Customer")
+        .alias("c")
+        .traverse(relationship)
+        .select(["customer: c.goid", "order: o.goid"]);
+    let parsed_built = graph_built.parse(ParseOptions::default()).unwrap();
+    let parsed_handwritten = coveql::parse_query(
+        "node(Customer) as c.traverse(out(edge(CustomerPlacedOrder) as placed).to(node(Order) as o)).select(customer: c.goid, order: o.goid)",
+        ParseOptions::default(),
+    )
+    .unwrap();
     assert_eq!(
         parsed_built.parsed_ast_fingerprint,
         parsed_handwritten.parsed_ast_fingerprint
@@ -318,13 +479,13 @@ fn parsed_query_canonical_query_round_trips_ast_fingerprint() {
     ];
 
     for query in cases {
-        let parsed = cove_oql::parse_query(query, ParseOptions::default()).unwrap();
+        let parsed = coveql::parse_query(query, ParseOptions::default()).unwrap();
         let rendered = parsed.to_canonical_query();
-        let reparsed = cove_oql::parse_query(
+        let reparsed = coveql::parse_query(
             &rendered,
             ParseOptions {
                 allow_implicit_language_version: false,
-                required_language_version: Some(cove_oql::COVE_OQL_LANGUAGE_VERSION.into()),
+                required_language_version: Some(coveql::COVEQL_LANGUAGE_VERSION.into()),
                 ..ParseOptions::default()
             },
         )
@@ -338,12 +499,12 @@ fn parsed_query_canonical_query_round_trips_ast_fingerprint() {
 
 #[test]
 fn query_builder_matches_default_method_syntax() {
-    let built = cove_oql::CoveOqlQueryBuilder::object("Thing")
+    let built = coveql::CoveQlQueryBuilder::object("Thing")
         .history_default()
         .order_by_default("active")
         .explain_default();
     let parsed_built = built.parse(ParseOptions::default()).unwrap();
-    let parsed_handwritten = cove_oql::parse_query(
+    let parsed_handwritten = coveql::parse_query(
         "Thing.history().orderBy(active).explain()",
         ParseOptions::default(),
     )
@@ -353,22 +514,22 @@ fn query_builder_matches_default_method_syntax() {
         parsed_handwritten.parsed_ast_fingerprint
     );
 
-    let changes_built = cove_oql::CoveOqlQueryBuilder::object("Thing").changes_csn_default(1, 3);
+    let changes_built = coveql::CoveQlQueryBuilder::object("Thing").changes_csn_default(1, 3);
     let parsed_changes_built = changes_built.parse(ParseOptions::default()).unwrap();
     let parsed_changes_handwritten =
-        cove_oql::parse_query("Thing.changes(from: 1, to: 3)", ParseOptions::default()).unwrap();
+        coveql::parse_query("Thing.changes(from: 1, to: 3)", ParseOptions::default()).unwrap();
     assert_eq!(
         parsed_changes_built.parsed_ast_fingerprint,
         parsed_changes_handwritten.parsed_ast_fingerprint
     );
 
-    let branch_tombstone_built = cove_oql::CoveOqlQueryBuilder::object("Thing")
+    let branch_tombstone_built = coveql::CoveQlQueryBuilder::object("Thing")
         .branch_reject_ambiguous()
         .include_tombstones_enabled()
         .explain_coded()
         .parse(ParseOptions::default())
         .unwrap();
-    let branch_tombstone_handwritten = cove_oql::parse_query(
+    let branch_tombstone_handwritten = coveql::parse_query(
         "Thing.branch(reject_ambiguous).includeTombstones(true).explain(\"coded\")",
         ParseOptions::default(),
     )
@@ -378,11 +539,11 @@ fn query_builder_matches_default_method_syntax() {
         branch_tombstone_handwritten.parsed_ast_fingerprint
     );
 
-    let as_of_time_built = cove_oql::CoveOqlQueryBuilder::object("Thing")
+    let as_of_time_built = coveql::CoveQlQueryBuilder::object("Thing")
         .as_of_time("2026-01-01T00:00:00Z")
         .parse(ParseOptions::default())
         .unwrap();
-    let as_of_time_handwritten = cove_oql::parse_query(
+    let as_of_time_handwritten = coveql::parse_query(
         r#"Thing.asOf(time: "2026-01-01T00:00:00Z")"#,
         ParseOptions::default(),
     )
@@ -394,51 +555,51 @@ fn query_builder_matches_default_method_syntax() {
 
     for (built, handwritten) in [
         (
-            cove_oql::CoveOqlQueryBuilder::object("Thing")
+            coveql::CoveQlQueryBuilder::object("Thing")
                 .history_records()
                 .to_query(),
             "Thing.history(mode: records)",
         ),
         (
-            cove_oql::CoveOqlQueryBuilder::object("Thing")
+            coveql::CoveQlQueryBuilder::object("Thing")
                 .history_states()
                 .to_query(),
             "Thing.history(mode: states)",
         ),
         (
-            cove_oql::CoveOqlQueryBuilder::object("Thing")
+            coveql::CoveQlQueryBuilder::object("Thing")
                 .history_records_and_states()
                 .to_query(),
             "Thing.history(mode: records_and_states)",
         ),
         (
-            cove_oql::CoveOqlQueryBuilder::object("Thing")
+            coveql::CoveQlQueryBuilder::object("Thing")
                 .changes_csn_records(1, 3)
                 .to_query(),
             "Thing.changes(from: 1, to: 3, mode: records)",
         ),
         (
-            cove_oql::CoveOqlQueryBuilder::object("Thing")
+            coveql::CoveQlQueryBuilder::object("Thing")
                 .changes_csn_state_transitions(1, 3)
                 .to_query(),
             "Thing.changes(from: 1, to: 3, mode: state_transitions)",
         ),
         (
-            cove_oql::CoveOqlQueryBuilder::object("Thing")
+            coveql::CoveQlQueryBuilder::object("Thing")
                 .changes_csn_property_diffs(1, 3)
                 .to_query(),
             "Thing.changes(from: 1, to: 3, mode: property_diffs)",
         ),
         (
-            cove_oql::CoveOqlQueryBuilder::object("Thing")
+            coveql::CoveQlQueryBuilder::object("Thing")
                 .changes_csn_final_objects(1, 3)
                 .to_query(),
             "Thing.changes(from: 1, to: 3, mode: final_objects)",
         ),
         (
-            cove_oql::CoveOqlQueryBuilder::object("Thing")
+            coveql::CoveQlQueryBuilder::object("Thing")
                 .changes_timestamp_records(
-                    cove_oql::AstTimeRole::ValidTime,
+                    coveql::AstTimeRole::ValidTime,
                     "2026-01-01T00:00:00Z",
                     "2026-01-02T00:00:00Z",
                 )
@@ -446,9 +607,9 @@ fn query_builder_matches_default_method_syntax() {
             r#"Thing.changes(valid_time: "2026-01-01T00:00:00Z", valid_time: "2026-01-02T00:00:00Z", mode: records)"#,
         ),
         (
-            cove_oql::CoveOqlQueryBuilder::object("Thing")
+            coveql::CoveQlQueryBuilder::object("Thing")
                 .changes_timestamp_state_transitions(
-                    cove_oql::AstTimeRole::ObservedTime,
+                    coveql::AstTimeRole::ObservedTime,
                     "2026-01-01T00:00:00Z",
                     "2026-01-02T00:00:00Z",
                 )
@@ -456,9 +617,9 @@ fn query_builder_matches_default_method_syntax() {
             r#"Thing.changes(observed_time: "2026-01-01T00:00:00Z", observed_time: "2026-01-02T00:00:00Z", mode: state_transitions)"#,
         ),
         (
-            cove_oql::CoveOqlQueryBuilder::object("Thing")
+            coveql::CoveQlQueryBuilder::object("Thing")
                 .changes_timestamp_property_diffs(
-                    cove_oql::AstTimeRole::SourceEventTime,
+                    coveql::AstTimeRole::SourceEventTime,
                     "2026-01-01T00:00:00Z",
                     "2026-01-02T00:00:00Z",
                 )
@@ -466,15 +627,15 @@ fn query_builder_matches_default_method_syntax() {
             r#"Thing.changes(source_event_time: "2026-01-01T00:00:00Z", source_event_time: "2026-01-02T00:00:00Z", mode: property_diffs)"#,
         ),
         (
-            cove_oql::CoveOqlQueryBuilder::object("Thing")
+            coveql::CoveQlQueryBuilder::object("Thing")
                 .changes_time_final_objects("2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z")
                 .to_query(),
             r#"Thing.changes(time: "2026-01-01T00:00:00Z", time: "2026-01-02T00:00:00Z", mode: final_objects)"#,
         ),
         (
-            cove_oql::CoveOqlQueryBuilder::object("Thing")
+            coveql::CoveQlQueryBuilder::object("Thing")
                 .changes_timestamp_final_objects(
-                    cove_oql::AstTimeRole::AssociationValidTime,
+                    coveql::AstTimeRole::AssociationValidTime,
                     "2026-01-01T00:00:00Z",
                     "2026-01-02T00:00:00Z",
                 )
@@ -482,45 +643,44 @@ fn query_builder_matches_default_method_syntax() {
             r#"Thing.changes(association_valid_time: "2026-01-01T00:00:00Z", association_valid_time: "2026-01-02T00:00:00Z", mode: final_objects)"#,
         ),
         (
-            cove_oql::CoveOqlQueryBuilder::object("Thing")
+            coveql::CoveQlQueryBuilder::object("Thing")
                 .changes_bounds_records(
-                    cove_oql::AstChangeBound::Csn(1),
-                    cove_oql::AstChangeBound::Csn(3),
+                    coveql::AstChangeBound::Csn(1),
+                    coveql::AstChangeBound::Csn(3),
                 )
                 .to_query(),
             "Thing.changes(csn: 1, csn: 3, mode: records)",
         ),
         (
-            cove_oql::CoveOqlQueryBuilder::object("Thing")
+            coveql::CoveQlQueryBuilder::object("Thing")
                 .changes_bounds_state_transitions(
-                    cove_oql::AstChangeBound::Csn(1),
-                    cove_oql::AstChangeBound::Csn(3),
+                    coveql::AstChangeBound::Csn(1),
+                    coveql::AstChangeBound::Csn(3),
                 )
                 .to_query(),
             "Thing.changes(csn: 1, csn: 3, mode: state_transitions)",
         ),
         (
-            cove_oql::CoveOqlQueryBuilder::object("Thing")
+            coveql::CoveQlQueryBuilder::object("Thing")
                 .changes_bounds_property_diffs(
-                    cove_oql::AstChangeBound::Csn(1),
-                    cove_oql::AstChangeBound::Csn(3),
+                    coveql::AstChangeBound::Csn(1),
+                    coveql::AstChangeBound::Csn(3),
                 )
                 .to_query(),
             "Thing.changes(csn: 1, csn: 3, mode: property_diffs)",
         ),
         (
-            cove_oql::CoveOqlQueryBuilder::object("Thing")
+            coveql::CoveQlQueryBuilder::object("Thing")
                 .changes_bounds_final_objects(
-                    cove_oql::AstChangeBound::Csn(1),
-                    cove_oql::AstChangeBound::Csn(3),
+                    coveql::AstChangeBound::Csn(1),
+                    coveql::AstChangeBound::Csn(3),
                 )
                 .to_query(),
             "Thing.changes(csn: 1, csn: 3, mode: final_objects)",
         ),
     ] {
-        let parsed_built = cove_oql::parse_query(&built, ParseOptions::default()).unwrap();
-        let parsed_handwritten =
-            cove_oql::parse_query(handwritten, ParseOptions::default()).unwrap();
+        let parsed_built = coveql::parse_query(&built, ParseOptions::default()).unwrap();
+        let parsed_handwritten = coveql::parse_query(handwritten, ParseOptions::default()).unwrap();
         assert_eq!(
             parsed_built.parsed_ast_fingerprint, parsed_handwritten.parsed_ast_fingerprint,
             "{built} should match {handwritten}"
@@ -530,17 +690,17 @@ fn query_builder_matches_default_method_syntax() {
 
 #[test]
 fn prefix_explain_coded_matches_method_explain_syntax() {
-    let prefixed = cove_oql::parse_query(
+    let prefixed = coveql::parse_query(
         "EXPLAIN CODED Person.where(active == true).select(active)",
         ParseOptions::default(),
     )
     .unwrap();
-    let method = cove_oql::parse_query(
+    let method = coveql::parse_query(
         r#"Person.where(active == true).select(active).explain("coded")"#,
         ParseOptions::default(),
     )
     .unwrap();
-    let uppercase_method = cove_oql::parse_query(
+    let uppercase_method = coveql::parse_query(
         r#"Person.where(active == true).select(active).explain("CODED")"#,
         ParseOptions::default(),
     )
@@ -556,9 +716,9 @@ fn prefix_explain_coded_matches_method_explain_syntax() {
     );
 
     let object_named_coded =
-        cove_oql::parse_query("EXPLAIN coded.select(active)", ParseOptions::default()).unwrap();
+        coveql::parse_query("EXPLAIN coded.select(active)", ParseOptions::default()).unwrap();
     let explicit_public =
-        cove_oql::parse_query("coded.select(active).explain()", ParseOptions::default()).unwrap();
+        coveql::parse_query("coded.select(active).explain()", ParseOptions::default()).unwrap();
     assert_eq!(
         object_named_coded.parsed_ast_fingerprint,
         explicit_public.parsed_ast_fingerprint
@@ -567,11 +727,11 @@ fn prefix_explain_coded_matches_method_explain_syntax() {
 
 #[test]
 fn query_builder_matches_grouped_aggregate_syntax() {
-    let count_built = cove_oql::CoveOqlQueryBuilder::object("Person")
+    let count_built = coveql::CoveQlQueryBuilder::object("Person")
         .group_by_count_star_as(["active"], "n")
         .parse(ParseOptions::default())
         .unwrap();
-    let count_handwritten = cove_oql::parse_query(
+    let count_handwritten = coveql::parse_query(
         "Person.groupBy(active).select(active, n: count(*))",
         ParseOptions::default(),
     )
@@ -581,16 +741,16 @@ fn query_builder_matches_grouped_aggregate_syntax() {
         count_handwritten.parsed_ast_fingerprint
     );
 
-    let sum_built = cove_oql::CoveOqlQueryBuilder::object("Person")
+    let sum_built = coveql::CoveQlQueryBuilder::object("Person")
         .group_by_aggregate_as(
             ["active"],
             "total_score",
-            cove_oql::AstAggregateName::Sum,
+            coveql::AstAggregateName::Sum,
             "score",
         )
         .parse(ParseOptions::default())
         .unwrap();
-    let sum_handwritten = cove_oql::parse_query(
+    let sum_handwritten = coveql::parse_query(
         "Person.groupBy(active).select(active, total_score: sum(score))",
         ParseOptions::default(),
     )
@@ -600,33 +760,33 @@ fn query_builder_matches_grouped_aggregate_syntax() {
         sum_handwritten.parsed_ast_fingerprint
     );
 
-    let select_count_built = cove_oql::CoveOqlQueryBuilder::object("Person")
+    let select_count_built = coveql::CoveQlQueryBuilder::object("Person")
         .select_count_star_as("n")
         .parse(ParseOptions::default())
         .unwrap();
     let select_count_handwritten =
-        cove_oql::parse_query("Person.select(n: count(*))", ParseOptions::default()).unwrap();
+        coveql::parse_query("Person.select(n: count(*))", ParseOptions::default()).unwrap();
     assert_eq!(
         select_count_built.parsed_ast_fingerprint,
         select_count_handwritten.parsed_ast_fingerprint
     );
 
-    let select_exists_built = cove_oql::CoveOqlQueryBuilder::object("Person")
-        .select_star_aggregate_as("e", cove_oql::AstAggregateName::Exists)
+    let select_exists_built = coveql::CoveQlQueryBuilder::object("Person")
+        .select_star_aggregate_as("e", coveql::AstAggregateName::Exists)
         .parse(ParseOptions::default())
         .unwrap();
     let select_exists_handwritten =
-        cove_oql::parse_query("Person.select(e: exists(*))", ParseOptions::default()).unwrap();
+        coveql::parse_query("Person.select(e: exists(*))", ParseOptions::default()).unwrap();
     assert_eq!(
         select_exists_built.parsed_ast_fingerprint,
         select_exists_handwritten.parsed_ast_fingerprint
     );
 
-    let distinct_built = cove_oql::CoveOqlQueryBuilder::object("Person")
-        .select_aggregate_as("d", cove_oql::AstAggregateName::DistinctCount, "active")
+    let distinct_built = coveql::CoveQlQueryBuilder::object("Person")
+        .select_aggregate_as("d", coveql::AstAggregateName::DistinctCount, "active")
         .parse(ParseOptions::default())
         .unwrap();
-    let distinct_handwritten = cove_oql::parse_query(
+    let distinct_handwritten = coveql::parse_query(
         "Person.select(d: distinct_count(active))",
         ParseOptions::default(),
     )
@@ -636,11 +796,11 @@ fn query_builder_matches_grouped_aggregate_syntax() {
         distinct_handwritten.parsed_ast_fingerprint
     );
 
-    let grouped_exists_built = cove_oql::CoveOqlQueryBuilder::object("Person")
-        .group_by_star_aggregate_as(["active"], "e", cove_oql::AstAggregateName::Exists)
+    let grouped_exists_built = coveql::CoveQlQueryBuilder::object("Person")
+        .group_by_star_aggregate_as(["active"], "e", coveql::AstAggregateName::Exists)
         .parse(ParseOptions::default())
         .unwrap();
-    let grouped_exists_handwritten = cove_oql::parse_query(
+    let grouped_exists_handwritten = coveql::parse_query(
         "Person.groupBy(active).select(active, e: exists(*))",
         ParseOptions::default(),
     )
@@ -650,16 +810,16 @@ fn query_builder_matches_grouped_aggregate_syntax() {
         grouped_exists_handwritten.parsed_ast_fingerprint
     );
 
-    let grouped_distinct_built = cove_oql::CoveOqlQueryBuilder::object("Person")
+    let grouped_distinct_built = coveql::CoveQlQueryBuilder::object("Person")
         .group_by_aggregate_as(
             ["active"],
             "d",
-            cove_oql::AstAggregateName::DistinctCount,
+            coveql::AstAggregateName::DistinctCount,
             "score",
         )
         .parse(ParseOptions::default())
         .unwrap();
-    let grouped_distinct_handwritten = cove_oql::parse_query(
+    let grouped_distinct_handwritten = coveql::parse_query(
         "Person.groupBy(active).select(active, d: distinct_count(score))",
         ParseOptions::default(),
     )
@@ -672,21 +832,159 @@ fn query_builder_matches_grouped_aggregate_syntax() {
 
 #[test]
 fn query_builder_supports_evidence_projection_shorthand() {
-    let parsed = cove_oql::CoveOqlQueryBuilder::evidence_projection_with_grain(
+    let parsed = coveql::CoveQlQueryBuilder::evidence_projection_with_grain(
         "people_projection",
-        cove_oql::AstEvidenceGrain::Row,
+        coveql::AstEvidenceGrain::Row,
     )
     .select(["source_id"])
     .parse(ParseOptions::default())
     .unwrap();
 
-    let cove_oql::AstRoot::Evidence(evidence) = parsed.root.node else {
+    let coveql::AstRoot::Evidence(evidence) = parsed.root.node else {
         panic!("expected evidence root");
     };
-    assert_eq!(evidence.grain, Some(cove_oql::AstEvidenceGrain::Row));
+    assert_eq!(evidence.grain, Some(coveql::AstEvidenceGrain::Row));
     assert!(matches!(
         evidence.target,
-        Some(cove_oql::AstEvidenceTarget::Projection(_))
+        Some(coveql::AstEvidenceTarget::Projection(_))
+    ));
+}
+
+#[test]
+fn parser_supports_evidence_root_binding_targets() {
+    let parsed = coveql::parse_query(
+        r#"evidence(table("order-history") as o, grain: row).select(source_id)"#,
+        ParseOptions::default(),
+    )
+    .unwrap();
+    let coveql::AstRoot::Evidence(evidence) = parsed.root.node else {
+        panic!("expected evidence root");
+    };
+    let Some(coveql::AstEvidenceTarget::RootBinding(binding)) = evidence.target else {
+        panic!("expected root-binding evidence target");
+    };
+    assert!(matches!(binding.root.node, coveql::AstRoot::Table(_)));
+    assert_eq!(binding.alias.unwrap().name, "o");
+    assert_eq!(evidence.grain, Some(coveql::AstEvidenceGrain::Row));
+}
+
+#[test]
+fn query_builder_matches_evidence_root_binding_target() {
+    let built = coveql::CoveQlQueryBuilder::evidence_root_binding_with_grain(
+        "table(thing_projection) as t",
+        coveql::AstEvidenceGrain::Row,
+    )
+    .select(["source_id"])
+    .parse(ParseOptions::default())
+    .unwrap();
+    let handwritten = coveql::parse_query(
+        "evidence(table(thing_projection) as t, grain: row).select(source_id)",
+        ParseOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        built.parsed_ast_fingerprint,
+        handwritten.parsed_ast_fingerprint
+    );
+}
+
+#[test]
+fn evidence_root_binding_targets_resolve_through_profile_root_context() {
+    let resolved = parse_and_resolve_query(
+        &minimal_object_with_evidence_index_file(),
+        "evidence(object(Person), grain: object).select(source_id)",
+        ParseOptions::default(),
+        ResolveOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+    let ResolvedRoot::Evidence(evidence) = &resolved.root else {
+        panic!("expected evidence root");
+    };
+    assert_eq!(evidence.grain, coveql::AstEvidenceGrain::Object);
+    assert!(matches!(
+        evidence.target,
+        Some(coveql::ResolvedEvidenceTarget::ObjectType { .. })
+    ));
+
+    let resolved = parse_and_resolve_query(
+        &minimal_object_with_evidence_index_file(),
+        "evidence(node(Person), grain: node).select(source_id)",
+        ParseOptions::default(),
+        ResolveOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+    let ResolvedRoot::Evidence(evidence) = &resolved.root else {
+        panic!("expected evidence root");
+    };
+    assert_eq!(evidence.grain, coveql::AstEvidenceGrain::Node);
+    assert!(matches!(
+        evidence.target,
+        Some(coveql::ResolvedEvidenceTarget::GraphNode { .. })
+    ));
+}
+
+#[test]
+fn table_profile_evidence_targets_preserve_row_and_column_grain() {
+    let resolved = parse_and_resolve_query(
+        &minimal_object_with_projection_and_evidence_index_file(),
+        "evidence(table(people_projection) as p, grain: row).select(source_id)",
+        ParseOptions::default(),
+        ResolveOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+    let ResolvedRoot::Evidence(evidence) = &resolved.root else {
+        panic!("expected evidence root");
+    };
+    assert_eq!(evidence.grain, coveql::AstEvidenceGrain::Row);
+    assert!(matches!(
+        evidence.target,
+        Some(coveql::ResolvedEvidenceTarget::TableRow { .. })
+    ));
+
+    let mut resolve_options = protected_json_resolve_options();
+    resolve_options.security.aggregate_disclosure_policy = AggregateDisclosurePolicy::AllowExact;
+    let resolved = parse_and_resolve_query(
+        &minimal_object_with_projection_and_evidence_index_file(),
+        "table(people_projection) as p.select(evidence_count: count(evidence(p.active)))",
+        ParseOptions::default(),
+        resolve_options,
+        validation_options(),
+    )
+    .unwrap();
+    let select = resolved.method_chain.select.as_ref().unwrap();
+    let coveql::ResolvedExpr::AggregateCall { arg: Some(arg), .. } = &select[0].expr else {
+        panic!("expected evidence aggregate");
+    };
+    let coveql::ResolvedExpr::Evidence(evidence) = arg.as_ref() else {
+        panic!("expected evidence helper");
+    };
+    assert_eq!(evidence.grain, coveql::AstEvidenceGrain::Column);
+    assert!(matches!(
+        evidence.target,
+        Some(coveql::ResolvedEvidenceTarget::TableColumn { .. })
+    ));
+}
+
+#[test]
+fn graph_profile_evidence_targets_preserve_edge_grain() {
+    let resolved = parse_and_resolve_query(
+        &association_file_with_evidence_entries(Vec::new()),
+        "evidence(edge(CustomerPlacedOrder) as e, grain: edge).select(source_id)",
+        ParseOptions::default(),
+        ResolveOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+    let ResolvedRoot::Evidence(evidence) = &resolved.root else {
+        panic!("expected evidence root");
+    };
+    assert_eq!(evidence.grain, coveql::AstEvidenceGrain::Edge);
+    assert!(matches!(
+        evidence.target,
+        Some(coveql::ResolvedEvidenceTarget::GraphEdge { .. })
     ));
 }
 
@@ -704,8 +1002,8 @@ fn root_property_evidence_target_resolves_object_property_path() {
     let ResolvedRoot::Evidence(evidence) = &resolved.root else {
         panic!("expected evidence root");
     };
-    assert_eq!(evidence.grain, cove_oql::AstEvidenceGrain::Property);
-    let Some(cove_oql::ResolvedEvidenceTarget::Property {
+    assert_eq!(evidence.grain, coveql::AstEvidenceGrain::Property);
+    let Some(coveql::ResolvedEvidenceTarget::Property {
         object_type_id,
         property_id,
         property_name,
@@ -720,66 +1018,63 @@ fn root_property_evidence_target_resolves_object_property_path() {
 
 #[test]
 fn parser_supports_directed_association_root() {
-    let parsed = cove_oql::parse_query(
+    let parsed = coveql::parse_query(
         "out(association(CustomerPlacedOrder, from: customer)).select(source_goid)",
         ParseOptions::default(),
     )
     .unwrap();
 
-    let cove_oql::AstRoot::Association(association) = parsed.root.node else {
+    let coveql::AstRoot::Association(association) = parsed.root.node else {
         panic!("expected association root");
     };
     assert_eq!(
         association.direction,
-        Some(cove_oql::AstAssociationDirection::Out)
+        Some(coveql::AstAssociationDirection::Out)
     );
-    assert_eq!(association.role, Some(cove_oql::AstAssociationRole::From));
+    assert_eq!(association.role, Some(coveql::AstAssociationRole::From));
     assert_eq!(association.role_name.unwrap().name, "customer");
 }
 
 #[test]
 fn query_builder_supports_directed_evidence_association_shorthand() {
-    let parsed = cove_oql::CoveOqlQueryBuilder::evidence_association_with_direction_role_and_grain(
-        cove_oql::AstAssociationDirection::In,
+    let parsed = coveql::CoveQlQueryBuilder::evidence_association_with_direction_role_and_grain(
+        coveql::AstAssociationDirection::In,
         "CustomerPlacedOrder",
-        cove_oql::AstAssociationRole::To,
+        coveql::AstAssociationRole::To,
         "order",
-        cove_oql::AstEvidenceGrain::Association,
+        coveql::AstEvidenceGrain::Association,
     )
     .select(["source_id"])
     .parse(ParseOptions::default())
     .unwrap();
 
-    let cove_oql::AstRoot::Evidence(evidence) = parsed.root.node else {
+    let coveql::AstRoot::Evidence(evidence) = parsed.root.node else {
         panic!("expected evidence root");
     };
-    assert_eq!(
-        evidence.grain,
-        Some(cove_oql::AstEvidenceGrain::Association)
-    );
-    let Some(cove_oql::AstEvidenceTarget::Association(association)) = evidence.target else {
+    assert_eq!(evidence.grain, Some(coveql::AstEvidenceGrain::Association));
+    let Some(coveql::AstEvidenceTarget::Association(association)) = evidence.target else {
         panic!("expected association evidence target");
     };
     assert_eq!(
         association.direction,
-        Some(cove_oql::AstAssociationDirection::In)
+        Some(coveql::AstAssociationDirection::In)
     );
-    assert_eq!(association.role, Some(cove_oql::AstAssociationRole::To));
+    assert_eq!(association.role, Some(coveql::AstAssociationRole::To));
     assert_eq!(association.role_name.unwrap().name, "order");
 }
 
 #[test]
 fn query_builder_matches_directed_evidence_association_without_grain() {
-    let built = cove_oql::CoveOqlQueryBuilder::evidence_association_with_direction_and_role(
-        cove_oql::AstAssociationDirection::Out,
+    let built = coveql::CoveQlQueryBuilder::evidence_association_with_direction_and_role(
+        coveql::AstAssociationDirection::Out,
         "CustomerPlacedOrder",
-        cove_oql::AstAssociationRole::From,
+        coveql::AstAssociationRole::From,
         "customer",
     )
     .select(["source_id"])
     .parse(ParseOptions::default())
     .unwrap();
-    let handwritten = cove_oql::parse_query(
+    let handwritten = coveql::parse_query(
         "evidence(out(association(CustomerPlacedOrder, from: customer))).select(source_id)",
         ParseOptions::default(),
     )
@@ -789,6 +1084,821 @@ fn query_builder_matches_directed_evidence_association_without_grain() {
         built.parsed_ast_fingerprint,
         handwritten.parsed_ast_fingerprint
     );
+}
+
+#[test]
+fn parser_accepts_coveql_profile_directives_aliases_and_explicit_object_root() {
+    let parsed = coveql::parse_query(
+        "# coveql: 0.1\n# profiles: object, table\nobject(Person) as p.where(p.active == true).select(p.active)",
+        ParseOptions::default(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        parsed.profiles,
+        vec![
+            coveql::CoveQlProfileId::Object,
+            coveql::CoveQlProfileId::Table
+        ]
+    );
+    assert_eq!(parsed.root_alias.as_ref().unwrap().name, "p");
+    assert!(matches!(parsed.root.node, coveql::AstRoot::Object(_)));
+    assert!(parsed.to_canonical_query().contains("object(Person) as p"));
+
+    let explicit = coveql::parse_query(
+        "object(Person).where(active == true)",
+        ParseOptions::default(),
+    )
+    .unwrap();
+    let legacy =
+        coveql::parse_query("Person.where(active == true)", ParseOptions::default()).unwrap();
+    assert_eq!(
+        explicit.parsed_ast_fingerprint,
+        legacy.parsed_ast_fingerprint
+    );
+}
+
+#[test]
+fn parser_accepts_table_and_graph_profile_constructs() {
+    let table = coveql::parse_query(
+        "table(orders) as o.lookup(table(customers) as c, on: o.customer_id == c.customer_id).select(o.id)",
+        ParseOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(table.profiles, vec![coveql::CoveQlProfileId::Table]);
+    assert!(matches!(table.root.node, coveql::AstRoot::Table(_)));
+    assert_eq!(table.root_alias.as_ref().unwrap().name, "o");
+    assert!(matches!(
+        table.methods[0].node,
+        coveql::AstMethod::ProfileCall { .. }
+    ));
+
+    let graph = coveql::parse_query(
+        "node(Customer) as c.traverse(out(edge(CustomerPlacedOrder) as placed).to(node(Order) as o)).select(c.goid)",
+        ParseOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(graph.profiles, vec![coveql::CoveQlProfileId::Graph]);
+    assert!(matches!(graph.root.node, coveql::AstRoot::Node(_)));
+    assert!(matches!(
+        graph.methods[0].node,
+        coveql::AstMethod::ProfileCall { .. }
+    ));
+
+    let path = coveql::parse_query(
+        "path(node(Customer) as c.out(edge(CustomerPlacedOrder)).to(node(Order) as o))",
+        ParseOptions::default(),
+    )
+    .unwrap();
+    assert!(matches!(path.root.node, coveql::AstRoot::Path(_)));
+}
+
+#[test]
+fn parser_rejects_invalid_path_start_and_canonicalizes_final_rows() {
+    let err = coveql::parse_query(
+        "path(table(orders).out(edge(CustomerPlacedOrder)))",
+        ParseOptions::default(),
+    )
+    .unwrap_err();
+    assert_eq!(err[0].code, "E_PARSE");
+
+    let legacy = coveql::parse_query(
+        "object(Person).changes(from: 1, to: 3, mode: final_objects)",
+        ParseOptions::default(),
+    )
+    .unwrap();
+    let canonical = coveql::parse_query(
+        "object(Person).changes(from: 1, to: 3, mode: final_rows)",
+        ParseOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        legacy.parsed_ast_fingerprint,
+        canonical.parsed_ast_fingerprint
+    );
+    assert!(legacy.to_canonical_query().contains("mode: final_rows"));
+}
+
+#[test]
+fn resolver_executes_projection_backed_table_surface() {
+    let executed = parse_resolve_plan_and_execute_query(
+        &object_file_with_bool_records_and_projection(&[false, true]),
+        "table(thing_projection) as t.where(t.active == true).select(t.active)",
+        ParseOptions::default(),
+        ResolveOptions::default(),
+        PlanOptions::default(),
+        ExecutionOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        executed.planned.resolved.parsed.profiles,
+        vec![coveql::CoveQlProfileId::Table]
+    );
+    let ResolvedRoot::Table(table) = &executed.planned.resolved.root else {
+        panic!("expected resolved table root");
+    };
+    assert_eq!(table.table_name, "thing_projection");
+    assert_eq!(table.binding_name.as_deref(), Some("t"));
+    assert_eq!(
+        table.authority_kind,
+        coveql::TableSurfaceAuthorityKind::DeterministicProjection
+    );
+    assert_eq!(table.table_id, "projection:thing_projection");
+    assert_eq!(table.row_grain, "one_row_per_object");
+    assert!(!table.row_identity.is_empty());
+    assert_eq!(table.canonical_order, table.row_identity);
+    assert_eq!(
+        table.temporal_authority,
+        coveql::TableTemporalAuthority::MaterializedSnapshotOnly
+    );
+    assert_eq!(table.table_surface_contract.table_id, table.table_id);
+    assert_eq!(
+        table
+            .table_surface_contract
+            .projection_dependency_contract_id
+            .as_deref(),
+        Some("thing_projection")
+    );
+    assert!(table
+        .table_surface_contract
+        .logical_column_map
+        .iter()
+        .any(|column| column.name == "active"));
+    assert_eq!(table.projection.projection_id, "thing_projection");
+    assert_eq!(
+        executed.planned.resolved.output_mode,
+        CoveQlOutputMode::JsonRows
+    );
+    assert_eq!(executed.pushdown_report.outcome, PushdownOutcome::Applied);
+    assert_eq!(
+        executed
+            .pushdown_report
+            .counters
+            .property_predicate_candidates,
+        1
+    );
+
+    let CoveQlExecutionResult::JsonRows(rows) = executed.result else {
+        panic!("expected table JSON rows");
+    };
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["active"], json!(true));
+}
+
+#[test]
+fn table_surface_contract_override_must_prove_row_identity() {
+    let mut contract = projection_backed_thing_table_contract();
+    contract.row_identity.clear();
+    let mut resolve_options = ResolveOptions::default();
+    resolve_options
+        .table_surface_contracts
+        .insert("thing_projection".into(), contract);
+    let err = parse_and_resolve_query(
+        &object_file_with_bool_records_and_projection(&[false, true]),
+        "table(thing_projection).select(active)",
+        ParseOptions::default(),
+        resolve_options,
+        validation_options(),
+    )
+    .unwrap_err();
+
+    assert_eq!(err.diagnostics[0].code, "E_UNKNOWN_TABLE_SURFACE");
+    assert!(err.diagnostics[0].message.contains("row_identity"));
+}
+
+#[test]
+fn table_lookup_executes_projection_backed_left_preserving_join() {
+    let executed = parse_resolve_plan_and_execute_query(
+        &object_file_with_bool_records_and_projection(&[false, true]),
+        "table(thing_projection) as l.lookup(table(thing_projection) as r, on: l.active == r.active).select(left_active: l.active, right_active: r.active)",
+        ParseOptions::default(),
+        ResolveOptions::default(),
+        PlanOptions::default(),
+        ExecutionOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+
+    let ResolvedRoot::Table(root) = &executed.planned.resolved.root else {
+        panic!("expected table root");
+    };
+    assert_eq!(root.binding_name.as_deref(), Some("l"));
+    assert_eq!(executed.planned.resolved.method_chain.lookups.len(), 1);
+    assert_eq!(
+        executed.planned.resolved.method_chain.lookups[0]
+            .right
+            .binding_name
+            .as_deref(),
+        Some("r")
+    );
+    assert_eq!(
+        executed.planned.resolved.method_chain.lookups[0].cardinality,
+        coveql::TableLookupCardinality::One
+    );
+    assert_eq!(
+        executed.planned.resolved.method_chain.lookups[0].duplicate_policy,
+        coveql::TableLookupDuplicatePolicy::Reject
+    );
+    assert_eq!(
+        executed.planned.resolved.method_chain.lookups[0].unmatched_policy,
+        coveql::TableLookupUnmatchedPolicy::Nulls
+    );
+    let CoveQlExecutionResult::JsonRows(rows) = executed.result else {
+        panic!("expected table lookup JSON rows");
+    };
+    assert_eq!(rows.len(), 2);
+    assert!(rows
+        .iter()
+        .any(|row| row["left_active"] == json!(false) && row["right_active"] == json!(false)));
+    assert!(rows
+        .iter()
+        .any(|row| row["left_active"] == json!(true) && row["right_active"] == json!(true)));
+}
+
+#[test]
+fn table_lookup_enforces_cardinality_and_duplicate_contract() {
+    let bytes = object_file_with_bool_records_and_projection(&[true, true]);
+    let err = parse_resolve_plan_and_execute_query(
+        &bytes,
+        "table(thing_projection) as l.lookup(table(thing_projection) as r, on: l.active == r.active).select(left_active: l.active, right_active: r.active)",
+        ParseOptions::default(),
+        ResolveOptions::default(),
+        PlanOptions::default(),
+        ExecutionOptions::default(),
+        validation_options(),
+    )
+    .unwrap_err();
+    assert_eq!(err.diagnostics[0].code, "E_LOOKUP_DUPLICATE_MATCH");
+
+    let executed = parse_resolve_plan_and_execute_query(
+        &bytes,
+        "table(thing_projection) as l.lookup(table(thing_projection) as r, on: l.active == r.active, cardinality: many).select(left_active: l.active, right_active: r.active)",
+        ParseOptions::default(),
+        ResolveOptions::default(),
+        PlanOptions::default(),
+        ExecutionOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+    assert_eq!(
+        executed.planned.resolved.method_chain.lookups[0].cardinality,
+        coveql::TableLookupCardinality::Many
+    );
+    assert_eq!(
+        executed.planned.resolved.method_chain.lookups[0].duplicate_policy,
+        coveql::TableLookupDuplicatePolicy::EmitAll
+    );
+    let CoveQlExecutionResult::JsonRows(rows) = executed.result else {
+        panic!("expected table lookup JSON rows");
+    };
+    assert_eq!(rows.len(), 4);
+}
+
+#[test]
+fn table_exists_executes_projection_backed_semi_and_anti_join() {
+    let bytes = object_file_with_bool_records_and_projection(&[false, true]);
+    let semi = parse_resolve_plan_and_execute_query(
+        &bytes,
+        "table(thing_projection) as l.where(exists(table(thing_projection) as r, on: l.active == r.active)).select(active)",
+        ParseOptions::default(),
+        ResolveOptions::default(),
+        PlanOptions::default(),
+        ExecutionOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+    let CoveQlExecutionResult::JsonRows(rows) = semi.result else {
+        panic!("expected semi-join JSON rows");
+    };
+    assert_eq!(rows.len(), 2);
+
+    let anti = parse_resolve_plan_and_execute_query(
+        &bytes,
+        "table(thing_projection) as l.where(!exists(table(thing_projection) as r, on: l.active == r.active)).select(active)",
+        ParseOptions::default(),
+        ResolveOptions::default(),
+        PlanOptions::default(),
+        ExecutionOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+    let CoveQlExecutionResult::JsonRows(rows) = anti.result else {
+        panic!("expected anti-join JSON rows");
+    };
+    assert!(rows.is_empty());
+}
+
+#[test]
+fn projection_backed_table_emits_projection_dependency_contract() {
+    let planned = parse_resolve_and_plan_query(
+        &minimal_object_with_projection_file(),
+        "table(people_projection).where(active == true).select(active)",
+        ParseOptions::default(),
+        ResolveOptions::default(),
+        PlanOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        planned.logical_plan.context.root_kind,
+        coveql::LogicalRootKind::Table
+    );
+    assert_eq!(
+        planned.logical_plan.context.scan_grain,
+        coveql::ScanGrain::TableRow
+    );
+    assert!(planned
+        .logical_plan
+        .canonical_order
+        .contains(&"projection_row_identity".to_string()));
+    let contract = planned.dependencies.projection_contracts.first().unwrap();
+    assert_eq!(contract.projection_id, "people_projection");
+    assert!(contract.pushed_columns.contains("active"));
+    assert!(contract.pushed_predicates[0].contains("compare:Eq:active"));
+    assert_eq!(planned.explain_json()["primary_profile"], json!("table"));
+    assert_eq!(planned.explain_json()["root"], json!("table"));
+    assert_eq!(planned.explain_json()["grain"], json!("table_row"));
+    let query_contract = &planned.explain_json()["profile_contracts"][0]["query_contract"];
+    assert_eq!(
+        query_contract["table_id"],
+        json!("projection:people_projection")
+    );
+    assert_eq!(
+        query_contract["row_identity"],
+        json!(["projection_row_identity"])
+    );
+    assert_eq!(
+        query_contract["projection_dependency_contract_id"],
+        json!("people_projection")
+    );
+}
+
+#[test]
+fn projection_backed_table_direct_scan_supports_alias_qualified_columns() {
+    let executed = parse_resolve_plan_and_execute_query(
+        &object_file_with_bool_records_and_projection(&[false, true]),
+        "table(thing_projection) as p.where(p.active == true).select(value: p.active)",
+        ParseOptions::default(),
+        ResolveOptions::default(),
+        PlanOptions::default(),
+        ExecutionOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+    let CoveQlExecutionResult::JsonRows(rows) = executed.result else {
+        panic!("expected table JSON rows");
+    };
+    assert_eq!(rows, vec![json!({"value": true})]);
+    let contract = executed
+        .planned
+        .dependencies
+        .projection_contracts
+        .first()
+        .unwrap();
+    assert!(contract.pushed_columns.contains("active"));
+    assert!(contract.pushed_predicates[0].contains("compare:Eq:active"));
+}
+
+#[test]
+fn graph_node_and_edge_roots_execute_through_object_authority() {
+    let node = parse_resolve_plan_and_execute_query(
+        &object_file_with_bool_records_and_projection(&[false, true]),
+        "node(Thing) as t.where(t.active == true).select(t.active)",
+        ParseOptions::default(),
+        ResolveOptions::default(),
+        PlanOptions::default(),
+        ExecutionOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+    assert_eq!(
+        node.planned.resolved.parsed.profiles,
+        vec![coveql::CoveQlProfileId::Graph]
+    );
+    assert!(matches!(node.planned.resolved.root, ResolvedRoot::Node(_)));
+    assert_eq!(
+        node.planned.logical_plan.context.root_kind,
+        coveql::LogicalRootKind::Node
+    );
+    assert_eq!(
+        node.planned.logical_plan.context.scan_grain,
+        coveql::ScanGrain::NodeState
+    );
+    let CoveQlExecutionResult::JsonRows(rows) = node.result else {
+        panic!("expected graph node JSON rows");
+    };
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["active"], json!(true));
+
+    let edge = parse_resolve_plan_and_execute_query(
+        &object_file_with_person_and_association_record(),
+        "edge(CustomerPlacedOrder) as e.select(e.source_goid, e.target_goid)",
+        ParseOptions::default(),
+        ResolveOptions::default(),
+        PlanOptions::default(),
+        ExecutionOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+    assert!(matches!(edge.planned.resolved.root, ResolvedRoot::Edge(_)));
+    assert_eq!(
+        edge.planned.logical_plan.context.root_kind,
+        coveql::LogicalRootKind::Edge
+    );
+    assert_eq!(
+        edge.planned.logical_plan.context.scan_grain,
+        coveql::ScanGrain::EdgeState
+    );
+    let CoveQlExecutionResult::JsonRows(rows) = edge.result else {
+        panic!("expected graph edge JSON rows");
+    };
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0]["source_goid"].is_string());
+    assert!(rows[0]["target_goid"].is_string());
+}
+
+#[test]
+fn graph_traverse_executes_one_hop_edge_expansion() {
+    let executed = parse_resolve_plan_and_execute_query(
+        &object_file_with_person_and_association_record(),
+        "node(Person) as c.traverse(out(edge(CustomerPlacedOrder) as placed)).select(customer: c.goid, target: placed.target_goid)",
+        ParseOptions::default(),
+        ResolveOptions::default(),
+        PlanOptions::default(),
+        ExecutionOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+    assert_eq!(executed.planned.resolved.method_chain.traversals.len(), 1);
+    let CoveQlExecutionResult::JsonRows(rows) = executed.result else {
+        panic!("expected graph traversal JSON rows");
+    };
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0]["customer"].is_string());
+    assert!(rows[0]["target"].is_string());
+    assert_ne!(rows[0]["customer"], rows[0]["target"]);
+}
+
+#[test]
+fn graph_relationship_exists_and_aggregates_use_association_authority() {
+    let mut resolve_options = protected_json_resolve_options();
+    resolve_options.security.aggregate_disclosure_policy = AggregateDisclosurePolicy::AllowExact;
+    let executed = parse_resolve_plan_and_execute_query(
+        &object_file_with_person_and_association_record(),
+        "node(Person) as c.where(exists(out(edge(CustomerPlacedOrder)))).select(active)",
+        ParseOptions::default(),
+        resolve_options.clone(),
+        PlanOptions::default(),
+        ExecutionOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+    let CoveQlExecutionResult::JsonRows(rows) = executed.result else {
+        panic!("expected graph relationship JSON rows");
+    };
+    assert_eq!(rows, vec![json!({"active": true})]);
+
+    let aggregates = parse_resolve_plan_and_execute_query(
+        &object_file_with_person_and_association_record(),
+        "node(Person) as c.select(c: count(out(edge(CustomerPlacedOrder))), e: exists(out(edge(CustomerPlacedOrder))), d: distinct_count(out(edge(CustomerPlacedOrder))))",
+        ParseOptions::default(),
+        resolve_options,
+        PlanOptions::default(),
+        ExecutionOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+    let CoveQlExecutionResult::JsonRows(rows) = aggregates.result else {
+        panic!("expected graph relationship aggregate JSON rows");
+    };
+    assert_eq!(rows, vec![json!({"c": 1, "e": true, "d": 1})]);
+}
+
+#[test]
+fn graph_relationship_target_node_filter_uses_visible_target_node_rows() {
+    let mut resolve_options = protected_json_resolve_options();
+    resolve_options.security.aggregate_disclosure_policy = AggregateDisclosurePolicy::AllowExact;
+    let bytes = object_file_with_two_person_association_record();
+    let executed = parse_resolve_plan_and_execute_query(
+        &bytes,
+        "node(Person) as c.where(exists(out(edge(CustomerPlacedOrder)).to(node(Person)))).select(active)",
+        ParseOptions::default(),
+        resolve_options.clone(),
+        PlanOptions::default(),
+        ExecutionOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+    let CoveQlExecutionResult::JsonRows(rows) = executed.result else {
+        panic!("expected graph target relationship JSON rows");
+    };
+    assert_eq!(rows, vec![json!({"active": true})]);
+
+    let aggregate = parse_resolve_plan_and_execute_query(
+        &bytes,
+        "node(Person) as c.select(c: count(out(edge(CustomerPlacedOrder)).to(node(Person))), e: exists(out(edge(CustomerPlacedOrder)).to(node(Person))), d: distinct_count(out(edge(CustomerPlacedOrder)).to(node(Person))))",
+        ParseOptions::default(),
+        resolve_options,
+        PlanOptions::default(),
+        ExecutionOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+    let CoveQlExecutionResult::JsonRows(rows) = aggregate.result else {
+        panic!("expected graph target relationship aggregate rows");
+    };
+    assert_eq!(rows, vec![json!({"c": 1, "e": true, "d": 1})]);
+}
+
+#[test]
+fn graph_path_root_executes_as_implicit_one_hop_traversal() {
+    let executed = parse_resolve_plan_and_execute_query(
+        &object_file_with_person_and_association_record(),
+        "path(node(Person) as c.out(edge(CustomerPlacedOrder) as placed)).select(customer: c.goid, target: placed.target_goid)",
+        ParseOptions::default(),
+        ResolveOptions::default(),
+        PlanOptions::default(),
+        ExecutionOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+    assert_eq!(executed.planned.resolved.method_chain.traversals.len(), 1);
+    let CoveQlExecutionResult::JsonRows(rows) = executed.result else {
+        panic!("expected graph path JSON rows");
+    };
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0]["customer"].is_string());
+    assert!(rows[0]["target"].is_string());
+}
+
+#[test]
+fn graph_path_root_executes_multi_hop_traversal() {
+    let executed = parse_resolve_plan_and_execute_query(
+        &object_file_with_three_person_two_association_records(),
+        "path(node(Person) as a.out(edge(CustomerPlacedOrder) as first).to(node(Person) as b).out(edge(CustomerPlacedOrder) as second).to(node(Person) as c)).select(start: a.goid, mid: b.goid, end: c.goid)",
+        ParseOptions::default(),
+        ResolveOptions::default(),
+        PlanOptions::default(),
+        ExecutionOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+    assert_eq!(executed.planned.resolved.method_chain.traversals.len(), 2);
+    let CoveQlExecutionResult::JsonRows(rows) = executed.result else {
+        panic!("expected graph path JSON rows");
+    };
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["start"], json!("00000000000000000000000000000000"));
+    assert_eq!(rows[0]["mid"], json!("02020202020202020202020202020202"));
+    assert_eq!(rows[0]["end"], json!("03030303030303030303030303030303"));
+}
+
+#[test]
+fn graph_traverse_method_chains_use_previous_hop_target() {
+    let executed = parse_resolve_plan_and_execute_query(
+        &object_file_with_three_person_two_association_records(),
+        "node(Person) as a.traverse(out(edge(CustomerPlacedOrder) as first).to(node(Person) as b)).traverse(out(edge(CustomerPlacedOrder) as second).to(node(Person) as c)).select(start: a.goid, mid: b.goid, end: c.goid)",
+        ParseOptions::default(),
+        ResolveOptions::default(),
+        PlanOptions::default(),
+        ExecutionOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+    assert_eq!(executed.planned.resolved.method_chain.traversals.len(), 2);
+    let CoveQlExecutionResult::JsonRows(rows) = executed.result else {
+        panic!("expected chained graph traverse JSON rows");
+    };
+    assert_eq!(
+        rows,
+        vec![json!({
+            "start": "00000000000000000000000000000000",
+            "mid": "02020202020202020202020202020202",
+            "end": "03030303030303030303030303030303"
+        })]
+    );
+}
+
+#[test]
+fn graph_traverse_accepts_explicit_one_hop_contract_arguments() {
+    let executed = parse_resolve_plan_and_execute_query(
+        &object_file_with_person_and_association_record(),
+        "node(Person) as c.traverse(out(edge(CustomerPlacedOrder) as placed), min: 1, max: 1, mode: walk).select(customer: c.goid, target: placed.target_goid)",
+        ParseOptions::default(),
+        ResolveOptions::default(),
+        PlanOptions::default(),
+        ExecutionOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+    let traversal = &executed.planned.resolved.method_chain.traversals[0];
+    assert_eq!(traversal.min_depth, 1);
+    assert_eq!(traversal.max_depth, 1);
+    assert_eq!(traversal.mode, coveql::GraphTraversalMode::Walk);
+    let CoveQlExecutionResult::JsonRows(rows) = executed.result else {
+        panic!("expected graph traversal JSON rows");
+    };
+    assert_eq!(rows.len(), 1);
+}
+
+#[test]
+fn graph_traverse_rejects_variable_length_without_contract() {
+    let err = parse_and_resolve_query(
+        &object_file_with_person_and_association_record(),
+        "node(Person) as c.traverse(out(edge(CustomerPlacedOrder)), min: 1, max: 3, mode: walk).select(c.goid)",
+        ParseOptions::default(),
+        ResolveOptions::default(),
+        validation_options(),
+    )
+    .unwrap_err();
+    assert_eq!(err.diagnostics[0].code, "E_UNSUPPORTED_PROFILE_METHOD");
+    assert!(err.diagnostics[0]
+        .message
+        .contains("variable-length traversal"));
+}
+
+#[test]
+fn graph_traverse_executes_variable_length_with_contract() {
+    let mut resolve_options = ResolveOptions::default();
+    resolve_options.graph_traversal_contract = Some(graph_traversal_contract());
+    let executed = parse_resolve_plan_and_execute_query(
+        &object_file_with_three_person_two_association_records(),
+        "node(Person) as a.traverse(out(edge(CustomerPlacedOrder) as placed).to(node(Person) as p), min: 1, max: 2, mode: walk, distinct: path).select(start: a.goid, end: p.goid)",
+        ParseOptions::default(),
+        resolve_options,
+        PlanOptions::default(),
+        ExecutionOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+
+    let traversal = &executed.planned.resolved.method_chain.traversals[0];
+    assert_eq!(traversal.min_depth, 1);
+    assert_eq!(traversal.max_depth, 2);
+    assert_eq!(traversal.mode, coveql::GraphTraversalMode::Walk);
+    assert_eq!(
+        traversal.distinct,
+        coveql::GraphTraversalDistinctPolicy::Path
+    );
+    assert!(traversal.contract.is_some());
+    let graph_contract =
+        &executed.explain_json()["profile_contracts"][0]["query_contract"]["traversals"][0];
+    assert_eq!(graph_contract["min_depth"], json!(1));
+    assert_eq!(graph_contract["max_depth"], json!(2));
+    assert_eq!(graph_contract["mode"], json!("walk"));
+    assert_eq!(graph_contract["distinct"], json!("path"));
+    assert_eq!(graph_contract["contract_present"], json!(true));
+    assert_eq!(graph_contract["contract"]["max_depth"], json!(4));
+    let CoveQlExecutionResult::JsonRows(rows) = executed.result else {
+        panic!("expected variable graph traversal JSON rows");
+    };
+    assert_eq!(
+        rows.iter()
+            .map(|row| format!(
+                "{}>{}",
+                row["start"].as_str().unwrap(),
+                row["end"].as_str().unwrap()
+            ))
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([
+            "00000000000000000000000000000000>02020202020202020202020202020202".to_string(),
+            "02020202020202020202020202020202>03030303030303030303030303030303".to_string(),
+            "00000000000000000000000000000000>03030303030303030303030303030303".to_string(),
+        ])
+    );
+}
+
+#[test]
+fn graph_traverse_contract_rejects_unsupported_distinct_policy() {
+    let mut contract = graph_traversal_contract();
+    contract.supported_distinct_policies = vec![coveql::GraphTraversalDistinctPolicy::None];
+    let mut resolve_options = ResolveOptions::default();
+    resolve_options.graph_traversal_contract = Some(contract);
+    let err = parse_and_resolve_query(
+        &object_file_with_three_person_two_association_records(),
+        "node(Person) as a.traverse(out(edge(CustomerPlacedOrder)), min: 1, max: 2, mode: walk, distinct: path).select(a.goid)",
+        ParseOptions::default(),
+        resolve_options,
+        validation_options(),
+    )
+    .unwrap_err();
+
+    assert_eq!(err.diagnostics[0].code, "E_UNSUPPORTED_PROFILE_METHOD");
+    assert!(err.diagnostics[0].message.contains("distinct policy path"));
+}
+
+#[test]
+fn graph_traverse_contract_respects_resource_depth_budget() {
+    let mut resolve_options = ResolveOptions::default();
+    resolve_options.graph_traversal_contract = Some(graph_traversal_contract());
+    resolve_options
+        .resource_budget
+        .maximum_graph_traversal_depth = 1;
+    let err = parse_and_resolve_query(
+        &object_file_with_three_person_two_association_records(),
+        "node(Person) as a.traverse(out(edge(CustomerPlacedOrder)), min: 1, max: 2, mode: walk).select(a.goid)",
+        ParseOptions::default(),
+        resolve_options,
+        validation_options(),
+    )
+    .unwrap_err();
+
+    assert_eq!(err.diagnostics[0].code, "E_RESOURCE_BUDGET_EXCEEDED");
+    assert!(err.diagnostics[0]
+        .message
+        .contains("maximum_graph_traversal_depth"));
+}
+
+#[test]
+fn graph_path_root_can_continue_with_traverse_method() {
+    let executed = parse_resolve_plan_and_execute_query(
+        &object_file_with_three_person_two_association_records(),
+        "path(node(Person) as a.out(edge(CustomerPlacedOrder) as first).to(node(Person) as b)).traverse(out(edge(CustomerPlacedOrder) as second).to(node(Person) as c)).select(start: a.goid, mid: b.goid, end: c.goid)",
+        ParseOptions::default(),
+        ResolveOptions::default(),
+        PlanOptions::default(),
+        ExecutionOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+    assert_eq!(executed.planned.resolved.method_chain.traversals.len(), 2);
+    let CoveQlExecutionResult::JsonRows(rows) = executed.result else {
+        panic!("expected continued graph path JSON rows");
+    };
+    assert_eq!(
+        rows,
+        vec![json!({
+            "start": "00000000000000000000000000000000",
+            "mid": "02020202020202020202020202020202",
+            "end": "03030303030303030303030303030303"
+        })]
+    );
+}
+
+#[test]
+fn resolver_rejects_unknown_or_undeclared_profile_constructs_with_stable_diagnostics() {
+    let table = parse_and_resolve_query(
+        &minimal_object_file(),
+        "table(orders).select(order_id)",
+        ParseOptions::default(),
+        ResolveOptions::default(),
+        validation_options(),
+    )
+    .unwrap_err();
+    assert_eq!(table.diagnostics[0].code, "E_UNKNOWN_TABLE_SURFACE");
+
+    let graph = parse_and_resolve_query(
+        &minimal_object_file(),
+        "node(Customer).select(goid)",
+        ParseOptions::default(),
+        ResolveOptions::default(),
+        validation_options(),
+    )
+    .unwrap_err();
+    assert_eq!(graph.diagnostics[0].code, "E_UNKNOWN_GRAPH_LABEL");
+
+    let path = parse_and_resolve_query(
+        &minimal_object_file(),
+        "path(node(Person) as p.out(edge(CustomerPlacedOrder)))",
+        ParseOptions::default(),
+        ResolveOptions::default(),
+        validation_options(),
+    )
+    .unwrap_err();
+    assert_eq!(path.diagnostics[0].code, "E_UNKNOWN_GRAPH_LABEL");
+
+    let method = parse_and_resolve_query(
+        &minimal_object_file(),
+        "object(Person).lookup(table(orders), on: active == true)",
+        ParseOptions::default(),
+        ResolveOptions::default(),
+        validation_options(),
+    )
+    .unwrap_err();
+    assert_eq!(method.diagnostics[0].code, "E_UNKNOWN_BRIDGE");
+
+    let exists_bridge = parse_and_resolve_query(
+        &object_file_with_bool_records_and_projection(&[true]),
+        "object(Thing).where(exists(table(thing_projection) as t, on: active == t.active)).select(active)",
+        ParseOptions::default(),
+        ResolveOptions::default(),
+        validation_options(),
+    )
+    .unwrap_err();
+    assert_eq!(exists_bridge.diagnostics[0].code, "E_UNKNOWN_BRIDGE");
+
+    let ambiguous = parse_and_resolve_query(
+        &minimal_object_file(),
+        "# profiles: object, table\nprojection(people_projection)",
+        ParseOptions::default(),
+        ResolveOptions::default(),
+        validation_options(),
+    )
+    .unwrap_err();
+    assert_eq!(ambiguous.diagnostics[0].code, "E_AMBIGUOUS_PROFILE");
 }
 
 fn minimal_object_file() -> Vec<u8> {
@@ -2587,7 +3697,7 @@ fn object_file_with_filecode_key_records_with_file_id_collation_and_function_reg
         optional_features: 0,
         data: CodeSpaceDescriptorV1 {
             code_space_id: 1,
-            namespace: "org.example.oql".into(),
+            namespace: "org.example.coveql".into(),
             stable_id: b"exec-codes".to_vec(),
             epoch: 1,
             flags: 0,
@@ -3392,7 +4502,7 @@ fn object_property_index_only_covi_with_target(
 ) -> Vec<u8> {
     let context = build_operation_context(
         bytes,
-        CoveOqlOperationRequest::default(),
+        CoveQlOperationRequest::default(),
         validation_options(),
     )
     .unwrap();
@@ -3688,7 +4798,7 @@ fn object_property_bool_lookup_covi(
 ) -> Vec<u8> {
     let context = build_operation_context(
         bytes,
-        CoveOqlOperationRequest::default(),
+        CoveQlOperationRequest::default(),
         validation_options(),
     )
     .unwrap();
@@ -4432,6 +5542,327 @@ fn object_file_with_person_and_association_record() -> Vec<u8> {
     writer.write().unwrap()
 }
 
+fn object_file_with_two_person_association_record() -> Vec<u8> {
+    let catalog = ObjectTypeCatalog {
+        flags: 0,
+        types: vec![
+            ObjectTypeEntryV1 {
+                object_type_id: 1,
+                type_name: "Person".into(),
+                flags: OBJECT_TYPE_FLAG_ENTITY_OBJECT,
+                properties: vec![PropertyEntryV1 {
+                    property_id: 1,
+                    property_name: "active".into(),
+                    logical_type: CoveLogicalType::Bool,
+                    physical_kind: CovePhysicalKind::Boolean,
+                    nullable: false,
+                    collation_id: 0,
+                    flags: 0,
+                }],
+            },
+            ObjectTypeEntryV1 {
+                object_type_id: 7,
+                type_name: "CustomerPlacedOrder".into(),
+                flags: OBJECT_TYPE_FLAG_ASSOCIATION_OBJECT,
+                properties: vec![
+                    PropertyEntryV1 {
+                        property_id: 11,
+                        property_name: "source_goid".into(),
+                        logical_type: CoveLogicalType::Uuid,
+                        physical_kind: CovePhysicalKind::FixedBytes,
+                        nullable: false,
+                        collation_id: 0,
+                        flags: PROPERTY_FLAG_ASSOCIATION_FROM_GOID,
+                    },
+                    PropertyEntryV1 {
+                        property_id: 12,
+                        property_name: "target_goid".into(),
+                        logical_type: CoveLogicalType::Uuid,
+                        physical_kind: CovePhysicalKind::FixedBytes,
+                        nullable: false,
+                        collation_id: 0,
+                        flags: PROPERTY_FLAG_ASSOCIATION_TO_GOID,
+                    },
+                ],
+            },
+        ],
+    };
+    let person_rows = vec![
+        TemporalRowEntryV1 {
+            timestamp_us: 10,
+            csn: 1,
+            branch_key: 0,
+            goid: [0; 16],
+            record_id: [32; 16],
+            record_kind: RecordKind::Baseline,
+            prev_ref: None,
+        },
+        TemporalRowEntryV1 {
+            timestamp_us: 11,
+            csn: 2,
+            branch_key: 0,
+            goid: [2; 16],
+            record_id: [33; 16],
+            record_kind: RecordKind::Baseline,
+            prev_ref: None,
+        },
+    ];
+    let association_rows = vec![TemporalRowEntryV1 {
+        timestamp_us: 20,
+        csn: 3,
+        branch_key: 0,
+        goid: [7; 16],
+        record_id: [40; 16],
+        record_kind: RecordKind::Baseline,
+        prev_ref: None,
+    }];
+    let person_segment = temporal_segment_with_bool_property(&person_rows, &[true, false]);
+    let association_segment =
+        temporal_segment_with_association_endpoints(&association_rows, &[[0; 16]], &[[2; 16]]);
+    let index = TemporalSegmentIndex {
+        flags: 0,
+        entries: vec![
+            temporal_segment_entry_for_object_type_rows(
+                7,
+                1,
+                &person_rows,
+                person_segment.len() as u64,
+            ),
+            temporal_segment_entry_for_object_type_rows(
+                8,
+                7,
+                &association_rows,
+                association_segment.len() as u64,
+            ),
+        ],
+    };
+
+    let mut writer = MinimalCoveWriter::new();
+    writer.primary_profile = PrimaryProfile::ObjectTemporal as u8;
+    writer.required_features = FEATURE_OBJECT_PROFILE;
+    writer.sections.push(SectionPayload {
+        section_kind: SectionKind::ObjectTypeCatalog as u16,
+        profile: PrimaryProfile::ObjectTemporal as u8,
+        flags: 0,
+        item_count: 2,
+        row_count: 0,
+        compression: CompressionCodec::None as u8,
+        alignment_log2: 0,
+        required_features: FEATURE_OBJECT_PROFILE,
+        optional_features: 0,
+        data: catalog.serialize().unwrap(),
+    });
+    writer.sections.push(SectionPayload {
+        section_kind: SectionKind::TemporalSegmentIndex as u16,
+        profile: PrimaryProfile::ObjectTemporal as u8,
+        flags: 0,
+        item_count: 2,
+        row_count: 3,
+        compression: CompressionCodec::None as u8,
+        alignment_log2: 0,
+        required_features: FEATURE_OBJECT_PROFILE,
+        optional_features: 0,
+        data: index.serialize().unwrap(),
+    });
+    writer.sections.push(SectionPayload {
+        section_kind: SectionKind::TemporalSegmentData as u16,
+        profile: PrimaryProfile::ObjectTemporal as u8,
+        flags: 0,
+        item_count: 1,
+        row_count: person_rows.len() as u64,
+        compression: CompressionCodec::None as u8,
+        alignment_log2: 0,
+        required_features: FEATURE_OBJECT_PROFILE,
+        optional_features: 0,
+        data: person_segment,
+    });
+    writer.sections.push(SectionPayload {
+        section_kind: SectionKind::TemporalSegmentData as u16,
+        profile: PrimaryProfile::ObjectTemporal as u8,
+        flags: 0,
+        item_count: 1,
+        row_count: association_rows.len() as u64,
+        compression: CompressionCodec::None as u8,
+        alignment_log2: 0,
+        required_features: FEATURE_OBJECT_PROFILE,
+        optional_features: 0,
+        data: association_segment,
+    });
+    writer.write().unwrap()
+}
+
+fn object_file_with_three_person_two_association_records() -> Vec<u8> {
+    let catalog = ObjectTypeCatalog {
+        flags: 0,
+        types: vec![
+            ObjectTypeEntryV1 {
+                object_type_id: 1,
+                type_name: "Person".into(),
+                flags: OBJECT_TYPE_FLAG_ENTITY_OBJECT,
+                properties: vec![PropertyEntryV1 {
+                    property_id: 1,
+                    property_name: "active".into(),
+                    logical_type: CoveLogicalType::Bool,
+                    physical_kind: CovePhysicalKind::Boolean,
+                    nullable: false,
+                    collation_id: 0,
+                    flags: 0,
+                }],
+            },
+            ObjectTypeEntryV1 {
+                object_type_id: 7,
+                type_name: "CustomerPlacedOrder".into(),
+                flags: OBJECT_TYPE_FLAG_ASSOCIATION_OBJECT,
+                properties: vec![
+                    PropertyEntryV1 {
+                        property_id: 11,
+                        property_name: "source_goid".into(),
+                        logical_type: CoveLogicalType::Uuid,
+                        physical_kind: CovePhysicalKind::FixedBytes,
+                        nullable: false,
+                        collation_id: 0,
+                        flags: PROPERTY_FLAG_ASSOCIATION_FROM_GOID,
+                    },
+                    PropertyEntryV1 {
+                        property_id: 12,
+                        property_name: "target_goid".into(),
+                        logical_type: CoveLogicalType::Uuid,
+                        physical_kind: CovePhysicalKind::FixedBytes,
+                        nullable: false,
+                        collation_id: 0,
+                        flags: PROPERTY_FLAG_ASSOCIATION_TO_GOID,
+                    },
+                ],
+            },
+        ],
+    };
+    let person_rows = vec![
+        TemporalRowEntryV1 {
+            timestamp_us: 10,
+            csn: 1,
+            branch_key: 0,
+            goid: [0; 16],
+            record_id: [32; 16],
+            record_kind: RecordKind::Baseline,
+            prev_ref: None,
+        },
+        TemporalRowEntryV1 {
+            timestamp_us: 11,
+            csn: 2,
+            branch_key: 0,
+            goid: [2; 16],
+            record_id: [33; 16],
+            record_kind: RecordKind::Baseline,
+            prev_ref: None,
+        },
+        TemporalRowEntryV1 {
+            timestamp_us: 12,
+            csn: 3,
+            branch_key: 0,
+            goid: [3; 16],
+            record_id: [34; 16],
+            record_kind: RecordKind::Baseline,
+            prev_ref: None,
+        },
+    ];
+    let association_rows = vec![
+        TemporalRowEntryV1 {
+            timestamp_us: 20,
+            csn: 4,
+            branch_key: 0,
+            goid: [7; 16],
+            record_id: [40; 16],
+            record_kind: RecordKind::Baseline,
+            prev_ref: None,
+        },
+        TemporalRowEntryV1 {
+            timestamp_us: 21,
+            csn: 5,
+            branch_key: 0,
+            goid: [8; 16],
+            record_id: [41; 16],
+            record_kind: RecordKind::Baseline,
+            prev_ref: None,
+        },
+    ];
+    let person_segment = temporal_segment_with_bool_property(&person_rows, &[true, false, true]);
+    let association_segment = temporal_segment_with_association_endpoints(
+        &association_rows,
+        &[[0; 16], [2; 16]],
+        &[[2; 16], [3; 16]],
+    );
+    let index = TemporalSegmentIndex {
+        flags: 0,
+        entries: vec![
+            temporal_segment_entry_for_object_type_rows(
+                7,
+                1,
+                &person_rows,
+                person_segment.len() as u64,
+            ),
+            temporal_segment_entry_for_object_type_rows(
+                8,
+                7,
+                &association_rows,
+                association_segment.len() as u64,
+            ),
+        ],
+    };
+
+    let mut writer = MinimalCoveWriter::new();
+    writer.primary_profile = PrimaryProfile::ObjectTemporal as u8;
+    writer.required_features = FEATURE_OBJECT_PROFILE;
+    writer.sections.push(SectionPayload {
+        section_kind: SectionKind::ObjectTypeCatalog as u16,
+        profile: PrimaryProfile::ObjectTemporal as u8,
+        flags: 0,
+        item_count: 2,
+        row_count: 0,
+        compression: CompressionCodec::None as u8,
+        alignment_log2: 0,
+        required_features: FEATURE_OBJECT_PROFILE,
+        optional_features: 0,
+        data: catalog.serialize().unwrap(),
+    });
+    writer.sections.push(SectionPayload {
+        section_kind: SectionKind::TemporalSegmentIndex as u16,
+        profile: PrimaryProfile::ObjectTemporal as u8,
+        flags: 0,
+        item_count: 2,
+        row_count: 5,
+        compression: CompressionCodec::None as u8,
+        alignment_log2: 0,
+        required_features: FEATURE_OBJECT_PROFILE,
+        optional_features: 0,
+        data: index.serialize().unwrap(),
+    });
+    writer.sections.push(SectionPayload {
+        section_kind: SectionKind::TemporalSegmentData as u16,
+        profile: PrimaryProfile::ObjectTemporal as u8,
+        flags: 0,
+        item_count: 1,
+        row_count: person_rows.len() as u64,
+        compression: CompressionCodec::None as u8,
+        alignment_log2: 0,
+        required_features: FEATURE_OBJECT_PROFILE,
+        optional_features: 0,
+        data: person_segment,
+    });
+    writer.sections.push(SectionPayload {
+        section_kind: SectionKind::TemporalSegmentData as u16,
+        profile: PrimaryProfile::ObjectTemporal as u8,
+        flags: 0,
+        item_count: 1,
+        row_count: association_rows.len() as u64,
+        compression: CompressionCodec::None as u8,
+        alignment_log2: 0,
+        required_features: FEATURE_OBJECT_PROFILE,
+        optional_features: 0,
+        data: association_segment,
+    });
+    writer.write().unwrap()
+}
+
 fn minimal_filecode_object_file() -> Vec<u8> {
     let catalog = ObjectTypeCatalog {
         flags: 0,
@@ -5065,7 +6496,7 @@ fn push_embedded_map_section(
 fn object_context_validates_minimal_object_file() {
     let context = build_operation_context(
         &minimal_object_file(),
-        CoveOqlOperationRequest::default(),
+        CoveQlOperationRequest::default(),
         validation_options(),
     )
     .unwrap();
@@ -5118,26 +6549,26 @@ fn manifest_dataset_scope_validates_members_and_keeps_bridges_inexact() {
     let left = minimal_object_file_with_id([0xA1; 16]);
     let right = minimal_object_file_with_id([0xB2; 16]);
     let manifest = covm_manifest_for_members(&[("left.cove", &left), ("right.cove", &right)]);
-    let scope = cove_oql::build_manifest_dataset_scope_context(
+    let scope = coveql::build_manifest_dataset_scope_context(
         &manifest,
         &[
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "left.cove",
                 bytes: &left,
             },
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "right.cove",
                 bytes: &right,
             },
         ],
-        cove_oql::ManifestDatasetScopeOptions {
+        coveql::ManifestDatasetScopeOptions {
             tenant_id: Some("tenant-a".into()),
             security: SecurityContext {
                 principal_or_session: Some("principal-a".into()),
                 metadata_disclosure_policy: MetadataDisclosurePolicy::AllowProtected,
                 ..SecurityContext::default()
             },
-            ..cove_oql::ManifestDatasetScopeOptions::default()
+            ..coveql::ManifestDatasetScopeOptions::default()
         },
     )
     .unwrap();
@@ -5146,16 +6577,16 @@ fn manifest_dataset_scope_validates_members_and_keeps_bridges_inexact() {
     assert_eq!(scope.files.len(), 2);
     assert_eq!(
         scope.cross_file_ordering,
-        cove_oql::CrossFileOrderingPolicy::CanonicalDatasetOrder
+        coveql::CrossFileOrderingPolicy::CanonicalDatasetOrder
     );
     assert!(scope.execution_code_domains.is_empty());
     assert_eq!(
         scope.object_identity,
-        cove_oql::CrossFileObjectIdentityPolicy::DatasetFileIdAndGoid
+        coveql::CrossFileObjectIdentityPolicy::DatasetFileIdAndGoid
     );
     assert_eq!(
         scope.association_identity,
-        cove_oql::CrossFileAssociationIdentityPolicy::DatasetFileQualifiedEndpoints
+        coveql::CrossFileAssociationIdentityPolicy::DatasetFileQualifiedEndpoints
     );
     assert!(scope.file_membership_fingerprint.starts_with("sha256:"));
     assert!(scope
@@ -5183,34 +6614,34 @@ fn manifest_dataset_scope_accepts_explicit_exact_code_domain_bridge_proof() {
     let (left, _) = object_file_with_filecode_records_with_file_id([0xA1; 16], &["red", "blue"]);
     let (right, _) = object_file_with_filecode_records_with_file_id([0xB2; 16], &["red", "green"]);
     let manifest = covm_manifest_for_members(&[("left.cove", &left), ("right.cove", &right)]);
-    let scope = cove_oql::build_manifest_dataset_scope_context(
+    let scope = coveql::build_manifest_dataset_scope_context(
         &manifest,
         &[
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "left.cove",
                 bytes: &left,
             },
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "right.cove",
                 bytes: &right,
             },
         ],
-        cove_oql::ManifestDatasetScopeOptions {
+        coveql::ManifestDatasetScopeOptions {
             tenant_id: Some("tenant-a".into()),
             security: SecurityContext {
                 principal_or_session: Some("principal-a".into()),
                 metadata_disclosure_policy: MetadataDisclosurePolicy::AllowProtected,
                 ..SecurityContext::default()
             },
-            code_domain_bridge_proofs: vec![cove_oql::ManifestCodeDomainBridgeProof {
-                domain_id: "cove_e:org.example.oql:exec-codes".into(),
+            code_domain_bridge_proofs: vec![coveql::ManifestCodeDomainBridgeProof {
+                domain_id: "cove_e:org.example.coveql:exec-codes".into(),
                 bridge_kind: "manifest_validated_canonical_remap".into(),
                 exact: true,
                 epoch: Some(1),
                 reason: "manifest member dictionaries remap to the same canonical code domain"
                     .into(),
             }],
-            ..cove_oql::ManifestDatasetScopeOptions::default()
+            ..coveql::ManifestDatasetScopeOptions::default()
         },
     )
     .unwrap();
@@ -5218,7 +6649,7 @@ fn manifest_dataset_scope_accepts_explicit_exact_code_domain_bridge_proof() {
     assert_eq!(scope.code_domain_bridges.len(), 1);
     assert_eq!(
         scope.code_domain_bridges[0].domain_id,
-        "cove_e:org.example.oql:exec-codes"
+        "cove_e:org.example.coveql:exec-codes"
     );
     assert_eq!(
         scope.code_domain_bridges[0].bridge_kind,
@@ -5236,7 +6667,8 @@ fn manifest_dataset_scope_accepts_explicit_exact_code_domain_bridge_proof() {
         .execution_code_domains
         .iter()
         .all(|domain| domain.epoch == Some(1)
-            && domain.semantic_domain_id.as_deref() == Some("cove_e:org.example.oql:exec-codes")));
+            && domain.semantic_domain_id.as_deref()
+                == Some("cove_e:org.example.coveql:exec-codes")));
 }
 
 #[test]
@@ -5244,26 +6676,26 @@ fn manifest_dataset_scope_rejects_exact_bridge_proof_without_epoch() {
     let left = minimal_object_file_with_id([0xA1; 16]);
     let right = minimal_object_file_with_id([0xB2; 16]);
     let manifest = covm_manifest_for_members(&[("left.cove", &left), ("right.cove", &right)]);
-    let err = cove_oql::build_manifest_dataset_scope_context(
+    let err = coveql::build_manifest_dataset_scope_context(
         &manifest,
         &[
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "left.cove",
                 bytes: &left,
             },
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "right.cove",
                 bytes: &right,
             },
         ],
-        cove_oql::ManifestDatasetScopeOptions {
+        coveql::ManifestDatasetScopeOptions {
             tenant_id: Some("tenant-a".into()),
             security: SecurityContext {
                 principal_or_session: Some("principal-a".into()),
                 metadata_disclosure_policy: MetadataDisclosurePolicy::AllowProtected,
                 ..SecurityContext::default()
             },
-            code_domain_bridge_proofs: vec![cove_oql::ManifestCodeDomainBridgeProof {
+            code_domain_bridge_proofs: vec![coveql::ManifestCodeDomainBridgeProof {
                 domain_id: "customer_status".into(),
                 bridge_kind: "manifest_validated_canonical_remap".into(),
                 exact: true,
@@ -5271,7 +6703,7 @@ fn manifest_dataset_scope_rejects_exact_bridge_proof_without_epoch() {
                 reason: "manifest member dictionaries remap to the same canonical code domain"
                     .into(),
             }],
-            ..cove_oql::ManifestDatasetScopeOptions::default()
+            ..coveql::ManifestDatasetScopeOptions::default()
         },
     )
     .unwrap_err();
@@ -5281,7 +6713,7 @@ fn manifest_dataset_scope_rejects_exact_bridge_proof_without_epoch() {
     assert!(err.diagnostics[0].message.contains("epoch"));
     assert_eq!(
         err.rejections[0].kind,
-        cove_oql::RejectionKind::UnsupportedDatasetScope
+        coveql::RejectionKind::UnsupportedDatasetScope
     );
 }
 
@@ -5290,33 +6722,33 @@ fn manifest_dataset_scope_rejects_exact_bridge_proof_for_unobserved_epoch() {
     let (left, _) = object_file_with_filecode_records_with_file_id([0xA1; 16], &["red", "blue"]);
     let (right, _) = object_file_with_filecode_records_with_file_id([0xB2; 16], &["red", "green"]);
     let manifest = covm_manifest_for_members(&[("left.cove", &left), ("right.cove", &right)]);
-    let err = cove_oql::build_manifest_dataset_scope_context(
+    let err = coveql::build_manifest_dataset_scope_context(
         &manifest,
         &[
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "left.cove",
                 bytes: &left,
             },
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "right.cove",
                 bytes: &right,
             },
         ],
-        cove_oql::ManifestDatasetScopeOptions {
+        coveql::ManifestDatasetScopeOptions {
             tenant_id: Some("tenant-a".into()),
             security: SecurityContext {
                 principal_or_session: Some("principal-a".into()),
                 metadata_disclosure_policy: MetadataDisclosurePolicy::AllowProtected,
                 ..SecurityContext::default()
             },
-            code_domain_bridge_proofs: vec![cove_oql::ManifestCodeDomainBridgeProof {
-                domain_id: "cove_e:org.example.oql:exec-codes".into(),
+            code_domain_bridge_proofs: vec![coveql::ManifestCodeDomainBridgeProof {
+                domain_id: "cove_e:org.example.coveql:exec-codes".into(),
                 bridge_kind: "manifest_validated_canonical_remap".into(),
                 exact: true,
                 epoch: Some(42),
                 reason: "stale remap proof".into(),
             }],
-            ..cove_oql::ManifestDatasetScopeOptions::default()
+            ..coveql::ManifestDatasetScopeOptions::default()
         },
     )
     .unwrap_err();
@@ -5331,33 +6763,33 @@ fn manifest_dataset_scope_rejects_exact_raw_local_code_bridge_kind() {
     let left = minimal_object_file_with_id([0xA1; 16]);
     let right = minimal_object_file_with_id([0xB2; 16]);
     let manifest = covm_manifest_for_members(&[("left.cove", &left), ("right.cove", &right)]);
-    let err = cove_oql::build_manifest_dataset_scope_context(
+    let err = coveql::build_manifest_dataset_scope_context(
         &manifest,
         &[
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "left.cove",
                 bytes: &left,
             },
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "right.cove",
                 bytes: &right,
             },
         ],
-        cove_oql::ManifestDatasetScopeOptions {
+        coveql::ManifestDatasetScopeOptions {
             tenant_id: Some("tenant-a".into()),
             security: SecurityContext {
                 principal_or_session: Some("principal-a".into()),
                 metadata_disclosure_policy: MetadataDisclosurePolicy::AllowProtected,
                 ..SecurityContext::default()
             },
-            code_domain_bridge_proofs: vec![cove_oql::ManifestCodeDomainBridgeProof {
+            code_domain_bridge_proofs: vec![coveql::ManifestCodeDomainBridgeProof {
                 domain_id: "customer_status".into(),
                 bridge_kind: "raw_local_code_equality".into(),
                 exact: true,
                 epoch: Some(42),
                 reason: "unsafe raw local codes happen to match".into(),
             }],
-            ..cove_oql::ManifestDatasetScopeOptions::default()
+            ..coveql::ManifestDatasetScopeOptions::default()
         },
     )
     .unwrap_err();
@@ -5372,19 +6804,19 @@ fn manifest_dataset_scope_rejects_duplicate_bridge_proofs_for_same_domain() {
     let left = minimal_object_file_with_id([0xA1; 16]);
     let right = minimal_object_file_with_id([0xB2; 16]);
     let manifest = covm_manifest_for_members(&[("left.cove", &left), ("right.cove", &right)]);
-    let err = cove_oql::build_manifest_dataset_scope_context(
+    let err = coveql::build_manifest_dataset_scope_context(
         &manifest,
         &[
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "left.cove",
                 bytes: &left,
             },
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "right.cove",
                 bytes: &right,
             },
         ],
-        cove_oql::ManifestDatasetScopeOptions {
+        coveql::ManifestDatasetScopeOptions {
             tenant_id: Some("tenant-a".into()),
             security: SecurityContext {
                 principal_or_session: Some("principal-a".into()),
@@ -5392,14 +6824,14 @@ fn manifest_dataset_scope_rejects_duplicate_bridge_proofs_for_same_domain() {
                 ..SecurityContext::default()
             },
             code_domain_bridge_proofs: vec![
-                cove_oql::ManifestCodeDomainBridgeProof {
+                coveql::ManifestCodeDomainBridgeProof {
                     domain_id: "customer_status".into(),
                     bridge_kind: "manifest_validated_canonical_remap".into(),
                     exact: true,
                     epoch: Some(42),
                     reason: "first proof".into(),
                 },
-                cove_oql::ManifestCodeDomainBridgeProof {
+                coveql::ManifestCodeDomainBridgeProof {
                     domain_id: "customer_status".into(),
                     bridge_kind: "materialized_canonical_value".into(),
                     exact: false,
@@ -5407,7 +6839,7 @@ fn manifest_dataset_scope_rejects_duplicate_bridge_proofs_for_same_domain() {
                     reason: "conflicting proof".into(),
                 },
             ],
-            ..cove_oql::ManifestDatasetScopeOptions::default()
+            ..coveql::ManifestDatasetScopeOptions::default()
         },
     )
     .unwrap_err();
@@ -5422,27 +6854,27 @@ fn manifest_dataset_scope_redacts_explicit_bridge_proof_when_security_blocks_met
     let left = minimal_object_file_with_id([0xA1; 16]);
     let right = minimal_object_file_with_id([0xB2; 16]);
     let manifest = covm_manifest_for_members(&[("left.cove", &left), ("right.cove", &right)]);
-    let scope = cove_oql::build_manifest_dataset_scope_context(
+    let scope = coveql::build_manifest_dataset_scope_context(
         &manifest,
         &[
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "left.cove",
                 bytes: &left,
             },
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "right.cove",
                 bytes: &right,
             },
         ],
-        cove_oql::ManifestDatasetScopeOptions {
-            code_domain_bridge_proofs: vec![cove_oql::ManifestCodeDomainBridgeProof {
+        coveql::ManifestDatasetScopeOptions {
+            code_domain_bridge_proofs: vec![coveql::ManifestCodeDomainBridgeProof {
                 domain_id: "sensitive_domain".into(),
                 bridge_kind: "manifest_validated_canonical_remap".into(),
                 exact: true,
                 epoch: Some(42),
                 reason: "sensitive remap proof".into(),
             }],
-            ..cove_oql::ManifestDatasetScopeOptions::default()
+            ..coveql::ManifestDatasetScopeOptions::default()
         },
     )
     .unwrap();
@@ -5464,19 +6896,19 @@ fn manifest_dataset_scope_blocks_code_domain_bridge_details_without_metadata_per
     let left = minimal_object_file_with_id([0xA1; 16]);
     let right = minimal_object_file_with_id([0xB2; 16]);
     let manifest = covm_manifest_for_members(&[("left.cove", &left), ("right.cove", &right)]);
-    let scope = cove_oql::build_manifest_dataset_scope_context(
+    let scope = coveql::build_manifest_dataset_scope_context(
         &manifest,
         &[
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "left.cove",
                 bytes: &left,
             },
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "right.cove",
                 bytes: &right,
             },
         ],
-        cove_oql::ManifestDatasetScopeOptions::default(),
+        coveql::ManifestDatasetScopeOptions::default(),
     )
     .unwrap();
 
@@ -5497,24 +6929,24 @@ fn manifest_dataset_scope_blocks_code_domain_bridge_details_without_tenant_scope
     let left = minimal_object_file_with_id([0xA1; 16]);
     let right = minimal_object_file_with_id([0xB2; 16]);
     let manifest = covm_manifest_for_members(&[("left.cove", &left), ("right.cove", &right)]);
-    let scope = cove_oql::build_manifest_dataset_scope_context(
+    let scope = coveql::build_manifest_dataset_scope_context(
         &manifest,
         &[
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "left.cove",
                 bytes: &left,
             },
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "right.cove",
                 bytes: &right,
             },
         ],
-        cove_oql::ManifestDatasetScopeOptions {
+        coveql::ManifestDatasetScopeOptions {
             security: SecurityContext {
                 metadata_disclosure_policy: MetadataDisclosurePolicy::AllowProtected,
                 ..SecurityContext::default()
             },
-            ..cove_oql::ManifestDatasetScopeOptions::default()
+            ..coveql::ManifestDatasetScopeOptions::default()
         },
     )
     .unwrap();
@@ -5535,32 +6967,32 @@ fn manifest_dataset_scope_blocks_code_domain_bridge_details_without_principal_sc
     let left = minimal_object_file_with_id([0xA1; 16]);
     let right = minimal_object_file_with_id([0xB2; 16]);
     let manifest = covm_manifest_for_members(&[("left.cove", &left), ("right.cove", &right)]);
-    let scope = cove_oql::build_manifest_dataset_scope_context(
+    let scope = coveql::build_manifest_dataset_scope_context(
         &manifest,
         &[
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "left.cove",
                 bytes: &left,
             },
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "right.cove",
                 bytes: &right,
             },
         ],
-        cove_oql::ManifestDatasetScopeOptions {
+        coveql::ManifestDatasetScopeOptions {
             tenant_id: Some("tenant-a".into()),
             security: SecurityContext {
                 metadata_disclosure_policy: MetadataDisclosurePolicy::AllowProtected,
                 ..SecurityContext::default()
             },
-            code_domain_bridge_proofs: vec![cove_oql::ManifestCodeDomainBridgeProof {
+            code_domain_bridge_proofs: vec![coveql::ManifestCodeDomainBridgeProof {
                 domain_id: "sensitive_domain".into(),
                 bridge_kind: "manifest_validated_canonical_remap".into(),
                 exact: true,
                 epoch: Some(42),
                 reason: "sensitive remap proof".into(),
             }],
-            ..cove_oql::ManifestDatasetScopeOptions::default()
+            ..coveql::ManifestDatasetScopeOptions::default()
         },
     )
     .unwrap();
@@ -5585,26 +7017,26 @@ fn manifest_dataset_scope_rejects_tenant_visibility_scope_mismatch() {
     let left = minimal_object_file_with_id([0xA1; 16]);
     let right = minimal_object_file_with_id([0xB2; 16]);
     let manifest = covm_manifest_for_members(&[("left.cove", &left), ("right.cove", &right)]);
-    let err = cove_oql::build_manifest_dataset_scope_context(
+    let err = coveql::build_manifest_dataset_scope_context(
         &manifest,
         &[
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "left.cove",
                 bytes: &left,
             },
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "right.cove",
                 bytes: &right,
             },
         ],
-        cove_oql::ManifestDatasetScopeOptions {
+        coveql::ManifestDatasetScopeOptions {
             tenant_id: Some("tenant-a".into()),
             security: SecurityContext {
                 visibility_policy: VisibilityPolicy::ExternalOverlay("tenant-b".into()),
                 metadata_disclosure_policy: MetadataDisclosurePolicy::AllowProtected,
                 ..SecurityContext::default()
             },
-            ..cove_oql::ManifestDatasetScopeOptions::default()
+            ..coveql::ManifestDatasetScopeOptions::default()
         },
     )
     .unwrap_err();
@@ -5621,24 +7053,24 @@ fn manifest_dataset_scope_rejects_incompatible_object_schemas() {
     let right = minimal_incompatible_object_file_with_id([0xB2; 16]);
     let manifest = covm_manifest_for_members(&[("left.cove", &left), ("right.cove", &right)]);
 
-    let err = cove_oql::build_manifest_dataset_scope_context(
+    let err = coveql::build_manifest_dataset_scope_context(
         &manifest,
         &[
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "left.cove",
                 bytes: &left,
             },
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "right.cove",
                 bytes: &right,
             },
         ],
-        cove_oql::ManifestDatasetScopeOptions {
+        coveql::ManifestDatasetScopeOptions {
             security: SecurityContext {
                 metadata_disclosure_policy: MetadataDisclosurePolicy::AllowProtected,
                 ..SecurityContext::default()
             },
-            ..cove_oql::ManifestDatasetScopeOptions::default()
+            ..coveql::ManifestDatasetScopeOptions::default()
         },
     )
     .unwrap_err();
@@ -5647,7 +7079,7 @@ fn manifest_dataset_scope_rejects_incompatible_object_schemas() {
     assert!(err.diagnostics[0].message.contains("object schema"));
     assert_eq!(
         err.rejections[0].kind,
-        cove_oql::RejectionKind::UnsupportedDatasetScope
+        coveql::RejectionKind::UnsupportedDatasetScope
     );
 }
 
@@ -5657,24 +7089,24 @@ fn manifest_dataset_scope_rejects_incompatible_projection_catalogs() {
     let right = minimal_object_projection_file_with_id([0xB2; 16], "enabled");
     let manifest = covm_manifest_for_members(&[("left.cove", &left), ("right.cove", &right)]);
 
-    let err = cove_oql::build_manifest_dataset_scope_context(
+    let err = coveql::build_manifest_dataset_scope_context(
         &manifest,
         &[
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "left.cove",
                 bytes: &left,
             },
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "right.cove",
                 bytes: &right,
             },
         ],
-        cove_oql::ManifestDatasetScopeOptions {
+        coveql::ManifestDatasetScopeOptions {
             security: SecurityContext {
                 metadata_disclosure_policy: MetadataDisclosurePolicy::AllowProtected,
                 ..SecurityContext::default()
             },
-            ..cove_oql::ManifestDatasetScopeOptions::default()
+            ..coveql::ManifestDatasetScopeOptions::default()
         },
     )
     .unwrap_err();
@@ -5683,7 +7115,7 @@ fn manifest_dataset_scope_rejects_incompatible_projection_catalogs() {
     assert!(err.diagnostics[0].message.contains("projection catalog"));
     assert_eq!(
         err.rejections[0].kind,
-        cove_oql::RejectionKind::UnsupportedDatasetScope
+        coveql::RejectionKind::UnsupportedDatasetScope
     );
 }
 
@@ -5703,24 +7135,24 @@ fn manifest_dataset_scope_rejects_incompatible_semantic_map_identity() {
     );
     let manifest = covm_manifest_for_members(&[("left.cove", &left), ("right.cove", &right)]);
 
-    let err = cove_oql::build_manifest_dataset_scope_context(
+    let err = coveql::build_manifest_dataset_scope_context(
         &manifest,
         &[
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "left.cove",
                 bytes: &left,
             },
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "right.cove",
                 bytes: &right,
             },
         ],
-        cove_oql::ManifestDatasetScopeOptions {
+        coveql::ManifestDatasetScopeOptions {
             security: SecurityContext {
                 metadata_disclosure_policy: MetadataDisclosurePolicy::AllowProtected,
                 ..SecurityContext::default()
             },
-            ..cove_oql::ManifestDatasetScopeOptions::default()
+            ..coveql::ManifestDatasetScopeOptions::default()
         },
     )
     .unwrap_err();
@@ -5729,21 +7161,21 @@ fn manifest_dataset_scope_rejects_incompatible_semantic_map_identity() {
     assert!(err.diagnostics[0].message.contains("semantic-map identity"));
     assert_eq!(
         err.rejections[0].kind,
-        cove_oql::RejectionKind::UnsupportedDatasetScope
+        coveql::RejectionKind::UnsupportedDatasetScope
     );
 }
 
 #[test]
 fn operation_context_reports_execution_code_domain_under_active_security_scope() {
     let (bytes, _) = object_file_with_filecode_records(&["red", "blue"]);
-    let request = CoveOqlOperationRequest {
+    let request = CoveQlOperationRequest {
         execution_code_mapping_requested: true,
         security: SecurityContext {
             principal_or_session: Some("principal-a".into()),
             metadata_disclosure_policy: MetadataDisclosurePolicy::AllowProtected,
             ..SecurityContext::default()
         },
-        ..CoveOqlOperationRequest::default()
+        ..CoveQlOperationRequest::default()
     };
 
     let context = build_operation_context(&bytes, request, validation_options()).unwrap();
@@ -5778,20 +7210,20 @@ fn manifest_dataset_scope_rejects_stale_member_identity() {
     let stale = minimal_object_file_with_id([0xB2; 16]);
     let manifest = covm_manifest_for_members(&[("member.cove", &original)]);
 
-    let err = cove_oql::build_manifest_dataset_scope_context(
+    let err = coveql::build_manifest_dataset_scope_context(
         &manifest,
-        &[cove_oql::ManifestDatasetMember {
+        &[coveql::ManifestDatasetMember {
             source: "member.cove",
             bytes: &stale,
         }],
-        cove_oql::ManifestDatasetScopeOptions::default(),
+        coveql::ManifestDatasetScopeOptions::default(),
     )
     .unwrap_err();
 
     assert_eq!(err.diagnostics[0].code, "E_STALE_SIDECAR");
     assert_eq!(
         err.rejections[0].kind,
-        cove_oql::RejectionKind::FeatureValidation
+        coveql::RejectionKind::FeatureValidation
     );
 }
 
@@ -5822,18 +7254,18 @@ fn single_input_execution_rejects_manifest_scoped_multifile_plan() {
         .resolved
         .operation_context
         .dataset
-        .cross_file_ordering = cove_oql::CrossFileOrderingPolicy::CanonicalDatasetOrder;
+        .cross_file_ordering = coveql::CrossFileOrderingPolicy::CanonicalDatasetOrder;
     planned.resolved.operation_context.dataset.object_identity =
-        cove_oql::CrossFileObjectIdentityPolicy::DatasetFileIdAndGoid;
+        coveql::CrossFileObjectIdentityPolicy::DatasetFileIdAndGoid;
     planned
         .resolved
         .operation_context
         .dataset
         .association_identity =
-        cove_oql::CrossFileAssociationIdentityPolicy::DatasetFileQualifiedEndpoints;
+        coveql::CrossFileAssociationIdentityPolicy::DatasetFileQualifiedEndpoints;
 
-    let err = cove_oql::execute_planned_query_retained(
-        CoveOqlRetainedInput::from_vec(bytes),
+    let err = coveql::execute_planned_query_retained(
+        CoveQlRetainedInput::from_vec(bytes),
         planned,
         ExecutionOptions::default(),
     )
@@ -5842,7 +7274,7 @@ fn single_input_execution_rejects_manifest_scoped_multifile_plan() {
     assert_eq!(err.diagnostics[0].code, "E_UNSUPPORTED_DATASET_SCOPE");
     assert!(err.diagnostics[0]
         .message
-        .contains("single-input OQL executor refuses"));
+        .contains("single-input CoveQL executor refuses"));
     assert_eq!(err.diagnostics[0].safe_details["file_count"], json!(2));
 }
 
@@ -5851,19 +7283,19 @@ fn manifest_member_execution_applies_global_order_and_paging() {
     let left = object_file_with_bool_records_with_file_id([0xA1; 16], &[true, true]);
     let right = object_file_with_bool_records_with_file_id([0xB2; 16], &[true, true]);
     let manifest = covm_manifest_for_members(&[("left.cove", &left), ("right.cove", &right)]);
-    let scope = cove_oql::build_manifest_dataset_scope_context(
+    let scope = coveql::build_manifest_dataset_scope_context(
         &manifest,
         &[
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "left.cove",
                 bytes: &left,
             },
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "right.cove",
                 bytes: &right,
             },
         ],
-        cove_oql::ManifestDatasetScopeOptions::default(),
+        coveql::ManifestDatasetScopeOptions::default(),
     )
     .unwrap();
     assert!(scope
@@ -5877,7 +7309,7 @@ fn manifest_member_execution_applies_global_order_and_paging() {
         "Thing.where(active == true).take(3)",
         ParseOptions::default(),
         ResolveOptions {
-            output_mode: Some(CoveOqlOutputMode::ObjectRows),
+            output_mode: Some(CoveQlOutputMode::ObjectRows),
             ..ResolveOptions::default()
         },
         PlanOptions::default(),
@@ -5886,13 +7318,13 @@ fn manifest_member_execution_applies_global_order_and_paging() {
     .unwrap();
     planned.resolved.operation_context.dataset = scope;
 
-    let executed = cove_oql::execute_manifest_planned_query(
+    let executed = coveql::execute_manifest_planned_query(
         &[
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "right.cove",
                 bytes: &right,
             },
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "left.cove",
                 bytes: &left,
             },
@@ -5902,7 +7334,7 @@ fn manifest_member_execution_applies_global_order_and_paging() {
     )
     .unwrap();
 
-    let CoveOqlExecutionResult::ObjectRows(rows) = executed.result else {
+    let CoveQlExecutionResult::ObjectRows(rows) = executed.result else {
         panic!("expected object rows");
     };
     assert_eq!(rows.len(), 3);
@@ -5941,30 +7373,30 @@ fn manifest_member_execution_reports_exact_bridge_materialized_boundary() {
         metadata_disclosure_policy: MetadataDisclosurePolicy::AllowProtected,
         ..SecurityContext::default()
     };
-    let scope = cove_oql::build_manifest_dataset_scope_context(
+    let scope = coveql::build_manifest_dataset_scope_context(
         &manifest,
         &[
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "left.cove",
                 bytes: &left,
             },
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "right.cove",
                 bytes: &right,
             },
         ],
-        cove_oql::ManifestDatasetScopeOptions {
+        coveql::ManifestDatasetScopeOptions {
             tenant_id: Some("tenant-a".into()),
             security: security.clone(),
-            code_domain_bridge_proofs: vec![cove_oql::ManifestCodeDomainBridgeProof {
-                domain_id: "cove_e:org.example.oql:exec-codes".into(),
+            code_domain_bridge_proofs: vec![coveql::ManifestCodeDomainBridgeProof {
+                domain_id: "cove_e:org.example.coveql:exec-codes".into(),
                 bridge_kind: "manifest_validated_canonical_remap".into(),
                 exact: true,
                 epoch: Some(1),
                 reason: "manifest member dictionaries remap to the same canonical code domain"
                     .into(),
             }],
-            ..cove_oql::ManifestDatasetScopeOptions::default()
+            ..coveql::ManifestDatasetScopeOptions::default()
         },
     )
     .unwrap();
@@ -5973,7 +7405,7 @@ fn manifest_member_execution_reports_exact_bridge_materialized_boundary() {
         r#"Person.where(name == "red").select(name)"#,
         ParseOptions::default(),
         ResolveOptions {
-            output_mode: Some(CoveOqlOutputMode::JsonRows),
+            output_mode: Some(CoveQlOutputMode::JsonRows),
             security,
             ..ResolveOptions::default()
         },
@@ -5983,13 +7415,13 @@ fn manifest_member_execution_reports_exact_bridge_materialized_boundary() {
     .unwrap();
     planned.resolved.operation_context.dataset = scope;
 
-    let executed = cove_oql::execute_manifest_planned_query(
+    let executed = coveql::execute_manifest_planned_query(
         &[
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "right.cove",
                 bytes: &right,
             },
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "left.cove",
                 bytes: &left,
             },
@@ -5999,7 +7431,7 @@ fn manifest_member_execution_reports_exact_bridge_materialized_boundary() {
     )
     .unwrap();
 
-    let CoveOqlExecutionResult::JsonRows(rows) = executed.result else {
+    let CoveQlExecutionResult::JsonRows(rows) = executed.result else {
         panic!("expected JSON rows");
     };
     assert_eq!(rows, vec![json!({"name": "red"}), json!({"name": "red"})]);
@@ -6031,30 +7463,30 @@ fn manifest_physical_kernel_executes_exact_bridge_direct_projection_with_compare
         metadata_disclosure_policy: MetadataDisclosurePolicy::AllowProtected,
         ..SecurityContext::default()
     };
-    let scope = cove_oql::build_manifest_dataset_scope_context(
+    let scope = coveql::build_manifest_dataset_scope_context(
         &manifest,
         &[
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "left.cove",
                 bytes: &left,
             },
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "right.cove",
                 bytes: &right,
             },
         ],
-        cove_oql::ManifestDatasetScopeOptions {
+        coveql::ManifestDatasetScopeOptions {
             tenant_id: Some("tenant-a".into()),
             security: security.clone(),
-            code_domain_bridge_proofs: vec![cove_oql::ManifestCodeDomainBridgeProof {
-                domain_id: "cove_e:org.example.oql:exec-codes".into(),
+            code_domain_bridge_proofs: vec![coveql::ManifestCodeDomainBridgeProof {
+                domain_id: "cove_e:org.example.coveql:exec-codes".into(),
                 bridge_kind: "manifest_validated_canonical_remap".into(),
                 exact: true,
                 epoch: Some(1),
                 reason: "manifest member dictionaries remap to the same canonical code domain"
                     .into(),
             }],
-            ..cove_oql::ManifestDatasetScopeOptions::default()
+            ..coveql::ManifestDatasetScopeOptions::default()
         },
     )
     .unwrap();
@@ -6063,7 +7495,7 @@ fn manifest_physical_kernel_executes_exact_bridge_direct_projection_with_compare
         r#"Person.where(name == "red").select(name)"#,
         ParseOptions::default(),
         ResolveOptions {
-            output_mode: Some(CoveOqlOutputMode::JsonRows),
+            output_mode: Some(CoveQlOutputMode::JsonRows),
             security,
             ..ResolveOptions::default()
         },
@@ -6082,11 +7514,11 @@ fn manifest_physical_kernel_executes_exact_bridge_direct_projection_with_compare
 
     let executed = execute_manifest_physical_planned_query(
         &[
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "right.cove",
                 bytes: &right,
             },
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "left.cove",
                 bytes: &left,
             },
@@ -6100,7 +7532,7 @@ fn manifest_physical_kernel_executes_exact_bridge_direct_projection_with_compare
     )
     .unwrap();
 
-    let CoveOqlExecutionResult::JsonRows(rows) = &executed.executed.result else {
+    let CoveQlExecutionResult::JsonRows(rows) = &executed.executed.result else {
         panic!("expected JSON rows");
     };
     assert_eq!(rows, &vec![json!({"name": "red"}), json!({"name": "red"})]);
@@ -6136,30 +7568,30 @@ fn manifest_physical_kernel_executes_exact_direct_aggregate_after_global_merge()
         aggregate_disclosure_policy: AggregateDisclosurePolicy::AllowExact,
         ..SecurityContext::default()
     };
-    let scope = cove_oql::build_manifest_dataset_scope_context(
+    let scope = coveql::build_manifest_dataset_scope_context(
         &manifest,
         &[
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "left.cove",
                 bytes: &left,
             },
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "right.cove",
                 bytes: &right,
             },
         ],
-        cove_oql::ManifestDatasetScopeOptions {
+        coveql::ManifestDatasetScopeOptions {
             tenant_id: Some("tenant-a".into()),
             security: security.clone(),
-            code_domain_bridge_proofs: vec![cove_oql::ManifestCodeDomainBridgeProof {
-                domain_id: "cove_e:org.example.oql:exec-codes".into(),
+            code_domain_bridge_proofs: vec![coveql::ManifestCodeDomainBridgeProof {
+                domain_id: "cove_e:org.example.coveql:exec-codes".into(),
                 bridge_kind: "manifest_validated_canonical_remap".into(),
                 exact: true,
                 epoch: Some(1),
                 reason: "manifest member dictionaries remap to the same canonical code domain"
                     .into(),
             }],
-            ..cove_oql::ManifestDatasetScopeOptions::default()
+            ..coveql::ManifestDatasetScopeOptions::default()
         },
     )
     .unwrap();
@@ -6168,7 +7600,7 @@ fn manifest_physical_kernel_executes_exact_direct_aggregate_after_global_merge()
         "Person.select(n: count(*))",
         ParseOptions::default(),
         ResolveOptions {
-            output_mode: Some(CoveOqlOutputMode::JsonRows),
+            output_mode: Some(CoveQlOutputMode::JsonRows),
             security,
             ..ResolveOptions::default()
         },
@@ -6187,11 +7619,11 @@ fn manifest_physical_kernel_executes_exact_direct_aggregate_after_global_merge()
 
     let executed = execute_manifest_physical_planned_query(
         &[
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "left.cove",
                 bytes: &left,
             },
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "right.cove",
                 bytes: &right,
             },
@@ -6205,7 +7637,7 @@ fn manifest_physical_kernel_executes_exact_direct_aggregate_after_global_merge()
     )
     .unwrap();
 
-    let CoveOqlExecutionResult::JsonRows(rows) = &executed.executed.result else {
+    let CoveQlExecutionResult::JsonRows(rows) = &executed.executed.result else {
         panic!("expected JSON rows");
     };
     assert_eq!(rows, &vec![json!({"n": 4})]);
@@ -6229,30 +7661,30 @@ fn manifest_physical_kernel_groups_filecode_values_after_exact_bridge_merge() {
         aggregate_disclosure_policy: AggregateDisclosurePolicy::AllowExact,
         ..SecurityContext::default()
     };
-    let scope = cove_oql::build_manifest_dataset_scope_context(
+    let scope = coveql::build_manifest_dataset_scope_context(
         &manifest,
         &[
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "left.cove",
                 bytes: &left,
             },
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "right.cove",
                 bytes: &right,
             },
         ],
-        cove_oql::ManifestDatasetScopeOptions {
+        coveql::ManifestDatasetScopeOptions {
             tenant_id: Some("tenant-a".into()),
             security: security.clone(),
-            code_domain_bridge_proofs: vec![cove_oql::ManifestCodeDomainBridgeProof {
-                domain_id: "cove_e:org.example.oql:exec-codes".into(),
+            code_domain_bridge_proofs: vec![coveql::ManifestCodeDomainBridgeProof {
+                domain_id: "cove_e:org.example.coveql:exec-codes".into(),
                 bridge_kind: "manifest_validated_canonical_remap".into(),
                 exact: true,
                 epoch: Some(1),
                 reason: "manifest member dictionaries remap to the same canonical code domain"
                     .into(),
             }],
-            ..cove_oql::ManifestDatasetScopeOptions::default()
+            ..coveql::ManifestDatasetScopeOptions::default()
         },
     )
     .unwrap();
@@ -6261,7 +7693,7 @@ fn manifest_physical_kernel_groups_filecode_values_after_exact_bridge_merge() {
         "Person.groupBy(name).select(name, n: count(*))",
         ParseOptions::default(),
         ResolveOptions {
-            output_mode: Some(CoveOqlOutputMode::JsonRows),
+            output_mode: Some(CoveQlOutputMode::JsonRows),
             security,
             ..ResolveOptions::default()
         },
@@ -6280,11 +7712,11 @@ fn manifest_physical_kernel_groups_filecode_values_after_exact_bridge_merge() {
 
     let executed = execute_manifest_physical_planned_query(
         &[
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "right.cove",
                 bytes: &right,
             },
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "left.cove",
                 bytes: &left,
             },
@@ -6298,7 +7730,7 @@ fn manifest_physical_kernel_groups_filecode_values_after_exact_bridge_merge() {
     )
     .unwrap();
 
-    let CoveOqlExecutionResult::JsonRows(rows) = &executed.executed.result else {
+    let CoveQlExecutionResult::JsonRows(rows) = &executed.executed.result else {
         panic!("expected JSON rows");
     };
     assert_eq!(
@@ -6326,19 +7758,19 @@ fn manifest_physical_kernel_executes_projection_root_without_code_bridge() {
     let right =
         object_file_with_bool_records_and_projection_with_file_id([0xB2; 16], &[true, false, true]);
     let manifest = covm_manifest_for_members(&[("left.cove", &left), ("right.cove", &right)]);
-    let scope = cove_oql::build_manifest_dataset_scope_context(
+    let scope = coveql::build_manifest_dataset_scope_context(
         &manifest,
         &[
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "left.cove",
                 bytes: &left,
             },
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "right.cove",
                 bytes: &right,
             },
         ],
-        cove_oql::ManifestDatasetScopeOptions::default(),
+        coveql::ManifestDatasetScopeOptions::default(),
     )
     .unwrap();
     let mut planned = parse_resolve_and_plan_query(
@@ -6346,7 +7778,7 @@ fn manifest_physical_kernel_executes_projection_root_without_code_bridge() {
         "projection(thing_projection).select(active)",
         ParseOptions::default(),
         ResolveOptions {
-            output_mode: Some(CoveOqlOutputMode::JsonRows),
+            output_mode: Some(CoveQlOutputMode::JsonRows),
             ..ResolveOptions::default()
         },
         PlanOptions::default(),
@@ -6363,11 +7795,11 @@ fn manifest_physical_kernel_executes_projection_root_without_code_bridge() {
     .unwrap();
     let executed = execute_manifest_physical_planned_query(
         &[
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "right.cove",
                 bytes: &right,
             },
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "left.cove",
                 bytes: &left,
             },
@@ -6383,12 +7815,12 @@ fn manifest_physical_kernel_executes_projection_root_without_code_bridge() {
 
     assert_eq!(
         executed.executed.authority.source,
-        cove_oql::ExecutionAuthoritySource::ExactOptimizedKernel
+        coveql::ExecutionAuthoritySource::ExactOptimizedKernel
     );
     assert!(!executed.executed.authority.materialized_fallback);
     assert!(!executed.executed.authority.residual_required);
     assert!(executed.kernel_report.compared_with_materialized);
-    let CoveOqlExecutionResult::JsonRows(rows) = executed.executed.result else {
+    let CoveQlExecutionResult::JsonRows(rows) = executed.executed.result else {
         panic!("expected JSON rows");
     };
     assert_eq!(
@@ -6410,19 +7842,19 @@ fn manifest_physical_kernel_executes_projection_rows_without_code_bridge() {
     let right =
         object_file_with_bool_records_and_projection_with_file_id([0xB2; 16], &[true, false, true]);
     let manifest = covm_manifest_for_members(&[("left.cove", &left), ("right.cove", &right)]);
-    let scope = cove_oql::build_manifest_dataset_scope_context(
+    let scope = coveql::build_manifest_dataset_scope_context(
         &manifest,
         &[
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "left.cove",
                 bytes: &left,
             },
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "right.cove",
                 bytes: &right,
             },
         ],
-        cove_oql::ManifestDatasetScopeOptions::default(),
+        coveql::ManifestDatasetScopeOptions::default(),
     )
     .unwrap();
     let mut planned = parse_resolve_and_plan_query(
@@ -6444,11 +7876,11 @@ fn manifest_physical_kernel_executes_projection_rows_without_code_bridge() {
     .unwrap();
     let executed = execute_manifest_physical_planned_query(
         &[
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "right.cove",
                 bytes: &right,
             },
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "left.cove",
                 bytes: &left,
             },
@@ -6464,12 +7896,12 @@ fn manifest_physical_kernel_executes_projection_rows_without_code_bridge() {
 
     assert_eq!(
         executed.executed.authority.source,
-        cove_oql::ExecutionAuthoritySource::ExactOptimizedKernel
+        coveql::ExecutionAuthoritySource::ExactOptimizedKernel
     );
     assert!(!executed.executed.authority.materialized_fallback);
     assert!(!executed.executed.authority.residual_required);
     assert!(executed.kernel_report.compared_with_materialized);
-    let CoveOqlExecutionResult::ProjectionRows(rows) = executed.executed.result else {
+    let CoveQlExecutionResult::ProjectionRows(rows) = executed.executed.result else {
         panic!("expected projection rows");
     };
     assert_eq!(rows.len(), 5);
@@ -6488,30 +7920,30 @@ fn manifest_physical_kernel_executes_role_bound_asof_direct_projection() {
         metadata_disclosure_policy: MetadataDisclosurePolicy::AllowProtected,
         ..SecurityContext::default()
     };
-    let scope = cove_oql::build_manifest_dataset_scope_context(
+    let scope = coveql::build_manifest_dataset_scope_context(
         &manifest,
         &[
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "left.cove",
                 bytes: &left,
             },
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "right.cove",
                 bytes: &right,
             },
         ],
-        cove_oql::ManifestDatasetScopeOptions {
+        coveql::ManifestDatasetScopeOptions {
             tenant_id: Some("tenant-a".into()),
             security: security.clone(),
-            code_domain_bridge_proofs: vec![cove_oql::ManifestCodeDomainBridgeProof {
-                domain_id: "cove_e:org.example.oql:exec-codes".into(),
+            code_domain_bridge_proofs: vec![coveql::ManifestCodeDomainBridgeProof {
+                domain_id: "cove_e:org.example.coveql:exec-codes".into(),
                 bridge_kind: "manifest_validated_canonical_remap".into(),
                 exact: true,
                 epoch: Some(1),
                 reason: "manifest member dictionaries remap to the same canonical code domain"
                     .into(),
             }],
-            ..cove_oql::ManifestDatasetScopeOptions::default()
+            ..coveql::ManifestDatasetScopeOptions::default()
         },
     )
     .unwrap();
@@ -6520,7 +7952,7 @@ fn manifest_physical_kernel_executes_role_bound_asof_direct_projection() {
         r#"EventThing.asOf(source_event_time: "1970-01-01T00:00:00.000002Z").select(event_time)"#,
         ParseOptions::default(),
         ResolveOptions {
-            output_mode: Some(CoveOqlOutputMode::JsonRows),
+            output_mode: Some(CoveQlOutputMode::JsonRows),
             security,
             ..ResolveOptions::default()
         },
@@ -6539,11 +7971,11 @@ fn manifest_physical_kernel_executes_role_bound_asof_direct_projection() {
 
     let executed = execute_manifest_physical_planned_query(
         &[
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "right.cove",
                 bytes: &right,
             },
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "left.cove",
                 bytes: &left,
             },
@@ -6557,7 +7989,7 @@ fn manifest_physical_kernel_executes_role_bound_asof_direct_projection() {
     )
     .unwrap();
 
-    let CoveOqlExecutionResult::JsonRows(rows) = &executed.executed.result else {
+    let CoveQlExecutionResult::JsonRows(rows) = &executed.executed.result else {
         panic!("expected JSON rows");
     };
     assert_eq!(
@@ -6583,22 +8015,22 @@ fn manifest_physical_kernel_force_rejects_cross_file_direct_projection_without_b
         metadata_disclosure_policy: MetadataDisclosurePolicy::AllowProtected,
         ..SecurityContext::default()
     };
-    let scope = cove_oql::build_manifest_dataset_scope_context(
+    let scope = coveql::build_manifest_dataset_scope_context(
         &manifest,
         &[
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "left.cove",
                 bytes: &left,
             },
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "right.cove",
                 bytes: &right,
             },
         ],
-        cove_oql::ManifestDatasetScopeOptions {
+        coveql::ManifestDatasetScopeOptions {
             tenant_id: Some("tenant-a".into()),
             security: security.clone(),
-            ..cove_oql::ManifestDatasetScopeOptions::default()
+            ..coveql::ManifestDatasetScopeOptions::default()
         },
     )
     .unwrap();
@@ -6607,7 +8039,7 @@ fn manifest_physical_kernel_force_rejects_cross_file_direct_projection_without_b
         r#"Person.select(name)"#,
         ParseOptions::default(),
         ResolveOptions {
-            output_mode: Some(CoveOqlOutputMode::JsonRows),
+            output_mode: Some(CoveQlOutputMode::JsonRows),
             security,
             ..ResolveOptions::default()
         },
@@ -6626,11 +8058,11 @@ fn manifest_physical_kernel_force_rejects_cross_file_direct_projection_without_b
 
     let err = execute_manifest_physical_planned_query(
         &[
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "left.cove",
                 bytes: &left,
             },
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "right.cove",
                 bytes: &right,
             },
@@ -6670,19 +8102,19 @@ fn manifest_member_execution_rejects_stale_member_bytes() {
     let right = object_file_with_bool_records_with_file_id([0xB2; 16], &[true]);
     let stale_right = object_file_with_bool_records_with_file_id([0xC3; 16], &[true]);
     let manifest = covm_manifest_for_members(&[("left.cove", &left), ("right.cove", &right)]);
-    let scope = cove_oql::build_manifest_dataset_scope_context(
+    let scope = coveql::build_manifest_dataset_scope_context(
         &manifest,
         &[
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "left.cove",
                 bytes: &left,
             },
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "right.cove",
                 bytes: &right,
             },
         ],
-        cove_oql::ManifestDatasetScopeOptions::default(),
+        coveql::ManifestDatasetScopeOptions::default(),
     )
     .unwrap();
     let mut planned = parse_resolve_and_plan_query(
@@ -6690,7 +8122,7 @@ fn manifest_member_execution_rejects_stale_member_bytes() {
         "Thing.take(1)",
         ParseOptions::default(),
         ResolveOptions {
-            output_mode: Some(CoveOqlOutputMode::ObjectRows),
+            output_mode: Some(CoveQlOutputMode::ObjectRows),
             ..ResolveOptions::default()
         },
         PlanOptions::default(),
@@ -6699,13 +8131,13 @@ fn manifest_member_execution_rejects_stale_member_bytes() {
     .unwrap();
     planned.resolved.operation_context.dataset = scope;
 
-    let err = cove_oql::execute_manifest_planned_query(
+    let err = coveql::execute_manifest_planned_query(
         &[
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "left.cove",
                 bytes: &left,
             },
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "right.cove",
                 bytes: &stale_right,
             },
@@ -6724,8 +8156,8 @@ fn manifest_member_execution_rejects_stale_member_bytes() {
 
 #[test]
 fn explain_schema_declares_dataset_context_fields() {
-    let schema = cove_oql::explain_json_schema();
-    assert_eq!(schema.version, cove_oql::EXPLAIN_JSON_SCHEMA_VERSION);
+    let schema = coveql::explain_json_schema();
+    assert_eq!(schema.version, coveql::EXPLAIN_JSON_SCHEMA_VERSION);
     assert!(schema.modes.contains(&"coded"));
     assert!(schema
         .required_top_level_fields
@@ -6806,35 +8238,35 @@ fn explain_schema_declares_dataset_context_fields() {
     let context_json = &planned.explain_json()["operation_context"];
     assert_eq!(
         context_json["language_version"],
-        cove_oql::COVE_OQL_LANGUAGE_VERSION
+        coveql::COVEQL_LANGUAGE_VERSION
     );
     assert_eq!(
         context_json["grammar_version"],
-        cove_oql::COVE_OQL_GRAMMAR_VERSION
+        coveql::COVEQL_GRAMMAR_VERSION
     );
     assert_eq!(
         context_json["resolved_ast_version"],
-        cove_oql::RESOLVED_AST_VERSION
+        coveql::RESOLVED_AST_VERSION
     );
     assert_eq!(
         context_json["logical_plan_version"],
-        cove_oql::LOGICAL_PLAN_VERSION
+        coveql::LOGICAL_PLAN_VERSION
     );
     assert_eq!(
         context_json["physical_plan_version"],
-        cove_oql::PHYSICAL_PLAN_VERSION
+        coveql::PHYSICAL_PLAN_VERSION
     );
     assert_eq!(
         context_json["projection_dependency_contract_version"],
-        cove_oql::PROJECTION_DEPENDENCY_CONTRACT_VERSION
+        coveql::PROJECTION_DEPENDENCY_CONTRACT_VERSION
     );
     assert_eq!(
         context_json["predicate_normal_form_version"],
-        cove_oql::PREDICATE_NORMAL_FORM_VERSION
+        coveql::PREDICATE_NORMAL_FORM_VERSION
     );
     assert_eq!(
         context_json["explain_json_schema_version"],
-        cove_oql::EXPLAIN_JSON_SCHEMA_VERSION
+        coveql::EXPLAIN_JSON_SCHEMA_VERSION
     );
 }
 
@@ -6842,9 +8274,9 @@ fn explain_schema_declares_dataset_context_fields() {
 fn projection_and_evidence_contexts_validate_map_profile() {
     let bytes = minimal_map_file();
 
-    let projection_request = CoveOqlOperationRequest {
-        selected_operation: CoveOqlSelectedOperation::Projection,
-        ..CoveOqlOperationRequest::default()
+    let projection_request = CoveQlOperationRequest {
+        selected_operation: CoveQlSelectedOperation::Projection,
+        ..CoveQlOperationRequest::default()
     };
     let projection_context =
         build_operation_context(&bytes, projection_request, validation_options()).unwrap();
@@ -6854,9 +8286,9 @@ fn projection_and_evidence_contexts_validate_map_profile() {
     );
     assert_eq!(projection_context.validation_reports.len(), 2);
 
-    let evidence_request = CoveOqlOperationRequest {
-        selected_operation: CoveOqlSelectedOperation::Evidence,
-        ..CoveOqlOperationRequest::default()
+    let evidence_request = CoveQlOperationRequest {
+        selected_operation: CoveQlSelectedOperation::Evidence,
+        ..CoveQlOperationRequest::default()
     };
     let evidence_context = build_operation_context(
         &minimal_object_with_evidence_index_file(),
@@ -6882,11 +8314,11 @@ fn fail_open_optional_metadata_is_reported_as_ignored() {
         include_bytes!("../../../conformance/feature-scope/optional_layout_crc_ignored.cove");
     let mut options = validation_options();
     options.optional_pushdown_policy = OptionalPushdownPolicy::FailOpen;
-    let request = CoveOqlOperationRequest {
-        selected_operation: CoveOqlSelectedOperation::ArrowExport {
+    let request = CoveQlOperationRequest {
+        selected_operation: CoveQlSelectedOperation::ArrowExport {
             zero_copy_requested: false,
         },
-        ..CoveOqlOperationRequest::default()
+        ..CoveQlOperationRequest::default()
     };
 
     let context = build_operation_context(bytes, request, options).unwrap();
@@ -6901,12 +8333,12 @@ fn operation_required_unknown_feature_rejects_selected_query() {
     let bytes = include_bytes!(
         "../../../conformance/feature-scope/operation_scoped_unknown_coverage_reject.cove"
     );
-    let request = CoveOqlOperationRequest {
-        selected_operation: CoveOqlSelectedOperation::Explain {
-            target: cove_oql::CoveOqlExplainTarget::Object,
+    let request = CoveQlOperationRequest {
+        selected_operation: CoveQlSelectedOperation::Explain {
+            target: coveql::CoveQlExplainTarget::Object,
             mode: ExplainMode::Proof,
         },
-        ..CoveOqlOperationRequest::default()
+        ..CoveQlOperationRequest::default()
     };
 
     let err = build_operation_context(bytes, request, validation_options()).unwrap_err();
@@ -6915,9 +8347,9 @@ fn operation_required_unknown_feature_rejects_selected_query() {
 
 #[test]
 fn proof_explain_json_redacts_without_protected_metadata_permission() {
-    let request = CoveOqlOperationRequest {
-        selected_operation: CoveOqlSelectedOperation::Explain {
-            target: cove_oql::CoveOqlExplainTarget::Object,
+    let request = CoveQlOperationRequest {
+        selected_operation: CoveQlSelectedOperation::Explain {
+            target: coveql::CoveQlExplainTarget::Object,
             mode: ExplainMode::Proof,
         },
         security: SecurityContext {
@@ -6926,7 +8358,7 @@ fn proof_explain_json_redacts_without_protected_metadata_permission() {
             metadata_disclosure_policy: MetadataDisclosurePolicy::DenyProtected,
             ..SecurityContext::default()
         },
-        ..CoveOqlOperationRequest::default()
+        ..CoveQlOperationRequest::default()
     };
 
     let context =
@@ -6988,6 +8420,57 @@ fn duplicate_methods_reject_during_resolution() {
     )
     .unwrap_err();
     assert_eq!(err.diagnostics[0].code, "E_METHOD_CONFLICT");
+}
+
+#[test]
+fn method_placement_conflicts_reject_during_resolution() {
+    let err = parse_and_resolve_query(
+        &minimal_object_file(),
+        "Person.groupBy(active).where(active == true).select(active, n: count(*))",
+        ParseOptions::default(),
+        ResolveOptions::default(),
+        validation_options(),
+    )
+    .unwrap_err();
+    assert_eq!(err.diagnostics[0].code, "E_METHOD_CONFLICT");
+    assert!(err.diagnostics[0].message.contains("where after groupBy"));
+
+    let err = parse_and_resolve_query(
+        &object_file_with_bool_records_and_projection(&[false, true]),
+        "table(thing_projection) as l.groupBy(l.active).lookup(table(thing_projection) as r, on: l.active == r.active).select(l.active)",
+        ParseOptions::default(),
+        ResolveOptions::default(),
+        validation_options(),
+    )
+    .unwrap_err();
+    assert_eq!(err.diagnostics[0].code, "E_METHOD_CONFLICT");
+    assert!(err.diagnostics[0]
+        .message
+        .contains("lookup cannot appear after groupBy"));
+
+    let err = parse_and_resolve_query(
+        &object_file_with_person_and_association_record(),
+        "node(Person) as c.traverse(out(edge(CustomerPlacedOrder))).asOf(csn: 1).select(c.goid)",
+        ParseOptions::default(),
+        ResolveOptions::default(),
+        validation_options(),
+    )
+    .unwrap_err();
+    assert_eq!(err.diagnostics[0].code, "E_METHOD_CONFLICT");
+    assert!(err.diagnostics[0].message.contains("asOf must appear"));
+
+    let err = parse_and_resolve_query(
+        &minimal_object_file(),
+        "Person.explain(public).select(active)",
+        ParseOptions::default(),
+        ResolveOptions::default(),
+        validation_options(),
+    )
+    .unwrap_err();
+    assert_eq!(err.diagnostics[0].code, "E_METHOD_CONFLICT");
+    assert!(err.diagnostics[0]
+        .message
+        .contains("explain must be the final method"));
 }
 
 #[test]
@@ -7253,17 +8736,17 @@ fn directed_association_roots_resolve_endpoint_roles() {
     for (query, direction, endpoint_role) in [
         (
             "out(association(CustomerPlacedOrder)).select(source_goid)",
-            cove_oql::AstAssociationDirection::Out,
+            coveql::AstAssociationDirection::Out,
             AssociationEndpointRole::Source,
         ),
         (
             "in(association(CustomerPlacedOrder)).select(target_goid)",
-            cove_oql::AstAssociationDirection::In,
+            coveql::AstAssociationDirection::In,
             AssociationEndpointRole::Target,
         ),
         (
             "either(association(CustomerPlacedOrder)).select(source_goid)",
-            cove_oql::AstAssociationDirection::Either,
+            coveql::AstAssociationDirection::Either,
             AssociationEndpointRole::Either,
         ),
     ] {
@@ -7333,7 +8816,7 @@ fn builtin_functions_resolve_with_coded_safe_contracts_when_kernel_supported() {
     assert!(contract.deterministic);
     assert_eq!(
         contract.execution_class,
-        cove_oql::FunctionExecutionClass::CodedSafe
+        coveql::FunctionExecutionClass::CodedSafe
     );
 }
 
@@ -7364,7 +8847,7 @@ fn coalesce_ignores_leading_null_for_common_type_and_coded_contract() {
     assert_eq!(physical_kind, "boolean");
     assert_eq!(
         contract.execution_class,
-        cove_oql::FunctionExecutionClass::CodedSafe
+        coveql::FunctionExecutionClass::CodedSafe
     );
 }
 
@@ -7412,7 +8895,7 @@ fn safe_cast_function_resolves_with_materialized_contract() {
     assert!(contract.dependency.contains("safe-cast"));
     assert_eq!(
         contract.execution_class,
-        cove_oql::FunctionExecutionClass::MaterializedOnly
+        coveql::FunctionExecutionClass::MaterializedOnly
     );
 }
 
@@ -7458,7 +8941,7 @@ fn identity_safe_cast_function_resolves_with_coded_safe_contract() {
     assert!(contract.dependency.contains("coded-identity"));
     assert_eq!(
         contract.execution_class,
-        cove_oql::FunctionExecutionClass::CodedSafe
+        coveql::FunctionExecutionClass::CodedSafe
     );
 }
 
@@ -7501,7 +8984,7 @@ fn null_check_functions_resolve_with_builtin_contracts() {
                 assert!(contract.deterministic);
                 assert_eq!(
                     contract.execution_class,
-                    cove_oql::FunctionExecutionClass::CodedSafe
+                    coveql::FunctionExecutionClass::CodedSafe
                 );
                 function_id.as_str()
             }
@@ -7549,7 +9032,7 @@ fn registered_covemap_string_functions_resolve_with_coded_safe_bodies() {
     assert_eq!(contract.version, "1");
     assert_eq!(
         contract.execution_class,
-        cove_oql::FunctionExecutionClass::CodedSafe
+        coveql::FunctionExecutionClass::CodedSafe
     );
 }
 
@@ -7577,7 +9060,7 @@ fn string_functions_without_covemap_contract_resolve_materialized_only() {
         assert!(matches!(function_id.as_str(), "length" | "startsWith"));
         assert_eq!(
             contract.execution_class,
-            cove_oql::FunctionExecutionClass::MaterializedOnly
+            coveql::FunctionExecutionClass::MaterializedOnly
         );
         assert_eq!(contract.dependency, "materialized-string-built-in");
         assert!(contract.unicode_or_collation_contract.is_none());
@@ -7618,7 +9101,7 @@ fn length_and_starts_with_without_exact_accelerator_contracts_remain_materialize
         assert_eq!(function_id, expected_function);
         assert_eq!(
             contract.execution_class,
-            cove_oql::FunctionExecutionClass::MaterializedOnly
+            coveql::FunctionExecutionClass::MaterializedOnly
         );
         assert_eq!(contract.dependency, "materialized-string-built-in");
         assert!(contract.unicode_or_collation_contract.is_none());
@@ -7667,7 +9150,7 @@ fn length_and_starts_with_with_exact_accelerator_contracts_are_coded_safe() {
         assert_eq!(function_id, expected_function);
         assert_eq!(
             contract.execution_class,
-            cove_oql::FunctionExecutionClass::CodedSafe
+            coveql::FunctionExecutionClass::CodedSafe
         );
         assert!(contract.dependency.contains(expected_dependency));
         assert_eq!(
@@ -7818,7 +9301,7 @@ fn mandatory_scalar_functions_execute_with_declared_materialized_contracts() {
     )
     .unwrap();
 
-    let CoveOqlExecutionResult::JsonRows(rows) = executed.result else {
+    let CoveQlExecutionResult::JsonRows(rows) = executed.result else {
         panic!("expected JSON rows");
     };
     assert_eq!(
@@ -8129,10 +9612,7 @@ fn logical_plan_classifies_goid_or_as_candidate_union_with_residual_verification
     assert!(or_form
         .residual_reason
         .as_deref()
-        .is_some_and(
-            |reason| reason.contains("materialized OQL truth verification")
-                && !reason.contains("not implemented")
-        ));
+        .is_some_and(|reason| reason.contains("materialized CoveQL truth verification")));
 }
 
 #[test]
@@ -8171,7 +9651,7 @@ fn logical_plan_classifies_same_path_or_as_exact_in_equivalent() {
     assert!(or_form
         .representation
         .reason
-        .contains("equivalent to one OQL IN"));
+        .contains("equivalent to one CoveQL IN"));
     let pre_filter = planned
         .logical_plan
         .nodes
@@ -8439,7 +9919,7 @@ fn source_event_time_infers_event_time_property_binding() {
         .contains("event_time"));
 
     let executed = execute_planned_query(&bytes, planned, ExecutionOptions::default()).unwrap();
-    let CoveOqlExecutionResult::JsonRows(rows) = executed.result else {
+    let CoveQlExecutionResult::JsonRows(rows) = executed.result else {
         panic!("expected JSON rows");
     };
     assert_eq!(
@@ -8503,7 +9983,7 @@ fn kernel_source_event_time_as_of_direct_projection_executes_with_exact_native_a
     assert_eq!(temporal_contract["exact"], json!(true));
     assert_eq!(temporal_contract["residual_required"], json!(false));
     assert_eq!(temporal_contract["fallback_boundary"], json!(null));
-    let CoveOqlExecutionResult::JsonRows(rows) = kernel.executed.result else {
+    let CoveQlExecutionResult::JsonRows(rows) = kernel.executed.result else {
         panic!("expected JSON rows");
     };
     assert_eq!(
@@ -8518,7 +9998,7 @@ fn kernel_source_event_time_as_of_direct_projection_can_return_arrow_batches() {
     let query =
         r#"EventThing.asOf(source_event_time: "1970-01-01T00:00:00.000002Z").select(event_time)"#;
     let resolve_options = ResolveOptions {
-        output_mode: Some(CoveOqlOutputMode::ArrowRecordBatch {
+        output_mode: Some(CoveQlOutputMode::ArrowRecordBatch {
             zero_copy_requested: false,
         }),
         ..json_resolve_options()
@@ -8555,7 +10035,7 @@ fn kernel_source_event_time_as_of_direct_projection_can_return_arrow_batches() {
         materialized.output_fingerprint
     );
     assert!(!kernel.executed.authority.residual_required);
-    let CoveOqlExecutionResult::ArrowRecordBatches(batches) = &kernel.executed.result else {
+    let CoveQlExecutionResult::ArrowRecordBatches(batches) = &kernel.executed.result else {
         panic!("expected Arrow batches");
     };
     assert_eq!(batches.len(), 1);
@@ -8608,7 +10088,7 @@ fn branch_string_selector_resolves_through_aliases() {
 
     assert_eq!(
         resolved.branch.selector,
-        cove_oql::BranchSelector::BranchKey(7)
+        coveql::BranchSelector::BranchKey(7)
     );
 }
 
@@ -8654,7 +10134,7 @@ fn logical_plan_grouping_rejects_ungrouped_raw_fields() {
     )
     .unwrap();
 
-    let err = cove_oql::build_logical_plan(resolved, PlanOptions::default()).unwrap_err();
+    let err = coveql::build_logical_plan(resolved, PlanOptions::default()).unwrap_err();
     assert_eq!(err.diagnostics[0].code, "E_GROUPING");
 }
 
@@ -8690,7 +10170,7 @@ fn logical_plan_rejects_aggregates_when_disclosure_policy_rejects() {
     )
     .unwrap();
 
-    let err = cove_oql::build_logical_plan(resolved, PlanOptions::default()).unwrap_err();
+    let err = coveql::build_logical_plan(resolved, PlanOptions::default()).unwrap_err();
     assert_eq!(err.diagnostics[0].code, "E_AGGREGATE_DISCLOSURE_FORBIDDEN");
 }
 
@@ -8729,7 +10209,7 @@ fn logical_plan_explicit_ordering_defaults_nulls_by_direction() {
             _ => None,
         })
         .unwrap();
-    assert_eq!(sort[0].nulls, cove_oql::AstNullOrdering::NullsFirst);
+    assert_eq!(sort[0].nulls, coveql::AstNullOrdering::NullsFirst);
     assert!(!planned.logical_plan.default_ordering_applied);
 }
 
@@ -8744,7 +10224,7 @@ fn logical_plan_rejects_non_string_filecode_ordering() {
         validation_options(),
     )
     .unwrap();
-    let err = cove_oql::build_logical_plan(resolved, PlanOptions::default()).unwrap_err();
+    let err = coveql::build_logical_plan(resolved, PlanOptions::default()).unwrap_err();
     assert_eq!(err.diagnostics[0].code, "E_UNSAFE_CODE_ORDERING");
 }
 
@@ -8917,7 +10397,7 @@ fn logical_plan_json_can_disclose_protected_details_when_allowed() {
         .unwrap()
         .iter()
         .all(|form| form["representation"]["contract_version"]
-            == cove_oql::PREDICATE_REPRESENTATION_CONTRACT_VERSION));
+            == coveql::PREDICATE_REPRESENTATION_CONTRACT_VERSION));
 }
 
 #[test]
@@ -8944,6 +10424,18 @@ fn stable_explain_json_has_ordered_top_level_schema() {
         vec![
             "schema_version",
             "mode",
+            "coveql_version",
+            "core_version",
+            "primary_profile",
+            "profiles",
+            "profile_contracts",
+            "root",
+            "grain",
+            "operation",
+            "temporal_mode",
+            "canonical_order",
+            "visibility_applied",
+            "redaction_applied",
             "fingerprints",
             "operation_context",
             "logical_plan",
@@ -8964,6 +10456,18 @@ fn stable_explain_json_has_ordered_top_level_schema() {
         ]
     );
     assert_eq!(explain["schema_version"], "0.1");
+    assert_eq!(explain["coveql_version"], coveql::COVEQL_LANGUAGE_VERSION);
+    assert_eq!(explain["core_version"], coveql::COVEQL_CORE_VERSION);
+    assert_eq!(explain["primary_profile"], "object");
+    assert_eq!(explain["profiles"], json!(["object"]));
+    assert_eq!(explain["root"], "object");
+    assert_eq!(explain["grain"], "latest_state");
+    assert_eq!(explain["operation"], "explain_object");
+    assert_eq!(explain["temporal_mode"], "latest");
+    assert!(explain["canonical_order"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("goid")));
     assert_eq!(explain["physical_plan"], json!([]));
     assert!(explain["fingerprints"]["physical_plan"].is_null());
     assert!(explain["fingerprints"]["predicate_ast"].is_string());
@@ -8982,7 +10486,7 @@ fn stable_explain_json_has_ordered_top_level_schema() {
             .unwrap()
             .iter()
             .all(|contract| contract["contract_version"]
-                == cove_oql::CODED_OPERATOR_CONTRACT_VERSION)
+                == coveql::CODED_OPERATOR_CONTRACT_VERSION)
     );
 }
 
@@ -9014,7 +10518,7 @@ fn stable_explain_modes_are_policy_clamped() {
                 && item["redacted"] == true
         })
         .expect("policy clamp diagnostic is present");
-    for field in cove_oql::conformance_profile().required_diagnostic_fields {
+    for field in coveql::conformance_profile().required_diagnostic_fields {
         assert!(
             diagnostic.get(*field).is_some(),
             "diagnostic JSON missing required field {field}: {diagnostic}"
@@ -9205,20 +10709,20 @@ fn coded_explain_requires_exact_manifest_bridge_for_multifile_filecode_contracts
         .resolved
         .operation_context
         .dataset
-        .cross_file_ordering = cove_oql::CrossFileOrderingPolicy::CanonicalDatasetOrder;
+        .cross_file_ordering = coveql::CrossFileOrderingPolicy::CanonicalDatasetOrder;
     planned.resolved.operation_context.dataset.object_identity =
-        cove_oql::CrossFileObjectIdentityPolicy::DatasetFileIdAndGoid;
+        coveql::CrossFileObjectIdentityPolicy::DatasetFileIdAndGoid;
     planned
         .resolved
         .operation_context
         .dataset
         .association_identity =
-        cove_oql::CrossFileAssociationIdentityPolicy::DatasetFileQualifiedEndpoints;
+        coveql::CrossFileAssociationIdentityPolicy::DatasetFileQualifiedEndpoints;
     planned
         .resolved
         .operation_context
         .dataset
-        .code_domain_bridges = vec![cove_oql::CodeDomainBridgeContext {
+        .code_domain_bridges = vec![coveql::CodeDomainBridgeContext {
         domain_id: "name_domain".into(),
         bridge_kind: "manifest_candidate_requires_canonical_remap".into(),
         epoch: None,
@@ -9470,7 +10974,7 @@ fn logical_plan_projection_roots_produce_projection_read_contract() {
     let contract = planned.dependencies.projection_contracts.first().unwrap();
     assert_eq!(
         contract.contract_version,
-        cove_oql::PROJECTION_DEPENDENCY_CONTRACT_VERSION
+        coveql::PROJECTION_DEPENDENCY_CONTRACT_VERSION
     );
     assert_eq!(contract.projection_id, "people_projection");
     assert_eq!(contract.projection_version.as_deref(), Some("2026.05"));
@@ -9488,7 +10992,7 @@ fn logical_plan_projection_roots_produce_projection_read_contract() {
     assert!(contract.residual_predicates.is_empty());
     assert_eq!(
         contract.pushdown_status,
-        cove_oql::ProjectionPushdownStatus::FullyPushdownSafe
+        coveql::ProjectionPushdownStatus::FullyPushdownSafe
     );
     assert_eq!(contract.visibility_policy, "all_rows");
     assert_eq!(contract.redaction_policy, "protected_values_redacted");
@@ -9510,7 +11014,7 @@ fn logical_plan_projection_roots_produce_projection_read_contract() {
         &planned.explain_json()["resolved_dependencies"]["projection_contracts"][0];
     assert_eq!(
         explain_contract["contract_version"],
-        json!(cove_oql::PROJECTION_DEPENDENCY_CONTRACT_VERSION)
+        json!(coveql::PROJECTION_DEPENDENCY_CONTRACT_VERSION)
     );
     assert_eq!(explain_contract["map_columns"][0]["name"], "active");
     assert_eq!(
@@ -9564,7 +11068,7 @@ fn projection_contract_treats_omitted_select_as_all_projection_columns() {
     assert!(!contract.residual_required);
     assert_eq!(
         contract.pushdown_status,
-        cove_oql::ProjectionPushdownStatus::FullyPushdownSafe
+        coveql::ProjectionPushdownStatus::FullyPushdownSafe
     );
 }
 
@@ -9754,7 +11258,7 @@ fn projection_contract_keeps_negated_in_with_null_residual() {
     assert!(!contract.pushdown_safe);
     assert_eq!(
         contract.pushdown_status,
-        cove_oql::ProjectionPushdownStatus::PartiallyPushdownSafe
+        coveql::ProjectionPushdownStatus::PartiallyPushdownSafe
     );
 }
 
@@ -9777,7 +11281,7 @@ fn projection_contract_reports_residual_filter_predicates() {
     assert!(!contract.pushdown_safe);
     assert_eq!(
         contract.pushdown_status,
-        cove_oql::ProjectionPushdownStatus::PartiallyPushdownSafe
+        coveql::ProjectionPushdownStatus::PartiallyPushdownSafe
     );
 }
 
@@ -9798,7 +11302,7 @@ fn projection_order_by_default_nulls_marks_dependency_contract_residual() {
     assert!(contract.pushed_columns.contains("active"));
     assert_eq!(
         contract.pushdown_status,
-        cove_oql::ProjectionPushdownStatus::PartiallyPushdownSafe
+        coveql::ProjectionPushdownStatus::PartiallyPushdownSafe
     );
     assert!(contract.residual_required_fields.contains("active"));
     assert!(!contract.pushdown_safe);
@@ -9837,7 +11341,7 @@ fn projection_contract_pushes_columns_required_by_residual_select_expressions() 
         .contains("residual verification"));
     assert_eq!(
         contract.pushdown_status,
-        cove_oql::ProjectionPushdownStatus::PartiallyPushdownSafe
+        coveql::ProjectionPushdownStatus::PartiallyPushdownSafe
     );
     assert!(contract.residual_required);
     assert!(contract.residual_required_fields.contains("active"));
@@ -9910,7 +11414,7 @@ fn datafusion_projection_report_separates_pushed_and_residual_filters() {
         Box::new(Expr::Literal(ScalarValue::Float64(Some(1.0)), None)),
     ));
 
-    let report = cove_oql::datafusion_projection_pushdown_report_for_plan(
+    let report = coveql::datafusion_projection_pushdown_report_for_plan(
         &schema,
         &[supported, residual],
         &planned,
@@ -9919,7 +11423,7 @@ fn datafusion_projection_report_separates_pushed_and_residual_filters() {
 
     assert_eq!(
         report.report_version,
-        cove_oql::DATAFUSION_OQL_REPORT_VERSION
+        coveql::DATAFUSION_COVEQL_REPORT_VERSION
     );
     assert_eq!(report.supported_filter_count, 1);
     assert_eq!(report.residual_filter_count, 1);
@@ -9927,25 +11431,25 @@ fn datafusion_projection_report_separates_pushed_and_residual_filters() {
     assert_eq!(report.filter_outcomes.len(), 2);
     assert_eq!(
         report.filter_outcomes[0].outcome,
-        cove_oql::DataFusionOqlFilterOutcomeKind::TrustedExact
+        coveql::DataFusionCoveQlFilterOutcomeKind::TrustedExact
     );
     assert!(report.filter_outcomes[0].trusted);
     assert_eq!(
         report.filter_outcomes[1].outcome,
-        cove_oql::DataFusionOqlFilterOutcomeKind::ResidualRejected
+        coveql::DataFusionCoveQlFilterOutcomeKind::ResidualRejected
     );
     assert_eq!(report.filter_outcomes[0].diagnostic_code, None);
     assert_eq!(
         report.filter_outcomes[1].diagnostic_code.as_deref(),
-        Some(cove_oql::DATAFUSION_PUSH_FILTER_UNSAFE_DIAGNOSTIC_CODE)
+        Some(coveql::DATAFUSION_PUSH_FILTER_UNSAFE_DIAGNOSTIC_CODE)
     );
-    assert!(report.filter_outcomes[0].lowered_oql_predicates[0].contains("projection.active"));
+    assert!(report.filter_outcomes[0].lowered_coveql_predicates[0].contains("projection.active"));
     assert_eq!(report.pushed_filters.len(), 1);
     assert_eq!(report.trusted_filters.len(), 1);
     assert_eq!(report.residual_filters.len(), 1);
     assert_eq!(report.rejected_filters, report.residual_filters);
-    assert_eq!(report.lowered_oql_predicates.len(), 1);
-    assert!(report.lowered_oql_predicates[0].contains("projection.active"));
+    assert_eq!(report.lowered_coveql_predicates.len(), 1);
+    assert!(report.lowered_coveql_predicates[0].contains("projection.active"));
     assert_eq!(report.proof_states, vec![PredicateProofState::ProvenExact]);
     assert_eq!(report.decode_boundaries.len(), 1);
     assert!(!report.trusted);
@@ -9953,7 +11457,7 @@ fn datafusion_projection_report_separates_pushed_and_residual_filters() {
 
 #[cfg(feature = "datafusion")]
 #[test]
-fn datafusion_oql_memtable_registers_materialized_oql_output() {
+fn datafusion_coveql_memtable_registers_materialized_coveql_output() {
     let ctx = datafusion::execution::context::SessionContext::new();
     let bytes = minimal_object_with_projection_file();
     let planned = parse_resolve_and_plan_query(
@@ -9961,7 +11465,7 @@ fn datafusion_oql_memtable_registers_materialized_oql_output() {
         "projection(people_projection).select(active)",
         ParseOptions::default(),
         ResolveOptions {
-            output_mode: Some(CoveOqlOutputMode::DataFusionTableProvider),
+            output_mode: Some(CoveQlOutputMode::DataFusionTableProvider),
             ..ResolveOptions::default()
         },
         PlanOptions::default(),
@@ -9969,9 +11473,9 @@ fn datafusion_oql_memtable_registers_materialized_oql_output() {
     )
     .unwrap();
 
-    let report = cove_oql::register_datafusion_oql_memtable_for_plan(
+    let report = coveql::register_datafusion_coveql_memtable_for_plan(
         &ctx,
-        "people_oql",
+        "people_coveql",
         bytes,
         &planned,
         ExecutionOptions::default(),
@@ -9980,19 +11484,19 @@ fn datafusion_oql_memtable_registers_materialized_oql_output() {
 
     assert_eq!(
         report.report_version,
-        cove_oql::DATAFUSION_OQL_REPORT_VERSION
+        coveql::DATAFUSION_COVEQL_REPORT_VERSION
     );
-    assert_eq!(report.provider_kind, "oql_memtable");
+    assert_eq!(report.provider_kind, "coveql_memtable");
     assert_eq!(report.root_kind, "projection");
-    assert!(report.materialized_oql_before_registration);
+    assert!(report.materialized_coveql_before_registration);
     assert!(report.residual_verification);
     assert!(report.scan_residual_verification_required);
     assert_eq!(
-        report.oql_scan_authority_source,
-        cove_oql::ExecutionAuthoritySource::MaterializedBaseline
+        report.coveql_scan_authority_source,
+        coveql::ExecutionAuthoritySource::MaterializedBaseline
     );
-    assert!(report.oql_scan_materialized_fallback);
-    assert!(report.oql_scan_residual_required);
+    assert!(report.coveql_scan_materialized_fallback);
+    assert!(report.coveql_scan_residual_required);
     assert_eq!(
         report.scan_execution_policy,
         "materialized_arrow_memtable_before_datafusion"
@@ -10005,23 +11509,23 @@ fn datafusion_oql_memtable_registers_materialized_oql_output() {
 
 #[cfg(feature = "datafusion")]
 #[test]
-fn datafusion_oql_provider_rejects_manifest_scoped_single_buffer_registration() {
+fn datafusion_coveql_provider_rejects_manifest_scoped_single_buffer_registration() {
     let left = object_file_with_bool_records_with_file_id([0xA1; 16], &[true]);
     let right = object_file_with_bool_records_with_file_id([0xB2; 16], &[false]);
     let manifest = covm_manifest_for_members(&[("left.cove", &left), ("right.cove", &right)]);
-    let scope = cove_oql::build_manifest_dataset_scope_context(
+    let scope = coveql::build_manifest_dataset_scope_context(
         &manifest,
         &[
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "left.cove",
                 bytes: &left,
             },
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "right.cove",
                 bytes: &right,
             },
         ],
-        cove_oql::ManifestDatasetScopeOptions::default(),
+        coveql::ManifestDatasetScopeOptions::default(),
     )
     .unwrap();
     let mut planned = parse_resolve_and_plan_query(
@@ -10029,7 +11533,7 @@ fn datafusion_oql_provider_rejects_manifest_scoped_single_buffer_registration() 
         "Thing",
         ParseOptions::default(),
         ResolveOptions {
-            output_mode: Some(CoveOqlOutputMode::DataFusionTableProvider),
+            output_mode: Some(CoveQlOutputMode::DataFusionTableProvider),
             ..ResolveOptions::default()
         },
         PlanOptions::default(),
@@ -10038,7 +11542,7 @@ fn datafusion_oql_provider_rejects_manifest_scoped_single_buffer_registration() 
     .unwrap();
     planned.resolved.operation_context.dataset = scope;
 
-    let err = cove_oql::datafusion_oql_provider_for_plan(
+    let err = coveql::datafusion_coveql_provider_for_plan(
         Arc::new(left),
         &planned,
         ExecutionOptions::default(),
@@ -10053,7 +11557,7 @@ fn datafusion_oql_provider_rejects_manifest_scoped_single_buffer_registration() 
 
 #[cfg(feature = "datafusion")]
 #[tokio::test]
-async fn datafusion_oql_provider_executes_planned_oql_at_scan_time() {
+async fn datafusion_coveql_provider_executes_planned_coveql_at_scan_time() {
     let ctx = datafusion::execution::context::SessionContext::new();
     let bytes = minimal_object_with_projection_file();
     let planned = parse_resolve_and_plan_query(
@@ -10061,7 +11565,7 @@ async fn datafusion_oql_provider_executes_planned_oql_at_scan_time() {
         "projection(people_projection).select(active)",
         ParseOptions::default(),
         ResolveOptions {
-            output_mode: Some(CoveOqlOutputMode::DataFusionTableProvider),
+            output_mode: Some(CoveQlOutputMode::DataFusionTableProvider),
             ..ResolveOptions::default()
         },
         PlanOptions::default(),
@@ -10069,18 +11573,18 @@ async fn datafusion_oql_provider_executes_planned_oql_at_scan_time() {
     )
     .unwrap();
 
-    let report = cove_oql::register_datafusion_oql_provider_for_plan(
+    let report = coveql::register_datafusion_coveql_provider_for_plan(
         &ctx,
-        "people_oql_provider",
+        "people_coveql_provider",
         Arc::new(bytes),
         &planned,
         ExecutionOptions::default(),
     )
     .unwrap();
 
-    assert_eq!(report.provider_kind, "oql_table_provider");
+    assert_eq!(report.provider_kind, "coveql_table_provider");
     assert_eq!(report.root_kind, "projection");
-    assert!(!report.materialized_oql_before_registration);
+    assert!(!report.materialized_coveql_before_registration);
     assert!(report.residual_verification);
     assert!(report.scan_filter_pushdown_supported);
     assert!(report.scan_projection_pushdown_supported);
@@ -10093,7 +11597,7 @@ async fn datafusion_oql_provider_executes_planned_oql_at_scan_time() {
     assert_eq!(report.batch_count, 1);
 
     let dataframe = ctx
-        .sql("select active from people_oql_provider limit 1")
+        .sql("select active from people_coveql_provider limit 1")
         .await
         .unwrap();
     let batches = dataframe.collect().await.unwrap();
@@ -10108,7 +11612,113 @@ async fn datafusion_oql_provider_executes_planned_oql_at_scan_time() {
 
 #[cfg(feature = "datafusion")]
 #[tokio::test]
-async fn datafusion_oql_provider_executes_temporal_history_with_exact_kernel_probe() {
+async fn datafusion_coveql_provider_executes_table_lookup_without_projection_fast_path() {
+    use datafusion::catalog::TableProvider;
+
+    let ctx = datafusion::execution::context::SessionContext::new();
+    let bytes = object_file_with_bool_records_and_projection(&[false, true]);
+    let planned = parse_resolve_and_plan_query(
+        &bytes,
+        "table(thing_projection) as l.lookup(table(thing_projection) as r, on: l.active == r.active).select(left_active: l.active, right_active: r.active)",
+        ParseOptions::default(),
+        ResolveOptions {
+            output_mode: Some(CoveQlOutputMode::DataFusionTableProvider),
+            ..ResolveOptions::default()
+        },
+        PlanOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+    let provider = coveql::datafusion_coveql_provider_for_plan(
+        Arc::new(bytes.clone()),
+        &planned,
+        ExecutionOptions::default(),
+    )
+    .unwrap();
+    let report = provider.report();
+    assert_eq!(report.root_kind, "table");
+    assert!(!report.scan_filter_pushdown_supported);
+    assert!(!report.scan_projection_pushdown_supported);
+    assert_eq!(report.scan_execution_policy, "planned_coveql_scan");
+    assert!(report.unhandled_residuals.iter().any(|residual| {
+        residual.contains("table lookup joins execute inside materialized table semantics")
+    }));
+
+    let negotiation = provider
+        .scan_negotiation_report(Some(&[0]), &[], None)
+        .unwrap();
+    assert!(!negotiation.projection_pushdown_supported);
+    assert!(!negotiation.projection_pushed_to_coveql);
+    assert_eq!(negotiation.scan_execution_policy, "planned_coveql_scan");
+
+    ctx.register_table("thing_lookup", provider as Arc<dyn TableProvider>)
+        .unwrap();
+    let batches = ctx
+        .sql("select left_active, right_active from thing_lookup")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+        2
+    );
+}
+
+#[cfg(feature = "datafusion")]
+#[tokio::test]
+async fn datafusion_coveql_provider_executes_graph_traversal_without_row_pushdown() {
+    use datafusion::catalog::TableProvider;
+
+    let ctx = datafusion::execution::context::SessionContext::new();
+    let bytes = object_file_with_person_and_association_record();
+    let planned = parse_resolve_and_plan_query(
+        &bytes,
+        "node(Person) as c.traverse(out(edge(CustomerPlacedOrder) as placed)).select(customer: c.goid, target: placed.target_goid)",
+        ParseOptions::default(),
+        ResolveOptions {
+            output_mode: Some(CoveQlOutputMode::DataFusionTableProvider),
+            ..ResolveOptions::default()
+        },
+        PlanOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+    let provider = coveql::datafusion_coveql_provider_for_plan(
+        Arc::new(bytes.clone()),
+        &planned,
+        ExecutionOptions::default(),
+    )
+    .unwrap();
+    let report = provider.report();
+    assert_eq!(report.root_kind, "node");
+    assert!(!report.scan_filter_pushdown_supported);
+    assert!(!report.scan_projection_pushdown_supported);
+    assert_eq!(report.scan_execution_policy, "planned_coveql_scan");
+    assert!(report.unhandled_residuals.iter().any(|residual| {
+        residual.contains("graph traversal executes inside materialized graph semantics")
+    }));
+
+    ctx.register_table("person_traverse", provider as Arc<dyn TableProvider>)
+        .unwrap();
+    let batches = ctx
+        .sql("select customer, target from person_traverse")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+        1
+    );
+    assert_eq!(batches[0].num_columns(), 2);
+}
+
+#[cfg(feature = "datafusion")]
+#[tokio::test]
+async fn datafusion_coveql_provider_executes_temporal_history_with_exact_kernel_probe() {
     let ctx = datafusion::execution::context::SessionContext::new();
     let bytes = include_bytes!("../../../conformance/accept/cove_o_temporal_valid.cove");
     let planned = parse_resolve_and_plan_query(
@@ -10116,7 +11726,7 @@ async fn datafusion_oql_provider_executes_temporal_history_with_exact_kernel_pro
         "Thing.history(mode: records).select(active)",
         ParseOptions::default(),
         ResolveOptions {
-            output_mode: Some(CoveOqlOutputMode::DataFusionTableProvider),
+            output_mode: Some(CoveQlOutputMode::DataFusionTableProvider),
             ..ResolveOptions::default()
         },
         PlanOptions::default(),
@@ -10124,31 +11734,31 @@ async fn datafusion_oql_provider_executes_temporal_history_with_exact_kernel_pro
     )
     .unwrap();
 
-    let report = cove_oql::register_datafusion_oql_provider_for_plan(
+    let report = coveql::register_datafusion_coveql_provider_for_plan(
         &ctx,
-        "thing_history_oql_provider",
+        "thing_history_coveql_provider",
         Arc::new(bytes.to_vec()),
         &planned,
         ExecutionOptions::default(),
     )
     .unwrap();
 
-    assert_eq!(report.provider_kind, "oql_table_provider");
+    assert_eq!(report.provider_kind, "coveql_table_provider");
     assert_eq!(report.root_kind, "object");
-    assert!(!report.materialized_oql_before_registration);
+    assert!(!report.materialized_coveql_before_registration);
     assert_eq!(
-        report.oql_scan_authority_source,
-        cove_oql::ExecutionAuthoritySource::ExactOptimizedKernel
+        report.coveql_scan_authority_source,
+        coveql::ExecutionAuthoritySource::ExactOptimizedKernel
     );
-    assert!(!report.oql_scan_materialized_fallback);
-    assert!(!report.oql_scan_residual_required);
+    assert!(!report.coveql_scan_materialized_fallback);
+    assert!(!report.coveql_scan_residual_required);
     assert!(!report.scan_filter_pushdown_supported);
     assert!(report.limit_pushdown_policy.contains("filterless scans"));
     assert!(report.notes.iter().any(|note| note
-        .contains("planned OQL physical execution is attempted inside the provider scan")));
+        .contains("planned CoveQL physical execution is attempted inside the provider scan")));
 
     let explain_batches = ctx
-        .sql("explain select active from thing_history_oql_provider limit 1")
+        .sql("explain select active from thing_history_coveql_provider limit 1")
         .await
         .unwrap()
         .collect()
@@ -10166,14 +11776,14 @@ async fn datafusion_oql_provider_executes_temporal_history_with_exact_kernel_pro
             }
         }
     }
-    assert!(explain_text.contains("OqlExec"), "{explain_text}");
+    assert!(explain_text.contains("CoveQlExec"), "{explain_text}");
     assert!(
-        explain_text.contains("oql_scan_authority_probe=ExactOptimizedKernel"),
+        explain_text.contains("coveql_scan_authority_probe=ExactOptimizedKernel"),
         "{explain_text}"
     );
 
     let dataframe = ctx
-        .sql("select active from thing_history_oql_provider limit 1")
+        .sql("select active from thing_history_coveql_provider limit 1")
         .await
         .unwrap();
     let batches = dataframe.collect().await.unwrap();
@@ -10191,7 +11801,7 @@ async fn datafusion_oql_provider_executes_temporal_history_with_exact_kernel_pro
 
 #[cfg(feature = "datafusion")]
 #[tokio::test]
-async fn datafusion_oql_provider_pushes_filterless_scan_projection_to_oql_readback() {
+async fn datafusion_coveql_provider_pushes_filterless_scan_projection_to_coveql_readback() {
     let ctx = datafusion::execution::context::SessionContext::new();
     let bytes = minimal_object_with_two_column_projection_file();
     let planned = parse_resolve_and_plan_query(
@@ -10199,7 +11809,7 @@ async fn datafusion_oql_provider_pushes_filterless_scan_projection_to_oql_readba
         "projection(people_projection).select(active, enabled)",
         ParseOptions::default(),
         ResolveOptions {
-            output_mode: Some(CoveOqlOutputMode::DataFusionTableProvider),
+            output_mode: Some(CoveQlOutputMode::DataFusionTableProvider),
             ..ResolveOptions::default()
         },
         PlanOptions::default(),
@@ -10207,9 +11817,9 @@ async fn datafusion_oql_provider_pushes_filterless_scan_projection_to_oql_readba
     )
     .unwrap();
 
-    let report = cove_oql::register_datafusion_oql_provider_for_plan(
+    let report = coveql::register_datafusion_coveql_provider_for_plan(
         &ctx,
-        "people_projection_oql_provider",
+        "people_projection_coveql_provider",
         Arc::new(bytes),
         &planned,
         ExecutionOptions::default(),
@@ -10218,7 +11828,7 @@ async fn datafusion_oql_provider_pushes_filterless_scan_projection_to_oql_readba
     assert!(report.scan_projection_pushdown_supported);
 
     let explain_batches = ctx
-        .sql("explain select active from people_projection_oql_provider")
+        .sql("explain select active from people_projection_coveql_provider")
         .await
         .unwrap()
         .collect()
@@ -10237,7 +11847,7 @@ async fn datafusion_oql_provider_pushes_filterless_scan_projection_to_oql_readba
         }
     }
     assert!(
-        explain_text.contains("projection_pushed_to_oql=true"),
+        explain_text.contains("projection_pushed_to_coveql=true"),
         "{explain_text}"
     );
     assert!(
@@ -10253,12 +11863,12 @@ async fn datafusion_oql_provider_pushes_filterless_scan_projection_to_oql_readba
         "{explain_text}"
     );
     assert!(
-        !explain_text.contains("residual_authority=materialized_oql"),
+        !explain_text.contains("residual_authority=materialized_coveql"),
         "{explain_text}"
     );
 
     let dataframe = ctx
-        .sql("select active from people_projection_oql_provider")
+        .sql("select active from people_projection_coveql_provider")
         .await
         .unwrap();
     let batches = dataframe.collect().await.unwrap();
@@ -10269,7 +11879,7 @@ async fn datafusion_oql_provider_pushes_filterless_scan_projection_to_oql_readba
 
 #[cfg(feature = "datafusion")]
 #[tokio::test]
-async fn datafusion_oql_provider_lowers_direct_projection_filters_as_trusted_exact() {
+async fn datafusion_coveql_provider_lowers_direct_projection_filters_as_trusted_exact() {
     use datafusion::{
         catalog::TableProvider,
         common::{Column, ScalarValue},
@@ -10283,14 +11893,14 @@ async fn datafusion_oql_provider_lowers_direct_projection_filters_as_trusted_exa
         "projection(thing_projection).select(active)",
         ParseOptions::default(),
         ResolveOptions {
-            output_mode: Some(CoveOqlOutputMode::DataFusionTableProvider),
+            output_mode: Some(CoveQlOutputMode::DataFusionTableProvider),
             ..ResolveOptions::default()
         },
         PlanOptions::default(),
         validation_options(),
     )
     .unwrap();
-    let provider = cove_oql::datafusion_oql_provider_for_plan(
+    let provider = coveql::datafusion_coveql_provider_for_plan(
         Arc::new(bytes),
         &planned,
         ExecutionOptions::default(),
@@ -10312,10 +11922,10 @@ async fn datafusion_oql_provider_lowers_direct_projection_filters_as_trusted_exa
     assert_eq!(report.filter_outcomes.len(), 1);
     assert_eq!(
         report.filter_outcomes[0].outcome,
-        cove_oql::DataFusionOqlFilterOutcomeKind::TrustedExact
+        coveql::DataFusionCoveQlFilterOutcomeKind::TrustedExact
     );
     assert!(report.filter_outcomes[0].trusted);
-    assert!(report.filter_outcomes[0].lowered_oql_predicates[0].contains("projection.active"));
+    assert!(report.filter_outcomes[0].lowered_coveql_predicates[0].contains("projection.active"));
     assert_eq!(report.pushed_filters.len(), 1);
     assert_eq!(report.trusted_filters.len(), 1);
     assert!(report.residual_filters.is_empty());
@@ -10327,27 +11937,27 @@ async fn datafusion_oql_provider_lowers_direct_projection_filters_as_trusted_exa
         .unwrap();
     assert_eq!(
         negotiation.report_version,
-        cove_oql::DATAFUSION_OQL_REPORT_VERSION
+        coveql::DATAFUSION_COVEQL_REPORT_VERSION
     );
-    assert_eq!(negotiation.provider_kind, "oql_table_provider");
+    assert_eq!(negotiation.provider_kind, "coveql_table_provider");
     assert_eq!(negotiation.root_kind, "projection");
     assert_eq!(
         negotiation.received_projection_columns,
         Some(vec!["active".into()])
     );
     assert!(negotiation.projection_pushdown_supported);
-    assert!(negotiation.projection_pushed_to_oql);
+    assert!(negotiation.projection_pushed_to_coveql);
     assert_eq!(negotiation.pushed_projection_columns, vec!["active"]);
     assert_eq!(negotiation.received_filters.len(), 1);
     assert_eq!(negotiation.trusted_filters.len(), 1);
     assert!(negotiation.residual_filters.is_empty());
     assert!(negotiation.filters_trusted_exact);
     assert_eq!(negotiation.received_limit, Some(1));
-    assert!(negotiation.limit_pushed_to_oql);
+    assert!(negotiation.limit_pushed_to_coveql);
     assert_eq!(negotiation.pushed_limit, Some(1));
     assert_eq!(
         negotiation.residual_filter_authority,
-        "trusted_exact_oql_pushdown"
+        "trusted_exact_coveql_pushdown"
     );
     assert_eq!(
         negotiation.scan_execution_policy,
@@ -10355,10 +11965,10 @@ async fn datafusion_oql_provider_lowers_direct_projection_filters_as_trusted_exa
     );
     assert!(negotiation.unhandled_residuals.is_empty());
 
-    ctx.register_table("thing_oql_provider", provider as Arc<dyn TableProvider>)
+    ctx.register_table("thing_coveql_provider", provider as Arc<dyn TableProvider>)
         .unwrap();
     let explain_batches = ctx
-        .sql("explain select active from thing_oql_provider where active = true limit 1")
+        .sql("explain select active from thing_coveql_provider where active = true limit 1")
         .await
         .unwrap()
         .collect()
@@ -10382,7 +11992,7 @@ async fn datafusion_oql_provider_lowers_direct_projection_filters_as_trusted_exa
         "{explain_text}"
     );
     assert!(
-        explain_text.contains("residual_filter_authority=trusted_exact_oql_pushdown"),
+        explain_text.contains("residual_filter_authority=trusted_exact_coveql_pushdown"),
         "{explain_text}"
     );
     assert!(
@@ -10390,12 +12000,12 @@ async fn datafusion_oql_provider_lowers_direct_projection_filters_as_trusted_exa
         "{explain_text}"
     );
     assert!(
-        explain_text.contains("limit_pushed_to_oql=true"),
+        explain_text.contains("limit_pushed_to_coveql=true"),
         "{explain_text}"
     );
 
     let dataframe = ctx
-        .sql("select active from thing_oql_provider where active = true limit 1")
+        .sql("select active from thing_coveql_provider where active = true limit 1")
         .await
         .unwrap();
     let batches = dataframe.collect().await.unwrap();
@@ -10413,7 +12023,7 @@ async fn datafusion_oql_provider_lowers_direct_projection_filters_as_trusted_exa
 
 #[cfg(feature = "datafusion")]
 #[tokio::test]
-async fn datafusion_oql_provider_lowers_same_column_or_projection_filters_to_in_list() {
+async fn datafusion_coveql_provider_lowers_same_column_or_projection_filters_to_in_list() {
     use datafusion::{
         catalog::TableProvider,
         common::{Column, ScalarValue},
@@ -10426,14 +12036,14 @@ async fn datafusion_oql_provider_lowers_same_column_or_projection_filters_to_in_
         "projection(thing_projection).select(active)",
         ParseOptions::default(),
         ResolveOptions {
-            output_mode: Some(CoveOqlOutputMode::DataFusionTableProvider),
+            output_mode: Some(CoveQlOutputMode::DataFusionTableProvider),
             ..ResolveOptions::default()
         },
         PlanOptions::default(),
         validation_options(),
     )
     .unwrap();
-    let provider = cove_oql::datafusion_oql_provider_for_plan(
+    let provider = coveql::datafusion_coveql_provider_for_plan(
         Arc::new(bytes),
         &planned,
         ExecutionOptions::default(),
@@ -10466,15 +12076,15 @@ async fn datafusion_oql_provider_lowers_same_column_or_projection_filters_to_in_
     assert_eq!(report.pushed_filters.len(), 1);
     assert_eq!(report.trusted_filters.len(), 1);
     assert!(report.residual_filters.is_empty());
-    assert_eq!(report.lowered_oql_predicates.len(), 1);
-    assert!(report.lowered_oql_predicates[0].contains("projection.active in [2 literals]"));
+    assert_eq!(report.lowered_coveql_predicates.len(), 1);
+    assert!(report.lowered_coveql_predicates[0].contains("projection.active in [2 literals]"));
     assert_eq!(report.proof_states, vec![PredicateProofState::ProvenExact]);
     assert!(report.trusted);
 }
 
 #[cfg(feature = "datafusion")]
 #[tokio::test]
-async fn datafusion_oql_provider_keeps_computed_projection_filters_as_residuals() {
+async fn datafusion_coveql_provider_keeps_computed_projection_filters_as_residuals() {
     use datafusion::{
         catalog::TableProvider,
         common::{Column, ScalarValue},
@@ -10489,14 +12099,14 @@ async fn datafusion_oql_provider_keeps_computed_projection_filters_as_residuals(
         "projection(people_projection).select(value: coalesce(active, false))",
         ParseOptions::default(),
         ResolveOptions {
-            output_mode: Some(CoveOqlOutputMode::DataFusionTableProvider),
+            output_mode: Some(CoveQlOutputMode::DataFusionTableProvider),
             ..ResolveOptions::default()
         },
         PlanOptions::default(),
         validation_options(),
     )
     .unwrap();
-    let provider = cove_oql::datafusion_oql_provider_for_plan(
+    let provider = coveql::datafusion_coveql_provider_for_plan(
         Arc::new(bytes),
         &planned,
         ExecutionOptions::default(),
@@ -10518,11 +12128,11 @@ async fn datafusion_oql_provider_keeps_computed_projection_filters_as_residuals(
     assert_eq!(report.residual_filter_count, 1);
     assert_eq!(
         report.filter_outcomes[0].outcome,
-        cove_oql::DataFusionOqlFilterOutcomeKind::ResidualRejected
+        coveql::DataFusionCoveQlFilterOutcomeKind::ResidualRejected
     );
     assert_eq!(
         report.filter_outcomes[0].diagnostic_code.as_deref(),
-        Some(cove_oql::DATAFUSION_PUSH_FILTER_UNSAFE_DIAGNOSTIC_CODE)
+        Some(coveql::DATAFUSION_PUSH_FILTER_UNSAFE_DIAGNOSTIC_CODE)
     );
     assert!(report.pushed_filters.is_empty());
     assert_eq!(report.rejected_filters.len(), 1);
@@ -10531,45 +12141,45 @@ async fn datafusion_oql_provider_keeps_computed_projection_filters_as_residuals(
         .unwrap();
     assert_eq!(
         negotiation.report_version,
-        cove_oql::DATAFUSION_OQL_REPORT_VERSION
+        coveql::DATAFUSION_COVEQL_REPORT_VERSION
     );
     assert_eq!(
         negotiation.received_projection_columns,
-        Some(vec!["active".into()])
+        Some(vec!["value".into()])
     );
     assert!(!negotiation.projection_pushdown_supported);
-    assert!(!negotiation.projection_pushed_to_oql);
+    assert!(!negotiation.projection_pushed_to_coveql);
     assert!(negotiation.pushed_projection_columns.is_empty());
     assert_eq!(negotiation.received_filters.len(), 1);
     assert_eq!(
         negotiation.filter_outcomes[0].diagnostic_code.as_deref(),
-        Some(cove_oql::DATAFUSION_PUSH_FILTER_UNSAFE_DIAGNOSTIC_CODE)
+        Some(coveql::DATAFUSION_PUSH_FILTER_UNSAFE_DIAGNOSTIC_CODE)
     );
     assert_eq!(negotiation.residual_filters.len(), 1);
     assert_eq!(negotiation.rejected_filters.len(), 1);
     assert!(!negotiation.filters_trusted_exact);
     assert_eq!(negotiation.received_limit, Some(1));
-    assert!(!negotiation.limit_pushed_to_oql);
+    assert!(!negotiation.limit_pushed_to_coveql);
     assert_eq!(negotiation.pushed_limit, None);
     assert_eq!(
         negotiation.residual_filter_authority,
         "datafusion_residual_verification"
     );
-    assert_eq!(negotiation.scan_execution_policy, "planned_oql_scan");
+    assert_eq!(negotiation.scan_execution_policy, "planned_coveql_scan");
     assert!(negotiation.unhandled_residuals.iter().any(|residual| {
-        residual.contains("DataFusion scan projection remains outside Cove-OQL")
+        residual.contains("DataFusion scan projection remains outside CoveQL")
     }));
     assert!(negotiation
         .unhandled_residuals
         .iter()
-        .any(|residual| { residual.contains("DataFusion scan limit remains outside Cove-OQL") }));
+        .any(|residual| { residual.contains("DataFusion scan limit remains outside CoveQL") }));
 
     let state = ctx.state();
     let exec = TableProvider::scan(provider.as_ref(), &state, None, &[filter], Some(1))
         .await
         .unwrap();
     let explain_text = displayable(exec.as_ref()).one_line().to_string();
-    assert!(explain_text.contains("OqlExec"), "{explain_text}");
+    assert!(explain_text.contains("CoveQlExec"), "{explain_text}");
     assert!(
         explain_text.contains("received_filters=1"),
         "{explain_text}"
@@ -10587,7 +12197,7 @@ async fn datafusion_oql_provider_keeps_computed_projection_filters_as_residuals(
         "{explain_text}"
     );
     assert!(
-        explain_text.contains("limit_pushed_to_oql=false"),
+        explain_text.contains("limit_pushed_to_coveql=false"),
         "{explain_text}"
     );
     assert!(explain_text.contains("limit=None"), "{explain_text}");
@@ -10595,7 +12205,7 @@ async fn datafusion_oql_provider_keeps_computed_projection_filters_as_residuals(
 
 #[cfg(feature = "datafusion")]
 #[tokio::test]
-async fn datafusion_oql_provider_keeps_aliased_projection_filters_as_residuals() {
+async fn datafusion_coveql_provider_keeps_aliased_projection_filters_as_residuals() {
     use datafusion::{
         catalog::TableProvider,
         common::{Column, ScalarValue},
@@ -10608,14 +12218,14 @@ async fn datafusion_oql_provider_keeps_aliased_projection_filters_as_residuals()
         "projection(people_projection).select(flag: active)",
         ParseOptions::default(),
         ResolveOptions {
-            output_mode: Some(CoveOqlOutputMode::DataFusionTableProvider),
+            output_mode: Some(CoveQlOutputMode::DataFusionTableProvider),
             ..ResolveOptions::default()
         },
         PlanOptions::default(),
         validation_options(),
     )
     .unwrap();
-    let provider = cove_oql::datafusion_oql_provider_for_plan(
+    let provider = coveql::datafusion_coveql_provider_for_plan(
         Arc::new(bytes),
         &planned,
         ExecutionOptions::default(),
@@ -10637,11 +12247,11 @@ async fn datafusion_oql_provider_keeps_aliased_projection_filters_as_residuals()
     assert_eq!(report.residual_filter_count, 1);
     assert_eq!(
         report.filter_outcomes[0].outcome,
-        cove_oql::DataFusionOqlFilterOutcomeKind::ResidualRejected
+        coveql::DataFusionCoveQlFilterOutcomeKind::ResidualRejected
     );
     assert_eq!(
         report.filter_outcomes[0].diagnostic_code.as_deref(),
-        Some(cove_oql::DATAFUSION_PUSH_FILTER_UNSAFE_DIAGNOSTIC_CODE)
+        Some(coveql::DATAFUSION_PUSH_FILTER_UNSAFE_DIAGNOSTIC_CODE)
     );
     assert!(report.pushed_filters.is_empty());
     assert_eq!(report.rejected_filters.len(), 1);
@@ -10649,7 +12259,7 @@ async fn datafusion_oql_provider_keeps_aliased_projection_filters_as_residuals()
 
 #[cfg(feature = "datafusion")]
 #[tokio::test]
-async fn datafusion_oql_provider_lowers_object_filters_as_trusted_exact() {
+async fn datafusion_coveql_provider_lowers_object_filters_as_trusted_exact() {
     use datafusion::{
         catalog::TableProvider,
         common::{Column, ScalarValue},
@@ -10663,14 +12273,14 @@ async fn datafusion_oql_provider_lowers_object_filters_as_trusted_exact() {
         "Thing.select(active)",
         ParseOptions::default(),
         ResolveOptions {
-            output_mode: Some(CoveOqlOutputMode::DataFusionTableProvider),
+            output_mode: Some(CoveQlOutputMode::DataFusionTableProvider),
             ..ResolveOptions::default()
         },
         PlanOptions::default(),
         validation_options(),
     )
     .unwrap();
-    let provider = cove_oql::datafusion_oql_provider_for_plan(
+    let provider = coveql::datafusion_coveql_provider_for_plan(
         Arc::new(bytes),
         &planned,
         ExecutionOptions::default(),
@@ -10684,7 +12294,7 @@ async fn datafusion_oql_provider_lowers_object_filters_as_trusted_exact() {
     assert!(provider_report.scan_projection_pushdown_supported);
     assert_eq!(
         provider_report.scan_execution_policy,
-        "oql_physical_or_materialized_scan"
+        "coveql_physical_or_materialized_scan"
     );
     assert!(provider_report
         .residual_filter_authority
@@ -10709,26 +12319,26 @@ async fn datafusion_oql_provider_lowers_object_filters_as_trusted_exact() {
     assert_eq!(report.filter_outcomes.len(), 1);
     assert_eq!(
         report.filter_outcomes[0].outcome,
-        cove_oql::DataFusionOqlFilterOutcomeKind::TrustedExact
+        coveql::DataFusionCoveQlFilterOutcomeKind::TrustedExact
     );
     assert!(report.filter_outcomes[0].trusted);
-    assert!(report.filter_outcomes[0].lowered_oql_predicates[0].contains("object.active"));
+    assert!(report.filter_outcomes[0].lowered_coveql_predicates[0].contains("object.active"));
     assert_eq!(report.pushed_filters.len(), 1);
     assert_eq!(report.trusted_filters.len(), 1);
     assert!(report.rejected_filters.is_empty());
     assert!(report.residual_filters.is_empty());
-    assert_eq!(report.lowered_oql_predicates.len(), 1);
-    assert!(report.lowered_oql_predicates[0].contains("object.active"));
+    assert_eq!(report.lowered_coveql_predicates.len(), 1);
+    assert!(report.lowered_coveql_predicates[0].contains("object.active"));
     assert_eq!(report.proof_states, vec![PredicateProofState::ProvenExact]);
     assert!(report.trusted);
 
     ctx.register_table(
-        "thing_object_oql_provider",
+        "thing_object_coveql_provider",
         provider as Arc<dyn TableProvider>,
     )
     .unwrap();
     let explain_batches = ctx
-        .sql("explain select active from thing_object_oql_provider where active = true")
+        .sql("explain select active from thing_object_coveql_provider where active = true")
         .await
         .unwrap()
         .collect()
@@ -10746,7 +12356,7 @@ async fn datafusion_oql_provider_lowers_object_filters_as_trusted_exact() {
             }
         }
     }
-    assert!(explain_text.contains("OqlExec"), "{explain_text}");
+    assert!(explain_text.contains("CoveQlExec"), "{explain_text}");
     assert!(explain_text.contains("pushed_filters=1"), "{explain_text}");
     assert!(explain_text.contains("trusted_filters=1"), "{explain_text}");
     assert!(
@@ -10762,24 +12372,24 @@ async fn datafusion_oql_provider_lowers_object_filters_as_trusted_exact() {
         "{explain_text}"
     );
     assert!(
-        explain_text.contains("scan_execution_policy=oql_physical_or_materialized_scan"),
+        explain_text.contains("scan_execution_policy=coveql_physical_or_materialized_scan"),
         "{explain_text}"
     );
     assert!(
-        explain_text.contains("residual_filter_authority=trusted_exact_oql_pushdown"),
+        explain_text.contains("residual_filter_authority=trusted_exact_coveql_pushdown"),
         "{explain_text}"
     );
     assert!(
-        explain_text.contains("oql_scan_authority_probe="),
+        explain_text.contains("coveql_scan_authority_probe="),
         "{explain_text}"
     );
     assert!(
-        !explain_text.contains("residual_authority=materialized_oql"),
+        !explain_text.contains("residual_authority=materialized_coveql"),
         "{explain_text}"
     );
 
     let limit_explain_batches = ctx
-        .sql("explain select active from thing_object_oql_provider where active = true limit 1")
+        .sql("explain select active from thing_object_coveql_provider where active = true limit 1")
         .await
         .unwrap()
         .collect()
@@ -10806,7 +12416,7 @@ async fn datafusion_oql_provider_lowers_object_filters_as_trusted_exact() {
         "{limit_explain_text}"
     );
     assert!(
-        limit_explain_text.contains("limit_pushed_to_oql=true"),
+        limit_explain_text.contains("limit_pushed_to_coveql=true"),
         "{limit_explain_text}"
     );
     assert!(
@@ -10815,7 +12425,7 @@ async fn datafusion_oql_provider_lowers_object_filters_as_trusted_exact() {
     );
 
     let dataframe = ctx
-        .sql("select active from thing_object_oql_provider where active = true limit 1")
+        .sql("select active from thing_object_coveql_provider where active = true limit 1")
         .await
         .unwrap();
     let batches = dataframe.collect().await.unwrap();
@@ -10833,7 +12443,7 @@ async fn datafusion_oql_provider_lowers_object_filters_as_trusted_exact() {
 
 #[cfg(feature = "datafusion")]
 #[tokio::test]
-async fn datafusion_manifest_oql_provider_executes_validated_members_with_residual_filters() {
+async fn datafusion_manifest_coveql_provider_executes_validated_members_with_residual_filters() {
     use datafusion::{
         catalog::TableProvider,
         common::{Column, ScalarValue},
@@ -10844,19 +12454,19 @@ async fn datafusion_manifest_oql_provider_executes_validated_members_with_residu
     let left = object_file_with_bool_records_with_file_id([0xA1; 16], &[false, true]);
     let right = object_file_with_bool_records_with_file_id([0xB2; 16], &[true, false, true]);
     let manifest = covm_manifest_for_members(&[("left.cove", &left), ("right.cove", &right)]);
-    let scope = cove_oql::build_manifest_dataset_scope_context(
+    let scope = coveql::build_manifest_dataset_scope_context(
         &manifest,
         &[
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "left.cove",
                 bytes: &left,
             },
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "right.cove",
                 bytes: &right,
             },
         ],
-        cove_oql::ManifestDatasetScopeOptions::default(),
+        coveql::ManifestDatasetScopeOptions::default(),
     )
     .unwrap();
     let mut planned = parse_resolve_and_plan_query(
@@ -10864,7 +12474,7 @@ async fn datafusion_manifest_oql_provider_executes_validated_members_with_residu
         "Thing.select(active)",
         ParseOptions::default(),
         ResolveOptions {
-            output_mode: Some(CoveOqlOutputMode::DataFusionTableProvider),
+            output_mode: Some(CoveQlOutputMode::DataFusionTableProvider),
             ..ResolveOptions::default()
         },
         PlanOptions::default(),
@@ -10872,17 +12482,17 @@ async fn datafusion_manifest_oql_provider_executes_validated_members_with_residu
     )
     .unwrap();
     planned.resolved.operation_context.dataset = scope;
-    let provider = cove_oql::datafusion_manifest_oql_provider_for_plan(
+    let provider = coveql::datafusion_manifest_coveql_provider_for_plan(
         vec![
-            cove_oql::CoveOqlRetainedManifestMember::from_vec("right.cove", right),
-            cove_oql::CoveOqlRetainedManifestMember::from_vec("left.cove", left),
+            coveql::CoveQlRetainedManifestMember::from_vec("right.cove", right),
+            coveql::CoveQlRetainedManifestMember::from_vec("left.cove", left),
         ],
         &planned,
         ExecutionOptions::default(),
     )
     .unwrap();
     let report = provider.report();
-    assert_eq!(report.provider_kind, "manifest_oql_table_provider");
+    assert_eq!(report.provider_kind, "manifest_coveql_table_provider");
     assert_eq!(report.root_kind, "object");
     assert_eq!(report.root_id.as_deref(), Some("Thing"));
     assert_eq!(report.dataset_file_count, 2);
@@ -10890,20 +12500,20 @@ async fn datafusion_manifest_oql_provider_executes_validated_members_with_residu
     assert!(report.scan_projection_pushdown_supported);
     assert_eq!(
         report.scan_execution_policy,
-        "manifest_oql_physical_or_materialized_scan"
+        "manifest_coveql_physical_or_materialized_scan"
     );
     assert_eq!(
-        report.oql_scan_authority_source,
-        cove_oql::ExecutionAuthoritySource::MaterializedBaseline
+        report.coveql_scan_authority_source,
+        coveql::ExecutionAuthoritySource::MaterializedBaseline
     );
-    assert!(report.oql_scan_materialized_fallback);
-    assert!(report.oql_scan_residual_required);
+    assert!(report.coveql_scan_materialized_fallback);
+    assert!(report.coveql_scan_residual_required);
     assert!(report
         .residual_filter_authority
-        .contains("manifest physical OQL kernel"));
+        .contains("manifest physical CoveQL kernel"));
     assert!(report
         .residual_filter_authority
-        .contains("materialized OQL oracle"));
+        .contains("materialized CoveQL oracle"));
     assert_eq!(report.row_count, 5);
 
     let filter = Expr::BinaryExpr(BinaryExpr::new(
@@ -10921,12 +12531,12 @@ async fn datafusion_manifest_oql_provider_executes_validated_members_with_residu
     assert_eq!(pushdown_report.residual_filter_count, 0);
     assert_eq!(
         pushdown_report.filter_outcomes[0].outcome,
-        cove_oql::DataFusionOqlFilterOutcomeKind::TrustedExact
+        coveql::DataFusionCoveQlFilterOutcomeKind::TrustedExact
     );
     let negotiation = provider
         .scan_negotiation_report(Some(&[0]), &[filter.clone()], Some(2))
         .unwrap();
-    assert_eq!(negotiation.provider_kind, "manifest_oql_table_provider");
+    assert_eq!(negotiation.provider_kind, "manifest_coveql_table_provider");
     assert_eq!(negotiation.root_kind, "object");
     assert_eq!(negotiation.dataset_file_count, 2);
     assert_eq!(
@@ -10934,31 +12544,33 @@ async fn datafusion_manifest_oql_provider_executes_validated_members_with_residu
         Some(vec!["active".into()])
     );
     assert!(negotiation.projection_pushdown_supported);
-    assert!(negotiation.projection_pushed_to_oql);
+    assert!(negotiation.projection_pushed_to_coveql);
     assert_eq!(negotiation.pushed_projection_columns, vec!["active"]);
     assert_eq!(negotiation.received_filters.len(), 1);
     assert_eq!(negotiation.trusted_filters.len(), 1);
     assert!(negotiation.residual_filters.is_empty());
     assert!(negotiation.filters_trusted_exact);
     assert_eq!(negotiation.received_limit, Some(2));
-    assert!(negotiation.limit_pushed_to_oql);
+    assert!(negotiation.limit_pushed_to_coveql);
     assert_eq!(negotiation.pushed_limit, Some(2));
     assert_eq!(
         negotiation.residual_filter_authority,
-        "trusted_exact_oql_pushdown"
+        "trusted_exact_coveql_pushdown"
     );
     assert_eq!(
         negotiation.scan_execution_policy,
-        "manifest_oql_physical_or_materialized_scan"
+        "manifest_coveql_physical_or_materialized_scan"
     );
 
     ctx.register_table(
-        "manifest_thing_oql_provider",
+        "manifest_thing_coveql_provider",
         provider as Arc<dyn TableProvider>,
     )
     .unwrap();
     let explain_batches = ctx
-        .sql("explain select active from manifest_thing_oql_provider where active = true limit 2")
+        .sql(
+            "explain select active from manifest_thing_coveql_provider where active = true limit 2",
+        )
         .await
         .unwrap()
         .collect()
@@ -10976,7 +12588,10 @@ async fn datafusion_manifest_oql_provider_executes_validated_members_with_residu
             }
         }
     }
-    assert!(explain_text.contains("ManifestOqlExec"), "{explain_text}");
+    assert!(
+        explain_text.contains("ManifestCoveQlExec"),
+        "{explain_text}"
+    );
     assert!(explain_text.contains("pushed_filters=1"), "{explain_text}");
     assert!(explain_text.contains("trusted_filters=1"), "{explain_text}");
     assert!(
@@ -10988,25 +12603,26 @@ async fn datafusion_manifest_oql_provider_executes_validated_members_with_residu
         "{explain_text}"
     );
     assert!(
-        explain_text.contains("limit_pushed_to_oql=true"),
+        explain_text.contains("limit_pushed_to_coveql=true"),
         "{explain_text}"
     );
     assert!(explain_text.contains("limit=Some(2)"), "{explain_text}");
     assert!(
-        explain_text.contains("scan_execution_policy=manifest_oql_physical_or_materialized_scan"),
+        explain_text
+            .contains("scan_execution_policy=manifest_coveql_physical_or_materialized_scan"),
         "{explain_text}"
     );
     assert!(
-        explain_text.contains("residual_filter_authority=trusted_exact_oql_pushdown"),
+        explain_text.contains("residual_filter_authority=trusted_exact_coveql_pushdown"),
         "{explain_text}"
     );
     assert!(
-        !explain_text.contains("residual_authority=manifest_materialized_oql"),
+        !explain_text.contains("residual_authority=manifest_materialized_coveql"),
         "{explain_text}"
     );
 
     let batches = ctx
-        .sql("select active from manifest_thing_oql_provider where active = true limit 2")
+        .sql("select active from manifest_thing_coveql_provider where active = true limit 2")
         .await
         .unwrap()
         .collect()
@@ -11030,41 +12646,41 @@ async fn datafusion_manifest_oql_provider_executes_validated_members_with_residu
 
 #[cfg(feature = "datafusion")]
 #[tokio::test]
-async fn datafusion_manifest_oql_provider_reports_exact_kernel_with_validated_bridge() {
+async fn datafusion_manifest_coveql_provider_reports_exact_kernel_with_validated_bridge() {
     use datafusion::catalog::TableProvider;
 
     let ctx = datafusion::execution::context::SessionContext::new();
     let (left, _) = object_file_with_filecode_records_with_file_id([0xA1; 16], &["red", "blue"]);
     let (right, _) = object_file_with_filecode_records_with_file_id([0xB2; 16], &["red", "green"]);
     let manifest = covm_manifest_for_members(&[("left.cove", &left), ("right.cove", &right)]);
-    let scope = cove_oql::build_manifest_dataset_scope_context(
+    let scope = coveql::build_manifest_dataset_scope_context(
         &manifest,
         &[
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "left.cove",
                 bytes: &left,
             },
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "right.cove",
                 bytes: &right,
             },
         ],
-        cove_oql::ManifestDatasetScopeOptions {
+        coveql::ManifestDatasetScopeOptions {
             tenant_id: Some("tenant-a".into()),
             security: SecurityContext {
                 principal_or_session: Some("principal-a".into()),
                 metadata_disclosure_policy: MetadataDisclosurePolicy::AllowProtected,
                 ..SecurityContext::default()
             },
-            code_domain_bridge_proofs: vec![cove_oql::ManifestCodeDomainBridgeProof {
-                domain_id: "cove_e:org.example.oql:exec-codes".into(),
+            code_domain_bridge_proofs: vec![coveql::ManifestCodeDomainBridgeProof {
+                domain_id: "cove_e:org.example.coveql:exec-codes".into(),
                 bridge_kind: "manifest_validated_canonical_remap".into(),
                 exact: true,
                 epoch: Some(1),
                 reason: "manifest member dictionaries remap to the same canonical code domain"
                     .into(),
             }],
-            ..cove_oql::ManifestDatasetScopeOptions::default()
+            ..coveql::ManifestDatasetScopeOptions::default()
         },
     )
     .unwrap();
@@ -11073,7 +12689,7 @@ async fn datafusion_manifest_oql_provider_reports_exact_kernel_with_validated_br
         "Person.select(name)",
         ParseOptions::default(),
         ResolveOptions {
-            output_mode: Some(CoveOqlOutputMode::DataFusionTableProvider),
+            output_mode: Some(CoveQlOutputMode::DataFusionTableProvider),
             ..ResolveOptions::default()
         },
         PlanOptions::default(),
@@ -11081,29 +12697,29 @@ async fn datafusion_manifest_oql_provider_reports_exact_kernel_with_validated_br
     )
     .unwrap();
     planned.resolved.operation_context.dataset = scope;
-    let provider = cove_oql::datafusion_manifest_oql_provider_for_plan(
+    let provider = coveql::datafusion_manifest_coveql_provider_for_plan(
         vec![
-            cove_oql::CoveOqlRetainedManifestMember::from_vec("right.cove", right),
-            cove_oql::CoveOqlRetainedManifestMember::from_vec("left.cove", left),
+            coveql::CoveQlRetainedManifestMember::from_vec("right.cove", right),
+            coveql::CoveQlRetainedManifestMember::from_vec("left.cove", left),
         ],
         &planned,
         ExecutionOptions::default(),
     )
     .unwrap();
     let report = provider.report();
-    assert_eq!(report.provider_kind, "manifest_oql_table_provider");
+    assert_eq!(report.provider_kind, "manifest_coveql_table_provider");
     assert_eq!(report.root_kind, "object");
     assert_eq!(report.dataset_file_count, 2);
     assert_eq!(
-        report.oql_scan_authority_source,
-        cove_oql::ExecutionAuthoritySource::ExactOptimizedKernel
+        report.coveql_scan_authority_source,
+        coveql::ExecutionAuthoritySource::ExactOptimizedKernel
     );
     assert_eq!(
         report.scan_execution_policy,
-        "manifest_oql_physical_or_materialized_scan"
+        "manifest_coveql_physical_or_materialized_scan"
     );
-    assert!(!report.oql_scan_materialized_fallback);
-    assert!(!report.oql_scan_residual_required);
+    assert!(!report.coveql_scan_materialized_fallback);
+    assert!(!report.coveql_scan_residual_required);
 
     ctx.register_table("manifest_people_exact", provider as Arc<dyn TableProvider>)
         .unwrap();
@@ -11129,7 +12745,7 @@ async fn datafusion_manifest_oql_provider_reports_exact_kernel_with_validated_br
 
 #[cfg(feature = "datafusion")]
 #[tokio::test]
-async fn datafusion_manifest_oql_provider_lowers_direct_projection_filters_as_trusted_exact() {
+async fn datafusion_manifest_coveql_provider_lowers_direct_projection_filters_as_trusted_exact() {
     use datafusion::{
         catalog::TableProvider,
         common::{Column, ScalarValue},
@@ -11142,19 +12758,19 @@ async fn datafusion_manifest_oql_provider_lowers_direct_projection_filters_as_tr
     let right =
         object_file_with_bool_records_and_projection_with_file_id([0xB2; 16], &[true, false, true]);
     let manifest = covm_manifest_for_members(&[("left.cove", &left), ("right.cove", &right)]);
-    let scope = cove_oql::build_manifest_dataset_scope_context(
+    let scope = coveql::build_manifest_dataset_scope_context(
         &manifest,
         &[
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "left.cove",
                 bytes: &left,
             },
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "right.cove",
                 bytes: &right,
             },
         ],
-        cove_oql::ManifestDatasetScopeOptions::default(),
+        coveql::ManifestDatasetScopeOptions::default(),
     )
     .unwrap();
     let mut planned = parse_resolve_and_plan_query(
@@ -11162,7 +12778,7 @@ async fn datafusion_manifest_oql_provider_lowers_direct_projection_filters_as_tr
         "projection(thing_projection).select(active)",
         ParseOptions::default(),
         ResolveOptions {
-            output_mode: Some(CoveOqlOutputMode::DataFusionTableProvider),
+            output_mode: Some(CoveQlOutputMode::DataFusionTableProvider),
             ..ResolveOptions::default()
         },
         PlanOptions::default(),
@@ -11170,30 +12786,30 @@ async fn datafusion_manifest_oql_provider_lowers_direct_projection_filters_as_tr
     )
     .unwrap();
     planned.resolved.operation_context.dataset = scope;
-    let provider = cove_oql::datafusion_manifest_oql_provider_for_plan(
+    let provider = coveql::datafusion_manifest_coveql_provider_for_plan(
         vec![
-            cove_oql::CoveOqlRetainedManifestMember::from_vec("right.cove", right),
-            cove_oql::CoveOqlRetainedManifestMember::from_vec("left.cove", left),
+            coveql::CoveQlRetainedManifestMember::from_vec("right.cove", right),
+            coveql::CoveQlRetainedManifestMember::from_vec("left.cove", left),
         ],
         &planned,
         ExecutionOptions::default(),
     )
     .unwrap();
     let report = provider.report();
-    assert_eq!(report.provider_kind, "manifest_oql_table_provider");
+    assert_eq!(report.provider_kind, "manifest_coveql_table_provider");
     assert_eq!(report.root_kind, "projection");
     assert!(report.scan_filter_pushdown_supported);
     assert!(report.scan_projection_pushdown_supported);
     assert_eq!(
         report.scan_execution_policy,
-        "manifest_oql_physical_or_materialized_scan"
+        "manifest_coveql_physical_or_materialized_scan"
     );
     assert_eq!(
-        report.oql_scan_authority_source,
-        cove_oql::ExecutionAuthoritySource::ExactOptimizedKernel
+        report.coveql_scan_authority_source,
+        coveql::ExecutionAuthoritySource::ExactOptimizedKernel
     );
-    assert!(!report.oql_scan_materialized_fallback);
-    assert!(!report.oql_scan_residual_required);
+    assert!(!report.coveql_scan_materialized_fallback);
+    assert!(!report.coveql_scan_residual_required);
 
     let filter = Expr::BinaryExpr(BinaryExpr::new(
         Box::new(Expr::Column(Column::from_name("active"))),
@@ -11208,12 +12824,12 @@ async fn datafusion_manifest_oql_provider_lowers_direct_projection_filters_as_tr
     assert_eq!(pushdown_report.residual_filter_count, 0);
     assert_eq!(
         pushdown_report.filter_outcomes[0].outcome,
-        cove_oql::DataFusionOqlFilterOutcomeKind::TrustedExact
+        coveql::DataFusionCoveQlFilterOutcomeKind::TrustedExact
     );
     let negotiation = provider
         .scan_negotiation_report(Some(&[0]), &[filter.clone()], Some(2))
         .unwrap();
-    assert_eq!(negotiation.provider_kind, "manifest_oql_table_provider");
+    assert_eq!(negotiation.provider_kind, "manifest_coveql_table_provider");
     assert_eq!(negotiation.root_kind, "projection");
     assert_eq!(negotiation.dataset_file_count, 2);
     assert_eq!(
@@ -11221,32 +12837,32 @@ async fn datafusion_manifest_oql_provider_lowers_direct_projection_filters_as_tr
         Some(vec!["active".into()])
     );
     assert!(negotiation.projection_pushdown_supported);
-    assert!(negotiation.projection_pushed_to_oql);
+    assert!(negotiation.projection_pushed_to_coveql);
     assert_eq!(negotiation.pushed_projection_columns, vec!["active"]);
     assert_eq!(negotiation.received_filters.len(), 1);
     assert_eq!(negotiation.trusted_filters.len(), 1);
     assert!(negotiation.residual_filters.is_empty());
     assert!(negotiation.filters_trusted_exact);
     assert_eq!(negotiation.received_limit, Some(2));
-    assert!(negotiation.limit_pushed_to_oql);
+    assert!(negotiation.limit_pushed_to_coveql);
     assert_eq!(negotiation.pushed_limit, Some(2));
     assert_eq!(
         negotiation.residual_filter_authority,
-        "trusted_exact_oql_pushdown"
+        "trusted_exact_coveql_pushdown"
     );
     assert_eq!(
         negotiation.scan_execution_policy,
-        "manifest_oql_physical_or_materialized_scan"
+        "manifest_coveql_physical_or_materialized_scan"
     );
 
     ctx.register_table(
-        "manifest_projection_oql_provider",
+        "manifest_projection_coveql_provider",
         provider as Arc<dyn TableProvider>,
     )
     .unwrap();
     let explain_batches = ctx
         .sql(
-            "explain select active from manifest_projection_oql_provider where active = true limit 2",
+            "explain select active from manifest_projection_coveql_provider where active = true limit 2",
         )
         .await
         .unwrap()
@@ -11265,7 +12881,10 @@ async fn datafusion_manifest_oql_provider_lowers_direct_projection_filters_as_tr
             }
         }
     }
-    assert!(explain_text.contains("ManifestOqlExec"), "{explain_text}");
+    assert!(
+        explain_text.contains("ManifestCoveQlExec"),
+        "{explain_text}"
+    );
     assert!(explain_text.contains("pushed_filters=1"), "{explain_text}");
     assert!(explain_text.contains("trusted_filters=1"), "{explain_text}");
     assert!(
@@ -11278,21 +12897,22 @@ async fn datafusion_manifest_oql_provider_lowers_direct_projection_filters_as_tr
         "{explain_text}"
     );
     assert!(
-        explain_text.contains("limit_pushed_to_oql=true"),
+        explain_text.contains("limit_pushed_to_coveql=true"),
         "{explain_text}"
     );
     assert!(explain_text.contains("limit=Some(2)"), "{explain_text}");
     assert!(
-        explain_text.contains("scan_execution_policy=manifest_oql_physical_or_materialized_scan"),
+        explain_text
+            .contains("scan_execution_policy=manifest_coveql_physical_or_materialized_scan"),
         "{explain_text}"
     );
     assert!(
-        explain_text.contains("residual_filter_authority=trusted_exact_oql_pushdown"),
+        explain_text.contains("residual_filter_authority=trusted_exact_coveql_pushdown"),
         "{explain_text}"
     );
 
     let batches = ctx
-        .sql("select active from manifest_projection_oql_provider where active = true limit 2")
+        .sql("select active from manifest_projection_coveql_provider where active = true limit 2")
         .await
         .unwrap()
         .collect()
@@ -11316,7 +12936,7 @@ async fn datafusion_manifest_oql_provider_lowers_direct_projection_filters_as_tr
 
 #[cfg(feature = "datafusion")]
 #[tokio::test]
-async fn datafusion_oql_provider_guards_row_projection_when_filters_need_residual() {
+async fn datafusion_coveql_provider_guards_row_projection_when_filters_need_residual() {
     use datafusion::{
         catalog::TableProvider,
         common::{Column, ScalarValue},
@@ -11330,14 +12950,14 @@ async fn datafusion_oql_provider_guards_row_projection_when_filters_need_residua
         "Thing.select(goid, active)",
         ParseOptions::default(),
         ResolveOptions {
-            output_mode: Some(CoveOqlOutputMode::DataFusionTableProvider),
+            output_mode: Some(CoveQlOutputMode::DataFusionTableProvider),
             ..ResolveOptions::default()
         },
         PlanOptions::default(),
         validation_options(),
     )
     .unwrap();
-    let provider = cove_oql::datafusion_oql_provider_for_plan(
+    let provider = coveql::datafusion_coveql_provider_for_plan(
         Arc::new(bytes),
         &planned,
         ExecutionOptions::default(),
@@ -11354,12 +12974,12 @@ async fn datafusion_oql_provider_guards_row_projection_when_filters_need_residua
     assert!(report.trusted);
 
     ctx.register_table(
-        "thing_projected_oql_provider",
+        "thing_projected_coveql_provider",
         provider as Arc<dyn TableProvider>,
     )
     .unwrap();
     let explain_batches = ctx
-        .sql("explain select goid from thing_projected_oql_provider where active = true")
+        .sql("explain select goid from thing_projected_coveql_provider where active = true")
         .await
         .unwrap()
         .collect()
@@ -11378,7 +12998,7 @@ async fn datafusion_oql_provider_guards_row_projection_when_filters_need_residua
         }
     }
     assert!(
-        explain_text.contains("projection_pushed_to_oql=true"),
+        explain_text.contains("projection_pushed_to_coveql=true"),
         "{explain_text}"
     );
     assert!(
@@ -11393,7 +13013,7 @@ async fn datafusion_oql_provider_guards_row_projection_when_filters_need_residua
     assert!(explain_text.contains("trusted_filters=1"), "{explain_text}");
 
     let dataframe = ctx
-        .sql("select goid from thing_projected_oql_provider where active = true")
+        .sql("select goid from thing_projected_coveql_provider where active = true")
         .await
         .unwrap();
     let batches = dataframe.collect().await.unwrap();
@@ -11407,7 +13027,7 @@ async fn datafusion_oql_provider_guards_row_projection_when_filters_need_residua
 
 #[cfg(feature = "datafusion")]
 #[tokio::test]
-async fn datafusion_oql_provider_lowers_numeric_range_object_filters_as_trusted_exact() {
+async fn datafusion_coveql_provider_lowers_numeric_range_object_filters_as_trusted_exact() {
     use datafusion::{
         catalog::TableProvider,
         common::{Column, ScalarValue},
@@ -11421,14 +13041,14 @@ async fn datafusion_oql_provider_lowers_numeric_range_object_filters_as_trusted_
         "MetricThing.select(metric)",
         ParseOptions::default(),
         ResolveOptions {
-            output_mode: Some(CoveOqlOutputMode::DataFusionTableProvider),
+            output_mode: Some(CoveQlOutputMode::DataFusionTableProvider),
             ..ResolveOptions::default()
         },
         PlanOptions::default(),
         validation_options(),
     )
     .unwrap();
-    let provider = cove_oql::datafusion_oql_provider_for_plan(
+    let provider = coveql::datafusion_coveql_provider_for_plan(
         Arc::new(bytes),
         &planned,
         ExecutionOptions::default(),
@@ -11458,13 +13078,13 @@ async fn datafusion_oql_provider_lowers_numeric_range_object_filters_as_trusted_
     assert_eq!(report.pushed_filters.len(), 2);
     assert_eq!(report.trusted_filters.len(), 2);
     assert!(report.residual_filters.is_empty());
-    assert_eq!(report.lowered_oql_predicates.len(), 2);
+    assert_eq!(report.lowered_coveql_predicates.len(), 2);
     assert!(report
-        .lowered_oql_predicates
+        .lowered_coveql_predicates
         .iter()
         .any(|predicate| predicate.contains("object.metric >")));
     assert!(report
-        .lowered_oql_predicates
+        .lowered_coveql_predicates
         .iter()
         .any(|predicate| predicate.contains("object.metric <=")));
     assert_eq!(
@@ -11477,18 +13097,18 @@ async fn datafusion_oql_provider_lowers_numeric_range_object_filters_as_trusted_
     assert_eq!(report.filter_outcomes.len(), 1);
     assert_eq!(
         report.filter_outcomes[0].outcome,
-        cove_oql::DataFusionOqlFilterOutcomeKind::TrustedExact
+        coveql::DataFusionCoveQlFilterOutcomeKind::TrustedExact
     );
     assert!(report.trusted);
 
     ctx.register_table(
-        "metric_range_oql_provider",
+        "metric_range_coveql_provider",
         provider as Arc<dyn TableProvider>,
     )
     .unwrap();
     let batches = ctx
         .sql(
-            "select metric from metric_range_oql_provider \
+            "select metric from metric_range_coveql_provider \
              where metric > 10 and metric <= 30 order by metric",
         )
         .await
@@ -11515,7 +13135,7 @@ async fn datafusion_oql_provider_lowers_numeric_range_object_filters_as_trusted_
 
 #[cfg(feature = "datafusion")]
 #[tokio::test]
-async fn datafusion_oql_provider_lowers_filecode_string_range_filters_with_collation_as_trusted_exact(
+async fn datafusion_coveql_provider_lowers_filecode_string_range_filters_with_collation_as_trusted_exact(
 ) {
     use datafusion::{
         catalog::TableProvider,
@@ -11533,14 +13153,14 @@ async fn datafusion_oql_provider_lowers_filecode_string_range_filters_with_colla
         "Person.select(name)",
         ParseOptions::default(),
         ResolveOptions {
-            output_mode: Some(CoveOqlOutputMode::DataFusionTableProvider),
+            output_mode: Some(CoveQlOutputMode::DataFusionTableProvider),
             ..ResolveOptions::default()
         },
         PlanOptions::default(),
         validation_options(),
     )
     .unwrap();
-    let provider = cove_oql::datafusion_oql_provider_for_plan(
+    let provider = coveql::datafusion_coveql_provider_for_plan(
         Arc::new(bytes),
         &planned,
         ExecutionOptions::default(),
@@ -11560,13 +13180,13 @@ async fn datafusion_oql_provider_lowers_filecode_string_range_filters_with_colla
     assert_eq!(report.pushed_filters.len(), 1);
     assert_eq!(report.trusted_filters.len(), 1);
     assert!(report.residual_filters.is_empty());
-    assert_eq!(report.lowered_oql_predicates.len(), 1);
-    assert!(report.lowered_oql_predicates[0].contains("object.name <"));
+    assert_eq!(report.lowered_coveql_predicates.len(), 1);
+    assert!(report.lowered_coveql_predicates[0].contains("object.name <"));
     assert_eq!(report.proof_states, vec![PredicateProofState::ProvenExact]);
     assert_eq!(report.filter_outcomes.len(), 1);
     assert_eq!(
         report.filter_outcomes[0].outcome,
-        cove_oql::DataFusionOqlFilterOutcomeKind::TrustedExact
+        coveql::DataFusionCoveQlFilterOutcomeKind::TrustedExact
     );
     assert!(report
         .decode_boundaries
@@ -11575,13 +13195,13 @@ async fn datafusion_oql_provider_lowers_filecode_string_range_filters_with_colla
     assert!(report.trusted);
 
     ctx.register_table(
-        "person_name_range_oql_provider",
+        "person_name_range_coveql_provider",
         provider as Arc<dyn TableProvider>,
     )
     .unwrap();
     let batches = ctx
         .sql(
-            "select name from person_name_range_oql_provider \
+            "select name from person_name_range_coveql_provider \
              where name < 'M' order by name",
         )
         .await
@@ -11605,7 +13225,7 @@ async fn datafusion_oql_provider_lowers_filecode_string_range_filters_with_colla
 
 #[cfg(feature = "datafusion")]
 #[tokio::test]
-async fn datafusion_oql_provider_lowers_filecode_string_range_filters_with_default_collation_as_trusted_exact(
+async fn datafusion_coveql_provider_lowers_filecode_string_range_filters_with_default_collation_as_trusted_exact(
 ) {
     use datafusion::{
         catalog::TableProvider,
@@ -11620,14 +13240,14 @@ async fn datafusion_oql_provider_lowers_filecode_string_range_filters_with_defau
         "Person.select(name)",
         ParseOptions::default(),
         ResolveOptions {
-            output_mode: Some(CoveOqlOutputMode::DataFusionTableProvider),
+            output_mode: Some(CoveQlOutputMode::DataFusionTableProvider),
             ..ResolveOptions::default()
         },
         PlanOptions::default(),
         validation_options(),
     )
     .unwrap();
-    let provider = cove_oql::datafusion_oql_provider_for_plan(
+    let provider = coveql::datafusion_coveql_provider_for_plan(
         Arc::new(bytes),
         &planned,
         ExecutionOptions::default(),
@@ -11651,7 +13271,7 @@ async fn datafusion_oql_provider_lowers_filecode_string_range_filters_with_defau
     assert_eq!(report.filter_outcomes.len(), 1);
     assert_eq!(
         report.filter_outcomes[0].outcome,
-        cove_oql::DataFusionOqlFilterOutcomeKind::TrustedExact
+        coveql::DataFusionCoveQlFilterOutcomeKind::TrustedExact
     );
     assert!(report
         .decode_boundaries
@@ -11660,13 +13280,13 @@ async fn datafusion_oql_provider_lowers_filecode_string_range_filters_with_defau
     assert!(report.trusted);
 
     ctx.register_table(
-        "person_name_default_range_oql_provider",
+        "person_name_default_range_coveql_provider",
         provider as Arc<dyn TableProvider>,
     )
     .unwrap();
     let batches = ctx
         .sql(
-            "select name from person_name_default_range_oql_provider \
+            "select name from person_name_default_range_coveql_provider \
              where name < 'M' order by name",
         )
         .await
@@ -11690,7 +13310,7 @@ async fn datafusion_oql_provider_lowers_filecode_string_range_filters_with_defau
 
 #[cfg(feature = "datafusion")]
 #[tokio::test]
-async fn datafusion_oql_provider_lowers_bare_boolean_object_filters() {
+async fn datafusion_coveql_provider_lowers_bare_boolean_object_filters() {
     use datafusion::{
         catalog::TableProvider,
         common::Column,
@@ -11704,14 +13324,14 @@ async fn datafusion_oql_provider_lowers_bare_boolean_object_filters() {
         "Thing.select(active)",
         ParseOptions::default(),
         ResolveOptions {
-            output_mode: Some(CoveOqlOutputMode::DataFusionTableProvider),
+            output_mode: Some(CoveQlOutputMode::DataFusionTableProvider),
             ..ResolveOptions::default()
         },
         PlanOptions::default(),
         validation_options(),
     )
     .unwrap();
-    let provider = cove_oql::datafusion_oql_provider_for_plan(
+    let provider = coveql::datafusion_coveql_provider_for_plan(
         Arc::new(bytes),
         &planned,
         ExecutionOptions::default(),
@@ -11729,18 +13349,18 @@ async fn datafusion_oql_provider_lowers_bare_boolean_object_filters() {
     assert_eq!(report.pushed_filters.len(), 1);
     assert_eq!(report.trusted_filters.len(), 1);
     assert!(report.residual_filters.is_empty());
-    assert_eq!(report.lowered_oql_predicates.len(), 1);
-    assert!(report.lowered_oql_predicates[0].contains("object.active"));
+    assert_eq!(report.lowered_coveql_predicates.len(), 1);
+    assert!(report.lowered_coveql_predicates[0].contains("object.active"));
     assert_eq!(report.proof_states, vec![PredicateProofState::ProvenExact]);
     assert!(report.trusted);
 
     ctx.register_table(
-        "thing_bool_oql_provider",
+        "thing_bool_coveql_provider",
         provider as Arc<dyn TableProvider>,
     )
     .unwrap();
     let dataframe = ctx
-        .sql("select active from thing_bool_oql_provider where active")
+        .sql("select active from thing_bool_coveql_provider where active")
         .await
         .unwrap();
     let batches = dataframe.collect().await.unwrap();
@@ -11752,7 +13372,7 @@ async fn datafusion_oql_provider_lowers_bare_boolean_object_filters() {
 
 #[cfg(feature = "datafusion")]
 #[tokio::test]
-async fn datafusion_oql_provider_lowers_negated_boolean_object_filters() {
+async fn datafusion_coveql_provider_lowers_negated_boolean_object_filters() {
     use datafusion::{
         catalog::TableProvider,
         common::Column,
@@ -11766,14 +13386,14 @@ async fn datafusion_oql_provider_lowers_negated_boolean_object_filters() {
         "Thing.select(active)",
         ParseOptions::default(),
         ResolveOptions {
-            output_mode: Some(CoveOqlOutputMode::DataFusionTableProvider),
+            output_mode: Some(CoveQlOutputMode::DataFusionTableProvider),
             ..ResolveOptions::default()
         },
         PlanOptions::default(),
         validation_options(),
     )
     .unwrap();
-    let provider = cove_oql::datafusion_oql_provider_for_plan(
+    let provider = coveql::datafusion_coveql_provider_for_plan(
         Arc::new(bytes),
         &planned,
         ExecutionOptions::default(),
@@ -11791,19 +13411,19 @@ async fn datafusion_oql_provider_lowers_negated_boolean_object_filters() {
     assert_eq!(report.pushed_filters.len(), 1);
     assert_eq!(report.trusted_filters.len(), 1);
     assert!(report.residual_filters.is_empty());
-    assert_eq!(report.lowered_oql_predicates.len(), 1);
-    assert!(report.lowered_oql_predicates[0].contains("object.active"));
-    assert!(report.lowered_oql_predicates[0].contains("Boolean(false)"));
+    assert_eq!(report.lowered_coveql_predicates.len(), 1);
+    assert!(report.lowered_coveql_predicates[0].contains("object.active"));
+    assert!(report.lowered_coveql_predicates[0].contains("Boolean(false)"));
     assert_eq!(report.proof_states, vec![PredicateProofState::ProvenExact]);
     assert!(report.trusted);
 
     ctx.register_table(
-        "thing_negated_oql_provider",
+        "thing_negated_coveql_provider",
         provider as Arc<dyn TableProvider>,
     )
     .unwrap();
     let dataframe = ctx
-        .sql("select active from thing_negated_oql_provider where not active")
+        .sql("select active from thing_negated_coveql_provider where not active")
         .await
         .unwrap();
     let batches = dataframe.collect().await.unwrap();
@@ -11821,7 +13441,7 @@ async fn datafusion_oql_provider_lowers_negated_boolean_object_filters() {
 
 #[cfg(feature = "datafusion")]
 #[tokio::test]
-async fn datafusion_oql_provider_lowers_not_equal_object_filters() {
+async fn datafusion_coveql_provider_lowers_not_equal_object_filters() {
     use datafusion::{
         catalog::TableProvider,
         common::{Column, ScalarValue},
@@ -11836,14 +13456,14 @@ async fn datafusion_oql_provider_lowers_not_equal_object_filters() {
         "Thing.select(active)",
         ParseOptions::default(),
         ResolveOptions {
-            output_mode: Some(CoveOqlOutputMode::DataFusionTableProvider),
+            output_mode: Some(CoveQlOutputMode::DataFusionTableProvider),
             ..ResolveOptions::default()
         },
         PlanOptions::default(),
         validation_options(),
     )
     .unwrap();
-    let provider = cove_oql::datafusion_oql_provider_for_plan(
+    let provider = coveql::datafusion_coveql_provider_for_plan(
         Arc::new(bytes),
         &planned,
         ExecutionOptions::default(),
@@ -11863,20 +13483,20 @@ async fn datafusion_oql_provider_lowers_not_equal_object_filters() {
     assert_eq!(report.pushed_filters.len(), 1);
     assert_eq!(report.trusted_filters.len(), 1);
     assert!(report.residual_filters.is_empty());
-    assert_eq!(report.lowered_oql_predicates.len(), 1);
-    assert!(report.lowered_oql_predicates[0].contains("object.active"));
-    assert!(report.lowered_oql_predicates[0].contains("!="));
-    assert!(report.lowered_oql_predicates[0].contains("Boolean(true)"));
+    assert_eq!(report.lowered_coveql_predicates.len(), 1);
+    assert!(report.lowered_coveql_predicates[0].contains("object.active"));
+    assert!(report.lowered_coveql_predicates[0].contains("!="));
+    assert!(report.lowered_coveql_predicates[0].contains("Boolean(true)"));
     assert_eq!(report.proof_states, vec![PredicateProofState::ProvenExact]);
     assert!(report.trusted);
 
     ctx.register_table(
-        "thing_not_equal_oql_provider",
+        "thing_not_equal_coveql_provider",
         provider as Arc<dyn TableProvider>,
     )
     .unwrap();
     let dataframe = ctx
-        .sql("select active from thing_not_equal_oql_provider where active != true")
+        .sql("select active from thing_not_equal_coveql_provider where active != true")
         .await
         .unwrap();
     let batches = dataframe.collect().await.unwrap();
@@ -11894,7 +13514,7 @@ async fn datafusion_oql_provider_lowers_not_equal_object_filters() {
 
 #[cfg(feature = "datafusion")]
 #[tokio::test]
-async fn datafusion_oql_provider_lowers_not_of_equality_object_filters() {
+async fn datafusion_coveql_provider_lowers_not_of_equality_object_filters() {
     use datafusion::{
         catalog::TableProvider,
         common::{Column, ScalarValue},
@@ -11908,14 +13528,14 @@ async fn datafusion_oql_provider_lowers_not_of_equality_object_filters() {
         "Person.select(name)",
         ParseOptions::default(),
         ResolveOptions {
-            output_mode: Some(CoveOqlOutputMode::DataFusionTableProvider),
+            output_mode: Some(CoveQlOutputMode::DataFusionTableProvider),
             ..ResolveOptions::default()
         },
         PlanOptions::default(),
         validation_options(),
     )
     .unwrap();
-    let provider = cove_oql::datafusion_oql_provider_for_plan(
+    let provider = coveql::datafusion_coveql_provider_for_plan(
         Arc::new(bytes),
         &planned,
         ExecutionOptions::default(),
@@ -11938,25 +13558,25 @@ async fn datafusion_oql_provider_lowers_not_of_equality_object_filters() {
     assert_eq!(report.trusted_filters.len(), 1);
     assert!(report.residual_filters.is_empty());
     assert!(report.rejected_filters.is_empty());
-    assert_eq!(report.lowered_oql_predicates.len(), 1);
-    assert!(report.lowered_oql_predicates[0].contains("object.name !="));
-    assert!(report.lowered_oql_predicates[0].contains(r#"Utf8("red")"#));
+    assert_eq!(report.lowered_coveql_predicates.len(), 1);
+    assert!(report.lowered_coveql_predicates[0].contains("object.name !="));
+    assert!(report.lowered_coveql_predicates[0].contains(r#"Utf8("red")"#));
     assert_eq!(report.proof_states, vec![PredicateProofState::ProvenExact]);
     assert_eq!(
         report.filter_outcomes[0].outcome,
-        cove_oql::DataFusionOqlFilterOutcomeKind::TrustedExact
+        coveql::DataFusionCoveQlFilterOutcomeKind::TrustedExact
     );
     assert!(report.filter_outcomes[0].trusted);
     assert!(report.decode_boundaries.is_empty());
     assert!(report.trusted);
 
     ctx.register_table(
-        "person_not_eq_oql_provider",
+        "person_not_eq_coveql_provider",
         provider as Arc<dyn TableProvider>,
     )
     .unwrap();
     let batches = ctx
-        .sql("select name from person_not_eq_oql_provider where not (name = 'red')")
+        .sql("select name from person_not_eq_coveql_provider where not (name = 'red')")
         .await
         .unwrap()
         .collect()
@@ -11981,7 +13601,7 @@ async fn datafusion_oql_provider_lowers_not_of_equality_object_filters() {
 
 #[cfg(feature = "datafusion")]
 #[tokio::test]
-async fn datafusion_oql_provider_lowers_is_true_false_boolean_object_filters() {
+async fn datafusion_coveql_provider_lowers_is_true_false_boolean_object_filters() {
     use datafusion::{
         catalog::TableProvider,
         common::Column,
@@ -11996,14 +13616,14 @@ async fn datafusion_oql_provider_lowers_is_true_false_boolean_object_filters() {
         "Thing.select(active)",
         ParseOptions::default(),
         ResolveOptions {
-            output_mode: Some(CoveOqlOutputMode::DataFusionTableProvider),
+            output_mode: Some(CoveQlOutputMode::DataFusionTableProvider),
             ..ResolveOptions::default()
         },
         PlanOptions::default(),
         validation_options(),
     )
     .unwrap();
-    let provider = cove_oql::datafusion_oql_provider_for_plan(
+    let provider = coveql::datafusion_coveql_provider_for_plan(
         Arc::new(bytes),
         &planned,
         ExecutionOptions::default(),
@@ -12031,20 +13651,20 @@ async fn datafusion_oql_provider_lowers_is_true_false_boolean_object_filters() {
         assert_eq!(report.pushed_filters.len(), 1);
         assert_eq!(report.trusted_filters.len(), 1);
         assert!(report.residual_filters.is_empty());
-        assert_eq!(report.lowered_oql_predicates.len(), 1);
-        assert!(report.lowered_oql_predicates[0].contains("object.active"));
-        assert!(report.lowered_oql_predicates[0].contains(expected_literal));
+        assert_eq!(report.lowered_coveql_predicates.len(), 1);
+        assert!(report.lowered_coveql_predicates[0].contains("object.active"));
+        assert!(report.lowered_coveql_predicates[0].contains(expected_literal));
         assert_eq!(report.proof_states, vec![PredicateProofState::ProvenExact]);
         assert!(report.trusted);
     }
 
     ctx.register_table(
-        "thing_is_bool_oql_provider",
+        "thing_is_bool_coveql_provider",
         provider as Arc<dyn TableProvider>,
     )
     .unwrap();
     let true_batches = ctx
-        .sql("select active from thing_is_bool_oql_provider where active is true")
+        .sql("select active from thing_is_bool_coveql_provider where active is true")
         .await
         .unwrap()
         .collect()
@@ -12058,7 +13678,7 @@ async fn datafusion_oql_provider_lowers_is_true_false_boolean_object_filters() {
         2
     );
     let false_batches = ctx
-        .sql("select active from thing_is_bool_oql_provider where active is false")
+        .sql("select active from thing_is_bool_coveql_provider where active is false")
         .await
         .unwrap()
         .collect()
@@ -12075,7 +13695,7 @@ async fn datafusion_oql_provider_lowers_is_true_false_boolean_object_filters() {
 
 #[cfg(feature = "datafusion")]
 #[tokio::test]
-async fn datafusion_oql_provider_lowers_null_boolean_object_filters() {
+async fn datafusion_coveql_provider_lowers_null_boolean_object_filters() {
     use datafusion::{
         catalog::TableProvider,
         common::Column,
@@ -12090,14 +13710,14 @@ async fn datafusion_oql_provider_lowers_null_boolean_object_filters() {
         "Thing.select(active)",
         ParseOptions::default(),
         ResolveOptions {
-            output_mode: Some(CoveOqlOutputMode::DataFusionTableProvider),
+            output_mode: Some(CoveQlOutputMode::DataFusionTableProvider),
             ..ResolveOptions::default()
         },
         PlanOptions::default(),
         validation_options(),
     )
     .unwrap();
-    let provider = cove_oql::datafusion_oql_provider_for_plan(
+    let provider = coveql::datafusion_coveql_provider_for_plan(
         Arc::new(bytes),
         &planned,
         ExecutionOptions::default(),
@@ -12125,26 +13745,26 @@ async fn datafusion_oql_provider_lowers_null_boolean_object_filters() {
         assert_eq!(report.pushed_filters.len(), 1);
         assert_eq!(report.trusted_filters.len(), 1);
         assert!(report.residual_filters.is_empty());
-        assert_eq!(report.lowered_oql_predicates.len(), 1);
-        assert!(report.lowered_oql_predicates[0].contains("object.active"));
-        assert!(report.lowered_oql_predicates[0].contains(expected_summary));
+        assert_eq!(report.lowered_coveql_predicates.len(), 1);
+        assert!(report.lowered_coveql_predicates[0].contains("object.active"));
+        assert!(report.lowered_coveql_predicates[0].contains(expected_summary));
         assert_eq!(report.proof_states, vec![PredicateProofState::ProvenExact]);
         assert_eq!(report.filter_outcomes.len(), 1);
         assert_eq!(
             report.filter_outcomes[0].outcome,
-            cove_oql::DataFusionOqlFilterOutcomeKind::TrustedExact
+            coveql::DataFusionCoveQlFilterOutcomeKind::TrustedExact
         );
         assert!(report.filter_outcomes[0].trusted);
         assert!(report.trusted);
     }
 
     ctx.register_table(
-        "thing_null_oql_provider",
+        "thing_null_coveql_provider",
         provider as Arc<dyn TableProvider>,
     )
     .unwrap();
     let null_batches = ctx
-        .sql("select active from thing_null_oql_provider where active is null")
+        .sql("select active from thing_null_coveql_provider where active is null")
         .await
         .unwrap()
         .collect()
@@ -12165,7 +13785,7 @@ async fn datafusion_oql_provider_lowers_null_boolean_object_filters() {
     assert!(null_values.is_null(0));
 
     let not_null_batches = ctx
-        .sql("select active from thing_null_oql_provider where active is not null")
+        .sql("select active from thing_null_coveql_provider where active is not null")
         .await
         .unwrap()
         .collect()
@@ -12182,7 +13802,7 @@ async fn datafusion_oql_provider_lowers_null_boolean_object_filters() {
 
 #[cfg(feature = "datafusion")]
 #[tokio::test]
-async fn datafusion_oql_provider_lowers_same_column_or_object_filters_to_in_list() {
+async fn datafusion_coveql_provider_lowers_same_column_or_object_filters_to_in_list() {
     use datafusion::{
         catalog::TableProvider,
         common::{Column, ScalarValue},
@@ -12197,14 +13817,14 @@ async fn datafusion_oql_provider_lowers_same_column_or_object_filters_to_in_list
         "Thing.select(active)",
         ParseOptions::default(),
         ResolveOptions {
-            output_mode: Some(CoveOqlOutputMode::DataFusionTableProvider),
+            output_mode: Some(CoveQlOutputMode::DataFusionTableProvider),
             ..ResolveOptions::default()
         },
         PlanOptions::default(),
         validation_options(),
     )
     .unwrap();
-    let provider = cove_oql::datafusion_oql_provider_for_plan(
+    let provider = coveql::datafusion_coveql_provider_for_plan(
         Arc::new(bytes),
         &planned,
         ExecutionOptions::default(),
@@ -12234,16 +13854,19 @@ async fn datafusion_oql_provider_lowers_same_column_or_object_filters_to_in_list
     assert_eq!(report.pushed_filters.len(), 1);
     assert_eq!(report.trusted_filters.len(), 1);
     assert!(report.residual_filters.is_empty());
-    assert_eq!(report.lowered_oql_predicates.len(), 1);
-    assert!(report.lowered_oql_predicates[0].contains("object.active in [2 literals]"));
+    assert_eq!(report.lowered_coveql_predicates.len(), 1);
+    assert!(report.lowered_coveql_predicates[0].contains("object.active in [2 literals]"));
     assert_eq!(report.proof_states, vec![PredicateProofState::ProvenExact]);
     assert!(report.trusted);
 
-    ctx.register_table("thing_or_oql_provider", provider as Arc<dyn TableProvider>)
-        .unwrap();
+    ctx.register_table(
+        "thing_or_coveql_provider",
+        provider as Arc<dyn TableProvider>,
+    )
+    .unwrap();
     let batches = ctx
         .sql(
-            "select active from thing_or_oql_provider \
+            "select active from thing_or_coveql_provider \
              where active = true or active = false",
         )
         .await
@@ -12259,7 +13882,7 @@ async fn datafusion_oql_provider_lowers_same_column_or_object_filters_to_in_list
 
 #[cfg(feature = "datafusion")]
 #[tokio::test]
-async fn datafusion_oql_provider_lowers_not_in_object_filters_to_ne_conjunction() {
+async fn datafusion_coveql_provider_lowers_not_in_object_filters_to_ne_conjunction() {
     use datafusion::{
         catalog::TableProvider,
         common::{Column, ScalarValue},
@@ -12273,14 +13896,14 @@ async fn datafusion_oql_provider_lowers_not_in_object_filters_to_ne_conjunction(
         "Person.select(name)",
         ParseOptions::default(),
         ResolveOptions {
-            output_mode: Some(CoveOqlOutputMode::DataFusionTableProvider),
+            output_mode: Some(CoveQlOutputMode::DataFusionTableProvider),
             ..ResolveOptions::default()
         },
         PlanOptions::default(),
         validation_options(),
     )
     .unwrap();
-    let provider = cove_oql::datafusion_oql_provider_for_plan(
+    let provider = coveql::datafusion_coveql_provider_for_plan(
         Arc::new(bytes),
         &planned,
         ExecutionOptions::default(),
@@ -12304,9 +13927,9 @@ async fn datafusion_oql_provider_lowers_not_in_object_filters_to_ne_conjunction(
     assert_eq!(report.trusted_filters.len(), 2);
     assert!(report.residual_filters.is_empty());
     assert!(report.rejected_filters.is_empty());
-    assert_eq!(report.lowered_oql_predicates.len(), 2);
+    assert_eq!(report.lowered_coveql_predicates.len(), 2);
     assert!(report
-        .lowered_oql_predicates
+        .lowered_coveql_predicates
         .iter()
         .all(|predicate| predicate.contains("object.name !=")));
     assert_eq!(
@@ -12318,19 +13941,19 @@ async fn datafusion_oql_provider_lowers_not_in_object_filters_to_ne_conjunction(
     );
     assert_eq!(
         report.filter_outcomes[0].outcome,
-        cove_oql::DataFusionOqlFilterOutcomeKind::TrustedExact
+        coveql::DataFusionCoveQlFilterOutcomeKind::TrustedExact
     );
     assert!(report.filter_outcomes[0].trusted);
     assert!(report.decode_boundaries.is_empty());
     assert!(report.trusted);
 
     ctx.register_table(
-        "person_not_in_oql_provider",
+        "person_not_in_coveql_provider",
         provider as Arc<dyn TableProvider>,
     )
     .unwrap();
     let batches = ctx
-        .sql("select name from person_not_in_oql_provider where name not in ('red', 'green')")
+        .sql("select name from person_not_in_coveql_provider where name not in ('red', 'green')")
         .await
         .unwrap()
         .collect()
@@ -12350,7 +13973,7 @@ async fn datafusion_oql_provider_lowers_not_in_object_filters_to_ne_conjunction(
 
 #[cfg(feature = "datafusion")]
 #[tokio::test]
-async fn datafusion_oql_provider_executes_association_root_at_scan_time() {
+async fn datafusion_coveql_provider_executes_association_root_at_scan_time() {
     let ctx = datafusion::execution::context::SessionContext::new();
     let bytes = object_file_with_person_and_association_record();
     let planned = parse_resolve_and_plan_query(
@@ -12358,7 +13981,7 @@ async fn datafusion_oql_provider_executes_association_root_at_scan_time() {
         "association(CustomerPlacedOrder).select(source_goid, target_goid)",
         ParseOptions::default(),
         ResolveOptions {
-            output_mode: Some(CoveOqlOutputMode::DataFusionTableProvider),
+            output_mode: Some(CoveQlOutputMode::DataFusionTableProvider),
             ..ResolveOptions::default()
         },
         PlanOptions::default(),
@@ -12366,33 +13989,33 @@ async fn datafusion_oql_provider_executes_association_root_at_scan_time() {
     )
     .unwrap();
 
-    let report = cove_oql::register_datafusion_oql_provider_for_plan(
+    let report = coveql::register_datafusion_coveql_provider_for_plan(
         &ctx,
-        "association_oql_provider",
+        "association_coveql_provider",
         Arc::new(bytes),
         &planned,
         ExecutionOptions::default(),
     )
     .unwrap();
 
-    assert_eq!(report.provider_kind, "oql_table_provider");
+    assert_eq!(report.provider_kind, "coveql_table_provider");
     assert_eq!(report.root_kind, "association");
     assert_eq!(report.root_id.as_deref(), Some("CustomerPlacedOrder"));
     assert_eq!(report.dataset_file_count, 1);
-    assert!(!report.materialized_oql_before_registration);
+    assert!(!report.materialized_coveql_before_registration);
     assert!(report.residual_verification);
     assert!(!report.scan_residual_verification_required);
     assert_eq!(
-        report.oql_scan_authority_source,
-        cove_oql::ExecutionAuthoritySource::ExactOptimizedKernel
+        report.coveql_scan_authority_source,
+        coveql::ExecutionAuthoritySource::ExactOptimizedKernel
     );
-    assert!(!report.oql_scan_materialized_fallback);
-    assert!(!report.oql_scan_residual_required);
+    assert!(!report.coveql_scan_materialized_fallback);
+    assert!(!report.coveql_scan_residual_required);
     assert!(report.scan_filter_pushdown_supported);
     assert_eq!(report.row_count, 1);
 
     let dataframe = ctx
-        .sql("select source_goid, target_goid from association_oql_provider")
+        .sql("select source_goid, target_goid from association_coveql_provider")
         .await
         .unwrap();
     let batches = dataframe.collect().await.unwrap();
@@ -12435,7 +14058,7 @@ fn datafusion_table_provider_output_mode_is_valid_for_association_and_evidence_r
             query,
             ParseOptions::default(),
             ResolveOptions {
-                output_mode: Some(CoveOqlOutputMode::DataFusionTableProvider),
+                output_mode: Some(CoveQlOutputMode::DataFusionTableProvider),
                 ..ResolveOptions::default()
             },
             PlanOptions::default(),
@@ -12453,7 +14076,7 @@ fn datafusion_table_provider_output_mode_is_valid_for_association_and_evidence_r
 
 #[cfg(feature = "datafusion")]
 #[tokio::test]
-async fn datafusion_oql_provider_lowers_association_filters_as_trusted_exact() {
+async fn datafusion_coveql_provider_lowers_association_filters_as_trusted_exact() {
     use datafusion::{
         catalog::TableProvider,
         common::{Column, ScalarValue},
@@ -12467,14 +14090,14 @@ async fn datafusion_oql_provider_lowers_association_filters_as_trusted_exact() {
         "association(CustomerPlacedOrder).select(source_goid, target_goid)",
         ParseOptions::default(),
         ResolveOptions {
-            output_mode: Some(CoveOqlOutputMode::DataFusionTableProvider),
+            output_mode: Some(CoveQlOutputMode::DataFusionTableProvider),
             ..ResolveOptions::default()
         },
         PlanOptions::default(),
         validation_options(),
     )
     .unwrap();
-    let provider = cove_oql::datafusion_oql_provider_for_plan(
+    let provider = coveql::datafusion_coveql_provider_for_plan(
         Arc::new(bytes),
         &planned,
         ExecutionOptions::default(),
@@ -12496,17 +14119,17 @@ async fn datafusion_oql_provider_lowers_association_filters_as_trusted_exact() {
     assert_eq!(report.supported_filter_count, 1);
     assert_eq!(report.residual_filter_count, 0);
     assert_eq!(report.proof_states, vec![PredicateProofState::ProvenExact]);
-    assert!(report.lowered_oql_predicates[0].contains("association.source_goid"));
+    assert!(report.lowered_coveql_predicates[0].contains("association.source_goid"));
     assert!(report.trusted);
 
     ctx.register_table(
-        "association_oql_filter_provider",
+        "association_coveql_filter_provider",
         provider as Arc<dyn TableProvider>,
     )
     .unwrap();
     let dataframe = ctx
         .sql(
-            "select source_goid from association_oql_filter_provider \
+            "select source_goid from association_coveql_filter_provider \
              where source_goid = '00000000000000000000000000000000'",
         )
         .await
@@ -12520,7 +14143,7 @@ async fn datafusion_oql_provider_lowers_association_filters_as_trusted_exact() {
 
 #[cfg(feature = "datafusion")]
 #[tokio::test]
-async fn datafusion_oql_provider_executes_evidence_root_at_scan_time() {
+async fn datafusion_coveql_provider_executes_evidence_root_at_scan_time() {
     let ctx = datafusion::execution::context::SessionContext::new();
     let bytes = minimal_object_with_evidence_index_file();
     let planned = parse_resolve_and_plan_query(
@@ -12528,7 +14151,7 @@ async fn datafusion_oql_provider_executes_evidence_root_at_scan_time() {
         "evidence(Person, grain: object).select(source_id, source_row_identity)",
         ParseOptions::default(),
         ResolveOptions {
-            output_mode: Some(CoveOqlOutputMode::DataFusionTableProvider),
+            output_mode: Some(CoveQlOutputMode::DataFusionTableProvider),
             ..ResolveOptions::default()
         },
         PlanOptions::default(),
@@ -12536,33 +14159,33 @@ async fn datafusion_oql_provider_executes_evidence_root_at_scan_time() {
     )
     .unwrap();
 
-    let report = cove_oql::register_datafusion_oql_provider_for_plan(
+    let report = coveql::register_datafusion_coveql_provider_for_plan(
         &ctx,
-        "evidence_oql_provider",
+        "evidence_coveql_provider",
         Arc::new(bytes),
         &planned,
         ExecutionOptions::default(),
     )
     .unwrap();
 
-    assert_eq!(report.provider_kind, "oql_table_provider");
+    assert_eq!(report.provider_kind, "coveql_table_provider");
     assert_eq!(report.root_kind, "evidence");
     assert_eq!(report.root_id, None);
     assert_eq!(report.dataset_file_count, 1);
-    assert!(!report.materialized_oql_before_registration);
+    assert!(!report.materialized_coveql_before_registration);
     assert!(report.residual_verification);
     assert!(report.scan_residual_verification_required);
     assert_eq!(
-        report.oql_scan_authority_source,
-        cove_oql::ExecutionAuthoritySource::ExactOptimizedKernel
+        report.coveql_scan_authority_source,
+        coveql::ExecutionAuthoritySource::ExactOptimizedKernel
     );
-    assert!(!report.oql_scan_materialized_fallback);
-    assert!(report.oql_scan_residual_required);
+    assert!(!report.coveql_scan_materialized_fallback);
+    assert!(report.coveql_scan_residual_required);
     assert!(report.scan_filter_pushdown_supported);
     assert_eq!(report.row_count, 1);
 
     let dataframe = ctx
-        .sql("select source_id, source_row_identity from evidence_oql_provider")
+        .sql("select source_id, source_row_identity from evidence_coveql_provider")
         .await
         .unwrap();
     let batches = dataframe.collect().await.unwrap();
@@ -12588,7 +14211,7 @@ async fn datafusion_oql_provider_executes_evidence_root_at_scan_time() {
 
 #[cfg(feature = "datafusion")]
 #[tokio::test]
-async fn datafusion_oql_provider_lowers_evidence_filters_as_trusted_exact() {
+async fn datafusion_coveql_provider_lowers_evidence_filters_as_trusted_exact() {
     use datafusion::{
         catalog::TableProvider,
         common::{Column, ScalarValue},
@@ -12602,14 +14225,14 @@ async fn datafusion_oql_provider_lowers_evidence_filters_as_trusted_exact() {
         "evidence(Person, grain: object).select(source_id, source_row_identity)",
         ParseOptions::default(),
         ResolveOptions {
-            output_mode: Some(CoveOqlOutputMode::DataFusionTableProvider),
+            output_mode: Some(CoveQlOutputMode::DataFusionTableProvider),
             ..ResolveOptions::default()
         },
         PlanOptions::default(),
         validation_options(),
     )
     .unwrap();
-    let provider = cove_oql::datafusion_oql_provider_for_plan(
+    let provider = coveql::datafusion_coveql_provider_for_plan(
         Arc::new(bytes),
         &planned,
         ExecutionOptions::default(),
@@ -12636,20 +14259,20 @@ async fn datafusion_oql_provider_lowers_evidence_filters_as_trusted_exact() {
     assert_eq!(report.proof_states, vec![PredicateProofState::ProvenExact]);
     assert_eq!(
         report.filter_outcomes[0].outcome,
-        cove_oql::DataFusionOqlFilterOutcomeKind::TrustedExact
+        coveql::DataFusionCoveQlFilterOutcomeKind::TrustedExact
     );
     assert!(report.filter_outcomes[0].trusted);
     assert!(report.decode_boundaries.is_empty());
-    assert!(report.lowered_oql_predicates[0].contains("evidence.source_id"));
+    assert!(report.lowered_coveql_predicates[0].contains("evidence.source_id"));
     assert!(report.trusted);
 
     ctx.register_table(
-        "evidence_oql_filter_provider",
+        "evidence_coveql_filter_provider",
         provider as Arc<dyn TableProvider>,
     )
     .unwrap();
     let dataframe = ctx
-        .sql("select source_id from evidence_oql_filter_provider where source_id = 'crm.customers'")
+        .sql("select source_id from evidence_coveql_filter_provider where source_id = 'crm.customers'")
         .await
         .unwrap();
     let batches = dataframe.collect().await.unwrap();
@@ -12675,14 +14298,14 @@ fn logical_plan_text_printer_is_deterministic() {
 
 fn json_resolve_options() -> ResolveOptions {
     ResolveOptions {
-        output_mode: Some(CoveOqlOutputMode::JsonRows),
+        output_mode: Some(CoveQlOutputMode::JsonRows),
         ..ResolveOptions::default()
     }
 }
 
 fn protected_json_resolve_options() -> ResolveOptions {
     ResolveOptions {
-        output_mode: Some(CoveOqlOutputMode::JsonRows),
+        output_mode: Some(CoveQlOutputMode::JsonRows),
         security: SecurityContext {
             metadata_disclosure_policy: MetadataDisclosurePolicy::AllowProtected,
             ..SecurityContext::default()
@@ -12705,7 +14328,7 @@ fn materialized_object_execution_returns_selected_json_rows() {
     )
     .unwrap();
 
-    let CoveOqlExecutionResult::JsonRows(rows) = executed.result else {
+    let CoveQlExecutionResult::JsonRows(rows) = executed.result else {
         panic!("expected JSON rows");
     };
     assert_eq!(rows.len(), 1);
@@ -12778,7 +14401,7 @@ fn explain_query_execution_is_marked_plan_only() {
     )
     .unwrap();
 
-    let CoveOqlExecutionResult::ExplainJson(explain) = executed.result else {
+    let CoveQlExecutionResult::ExplainJson(explain) = executed.result else {
         panic!("expected explain JSON");
     };
     assert_eq!(explain["execution"]["completed"], false);
@@ -12900,10 +14523,10 @@ fn disabled_pushdown_preserves_visible_json_rows() {
     )
     .unwrap();
 
-    let CoveOqlExecutionResult::JsonRows(enabled_rows) = enabled.result else {
+    let CoveQlExecutionResult::JsonRows(enabled_rows) = enabled.result else {
         panic!("expected JSON rows");
     };
-    let CoveOqlExecutionResult::JsonRows(disabled_rows) = disabled.result else {
+    let CoveQlExecutionResult::JsonRows(disabled_rows) = disabled.result else {
         panic!("expected JSON rows");
     };
     assert_eq!(enabled_rows, disabled_rows);
@@ -12941,10 +14564,10 @@ fn exact_bool_property_candidate_prunes_rows_but_preserves_result() {
     )
     .unwrap();
 
-    let CoveOqlExecutionResult::JsonRows(enabled_rows) = enabled.result else {
+    let CoveQlExecutionResult::JsonRows(enabled_rows) = enabled.result else {
         panic!("expected JSON rows");
     };
-    let CoveOqlExecutionResult::JsonRows(disabled_rows) = disabled.result else {
+    let CoveQlExecutionResult::JsonRows(disabled_rows) = disabled.result else {
         panic!("expected JSON rows");
     };
     assert_eq!(enabled_rows, disabled_rows);
@@ -13002,10 +14625,10 @@ fn goid_in_list_pushdown_prunes_candidates_but_preserves_result() {
     )
     .unwrap();
 
-    let CoveOqlExecutionResult::JsonRows(enabled_rows) = enabled.result else {
+    let CoveQlExecutionResult::JsonRows(enabled_rows) = enabled.result else {
         panic!("expected JSON rows");
     };
-    let CoveOqlExecutionResult::JsonRows(disabled_rows) = disabled.result else {
+    let CoveQlExecutionResult::JsonRows(disabled_rows) = disabled.result else {
         panic!("expected JSON rows");
     };
     assert_eq!(enabled_rows, disabled_rows);
@@ -13054,10 +14677,10 @@ fn goid_or_pushdown_unions_candidates_but_preserves_result() {
     )
     .unwrap();
 
-    let CoveOqlExecutionResult::JsonRows(enabled_rows) = enabled.result else {
+    let CoveQlExecutionResult::JsonRows(enabled_rows) = enabled.result else {
         panic!("expected JSON rows");
     };
-    let CoveOqlExecutionResult::JsonRows(disabled_rows) = disabled.result else {
+    let CoveQlExecutionResult::JsonRows(disabled_rows) = disabled.result else {
         panic!("expected JSON rows");
     };
     assert_eq!(enabled_rows, disabled_rows);
@@ -13099,7 +14722,7 @@ fn role_bound_as_of_does_not_apply_commit_time_pushdown() {
     let query =
         r#"MetricThing.asOf(source_event_time: "1970-01-01T00:00:00.000005Z").select(metric)"#;
     let resolve_options = ResolveOptions {
-        output_mode: Some(CoveOqlOutputMode::JsonRows),
+        output_mode: Some(CoveQlOutputMode::JsonRows),
         temporal_role_bindings: BTreeMap::from([(TemporalRole::SourceEventTime, "metric".into())]),
         ..ResolveOptions::default()
     };
@@ -13129,10 +14752,10 @@ fn role_bound_as_of_does_not_apply_commit_time_pushdown() {
     )
     .unwrap();
 
-    let CoveOqlExecutionResult::JsonRows(enabled_rows) = enabled.result else {
+    let CoveQlExecutionResult::JsonRows(enabled_rows) = enabled.result else {
         panic!("expected JSON rows");
     };
-    let CoveOqlExecutionResult::JsonRows(disabled_rows) = disabled.result else {
+    let CoveQlExecutionResult::JsonRows(disabled_rows) = disabled.result else {
         panic!("expected JSON rows");
     };
     assert_eq!(enabled_rows, disabled_rows);
@@ -13184,7 +14807,7 @@ fn null_check_function_filters_nullable_properties_and_reports_validity_candidat
     )
     .unwrap();
 
-    let CoveOqlExecutionResult::JsonRows(rows) = executed.result else {
+    let CoveQlExecutionResult::JsonRows(rows) = executed.result else {
         panic!("expected JSON rows");
     };
     assert_eq!(rows, vec![json!({"name": "Ada"})]);
@@ -13212,7 +14835,7 @@ fn coded_safe_function_predicates_do_not_report_materialized_function_pushdown_r
     )
     .unwrap();
 
-    let CoveOqlExecutionResult::JsonRows(rows) = executed.result else {
+    let CoveQlExecutionResult::JsonRows(rows) = executed.result else {
         panic!("expected JSON rows");
     };
     assert_eq!(rows, vec![json!({"name": "Ada"})]);
@@ -13242,7 +14865,7 @@ fn null_check_functions_project_two_valued_booleans() {
     )
     .unwrap();
 
-    let CoveOqlExecutionResult::JsonRows(rows) = executed.result else {
+    let CoveQlExecutionResult::JsonRows(rows) = executed.result else {
         panic!("expected JSON rows");
     };
     assert_eq!(
@@ -13268,7 +14891,7 @@ fn materialized_safe_cast_function_executes_scalar_conversions() {
     )
     .unwrap();
 
-    let CoveOqlExecutionResult::JsonRows(rows) = executed.result else {
+    let CoveQlExecutionResult::JsonRows(rows) = executed.result else {
         panic!("expected JSON rows");
     };
     assert_eq!(
@@ -13303,7 +14926,7 @@ fn in_list_null_literals_use_three_valued_logic() {
             validation_options(),
         )
         .unwrap();
-        let CoveOqlExecutionResult::JsonRows(rows) = executed.result else {
+        let CoveQlExecutionResult::JsonRows(rows) = executed.result else {
             panic!("expected JSON rows");
         };
         assert_eq!(json!(rows), expected, "query: {query}");
@@ -13326,7 +14949,7 @@ fn numeric_equality_preserves_large_integer_precision() {
     )
     .unwrap();
 
-    let CoveOqlExecutionResult::JsonRows(rows) = executed.result else {
+    let CoveQlExecutionResult::JsonRows(rows) = executed.result else {
         panic!("expected JSON rows");
     };
     assert_eq!(rows, vec![json!({"metric": second})]);
@@ -13346,7 +14969,7 @@ fn distinct_count_dedupes_logical_numeric_values() {
     )
     .unwrap();
 
-    let CoveOqlExecutionResult::JsonRows(rows) = executed.result else {
+    let CoveQlExecutionResult::JsonRows(rows) = executed.result else {
         panic!("expected JSON rows");
     };
     assert_eq!(rows, vec![json!({"d": 1})]);
@@ -13366,7 +14989,7 @@ fn materialized_aggregate_execution_counts_visible_rows() {
     )
     .unwrap();
 
-    let CoveOqlExecutionResult::JsonRows(rows) = executed.result else {
+    let CoveQlExecutionResult::JsonRows(rows) = executed.result else {
         panic!("expected JSON rows");
     };
     assert_eq!(rows, vec![json!({"n": 1})]);
@@ -13386,7 +15009,7 @@ fn numeric_aggregates_keep_integer_precision() {
     )
     .unwrap();
 
-    let CoveOqlExecutionResult::JsonRows(rows) = executed.result else {
+    let CoveQlExecutionResult::JsonRows(rows) = executed.result else {
         panic!("expected JSON rows");
     };
     assert_eq!(rows[0]["total"], json!(9_223_372_036_854_775_808_u64));
@@ -13413,7 +15036,7 @@ fn thresholded_aggregate_policy_suppresses_small_groups() {
     )
     .unwrap();
 
-    let CoveOqlExecutionResult::JsonRows(rows) = executed.result else {
+    let CoveQlExecutionResult::JsonRows(rows) = executed.result else {
         panic!("expected JSON rows");
     };
     assert_eq!(
@@ -13440,7 +15063,7 @@ fn thresholded_aggregate_policy_returns_exact_when_threshold_passes() {
     )
     .unwrap();
 
-    let CoveOqlExecutionResult::JsonRows(rows) = executed.result else {
+    let CoveQlExecutionResult::JsonRows(rows) = executed.result else {
         panic!("expected JSON rows");
     };
     assert_eq!(rows, vec![json!({"n": 1})]);
@@ -13462,7 +15085,7 @@ fn redacted_aggregate_policy_returns_marker() {
     )
     .unwrap();
 
-    let CoveOqlExecutionResult::JsonRows(rows) = executed.result else {
+    let CoveQlExecutionResult::JsonRows(rows) = executed.result else {
         panic!("expected JSON rows");
     };
     assert_eq!(
@@ -13487,7 +15110,7 @@ fn redacted_filecode_values_return_policy_marker_by_default() {
     )
     .unwrap();
 
-    let CoveOqlExecutionResult::JsonRows(rows) = executed.result else {
+    let CoveQlExecutionResult::JsonRows(rows) = executed.result else {
         panic!("expected JSON rows");
     };
     assert_eq!(
@@ -13571,8 +15194,8 @@ fn every_history_and_change_mode_keeps_distinct_temporal_and_scan_grain() {
         ),
         (
             "Thing.changes(from: 1, to: 3, mode: final_objects)",
-            "changes_final_objects",
-            "change_final_object",
+            "changes_final_rows",
+            "change_final_row",
         ),
     ] {
         let planned = parse_resolve_and_plan_query(
@@ -13748,7 +15371,7 @@ fn kernel_temporal_changes_direct_projection_executes_with_exact_native_authorit
         kernel.kernel_report.decision.safe_details["residual_verification"],
         json!(false)
     );
-    let CoveOqlExecutionResult::JsonRows(rows) = &kernel.executed.result else {
+    let CoveQlExecutionResult::JsonRows(rows) = &kernel.executed.result else {
         panic!("expected JSON rows");
     };
     assert!(!rows.is_empty());
@@ -13783,7 +15406,7 @@ fn kernel_temporal_object_modes_report_exact_native_contracts() {
         (
             "Thing.changes(from: 1, to: 3, mode: final_objects).select(active)",
             "temporal_changes",
-            "change_final_object",
+            "change_final_row",
         ),
     ] {
         let kernel = parse_resolve_plan_build_physical_and_execute_query(
@@ -13855,7 +15478,7 @@ fn kernel_temporal_association_modes_report_exact_native_contracts() {
         (
             "association(CustomerPlacedOrder).changes(from: 1, to: 3, mode: final_objects).select(source_goid, target_goid)",
             "temporal_changes",
-            "change_final_object",
+            "change_final_row",
         ),
     ] {
         let kernel = parse_resolve_plan_build_physical_and_execute_query(
@@ -13967,7 +15590,7 @@ fn history_records_and_states_tags_output_grain() {
     )
     .unwrap();
 
-    let CoveOqlExecutionResult::ObjectRows(rows) = executed.result else {
+    let CoveQlExecutionResult::ObjectRows(rows) = executed.result else {
         panic!("expected object rows");
     };
     assert!(rows
@@ -13992,7 +15615,7 @@ fn history_records_and_states_default_ordering_pages_mixed_grains() {
     )
     .unwrap();
 
-    let CoveOqlExecutionResult::ObjectRows(rows) = executed.result else {
+    let CoveQlExecutionResult::ObjectRows(rows) = executed.result else {
         panic!("expected object rows");
     };
     assert_eq!(rows.len(), 1);
@@ -14030,7 +15653,7 @@ fn reject_ambiguous_branch_allows_single_materialized_state_branch() {
     )
     .unwrap();
 
-    let CoveOqlExecutionResult::JsonRows(rows) = executed.result else {
+    let CoveQlExecutionResult::JsonRows(rows) = executed.result else {
         panic!("expected JSON rows");
     };
     assert_eq!(
@@ -14069,7 +15692,7 @@ fn changes_property_diffs_emit_property_level_rows() {
     )
     .unwrap();
 
-    let CoveOqlExecutionResult::ObjectRows(rows) = executed.result else {
+    let CoveQlExecutionResult::ObjectRows(rows) = executed.result else {
         panic!("expected object rows");
     };
     assert!(!rows.is_empty());
@@ -14093,7 +15716,7 @@ fn association_history_records_and_states_tags_output_grain() {
     )
     .unwrap();
 
-    let CoveOqlExecutionResult::AssociationRows(rows) = executed.result else {
+    let CoveQlExecutionResult::AssociationRows(rows) = executed.result else {
         panic!("expected association rows");
     };
     assert_eq!(rows.len(), 4);
@@ -14121,7 +15744,7 @@ fn association_history_records_and_states_tags_output_grain() {
     )
     .unwrap();
 
-    let CoveOqlExecutionResult::AssociationRows(rows) = paged.result else {
+    let CoveQlExecutionResult::AssociationRows(rows) = paged.result else {
         panic!("expected paged association rows");
     };
     assert_eq!(rows.len(), 1);
@@ -14143,7 +15766,7 @@ fn association_changes_property_diffs_emit_endpoint_diffs() {
     )
     .unwrap();
 
-    let CoveOqlExecutionResult::AssociationRows(rows) = executed.result else {
+    let CoveQlExecutionResult::AssociationRows(rows) = executed.result else {
         panic!("expected association rows");
     };
     assert_eq!(rows.len(), 1);
@@ -14161,7 +15784,7 @@ fn association_changes_property_diffs_emit_endpoint_diffs() {
 }
 
 #[test]
-fn association_changes_final_objects_reconstruct_final_endpoint_state() {
+fn association_changes_final_rows_reconstruct_final_endpoint_state() {
     let bytes = association_file_with_endpoint_change();
     let executed = parse_resolve_plan_and_execute_query(
         &bytes,
@@ -14174,7 +15797,7 @@ fn association_changes_final_objects_reconstruct_final_endpoint_state() {
     )
     .unwrap();
 
-    let CoveOqlExecutionResult::AssociationRows(rows) = executed.result else {
+    let CoveQlExecutionResult::AssociationRows(rows) = executed.result else {
         panic!("expected association rows");
     };
     assert_eq!(rows.len(), 1);
@@ -14192,7 +15815,7 @@ fn association_changes_final_objects_reconstruct_final_endpoint_state() {
 #[test]
 fn incompatible_root_output_grains_reject_before_execution() {
     let mut output_options = ResolveOptions {
-        output_mode: Some(CoveOqlOutputMode::AssociationRows),
+        output_mode: Some(CoveQlOutputMode::AssociationRows),
         ..ResolveOptions::default()
     };
     let err = parse_resolve_plan_and_execute_query(
@@ -14207,7 +15830,7 @@ fn incompatible_root_output_grains_reject_before_execution() {
     .unwrap_err();
     assert_eq!(err.diagnostics[0].code, "E_EXECUTION_GRAIN");
 
-    output_options.output_mode = Some(CoveOqlOutputMode::ProjectionRows);
+    output_options.output_mode = Some(CoveQlOutputMode::ProjectionRows);
     let err = parse_resolve_plan_and_execute_query(
         &minimal_object_with_projection_file(),
         "projection(people_projection).history(mode: records).select(active)",
@@ -14235,7 +15858,7 @@ fn default_ordering_is_applied_before_skip_take() {
     )
     .unwrap();
 
-    let CoveOqlExecutionResult::ObjectRows(rows) = executed.result else {
+    let CoveQlExecutionResult::ObjectRows(rows) = executed.result else {
         panic!("expected object rows");
     };
     assert_eq!(rows.len(), 1);
@@ -14304,8 +15927,8 @@ fn planned_query_stream_batches_deterministically() {
         .any(|diagnostic| diagnostic.code == "W_STREAM_BATCHED_EXECUTION"));
     let batches = vec![first, second];
     assert_eq!(batches.len(), 2);
-    assert!(matches!(batches[0], CoveOqlExecutionResult::JsonRows(_)));
-    assert!(matches!(batches[1], CoveOqlExecutionResult::JsonRows(_)));
+    assert!(matches!(batches[0], CoveQlExecutionResult::JsonRows(_)));
+    assert!(matches!(batches[1], CoveQlExecutionResult::JsonRows(_)));
 }
 
 #[test]
@@ -14355,7 +15978,7 @@ fn aggregate_stream_is_marked_blocking() {
         Some("aggregate execution requires complete input")
     );
     let batch = stream.next_batch().unwrap().unwrap();
-    assert!(matches!(batch, CoveOqlExecutionResult::JsonRows(_)));
+    assert!(matches!(batch, CoveQlExecutionResult::JsonRows(_)));
     assert!(stream.next_batch().unwrap().is_none());
     let executed = stream.finish().unwrap();
     assert!(executed
@@ -14501,7 +16124,7 @@ fn materialized_projection_execution_can_return_arrow_batches() {
         "projection(people_projection).select(active)",
         ParseOptions::default(),
         ResolveOptions {
-            output_mode: Some(CoveOqlOutputMode::ArrowRecordBatch {
+            output_mode: Some(CoveQlOutputMode::ArrowRecordBatch {
                 zero_copy_requested: false,
             }),
             ..ResolveOptions::default()
@@ -14512,7 +16135,7 @@ fn materialized_projection_execution_can_return_arrow_batches() {
     )
     .unwrap();
 
-    let CoveOqlExecutionResult::ArrowRecordBatches(batches) = executed.result else {
+    let CoveQlExecutionResult::ArrowRecordBatches(batches) = executed.result else {
         panic!("expected Arrow batches");
     };
     assert!(!batches.is_empty());
@@ -14526,7 +16149,7 @@ fn arrow_output_preserves_selected_schema_for_empty_grouped_rows() {
         "Thing.where(active == false).groupBy(active).select(active, n: count(*))",
         ParseOptions::default(),
         ResolveOptions {
-            output_mode: Some(CoveOqlOutputMode::ArrowRecordBatch {
+            output_mode: Some(CoveQlOutputMode::ArrowRecordBatch {
                 zero_copy_requested: false,
             }),
             ..ResolveOptions::default()
@@ -14537,7 +16160,7 @@ fn arrow_output_preserves_selected_schema_for_empty_grouped_rows() {
     )
     .unwrap();
 
-    let CoveOqlExecutionResult::ArrowRecordBatches(batches) = executed.result else {
+    let CoveQlExecutionResult::ArrowRecordBatches(batches) = executed.result else {
         panic!("expected Arrow batches");
     };
     assert_eq!(batches.len(), 1);
@@ -14552,7 +16175,7 @@ fn arrow_output_preserves_selected_schema_for_empty_grouped_rows() {
 fn zero_copy_arrow_request_warns_when_owned_fallback_is_allowed() {
     let bytes = object_file_with_bool_records(&[true]);
     let mut resolve_options = ResolveOptions {
-        output_mode: Some(CoveOqlOutputMode::ArrowRecordBatch {
+        output_mode: Some(CoveQlOutputMode::ArrowRecordBatch {
             zero_copy_requested: true,
         }),
         ..ResolveOptions::default()
@@ -14572,7 +16195,7 @@ fn zero_copy_arrow_request_warns_when_owned_fallback_is_allowed() {
 
     assert!(matches!(
         executed.result,
-        CoveOqlExecutionResult::ArrowRecordBatches(_)
+        CoveQlExecutionResult::ArrowRecordBatches(_)
     ));
     let diagnostic = executed
         .diagnostics
@@ -14589,7 +16212,7 @@ fn zero_copy_arrow_request_warns_when_owned_fallback_is_allowed() {
 fn zero_copy_arrow_request_rejects_when_owned_fallback_is_forbidden() {
     let bytes = object_file_with_bool_records(&[true]);
     let mut resolve_options = ResolveOptions {
-        output_mode: Some(CoveOqlOutputMode::ArrowRecordBatch {
+        output_mode: Some(CoveQlOutputMode::ArrowRecordBatch {
             zero_copy_requested: true,
         }),
         fallback_policy: FallbackPolicy::RejectOnFallback,
@@ -14630,7 +16253,7 @@ fn retained_physical_zero_copy_arrow_uses_cove_l_object_page_owner() {
         .as_ptr();
 
     let mut resolve_options = ResolveOptions {
-        output_mode: Some(CoveOqlOutputMode::ArrowRecordBatch {
+        output_mode: Some(CoveQlOutputMode::ArrowRecordBatch {
             zero_copy_requested: true,
         }),
         ..ResolveOptions::default()
@@ -14638,7 +16261,7 @@ fn retained_physical_zero_copy_arrow_uses_cove_l_object_page_owner() {
     resolve_options.security.zero_copy_permission = true;
     resolve_options.security.metadata_disclosure_policy = MetadataDisclosurePolicy::AllowProtected;
     let kernel = parse_resolve_plan_build_physical_and_execute_query_retained(
-        CoveOqlRetainedInput::from_arc(Arc::clone(&bytes)),
+        CoveQlRetainedInput::from_arc(Arc::clone(&bytes)),
         "MetricThing.select(metric)",
         ParseOptions::default(),
         resolve_options,
@@ -14667,7 +16290,7 @@ fn retained_physical_zero_copy_arrow_uses_cove_l_object_page_owner() {
         .diagnostics
         .iter()
         .any(|diagnostic| diagnostic.code == "W_ZERO_COPY_MATERIALIZED_FALLBACK"));
-    let CoveOqlExecutionResult::ArrowRecordBatches(batches) = &kernel.executed.result else {
+    let CoveQlExecutionResult::ArrowRecordBatches(batches) = &kernel.executed.result else {
         panic!("expected Arrow batches");
     };
     let batch = &batches[0];
@@ -14871,7 +16494,7 @@ fn kernel_single_file_filecode_equality_executes_with_exact_native_authority() {
         kernel.executed.output_fingerprint,
         materialized.output_fingerprint
     );
-    let CoveOqlExecutionResult::JsonRows(rows) = &kernel.executed.result else {
+    let CoveQlExecutionResult::JsonRows(rows) = &kernel.executed.result else {
         panic!("expected JSON row output");
     };
     assert_eq!(rows, &vec![json!({"name": "red"}), json!({"name": "red"})]);
@@ -14963,7 +16586,7 @@ fn kernel_direct_object_scalar_projection_executes_coded_safe_functions_with_exa
             && diagnostic.safe_details["residual_verification"] == json!(false)
     }));
 
-    let CoveOqlExecutionResult::JsonRows(rows) = &kernel.executed.result else {
+    let CoveQlExecutionResult::JsonRows(rows) = &kernel.executed.result else {
         panic!("expected JSON row output");
     };
     assert_eq!(
@@ -15043,7 +16666,7 @@ fn kernel_direct_object_string_scalar_projection_executes_registered_transforms_
         json!(false)
     );
 
-    let CoveOqlExecutionResult::JsonRows(rows) = &kernel.executed.result else {
+    let CoveQlExecutionResult::JsonRows(rows) = &kernel.executed.result else {
         panic!("expected JSON row output");
     };
     assert_eq!(
@@ -15124,7 +16747,7 @@ fn kernel_direct_object_bool_scalar_projection_executes_null_coalesce_and_cast_w
         json!(false)
     );
 
-    let CoveOqlExecutionResult::JsonRows(rows) = &kernel.executed.result else {
+    let CoveQlExecutionResult::JsonRows(rows) = &kernel.executed.result else {
         panic!("expected JSON row output");
     };
     assert_eq!(
@@ -15176,7 +16799,7 @@ fn kernel_direct_object_scalar_projection_can_return_arrow_batches_with_exact_na
         query,
         ParseOptions::default(),
         ResolveOptions {
-            output_mode: Some(CoveOqlOutputMode::ArrowRecordBatch {
+            output_mode: Some(CoveQlOutputMode::ArrowRecordBatch {
                 zero_copy_requested: false,
             }),
             ..json_resolve_options()
@@ -15196,7 +16819,7 @@ fn kernel_direct_object_scalar_projection_can_return_arrow_batches_with_exact_na
         query,
         ParseOptions::default(),
         ResolveOptions {
-            output_mode: Some(CoveOqlOutputMode::ArrowRecordBatch {
+            output_mode: Some(CoveQlOutputMode::ArrowRecordBatch {
                 zero_copy_requested: false,
             }),
             ..json_resolve_options()
@@ -15214,7 +16837,7 @@ fn kernel_direct_object_scalar_projection_can_return_arrow_batches_with_exact_na
     assert!(kernel.kernel_report.compared_with_materialized);
     assert!(!kernel.executed.authority.residual_required);
 
-    let CoveOqlExecutionResult::ArrowRecordBatches(batches) = &kernel.executed.result else {
+    let CoveQlExecutionResult::ArrowRecordBatches(batches) = &kernel.executed.result else {
         panic!("expected Arrow batches");
     };
     assert_eq!(batches.len(), 1);
@@ -15355,7 +16978,7 @@ fn kernel_starts_with_predicate_matches_materialized_output() {
     )
     .unwrap();
 
-    let CoveOqlExecutionResult::JsonRows(rows) = kernel.executed.result else {
+    let CoveQlExecutionResult::JsonRows(rows) = kernel.executed.result else {
         panic!("expected JSON rows");
     };
     assert_eq!(rows, vec![json!({"name": "Ada"}), json!({"name": "Ava"})]);
@@ -15408,7 +17031,7 @@ fn kernel_starts_with_compare_predicates_match_materialized_output() {
             kernel.executed.output_fingerprint,
             materialized.output_fingerprint
         );
-        let CoveOqlExecutionResult::JsonRows(ref rows) = kernel.executed.result else {
+        let CoveQlExecutionResult::JsonRows(ref rows) = kernel.executed.result else {
             panic!("expected JSON rows");
         };
         assert_eq!(rows, &expected);
@@ -15468,7 +17091,7 @@ fn kernel_length_compare_predicate_matches_materialized_output() {
         kernel.executed.output_fingerprint,
         materialized.output_fingerprint
     );
-    let CoveOqlExecutionResult::JsonRows(ref rows) = kernel.executed.result else {
+    let CoveQlExecutionResult::JsonRows(ref rows) = kernel.executed.result else {
         panic!("expected JSON rows");
     };
     assert_eq!(rows, &vec![json!({"name": "Ada"}), json!({"name": "Åsa"})]);
@@ -15543,7 +17166,7 @@ fn kernel_registered_string_scalar_compare_predicates_match_materialized_output(
             kernel.executed.output_fingerprint,
             materialized.output_fingerprint
         );
-        let CoveOqlExecutionResult::JsonRows(ref rows) = kernel.executed.result else {
+        let CoveQlExecutionResult::JsonRows(ref rows) = kernel.executed.result else {
             panic!("expected JSON rows");
         };
         assert_eq!(rows, &expected);
@@ -15600,7 +17223,7 @@ fn kernel_numeric_range_predicates_match_materialized_output() {
         kernel.executed.output_fingerprint,
         materialized.output_fingerprint
     );
-    let CoveOqlExecutionResult::JsonRows(rows) = kernel.executed.result else {
+    let CoveQlExecutionResult::JsonRows(rows) = kernel.executed.result else {
         panic!("expected JSON rows");
     };
     assert_eq!(rows, vec![json!({"metric": 10}), json!({"metric": 20})]);
@@ -15636,7 +17259,7 @@ fn multiple_where_methods_match_single_conjunction() {
     .unwrap();
 
     assert_eq!(chained.output_fingerprint, conjunction.output_fingerprint);
-    let CoveOqlExecutionResult::JsonRows(rows) = chained.result else {
+    let CoveQlExecutionResult::JsonRows(rows) = chained.result else {
         panic!("expected JSON rows");
     };
     assert_eq!(rows, vec![json!({"metric": 10}), json!({"metric": 20})]);
@@ -15676,7 +17299,7 @@ fn kernel_null_check_predicate_matches_materialized_output() {
         kernel.executed.output_fingerprint,
         materialized.output_fingerprint
     );
-    let CoveOqlExecutionResult::JsonRows(ref rows) = kernel.executed.result else {
+    let CoveQlExecutionResult::JsonRows(ref rows) = kernel.executed.result else {
         panic!("expected JSON rows");
     };
     assert_eq!(rows, &vec![json!({"name": null})]);
@@ -15721,7 +17344,7 @@ fn kernel_function_null_check_predicate_matches_materialized_output() {
         kernel.executed.output_fingerprint,
         materialized.output_fingerprint
     );
-    let CoveOqlExecutionResult::JsonRows(ref rows) = kernel.executed.result else {
+    let CoveQlExecutionResult::JsonRows(ref rows) = kernel.executed.result else {
         panic!("expected JSON rows");
     };
     assert_eq!(rows, &vec![json!({"name": null})]);
@@ -15784,7 +17407,7 @@ fn kernel_bool_path_predicate_matches_materialized_output() {
         kernel.executed.output_fingerprint,
         materialized.output_fingerprint
     );
-    let CoveOqlExecutionResult::JsonRows(rows) = kernel.executed.result else {
+    let CoveQlExecutionResult::JsonRows(rows) = kernel.executed.result else {
         panic!("expected JSON rows");
     };
     assert_eq!(rows, vec![json!({"active": true}), json!({"active": true})]);
@@ -15830,7 +17453,7 @@ fn kernel_identity_bool_predicate_matches_materialized_output() {
         kernel.executed.output_fingerprint,
         materialized.output_fingerprint
     );
-    let CoveOqlExecutionResult::JsonRows(ref rows) = kernel.executed.result else {
+    let CoveQlExecutionResult::JsonRows(ref rows) = kernel.executed.result else {
         panic!("expected JSON rows");
     };
     assert_eq!(
@@ -15889,7 +17512,7 @@ fn kernel_coalesce_bool_predicate_matches_materialized_output() {
         kernel.executed.output_fingerprint,
         materialized.output_fingerprint
     );
-    let CoveOqlExecutionResult::JsonRows(ref rows) = kernel.executed.result else {
+    let CoveQlExecutionResult::JsonRows(ref rows) = kernel.executed.result else {
         panic!("expected JSON rows");
     };
     assert_eq!(
@@ -15948,7 +17571,7 @@ fn kernel_coalesce_bool_compare_predicate_preserves_unknown_nulls() {
         kernel.executed.output_fingerprint,
         materialized.output_fingerprint
     );
-    let CoveOqlExecutionResult::JsonRows(ref rows) = kernel.executed.result else {
+    let CoveQlExecutionResult::JsonRows(ref rows) = kernel.executed.result else {
         panic!("expected JSON rows");
     };
     assert_eq!(rows, &vec![json!({"active": false})]);
@@ -16004,7 +17627,7 @@ fn kernel_identity_safe_cast_compare_matches_materialized_output() {
         kernel.executed.output_fingerprint,
         materialized.output_fingerprint
     );
-    let CoveOqlExecutionResult::JsonRows(ref rows) = kernel.executed.result else {
+    let CoveQlExecutionResult::JsonRows(ref rows) = kernel.executed.result else {
         panic!("expected JSON rows");
     };
     assert_eq!(rows, &vec![json!({"active": true})]);
@@ -16060,7 +17683,7 @@ fn kernel_identity_safe_cast_bool_predicate_matches_materialized_output() {
         kernel.executed.output_fingerprint,
         materialized.output_fingerprint
     );
-    let CoveOqlExecutionResult::JsonRows(ref rows) = kernel.executed.result else {
+    let CoveQlExecutionResult::JsonRows(ref rows) = kernel.executed.result else {
         panic!("expected JSON rows");
     };
     assert_eq!(rows, &vec![json!({"active": true})]);
@@ -16109,7 +17732,7 @@ fn kernel_path_literal_type_mismatch_falls_back_for_not_equal() {
         kernel.executed.output_fingerprint,
         materialized.output_fingerprint
     );
-    let CoveOqlExecutionResult::JsonRows(rows) = kernel.executed.result else {
+    let CoveQlExecutionResult::JsonRows(rows) = kernel.executed.result else {
         panic!("expected JSON rows");
     };
     assert_eq!(
@@ -16229,7 +17852,7 @@ fn kernel_in_list_literal_type_mismatch_falls_back_under_negation() {
         kernel.executed.output_fingerprint,
         materialized.output_fingerprint
     );
-    let CoveOqlExecutionResult::JsonRows(rows) = kernel.executed.result else {
+    let CoveQlExecutionResult::JsonRows(rows) = kernel.executed.result else {
         panic!("expected JSON rows");
     };
     assert_eq!(
@@ -16294,7 +17917,7 @@ fn kernel_not_predicate_preserves_three_valued_logic_for_nulls() {
         kernel.executed.output_fingerprint,
         materialized.output_fingerprint
     );
-    let CoveOqlExecutionResult::JsonRows(rows) = kernel.executed.result else {
+    let CoveQlExecutionResult::JsonRows(rows) = kernel.executed.result else {
         panic!("expected JSON rows");
     };
     assert_eq!(rows, vec![json!({"name": "Bob"})]);
@@ -16344,7 +17967,7 @@ fn kernel_or_predicate_preserves_three_valued_logic_for_nulls() {
         kernel.executed.output_fingerprint,
         materialized.output_fingerprint
     );
-    let CoveOqlExecutionResult::JsonRows(rows) = kernel.executed.result else {
+    let CoveQlExecutionResult::JsonRows(rows) = kernel.executed.result else {
         panic!("expected JSON rows");
     };
     assert_eq!(rows, vec![json!({"name": "Ada"}), json!({"name": null})]);
@@ -16394,7 +18017,7 @@ fn kernel_in_predicate_preserves_null_membership_semantics() {
         kernel.executed.output_fingerprint,
         materialized.output_fingerprint
     );
-    let CoveOqlExecutionResult::JsonRows(rows) = kernel.executed.result else {
+    let CoveQlExecutionResult::JsonRows(rows) = kernel.executed.result else {
         panic!("expected JSON rows");
     };
     assert_eq!(rows, vec![json!({"name": "Ada"})]);
@@ -16589,7 +18212,7 @@ fn execution_code_filecode_prune_matches_materialized_kernel_output() {
         kernel.executed.output_fingerprint,
         materialized.output_fingerprint
     );
-    let CoveOqlExecutionResult::JsonRows(rows) = kernel.executed.result else {
+    let CoveQlExecutionResult::JsonRows(rows) = kernel.executed.result else {
         panic!("expected json rows");
     };
     assert_eq!(rows.len(), 2);
@@ -16663,7 +18286,7 @@ fn execution_code_filecode_bool_prune_matches_materialized_kernel_output() {
         kernel.executed.output_fingerprint,
         materialized.output_fingerprint
     );
-    let CoveOqlExecutionResult::JsonRows(rows) = kernel.executed.result else {
+    let CoveQlExecutionResult::JsonRows(rows) = kernel.executed.result else {
         panic!("expected json rows");
     };
     assert_eq!(rows, vec![json!({"active": true}), json!({"active": true})]);
@@ -16725,7 +18348,7 @@ fn execution_code_filecode_int64_in_prune_matches_materialized_kernel_output() {
         kernel.executed.output_fingerprint,
         materialized.output_fingerprint
     );
-    let CoveOqlExecutionResult::JsonRows(rows) = kernel.executed.result else {
+    let CoveQlExecutionResult::JsonRows(rows) = kernel.executed.result else {
         panic!("expected json rows");
     };
     assert_eq!(
@@ -16787,7 +18410,7 @@ fn execution_code_filecode_uuid_prune_matches_materialized_kernel_output() {
         kernel.executed.output_fingerprint,
         materialized.output_fingerprint
     );
-    let CoveOqlExecutionResult::JsonRows(rows) = kernel.executed.result else {
+    let CoveQlExecutionResult::JsonRows(rows) = kernel.executed.result else {
         panic!("expected json rows");
     };
     assert_eq!(rows.len(), 2);
@@ -16860,7 +18483,7 @@ fn execution_code_filecode_timestamp_prune_matches_materialized_kernel_output() 
         kernel.executed.output_fingerprint,
         materialized.output_fingerprint
     );
-    let CoveOqlExecutionResult::JsonRows(rows) = kernel.executed.result else {
+    let CoveQlExecutionResult::JsonRows(rows) = kernel.executed.result else {
         panic!("expected json rows");
     };
     assert_eq!(rows.len(), 2);
@@ -16915,7 +18538,7 @@ fn execution_code_filecode_or_prune_matches_materialized_kernel_output() {
         kernel.executed.output_fingerprint,
         materialized.output_fingerprint
     );
-    let CoveOqlExecutionResult::JsonRows(rows) = kernel.executed.result else {
+    let CoveQlExecutionResult::JsonRows(rows) = kernel.executed.result else {
         panic!("expected json rows");
     };
     assert_eq!(
@@ -16979,7 +18602,7 @@ fn execution_code_filecode_not_equal_prune_matches_materialized_kernel_output() 
         kernel.executed.output_fingerprint,
         materialized.output_fingerprint
     );
-    let CoveOqlExecutionResult::JsonRows(rows) = kernel.executed.result else {
+    let CoveQlExecutionResult::JsonRows(rows) = kernel.executed.result else {
         panic!("expected json rows");
     };
     assert_eq!(
@@ -17038,7 +18661,7 @@ fn execution_code_filecode_negated_or_prune_matches_materialized_kernel_output()
         kernel.executed.output_fingerprint,
         materialized.output_fingerprint
     );
-    let CoveOqlExecutionResult::JsonRows(rows) = kernel.executed.result else {
+    let CoveQlExecutionResult::JsonRows(rows) = kernel.executed.result else {
         panic!("expected json rows");
     };
     assert_eq!(
@@ -17089,7 +18712,7 @@ fn index_only_count_executes_only_after_compare_match() {
     )
     .unwrap();
 
-    let CoveOqlExecutionResult::JsonRows(rows) = kernel.executed.result else {
+    let CoveQlExecutionResult::JsonRows(rows) = kernel.executed.result else {
         panic!("expected JSON rows");
     };
     assert_eq!(rows, vec![json!({"n": 0})]);
@@ -17159,7 +18782,7 @@ fn index_only_exists_and_distinct_count_use_validated_payloads() {
         )
         .unwrap();
 
-        let CoveOqlExecutionResult::JsonRows(rows) = kernel.executed.result else {
+        let CoveQlExecutionResult::JsonRows(rows) = kernel.executed.result else {
             panic!("expected JSON rows");
         };
         assert_eq!(rows, vec![expected]);
@@ -17223,7 +18846,7 @@ fn index_only_sum_and_avg_use_validated_numeric_payloads() {
         )
         .unwrap();
 
-        let CoveOqlExecutionResult::JsonRows(rows) = kernel.executed.result else {
+        let CoveQlExecutionResult::JsonRows(rows) = kernel.executed.result else {
             panic!("expected JSON rows");
         };
         assert_eq!(rows, vec![expected]);
@@ -17343,7 +18966,7 @@ fn kernel_force_mode_executes_aggregate_shape_with_residual_contract() {
         kernel.kernel_report.decision.kind,
         KernelDecisionKind::Applied
     );
-    let CoveOqlExecutionResult::JsonRows(rows) = kernel.executed.result else {
+    let CoveQlExecutionResult::JsonRows(rows) = kernel.executed.result else {
         panic!("expected JSON rows");
     };
     assert_eq!(rows, vec![json!({"n": 3})]);
@@ -17436,7 +19059,7 @@ fn kernel_force_mode_executes_direct_aggregates_with_exact_native_contract() {
             kernel.executed.output_fingerprint,
             materialized.output_fingerprint
         );
-        let CoveOqlExecutionResult::JsonRows(rows) = kernel.executed.result else {
+        let CoveQlExecutionResult::JsonRows(rows) = kernel.executed.result else {
             panic!("expected JSON rows");
         };
         assert_eq!(rows, vec![expected]);
@@ -17520,7 +19143,7 @@ fn kernel_force_mode_executes_single_file_filecode_direct_aggregates_with_exact_
             kernel.executed.output_fingerprint,
             materialized.output_fingerprint
         );
-        let CoveOqlExecutionResult::JsonRows(rows) = kernel.executed.result else {
+        let CoveQlExecutionResult::JsonRows(rows) = kernel.executed.result else {
             panic!("expected JSON rows");
         };
         assert_eq!(rows, vec![expected]);
@@ -17590,7 +19213,7 @@ fn kernel_force_mode_executes_min_max_numcode_aggregates_with_exact_native_contr
             kernel.executed.output_fingerprint,
             materialized.output_fingerprint
         );
-        let CoveOqlExecutionResult::JsonRows(rows) = kernel.executed.result else {
+        let CoveQlExecutionResult::JsonRows(rows) = kernel.executed.result else {
             panic!("expected JSON rows");
         };
         assert_eq!(rows, vec![expected]);
@@ -17664,7 +19287,7 @@ fn kernel_force_mode_executes_sum_avg_numcode_aggregates_with_exact_native_contr
             kernel.executed.output_fingerprint,
             materialized.output_fingerprint
         );
-        let CoveOqlExecutionResult::JsonRows(rows) = kernel.executed.result else {
+        let CoveQlExecutionResult::JsonRows(rows) = kernel.executed.result else {
             panic!("expected JSON rows");
         };
         assert_eq!(rows, vec![expected]);
@@ -17738,7 +19361,7 @@ fn kernel_force_mode_native_sum_avg_preserve_large_integer_precision() {
             kernel.executed.output_fingerprint,
             materialized.output_fingerprint
         );
-        let CoveOqlExecutionResult::JsonRows(rows) = kernel.executed.result else {
+        let CoveQlExecutionResult::JsonRows(rows) = kernel.executed.result else {
             panic!("expected JSON rows");
         };
         assert_eq!(rows, vec![expected]);
@@ -17789,7 +19412,7 @@ fn kernel_force_mode_executes_group_by_shape_with_residual_contract() {
         kernel.kernel_report.decision.kind,
         KernelDecisionKind::Applied
     );
-    let CoveOqlExecutionResult::JsonRows(rows) = kernel.executed.result else {
+    let CoveQlExecutionResult::JsonRows(rows) = kernel.executed.result else {
         panic!("expected JSON rows");
     };
     assert_eq!(
@@ -17872,7 +19495,7 @@ fn kernel_force_mode_executes_bool_group_count_with_exact_native_contract() {
         serde_json::to_value(kernel.kernel_report.optimization_authority.state).unwrap(),
         json!("authoritative")
     );
-    let CoveOqlExecutionResult::JsonRows(rows) = kernel.executed.result else {
+    let CoveQlExecutionResult::JsonRows(rows) = kernel.executed.result else {
         panic!("expected JSON rows");
     };
     assert_eq!(
@@ -17952,7 +19575,7 @@ fn kernel_force_mode_executes_numcode_group_count_with_exact_native_contract() {
         materialized.output_fingerprint
     );
     assert!(!kernel.executed.authority.residual_required);
-    let CoveOqlExecutionResult::JsonRows(rows) = kernel.executed.result else {
+    let CoveQlExecutionResult::JsonRows(rows) = kernel.executed.result else {
         panic!("expected JSON rows");
     };
     assert_eq!(
@@ -18060,7 +19683,7 @@ fn kernel_force_mode_executes_single_file_filecode_grouped_aggregates_with_exact
             materialized.output_fingerprint
         );
         assert!(!kernel.executed.authority.residual_required);
-        let CoveOqlExecutionResult::JsonRows(rows) = kernel.executed.result else {
+        let CoveQlExecutionResult::JsonRows(rows) = kernel.executed.result else {
             panic!("expected JSON rows");
         };
         assert_eq!(rows, expected_rows);
@@ -18202,7 +19825,7 @@ fn kernel_force_mode_executes_grouped_numcode_direct_aggregates_with_exact_nativ
             materialized.output_fingerprint
         );
         assert!(!kernel.executed.authority.residual_required);
-        let CoveOqlExecutionResult::JsonRows(rows) = kernel.executed.result else {
+        let CoveQlExecutionResult::JsonRows(rows) = kernel.executed.result else {
             panic!("expected JSON rows");
         };
         assert_eq!(rows, expected_rows);
@@ -18267,7 +19890,7 @@ fn kernel_force_mode_executes_bool_order_by_with_exact_native_contract() {
         kernel.kernel_report.decision.kind,
         KernelDecisionKind::Applied
     );
-    let CoveOqlExecutionResult::JsonRows(rows) = kernel.executed.result else {
+    let CoveQlExecutionResult::JsonRows(rows) = kernel.executed.result else {
         panic!("expected JSON rows");
     };
     assert_eq!(
@@ -18356,7 +19979,7 @@ fn kernel_force_mode_executes_numcode_order_by_and_pagination_with_exact_native_
         kernel.executed.output_fingerprint,
         materialized.output_fingerprint
     );
-    let CoveOqlExecutionResult::JsonRows(rows) = kernel.executed.result else {
+    let CoveQlExecutionResult::JsonRows(rows) = kernel.executed.result else {
         panic!("expected JSON rows");
     };
     assert_eq!(rows, vec![json!({"metric": 10}), json!({"metric": 20})]);
@@ -18430,7 +20053,7 @@ fn kernel_force_mode_executes_filecode_string_order_by_with_default_collation_bo
         kernel.executed.output_fingerprint,
         materialized.output_fingerprint
     );
-    let CoveOqlExecutionResult::JsonRows(rows) = kernel.executed.result else {
+    let CoveQlExecutionResult::JsonRows(rows) = kernel.executed.result else {
         panic!("expected JSON rows");
     };
     assert_eq!(
@@ -18515,7 +20138,7 @@ fn kernel_force_mode_executes_filecode_string_order_by_with_declared_collation_b
         kernel.executed.output_fingerprint,
         materialized.output_fingerprint
     );
-    let CoveOqlExecutionResult::JsonRows(rows) = kernel.executed.result else {
+    let CoveQlExecutionResult::JsonRows(rows) = kernel.executed.result else {
         panic!("expected JSON rows");
     };
     assert_eq!(
@@ -18597,7 +20220,7 @@ fn kernel_force_mode_executes_filecode_string_range_predicate_with_default_colla
         kernel.executed.output_fingerprint,
         materialized.output_fingerprint
     );
-    let CoveOqlExecutionResult::JsonRows(rows) = kernel.executed.result else {
+    let CoveQlExecutionResult::JsonRows(rows) = kernel.executed.result else {
         panic!("expected JSON rows");
     };
     assert_eq!(rows, vec![json!({"name": "Ada"}), json!({"name": "Bob"})]);
@@ -18669,7 +20292,7 @@ fn kernel_force_mode_executes_filecode_string_range_predicate_with_declared_coll
         kernel.executed.output_fingerprint,
         materialized.output_fingerprint
     );
-    let CoveOqlExecutionResult::JsonRows(rows) = kernel.executed.result else {
+    let CoveQlExecutionResult::JsonRows(rows) = kernel.executed.result else {
         panic!("expected JSON rows");
     };
     assert_eq!(rows, vec![json!({"name": "Ada"}), json!({"name": "Bob"})]);
@@ -18764,7 +20387,7 @@ fn kernel_auto_mode_executes_projection_roots_with_exact_provider_authority() {
                     && decision.outcome == PushdownOutcome::Applied
                     && decision.safe_details["columns"] == json!(["active"])
             }));
-        let CoveOqlExecutionResult::JsonRows(rows) = kernel.executed.result else {
+        let CoveQlExecutionResult::JsonRows(rows) = kernel.executed.result else {
             panic!("expected JSON rows");
         };
         assert!(rows.is_empty());
@@ -18799,7 +20422,7 @@ fn kernel_auto_mode_executes_projection_rows_with_exact_provider_authority() {
     );
     assert!(!kernel.executed.authority.materialized_fallback);
     assert!(!kernel.executed.authority.residual_required);
-    let CoveOqlExecutionResult::ProjectionRows(rows) = kernel.executed.result else {
+    let CoveQlExecutionResult::ProjectionRows(rows) = kernel.executed.result else {
         panic!("expected projection rows");
     };
     assert!(rows.is_empty());
@@ -18983,7 +20606,7 @@ fn kernel_association_root_row_scan_executes_with_exact_native_authority() {
             && decision.safe_details["root_kind"] == json!("association")
             && decision.safe_details["residual_verification"] == json!(false)
     }));
-    let CoveOqlExecutionResult::AssociationRows(rows) = kernel.executed.result else {
+    let CoveQlExecutionResult::AssociationRows(rows) = kernel.executed.result else {
         panic!("expected association rows");
     };
     assert_eq!(rows.len(), 1);
@@ -19039,7 +20662,7 @@ fn kernel_direct_association_projection_executes_with_exact_native_authority() {
             && diagnostic.safe_details["rows_projected"] == json!(1)
             && diagnostic.safe_details["residual_verification"] == json!(false)
     }));
-    let CoveOqlExecutionResult::JsonRows(rows) = kernel.executed.result else {
+    let CoveQlExecutionResult::JsonRows(rows) = kernel.executed.result else {
         panic!("expected JSON rows");
     };
     assert_eq!(
@@ -19094,7 +20717,7 @@ fn kernel_direct_association_projection_filters_root_rows_with_exact_native_auth
             && diagnostic.safe_details["rows_projected"] == json!(1)
             && diagnostic.safe_details["residual_verification"] == json!(false)
     }));
-    let CoveOqlExecutionResult::JsonRows(rows) = kernel.executed.result else {
+    let CoveQlExecutionResult::JsonRows(rows) = kernel.executed.result else {
         panic!("expected JSON rows");
     };
     assert_eq!(
@@ -19201,7 +20824,7 @@ fn kernel_association_exists_prefilter_executes_exact_semijoin_projection() {
         exists_contract["fallback_boundary"],
         serde_json::Value::Null
     );
-    let CoveOqlExecutionResult::JsonRows(rows) = kernel.executed.result else {
+    let CoveQlExecutionResult::JsonRows(rows) = kernel.executed.result else {
         panic!("expected JSON rows");
     };
     assert_eq!(rows, vec![json!({"active": true})]);
@@ -19250,7 +20873,7 @@ fn materialized_association_root_executes_endpoint_rows() {
     )
     .unwrap();
 
-    let CoveOqlExecutionResult::JsonRows(rows) = executed.result else {
+    let CoveQlExecutionResult::JsonRows(rows) = executed.result else {
         panic!("expected JSON rows");
     };
     assert_eq!(
@@ -19269,7 +20892,7 @@ fn materialized_association_root_can_return_arrow_batches() {
         "association(CustomerPlacedOrder).select(source_goid, target_goid)",
         ParseOptions::default(),
         ResolveOptions {
-            output_mode: Some(CoveOqlOutputMode::ArrowRecordBatch {
+            output_mode: Some(CoveQlOutputMode::ArrowRecordBatch {
                 zero_copy_requested: false,
             }),
             ..ResolveOptions::default()
@@ -19280,7 +20903,7 @@ fn materialized_association_root_can_return_arrow_batches() {
     )
     .unwrap();
 
-    let CoveOqlExecutionResult::ArrowRecordBatches(batches) = executed.result else {
+    let CoveQlExecutionResult::ArrowRecordBatches(batches) = executed.result else {
         panic!("expected Arrow batches");
     };
     assert_eq!(batches.len(), 1);
@@ -19319,7 +20942,7 @@ fn association_current_root_aggregates_count_exists_and_distinct_targets() {
     )
     .unwrap();
 
-    let CoveOqlExecutionResult::JsonRows(rows) = executed.result else {
+    let CoveQlExecutionResult::JsonRows(rows) = executed.result else {
         panic!("expected JSON rows");
     };
     assert_eq!(rows, vec![json!({"c": 1, "e": true, "d": 1})]);
@@ -19337,7 +20960,7 @@ fn association_current_root_exists_filter_respects_endpoint_direction() {
         validation_options(),
     )
     .unwrap();
-    let CoveOqlExecutionResult::JsonRows(outbound_rows) = outbound.result else {
+    let CoveQlExecutionResult::JsonRows(outbound_rows) = outbound.result else {
         panic!("expected JSON rows");
     };
     assert_eq!(outbound_rows, vec![json!({"active": true})]);
@@ -19352,7 +20975,7 @@ fn association_current_root_exists_filter_respects_endpoint_direction() {
         validation_options(),
     )
     .unwrap();
-    let CoveOqlExecutionResult::JsonRows(inbound_rows) = inbound.result else {
+    let CoveQlExecutionResult::JsonRows(inbound_rows) = inbound.result else {
         panic!("expected JSON rows");
     };
     assert!(inbound_rows.is_empty());
@@ -19383,7 +21006,7 @@ fn hidden_association_does_not_leak_through_counts_or_negated_exists() {
         validation_options(),
     )
     .unwrap();
-    let CoveOqlExecutionResult::JsonRows(rows) = aggregates.result else {
+    let CoveQlExecutionResult::JsonRows(rows) = aggregates.result else {
         panic!("expected JSON rows");
     };
     assert_eq!(rows, vec![json!({"c": 0, "e": false, "d": 0})]);
@@ -19398,7 +21021,7 @@ fn hidden_association_does_not_leak_through_counts_or_negated_exists() {
         validation_options(),
     )
     .unwrap();
-    let CoveOqlExecutionResult::JsonRows(rows) = negated_exists.result else {
+    let CoveQlExecutionResult::JsonRows(rows) = negated_exists.result else {
         panic!("expected JSON rows");
     };
     assert_eq!(rows, vec![json!({"active": true})]);
@@ -19485,7 +21108,7 @@ fn materialized_targetless_evidence_root_with_map_metadata_executes_object_grain
     )
     .unwrap();
 
-    let CoveOqlExecutionResult::EvidenceRows(rows) = executed.result else {
+    let CoveQlExecutionResult::EvidenceRows(rows) = executed.result else {
         panic!("expected evidence rows");
     };
     assert_eq!(rows.len(), 1);
@@ -19519,7 +21142,7 @@ fn materialized_evidence_root_with_map_metadata_executes_evidence_rows() {
         explain["execution"]["evidence_authority"],
         json!("cove_map_metadata")
     );
-    let CoveOqlExecutionResult::EvidenceRows(rows) = executed.result else {
+    let CoveQlExecutionResult::EvidenceRows(rows) = executed.result else {
         panic!("expected evidence rows");
     };
     assert_eq!(rows.len(), 1);
@@ -19540,7 +21163,7 @@ fn materialized_evidence_root_can_return_arrow_batches() {
         "evidence(Person, grain: object).where(source_id == \"crm.customers\").select(source_id, source_row_identity).take(1)",
         ParseOptions::default(),
         ResolveOptions {
-            output_mode: Some(CoveOqlOutputMode::ArrowRecordBatch {
+            output_mode: Some(CoveQlOutputMode::ArrowRecordBatch {
                 zero_copy_requested: false,
             }),
             ..ResolveOptions::default()
@@ -19551,7 +21174,7 @@ fn materialized_evidence_root_can_return_arrow_batches() {
     )
     .unwrap();
 
-    let CoveOqlExecutionResult::ArrowRecordBatches(batches) = executed.result else {
+    let CoveQlExecutionResult::ArrowRecordBatches(batches) = executed.result else {
         panic!("expected Arrow batches");
     };
     assert_eq!(batches.len(), 1);
@@ -19625,7 +21248,7 @@ fn materialized_property_evidence_root_filters_object_property_grain() {
     )
     .unwrap();
 
-    let CoveOqlExecutionResult::EvidenceRows(rows) = executed.result else {
+    let CoveQlExecutionResult::EvidenceRows(rows) = executed.result else {
         panic!("expected evidence rows");
     };
     assert_eq!(rows.len(), 1);
@@ -19667,7 +21290,7 @@ fn materialized_association_evidence_root_filters_association_type_grain() {
     )
     .unwrap();
 
-    let CoveOqlExecutionResult::EvidenceRows(rows) = executed.result else {
+    let CoveQlExecutionResult::EvidenceRows(rows) = executed.result else {
         panic!("expected evidence rows");
     };
     assert_eq!(rows.len(), 1);
@@ -19718,7 +21341,7 @@ fn materialized_source_evidence_root_filters_source_grain_for_object_target() {
     )
     .unwrap();
 
-    let CoveOqlExecutionResult::EvidenceRows(rows) = executed.result else {
+    let CoveQlExecutionResult::EvidenceRows(rows) = executed.result else {
         panic!("expected evidence rows");
     };
     assert_eq!(rows.len(), 1);
@@ -19778,7 +21401,7 @@ fn kernel_evidence_root_row_scan_executes_with_exact_native_authority() {
             && decision.safe_details["root_kind"] == json!("evidence")
             && decision.safe_details["residual_verification"] == json!(false)
     }));
-    let CoveOqlExecutionResult::EvidenceRows(rows) = kernel.executed.result else {
+    let CoveQlExecutionResult::EvidenceRows(rows) = kernel.executed.result else {
         panic!("expected evidence rows");
     };
     assert_eq!(rows.len(), 1);
@@ -19831,7 +21454,7 @@ fn kernel_direct_evidence_projection_executes_with_exact_native_authority() {
             && diagnostic.safe_details["rows_projected"] == json!(1)
             && diagnostic.safe_details["residual_verification"] == json!(false)
     }));
-    let CoveOqlExecutionResult::JsonRows(rows) = kernel.executed.result else {
+    let CoveQlExecutionResult::JsonRows(rows) = kernel.executed.result else {
         panic!("expected JSON rows");
     };
     assert_eq!(
@@ -19886,7 +21509,7 @@ fn kernel_direct_evidence_projection_filters_root_rows_with_exact_native_authori
             && diagnostic.safe_details["rows_projected"] == json!(1)
             && diagnostic.safe_details["residual_verification"] == json!(false)
     }));
-    let CoveOqlExecutionResult::JsonRows(rows) = kernel.executed.result else {
+    let CoveQlExecutionResult::JsonRows(rows) = kernel.executed.result else {
         panic!("expected JSON rows");
     };
     assert_eq!(
@@ -19988,7 +21611,7 @@ fn kernel_direct_evidence_projection_orders_and_pages_with_exact_native_authorit
         .unwrap()
         .iter()
         .any(|metadata| metadata == "stable_order_contract"));
-    let CoveOqlExecutionResult::JsonRows(rows) = kernel.executed.result else {
+    let CoveQlExecutionResult::JsonRows(rows) = kernel.executed.result else {
         panic!("expected JSON rows");
     };
     assert_eq!(
@@ -20027,7 +21650,7 @@ fn evidence_current_root_aggregates_count_exists_and_distinct_visible_entries() 
     )
     .unwrap();
 
-    let CoveOqlExecutionResult::JsonRows(rows) = executed.result else {
+    let CoveQlExecutionResult::JsonRows(rows) = executed.result else {
         panic!("expected JSON rows");
     };
     assert_eq!(rows, vec![json!({"c": 1, "e": true, "d": 1})]);
@@ -20059,7 +21682,7 @@ fn evidence_current_root_exists_filter_uses_matching_output_object_id() {
     )
     .unwrap();
 
-    let CoveOqlExecutionResult::JsonRows(rows) = executed.result else {
+    let CoveQlExecutionResult::JsonRows(rows) = executed.result else {
         panic!("expected JSON rows");
     };
     assert_eq!(rows, vec![json!({"active": true})]);
@@ -20093,7 +21716,7 @@ fn hidden_evidence_does_not_leak_through_counts_or_negated_exists() {
         validation_options(),
     )
     .unwrap();
-    let CoveOqlExecutionResult::JsonRows(rows) = aggregates.result else {
+    let CoveQlExecutionResult::JsonRows(rows) = aggregates.result else {
         panic!("expected JSON rows");
     };
     assert_eq!(rows, vec![json!({"c": 0, "e": false, "d": 0})]);
@@ -20108,7 +21731,7 @@ fn hidden_evidence_does_not_leak_through_counts_or_negated_exists() {
         validation_options(),
     )
     .unwrap();
-    let CoveOqlExecutionResult::JsonRows(rows) = negated_exists.result else {
+    let CoveQlExecutionResult::JsonRows(rows) = negated_exists.result else {
         panic!("expected JSON rows");
     };
     assert_eq!(rows, vec![json!({"active": true})]);
@@ -20141,7 +21764,7 @@ fn hidden_evidence_root_scan_returns_no_rows() {
     )
     .unwrap();
 
-    let CoveOqlExecutionResult::EvidenceRows(rows) = executed.result else {
+    let CoveQlExecutionResult::EvidenceRows(rows) = executed.result else {
         panic!("expected evidence rows");
     };
     assert!(rows.is_empty());
@@ -20237,7 +21860,7 @@ fn evidence_report_records_target_indexes_and_exact_fast_path_policy() {
     assert!(kernel.kernel_report.evidence.filtered_by_target);
     assert_eq!(
         kernel.kernel_report.evidence.target_index_kinds,
-        vec![cove_oql::EvidenceTargetIndexKind::ObjectType]
+        vec![coveql::EvidenceTargetIndexKind::ObjectType]
     );
     assert!(kernel.kernel_report.evidence.fallback_reasons.is_empty());
     assert!(!kernel.executed.authority.residual_required);
@@ -20417,7 +22040,7 @@ fn kernel_helper_association_aggregates_execute_with_exact_native_contract() {
             materialized.output_fingerprint
         );
         assert!(kernel.kernel_report.compared_with_materialized);
-        let CoveOqlExecutionResult::JsonRows(rows) = kernel.executed.result else {
+        let CoveQlExecutionResult::JsonRows(rows) = kernel.executed.result else {
             panic!("expected JSON rows");
         };
         assert_eq!(rows, vec![expected]);
@@ -20523,7 +22146,7 @@ fn kernel_helper_evidence_aggregates_execute_with_exact_native_contract() {
             materialized.output_fingerprint
         );
         assert!(kernel.kernel_report.compared_with_materialized);
-        let CoveOqlExecutionResult::JsonRows(rows) = kernel.executed.result else {
+        let CoveQlExecutionResult::JsonRows(rows) = kernel.executed.result else {
             panic!("expected JSON rows");
         };
         assert_eq!(rows, vec![expected]);
@@ -20614,7 +22237,7 @@ fn kernel_grouped_helper_association_aggregates_execute_with_exact_native_contra
             materialized.output_fingerprint
         );
         assert!(kernel.kernel_report.compared_with_materialized);
-        let CoveOqlExecutionResult::JsonRows(rows) = kernel.executed.result else {
+        let CoveQlExecutionResult::JsonRows(rows) = kernel.executed.result else {
             panic!("expected JSON rows");
         };
         assert_eq!(rows, expected_rows);
@@ -20736,7 +22359,7 @@ fn kernel_grouped_helper_evidence_aggregates_execute_with_exact_native_contract(
             materialized.output_fingerprint
         );
         assert!(kernel.kernel_report.compared_with_materialized);
-        let CoveOqlExecutionResult::JsonRows(rows) = kernel.executed.result else {
+        let CoveQlExecutionResult::JsonRows(rows) = kernel.executed.result else {
             panic!("expected JSON rows");
         };
         assert_eq!(rows, expected_rows);
@@ -20781,7 +22404,7 @@ fn datafusion_projection_helper_rejects_non_projection_plans() {
     )
     .unwrap();
     let ctx = datafusion::execution::context::SessionContext::new();
-    let err = cove_oql::register_datafusion_projection_for_plan(
+    let err = coveql::register_datafusion_projection_for_plan(
         &ctx,
         "people",
         std::path::Path::new("/tmp/nonexistent.cove"),
@@ -20789,7 +22412,35 @@ fn datafusion_projection_helper_rejects_non_projection_plans() {
         &planned,
     )
     .unwrap_err();
-    assert!(err.to_string().contains("projection-root plan"));
+    assert!(err.to_string().contains("projection-backed plan"));
+}
+
+#[cfg(feature = "datafusion")]
+#[test]
+fn datafusion_projection_helper_rejects_relation_aware_table_plans() {
+    let bytes = object_file_with_bool_records_and_projection(&[false, true]);
+    let planned = parse_resolve_and_plan_query(
+        &bytes,
+        "table(thing_projection) as l.lookup(table(thing_projection) as r, on: l.active == r.active).select(left_active: l.active, right_active: r.active)",
+        ParseOptions::default(),
+        ResolveOptions::default(),
+        PlanOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+    let ctx = datafusion::execution::context::SessionContext::new();
+    let err = coveql::register_datafusion_projection_for_plan(
+        &ctx,
+        "thing_lookup",
+        std::path::Path::new("/tmp/nonexistent.cove"),
+        None,
+        &planned,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("trivial projection-backed plan"));
+    assert!(err
+        .to_string()
+        .contains("register_datafusion_coveql_provider_for_plan"));
 }
 
 #[test]
@@ -20871,31 +22522,28 @@ fn physical_plan_uses_canonical_object_node_order() {
             "output",
         ]
     );
-    assert!(
-        physical
-            .physical_plan
-            .nodes
-            .iter()
-            .all(|node| node.contract.contract_version
-                == cove_oql::PHYSICAL_OPERATOR_CONTRACT_VERSION)
-    );
+    assert!(physical
+        .physical_plan
+        .nodes
+        .iter()
+        .all(|node| node.contract.contract_version == coveql::PHYSICAL_OPERATOR_CONTRACT_VERSION));
     assert_eq!(
         physical
             .physical_plan
             .predicate_normal_forms
             .normal_form_version,
-        cove_oql::PREDICATE_NORMAL_FORM_VERSION
+        coveql::PREDICATE_NORMAL_FORM_VERSION
     );
     assert_eq!(
         physical.explain_json()["physical_plan"]["predicate_normal_forms"]["normal_form_version"],
-        cove_oql::PREDICATE_NORMAL_FORM_VERSION
+        coveql::PREDICATE_NORMAL_FORM_VERSION
     );
     assert!(physical.explain_json()["physical_plan"]["nodes"]
         .as_array()
         .unwrap()
         .iter()
         .all(|node| node["contract"]["contract_version"]
-            == cove_oql::PHYSICAL_OPERATOR_CONTRACT_VERSION));
+            == coveql::PHYSICAL_OPERATOR_CONTRACT_VERSION));
     assert_eq!(
         physical.explain_json()["fingerprints"]["physical_plan"],
         physical.physical_plan_fingerprint
@@ -21095,8 +22743,8 @@ fn physical_plan_records_association_endpoint_and_evidence_grain_candidates() {
     };
     assert!(index_candidate);
     assert!(*target_filtered);
-    assert!(grains.contains(&cove_oql::EvidenceGrainKind::Row));
-    assert!(target_index_kinds.contains(&cove_oql::EvidenceTargetIndexKind::Projection));
+    assert!(grains.contains(&coveql::EvidenceGrainKind::Row));
+    assert!(target_index_kinds.contains(&coveql::EvidenceTargetIndexKind::Projection));
     assert_eq!(*existence_fast_path_candidates, 0);
     assert_eq!(*count_fast_path_candidates, 0);
     assert!(!*hidden_entry_filtering_required);
@@ -21425,30 +23073,30 @@ fn physical_predicate_code_domains_report_exact_manifest_bridge_scope() {
         metadata_disclosure_policy: MetadataDisclosurePolicy::AllowProtected,
         ..SecurityContext::default()
     };
-    let scope = cove_oql::build_manifest_dataset_scope_context(
+    let scope = coveql::build_manifest_dataset_scope_context(
         &manifest,
         &[
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "left.cove",
                 bytes: &left,
             },
-            cove_oql::ManifestDatasetMember {
+            coveql::ManifestDatasetMember {
                 source: "right.cove",
                 bytes: &right,
             },
         ],
-        cove_oql::ManifestDatasetScopeOptions {
+        coveql::ManifestDatasetScopeOptions {
             tenant_id: Some("tenant-a".into()),
             security: security.clone(),
-            code_domain_bridge_proofs: vec![cove_oql::ManifestCodeDomainBridgeProof {
-                domain_id: "cove_e:org.example.oql:exec-codes".into(),
+            code_domain_bridge_proofs: vec![coveql::ManifestCodeDomainBridgeProof {
+                domain_id: "cove_e:org.example.coveql:exec-codes".into(),
                 bridge_kind: "manifest_validated_canonical_remap".into(),
                 exact: true,
                 epoch: Some(1),
                 reason: "manifest member dictionaries remap to the same canonical code domain"
                     .into(),
             }],
-            ..cove_oql::ManifestDatasetScopeOptions::default()
+            ..coveql::ManifestDatasetScopeOptions::default()
         },
     )
     .unwrap();
@@ -21457,7 +23105,7 @@ fn physical_predicate_code_domains_report_exact_manifest_bridge_scope() {
         r#"Person.where(name == "red").select(name)"#,
         ParseOptions::default(),
         ResolveOptions {
-            output_mode: Some(CoveOqlOutputMode::JsonRows),
+            output_mode: Some(CoveQlOutputMode::JsonRows),
             security,
             ..ResolveOptions::default()
         },
@@ -21486,10 +23134,10 @@ fn physical_predicate_code_domains_report_exact_manifest_bridge_scope() {
         .dictionary_id
         .as_deref()
         .is_some_and(|dictionary_id| dictionary_id
-            .contains("bridged_dictionary_domain:cove_e_org.example.oql_exec-codes")));
+            .contains("bridged_dictionary_domain:cove_e_org.example.coveql_exec-codes")));
     assert_eq!(
         domain.semantic_domain_id.as_deref(),
-        Some("cove_e:org.example.oql:exec-codes")
+        Some("cove_e:org.example.coveql:exec-codes")
     );
     assert_eq!(domain.dictionary_epoch, Some(1));
     assert_eq!(domain.security_scope.tenant_id.as_deref(), Some("tenant-a"));
@@ -21533,7 +23181,7 @@ fn physical_predicates_report_goid_or_candidate_boundary() {
         .residual_reason
         .as_deref()
         .is_some_and(|reason| reason.contains("GOID OR")
-            && reason.contains("materialized OQL truth verification")));
+            && reason.contains("materialized CoveQL truth verification")));
 }
 
 #[test]
@@ -21671,14 +23319,14 @@ fn physical_optional_metadata_fail_open_and_strict_modes() {
             && validation.status == PhysicalSidecarStatus::Ignored
     }));
     assert!(physical.sidecar_validations.iter().all(|validation| {
-        validation.report_version == cove_oql::PHYSICAL_SIDECAR_VALIDATION_VERSION
+        validation.report_version == coveql::PHYSICAL_SIDECAR_VALIDATION_VERSION
     }));
     let sidecar_validation_json = physical.explain_json()["physical_plan"]["sidecar_validations"]
         .as_array()
         .unwrap()
         .clone();
     for validation in &sidecar_validation_json {
-        for field in cove_oql::explain_json_schema().required_physical_sidecar_validation_fields {
+        for field in coveql::explain_json_schema().required_physical_sidecar_validation_fields {
             assert!(
                 validation.get(*field).is_some(),
                 "physical sidecar validation explain JSON missing field {field}: {validation}"
@@ -21686,10 +23334,10 @@ fn physical_optional_metadata_fail_open_and_strict_modes() {
         }
         assert_eq!(
             validation["report_version"],
-            cove_oql::PHYSICAL_SIDECAR_VALIDATION_VERSION
+            coveql::PHYSICAL_SIDECAR_VALIDATION_VERSION
         );
     }
-    for field in cove_oql::explain_json_schema().required_physical_plan_sidecar_fields {
+    for field in coveql::explain_json_schema().required_physical_plan_sidecar_fields {
         assert!(
             physical.explain_json()["physical_plan"]
                 .get(*field)
@@ -21703,12 +23351,13 @@ fn physical_optional_metadata_fail_open_and_strict_modes() {
         .any(|validation| {
             validation.name == "cove_r" && validation.status == PhysicalSidecarStatus::Missing
         }));
-    assert!(physical
-        .runtime_compatibility_report
-        .iter()
-        .all(
-            |validation| validation.report_version == cove_oql::PHYSICAL_SIDECAR_VALIDATION_VERSION
-        ));
+    assert!(
+        physical
+            .runtime_compatibility_report
+            .iter()
+            .all(|validation| validation.report_version
+                == coveql::PHYSICAL_SIDECAR_VALIDATION_VERSION)
+    );
     assert!(physical
         .physical_plan
         .runtime_compatibility
@@ -21724,7 +23373,7 @@ fn physical_optional_metadata_fail_open_and_strict_modes() {
             .any(|validation| validation["name"] == json!("cove_r")
                 && validation["status"] == json!("missing")
                 && validation["report_version"]
-                    == json!(cove_oql::PHYSICAL_SIDECAR_VALIDATION_VERSION))
+                    == json!(coveql::PHYSICAL_SIDECAR_VALIDATION_VERSION))
     );
     assert!(physical
         .cache_compatibility_report
@@ -21732,9 +23381,13 @@ fn physical_optional_metadata_fail_open_and_strict_modes() {
         .any(|validation| {
             validation.name == "cove_cache" && validation.status == PhysicalSidecarStatus::Missing
         }));
-    assert!(physical.cache_compatibility_report.iter().all(
-        |validation| validation.report_version == cove_oql::PHYSICAL_SIDECAR_VALIDATION_VERSION
-    ));
+    assert!(
+        physical
+            .cache_compatibility_report
+            .iter()
+            .all(|validation| validation.report_version
+                == coveql::PHYSICAL_SIDECAR_VALIDATION_VERSION)
+    );
     assert!(physical
         .physical_plan
         .cache_compatibility
@@ -21750,7 +23403,7 @@ fn physical_optional_metadata_fail_open_and_strict_modes() {
             .any(|validation| validation["name"] == json!("cove_cache")
                 && validation["status"] == json!("missing")
                 && validation["report_version"]
-                    == json!(cove_oql::PHYSICAL_SIDECAR_VALIDATION_VERSION))
+                    == json!(coveql::PHYSICAL_SIDECAR_VALIDATION_VERSION))
     );
     assert!(physical
         .codec_compatibility_report
@@ -21760,9 +23413,13 @@ fn physical_optional_metadata_fail_open_and_strict_modes() {
                 && validation.status == PhysicalSidecarStatus::TrustedCandidate
                 && validation.safe_details["compatibility"] == json!("core_codec_only")
         }));
-    assert!(physical.codec_compatibility_report.iter().all(
-        |validation| validation.report_version == cove_oql::PHYSICAL_SIDECAR_VALIDATION_VERSION
-    ));
+    assert!(
+        physical
+            .codec_compatibility_report
+            .iter()
+            .all(|validation| validation.report_version
+                == coveql::PHYSICAL_SIDECAR_VALIDATION_VERSION)
+    );
     assert!(physical
         .physical_plan
         .codec_compatibility
@@ -21780,7 +23437,7 @@ fn physical_optional_metadata_fail_open_and_strict_modes() {
             .any(|validation| validation["name"] == json!("cove_cx")
                 && validation["status"] == json!("trusted_candidate")
                 && validation["report_version"]
-                    == json!(cove_oql::PHYSICAL_SIDECAR_VALIDATION_VERSION))
+                    == json!(coveql::PHYSICAL_SIDECAR_VALIDATION_VERSION))
     );
     assert!(physical
         .physical_plan
@@ -21847,7 +23504,7 @@ fn physical_runtime_compatibility_hints_are_reported_as_trusted_or_ignored() {
                 && validation["status"] == json!("trusted_candidate")
                 && validation["candidate_count"] == json!(1)
                 && validation["report_version"]
-                    == json!(cove_oql::PHYSICAL_SIDECAR_VALIDATION_VERSION)
+                    == json!(coveql::PHYSICAL_SIDECAR_VALIDATION_VERSION)
                 && validation["redacted"] == json!(true))
     );
 
@@ -21888,7 +23545,7 @@ fn physical_runtime_compatibility_hints_are_reported_as_trusted_or_ignored() {
         .fallback_reason
         .as_deref()
         .unwrap()
-        .contains("unsupported by the default Cove-OQL runtime"));
+        .contains("unsupported by the default CoveQL runtime"));
     assert!(
         unsupported.explain_json()["physical_plan"]["runtime_compatibility"]
             .as_array()
@@ -21899,7 +23556,7 @@ fn physical_runtime_compatibility_hints_are_reported_as_trusted_or_ignored() {
                 && validation["fallback_reason"]
                     .as_str()
                     .unwrap()
-                    .contains("unsupported by the default Cove-OQL runtime"))
+                    .contains("unsupported by the default CoveQL runtime"))
     );
 }
 

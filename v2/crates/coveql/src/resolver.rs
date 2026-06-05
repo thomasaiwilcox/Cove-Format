@@ -1,9 +1,9 @@
 use crate::{
-    ast::*, build_operation_context, parse_query, BranchContext, BranchSelector,
-    CoveOqlExplainTarget, CoveOqlOperationRequest, CoveOqlOutputMode, CoveOqlSelectedOperation,
-    DiagnosticSeverity, ExplainMode, MetadataDisclosurePolicy, OqlDiagnostic, RedactionReference,
-    RejectionKind, RejectionReport, ResourceUseEstimate, SecurityContext, TemporalContext,
-    TemporalMode, TemporalRole, TombstoneContext, VisibilityReference,
+    ast::*, build_operation_context, parse_query, BranchContext, BranchSelector, CoveQlDiagnostic,
+    CoveQlExplainTarget, CoveQlOperationRequest, CoveQlOutputMode, CoveQlProfileId,
+    CoveQlSelectedOperation, DiagnosticSeverity, ExplainMode, MetadataDisclosurePolicy,
+    RedactionReference, RejectionKind, RejectionReport, ResourceUseEstimate, SecurityContext,
+    TemporalContext, TemporalMode, TemporalRole, TombstoneContext, VisibilityReference,
 };
 use cove_core::{
     constants::CovePhysicalKind,
@@ -43,6 +43,7 @@ pub fn resolve_query(
     resolve_options: ResolveOptions,
     validation_options: ValidationOptions,
 ) -> Result<ResolvedQuery, BuildResolvedQueryError> {
+    validate_profile_shell(&parsed, &resolve_options)?;
     let mut settings = collect_chain_settings(&parsed, &resolve_options)?;
     let request = operation_request_for(&parsed, &settings, &resolve_options);
     let operation_context = build_operation_context(bytes, request, validation_options)
@@ -70,7 +71,8 @@ pub fn resolve_query(
     })?;
 
     let mut resolver = Resolver::new(surface, resolve_options.clone());
-    let root = resolver.resolve_root(&parsed.root.node)?;
+    let mut root = resolver.resolve_root(&parsed.root.node)?;
+    apply_root_alias(&mut root, parsed.root_alias.as_ref());
     settings.temporal = resolver.resolve_temporal_context(settings.temporal.clone(), &root)?;
     let method_chain = resolver.resolve_methods(&parsed, &root, &settings)?;
     let resolved_query_fingerprint = resolved_fingerprint(
@@ -80,6 +82,7 @@ pub fn resolve_query(
         &settings.temporal,
         &settings.branch,
         &settings.tombstone,
+        &parsed.profiles,
     );
     let diagnostics = operation_context
         .diagnostics
@@ -115,13 +118,13 @@ pub fn resolve_query(
 
 #[derive(Debug, Clone)]
 pub struct BuildResolvedQueryError {
-    pub diagnostics: Vec<OqlDiagnostic>,
+    pub diagnostics: Vec<CoveQlDiagnostic>,
     pub rejections: Vec<RejectionReport>,
     pub source: Option<String>,
 }
 
 impl BuildResolvedQueryError {
-    fn single(diagnostic: OqlDiagnostic) -> Self {
+    fn single(diagnostic: CoveQlDiagnostic) -> Self {
         Self {
             diagnostics: vec![diagnostic],
             rejections: Vec::new(),
@@ -129,7 +132,7 @@ impl BuildResolvedQueryError {
         }
     }
 
-    fn from_parse(diagnostics: Vec<OqlDiagnostic>) -> Self {
+    fn from_parse(diagnostics: Vec<CoveQlDiagnostic>) -> Self {
         Self {
             diagnostics,
             rejections: Vec::new(),
@@ -150,7 +153,7 @@ impl BuildResolvedQueryError {
             "resolve",
             self.diagnostics
                 .iter()
-                .map(crate::OqlDiagnostic::to_json)
+                .map(crate::CoveQlDiagnostic::to_json)
                 .collect(),
             self.rejections
                 .iter()
@@ -165,7 +168,7 @@ impl fmt::Display for BuildResolvedQueryError {
         if let Some(diagnostic) = self.diagnostics.first() {
             write!(f, "{}: {}", diagnostic.code, diagnostic.message)
         } else {
-            write!(f, "Cove-OQL query resolution failed")
+            write!(f, "CoveQL query resolution failed")
         }
     }
 }
@@ -174,8 +177,8 @@ impl Error for BuildResolvedQueryError {}
 
 #[derive(Debug, Clone)]
 struct ChainSettings {
-    selected_operation: CoveOqlSelectedOperation,
-    output_mode: CoveOqlOutputMode,
+    selected_operation: CoveQlSelectedOperation,
+    output_mode: CoveQlOutputMode,
     temporal: TemporalContext,
     branch: BranchContext,
     tombstone: TombstoneContext,
@@ -199,17 +202,37 @@ fn collect_chain_settings(
     let mut seen_take = false;
     let mut seen_skip = false;
     let mut seen_group_by = false;
+    let mut seen_relationship_expansion = matches!(parsed.root.node, AstRoot::Path(_));
     let mut explain = None;
 
     for method in &parsed.methods {
+        if explain.is_some() {
+            return Err(conflict(
+                "explain must be the final method in a CoveQL method chain",
+                resolve_options,
+            ));
+        }
         match &method.node {
-            AstMethod::Where(_) => {}
+            AstMethod::Where(_) => {
+                if seen_group_by {
+                    return Err(conflict(
+                        "where after groupBy requires a profile-declared having/post-aggregate filter",
+                        resolve_options,
+                    ));
+                }
+            }
             AstMethod::Select(_) => reject_duplicate(&mut seen_select, "select", resolve_options)?,
             AstMethod::AsOf(bound) => {
                 reject_duplicate(&mut seen_as_of, "asOf", resolve_options)?;
                 if seen_history || seen_changes {
                     return Err(conflict(
                         "asOf cannot be mixed with history or changes",
+                        resolve_options,
+                    ));
+                }
+                if seen_relationship_expansion {
+                    return Err(conflict(
+                        "asOf must appear in the temporal phase before lookup, traverse, or path expansion",
                         resolve_options,
                     ));
                 }
@@ -231,6 +254,12 @@ fn collect_chain_settings(
                         resolve_options,
                     ));
                 }
+                if seen_relationship_expansion {
+                    return Err(conflict(
+                        "history must appear in the temporal phase before lookup, traverse, or path expansion",
+                        resolve_options,
+                    ));
+                }
                 temporal.mode = match mode {
                     AstHistoryMode::Records => TemporalMode::HistoryRecords,
                     AstHistoryMode::States => TemporalMode::HistoryStates,
@@ -245,6 +274,12 @@ fn collect_chain_settings(
                         resolve_options,
                     ));
                 }
+                if seen_relationship_expansion {
+                    return Err(conflict(
+                        "changes must appear in the temporal phase before lookup, traverse, or path expansion",
+                        resolve_options,
+                    ));
+                }
                 if from.bound_kind() != to.bound_kind() {
                     return Err(conflict(
                         "changes bounds must use the same bound kind",
@@ -255,7 +290,7 @@ fn collect_chain_settings(
                     AstChangeMode::Records => TemporalMode::ChangesRecords,
                     AstChangeMode::StateTransitions => TemporalMode::ChangesStateTransitions,
                     AstChangeMode::PropertyDiffs => TemporalMode::ChangesPropertyDiffs,
-                    AstChangeMode::FinalObjects => TemporalMode::ChangesFinalObjects,
+                    AstChangeMode::FinalRows => TemporalMode::ChangesFinalObjects,
                 };
             }
             AstMethod::OrderBy(_) => {
@@ -271,6 +306,49 @@ fn collect_chain_settings(
                     return Err(duplicate("duplicate explain method", resolve_options));
                 }
             }
+            AstMethod::ProfileCall { name, .. }
+                if name.name == "lookup" && !matches!(parsed.root.node, AstRoot::Table(_)) =>
+            {
+                return Err(profile_rejection(
+                    "E_UNKNOWN_BRIDGE",
+                    "lookup requires a declared CoveQL bridge from the current root grain to CoveQL/Table",
+                    resolve_options,
+                ));
+            }
+            AstMethod::ProfileCall { name, .. }
+                if name.name == "traverse"
+                    && !matches!(parsed.root.node, AstRoot::Node(_) | AstRoot::Path(_)) =>
+            {
+                return Err(profile_rejection(
+                    "E_UNKNOWN_BRIDGE",
+                    "traverse requires a declared CoveQL bridge from the current root grain to CoveQL/Graph",
+                    resolve_options,
+                ));
+            }
+            AstMethod::ProfileCall { name, .. }
+                if name.name != "lookup" && name.name != "traverse" =>
+            {
+                return Err(profile_rejection(
+                    "E_UNSUPPORTED_PROFILE_METHOD",
+                    format!(
+                        "CoveQL profile method {} is not declared by the active profile contract for this root grain",
+                        name.name
+                    ),
+                    resolve_options,
+                ));
+            }
+            AstMethod::ProfileCall { name, .. } => {
+                if seen_group_by {
+                    return Err(conflict(
+                        format!(
+                            "{} cannot appear after groupBy unless its profile contract accepts aggregate grain",
+                            name.name
+                        ),
+                        resolve_options,
+                    ));
+                }
+                seen_relationship_expansion = true;
+            }
         }
     }
 
@@ -280,7 +358,7 @@ fn collect_chain_settings(
         resolve_options
             .output_mode
             .clone()
-            .unwrap_or(CoveOqlOutputMode::ExplainJson)
+            .unwrap_or(CoveQlOutputMode::ExplainJson)
     } else {
         resolve_options
             .output_mode
@@ -288,12 +366,12 @@ fn collect_chain_settings(
             .unwrap_or(default_output)
     };
     let selected_operation = if let Some(mode) = explain {
-        CoveOqlSelectedOperation::Explain { target, mode }
-    } else if let CoveOqlOutputMode::ArrowRecordBatch {
+        CoveQlSelectedOperation::Explain { target, mode }
+    } else if let CoveQlOutputMode::ArrowRecordBatch {
         zero_copy_requested,
     } = &output_mode
     {
-        CoveOqlSelectedOperation::ArrowExport {
+        CoveQlSelectedOperation::ArrowExport {
             zero_copy_requested: *zero_copy_requested,
         }
     } else {
@@ -319,8 +397,8 @@ fn operation_request_for(
     parsed: &ParsedQuery,
     settings: &ChainSettings,
     resolve_options: &ResolveOptions,
-) -> CoveOqlOperationRequest {
-    CoveOqlOperationRequest {
+) -> CoveQlOperationRequest {
+    CoveQlOperationRequest {
         selected_operation: settings.selected_operation.clone(),
         output_mode: settings.output_mode.clone(),
         temporal: settings.temporal.clone(),
@@ -364,6 +442,7 @@ fn method_requests_evidence_metadata(method: &AstMethod) -> bool {
         | AstMethod::Take(_)
         | AstMethod::Skip(_)
         | AstMethod::Explain(_) => false,
+        AstMethod::ProfileCall { args, .. } => args.iter().any(profile_argument_requests_evidence),
     }
 }
 
@@ -375,8 +454,11 @@ fn predicate_requests_evidence_metadata(predicate: &AstPredicate) -> bool {
         }
         AstPredicate::InList { expr, .. }
         | AstPredicate::NullCheck { expr, .. }
-        | AstPredicate::Exists(expr)
         | AstPredicate::BoolExpr(expr) => expr_requests_evidence_metadata(&expr.node),
+        AstPredicate::Exists { target, args } => {
+            expr_requests_evidence_metadata(&target.node)
+                || args.iter().any(profile_argument_requests_evidence)
+        }
         AstPredicate::Not(inner) => predicate_requests_evidence_metadata(&inner.node),
         AstPredicate::And(parts) | AstPredicate::Or(parts) => parts
             .iter()
@@ -393,7 +475,11 @@ fn expr_requests_evidence_metadata(expr: &AstExpr) -> bool {
         AstExpr::AggregateCall { arg, .. } => arg
             .as_deref()
             .is_some_and(|arg| expr_requests_evidence_metadata(&arg.node)),
-        AstExpr::Association(_) | AstExpr::Literal(_) | AstExpr::Path(_) => false,
+        AstExpr::Association(_)
+        | AstExpr::Relationship(_)
+        | AstExpr::RootBinding(_)
+        | AstExpr::Literal(_)
+        | AstExpr::Path(_) => false,
         AstExpr::Conditional {
             predicate,
             then_expr,
@@ -403,6 +489,125 @@ fn expr_requests_evidence_metadata(expr: &AstExpr) -> bool {
                 || expr_requests_evidence_metadata(&then_expr.node)
                 || expr_requests_evidence_metadata(&else_expr.node)
         }
+    }
+}
+
+fn profile_argument_requests_evidence(argument: &AstProfileArgument) -> bool {
+    match &argument.value {
+        AstProfileArgumentValue::Expr(expr) => expr_requests_evidence_metadata(&expr.node),
+        AstProfileArgumentValue::Predicate(predicate) => {
+            predicate_requests_evidence_metadata(&predicate.node)
+        }
+    }
+}
+
+fn validate_profile_shell(
+    parsed: &ParsedQuery,
+    resolve_options: &ResolveOptions,
+) -> Result<(), BuildResolvedQueryError> {
+    for profile in &parsed.profiles {
+        if !resolve_options.enabled_profiles.contains(profile) {
+            return Err(profile_rejection(
+                "E_UNSUPPORTED_PROFILE",
+                format!(
+                    "CoveQL/{} is not enabled for this resolver context",
+                    profile.as_str()
+                ),
+                resolve_options,
+            ));
+        }
+    }
+
+    let root_profile = profile_for_root(&parsed.root.node);
+    if matches!(
+        parsed.root.node,
+        AstRoot::Object(_) | AstRoot::Association(_)
+    ) && !parsed.profiles.contains(&CoveQlProfileId::Object)
+    {
+        return Err(profile_rejection(
+            "E_UNSUPPORTED_PROFILE",
+            "object and association roots require the CoveQL/Object profile",
+            resolve_options,
+        ));
+    }
+    if matches!(
+        parsed.root.node,
+        AstRoot::Projection(_) | AstRoot::Evidence(_)
+    ) && parsed.profiles.len() > 1
+    {
+        return Err(profile_rejection(
+            "E_AMBIGUOUS_PROFILE",
+            "projection and evidence roots require a single host profile context",
+            resolve_options,
+        ));
+    }
+    match root_profile {
+        CoveQlProfileId::Object => {}
+        CoveQlProfileId::Table => {}
+        CoveQlProfileId::Graph => {}
+    }
+    if let Some(name) = first_unsupported_profile_method(parsed) {
+        return Err(profile_rejection(
+            "E_UNSUPPORTED_PROFILE_METHOD",
+            format!(
+                "CoveQL profile method {name} is not declared by the active profile contract for this root grain"
+            ),
+            resolve_options,
+        ));
+    }
+    Ok(())
+}
+
+fn first_unsupported_profile_method(parsed: &ParsedQuery) -> Option<&str> {
+    parsed.methods.iter().find_map(|method| match &method.node {
+        AstMethod::ProfileCall { name, .. } if name.name != "lookup" && name.name != "traverse" => {
+            Some(name.name.as_str())
+        }
+        _ => None,
+    })
+}
+
+fn profile_for_root(root: &AstRoot) -> CoveQlProfileId {
+    match root {
+        AstRoot::Object(_)
+        | AstRoot::Association(_)
+        | AstRoot::Projection(_)
+        | AstRoot::Evidence(_) => CoveQlProfileId::Object,
+        AstRoot::Table(_) => CoveQlProfileId::Table,
+        AstRoot::Node(_) | AstRoot::Edge(_) | AstRoot::Path(_) => CoveQlProfileId::Graph,
+    }
+}
+
+fn profile_rejection(
+    code: &'static str,
+    message: impl Into<String>,
+    resolve_options: &ResolveOptions,
+) -> BuildResolvedQueryError {
+    BuildResolvedQueryError {
+        diagnostics: vec![diagnostic(
+            code,
+            message,
+            "resolve",
+            &resolve_options.security,
+        )],
+        rejections: vec![RejectionReport {
+            kind: RejectionKind::FeatureValidation,
+            reason: code.into(),
+        }],
+        source: None,
+    }
+}
+
+fn apply_root_alias(root: &mut ResolvedRoot, alias: Option<&AstIdentifier>) {
+    let Some(alias) = alias else {
+        return;
+    };
+    if let ResolvedRoot::Table(table) = root {
+        table.binding_name = Some(alias.name.clone());
+    } else if let ResolvedRoot::Node(node) = root {
+        node.binding_name = Some(alias.name.clone());
+    } else if let ResolvedRoot::Edge(edge) = root {
+        edge.binding_name = Some(alias.name.clone());
     }
 }
 
@@ -573,30 +778,40 @@ fn branch_for_selector(
     Ok(BranchContext { selector: branch })
 }
 
-fn selected_operation_for_root(root: &AstRoot) -> CoveOqlSelectedOperation {
+fn selected_operation_for_root(root: &AstRoot) -> CoveQlSelectedOperation {
     match root {
-        AstRoot::Object(_) => CoveOqlSelectedOperation::Object,
-        AstRoot::Association(_) => CoveOqlSelectedOperation::Association,
-        AstRoot::Projection(_) => CoveOqlSelectedOperation::Projection,
-        AstRoot::Evidence(_) => CoveOqlSelectedOperation::Evidence,
+        AstRoot::Object(_) => CoveQlSelectedOperation::Object,
+        AstRoot::Association(_) => CoveQlSelectedOperation::Association,
+        AstRoot::Node(_) => CoveQlSelectedOperation::GraphNode,
+        AstRoot::Edge(_) => CoveQlSelectedOperation::GraphEdge,
+        AstRoot::Table(_) => CoveQlSelectedOperation::Table,
+        AstRoot::Projection(_) => CoveQlSelectedOperation::Projection,
+        AstRoot::Evidence(_) => CoveQlSelectedOperation::Evidence,
+        AstRoot::Path(_) => CoveQlSelectedOperation::GraphNode,
     }
 }
 
-fn explain_target_for_root(root: &AstRoot) -> CoveOqlExplainTarget {
+fn explain_target_for_root(root: &AstRoot) -> CoveQlExplainTarget {
     match root {
-        AstRoot::Object(_) => CoveOqlExplainTarget::Object,
-        AstRoot::Association(_) => CoveOqlExplainTarget::Association,
-        AstRoot::Projection(_) => CoveOqlExplainTarget::Projection,
-        AstRoot::Evidence(_) => CoveOqlExplainTarget::Evidence,
+        AstRoot::Object(_) => CoveQlExplainTarget::Object,
+        AstRoot::Association(_) => CoveQlExplainTarget::Association,
+        AstRoot::Node(_) => CoveQlExplainTarget::GraphNode,
+        AstRoot::Edge(_) => CoveQlExplainTarget::GraphEdge,
+        AstRoot::Table(_) => CoveQlExplainTarget::Table,
+        AstRoot::Projection(_) => CoveQlExplainTarget::Projection,
+        AstRoot::Evidence(_) => CoveQlExplainTarget::Evidence,
+        AstRoot::Path(_) => CoveQlExplainTarget::GraphNode,
     }
 }
 
-fn output_mode_for_root(root: &AstRoot) -> CoveOqlOutputMode {
+fn output_mode_for_root(root: &AstRoot) -> CoveQlOutputMode {
     match root {
-        AstRoot::Object(_) => CoveOqlOutputMode::ObjectRows,
-        AstRoot::Association(_) => CoveOqlOutputMode::AssociationRows,
-        AstRoot::Projection(_) => CoveOqlOutputMode::ProjectionRows,
-        AstRoot::Evidence(_) => CoveOqlOutputMode::EvidenceRows,
+        AstRoot::Object(_) => CoveQlOutputMode::ObjectRows,
+        AstRoot::Association(_) => CoveQlOutputMode::AssociationRows,
+        AstRoot::Table(_) => CoveQlOutputMode::JsonRows,
+        AstRoot::Projection(_) => CoveQlOutputMode::ProjectionRows,
+        AstRoot::Evidence(_) => CoveQlOutputMode::EvidenceRows,
+        AstRoot::Node(_) | AstRoot::Edge(_) | AstRoot::Path(_) => CoveQlOutputMode::JsonRows,
     }
 }
 
@@ -607,7 +822,9 @@ fn expr_logical_type(expr: &ResolvedExpr) -> Option<&str> {
         ResolvedExpr::FunctionCall { logical_type, .. }
         | ResolvedExpr::AggregateCall { logical_type, .. }
         | ResolvedExpr::Conditional { logical_type, .. } => Some(logical_type.as_str()),
-        ResolvedExpr::Association(_) | ResolvedExpr::Evidence(_) => None,
+        ResolvedExpr::Association(_) | ResolvedExpr::Evidence(_) | ResolvedExpr::TableExists(_) => {
+            None
+        }
     }
 }
 
@@ -753,7 +970,10 @@ fn parse_uuid_literal(value: &str) -> Option<([u8; 16], String)> {
 struct Resolver {
     surface: CoveObjectSurface,
     options: ResolveOptions,
-    diagnostics: Vec<OqlDiagnostic>,
+    diagnostics: Vec<CoveQlDiagnostic>,
+    lookup_scope: Vec<ResolvedTableRoot>,
+    graph_node_scope: Vec<ResolvedGraphNodeRoot>,
+    graph_edge_scope: Vec<ResolvedGraphEdgeRoot>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -769,6 +989,9 @@ impl Resolver {
             surface,
             options,
             diagnostics: Vec::new(),
+            lookup_scope: Vec::new(),
+            graph_node_scope: Vec::new(),
+            graph_edge_scope: Vec::new(),
         }
     }
 
@@ -780,13 +1003,37 @@ impl Resolver {
             AstRoot::Association(association) => self
                 .resolve_association_root(association, None, AssociationResolveUsage::RootScan)
                 .map(ResolvedRoot::Association),
+            AstRoot::Node(identifier) => self
+                .resolve_graph_node_root(identifier)
+                .map(ResolvedRoot::Node),
+            AstRoot::Edge(edge) => self.resolve_graph_edge_root(edge).map(ResolvedRoot::Edge),
             AstRoot::Projection(identifier) => self
                 .resolve_projection_root(&identifier.name)
                 .map(ResolvedRoot::Projection),
+            AstRoot::Table(identifier) => self
+                .resolve_table_root(&identifier.name)
+                .map(ResolvedRoot::Table),
             AstRoot::Evidence(evidence) => self
                 .resolve_evidence_root(evidence, None)
                 .map(ResolvedRoot::Evidence),
+            AstRoot::Path(path) => self.resolve_path_root_start(path),
         }
+    }
+
+    fn resolve_path_root_start(
+        &self,
+        path: &AstPathRootExpr,
+    ) -> Result<ResolvedRoot, BuildResolvedQueryError> {
+        let mut root = self.resolve_root(&path.start.root.node)?;
+        apply_root_alias(&mut root, path.start.alias.as_ref());
+        if !matches!(root, ResolvedRoot::Node(_)) {
+            return Err(profile_rejection(
+                "E_UNSUPPORTED_PROFILE_METHOD",
+                "path roots require a node(...) start",
+                &self.options,
+            ));
+        }
+        Ok(root)
     }
 
     fn resolve_temporal_context(
@@ -863,6 +1110,24 @@ impl Resolver {
         settings: &ChainSettings,
     ) -> Result<ResolvedMethodChain, BuildResolvedQueryError> {
         let mut chain = ResolvedMethodChain::default();
+        if let AstRoot::Path(path) = &parsed.root.node {
+            for relationship in &path.relationships {
+                let traversal = self.resolve_graph_traversal_expr(
+                    relationship,
+                    root,
+                    1,
+                    1,
+                    GraphTraversalMode::Walk,
+                    GraphTraversalDistinctPolicy::None,
+                    None,
+                )?;
+                if let Some(target) = &traversal.target {
+                    self.graph_node_scope.push(target.clone());
+                }
+                self.graph_edge_scope.push(traversal.edge.clone());
+                chain.traversals.push(traversal);
+            }
+        }
         for method in &parsed.methods {
             match &method.node {
                 AstMethod::Where(predicate) => {
@@ -912,6 +1177,29 @@ impl Resolver {
                         mode: *mode,
                     });
                 }
+                AstMethod::ProfileCall { name, args } if name.name == "lookup" => {
+                    let lookup = self.resolve_table_lookup(args, root)?;
+                    self.lookup_scope.push(lookup.right.clone());
+                    chain.lookups.push(lookup);
+                }
+                AstMethod::ProfileCall { name, args } if name.name == "traverse" => {
+                    let traversal = self.resolve_graph_traversal(args, root)?;
+                    if let Some(target) = &traversal.target {
+                        self.graph_node_scope.push(target.clone());
+                    }
+                    self.graph_edge_scope.push(traversal.edge.clone());
+                    chain.traversals.push(traversal);
+                }
+                AstMethod::ProfileCall { name, .. } => {
+                    return Err(profile_rejection(
+                        "E_UNSUPPORTED_PROFILE_METHOD",
+                        format!(
+                            "CoveQL profile method {} is not declared by the active profile contract for this root grain",
+                            name.name
+                        ),
+                        &self.options,
+                    ));
+                }
                 AstMethod::AsOf(_) | AstMethod::Branch(_) | AstMethod::IncludeTombstones(_) => {}
             }
         }
@@ -924,10 +1212,513 @@ impl Resolver {
                 &self.options.security,
             ));
         }
-        if matches!(settings.output_mode, CoveOqlOutputMode::ExplainJson) {
+        if matches!(settings.output_mode, CoveQlOutputMode::ExplainJson) {
             chain.explain.get_or_insert(ExplainMode::Public);
         }
         Ok(chain)
+    }
+
+    fn resolve_table_lookup(
+        &mut self,
+        args: &[AstProfileArgument],
+        root: &ResolvedRoot,
+    ) -> Result<ResolvedTableLookup, BuildResolvedQueryError> {
+        if !matches!(root, ResolvedRoot::Table(_)) {
+            return Err(profile_rejection(
+                "E_UNSUPPORTED_PROFILE_METHOD",
+                "lookup is declared for CoveQL/Table roots; other root grains require an explicit bridge contract",
+                &self.options,
+            ));
+        }
+        let mut target = None;
+        let mut on = None;
+        let mut cardinality = TableLookupCardinality::One;
+        let mut cardinality_explicit = false;
+        let mut unmatched_policy = TableLookupUnmatchedPolicy::Nulls;
+        let mut duplicate_policy = TableLookupDuplicatePolicy::Reject;
+        let mut duplicate_explicit = false;
+        let mut nulls_match = false;
+        for arg in args {
+            match (arg.name.as_ref().map(|name| name.name.as_str()), &arg.value) {
+                (None, AstProfileArgumentValue::Expr(expr)) if target.is_none() => {
+                    target = Some(expr);
+                }
+                (Some("on"), AstProfileArgumentValue::Predicate(predicate)) if on.is_none() => {
+                    on = Some(predicate);
+                }
+                (Some("cardinality"), AstProfileArgumentValue::Expr(expr))
+                    if !cardinality_explicit =>
+                {
+                    cardinality = self.resolve_lookup_cardinality(expr)?;
+                    cardinality_explicit = true;
+                }
+                (Some("unmatched"), AstProfileArgumentValue::Expr(expr)) => {
+                    unmatched_policy = self.resolve_lookup_unmatched_policy(expr)?;
+                }
+                (Some("required"), AstProfileArgumentValue::Expr(expr)) => {
+                    unmatched_policy = if self.resolve_bool_profile_arg("required", expr)? {
+                        TableLookupUnmatchedPolicy::Reject
+                    } else {
+                        TableLookupUnmatchedPolicy::Nulls
+                    };
+                }
+                (Some("duplicate" | "duplicate_policy"), AstProfileArgumentValue::Expr(expr))
+                    if !duplicate_explicit =>
+                {
+                    duplicate_policy = self.resolve_lookup_duplicate_policy(expr)?;
+                    duplicate_explicit = true;
+                }
+                (Some("nulls_match"), AstProfileArgumentValue::Expr(expr)) => {
+                    nulls_match = self.resolve_bool_profile_arg("nulls_match", expr)?;
+                }
+                (Some(name), _) => {
+                    return Err(profile_rejection(
+                        "E_UNSUPPORTED_PROFILE_METHOD",
+                        format!("unsupported lookup argument {name}"),
+                        &self.options,
+                    ));
+                }
+                _ => {
+                    return Err(profile_rejection(
+                        "E_UNSUPPORTED_PROFILE_METHOD",
+                        "lookup requires one table root binding and one named on: predicate",
+                        &self.options,
+                    ));
+                }
+            }
+        }
+        let target = target.ok_or_else(|| {
+            profile_rejection(
+                "E_UNSUPPORTED_PROFILE_METHOD",
+                "lookup requires a right-hand table root binding",
+                &self.options,
+            )
+        })?;
+        let on = on.ok_or_else(|| {
+            profile_rejection(
+                "E_UNSUPPORTED_PROFILE_METHOD",
+                "lookup requires an on: predicate",
+                &self.options,
+            )
+        })?;
+        let AstExpr::RootBinding(binding) = &target.node else {
+            return Err(profile_rejection(
+                "E_UNSUPPORTED_PROFILE_METHOD",
+                "lookup target must be a table(...) root binding",
+                &self.options,
+            ));
+        };
+        let mut right_root = self.resolve_root(&binding.root.node)?;
+        apply_root_alias(&mut right_root, binding.alias.as_ref());
+        let ResolvedRoot::Table(right) = right_root else {
+            return Err(profile_rejection(
+                "E_UNSUPPORTED_PROFILE_METHOD",
+                "lookup target must resolve to a table surface",
+                &self.options,
+            ));
+        };
+        self.lookup_scope.push(right.clone());
+        let on = self.resolve_predicate(on, root)?;
+        self.lookup_scope.pop();
+        self.validate_table_lookup_predicate(&on)?;
+        if cardinality == TableLookupCardinality::Many && !duplicate_explicit {
+            duplicate_policy = TableLookupDuplicatePolicy::EmitAll;
+        }
+        if cardinality == TableLookupCardinality::One
+            && duplicate_policy == TableLookupDuplicatePolicy::EmitAll
+        {
+            return Err(profile_rejection(
+                "E_UNSUPPORTED_PROFILE_METHOD",
+                "lookup duplicate: many requires cardinality: many in CoveQL 0.1",
+                &self.options,
+            ));
+        }
+        Ok(ResolvedTableLookup {
+            right,
+            on,
+            join_kind: TableLookupJoinKind::LeftPreserving,
+            cardinality,
+            unmatched_policy,
+            duplicate_policy,
+            nulls_match,
+        })
+    }
+
+    fn resolve_lookup_cardinality(
+        &self,
+        expr: &Spanned<AstExpr>,
+    ) -> Result<TableLookupCardinality, BuildResolvedQueryError> {
+        match self.profile_enum_literal("cardinality", expr)?.as_str() {
+            "one" => Ok(TableLookupCardinality::One),
+            "many" => Ok(TableLookupCardinality::Many),
+            value => Err(profile_rejection(
+                "E_UNKNOWN_ENUM_LITERAL",
+                format!("unknown lookup cardinality enum literal {value}"),
+                &self.options,
+            )),
+        }
+    }
+
+    fn resolve_lookup_unmatched_policy(
+        &self,
+        expr: &Spanned<AstExpr>,
+    ) -> Result<TableLookupUnmatchedPolicy, BuildResolvedQueryError> {
+        match self.profile_enum_literal("unmatched", expr)?.as_str() {
+            "nulls" => Ok(TableLookupUnmatchedPolicy::Nulls),
+            "reject" => Ok(TableLookupUnmatchedPolicy::Reject),
+            value => Err(profile_rejection(
+                "E_UNKNOWN_ENUM_LITERAL",
+                format!("unknown lookup unmatched enum literal {value}"),
+                &self.options,
+            )),
+        }
+    }
+
+    fn resolve_lookup_duplicate_policy(
+        &self,
+        expr: &Spanned<AstExpr>,
+    ) -> Result<TableLookupDuplicatePolicy, BuildResolvedQueryError> {
+        match self.profile_enum_literal("duplicate", expr)?.as_str() {
+            "reject" => Ok(TableLookupDuplicatePolicy::Reject),
+            "many" | "emit_all" => Ok(TableLookupDuplicatePolicy::EmitAll),
+            value => Err(profile_rejection(
+                "E_UNKNOWN_ENUM_LITERAL",
+                format!("unknown lookup duplicate enum literal {value}"),
+                &self.options,
+            )),
+        }
+    }
+
+    fn resolve_bool_profile_arg(
+        &self,
+        name: &'static str,
+        expr: &Spanned<AstExpr>,
+    ) -> Result<bool, BuildResolvedQueryError> {
+        match &expr.node {
+            AstExpr::Literal(AstLiteral::Boolean(value)) => Ok(*value),
+            _ => Err(profile_rejection(
+                "E_UNKNOWN_ENUM_LITERAL",
+                format!("lookup argument {name} requires a boolean literal"),
+                &self.options,
+            )),
+        }
+    }
+
+    fn profile_enum_literal(
+        &self,
+        name: &'static str,
+        expr: &Spanned<AstExpr>,
+    ) -> Result<String, BuildResolvedQueryError> {
+        match &expr.node {
+            AstExpr::Path(path) if path.parts.len() == 1 => Ok(path.parts[0].name.clone()),
+            AstExpr::Literal(AstLiteral::String(value)) => Ok(value.clone()),
+            _ => Err(profile_rejection(
+                "E_UNKNOWN_ENUM_LITERAL",
+                format!("lookup argument {name} requires an enum literal"),
+                &self.options,
+            )),
+        }
+    }
+
+    fn validate_table_lookup_predicate(
+        &self,
+        predicate: &ResolvedPredicate,
+    ) -> Result<(), BuildResolvedQueryError> {
+        match predicate {
+            ResolvedPredicate::Compare { left, op, right }
+                if *op == AstCompareOp::Eq
+                    && matches!(left, ResolvedExpr::Path(_))
+                    && matches!(right, ResolvedExpr::Path(_)) =>
+            {
+                Ok(())
+            }
+            _ => Err(profile_rejection(
+                "E_UNSUPPORTED_PROFILE_METHOD",
+                "lookup requires an equality on: predicate between table paths",
+                &self.options,
+            )),
+        }
+    }
+
+    fn resolve_graph_traversal(
+        &self,
+        args: &[AstProfileArgument],
+        root: &ResolvedRoot,
+    ) -> Result<ResolvedGraphTraversal, BuildResolvedQueryError> {
+        if !matches!(root, ResolvedRoot::Node(_)) {
+            return Err(profile_rejection(
+                "E_UNSUPPORTED_PROFILE_METHOD",
+                "traverse is declared for CoveQL/Graph node or path grains",
+                &self.options,
+            ));
+        }
+        let mut relationship = None;
+        let mut min_depth = 1u32;
+        let mut max_depth = 1u32;
+        let mut mode = GraphTraversalMode::Walk;
+        let mut distinct = GraphTraversalDistinctPolicy::None;
+        for arg in args {
+            match (arg.name.as_ref().map(|name| name.name.as_str()), &arg.value) {
+                (None, AstProfileArgumentValue::Expr(expr)) if relationship.is_none() => {
+                    let AstExpr::Relationship(candidate) = &expr.node else {
+                        return Err(profile_rejection(
+                            "E_UNSUPPORTED_PROFILE_METHOD",
+                            "traverse accepts one positional relationship expression",
+                            &self.options,
+                        ));
+                    };
+                    relationship = Some(candidate);
+                }
+                (Some("min"), AstProfileArgumentValue::Expr(expr)) => {
+                    min_depth = self.resolve_traversal_depth_arg("min", expr)?;
+                }
+                (Some("max"), AstProfileArgumentValue::Expr(expr)) => {
+                    max_depth = self.resolve_traversal_depth_arg("max", expr)?;
+                }
+                (Some("mode"), AstProfileArgumentValue::Expr(expr)) => {
+                    let mode_literal = self.profile_enum_literal("mode", expr)?;
+                    mode = mode_literal.parse().map_err(|_| {
+                        profile_rejection(
+                            "E_UNKNOWN_ENUM_LITERAL",
+                            format!("unsupported traverse mode {mode_literal}"),
+                            &self.options,
+                        )
+                    })?;
+                }
+                (Some("distinct"), AstProfileArgumentValue::Expr(expr)) => {
+                    let distinct_literal = self.profile_enum_literal("distinct", expr)?;
+                    distinct = distinct_literal.parse().map_err(|_| {
+                        profile_rejection(
+                            "E_UNKNOWN_ENUM_LITERAL",
+                            format!("unsupported traverse distinct policy {distinct_literal}"),
+                            &self.options,
+                        )
+                    })?;
+                }
+                (Some(name), _) => {
+                    return Err(profile_rejection(
+                        "E_UNSUPPORTED_PROFILE_METHOD",
+                        format!("unsupported traverse argument {name}"),
+                        &self.options,
+                    ));
+                }
+                _ => {
+                    return Err(profile_rejection(
+                        "E_UNSUPPORTED_PROFILE_METHOD",
+                        "traverse requires one positional relationship expression",
+                        &self.options,
+                    ));
+                }
+            }
+        }
+        let relationship = relationship.ok_or_else(|| {
+            profile_rejection(
+                "E_UNSUPPORTED_PROFILE_METHOD",
+                "traverse requires one positional relationship expression",
+                &self.options,
+            )
+        })?;
+        if min_depth > max_depth {
+            return Err(profile_rejection(
+                "E_UNSUPPORTED_PROFILE_METHOD",
+                "traverse min depth must be less than or equal to max depth",
+                &self.options,
+            ));
+        }
+        let requires_contract = min_depth != 1
+            || max_depth != 1
+            || mode != GraphTraversalMode::Walk
+            || distinct != GraphTraversalDistinctPolicy::None;
+        let contract = if requires_contract {
+            let contract = self
+                .options
+                .graph_traversal_contract
+                .as_ref()
+                .ok_or_else(|| {
+                    profile_rejection(
+                        "E_UNSUPPORTED_PROFILE_METHOD",
+                        "variable-length traversal requires an explicit CoveQL/Graph traversal contract; CoveQL 0.1 executes min: 1, max: 1, mode: walk",
+                        &self.options,
+                    )
+                })?;
+            self.validate_graph_traversal_contract(contract, min_depth, max_depth, mode, distinct)?;
+            Some(contract.clone())
+        } else if let Some(contract) = &self.options.graph_traversal_contract {
+            self.validate_graph_traversal_contract(contract, min_depth, max_depth, mode, distinct)?;
+            Some(contract.clone())
+        } else {
+            None
+        };
+        self.resolve_graph_traversal_expr(
+            relationship,
+            root,
+            min_depth,
+            max_depth,
+            mode,
+            distinct,
+            contract,
+        )
+    }
+
+    fn validate_graph_traversal_contract(
+        &self,
+        contract: &GraphTraversalContract,
+        min_depth: u32,
+        max_depth: u32,
+        mode: GraphTraversalMode,
+        distinct: GraphTraversalDistinctPolicy,
+    ) -> Result<(), BuildResolvedQueryError> {
+        if max_depth > 1 && !contract.allow_variable_length {
+            return Err(profile_rejection(
+                "E_UNSUPPORTED_PROFILE_METHOD",
+                "graph traversal contract does not allow variable-length traversal",
+                &self.options,
+            ));
+        }
+        if max_depth > contract.max_depth {
+            return Err(profile_rejection(
+                "E_RESOURCE_BUDGET_EXCEEDED",
+                format!(
+                    "traverse max depth {max_depth} exceeds GraphTraversalContract max_depth {}",
+                    contract.max_depth
+                ),
+                &self.options,
+            ));
+        }
+        if max_depth > self.options.resource_budget.maximum_graph_traversal_depth {
+            return Err(profile_rejection(
+                "E_RESOURCE_BUDGET_EXCEEDED",
+                format!(
+                    "traverse max depth {max_depth} exceeds maximum_graph_traversal_depth {}",
+                    self.options.resource_budget.maximum_graph_traversal_depth
+                ),
+                &self.options,
+            ));
+        }
+        if !contract.supported_modes.contains(&mode) {
+            return Err(profile_rejection(
+                "E_UNSUPPORTED_PROFILE_METHOD",
+                format!(
+                    "graph traversal contract does not support mode {}",
+                    mode.as_str()
+                ),
+                &self.options,
+            ));
+        }
+        if !contract.supported_distinct_policies.contains(&distinct) {
+            return Err(profile_rejection(
+                "E_UNSUPPORTED_PROFILE_METHOD",
+                format!(
+                    "graph traversal contract does not support distinct policy {}",
+                    distinct.as_str()
+                ),
+                &self.options,
+            ));
+        }
+        if contract.max_fanout_per_node == 0
+            || contract.max_paths == 0
+            || contract.max_frontier == 0
+            || contract.path_identity.is_empty()
+            || contract.hidden_endpoint_policy.trim().is_empty()
+            || contract.ordering_policy.trim().is_empty()
+            || contract.execution_authority.trim().is_empty()
+            || contract.contract_version.trim().is_empty()
+        {
+            return Err(profile_rejection(
+                "E_UNSUPPORTED_PROFILE_METHOD",
+                "graph traversal contract is missing required identity, ordering, budget, authority, or hidden-endpoint fields",
+                &self.options,
+            ));
+        }
+        if min_depth == 0 && distinct == GraphTraversalDistinctPolicy::EndNode {
+            return Err(profile_rejection(
+                "E_UNSUPPORTED_PROFILE_METHOD",
+                "distinct: end_node is not valid with min: 0 because start rows have no traversed end node",
+                &self.options,
+            ));
+        }
+        Ok(())
+    }
+
+    fn resolve_graph_traversal_expr(
+        &self,
+        relationship: &AstRelationshipExpr,
+        root: &ResolvedRoot,
+        min_depth: u32,
+        max_depth: u32,
+        mode: GraphTraversalMode,
+        distinct: GraphTraversalDistinctPolicy,
+        contract: Option<GraphTraversalContract>,
+    ) -> Result<ResolvedGraphTraversal, BuildResolvedQueryError> {
+        if !matches!(root, ResolvedRoot::Node(_)) {
+            return Err(profile_rejection(
+                "E_UNSUPPORTED_PROFILE_METHOD",
+                "traverse is declared for CoveQL/Graph node or path grains",
+                &self.options,
+            ));
+        }
+        if relationship
+            .target
+            .as_ref()
+            .is_some_and(|target| !matches!(target.root.node, AstRoot::Node(_)))
+        {
+            return Err(profile_rejection(
+                "E_UNSUPPORTED_PROFILE_METHOD",
+                "traverse targets must be node(...) bindings",
+                &self.options,
+            ));
+        }
+        let mut edge = self.resolve_graph_edge_root(&relationship.edge)?;
+        if let Some(alias) = &relationship.edge_alias {
+            edge.binding_name = Some(alias.name.clone());
+        }
+        let target = relationship
+            .target
+            .as_ref()
+            .map(|target| {
+                let mut resolved = self.resolve_root(&target.root.node)?;
+                apply_root_alias(&mut resolved, target.alias.as_ref());
+                let ResolvedRoot::Node(node) = resolved else {
+                    return Err(profile_rejection(
+                        "E_UNSUPPORTED_PROFILE_METHOD",
+                        "traverse target must resolve to a graph node",
+                        &self.options,
+                    ));
+                };
+                Ok(node)
+            })
+            .transpose()?;
+        Ok(ResolvedGraphTraversal {
+            direction: relationship.direction,
+            edge,
+            target,
+            min_depth,
+            max_depth,
+            mode,
+            distinct,
+            contract,
+        })
+    }
+
+    fn resolve_traversal_depth_arg(
+        &self,
+        name: &'static str,
+        expr: &Spanned<AstExpr>,
+    ) -> Result<u32, BuildResolvedQueryError> {
+        let AstExpr::Literal(AstLiteral::Integer(value)) = &expr.node else {
+            return Err(profile_rejection(
+                "E_UNKNOWN_ENUM_LITERAL",
+                format!("traverse argument {name} requires an unsigned integer literal"),
+                &self.options,
+            ));
+        };
+        value.parse::<u32>().map_err(|_| {
+            profile_rejection(
+                "E_UNKNOWN_ENUM_LITERAL",
+                format!("traverse argument {name} requires an unsigned integer literal"),
+                &self.options,
+            )
+        })
     }
 
     fn resolve_predicate(
@@ -966,8 +1757,20 @@ impl Resolver {
                 expr: self.resolve_expr(expr, root)?,
                 negated: *negated,
             }),
-            AstPredicate::Exists(expr) => {
-                let expr = self.resolve_expr(expr, root)?;
+            AstPredicate::Exists { target, args } => {
+                if !args.is_empty() || matches!(target.node, AstExpr::RootBinding(_)) {
+                    let expr = self.resolve_profile_exists(target, args, root)?;
+                    self.validate_exists_disclosure(&expr, false)?;
+                    return Ok(ResolvedPredicate::Exists(expr));
+                }
+                if let AstExpr::Relationship(relationship) = &target.node {
+                    let expr = ResolvedExpr::Association(
+                        self.resolve_relationship_association(relationship, root)?,
+                    );
+                    self.validate_exists_disclosure(&expr, false)?;
+                    return Ok(ResolvedPredicate::Exists(expr));
+                }
+                let expr = self.resolve_expr(target, root)?;
                 self.validate_exists_disclosure(&expr, false)?;
                 Ok(ResolvedPredicate::Exists(expr))
             }
@@ -993,6 +1796,86 @@ impl Resolver {
                     .collect::<Result<Vec<_>, BuildResolvedQueryError>>()?,
             )),
         }
+    }
+
+    fn resolve_profile_exists(
+        &self,
+        target: &Spanned<AstExpr>,
+        args: &[AstProfileArgument],
+        root: &ResolvedRoot,
+    ) -> Result<ResolvedExpr, BuildResolvedQueryError> {
+        if !matches!(root, ResolvedRoot::Table(_)) {
+            return Err(profile_rejection(
+                "E_UNKNOWN_BRIDGE",
+                "profile-aware exists(root, on: ...) requires a declared bridge from the current root grain to CoveQL/Table",
+                &self.options,
+            ));
+        }
+        let AstExpr::RootBinding(binding) = &target.node else {
+            return Err(profile_rejection(
+                "E_UNSUPPORTED_PROFILE_METHOD",
+                "profile-aware exists requires a table(...) root binding target",
+                &self.options,
+            ));
+        };
+        let mut right_root = self.resolve_root(&binding.root.node)?;
+        apply_root_alias(&mut right_root, binding.alias.as_ref());
+        let ResolvedRoot::Table(right) = right_root else {
+            return Err(profile_rejection(
+                "E_UNKNOWN_BRIDGE",
+                "profile-aware exists target requires a declared bridge to a CoveQL/Table surface",
+                &self.options,
+            ));
+        };
+        let mut on = None;
+        for arg in args {
+            match (arg.name.as_ref().map(|name| name.name.as_str()), &arg.value) {
+                (Some("on"), AstProfileArgumentValue::Predicate(predicate)) if on.is_none() => {
+                    on = Some(predicate);
+                }
+                (Some(name), _) => {
+                    return Err(profile_rejection(
+                        "E_UNSUPPORTED_PROFILE_METHOD",
+                        format!("unsupported exists argument {name}"),
+                        &self.options,
+                    ));
+                }
+                _ => {
+                    return Err(profile_rejection(
+                        "E_UNSUPPORTED_PROFILE_METHOD",
+                        "profile-aware exists requires one named on: predicate",
+                        &self.options,
+                    ));
+                }
+            }
+        }
+        let on = on.ok_or_else(|| {
+            profile_rejection(
+                "E_UNSUPPORTED_PROFILE_METHOD",
+                "profile-aware exists requires an on: predicate",
+                &self.options,
+            )
+        })?;
+        let scoped = self.clone_for_lookup_scope(right.clone());
+        let on = scoped.resolve_predicate(on, root)?;
+        scoped.validate_table_lookup_predicate(&on)?;
+        Ok(ResolvedExpr::TableExists(ResolvedTableExists {
+            right,
+            on: Box::new(on),
+        }))
+    }
+
+    fn clone_for_lookup_scope(&self, right: ResolvedTableRoot) -> Self {
+        let mut resolver = Self {
+            surface: self.surface.clone(),
+            options: self.options.clone(),
+            diagnostics: Vec::new(),
+            lookup_scope: self.lookup_scope.clone(),
+            graph_node_scope: self.graph_node_scope.clone(),
+            graph_edge_scope: self.graph_edge_scope.clone(),
+        };
+        resolver.lookup_scope.push(right);
+        resolver
     }
 
     fn resolve_expr(
@@ -1033,6 +1916,14 @@ impl Resolver {
             }
             AstExpr::Evidence(evidence) => Ok(ResolvedExpr::Evidence(
                 self.resolve_evidence_root(evidence, Some(root))?,
+            )),
+            AstExpr::Relationship(relationship) => Ok(ResolvedExpr::Association(
+                self.resolve_relationship_association(relationship, root)?,
+            )),
+            AstExpr::RootBinding(_) => Err(profile_rejection(
+                "E_UNSUPPORTED_PROFILE",
+                "profile root expressions are valid only where a profile method, evidence target, or exists expression declares root-binding semantics",
+                &self.options,
             )),
             AstExpr::Conditional {
                 predicate,
@@ -1192,7 +2083,7 @@ impl Resolver {
                 let execution_class = builtin_function_execution_class(name, args);
                 Ok(ResolvedFunctionContract {
                     function_id: name.into(),
-                    version: "cove-oql-0.1".into(),
+                    version: "coveql-0.1".into(),
                     deterministic: true,
                     dependency: "pure".into(),
                     execution_class,
@@ -1214,7 +2105,7 @@ impl Resolver {
                 }
                 Ok(ResolvedFunctionContract {
                     function_id: name.into(),
-                    version: "cove-oql-0.1".into(),
+                    version: "coveql-0.1".into(),
                     deterministic: true,
                     dependency: "materialized-string-built-in".into(),
                     execution_class: FunctionExecutionClass::MaterializedOnly,
@@ -1226,7 +2117,7 @@ impl Resolver {
                 if execution_class == FunctionExecutionClass::CodedSafe {
                     return Ok(ResolvedFunctionContract {
                         function_id: name.into(),
-                        version: "cove-oql-0.1".into(),
+                        version: "coveql-0.1".into(),
                         deterministic: true,
                         dependency: "cove-map-safe-cast:coded-identity".into(),
                         execution_class,
@@ -1280,7 +2171,7 @@ impl Resolver {
             }
             "exists" => Ok(ResolvedFunctionContract {
                 function_id: name.into(),
-                version: "cove-oql-0.1".into(),
+                version: "coveql-0.1".into(),
                 deterministic: true,
                 dependency: "pure".into(),
                 execution_class: FunctionExecutionClass::MaterializedOnly,
@@ -1288,7 +2179,7 @@ impl Resolver {
             }),
             _ if self.deterministic_function_entry(name).is_some() => Err(self
                 .function_contract_error(
-                    "registered deterministic function has no Cove-OQL executable body",
+                    "registered deterministic function has no CoveQL executable body",
                     name,
                 )),
             _ => Err(self.unknown(
@@ -1490,6 +2381,9 @@ impl Resolver {
             ResolvedRoot::Association(association) => {
                 self.resolve_association_path(path, association)
             }
+            ResolvedRoot::Node(node) => self.resolve_graph_path_with_scope(path, node),
+            ResolvedRoot::Edge(edge) => self.resolve_graph_edge_path(path, edge),
+            ResolvedRoot::Table(table) => self.resolve_table_path_with_scope(path, table),
             ResolvedRoot::Projection(projection) => self.resolve_projection_path(path, projection),
             ResolvedRoot::Evidence(evidence) => self.resolve_evidence_path(path, evidence),
         }
@@ -1577,6 +2471,77 @@ impl Resolver {
         ))
     }
 
+    fn resolve_graph_node_path(
+        &self,
+        path: &AstPath,
+        node: &ResolvedGraphNodeRoot,
+    ) -> Result<ResolvedPath, BuildResolvedQueryError> {
+        let parts = path_names(path);
+        let path = path_without_graph_binding(path, &node.label, node.binding_name.as_deref())?;
+        let mut resolved = self.resolve_object_path(&path, &node.object)?;
+        resolved.root_kind = ResolvedPathRootKind::Node;
+        if let [binding, field] = parts.as_slice() {
+            resolved.projection_column = Some(format!("{binding}.{field}"));
+        }
+        let CodeDomainId::Placeholder { root, .. } = &mut resolved.code_domain_id;
+        *root = "node".into();
+        Ok(resolved)
+    }
+
+    fn resolve_graph_edge_path(
+        &self,
+        path: &AstPath,
+        edge: &ResolvedGraphEdgeRoot,
+    ) -> Result<ResolvedPath, BuildResolvedQueryError> {
+        let parts = path_names(path);
+        let path = path_without_graph_binding(path, &edge.label, edge.binding_name.as_deref())?;
+        let mut resolved = self.resolve_association_path(&path, &edge.association)?;
+        resolved.root_kind = ResolvedPathRootKind::Edge;
+        if let [binding, field] = parts.as_slice() {
+            resolved.projection_column = Some(format!("{binding}.{field}"));
+        }
+        let CodeDomainId::Placeholder { root, .. } = &mut resolved.code_domain_id;
+        *root = "edge".into();
+        Ok(resolved)
+    }
+
+    fn resolve_graph_path_with_scope(
+        &self,
+        path: &AstPath,
+        node: &ResolvedGraphNodeRoot,
+    ) -> Result<ResolvedPath, BuildResolvedQueryError> {
+        let parts = path_names(path);
+        if let [binding, ..] = parts.as_slice() {
+            if binding == &node.label
+                || node
+                    .binding_name
+                    .as_ref()
+                    .is_some_and(|alias| binding == alias)
+            {
+                return self.resolve_graph_node_path(path, node);
+            }
+            if let Some(scoped_node) = self.graph_node_scope.iter().find(|scoped| {
+                binding == &scoped.label
+                    || scoped
+                        .binding_name
+                        .as_ref()
+                        .is_some_and(|alias| binding == alias)
+            }) {
+                return self.resolve_graph_node_path(path, scoped_node);
+            }
+            if let Some(scoped_edge) = self.graph_edge_scope.iter().find(|scoped| {
+                binding == &scoped.label
+                    || scoped
+                        .binding_name
+                        .as_ref()
+                        .is_some_and(|alias| binding == alias)
+            }) {
+                return self.resolve_graph_edge_path(path, scoped_edge);
+            }
+        }
+        self.resolve_graph_node_path(path, node)
+    }
+
     fn resolve_projection_path(
         &self,
         path: &AstPath,
@@ -1634,6 +2599,95 @@ impl Resolver {
                 property_id: None,
                 projection_id: Some(projection.projection_id.clone()),
                 field: Some(field.into()),
+            },
+        })
+    }
+
+    fn resolve_table_path_with_scope(
+        &self,
+        path: &AstPath,
+        table: &ResolvedTableRoot,
+    ) -> Result<ResolvedPath, BuildResolvedQueryError> {
+        let parts = path_names(path);
+        if let [binding, ..] = parts.as_slice() {
+            if binding == &table.table_name
+                || table
+                    .binding_name
+                    .as_ref()
+                    .is_some_and(|alias| binding == alias)
+            {
+                return self.resolve_table_path_for_table(path, table);
+            }
+            if let Some(scoped) = self.lookup_scope.iter().find(|scoped| {
+                binding == &scoped.table_name
+                    || scoped
+                        .binding_name
+                        .as_ref()
+                        .is_some_and(|alias| binding == alias)
+            }) {
+                return self.resolve_table_path_for_table(path, scoped);
+            }
+        }
+        self.resolve_table_path_for_table(path, table)
+    }
+
+    fn resolve_table_path_for_table(
+        &self,
+        path: &AstPath,
+        table: &ResolvedTableRoot,
+    ) -> Result<ResolvedPath, BuildResolvedQueryError> {
+        let parts = path_names(path);
+        let (field, qualified_binding) = match parts.as_slice() {
+            [field] => (field.as_str(), None),
+            [binding, field]
+                if binding == &table.table_name
+                    || table
+                        .binding_name
+                        .as_ref()
+                        .is_some_and(|alias| binding == alias) =>
+            {
+                (field.as_str(), Some(binding.as_str()))
+            }
+            _ => {
+                return Err(self.unknown(
+                    "E_AMBIGUOUS_PATH",
+                    "table path is ambiguous",
+                    Some(&parts.join(".")),
+                ));
+            }
+        };
+        let column = table
+            .projection
+            .columns
+            .iter()
+            .find(|column| column.name == field)
+            .ok_or_else(|| self.unknown("E_UNKNOWN_PATH", "unknown table column", Some(field)))?;
+        let logical = column.logical_type.as_deref().unwrap_or("utf8");
+        let value_key = qualified_binding
+            .map(|binding| format!("{binding}.{field}"))
+            .unwrap_or_else(|| field.to_string());
+        Ok(ResolvedPath {
+            display_name: field.into(),
+            root_kind: ResolvedPathRootKind::Table,
+            object_type_id: None,
+            property_id: None,
+            association_type_id: None,
+            evidence_field_id: None,
+            projection_id: Some(table.projection.projection_id.clone()),
+            projection_column: Some(value_key.clone()),
+            system_field: None,
+            logical_type: logical.into(),
+            physical_kind: physical_kind_for_logical_name(logical).into(),
+            collation_id: None,
+            nullable: column.missing_policy != "reject",
+            null_policy: column.missing_policy.clone(),
+            temporal_role: None,
+            code_domain_id: CodeDomainId::Placeholder {
+                root: "table".into(),
+                object_type_id: None,
+                property_id: None,
+                projection_id: Some(table.projection.projection_id.clone()),
+                field: Some(value_key),
             },
         })
     }
@@ -1916,6 +2970,91 @@ impl Resolver {
                 &self.options.security,
             ),
             object_relative,
+            target_node_object_type_id: None,
+            target_node_label: None,
+        })
+    }
+
+    fn resolve_relationship_association(
+        &self,
+        relationship: &AstRelationshipExpr,
+        root: &ResolvedRoot,
+    ) -> Result<ResolvedAssociationRoot, BuildResolvedQueryError> {
+        if !matches!(root, ResolvedRoot::Node(_)) {
+            return Err(profile_rejection(
+                "E_UNSUPPORTED_PROFILE_METHOD",
+                "relationship expressions require a CoveQL/Graph node or path root grain",
+                &self.options,
+            ));
+        }
+        let association = AstAssociationExpr {
+            type_name: relationship.edge.type_name.clone(),
+            direction: Some(relationship.direction),
+            role: relationship.edge.role,
+            role_name: relationship.edge.role_name.clone(),
+        };
+        let mut resolved = self.resolve_association_root(
+            &association,
+            Some(root),
+            AssociationResolveUsage::ObjectRelative,
+        )?;
+        if let Some(target) = &relationship.target {
+            let mut target_root = self.resolve_root(&target.root.node)?;
+            apply_root_alias(&mut target_root, target.alias.as_ref());
+            let ResolvedRoot::Node(node) = target_root else {
+                return Err(profile_rejection(
+                    "E_UNSUPPORTED_PROFILE_METHOD",
+                    "relationship targets require node(...) bindings",
+                    &self.options,
+                ));
+            };
+            resolved.target_node_object_type_id = Some(node.object.object_type_id);
+            resolved.target_node_label = Some(node.label);
+        }
+        Ok(resolved)
+    }
+
+    fn resolve_graph_node_root(
+        &self,
+        identifier: &AstIdentifier,
+    ) -> Result<ResolvedGraphNodeRoot, BuildResolvedQueryError> {
+        let object = self.resolve_object_type(&identifier.name).map_err(|_| {
+            self.unknown(
+                "E_UNKNOWN_GRAPH_LABEL",
+                "unknown graph node label",
+                Some(&identifier.name),
+            )
+        })?;
+        Ok(ResolvedGraphNodeRoot {
+            label: identifier.name.clone(),
+            binding_name: None,
+            object: resolved_object_root(object),
+        })
+    }
+
+    fn resolve_graph_edge_root(
+        &self,
+        edge: &AstGraphEdgeExpr,
+    ) -> Result<ResolvedGraphEdgeRoot, BuildResolvedQueryError> {
+        let association = AstAssociationExpr {
+            type_name: edge.type_name.clone(),
+            direction: None,
+            role: edge.role,
+            role_name: edge.role_name.clone(),
+        };
+        let resolved = self
+            .resolve_association_root(&association, None, AssociationResolveUsage::RootScan)
+            .map_err(|_| {
+                self.unknown(
+                    "E_UNKNOWN_GRAPH_LABEL",
+                    "unknown graph edge label",
+                    Some(&edge.type_name.name),
+                )
+            })?;
+        Ok(ResolvedGraphEdgeRoot {
+            label: edge.type_name.name.clone(),
+            binding_name: None,
+            association: resolved,
         })
     }
 
@@ -2069,6 +3208,261 @@ impl Resolver {
         })
     }
 
+    fn resolve_table_root(
+        &self,
+        table_name: &str,
+    ) -> Result<ResolvedTableRoot, BuildResolvedQueryError> {
+        let catalog = self.projection_catalog().map_err(|_| {
+            self.unknown(
+                "E_UNKNOWN_TABLE_SURFACE",
+                "table surfaces require COVE-MAP projection metadata",
+                Some(table_name),
+            )
+        })?;
+        let projection_id = catalog
+            .projections
+            .iter()
+            .find(|entry| {
+                entry.output_table.as_deref() == Some(table_name)
+                    || entry.projection_id == table_name
+            })
+            .map(|entry| entry.projection_id.clone())
+            .ok_or_else(|| {
+                self.unknown(
+                    "E_UNKNOWN_TABLE_SURFACE",
+                    "unknown CoveQL/Table surface",
+                    Some(table_name),
+                )
+            })?;
+        let projection = self.resolve_projection_root(&projection_id)?;
+        let mut row_identity = projection.ordering.clone();
+        if row_identity.is_empty() {
+            row_identity.push("projection_row_identity".into());
+        }
+        let row_grain = projection
+            .row_grain
+            .clone()
+            .unwrap_or_else(|| "visible_table_row".into());
+        let mut canonical_order = projection.ordering.clone();
+        if canonical_order.is_empty() {
+            canonical_order = row_identity.clone();
+        }
+        let temporal_authority = if matches!(
+            projection.temporal_mode.as_deref(),
+            Some("as_of" | "recomputable" | "recomputable_projection_at_temporal_cut")
+        ) {
+            TableTemporalAuthority::RecomputableProjectionAtTemporalCut
+        } else {
+            TableTemporalAuthority::MaterializedSnapshotOnly
+        };
+        let auto_contract = self.projection_table_surface_contract(
+            table_name,
+            &projection,
+            &row_grain,
+            &row_identity,
+            &canonical_order,
+            temporal_authority,
+        );
+        let table_surface_contract = self
+            .table_surface_contract_override(table_name, &projection, &auto_contract)?
+            .unwrap_or(auto_contract);
+        Ok(ResolvedTableRoot {
+            table_name: table_name.into(),
+            binding_name: None,
+            table_id: format!("projection:{}", projection.projection_id),
+            authority_kind: table_surface_contract.authority_kind,
+            row_grain: table_surface_contract.row_grain.clone(),
+            row_identity: table_surface_contract.row_identity.clone(),
+            canonical_order: table_surface_contract.canonical_order.clone(),
+            temporal_authority: table_surface_contract.temporal_authority,
+            evidence_capabilities: table_surface_contract.evidence_capabilities.clone(),
+            table_surface_contract,
+            projection,
+        })
+    }
+
+    fn projection_table_surface_contract(
+        &self,
+        table_name: &str,
+        projection: &ResolvedProjectionRoot,
+        row_grain: &str,
+        row_identity: &[String],
+        canonical_order: &[String],
+        temporal_authority: TableTemporalAuthority,
+    ) -> TableSurfaceContract {
+        let table_id = format!("projection:{}", projection.projection_id);
+        let logical_column_map = projection
+            .columns
+            .iter()
+            .map(|column| TableSurfaceColumnContract {
+                name: column.name.clone(),
+                logical_type: column.logical_type.clone(),
+                nullable: column.missing_policy != "reject",
+                source_path: Some(column.value.clone()),
+                code_domain: None,
+                collation: None,
+            })
+            .collect::<Vec<_>>();
+        TableSurfaceContract {
+            table_id,
+            table_name: table_name.into(),
+            contract_version: crate::COVEQL_PROFILE_CONTRACT_VERSION.into(),
+            authority_kind: TableSurfaceAuthorityKind::DeterministicProjection,
+            authority_fingerprint: projection.projection_id.clone(),
+            schema_fingerprint: projection.projection_id.clone(),
+            logical_column_map,
+            row_grain: row_grain.into(),
+            row_identity: row_identity.to_vec(),
+            canonical_order: canonical_order.to_vec(),
+            visibility_authority: "cove_o_visibility".into(),
+            redaction_authority: "cove_o_redaction".into(),
+            temporal_authority,
+            evidence_capabilities: vec![
+                AstEvidenceGrain::Row,
+                AstEvidenceGrain::Column,
+                AstEvidenceGrain::Projection,
+                AstEvidenceGrain::Source,
+            ],
+            null_missing_nan_policy: "projection_contract".into(),
+            collation_policy: "projection_contract".into(),
+            code_domain_contexts: Vec::new(),
+            code_domain_bridges: Vec::new(),
+            projection_dependency_contract_id: Some(projection.projection_id.clone()),
+            datafusion_interop_contract: Some("coveql_table_projection_provider".into()),
+        }
+    }
+
+    fn table_surface_contract_override(
+        &self,
+        table_name: &str,
+        projection: &ResolvedProjectionRoot,
+        auto_contract: &TableSurfaceContract,
+    ) -> Result<Option<TableSurfaceContract>, BuildResolvedQueryError> {
+        let supplied = self
+            .options
+            .table_surface_contracts
+            .get(table_name)
+            .or_else(|| {
+                self.options
+                    .table_surface_contracts
+                    .get(&projection.projection_id)
+            })
+            .or_else(|| {
+                self.options
+                    .table_surface_contracts
+                    .get(&auto_contract.table_id)
+            });
+        let Some(contract) = supplied else {
+            return Ok(None);
+        };
+        self.validate_table_surface_contract(contract, projection, auto_contract)?;
+        Ok(Some(contract.clone()))
+    }
+
+    fn validate_table_surface_contract(
+        &self,
+        contract: &TableSurfaceContract,
+        projection: &ResolvedProjectionRoot,
+        auto_contract: &TableSurfaceContract,
+    ) -> Result<(), BuildResolvedQueryError> {
+        if contract.authority_kind != TableSurfaceAuthorityKind::DeterministicProjection {
+            return Err(self.unknown(
+                "E_UNKNOWN_TABLE_SURFACE",
+                "table surface contract is present, but only deterministic projection-backed table authorities are executable in this CoveQL milestone",
+                Some(&contract.table_name),
+            ));
+        }
+        let required_string_fields = [
+            ("contract_version", contract.contract_version.as_str()),
+            (
+                "authority_fingerprint",
+                contract.authority_fingerprint.as_str(),
+            ),
+            ("schema_fingerprint", contract.schema_fingerprint.as_str()),
+            ("row_grain", contract.row_grain.as_str()),
+            (
+                "visibility_authority",
+                contract.visibility_authority.as_str(),
+            ),
+            ("redaction_authority", contract.redaction_authority.as_str()),
+            (
+                "null_missing_nan_policy",
+                contract.null_missing_nan_policy.as_str(),
+            ),
+            ("collation_policy", contract.collation_policy.as_str()),
+        ];
+        for (field, value) in required_string_fields {
+            if value.trim().is_empty() {
+                return Err(profile_rejection(
+                    "E_UNKNOWN_TABLE_SURFACE",
+                    format!("table surface contract is missing required field {field}"),
+                    &self.options,
+                ));
+            }
+        }
+        if contract.table_id != auto_contract.table_id {
+            return Err(profile_rejection(
+                "E_UNKNOWN_TABLE_SURFACE",
+                "table surface contract table_id must match the deterministic projection authority",
+                &self.options,
+            ));
+        }
+        if contract.row_identity.is_empty() {
+            return Err(profile_rejection(
+                "E_UNKNOWN_TABLE_SURFACE",
+                "table surface contract requires a non-empty row_identity",
+                &self.options,
+            ));
+        }
+        if contract.row_grain != auto_contract.row_grain {
+            return Err(profile_rejection(
+                "E_UNKNOWN_TABLE_SURFACE",
+                "table surface contract row_grain must match the deterministic projection authority",
+                &self.options,
+            ));
+        }
+        if contract.canonical_order.is_empty() {
+            return Err(profile_rejection(
+                "E_UNKNOWN_TABLE_SURFACE",
+                "table surface contract requires a non-empty canonical_order",
+                &self.options,
+            ));
+        }
+        if contract.temporal_authority != auto_contract.temporal_authority {
+            return Err(profile_rejection(
+                "E_UNKNOWN_TABLE_SURFACE",
+                "table surface contract temporal authority does not match the projection authority",
+                &self.options,
+            ));
+        }
+        if contract.projection_dependency_contract_id.as_deref()
+            != Some(projection.projection_id.as_str())
+        {
+            return Err(profile_rejection(
+                "E_UNKNOWN_TABLE_SURFACE",
+                "table surface contract must reference the projection dependency contract it executes",
+                &self.options,
+            ));
+        }
+        for column in &projection.columns {
+            if !contract
+                .logical_column_map
+                .iter()
+                .any(|contract_column| contract_column.name == column.name)
+            {
+                return Err(profile_rejection(
+                    "E_UNKNOWN_TABLE_SURFACE",
+                    format!(
+                        "table surface contract is missing logical column {}",
+                        column.name
+                    ),
+                    &self.options,
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn resolve_evidence_root(
         &self,
         evidence: &AstEvidenceExpr,
@@ -2087,9 +3481,17 @@ impl Resolver {
         let grain = evidence.grain.unwrap_or_else(|| match target {
             Some(ResolvedEvidenceTarget::AssociationType { .. }) => AstEvidenceGrain::Association,
             Some(ResolvedEvidenceTarget::Projection { .. }) => AstEvidenceGrain::Row,
+            Some(ResolvedEvidenceTarget::TableRow { .. }) => AstEvidenceGrain::Row,
+            Some(ResolvedEvidenceTarget::TableColumn { .. }) => AstEvidenceGrain::Column,
+            Some(ResolvedEvidenceTarget::GraphNode { .. }) => AstEvidenceGrain::Node,
+            Some(ResolvedEvidenceTarget::GraphEdge { .. }) => AstEvidenceGrain::Edge,
+            Some(ResolvedEvidenceTarget::GraphPath { .. }) => AstEvidenceGrain::Path,
             Some(ResolvedEvidenceTarget::Property { .. }) => AstEvidenceGrain::Property,
             Some(ResolvedEvidenceTarget::CurrentRoot) => match contextual_root {
                 Some(ResolvedRoot::Association(_)) => AstEvidenceGrain::Association,
+                Some(ResolvedRoot::Node(_)) => AstEvidenceGrain::Node,
+                Some(ResolvedRoot::Edge(_)) => AstEvidenceGrain::Edge,
+                Some(ResolvedRoot::Table(_)) => AstEvidenceGrain::Row,
                 Some(ResolvedRoot::Projection(_)) => AstEvidenceGrain::Row,
                 _ => AstEvidenceGrain::Object,
             },
@@ -2141,20 +3543,22 @@ impl Resolver {
                     }
                 }
                 if path.parts.len() == 2 {
-                    let object_type = self.resolve_object_type(&path.parts[0].name)?;
-                    let property_name = &path.parts[1].name;
-                    let property = find_property(object_type, property_name).ok_or_else(|| {
-                        self.unknown(
-                            "E_UNKNOWN_PROPERTY",
-                            "unknown object property for evidence target",
-                            Some(property_name),
-                        )
-                    })?;
-                    return Ok(ResolvedEvidenceTarget::Property {
-                        object_type_id: Some(object_type.object_type_id),
-                        property_id: property.property_id,
-                        property_name: property.property_name.clone(),
-                    });
+                    if let Ok(object_type) = self.resolve_object_type(&path.parts[0].name) {
+                        let property_name = &path.parts[1].name;
+                        let property =
+                            find_property(object_type, property_name).ok_or_else(|| {
+                                self.unknown(
+                                    "E_UNKNOWN_PROPERTY",
+                                    "unknown object property for evidence target",
+                                    Some(property_name),
+                                )
+                            })?;
+                        return Ok(ResolvedEvidenceTarget::Property {
+                            object_type_id: Some(object_type.object_type_id),
+                            property_id: property.property_id,
+                            property_name: property.property_name.clone(),
+                        });
+                    }
                 }
                 let root = contextual_root.ok_or_else(|| {
                     self.unknown(
@@ -2164,11 +3568,34 @@ impl Resolver {
                     )
                 })?;
                 let resolved = self.resolve_path(path, root)?;
+                if let ResolvedRoot::Table(table) = root {
+                    return Ok(ResolvedEvidenceTarget::TableColumn {
+                        table_id: table.table_id.clone(),
+                        table_name: table.table_name.clone(),
+                        projection_id: table.projection.projection_id.clone(),
+                        column_name: resolved.display_name,
+                    });
+                }
                 Ok(ResolvedEvidenceTarget::Property {
                     object_type_id: resolved.object_type_id,
                     property_id: resolved.property_id.unwrap_or_default(),
                     property_name: resolved.display_name,
                 })
+            }
+            AstEvidenceTarget::RootBinding(binding) => {
+                if let AstRoot::Path(path) = &binding.root.node {
+                    let mut root = self.resolve_path_root_start(path)?;
+                    apply_root_alias(&mut root, binding.alias.as_ref());
+                    if let ResolvedRoot::Node(node) = root {
+                        return Ok(ResolvedEvidenceTarget::GraphPath {
+                            start_object_type_id: node.object.object_type_id,
+                            start_label: node.binding_name.unwrap_or(node.label),
+                        });
+                    }
+                }
+                let mut root = self.resolve_root(&binding.root.node)?;
+                apply_root_alias(&mut root, binding.alias.as_ref());
+                Ok(contextual_evidence_target(&root))
             }
             AstEvidenceTarget::Association(association) => {
                 let resolved = self.resolve_association_root(
@@ -2245,6 +3672,27 @@ fn contextual_evidence_target(root: &ResolvedRoot) -> ResolvedEvidenceTarget {
         ResolvedRoot::Association(association) => ResolvedEvidenceTarget::AssociationType {
             object_type_id: association.object_type_id,
             type_name: association.type_name.clone(),
+        },
+        ResolvedRoot::Node(node) => ResolvedEvidenceTarget::GraphNode {
+            object_type_id: node.object.object_type_id,
+            type_name: node.object.type_name.clone(),
+            label: node
+                .binding_name
+                .clone()
+                .unwrap_or_else(|| node.label.clone()),
+        },
+        ResolvedRoot::Edge(edge) => ResolvedEvidenceTarget::GraphEdge {
+            object_type_id: edge.association.object_type_id,
+            type_name: edge.association.type_name.clone(),
+            label: edge
+                .binding_name
+                .clone()
+                .unwrap_or_else(|| edge.label.clone()),
+        },
+        ResolvedRoot::Table(table) => ResolvedEvidenceTarget::TableRow {
+            table_id: table.table_id.clone(),
+            table_name: table.table_name.clone(),
+            projection_id: table.projection.projection_id.clone(),
         },
         ResolvedRoot::Projection(projection) => ResolvedEvidenceTarget::Projection {
             projection_id: projection.projection_id.clone(),
@@ -2448,6 +3896,29 @@ fn property_resolved_path(
 
 fn path_names(path: &AstPath) -> Vec<String> {
     path.parts.iter().map(|part| part.name.clone()).collect()
+}
+
+fn path_without_graph_binding(
+    path: &AstPath,
+    label: &str,
+    alias: Option<&str>,
+) -> Result<AstPath, BuildResolvedQueryError> {
+    let parts = path_names(path);
+    if parts.len() <= 1 {
+        return Ok(path.clone());
+    }
+    let binding = &parts[0];
+    if binding == label || alias.is_some_and(|alias| binding == alias) {
+        return Ok(AstPath {
+            parts: path.parts[1..].to_vec(),
+        });
+    }
+    Err(BuildResolvedQueryError::single(diagnostic(
+        "E_BINDING_OUT_OF_SCOPE",
+        "qualified graph path references a binding that is not in scope",
+        "resolve",
+        &SecurityContext::default(),
+    )))
 }
 
 fn evidence_key_exists(index: &MapEvidenceIndex, key: &str) -> bool {
@@ -2668,12 +4139,31 @@ fn timestamp_micros(
 fn resolved_fingerprint(
     root: &ResolvedRoot,
     method_chain: &ResolvedMethodChain,
-    output_mode: &CoveOqlOutputMode,
+    output_mode: &CoveQlOutputMode,
     temporal: &TemporalContext,
     branch: &BranchContext,
     tombstone: &TombstoneContext,
+    profiles: &[CoveQlProfileId],
 ) -> String {
+    let profile_contracts = profiles
+        .iter()
+        .map(|profile| {
+            let contract = crate::coveql_profile_contract(*profile);
+            json!({
+                "profile_id": profile,
+                "profile_version": contract.profile_version,
+                "implemented": contract.implemented,
+            })
+        })
+        .collect::<Vec<_>>();
     let value = json!({
+        "core_contract": {
+            "language_version": crate::COVEQL_LANGUAGE_VERSION,
+            "core_version": crate::COVEQL_CORE_VERSION,
+            "profile_contract_version": crate::COVEQL_PROFILE_CONTRACT_VERSION,
+        },
+        "profiles": profiles,
+        "profile_contracts": profile_contracts,
         "root": root,
         "method_chain": method_chain,
         "output_mode": output_mode,
@@ -2693,7 +4183,7 @@ fn warning(
     message: impl Into<String>,
     phase: impl Into<String>,
     security: &SecurityContext,
-) -> OqlDiagnostic {
+) -> CoveQlDiagnostic {
     let mut diagnostic = diagnostic(code, message, phase, security);
     diagnostic.severity = DiagnosticSeverity::Warning;
     diagnostic
@@ -2704,8 +4194,8 @@ fn diagnostic(
     message: impl Into<String>,
     phase: impl Into<String>,
     security: &SecurityContext,
-) -> OqlDiagnostic {
-    OqlDiagnostic {
+) -> CoveQlDiagnostic {
+    CoveQlDiagnostic {
         code: code.into(),
         severity: DiagnosticSeverity::Error,
         message: message.into(),

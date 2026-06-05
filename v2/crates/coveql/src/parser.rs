@@ -1,11 +1,14 @@
 use crate::{
-    ast::*, DiagnosticSeverity, ExplainMode, OqlDiagnostic, ResourceUseEstimate,
-    COVE_OQL_LANGUAGE_VERSION,
+    ast::*, CoveQlDiagnostic, CoveQlProfileId, DiagnosticSeverity, ExplainMode,
+    ResourceUseEstimate, COVEQL_LANGUAGE_VERSION,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-pub fn parse_query(text: &str, options: ParseOptions) -> Result<ParsedQuery, Vec<OqlDiagnostic>> {
+pub fn parse_query(
+    text: &str,
+    options: ParseOptions,
+) -> Result<ParsedQuery, Vec<CoveQlDiagnostic>> {
     if text.len() > options.resource_budget.maximum_query_bytes {
         return Err(vec![diagnostic_with_span(
             "E_RESOURCE_BUDGET_EXCEEDED",
@@ -23,11 +26,11 @@ pub fn parse_query(text: &str, options: ParseOptions) -> Result<ParsedQuery, Vec
     let language_version = lexed
         .language_version
         .clone()
-        .unwrap_or_else(|| COVE_OQL_LANGUAGE_VERSION.to_string());
+        .unwrap_or_else(|| COVEQL_LANGUAGE_VERSION.to_string());
     if lexed.language_version.is_none() && !options.allow_implicit_language_version {
         return Err(vec![diagnostic_with_span(
             "E_PARSE",
-            "missing required # cove-oql:0.1 directive",
+            "missing required # coveql:0.1 directive",
             "parse",
             SourceSpan::new(0, 0),
         )]);
@@ -36,7 +39,7 @@ pub fn parse_query(text: &str, options: ParseOptions) -> Result<ParsedQuery, Vec
         if required != &language_version {
             return Err(vec![diagnostic_with_span(
                 "E_UNSUPPORTED_CONSTRUCT",
-                format!("unsupported Cove-OQL language version {language_version}"),
+                format!("unsupported CoveQL language version {language_version}"),
                 "parse",
                 SourceSpan::new(0, 0),
             )]);
@@ -47,6 +50,7 @@ pub fn parse_query(text: &str, options: ParseOptions) -> Result<ParsedQuery, Vec
     let mut parser = Parser::new(lexed.tokens);
     let prefix_explain = parser.parse_prefix_explain()?;
     let root = parser.parse_root()?;
+    let root_alias = parser.parse_optional_alias()?;
     let mut methods = Vec::new();
     while !parser.at(TokenDiscriminant::Eof) {
         parser.expect(
@@ -65,11 +69,18 @@ pub fn parse_query(text: &str, options: ParseOptions) -> Result<ParsedQuery, Vec
 
     let resource_use = resource_use_for(text, &root, &methods);
     check_parse_budgets(&options.resource_budget, &resource_use)?;
+    let profiles = if lexed.profiles.is_empty() {
+        inferred_profiles_for_root(&root.node)
+    } else {
+        lexed.profiles.clone()
+    };
 
     let canonical_ast = json!({
         "language_version": language_version,
-        "root": root,
-        "methods": methods,
+        "profiles": profiles.clone(),
+        "root": root.clone(),
+        "root_alias": root_alias.clone(),
+        "methods": methods.clone(),
     });
     let parsed_ast_fingerprint = sha256_hex(
         serde_json::to_string(&canonical_ast)
@@ -79,7 +90,10 @@ pub fn parse_query(text: &str, options: ParseOptions) -> Result<ParsedQuery, Vec
 
     Ok(ParsedQuery {
         language_version,
+        directives: lexed.directives,
+        profiles,
         root,
+        root_alias,
         methods,
         span,
         resource_use,
@@ -88,10 +102,23 @@ pub fn parse_query(text: &str, options: ParseOptions) -> Result<ParsedQuery, Vec
     })
 }
 
+fn inferred_profiles_for_root(root: &AstRoot) -> Vec<CoveQlProfileId> {
+    match root {
+        AstRoot::Table(_) => vec![CoveQlProfileId::Table],
+        AstRoot::Node(_) | AstRoot::Edge(_) | AstRoot::Path(_) => vec![CoveQlProfileId::Graph],
+        AstRoot::Object(_)
+        | AstRoot::Association(_)
+        | AstRoot::Projection(_)
+        | AstRoot::Evidence(_) => vec![CoveQlProfileId::Object],
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Lexed {
     tokens: Vec<Token>,
     language_version: Option<String>,
+    directives: Vec<AstDirective>,
+    profiles: Vec<CoveQlProfileId>,
     canonical_token_stream: String,
 }
 
@@ -229,12 +256,14 @@ impl TokenKind {
     }
 }
 
-fn lex(text: &str) -> Result<Lexed, Vec<OqlDiagnostic>> {
+fn lex(text: &str) -> Result<Lexed, Vec<CoveQlDiagnostic>> {
     let mut tokens = Vec::new();
     let mut canonical = Vec::new();
     let mut diagnostics = Vec::new();
     let mut pos = 0usize;
     let mut language_version = None;
+    let mut directives = Vec::new();
+    let mut profiles = Vec::new();
     let mut only_ws_before = true;
 
     while pos < text.len() {
@@ -250,13 +279,45 @@ fn lex(text: &str) -> Result<Lexed, Vec<OqlDiagnostic>> {
                 .map(|offset| pos + offset)
                 .unwrap_or(text.len());
             let line = &text[pos..line_end];
-            if only_ws_before && line.trim_start().starts_with("# cove-oql:") {
+            if only_ws_before && line.trim_start().starts_with("# coveql:") {
                 let version = line
                     .trim_start()
-                    .trim_start_matches("# cove-oql:")
+                    .trim_start_matches("# coveql:")
                     .trim()
                     .to_string();
+                directives.push(AstDirective {
+                    name: AstIdentifier::new("coveql", false),
+                    values: vec![version.clone()],
+                });
                 language_version = Some(version);
+            } else if only_ws_before && line.trim_start().starts_with("# profiles:") {
+                let values = line
+                    .trim_start()
+                    .trim_start_matches("# profiles:")
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .collect::<Vec<_>>();
+                let mut directive_values = Vec::new();
+                for value in values {
+                    directive_values.push(value.to_string());
+                    if let Some(profile) = CoveQlProfileId::parse(value) {
+                        if !profiles.contains(&profile) {
+                            profiles.push(profile);
+                        }
+                    } else {
+                        diagnostics.push(diagnostic_with_span(
+                            "E_UNSUPPORTED_PROFILE",
+                            format!("unsupported CoveQL profile {value}"),
+                            "parse",
+                            SourceSpan::new(pos, line_end),
+                        ));
+                    }
+                }
+                directives.push(AstDirective {
+                    name: AstIdentifier::new("profiles", false),
+                    values: directive_values,
+                });
             }
             pos = line_end;
             continue;
@@ -416,6 +477,8 @@ fn lex(text: &str) -> Result<Lexed, Vec<OqlDiagnostic>> {
     Ok(Lexed {
         tokens,
         language_version,
+        directives,
+        profiles,
         canonical_token_stream: canonical.join(" "),
     })
 }
@@ -423,7 +486,7 @@ fn lex(text: &str) -> Result<Lexed, Vec<OqlDiagnostic>> {
 fn lex_quoted_identifier(
     text: &str,
     start: usize,
-    diagnostics: &mut Vec<OqlDiagnostic>,
+    diagnostics: &mut Vec<CoveQlDiagnostic>,
 ) -> (String, usize) {
     let mut out = String::new();
     let mut pos = start + 1;
@@ -457,7 +520,11 @@ fn lex_quoted_identifier(
     (out, text.len())
 }
 
-fn lex_string(text: &str, start: usize, diagnostics: &mut Vec<OqlDiagnostic>) -> (String, usize) {
+fn lex_string(
+    text: &str,
+    start: usize,
+    diagnostics: &mut Vec<CoveQlDiagnostic>,
+) -> (String, usize) {
     let mut out = String::new();
     let mut pos = start + 1;
     while pos < text.len() {
@@ -554,7 +621,9 @@ impl Parser {
         Self { tokens, pos: 0 }
     }
 
-    fn parse_prefix_explain(&mut self) -> Result<Option<Spanned<AstMethod>>, Vec<OqlDiagnostic>> {
+    fn parse_prefix_explain(
+        &mut self,
+    ) -> Result<Option<Spanned<AstMethod>>, Vec<CoveQlDiagnostic>> {
         let start = self.current().span.start;
         let TokenKind::Identifier(value, _) = &self.current().kind else {
             return Ok(None);
@@ -576,9 +645,20 @@ impl Parser {
         )))
     }
 
-    fn parse_root(&mut self) -> Result<Spanned<AstRoot>, Vec<OqlDiagnostic>> {
+    fn parse_root(&mut self) -> Result<Spanned<AstRoot>, Vec<CoveQlDiagnostic>> {
         let start = self.current().span.start;
-        if self.current_identifier_is("association") || self.current_is_association_direction() {
+        if self.current_identifier_is("object")
+            && self.peek_discriminant(1) == TokenDiscriminant::LParen
+        {
+            self.advance();
+            self.expect(TokenDiscriminant::LParen, "expected '(' after object")?;
+            let identifier = self.parse_identifier("expected object type identifier")?;
+            self.expect(TokenDiscriminant::RParen, "expected ')' after object root")?;
+            let span = SourceSpan::new(start, self.previous_span_end());
+            Ok(Spanned::new(AstRoot::Object(identifier), span))
+        } else if self.current_identifier_is("association")
+            || self.current_is_directed_association_expr()
+        {
             let association = self.parse_association_expr_target()?;
             let span = SourceSpan::new(start, self.previous_span_end());
             Ok(Spanned::new(AstRoot::Association(association), span))
@@ -596,14 +676,62 @@ impl Parser {
             )?;
             let span = SourceSpan::new(start, self.previous_span_end());
             Ok(Spanned::new(AstRoot::Projection(projection), span))
+        } else if self.current_identifier_is("table")
+            && self.peek_discriminant(1) == TokenDiscriminant::LParen
+        {
+            self.advance();
+            self.expect(TokenDiscriminant::LParen, "expected '(' after table")?;
+            let table = self.parse_identifier("expected table identifier")?;
+            self.expect(TokenDiscriminant::RParen, "expected ')' after table root")?;
+            let span = SourceSpan::new(start, self.previous_span_end());
+            Ok(Spanned::new(AstRoot::Table(table), span))
+        } else if self.current_identifier_is("node")
+            && self.peek_discriminant(1) == TokenDiscriminant::LParen
+        {
+            self.advance();
+            self.expect(TokenDiscriminant::LParen, "expected '(' after node")?;
+            let node = self.parse_identifier("expected graph node label")?;
+            self.expect(TokenDiscriminant::RParen, "expected ')' after node root")?;
+            let span = SourceSpan::new(start, self.previous_span_end());
+            Ok(Spanned::new(AstRoot::Node(node), span))
+        } else if self.current_identifier_is("edge")
+            && self.peek_discriminant(1) == TokenDiscriminant::LParen
+        {
+            let edge = self.parse_graph_edge_expr()?;
+            let span = SourceSpan::new(start, self.previous_span_end());
+            Ok(Spanned::new(AstRoot::Edge(edge), span))
+        } else if self.current_identifier_is("path")
+            && self.peek_discriminant(1) == TokenDiscriminant::LParen
+        {
+            let path = self.parse_path_root_expr()?;
+            let span = SourceSpan::new(start, self.previous_span_end());
+            Ok(Spanned::new(AstRoot::Path(path), span))
         } else {
-            let identifier = self.parse_identifier("expected Cove-OQL root")?;
+            let identifier = self.parse_identifier("expected CoveQL root")?;
             let span = SourceSpan::new(start, self.previous_span_end());
             Ok(Spanned::new(AstRoot::Object(identifier), span))
         }
     }
 
-    fn parse_method(&mut self) -> Result<Spanned<AstMethod>, Vec<OqlDiagnostic>> {
+    fn parse_optional_alias(&mut self) -> Result<Option<AstIdentifier>, Vec<CoveQlDiagnostic>> {
+        if self.current_identifier_is("as") {
+            self.advance();
+            Ok(Some(self.parse_identifier("expected alias after as")?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn parse_root_binding(&mut self) -> Result<AstRootBinding, Vec<CoveQlDiagnostic>> {
+        let root = self.parse_root()?;
+        let alias = self.parse_optional_alias()?;
+        Ok(AstRootBinding {
+            root: Box::new(root),
+            alias,
+        })
+    }
+
+    fn parse_method(&mut self) -> Result<Spanned<AstMethod>, Vec<CoveQlDiagnostic>> {
         let start = self.current().span.start;
         let name = self.parse_identifier("expected method name")?;
         match name.name.as_str() {
@@ -762,16 +890,86 @@ impl Parser {
                 self.expect(TokenDiscriminant::RParen, "expected ')' after explain")?;
                 Ok(self.spanned(start, AstMethod::Explain(mode)))
             }
-            other => Err(vec![diagnostic_with_span(
-                "E_UNSUPPORTED_CONSTRUCT",
-                format!("unsupported Cove-OQL method {other}"),
-                "parse",
-                SourceSpan::new(start, self.previous_span_end()),
-            )]),
+            _ => self.parse_profile_method_call(start, name),
         }
     }
 
-    fn parse_select_item(&mut self) -> Result<AstSelectItem, Vec<OqlDiagnostic>> {
+    fn parse_profile_method_call(
+        &mut self,
+        start: usize,
+        name: AstIdentifier,
+    ) -> Result<Spanned<AstMethod>, Vec<CoveQlDiagnostic>> {
+        self.expect(
+            TokenDiscriminant::LParen,
+            "expected '(' after profile method",
+        )?;
+        let args = self.parse_profile_arguments(TokenDiscriminant::RParen)?;
+        Ok(self.spanned(start, AstMethod::ProfileCall { name, args }))
+    }
+
+    fn parse_profile_arguments(
+        &mut self,
+        end: TokenDiscriminant,
+    ) -> Result<Vec<AstProfileArgument>, Vec<CoveQlDiagnostic>> {
+        let mut args = Vec::new();
+        if !self.at(end) {
+            loop {
+                args.push(self.parse_profile_argument()?);
+                if !self.match_token(TokenDiscriminant::Comma) {
+                    break;
+                }
+            }
+        }
+        self.expect(end, "expected ')' after profile argument list")?;
+        Ok(args)
+    }
+
+    fn parse_profile_argument(&mut self) -> Result<AstProfileArgument, Vec<CoveQlDiagnostic>> {
+        if self.peek_discriminant(0) == TokenDiscriminant::Identifier
+            && self.peek_discriminant(1) == TokenDiscriminant::Colon
+        {
+            let name = self.parse_identifier("expected named argument")?;
+            self.expect(
+                TokenDiscriminant::Colon,
+                "expected ':' after named argument",
+            )?;
+            let value = if name.name == "on" {
+                AstProfileArgumentValue::Predicate(self.parse_predicate()?)
+            } else {
+                AstProfileArgumentValue::Expr(self.parse_profile_argument_expr()?)
+            };
+            Ok(AstProfileArgument {
+                name: Some(name),
+                value,
+            })
+        } else {
+            Ok(AstProfileArgument {
+                name: None,
+                value: AstProfileArgumentValue::Expr(self.parse_profile_argument_expr()?),
+            })
+        }
+    }
+
+    fn parse_profile_argument_expr(&mut self) -> Result<Spanned<AstExpr>, Vec<CoveQlDiagnostic>> {
+        let start = self.current().span.start;
+        if self.current_is_relationship_expr() {
+            let relationship = self.parse_relationship_expr()?;
+            return Ok(Spanned::new(
+                AstExpr::Relationship(relationship),
+                SourceSpan::new(start, self.previous_span_end()),
+            ));
+        }
+        if self.current_is_root_expr() {
+            let binding = self.parse_root_binding()?;
+            return Ok(Spanned::new(
+                AstExpr::RootBinding(Box::new(binding)),
+                SourceSpan::new(start, self.previous_span_end()),
+            ));
+        }
+        self.parse_expr()
+    }
+
+    fn parse_select_item(&mut self) -> Result<AstSelectItem, Vec<CoveQlDiagnostic>> {
         if self.peek_discriminant(0) == TokenDiscriminant::Identifier
             && self.peek_discriminant(1) == TokenDiscriminant::Colon
         {
@@ -790,11 +988,11 @@ impl Parser {
         }
     }
 
-    fn parse_predicate(&mut self) -> Result<Spanned<AstPredicate>, Vec<OqlDiagnostic>> {
+    fn parse_predicate(&mut self) -> Result<Spanned<AstPredicate>, Vec<CoveQlDiagnostic>> {
         self.parse_or()
     }
 
-    fn parse_or(&mut self) -> Result<Spanned<AstPredicate>, Vec<OqlDiagnostic>> {
+    fn parse_or(&mut self) -> Result<Spanned<AstPredicate>, Vec<CoveQlDiagnostic>> {
         let mut parts = vec![self.parse_and()?];
         while self.match_token(TokenDiscriminant::OrOr) {
             parts.push(self.parse_and()?);
@@ -809,7 +1007,7 @@ impl Parser {
         }
     }
 
-    fn parse_and(&mut self) -> Result<Spanned<AstPredicate>, Vec<OqlDiagnostic>> {
+    fn parse_and(&mut self) -> Result<Spanned<AstPredicate>, Vec<CoveQlDiagnostic>> {
         let mut parts = vec![self.parse_not()?];
         while self.match_token(TokenDiscriminant::AndAnd) {
             parts.push(self.parse_not()?);
@@ -824,7 +1022,7 @@ impl Parser {
         }
     }
 
-    fn parse_not(&mut self) -> Result<Spanned<AstPredicate>, Vec<OqlDiagnostic>> {
+    fn parse_not(&mut self) -> Result<Spanned<AstPredicate>, Vec<CoveQlDiagnostic>> {
         if self.match_token(TokenDiscriminant::Bang) {
             let start = self.previous().span.start;
             let predicate = self.parse_not()?;
@@ -835,17 +1033,21 @@ impl Parser {
         }
     }
 
-    fn parse_compare(&mut self) -> Result<Spanned<AstPredicate>, Vec<OqlDiagnostic>> {
+    fn parse_compare(&mut self) -> Result<Spanned<AstPredicate>, Vec<CoveQlDiagnostic>> {
         if self.current_identifier_is("exists")
             && self.peek_discriminant(1) == TokenDiscriminant::LParen
         {
             let start = self.current().span.start;
             self.advance();
             self.expect(TokenDiscriminant::LParen, "expected '(' after exists")?;
-            let expr = self.parse_expr()?;
+            let target = self.parse_profile_argument_expr()?;
+            let mut args = Vec::new();
+            while self.match_token(TokenDiscriminant::Comma) {
+                args.push(self.parse_profile_argument()?);
+            }
             self.expect(TokenDiscriminant::RParen, "expected ')' after exists")?;
             return Ok(Spanned::new(
-                AstPredicate::Exists(expr),
+                AstPredicate::Exists { target, args },
                 SourceSpan::new(start, self.previous_span_end()),
             ));
         }
@@ -910,7 +1112,7 @@ impl Parser {
         Ok(Spanned::new(AstPredicate::BoolExpr(left), span))
     }
 
-    fn parse_expr(&mut self) -> Result<Spanned<AstExpr>, Vec<OqlDiagnostic>> {
+    fn parse_expr(&mut self) -> Result<Spanned<AstExpr>, Vec<CoveQlDiagnostic>> {
         let start = self.current().span.start;
         if self.match_token(TokenDiscriminant::LParen) {
             let expr = self.parse_expr()?;
@@ -947,6 +1149,20 @@ impl Parser {
                     SourceSpan::new(start, self.previous_span_end()),
                 ))
             }
+            TokenKind::Identifier(_, _) if self.current_is_relationship_expr() => {
+                let relationship = self.parse_relationship_expr()?;
+                Ok(Spanned::new(
+                    AstExpr::Relationship(relationship),
+                    SourceSpan::new(start, self.previous_span_end()),
+                ))
+            }
+            TokenKind::Identifier(_, _) if self.current_is_root_expr() => {
+                let binding = self.parse_root_binding()?;
+                Ok(Spanned::new(
+                    AstExpr::RootBinding(Box::new(binding)),
+                    SourceSpan::new(start, self.previous_span_end()),
+                ))
+            }
             TokenKind::Identifier(name, _)
                 if matches!(name.as_str(), "in" | "out" | "either")
                     && self.peek_discriminant(1) == TokenDiscriminant::LParen =>
@@ -968,7 +1184,7 @@ impl Parser {
         }
     }
 
-    fn parse_path_or_function_expr(&mut self) -> Result<Spanned<AstExpr>, Vec<OqlDiagnostic>> {
+    fn parse_path_or_function_expr(&mut self) -> Result<Spanned<AstExpr>, Vec<CoveQlDiagnostic>> {
         let start = self.current().span.start;
         let first = self.parse_identifier("expected identifier")?;
         if self.match_token(TokenDiscriminant::LParen) {
@@ -1037,7 +1253,7 @@ impl Parser {
         Ok(expr)
     }
 
-    fn parse_aggregate_expr(&mut self) -> Result<Spanned<AstExpr>, Vec<OqlDiagnostic>> {
+    fn parse_aggregate_expr(&mut self) -> Result<Spanned<AstExpr>, Vec<CoveQlDiagnostic>> {
         let start = self.current().span.start;
         let name_ident = self.parse_identifier("expected aggregate name")?;
         let name = aggregate_name(&name_ident.name).expect("guarded by caller");
@@ -1061,7 +1277,7 @@ impl Parser {
         ))
     }
 
-    fn parse_conditional_expr(&mut self) -> Result<Spanned<AstExpr>, Vec<OqlDiagnostic>> {
+    fn parse_conditional_expr(&mut self) -> Result<Spanned<AstExpr>, Vec<CoveQlDiagnostic>> {
         let start = self.current().span.start;
         self.expect_identifier("if")?;
         self.expect(TokenDiscriminant::LParen, "expected '(' after if")?;
@@ -1087,7 +1303,7 @@ impl Parser {
     fn parse_expr_args(
         &mut self,
         end: TokenDiscriminant,
-    ) -> Result<Vec<Spanned<AstExpr>>, Vec<OqlDiagnostic>> {
+    ) -> Result<Vec<Spanned<AstExpr>>, Vec<CoveQlDiagnostic>> {
         let mut args = Vec::new();
         if !self.at(end) {
             loop {
@@ -1104,7 +1320,7 @@ impl Parser {
     fn parse_association_expr(
         &mut self,
         direction: Option<AstAssociationDirection>,
-    ) -> Result<AstAssociationExpr, Vec<OqlDiagnostic>> {
+    ) -> Result<AstAssociationExpr, Vec<CoveQlDiagnostic>> {
         self.expect_identifier("association")?;
         self.expect(TokenDiscriminant::LParen, "expected '(' after association")?;
         let type_name = self.parse_identifier("expected association type")?;
@@ -1130,7 +1346,96 @@ impl Parser {
         })
     }
 
-    fn parse_association_expr_target(&mut self) -> Result<AstAssociationExpr, Vec<OqlDiagnostic>> {
+    fn parse_graph_edge_expr(&mut self) -> Result<AstGraphEdgeExpr, Vec<CoveQlDiagnostic>> {
+        self.expect_identifier("edge")?;
+        self.expect(TokenDiscriminant::LParen, "expected '(' after edge")?;
+        let type_name = self.parse_identifier("expected edge label")?;
+        let mut role = None;
+        let mut role_name = None;
+        if self.match_token(TokenDiscriminant::Comma) {
+            let role_key = self.parse_identifier("expected edge role key")?;
+            role = Some(match role_key.name.as_str() {
+                "role" => AstAssociationRole::Role,
+                "from" => AstAssociationRole::From,
+                "to" => AstAssociationRole::To,
+                _ => return Err(self.err_previous("expected role, from, or to")),
+            });
+            self.expect(TokenDiscriminant::Colon, "expected ':' after role key")?;
+            role_name = Some(self.parse_identifier("expected edge role value")?);
+        }
+        self.expect(TokenDiscriminant::RParen, "expected ')' after edge")?;
+        Ok(AstGraphEdgeExpr {
+            type_name,
+            role,
+            role_name,
+        })
+    }
+
+    fn parse_relationship_expr(&mut self) -> Result<AstRelationshipExpr, Vec<CoveQlDiagnostic>> {
+        let Some(direction) = self.current_association_direction() else {
+            return Err(self.err_current("expected relationship direction"));
+        };
+        self.advance();
+        self.expect(
+            TokenDiscriminant::LParen,
+            "expected '(' after relationship direction",
+        )?;
+        let edge = self.parse_graph_edge_expr()?;
+        let edge_alias = self.parse_optional_alias()?;
+        self.expect(
+            TokenDiscriminant::RParen,
+            "expected ')' after relationship edge",
+        )?;
+        let target = if self.peek_discriminant(0) == TokenDiscriminant::Dot
+            && matches!(self.peek_identifier(1).as_deref(), Some("to"))
+            && self.peek_discriminant(2) == TokenDiscriminant::LParen
+        {
+            self.advance();
+            self.expect_identifier("to")?;
+            self.expect(TokenDiscriminant::LParen, "expected '(' after to")?;
+            let binding = self.parse_root_binding()?;
+            self.expect(TokenDiscriminant::RParen, "expected ')' after to target")?;
+            Some(Box::new(binding))
+        } else {
+            None
+        };
+        Ok(AstRelationshipExpr {
+            direction,
+            edge,
+            edge_alias,
+            target,
+        })
+    }
+
+    fn parse_path_root_expr(&mut self) -> Result<AstPathRootExpr, Vec<CoveQlDiagnostic>> {
+        self.expect_identifier("path")?;
+        self.expect(TokenDiscriminant::LParen, "expected '(' after path")?;
+        let start = self.parse_root_binding()?;
+        if !matches!(&start.root.node, AstRoot::Node(_)) {
+            return Err(vec![diagnostic_with_span(
+                "E_PARSE",
+                "path(...) must start with node(...) in CoveQL/Graph",
+                "parse",
+                start.root.span,
+            )]);
+        }
+        let mut relationships = Vec::new();
+        while self.match_token(TokenDiscriminant::Dot) {
+            relationships.push(self.parse_relationship_expr()?);
+        }
+        if relationships.is_empty() {
+            return Err(self.err_current("path(...) requires at least one relationship"));
+        }
+        self.expect(TokenDiscriminant::RParen, "expected ')' after path")?;
+        Ok(AstPathRootExpr {
+            start,
+            relationships,
+        })
+    }
+
+    fn parse_association_expr_target(
+        &mut self,
+    ) -> Result<AstAssociationExpr, Vec<CoveQlDiagnostic>> {
         if self.current_identifier_is("association") {
             return self.parse_association_expr(None);
         }
@@ -1150,7 +1455,7 @@ impl Parser {
         Ok(association)
     }
 
-    fn parse_evidence_expr(&mut self) -> Result<AstEvidenceExpr, Vec<OqlDiagnostic>> {
+    fn parse_evidence_expr(&mut self) -> Result<AstEvidenceExpr, Vec<CoveQlDiagnostic>> {
         self.expect_identifier("evidence")?;
         self.expect(TokenDiscriminant::LParen, "expected '(' after evidence")?;
         let mut target = None;
@@ -1175,7 +1480,7 @@ impl Parser {
         Ok(AstEvidenceExpr { target, grain })
     }
 
-    fn parse_evidence_target(&mut self) -> Result<AstEvidenceTarget, Vec<OqlDiagnostic>> {
+    fn parse_evidence_target(&mut self) -> Result<AstEvidenceTarget, Vec<CoveQlDiagnostic>> {
         if self.current_identifier_is("self") {
             self.advance();
             return Ok(AstEvidenceTarget::SelfTarget);
@@ -1194,11 +1499,16 @@ impl Parser {
             self.expect(TokenDiscriminant::RParen, "expected ')' after projection")?;
             return Ok(AstEvidenceTarget::Projection(id));
         }
+        if self.current_is_root_expr() {
+            return Ok(AstEvidenceTarget::RootBinding(Box::new(
+                self.parse_root_binding()?,
+            )));
+        }
         let path = self.parse_path()?;
         Ok(AstEvidenceTarget::Path(path.node))
     }
 
-    fn parse_path(&mut self) -> Result<Spanned<AstPath>, Vec<OqlDiagnostic>> {
+    fn parse_path(&mut self) -> Result<Spanned<AstPath>, Vec<CoveQlDiagnostic>> {
         let start = self.current().span.start;
         let mut parts = vec![self.parse_identifier("expected path identifier")?];
         while self.match_token(TokenDiscriminant::Dot) {
@@ -1210,7 +1520,7 @@ impl Parser {
         ))
     }
 
-    fn parse_time_bound(&mut self) -> Result<AstTimeBound, Vec<OqlDiagnostic>> {
+    fn parse_time_bound(&mut self) -> Result<AstTimeBound, Vec<CoveQlDiagnostic>> {
         let key = self.parse_identifier("expected asOf bound key")?;
         self.expect(
             TokenDiscriminant::Colon,
@@ -1231,7 +1541,7 @@ impl Parser {
         }
     }
 
-    fn parse_change_bound(&mut self) -> Result<AstChangeBound, Vec<OqlDiagnostic>> {
+    fn parse_change_bound(&mut self) -> Result<AstChangeBound, Vec<CoveQlDiagnostic>> {
         if matches!(self.peek_identifier(0).as_deref(), Some("from" | "to"))
             && self.peek_discriminant(1) == TokenDiscriminant::Colon
         {
@@ -1272,7 +1582,7 @@ impl Parser {
         }
     }
 
-    fn parse_branch_selector(&mut self) -> Result<AstBranchSelector, Vec<OqlDiagnostic>> {
+    fn parse_branch_selector(&mut self) -> Result<AstBranchSelector, Vec<CoveQlDiagnostic>> {
         match self.current().kind.clone() {
             TokenKind::Identifier(_, _) => Ok(AstBranchSelector::Identifier(
                 self.parse_identifier("expected branch selector")?,
@@ -1288,7 +1598,7 @@ impl Parser {
         }
     }
 
-    fn parse_literal(&mut self) -> Result<Spanned<AstLiteral>, Vec<OqlDiagnostic>> {
+    fn parse_literal(&mut self) -> Result<Spanned<AstLiteral>, Vec<CoveQlDiagnostic>> {
         let token = self.current().clone();
         self.advance();
         let literal = match token.kind {
@@ -1305,7 +1615,7 @@ impl Parser {
         Ok(Spanned::new(literal, token.span))
     }
 
-    fn parse_timestamp_literal(&mut self) -> Result<String, Vec<OqlDiagnostic>> {
+    fn parse_timestamp_literal(&mut self) -> Result<String, Vec<CoveQlDiagnostic>> {
         match self.current().kind.clone() {
             TokenKind::String(value) => {
                 self.advance();
@@ -1315,7 +1625,7 @@ impl Parser {
         }
     }
 
-    fn parse_boolean(&mut self) -> Result<bool, Vec<OqlDiagnostic>> {
+    fn parse_boolean(&mut self) -> Result<bool, Vec<CoveQlDiagnostic>> {
         if self.match_token(TokenDiscriminant::True) {
             Ok(true)
         } else if self.match_token(TokenDiscriminant::False) {
@@ -1325,7 +1635,7 @@ impl Parser {
         }
     }
 
-    fn parse_history_mode(&mut self) -> Result<AstHistoryMode, Vec<OqlDiagnostic>> {
+    fn parse_history_mode(&mut self) -> Result<AstHistoryMode, Vec<CoveQlDiagnostic>> {
         let ident = self.parse_identifier("expected history mode")?;
         match ident.name.as_str() {
             "records" => Ok(AstHistoryMode::Records),
@@ -1338,26 +1648,31 @@ impl Parser {
         }
     }
 
-    fn parse_change_mode(&mut self) -> Result<AstChangeMode, Vec<OqlDiagnostic>> {
+    fn parse_change_mode(&mut self) -> Result<AstChangeMode, Vec<CoveQlDiagnostic>> {
         let ident = self.parse_identifier("expected changes mode")?;
         match ident.name.as_str() {
             "records" => Ok(AstChangeMode::Records),
             "state_transitions" => Ok(AstChangeMode::StateTransitions),
             "property_diffs" => Ok(AstChangeMode::PropertyDiffs),
-            "final_objects" => Ok(AstChangeMode::FinalObjects),
+            "final_rows" | "final_objects" => Ok(AstChangeMode::FinalRows),
             _ => {
                 Err(self.err_previous_code("E_UNSUPPORTED_CHANGE_MODE", "unsupported changes mode"))
             }
         }
     }
 
-    fn parse_evidence_grain(&mut self) -> Result<AstEvidenceGrain, Vec<OqlDiagnostic>> {
+    fn parse_evidence_grain(&mut self) -> Result<AstEvidenceGrain, Vec<CoveQlDiagnostic>> {
         let ident = self.parse_identifier("expected evidence grain")?;
         match ident.name.as_str() {
             "object" => Ok(AstEvidenceGrain::Object),
             "property" => Ok(AstEvidenceGrain::Property),
             "association" => Ok(AstEvidenceGrain::Association),
             "row" => Ok(AstEvidenceGrain::Row),
+            "column" => Ok(AstEvidenceGrain::Column),
+            "projection" => Ok(AstEvidenceGrain::Projection),
+            "node" => Ok(AstEvidenceGrain::Node),
+            "edge" => Ok(AstEvidenceGrain::Edge),
+            "path" => Ok(AstEvidenceGrain::Path),
             "source" => Ok(AstEvidenceGrain::Source),
             _ => {
                 Err(self
@@ -1366,7 +1681,7 @@ impl Parser {
         }
     }
 
-    fn parse_explain_mode(&mut self) -> Result<ExplainMode, Vec<OqlDiagnostic>> {
+    fn parse_explain_mode(&mut self) -> Result<ExplainMode, Vec<CoveQlDiagnostic>> {
         let value = match self.current().kind.clone() {
             TokenKind::Identifier(value, _) | TokenKind::String(value) => {
                 self.advance();
@@ -1391,7 +1706,7 @@ impl Parser {
         explain_mode_from_str(value)
     }
 
-    fn parse_u64(&mut self, message: &'static str) -> Result<u64, Vec<OqlDiagnostic>> {
+    fn parse_u64(&mut self, message: &'static str) -> Result<u64, Vec<CoveQlDiagnostic>> {
         let token = self.current().clone();
         match token.kind {
             TokenKind::Integer(value) if !value.starts_with('-') => {
@@ -1407,18 +1722,22 @@ impl Parser {
     fn parse_identifier(
         &mut self,
         message: &'static str,
-    ) -> Result<AstIdentifier, Vec<OqlDiagnostic>> {
+    ) -> Result<AstIdentifier, Vec<CoveQlDiagnostic>> {
         let token = self.current().clone();
         match token.kind {
             TokenKind::Identifier(value, quoted) => {
                 self.advance();
                 Ok(AstIdentifier::new(value, quoted))
             }
+            TokenKind::String(value) => {
+                self.advance();
+                Ok(AstIdentifier::new(value, true))
+            }
             _ => Err(self.err_current(message)),
         }
     }
 
-    fn expect_identifier(&mut self, expected: &str) -> Result<(), Vec<OqlDiagnostic>> {
+    fn expect_identifier(&mut self, expected: &str) -> Result<(), Vec<CoveQlDiagnostic>> {
         if self.current_identifier_is(expected) {
             self.advance();
             Ok(())
@@ -1445,7 +1764,7 @@ impl Parser {
         &mut self,
         kind: TokenDiscriminant,
         message: impl Into<String>,
-    ) -> Result<(), Vec<OqlDiagnostic>> {
+    ) -> Result<(), Vec<CoveQlDiagnostic>> {
         if self.at(kind) {
             self.advance();
             Ok(())
@@ -1474,6 +1793,26 @@ impl Parser {
     fn current_is_association_direction(&self) -> bool {
         self.current_association_direction().is_some()
             && self.peek_discriminant(1) == TokenDiscriminant::LParen
+    }
+
+    fn current_is_directed_association_expr(&self) -> bool {
+        self.current_is_association_direction()
+            && matches!(self.peek_identifier(2).as_deref(), Some("association"))
+    }
+
+    fn current_is_relationship_expr(&self) -> bool {
+        self.current_is_association_direction()
+            && matches!(self.peek_identifier(2).as_deref(), Some("edge"))
+    }
+
+    fn current_is_root_expr(&self) -> bool {
+        let Some(name) = self.peek_identifier(0) else {
+            return false;
+        };
+        matches!(
+            name.as_str(),
+            "object" | "table" | "node" | "edge" | "path" | "projection"
+        ) && self.peek_discriminant(1) == TokenDiscriminant::LParen
     }
 
     fn current_association_direction(&self) -> Option<AstAssociationDirection> {
@@ -1523,7 +1862,7 @@ impl Parser {
         Spanned::new(method, SourceSpan::new(start, self.previous_span_end()))
     }
 
-    fn err_current(&self, message: impl Into<String>) -> Vec<OqlDiagnostic> {
+    fn err_current(&self, message: impl Into<String>) -> Vec<CoveQlDiagnostic> {
         vec![diagnostic_with_span(
             "E_PARSE",
             message,
@@ -1532,7 +1871,7 @@ impl Parser {
         )]
     }
 
-    fn err_previous(&self, message: impl Into<String>) -> Vec<OqlDiagnostic> {
+    fn err_previous(&self, message: impl Into<String>) -> Vec<CoveQlDiagnostic> {
         vec![diagnostic_with_span(
             "E_PARSE",
             message,
@@ -1545,7 +1884,7 @@ impl Parser {
         &self,
         code: impl Into<String>,
         message: impl Into<String>,
-    ) -> Vec<OqlDiagnostic> {
+    ) -> Vec<CoveQlDiagnostic> {
         vec![diagnostic_with_span(
             code,
             message,
@@ -1600,6 +1939,7 @@ fn resource_use_for(
 fn root_depth(root: &Spanned<AstRoot>) -> usize {
     match &root.node {
         AstRoot::Evidence(evidence) => 1 + evidence_depth(evidence),
+        AstRoot::Path(path) => 1 + path_root_depth(path),
         _ => 1,
     }
 }
@@ -1614,6 +1954,9 @@ fn method_depth(method: &Spanned<AstMethod>) -> usize {
             .unwrap_or(1),
         AstMethod::OrderBy(order) => expr_depth(&order.expr),
         AstMethod::GroupBy(exprs) => exprs.iter().map(expr_depth).max().unwrap_or(1),
+        AstMethod::ProfileCall { args, .. } => {
+            1 + args.iter().map(profile_argument_depth).max().unwrap_or(0)
+        }
         _ => 1,
     }
 }
@@ -1623,7 +1966,9 @@ fn predicate_depth(predicate: &Spanned<AstPredicate>) -> usize {
         AstPredicate::Compare { left, right, .. } => 1 + expr_depth(left).max(expr_depth(right)),
         AstPredicate::InList { expr, .. } => 1 + expr_depth(expr),
         AstPredicate::NullCheck { expr, .. } | AstPredicate::BoolExpr(expr) => 1 + expr_depth(expr),
-        AstPredicate::Exists(expr) => 1 + expr_depth(expr),
+        AstPredicate::Exists { target, args } => {
+            1 + expr_depth(target) + args.iter().map(profile_argument_depth).max().unwrap_or(0)
+        }
         AstPredicate::Not(inner) => 1 + predicate_depth(inner),
         AstPredicate::And(parts) | AstPredicate::Or(parts) => {
             1 + parts.iter().map(predicate_depth).max().unwrap_or(0)
@@ -1636,6 +1981,8 @@ fn expr_depth(expr: &Spanned<AstExpr>) -> usize {
         AstExpr::FunctionCall { args, .. } => 1 + args.iter().map(expr_depth).max().unwrap_or(0),
         AstExpr::AggregateCall { arg, .. } => 1 + arg.as_deref().map(expr_depth).unwrap_or(0),
         AstExpr::Evidence(evidence) => 1 + evidence_depth(evidence),
+        AstExpr::Relationship(relationship) => 1 + relationship_depth(relationship),
+        AstExpr::RootBinding(binding) => 1 + root_binding_depth(binding),
         AstExpr::Conditional {
             predicate,
             then_expr,
@@ -1649,9 +1996,39 @@ fn expr_depth(expr: &Spanned<AstExpr>) -> usize {
     }
 }
 
+fn profile_argument_depth(argument: &AstProfileArgument) -> usize {
+    match &argument.value {
+        AstProfileArgumentValue::Expr(expr) => expr_depth(expr),
+        AstProfileArgumentValue::Predicate(predicate) => predicate_depth(predicate),
+    }
+}
+
+fn root_binding_depth(binding: &AstRootBinding) -> usize {
+    1 + root_depth(&binding.root)
+}
+
+fn relationship_depth(relationship: &AstRelationshipExpr) -> usize {
+    1 + relationship
+        .target
+        .as_deref()
+        .map(root_binding_depth)
+        .unwrap_or(0)
+}
+
+fn path_root_depth(path: &AstPathRootExpr) -> usize {
+    1 + root_binding_depth(&path.start)
+        + path
+            .relationships
+            .iter()
+            .map(relationship_depth)
+            .max()
+            .unwrap_or(0)
+}
+
 fn evidence_depth(evidence: &AstEvidenceExpr) -> usize {
     match &evidence.target {
         Some(AstEvidenceTarget::Association(_)) | Some(AstEvidenceTarget::Projection(_)) => 2,
+        Some(AstEvidenceTarget::RootBinding(binding)) => 1 + root_binding_depth(binding),
         Some(AstEvidenceTarget::Path(_)) | Some(AstEvidenceTarget::SelfTarget) | None => 1,
     }
 }
@@ -1659,6 +2036,7 @@ fn evidence_depth(evidence: &AstEvidenceExpr) -> usize {
 fn method_in_list_size(method: &Spanned<AstMethod>) -> usize {
     match &method.node {
         AstMethod::Where(predicate) => predicate_in_list_size(predicate),
+        AstMethod::ProfileCall { args, .. } => args.iter().map(profile_argument_in_list_size).sum(),
         _ => 0,
     }
 }
@@ -1670,13 +2048,24 @@ fn predicate_in_list_size(predicate: &Spanned<AstPredicate>) -> usize {
         AstPredicate::And(parts) | AstPredicate::Or(parts) => {
             parts.iter().map(predicate_in_list_size).sum()
         }
+        AstPredicate::Exists { args, .. } => args.iter().map(profile_argument_in_list_size).sum(),
         _ => 0,
+    }
+}
+
+fn profile_argument_in_list_size(argument: &AstProfileArgument) -> usize {
+    match &argument.value {
+        AstProfileArgumentValue::Expr(_) => 0,
+        AstProfileArgumentValue::Predicate(predicate) => predicate_in_list_size(predicate),
     }
 }
 
 fn method_disjunction_count(method: &Spanned<AstMethod>) -> usize {
     match &method.node {
         AstMethod::Where(predicate) => predicate_disjunction_count(predicate),
+        AstMethod::ProfileCall { args, .. } => {
+            args.iter().map(profile_argument_disjunction_count).sum()
+        }
         _ => 0,
     }
 }
@@ -1689,14 +2078,24 @@ fn predicate_disjunction_count(predicate: &Spanned<AstPredicate>) -> usize {
         }
         AstPredicate::And(parts) => parts.iter().map(predicate_disjunction_count).sum(),
         AstPredicate::Not(inner) => predicate_disjunction_count(inner),
+        AstPredicate::Exists { args, .. } => {
+            args.iter().map(profile_argument_disjunction_count).sum()
+        }
         _ => 0,
+    }
+}
+
+fn profile_argument_disjunction_count(argument: &AstProfileArgument) -> usize {
+    match &argument.value {
+        AstProfileArgumentValue::Expr(_) => 0,
+        AstProfileArgumentValue::Predicate(predicate) => predicate_disjunction_count(predicate),
     }
 }
 
 fn check_parse_budgets(
     budget: &crate::ResourceBudgetPolicy,
     usage: &ResourceUseEstimate,
-) -> Result<(), Vec<OqlDiagnostic>> {
+) -> Result<(), Vec<CoveQlDiagnostic>> {
     let checks = [
         (
             "maximum_ast_depth",
@@ -1779,8 +2178,8 @@ fn diagnostic(
     code: impl Into<String>,
     message: impl Into<String>,
     phase: impl Into<String>,
-) -> OqlDiagnostic {
-    OqlDiagnostic {
+) -> CoveQlDiagnostic {
+    CoveQlDiagnostic {
         code: code.into(),
         severity: DiagnosticSeverity::Error,
         message: message.into(),
@@ -1795,8 +2194,8 @@ fn diagnostic_with_span(
     message: impl Into<String>,
     phase: impl Into<String>,
     span: SourceSpan,
-) -> OqlDiagnostic {
-    OqlDiagnostic {
+) -> CoveQlDiagnostic {
+    CoveQlDiagnostic {
         code: code.into(),
         severity: DiagnosticSeverity::Error,
         message: message.into(),
@@ -1829,7 +2228,7 @@ mod tests {
     #[test]
     fn lexer_ignores_directive_and_whitespace_for_query_fingerprint() {
         let a = parse_query(
-            "# cove-oql:0.1\nPerson.where(name == \"Ada\")",
+            "# coveql:0.1\nPerson.where(name == \"Ada\")",
             ParseOptions::default(),
         )
         .unwrap();
@@ -1846,6 +2245,34 @@ mod tests {
         let a = parse_query("Person.select(name)", ParseOptions::default()).unwrap();
         let b = parse_query("`Person`.select(`name`)", ParseOptions::default()).unwrap();
         assert_eq!(a.parsed_ast_fingerprint, b.parsed_ast_fingerprint);
+    }
+
+    #[test]
+    fn double_quoted_identifier_positions_parse_as_quoted_identifiers() {
+        let parsed = parse_query(
+            r#"table("order-history") as o.select(o."customer id")"#,
+            ParseOptions::default(),
+        )
+        .unwrap();
+        let AstRoot::Table(table) = &parsed.root.node else {
+            panic!("expected table root");
+        };
+        assert_eq!(table.name, "order-history");
+        let alias = parsed.root_alias.as_ref().expect("expected table alias");
+        assert_eq!(alias.name, "o");
+        let AstMethod::Select(select) = &parsed.methods[0].node else {
+            panic!("expected select");
+        };
+        let AstExpr::Path(path) = &select[0].expr.node else {
+            panic!("expected path");
+        };
+        assert_eq!(
+            path.parts
+                .iter()
+                .map(|part| part.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["o", "customer id"]
+        );
     }
 
     #[test]

@@ -23,7 +23,7 @@ members = [
     "crates/cove-coverage",
     "crates/cove-index",
     "crates/cove-cache",
-    "crates/cove-oql",
+    "crates/coveql",
     "crates/cove-fuzz",
     "vendor/orc-rust",
 ]

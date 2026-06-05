@@ -114,6 +114,13 @@ impl LogicalPlanDependencySet {
         if let Some(predicate) = &resolved.method_chain.where_predicate {
             dependencies.record_predicate(predicate);
         }
+        for lookup in &resolved.method_chain.lookups {
+            dependencies.record_table_root(&lookup.right);
+            dependencies.record_predicate(&lookup.on);
+        }
+        for traversal in &resolved.method_chain.traversals {
+            dependencies.record_graph_traversal(traversal);
+        }
         if let Some(select) = &resolved.method_chain.select {
             for item in select {
                 dependencies.record_expr(&item.expr);
@@ -149,10 +156,29 @@ impl LogicalPlanDependencySet {
                     self.property_ids.insert(id);
                 }
             }
+            ResolvedRoot::Node(node) => {
+                self.object_type_ids.insert(node.object.object_type_id);
+                self.object_type_names.insert(node.object.type_name.clone());
+            }
+            ResolvedRoot::Edge(edge) => {
+                let association = &edge.association;
+                self.object_type_ids.insert(association.object_type_id);
+                self.object_type_names.insert(association.type_name.clone());
+                self.association_type_ids.insert(association.object_type_id);
+                if let Some(id) = association.source_property_id {
+                    self.property_ids.insert(id);
+                }
+                if let Some(id) = association.target_property_id {
+                    self.property_ids.insert(id);
+                }
+            }
             ResolvedRoot::Projection(projection) => {
                 self.projection_ids.insert(projection.projection_id.clone());
                 self.projection_columns
                     .extend(projection.columns.iter().map(|column| column.name.clone()));
+            }
+            ResolvedRoot::Table(table) => {
+                self.record_table_root(table);
             }
             ResolvedRoot::Evidence(evidence) => {
                 self.evidence_fields.insert("evidence_index".into());
@@ -165,6 +191,18 @@ impl LogicalPlanDependencySet {
                 }
             }
         }
+    }
+
+    fn record_table_root(&mut self, table: &crate::ResolvedTableRoot) {
+        self.projection_ids
+            .insert(table.projection.projection_id.clone());
+        self.projection_columns.extend(
+            table
+                .projection
+                .columns
+                .iter()
+                .map(|column| column.name.clone()),
+        );
     }
 
     pub fn record_predicate(&mut self, predicate: &ResolvedPredicate) {
@@ -207,24 +245,7 @@ impl LogicalPlanDependencySet {
                 }
             }
             ResolvedExpr::Association(association) => {
-                self.object_type_ids.insert(association.object_type_id);
-                self.object_type_names.insert(association.type_name.clone());
-                self.association_type_ids.insert(association.object_type_id);
-                if let Some(id) = association.source_property_id {
-                    self.property_ids.insert(id);
-                }
-                if let Some(id) = association.target_property_id {
-                    self.property_ids.insert(id);
-                }
-                if let Some(id) = association.association_type_property_id {
-                    self.property_ids.insert(id);
-                }
-                if let Some(id) = association.valid_from_property_id {
-                    self.property_ids.insert(id);
-                }
-                if let Some(id) = association.valid_to_property_id {
-                    self.property_ids.insert(id);
-                }
+                self.record_association_root(association);
             }
             ResolvedExpr::Evidence(evidence) => {
                 self.evidence_fields.insert("evidence_index".into());
@@ -236,6 +257,10 @@ impl LogicalPlanDependencySet {
                         .insert(format!("mapping_version:{mapping_version}"));
                 }
             }
+            ResolvedExpr::TableExists(exists) => {
+                self.record_table_root(&exists.right);
+                self.record_predicate(&exists.on);
+            }
             ResolvedExpr::Conditional {
                 predicate,
                 then_expr,
@@ -246,6 +271,42 @@ impl LogicalPlanDependencySet {
                 self.record_expr(then_expr);
                 self.record_expr(else_expr);
             }
+        }
+    }
+
+    fn record_graph_traversal(&mut self, traversal: &crate::ResolvedGraphTraversal) {
+        self.record_association_root(&traversal.edge.association);
+        if let Some(target) = &traversal.target {
+            self.object_type_ids.insert(target.object.object_type_id);
+            self.object_type_names
+                .insert(target.object.type_name.clone());
+        }
+    }
+
+    fn record_association_root(&mut self, association: &crate::ResolvedAssociationRoot) {
+        self.object_type_ids.insert(association.object_type_id);
+        self.object_type_names.insert(association.type_name.clone());
+        self.association_type_ids.insert(association.object_type_id);
+        if let Some(id) = association.source_property_id {
+            self.property_ids.insert(id);
+        }
+        if let Some(id) = association.target_property_id {
+            self.property_ids.insert(id);
+        }
+        if let Some(id) = association.association_type_property_id {
+            self.property_ids.insert(id);
+        }
+        if let Some(id) = association.valid_from_property_id {
+            self.property_ids.insert(id);
+        }
+        if let Some(id) = association.valid_to_property_id {
+            self.property_ids.insert(id);
+        }
+        if let Some(id) = association.target_node_object_type_id {
+            self.object_type_ids.insert(id);
+        }
+        if let Some(label) = &association.target_node_label {
+            self.object_type_names.insert(label.clone());
         }
     }
 
@@ -262,8 +323,8 @@ impl LogicalPlanDependencySet {
         if let Some(projection_id) = &path.projection_id {
             self.projection_ids.insert(projection_id.clone());
         }
-        if let Some(column) = &path.projection_column {
-            self.projection_columns.insert(column.clone());
+        if path.projection_column.is_some() {
+            self.projection_columns.insert(projection_column_name(path));
         }
         if let Some(field) = &path.evidence_field_id {
             self.evidence_fields.insert(field.clone());
@@ -275,7 +336,7 @@ impl LogicalPlanDependencySet {
     }
 
     fn record_projection_contracts(&mut self, resolved: &crate::ResolvedQuery) {
-        if let ResolvedRoot::Projection(projection) = &resolved.root {
+        if let Some(projection) = projection_contract_root(&resolved.root) {
             let selected_columns =
                 selected_projection_columns(&resolved.method_chain.select, projection);
             let pushed_columns = projection_pushed_columns(resolved, &selected_columns);
@@ -434,6 +495,14 @@ impl LogicalPlanDependencySet {
                     ..ProjectionDependencyContract::default()
                 });
         }
+    }
+}
+
+fn projection_contract_root(root: &ResolvedRoot) -> Option<&crate::ResolvedProjectionRoot> {
+    match root {
+        ResolvedRoot::Projection(projection) => Some(projection),
+        ResolvedRoot::Table(table) => Some(&table.projection),
+        _ => None,
     }
 }
 
@@ -757,7 +826,7 @@ fn collect_function_requirements_from_expr(
                 reason: if declared_coded_safe {
                     "function declares a coded-safe contract, but projection execution still requires a precomputed projection column or residual verification".into()
                 } else {
-                    "function requires materialized projection values for OQL-equivalent output evaluation".into()
+                    "function requires materialized projection values for CoveQL-equivalent output evaluation".into()
                 },
             });
         }
@@ -780,6 +849,9 @@ fn collect_function_requirements_from_expr(
         | ResolvedExpr::Literal(_)
         | ResolvedExpr::Association(_)
         | ResolvedExpr::Evidence(_) => {}
+        ResolvedExpr::TableExists(exists) => {
+            collect_function_requirements_from_predicate(&exists.on, out);
+        }
     }
 }
 
@@ -821,6 +893,9 @@ fn collect_aggregate_requirements_from_expr(
         | ResolvedExpr::Literal(_)
         | ResolvedExpr::Association(_)
         | ResolvedExpr::Evidence(_) => {}
+        ResolvedExpr::TableExists(exists) => {
+            collect_aggregate_requirements_from_predicate(&exists.on, out);
+        }
     }
 }
 
@@ -978,9 +1053,18 @@ fn projection_non_null_literal_key(literal: &ResolvedLiteral) -> Option<String> 
 }
 
 fn projection_column_name(path: &ResolvedPath) -> String {
-    path.projection_column
+    let column = path
+        .projection_column
         .clone()
-        .unwrap_or_else(|| path.display_name.clone())
+        .unwrap_or_else(|| path.display_name.clone());
+    if matches!(path.root_kind, crate::ResolvedPathRootKind::Table) {
+        column
+            .rsplit_once('.')
+            .map(|(_, unqualified)| unqualified.to_string())
+            .unwrap_or(column)
+    } else {
+        column
+    }
 }
 
 fn negated_compare_op(op: crate::AstCompareOp) -> crate::AstCompareOp {
@@ -1016,8 +1100,8 @@ fn collect_projection_predicate_columns(predicate: &ResolvedPredicate, out: &mut
 fn collect_projection_expr_column(expr: &ResolvedExpr, out: &mut BTreeSet<String>) {
     match expr {
         ResolvedExpr::Path(path) => {
-            if let Some(column) = &path.projection_column {
-                out.insert(column.clone());
+            if path.projection_column.is_some() {
+                out.insert(projection_column_name(path));
             }
         }
         ResolvedExpr::FunctionCall { args, .. } => {
@@ -1039,6 +1123,9 @@ fn collect_projection_expr_column(expr: &ResolvedExpr, out: &mut BTreeSet<String
             collect_projection_predicate_columns(predicate, out);
             collect_projection_expr_column(then_expr, out);
             collect_projection_expr_column(else_expr, out);
+        }
+        ResolvedExpr::TableExists(exists) => {
+            collect_projection_predicate_columns(&exists.on, out);
         }
         ResolvedExpr::Association(_) | ResolvedExpr::Evidence(_) | ResolvedExpr::Literal(_) => {}
     }

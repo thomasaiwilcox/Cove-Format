@@ -2,26 +2,27 @@ use crate::{
     parse_and_resolve_query, parse_query, parse_resolve_and_plan_query, AstAggregateName,
     AstAssociationDirection, AstAssociationRole, AstChangeBound, AstChangeMode, AstEvidenceGrain,
     AstHistoryMode, AstNullOrdering, AstOrderDirection, AstTimeBound, AstTimeRole,
-    BuildLogicalPlanError, BuildResolvedQueryError, ExplainMode, OqlDiagnostic, ParseOptions,
-    ParsedQuery, PlanOptions, PlannedQuery, ResolveOptions, ResolvedQuery,
+    BuildLogicalPlanError, BuildResolvedQueryError, CoveQlDiagnostic, ExplainMode, ParseOptions,
+    ParsedQuery, PlanOptions, PlannedQuery, ResolveOptions, ResolvedQuery, TableLookupCardinality,
+    TableLookupDuplicatePolicy, TableLookupUnmatchedPolicy,
 };
 use cove_core::reader::ValidationOptions;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CoveOqlQueryBuilder {
+pub struct CoveQlQueryBuilder {
     root: String,
     methods: Vec<String>,
 }
 
-impl CoveOqlQueryBuilder {
+impl CoveQlQueryBuilder {
     pub fn object(type_name: impl AsRef<str>) -> Self {
-        Self::new(oql_identifier(type_name.as_ref()))
+        Self::new(format!("object({})", coveql_identifier(type_name.as_ref())))
     }
 
     pub fn association(type_name: impl AsRef<str>) -> Self {
         Self::new(format!(
             "association({})",
-            oql_identifier(type_name.as_ref())
+            coveql_identifier(type_name.as_ref())
         ))
     }
 
@@ -66,8 +67,30 @@ impl CoveOqlQueryBuilder {
     pub fn projection(projection_id: impl AsRef<str>) -> Self {
         Self::new(format!(
             "projection({})",
-            oql_identifier(projection_id.as_ref())
+            coveql_identifier(projection_id.as_ref())
         ))
+    }
+
+    pub fn table(table_name: impl AsRef<str>) -> Self {
+        Self::new(format!("table({})", coveql_identifier(table_name.as_ref())))
+    }
+
+    pub fn node(label: impl AsRef<str>) -> Self {
+        Self::new(format!("node({})", coveql_identifier(label.as_ref())))
+    }
+
+    pub fn edge(label: impl AsRef<str>) -> Self {
+        Self::new(format!("edge({})", coveql_identifier(label.as_ref())))
+    }
+
+    pub fn path(path_expr: impl AsRef<str>) -> Self {
+        Self::new(format!("path({})", path_expr.as_ref()))
+    }
+
+    pub fn alias(mut self, alias: impl AsRef<str>) -> Self {
+        self.root
+            .push_str(&format!(" as {}", coveql_identifier(alias.as_ref())));
+        self
     }
 
     pub fn evidence() -> Self {
@@ -97,6 +120,21 @@ impl CoveOqlQueryBuilder {
         Self::new(format!(
             "evidence({}, grain: {})",
             path.as_ref(),
+            evidence_grain_name(grain)
+        ))
+    }
+
+    pub fn evidence_root_binding(root_binding: impl AsRef<str>) -> Self {
+        Self::new(format!("evidence({})", root_binding.as_ref()))
+    }
+
+    pub fn evidence_root_binding_with_grain(
+        root_binding: impl AsRef<str>,
+        grain: AstEvidenceGrain,
+    ) -> Self {
+        Self::new(format!(
+            "evidence({}, grain: {})",
+            root_binding.as_ref(),
             evidence_grain_name(grain)
         ))
     }
@@ -204,7 +242,7 @@ impl CoveOqlQueryBuilder {
     pub fn evidence_projection(projection_id: impl AsRef<str>) -> Self {
         Self::new(format!(
             "evidence(projection({}))",
-            oql_identifier(projection_id.as_ref())
+            coveql_identifier(projection_id.as_ref())
         ))
     }
 
@@ -214,7 +252,7 @@ impl CoveOqlQueryBuilder {
     ) -> Self {
         Self::new(format!(
             "evidence(projection({}), grain: {})",
-            oql_identifier(projection_id.as_ref()),
+            coveql_identifier(projection_id.as_ref()),
             evidence_grain_name(grain)
         ))
     }
@@ -237,6 +275,103 @@ impl CoveOqlQueryBuilder {
         self
     }
 
+    pub fn lookup(
+        self,
+        table_name: impl AsRef<str>,
+        alias: impl AsRef<str>,
+        on: impl AsRef<str>,
+    ) -> Self {
+        self.lookup_with_options(
+            table_name,
+            alias,
+            on,
+            TableLookupCardinality::One,
+            TableLookupUnmatchedPolicy::Nulls,
+            TableLookupDuplicatePolicy::Reject,
+            false,
+        )
+    }
+
+    pub fn lookup_many(
+        self,
+        table_name: impl AsRef<str>,
+        alias: impl AsRef<str>,
+        on: impl AsRef<str>,
+    ) -> Self {
+        self.lookup_with_options(
+            table_name,
+            alias,
+            on,
+            TableLookupCardinality::Many,
+            TableLookupUnmatchedPolicy::Nulls,
+            TableLookupDuplicatePolicy::EmitAll,
+            false,
+        )
+    }
+
+    pub fn lookup_required(
+        self,
+        table_name: impl AsRef<str>,
+        alias: impl AsRef<str>,
+        on: impl AsRef<str>,
+    ) -> Self {
+        self.lookup_with_options(
+            table_name,
+            alias,
+            on,
+            TableLookupCardinality::One,
+            TableLookupUnmatchedPolicy::Reject,
+            TableLookupDuplicatePolicy::Reject,
+            false,
+        )
+    }
+
+    pub fn lookup_with_options(
+        mut self,
+        table_name: impl AsRef<str>,
+        alias: impl AsRef<str>,
+        on: impl AsRef<str>,
+        cardinality: TableLookupCardinality,
+        unmatched: TableLookupUnmatchedPolicy,
+        duplicate: TableLookupDuplicatePolicy,
+        nulls_match: bool,
+    ) -> Self {
+        self.methods.push(format!(
+            "lookup(table({}) as {}, on: {}, cardinality: {}, unmatched: {}, duplicate: {}, nulls_match: {})",
+            coveql_identifier(table_name.as_ref()),
+            coveql_identifier(alias.as_ref()),
+            on.as_ref(),
+            table_lookup_cardinality_name(cardinality),
+            table_lookup_unmatched_name(unmatched),
+            table_lookup_duplicate_name(duplicate),
+            nulls_match
+        ));
+        self
+    }
+
+    pub fn traverse(mut self, relationship_expr: impl AsRef<str>) -> Self {
+        self.methods
+            .push(format!("traverse({})", relationship_expr.as_ref()));
+        self
+    }
+
+    pub fn traverse_to_node(
+        self,
+        direction: AstAssociationDirection,
+        edge_label: impl AsRef<str>,
+        edge_alias: impl AsRef<str>,
+        target_label: impl AsRef<str>,
+        target_alias: impl AsRef<str>,
+    ) -> Self {
+        self.traverse(coveql_relationship_expr_to_node(
+            direction,
+            edge_label,
+            Some(edge_alias),
+            target_label,
+            Some(target_alias),
+        ))
+    }
+
     pub fn as_of_csn(mut self, csn: u64) -> Self {
         self.methods.push(format!("asOf(csn: {csn})"));
         self
@@ -246,7 +381,7 @@ impl CoveOqlQueryBuilder {
         self.methods.push(format!(
             "asOf({}: {})",
             time_role_name(role),
-            oql_string_literal(timestamp.as_ref())
+            coveql_string_literal(timestamp.as_ref())
         ));
         self
     }
@@ -254,7 +389,7 @@ impl CoveOqlQueryBuilder {
     pub fn as_of_time(mut self, timestamp: impl AsRef<str>) -> Self {
         self.methods.push(format!(
             "asOf(time: {})",
-            oql_string_literal(timestamp.as_ref())
+            coveql_string_literal(timestamp.as_ref())
         ));
         self
     }
@@ -270,13 +405,15 @@ impl CoveOqlQueryBuilder {
 
     pub fn branch_identifier(mut self, branch: impl AsRef<str>) -> Self {
         self.methods
-            .push(format!("branch({})", oql_identifier(branch.as_ref())));
+            .push(format!("branch({})", coveql_identifier(branch.as_ref())));
         self
     }
 
     pub fn branch_string(mut self, branch: impl AsRef<str>) -> Self {
-        self.methods
-            .push(format!("branch({})", oql_string_literal(branch.as_ref())));
+        self.methods.push(format!(
+            "branch({})",
+            coveql_string_literal(branch.as_ref())
+        ));
         self
     }
 
@@ -351,8 +488,12 @@ impl CoveOqlQueryBuilder {
         self.changes_csn(from, to, AstChangeMode::PropertyDiffs)
     }
 
+    pub fn changes_csn_final_rows(self, from: u64, to: u64) -> Self {
+        self.changes_csn(from, to, AstChangeMode::FinalRows)
+    }
+
     pub fn changes_csn_final_objects(self, from: u64, to: u64) -> Self {
-        self.changes_csn(from, to, AstChangeMode::FinalObjects)
+        self.changes_csn_final_rows(from, to)
     }
 
     pub fn changes_timestamp(
@@ -365,9 +506,9 @@ impl CoveOqlQueryBuilder {
         self.methods.push(format!(
             "changes({}: {}, {}: {}, mode: {})",
             time_role_name(role),
-            oql_string_literal(from.as_ref()),
+            coveql_string_literal(from.as_ref()),
             time_role_name(role),
-            oql_string_literal(to.as_ref()),
+            coveql_string_literal(to.as_ref()),
             change_mode_name(mode)
         ));
         self
@@ -382,9 +523,9 @@ impl CoveOqlQueryBuilder {
         self.methods.push(format!(
             "changes({}: {}, {}: {})",
             time_role_name(role),
-            oql_string_literal(from.as_ref()),
+            coveql_string_literal(from.as_ref()),
             time_role_name(role),
-            oql_string_literal(to.as_ref())
+            coveql_string_literal(to.as_ref())
         ));
         self
     }
@@ -397,8 +538,8 @@ impl CoveOqlQueryBuilder {
     ) -> Self {
         self.methods.push(format!(
             "changes(time: {}, time: {}, mode: {})",
-            oql_string_literal(from.as_ref()),
-            oql_string_literal(to.as_ref()),
+            coveql_string_literal(from.as_ref()),
+            coveql_string_literal(to.as_ref()),
             change_mode_name(mode)
         ));
         self
@@ -407,8 +548,8 @@ impl CoveOqlQueryBuilder {
     pub fn changes_time_default(mut self, from: impl AsRef<str>, to: impl AsRef<str>) -> Self {
         self.methods.push(format!(
             "changes(time: {}, time: {})",
-            oql_string_literal(from.as_ref()),
-            oql_string_literal(to.as_ref())
+            coveql_string_literal(from.as_ref()),
+            coveql_string_literal(to.as_ref())
         ));
         self
     }
@@ -429,8 +570,12 @@ impl CoveOqlQueryBuilder {
         self.changes_time(from, to, AstChangeMode::PropertyDiffs)
     }
 
+    pub fn changes_time_final_rows(self, from: impl AsRef<str>, to: impl AsRef<str>) -> Self {
+        self.changes_time(from, to, AstChangeMode::FinalRows)
+    }
+
     pub fn changes_time_final_objects(self, from: impl AsRef<str>, to: impl AsRef<str>) -> Self {
-        self.changes_time(from, to, AstChangeMode::FinalObjects)
+        self.changes_time_final_rows(from, to)
     }
 
     pub fn changes_timestamp_records(
@@ -460,13 +605,22 @@ impl CoveOqlQueryBuilder {
         self.changes_timestamp(role, from, to, AstChangeMode::PropertyDiffs)
     }
 
+    pub fn changes_timestamp_final_rows(
+        self,
+        role: AstTimeRole,
+        from: impl AsRef<str>,
+        to: impl AsRef<str>,
+    ) -> Self {
+        self.changes_timestamp(role, from, to, AstChangeMode::FinalRows)
+    }
+
     pub fn changes_timestamp_final_objects(
         self,
         role: AstTimeRole,
         from: impl AsRef<str>,
         to: impl AsRef<str>,
     ) -> Self {
-        self.changes_timestamp(role, from, to, AstChangeMode::FinalObjects)
+        self.changes_timestamp_final_rows(role, from, to)
     }
 
     pub fn changes_bounds(
@@ -500,8 +654,12 @@ impl CoveOqlQueryBuilder {
         self.changes_bounds(from, to, AstChangeMode::PropertyDiffs)
     }
 
+    pub fn changes_bounds_final_rows(self, from: AstChangeBound, to: AstChangeBound) -> Self {
+        self.changes_bounds(from, to, AstChangeMode::FinalRows)
+    }
+
     pub fn changes_bounds_final_objects(self, from: AstChangeBound, to: AstChangeBound) -> Self {
-        self.changes_bounds(from, to, AstChangeMode::FinalObjects)
+        self.changes_bounds_final_rows(from, to)
     }
 
     pub fn changes_bounds_default(mut self, from: AstChangeBound, to: AstChangeBound) -> Self {
@@ -561,7 +719,7 @@ impl CoveOqlQueryBuilder {
     pub fn select_count_star_as(mut self, alias: impl AsRef<str>) -> Self {
         self.methods.push(format!(
             "select({}: count(*))",
-            oql_identifier(alias.as_ref())
+            coveql_identifier(alias.as_ref())
         ));
         self
     }
@@ -573,7 +731,7 @@ impl CoveOqlQueryBuilder {
     ) -> Self {
         self.methods.push(format!(
             "select({}: {}(*))",
-            oql_identifier(alias.as_ref()),
+            coveql_identifier(alias.as_ref()),
             aggregate_function_name(name)
         ));
         self
@@ -587,7 +745,7 @@ impl CoveOqlQueryBuilder {
     ) -> Self {
         self.methods.push(format!(
             "select({}: {}({}))",
-            oql_identifier(alias.as_ref()),
+            coveql_identifier(alias.as_ref()),
             aggregate_function_name(name),
             arg.as_ref()
         ));
@@ -605,7 +763,7 @@ impl CoveOqlQueryBuilder {
             .collect::<Vec<_>>();
         self.methods.push(format!("groupBy({})", exprs.join(", ")));
         let mut select_items = exprs;
-        select_items.push(format!("{}: count(*)", oql_identifier(alias.as_ref())));
+        select_items.push(format!("{}: count(*)", coveql_identifier(alias.as_ref())));
         self.methods
             .push(format!("select({})", select_items.join(", ")));
         self
@@ -629,7 +787,7 @@ impl CoveOqlQueryBuilder {
         let mut select_items = exprs;
         select_items.push(format!(
             "{}: {}(*)",
-            oql_identifier(alias.as_ref()),
+            coveql_identifier(alias.as_ref()),
             aggregate_function_name(name)
         ));
         self.methods
@@ -656,7 +814,7 @@ impl CoveOqlQueryBuilder {
         let mut select_items = exprs;
         select_items.push(format!(
             "{}: {}({})",
-            oql_identifier(alias.as_ref()),
+            coveql_identifier(alias.as_ref()),
             aggregate_function_name(name),
             arg.as_ref()
         ));
@@ -668,7 +826,7 @@ impl CoveOqlQueryBuilder {
     pub fn explain(mut self, mode: ExplainMode) -> Self {
         self.methods.push(format!(
             "explain({})",
-            oql_string_literal(explain_mode_name(mode))
+            coveql_string_literal(explain_mode_name(mode))
         ));
         self
     }
@@ -705,7 +863,7 @@ impl CoveOqlQueryBuilder {
         format!("{}.{}", self.root, self.methods.join("."))
     }
 
-    pub fn parse(&self, options: ParseOptions) -> Result<ParsedQuery, Vec<OqlDiagnostic>> {
+    pub fn parse(&self, options: ParseOptions) -> Result<ParsedQuery, Vec<CoveQlDiagnostic>> {
         parse_query(&self.to_query(), options)
     }
 
@@ -753,7 +911,7 @@ impl CoveOqlQueryBuilder {
     }
 }
 
-pub fn oql_identifier(value: &str) -> String {
+pub fn coveql_identifier(value: &str) -> String {
     if is_plain_identifier(value) && !requires_identifier_quote(value) {
         return value.into();
     }
@@ -769,11 +927,11 @@ pub fn oql_identifier(value: &str) -> String {
     out
 }
 
-pub fn oql_string_literal(value: &str) -> String {
+pub fn coveql_string_literal(value: &str) -> String {
     serde_json::to_string(value).expect("serializing a string literal cannot fail")
 }
 
-pub fn oql_association_expr(
+pub fn coveql_association_expr(
     type_name: impl AsRef<str>,
     role: Option<AstAssociationRole>,
     role_name: Option<impl AsRef<str>>,
@@ -781,13 +939,55 @@ pub fn oql_association_expr(
     association_expression(type_name, role, role_name)
 }
 
-pub fn oql_directed_association_expr(
+pub fn coveql_directed_association_expr(
     direction: AstAssociationDirection,
     type_name: impl AsRef<str>,
     role: Option<AstAssociationRole>,
     role_name: Option<impl AsRef<str>>,
 ) -> String {
     directed_association_expression(direction, type_name, role, role_name)
+}
+
+pub fn coveql_graph_edge_expr(
+    edge_label: impl AsRef<str>,
+    alias: Option<impl AsRef<str>>,
+) -> String {
+    let mut out = format!("edge({})", coveql_identifier(edge_label.as_ref()));
+    if let Some(alias) = alias {
+        out.push_str(&format!(" as {}", coveql_identifier(alias.as_ref())));
+    }
+    out
+}
+
+pub fn coveql_relationship_expr(
+    direction: AstAssociationDirection,
+    edge_label: impl AsRef<str>,
+    edge_alias: Option<impl AsRef<str>>,
+) -> String {
+    format!(
+        "{}({})",
+        association_direction_name(direction),
+        coveql_graph_edge_expr(edge_label, edge_alias)
+    )
+}
+
+pub fn coveql_relationship_expr_to_node(
+    direction: AstAssociationDirection,
+    edge_label: impl AsRef<str>,
+    edge_alias: Option<impl AsRef<str>>,
+    target_label: impl AsRef<str>,
+    target_alias: Option<impl AsRef<str>>,
+) -> String {
+    let mut out = coveql_relationship_expr(direction, edge_label, edge_alias);
+    out.push_str(&format!(
+        ".to(node({})",
+        coveql_identifier(target_label.as_ref())
+    ));
+    if let Some(target_alias) = target_alias {
+        out.push_str(&format!(" as {}", coveql_identifier(target_alias.as_ref())));
+    }
+    out.push(')');
+    out
 }
 
 fn directed_association_expression(
@@ -808,12 +1008,12 @@ fn association_expression(
     role: Option<AstAssociationRole>,
     role_name: Option<impl AsRef<str>>,
 ) -> String {
-    let mut args = vec![oql_identifier(type_name.as_ref())];
+    let mut args = vec![coveql_identifier(type_name.as_ref())];
     if let (Some(role), Some(role_name)) = (role, role_name) {
         args.push(format!(
             "{}: {}",
             association_role_name(role),
-            oql_identifier(role_name.as_ref())
+            coveql_identifier(role_name.as_ref())
         ));
     }
     format!("association({})", args.join(", "))
@@ -826,7 +1026,7 @@ fn time_bound(bound: AstTimeBound) -> String {
             format!(
                 "{}: {}",
                 time_role_name(role),
-                oql_string_literal(&timestamp)
+                coveql_string_literal(&timestamp)
             )
         }
     }
@@ -839,7 +1039,7 @@ fn change_bound(bound: AstChangeBound) -> String {
             format!(
                 "{}: {}",
                 time_role_name(role),
-                oql_string_literal(&timestamp)
+                coveql_string_literal(&timestamp)
             )
         }
     }
@@ -858,7 +1058,12 @@ fn requires_identifier_quote(value: &str) -> bool {
     matches!(
         value,
         "association"
+            | "object"
             | "evidence"
+            | "table"
+            | "node"
+            | "edge"
+            | "path"
             | "projection"
             | "where"
             | "select"
@@ -880,6 +1085,9 @@ fn requires_identifier_quote(value: &str) -> bool {
             | "in"
             | "out"
             | "either"
+            | "as"
+            | "lookup"
+            | "traverse"
             | "self"
             | "grain"
     )
@@ -907,7 +1115,33 @@ fn evidence_grain_name(grain: AstEvidenceGrain) -> &'static str {
         AstEvidenceGrain::Property => "property",
         AstEvidenceGrain::Association => "association",
         AstEvidenceGrain::Row => "row",
+        AstEvidenceGrain::Column => "column",
+        AstEvidenceGrain::Projection => "projection",
+        AstEvidenceGrain::Node => "node",
+        AstEvidenceGrain::Edge => "edge",
+        AstEvidenceGrain::Path => "path",
         AstEvidenceGrain::Source => "source",
+    }
+}
+
+fn table_lookup_cardinality_name(cardinality: TableLookupCardinality) -> &'static str {
+    match cardinality {
+        TableLookupCardinality::One => "one",
+        TableLookupCardinality::Many => "many",
+    }
+}
+
+fn table_lookup_unmatched_name(unmatched: TableLookupUnmatchedPolicy) -> &'static str {
+    match unmatched {
+        TableLookupUnmatchedPolicy::Nulls => "nulls",
+        TableLookupUnmatchedPolicy::Reject => "reject",
+    }
+}
+
+fn table_lookup_duplicate_name(duplicate: TableLookupDuplicatePolicy) -> &'static str {
+    match duplicate {
+        TableLookupDuplicatePolicy::Reject => "reject",
+        TableLookupDuplicatePolicy::EmitAll => "many",
     }
 }
 
@@ -924,7 +1158,7 @@ fn change_mode_name(mode: AstChangeMode) -> &'static str {
         AstChangeMode::Records => "records",
         AstChangeMode::StateTransitions => "state_transitions",
         AstChangeMode::PropertyDiffs => "property_diffs",
-        AstChangeMode::FinalObjects => "final_objects",
+        AstChangeMode::FinalRows => "final_rows",
     }
 }
 

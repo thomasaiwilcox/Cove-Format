@@ -240,7 +240,7 @@ pub(crate) fn projection_readback_report(
             decisions.push(PushdownDecision::new(
                 PushdownDecisionKind::ResidualMaterialized,
                 PushdownOutcome::Residual,
-                "projection predicate could not be proven safe for COVE-MAP readback and remains an OQL residual",
+                "projection predicate could not be proven safe for COVE-MAP readback and remains an CoveQL residual",
                 json!({
                     "projection_id": contract.projection_id,
                     "predicate": predicate,

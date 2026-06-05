@@ -20,9 +20,9 @@ use crate::{
     },
     physical_sidecars::{PhysicalSidecarInputs, PhysicalSidecarStatus, PhysicalSidecarValidation},
     AssociationDirectionPlan, AssociationOptimizationReport, AstAggregateName, AstChangeMode,
-    AstHistoryMode, BuildLogicalPlanError, CoveOqlOutputMode, DiagnosticSeverity,
-    EvidenceGrainKind, EvidenceOptimizationReport, EvidenceTargetIndexKind,
-    MetadataDisclosurePolicy, ParseOptions, PlanOptions, PlannedQuery, ResolveOptions,
+    AstHistoryMode, BuildLogicalPlanError, CoveQlOutputMode, DiagnosticSeverity, EvidenceGrainKind,
+    EvidenceOptimizationReport, EvidenceTargetIndexKind, MetadataDisclosurePolicy, ParseOptions,
+    PlanOptions, PlannedQuery, ResolveOptions,
 };
 
 pub type PhysicalPlanFingerprint = String;
@@ -299,7 +299,7 @@ pub enum PhysicalPlanNodeKind {
         fallbacks: Vec<PhysicalFallbackReport>,
     },
     OutputBoundary {
-        output_mode: CoveOqlOutputMode,
+        output_mode: CoveQlOutputMode,
     },
 }
 
@@ -372,7 +372,7 @@ impl fmt::Display for BuildPhysicalPlanError {
         if let Some(diagnostic) = self.diagnostics.first() {
             write!(f, "{}: {}", diagnostic.code, diagnostic.message)
         } else {
-            write!(f, "Cove-OQL physical plan build failed")
+            write!(f, "CoveQL physical plan build failed")
         }
     }
 }
@@ -768,7 +768,7 @@ fn build_nodes(
                 if native_exact {
                     "history/change direct projection uses exact temporal row-grain reconstruction before final output materialization"
                 } else {
-                    "history/change modes currently use materialized temporal reconstruction as the authority"
+                    "history/change modes use materialized temporal reconstruction as the semantic authority unless an exact temporal row-grain proof is available"
                 },
             ),
         );
@@ -963,7 +963,7 @@ fn build_nodes(
     );
     if matches!(
         planned.resolved.output_mode,
-        CoveOqlOutputMode::ArrowRecordBatch { .. } | CoveOqlOutputMode::DataFusionTableProvider
+        CoveQlOutputMode::ArrowRecordBatch { .. } | CoveQlOutputMode::DataFusionTableProvider
     ) {
         nodes.push(
             PhysicalPlanNodeKind::ArrowProjection {
@@ -1160,7 +1160,7 @@ fn physical_change_mode_name(mode: AstChangeMode) -> &'static str {
         AstChangeMode::Records => "records",
         AstChangeMode::StateTransitions => "state_transitions",
         AstChangeMode::PropertyDiffs => "property_diffs",
-        AstChangeMode::FinalObjects => "final_objects",
+        AstChangeMode::FinalRows => "final_rows",
     }
 }
 
@@ -1169,7 +1169,7 @@ fn physical_change_row_grain(mode: AstChangeMode) -> &'static str {
         AstChangeMode::Records => "change_record",
         AstChangeMode::StateTransitions => "change_state_transition",
         AstChangeMode::PropertyDiffs => "change_property_diff",
-        AstChangeMode::FinalObjects => "change_final_object",
+        AstChangeMode::FinalRows => "change_final_row",
     }
 }
 

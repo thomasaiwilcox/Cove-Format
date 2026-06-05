@@ -1,4 +1,4 @@
-# Cove-OQL: Cove Object Query Language
+# CoveQL/Object: Cove Object Query Language
 
 Status: exploratory proposal
 
@@ -9,9 +9,9 @@ and object-native query planning
 
 ## Summary
 
-**Cove-OQL** is the Cove Object Query Language: a read-only, object-native
-query surface for canonical COVE-O objects, associations, evidence, temporal
-state, and deterministic COVE-MAP projections.
+**CoveQL/Object** is the Cove Object Query Language profile: a read-only,
+object-native query surface for canonical COVE-O objects, associations,
+evidence, temporal state, and deterministic COVE-MAP projections.
 
 The language gives readers an object-native way to query canonical objects,
 associations, evidence, and deterministic projections without starting from SQL
@@ -32,7 +32,7 @@ The core design is to parse a friendly object query into a logical plan, lower
 that into a physical plan, preserve coded or proof-safe execution for as long
 as correctness allows, and materialize values only at explicit boundaries.
 
-Cove-OQL should start as a focused, immutable, read-only query language. It
+CoveQL should start as a focused, immutable, read-only query language. It
 should not include scripting, mutation, transactions, user-defined control
 flow, or live object-store behaviors.
 
@@ -54,7 +54,7 @@ Explain whether this predicate was answered through coverage/index metadata or
 through decoded scan.
 ```
 
-Cove-OQL would provide that object surface while still lowering to the same
+CoveQL would provide that object surface while still lowering to the same
 validated COVE-O, COVE-MAP, COVE-COVERAGE, COVE-I, and DataFusion machinery.
 
 ## Goals
@@ -85,12 +85,12 @@ validated COVE-O, COVE-MAP, COVE-COVERAGE, COVE-I, and DataFusion machinery.
 - No general UDF execution in the coded hot path.
 - No hidden cross-file code comparison. Equal integers from unrelated code
   domains are not equal values.
-- No promise that every valid Cove-OQL query is code-executable. Correct
+- No promise that every valid CoveQL query is code-executable. Correct
   materialized fallback is allowed, but it must be explainable.
 
 ## Design Principles
 
-Cove-OQL should be an object-first query surface that compiles into explicit
+CoveQL should be an object-first query surface that compiles into explicit
 planning layers rather than treating object queries as strings wrapped around
 SQL.
 
@@ -112,7 +112,7 @@ object-store assumptions are outside this proposal.
 
 ## Existing Implementation Anchors
 
-Cove-OQL should build on current repo surfaces instead of creating parallel
+CoveQL should build on current repo surfaces instead of creating parallel
 semantics:
 
 - COVE-O object state readback in
@@ -128,7 +128,7 @@ semantics:
 
 ## Spec Integration Contract
 
-Cove-OQL should be an execution/profile surface layered on the existing COVE
+CoveQL should be an execution/profile surface layered on the existing COVE
 v2 standards suite. It must not create a parallel truth model. A conforming
 implementation should treat the v2 spec as the authority for bootstrap,
 feature requiredness, object reconstruction, mapping/projection readback,
@@ -156,7 +156,7 @@ The planner should then apply the spec requiredness model:
 
 - unknown header `FileRequired` features reject before query planning;
 - unknown section/page/profile/operation-required features reject only when the
-  selected Cove-OQL operation needs that feature;
+  selected CoveQL operation needs that feature;
 - unsupported advisory features are ignored;
 - optional COVE-I, COVX, COVE-L, COVE-R, and COVE-CACHE metadata never changes
   correctness and must be validated before it can affect planning;
@@ -245,7 +245,7 @@ This proposal uses the following terms:
 The proposal should use explicit conformance language where ambiguity would
 otherwise create implementation-defined behavior:
 
-- `MUST`: required for a conforming Cove-OQL implementation.
+- `MUST`: required for a conforming CoveQL implementation.
 - `SHOULD`: expected unless a documented implementation constraint applies.
 - `MAY`: optional behavior that must still preserve all visible semantics.
 - `Rejected`: parsing, resolution, planning, or execution stops with a
@@ -264,8 +264,8 @@ Persisted queries, conformance cases, caches, and explain output should carry
 explicit versions:
 
 ```text
-CoveOqlLanguageVersion: 0.1
-CoveOqlGrammarVersion: 0.1
+CoveQlLanguageVersion: 0.1
+CoveQlGrammarVersion: 0.1
 ResolvedAstVersion: 0.1
 ExplainJsonSchemaVersion: 0.1
 ```
@@ -273,7 +273,7 @@ ExplainJsonSchemaVersion: 0.1
 String queries may declare the language version in a leading directive:
 
 ```coveo
-# cove-oql:0.1
+# coveql:0.1
 Person.where(status == "active")
 ```
 
@@ -298,7 +298,7 @@ tests, COVE-CACHE validation, and COVE-COVERAGE/COVE-I proof matching.
 
 ## Dataset Query Scope
 
-A Cove-OQL query scope is one validated file snapshot unless a dataset
+A CoveQL query scope is one validated file snapshot unless a dataset
 manifest explicitly defines a multi-file snapshot.
 
 For manifest-scoped datasets, the operation context must resolve:
@@ -317,7 +317,7 @@ decodes to canonical logical values, or uses an approved semantic bridge.
 
 ## Performance Positioning
 
-Cove-OQL should be designed as a storage-aware query language, not only as a
+CoveQL should be designed as a storage-aware query language, not only as a
 friendlier syntax for object readback. The parser is the least important part
 of the performance story. The important contract is that every query lowers
 into a plan that can exploit how COVE-O files are physically structured.
@@ -335,7 +335,7 @@ resolve object and property ids
   -> decode only selected output values
 ```
 
-Cove-OQL should make this path the default. Materialized object records,
+CoveQL should make this path the default. Materialized object records,
 `serde_json::Value`, row maps, and string dictionaries are boundary tools, not
 the primary execution representation.
 
@@ -364,7 +364,7 @@ This lets the planner:
 
 Temporal segment index entries carry `object_type_id`, timestamp range, CSN
 range, row count, delta/snapshot/baseline/tombstone counts, GOID min/max, and
-byte ranges. Cove-OQL planning should use those fields before reading segment
+byte ranges. CoveQL planning should use those fields before reading segment
 payloads.
 
 Examples:
@@ -421,7 +421,7 @@ Property values can therefore use the same page/morsel alignment, null bitmap,
 FileCode, NumCode, stats-only, constant-page, zone-stat, and dictionary
 contracts as table columns.
 
-Cove-OQL predicates should compile against these columns directly:
+CoveQL predicates should compile against these columns directly:
 
 - `status == "active"` resolves the literal to the relevant FileCode when the
   dictionary contract allows it;
@@ -438,7 +438,7 @@ as possible.
 ### Association And Link Objects
 
 COVE-O v2 materializes associations as declared association/link object types.
-Cove-OQL association roots and traversals should plan against those object type
+CoveQL association roots and traversals should plan against those object type
 and property flags directly:
 
 ```coveo
@@ -471,7 +471,7 @@ projected fields. Generic JSON row maps are a fallback path.
 
 ### Metadata That Unlocks The Fastest Plans
 
-Cove-OQL should run correctly without optional accelerators, but writers can
+CoveQL should run correctly without optional accelerators, but writers can
 make object queries dramatically faster by emitting the right validated
 metadata. The planner should prefer these structures when present:
 
@@ -498,7 +498,7 @@ Each item is optional. Absence should widen the plan, not change results.
 
 ## Language Shape
 
-Cove-OQL uses a focused fluent expression form. A query starts from one of four
+CoveQL uses a focused fluent expression form. A query starts from one of four
 root surfaces:
 
 - an object type, such as `Person`;
@@ -645,7 +645,9 @@ EvidenceSpec   := EvidenceTarget ("," EvidenceOption)*
 EvidenceTarget := Path | AssociationExpr | ProjectionTarget | "self"
 EvidenceOption := "grain" ":" EvidenceGrain
 ProjectionTarget := "projection" "(" Identifier ")"
-EvidenceGrain := "object" | "property" | "association" | "row" | "source"
+EvidenceGrain := "object" | "property" | "association" | "row"
+                | "column" | "projection" | "node" | "edge" | "path"
+                | "source"
 BranchSelector := Identifier | StringLiteral | UInt
 TimeBound      := TimeRole ":" Timestamp
 TimeRole       := "time" | "commit_time" | "valid_time" | "observed_time"
@@ -655,7 +657,7 @@ HistoryMode    := "records" | "states" | "records_and_states"
 ChangeBound    := ("csn" ":" UInt) | TimeBound
 ChangeArgs     := "," "mode" ":" ChangeMode
 ChangeMode     := "records" | "state_transitions" | "property_diffs"
-                | "final_objects"
+                | "final_rows" | "final_objects"
 OrderDirection := "," ("asc" | "desc")
 NullOrdering   := "," ("nulls_first" | "nulls_last")
 ExplainMode    := "public" | "developer" | "proof" | "forensic"
@@ -798,7 +800,7 @@ the same projection catalog semantics as DataFusion registration.
 
 ## Temporal Semantics
 
-Cove-OQL temporal behavior should be explicit and testable. Temporal
+CoveQL temporal behavior should be explicit and testable. Temporal
 reconstruction is applied before predicates that depend on reconstructed
 object state. Predicates over raw records, history rows, or changes operate at
 the requested output grain.
@@ -843,7 +845,9 @@ Temporal rules:
 - `changes(from, to, mode: records)` returns record events.
 - `changes(from, to, mode: state_transitions)` returns state transitions.
 - `changes(from, to, mode: property_diffs)` returns property-level diffs.
-- `changes(from, to, mode: final_objects)` returns final changed objects.
+- `changes(from, to, mode: final_rows)` returns final changed rows.
+- `changes(from, to, mode: final_objects)` is accepted as a legacy alias for
+  `final_rows` and canonicalizes to `final_rows`.
 - `changes(from, to)` is an alias for `changes(from, to, mode: records)`.
 - `changes` bounds must use the same bound kind. Mixed CSN/time bounds reject
   unless a projection declares an exact conversion rule.
@@ -963,7 +967,7 @@ ProjectionDependency {
 `explain` should report:
 
 - projection dependencies loaded;
-- projection filters pushed into Cove-OQL predicates;
+- projection filters pushed into CoveQL predicates;
 - projection filters left as residual predicates;
 - projection expressions requiring materialization;
 - evidence dependencies loaded;
@@ -1040,7 +1044,7 @@ policy behavior.
 ## Result Ordering And Pagination
 
 `take` and `skip` require deterministic ordering. When no `orderBy` is
-provided, Cove-OQL applies a canonical default order so materialized and
+provided, CoveQL applies a canonical default order so materialized and
 accelerated plans return the same page.
 
 Default orders:
@@ -1123,7 +1127,7 @@ Post-aggregate filters are not part of the current method set. A future
 
 ## Deterministic Function Profile
 
-Every function available to Cove-OQL should carry metadata:
+Every function available to CoveQL should carry metadata:
 
 ```text
 FunctionContract {
@@ -1186,7 +1190,7 @@ logical type requires it.
 
 ## Logical Plan
 
-Cove-OQL should lower into a compact logical plan before choosing an execution
+CoveQL should lower into a compact logical plan before choosing an execution
 backend.
 
 Every logical plan should carry:
@@ -1484,7 +1488,7 @@ specialized kernels in the plan-choice order.
 A fully integrated implementation should use this pipeline:
 
 1. Bootstrap-validate the file or dataset manifest.
-2. Build the feature-scope table and select the Cove-OQL operation.
+2. Build the feature-scope table and select the CoveQL operation.
 3. Validate only the required profile, section, page, and operation features
    for that query.
 4. Build the snapshot, visibility, redaction, semantic-map, and temporal-cut
@@ -1515,7 +1519,7 @@ reconstruction rules.
 
 ## Planner Rewrites For Performance
 
-Cove-OQL should allow users to write object-oriented queries while the planner
+CoveQL should allow users to write object-oriented queries while the planner
 applies relational and storage-aware rewrites.
 
 Safe rewrites include:
@@ -1549,7 +1553,7 @@ Unsafe or invalid rewrites must be forbidden:
 
 ## Coded Execution Rules
 
-Cove-OQL must follow the same representation discipline as COVE itself.
+CoveQL must follow the same representation discipline as COVE itself.
 
 Every coded predicate, join, grouping key, distinct key, and ordering key
 should carry an explicit domain descriptor.
@@ -1641,7 +1645,7 @@ Predicate planning should proceed in layers:
 6. Leave unsupported parts as materialized residual predicates.
 7. Emit an explainable plan showing which parts ran in which class.
 
-Cove-OQL's internal predicate form should map onto COVE-COVERAGE predicate
+CoveQL's internal predicate form should map onto COVE-COVERAGE predicate
 normal forms:
 
 - use `PredicateAst` as the complete canonical predicate representation;
@@ -1689,7 +1693,7 @@ ObjectScan(Person)
 
 ## Output Modes
 
-Cove-OQL should support several output modes:
+CoveQL should support several output modes:
 
 - object rows, preserving object identity and typed property values;
 - association rows;
@@ -1708,9 +1712,9 @@ semantics, null bitmap polarity, lifetime, visibility, and redaction. Otherwise
 the implementation must materialize Arrow-owned buffers.
 
 DataFusion output should expose COVE catalog and projection authority through a
-table provider, not replace it. Pushed filters should lower into Cove-OQL
+table provider, not replace it. Pushed filters should lower into CoveQL
 predicate forms and then follow the same proof and residual-predicate rules as
-native Cove-OQL queries.
+native CoveQL queries.
 
 ## Streaming And Cancellation
 
@@ -1880,13 +1884,13 @@ the active explain and metadata-disclosure policy allows it.
 
 ## Relationship To SQL And DataFusion
 
-Cove-OQL should not be defined as syntax sugar for SQL, but it should be able
+CoveQL should not be defined as syntax sugar for SQL, but it should be able
 to target SQL-shaped projection providers.
 
 Near-term lowering path:
 
 ```text
-Cove-OQL
+CoveQL
   -> CoveOLogicalPlan
   -> existing COVE-MAP projection/readback options
   -> DataFusion projection provider or direct Arrow output
@@ -1895,7 +1899,7 @@ Cove-OQL
 Longer-term lowering path:
 
 ```text
-Cove-OQL
+CoveQL
   -> CoveOLogicalPlan
   -> CoveOPhysicalPlan
   -> coded/proof-safe operators
@@ -1911,9 +1915,9 @@ DataFusion integration is a backend path, not the semantic authority.
 
 Rules:
 
-- DataFusion filters are advisory until translated into Cove-OQL predicate
+- DataFusion filters are advisory until translated into CoveQL predicate
   forms.
-- Unsupported filters remain residual DataFusion filters or residual Cove-OQL
+- Unsupported filters remain residual DataFusion filters or residual CoveQL
   materialized predicates.
 - COVE null, collation, canonicalization, temporal, visibility, and redaction
   semantics win over SQL-engine assumptions.
@@ -1924,18 +1928,18 @@ Rules:
 - A pushed filter must produce identical visible rows to the same filter left
   unpushed.
 - `EXPLAIN` must identify filters received from DataFusion, filters converted
-  to Cove-OQL predicate forms, filters trusted for proof/coded execution, and
+  to CoveQL predicate forms, filters trusted for proof/coded execution, and
   filters left residual.
 
 ## Compatibility And Fallback
 
-Cove-OQL should be an execution profile or library surface, not required
+CoveQL should be an execution profile or library surface, not required
 baseline COVE-Core behavior.
 
-A reader that does not support Cove-OQL can still read the underlying COVE file
+A reader that does not support CoveQL can still read the underlying COVE file
 through normal COVE-O, COVE-MAP, or table/projection surfaces.
 
-A reader that supports Cove-OQL but not a specific optional accelerator must
+A reader that supports CoveQL but not a specific optional accelerator must
 fall back to scanning or materialized evaluation when doing so preserves
 semantics. It must fail closed when required metadata is corrupt, stale, or
 claims unsafe proof authority.
@@ -2006,7 +2010,7 @@ Before consulting or disclosing metadata, the planner should ask:
 - may diagnostics include dictionary literals, path names, sidecar names, or
   coverage degrees?
 
-Cove-OQL should inherit COVE's visibility and redaction rules:
+CoveQL should inherit COVE's visibility and redaction rules:
 
 - do not expose redacted dictionary values through explain output;
 - do not reveal hidden evidence rows through association/object convenience
@@ -2039,7 +2043,7 @@ when the materialized visible-row result is itself safe to disclose.
 
 ## Resource Budgets
 
-Cove-OQL should be bounded before it is exposed to untrusted or multi-tenant
+CoveQL should be bounded before it is exposed to untrusted or multi-tenant
 query input.
 
 The operation context should carry limits for:
@@ -2106,10 +2110,10 @@ Deliverables:
 
 ### Phase 1: Formal Language And Resolved AST
 
-Add a dedicated parser and resolver crate or module for Cove-OQL:
+Add a dedicated parser and resolver crate or module for CoveQL:
 
 ```text
-cove-oql
+coveql
 ```
 
 Deliverables:
@@ -2166,7 +2170,7 @@ Deliverables:
   projection dependency semantics enforced before optimization;
 - direct Arrow output;
 - JSON diagnostic output;
-- DataFusion registration helper that consumes Cove-OQL plans rather than
+- DataFusion registration helper that consumes CoveQL plans rather than
   defining them;
 - conformance-style golden outputs for mapped files;
 - fallback-invariance tests with optional metadata absent, present, stale,
@@ -2379,7 +2383,8 @@ defaults:
 - Mandatory `history()` modes are `records`, `states`, and
   `records_and_states`.
 - Mandatory `changes()` modes are `records`, `state_transitions`,
-  `property_diffs`, and `final_objects`.
+  `property_diffs`, and `final_rows`; `final_objects` remains a legacy input
+  alias.
 - Mandatory deterministic functions are `isNull`, `isNotNull`, `coalesce`,
   safe COVE-MAP-declared casts, `lower`, `upper`, `trim`, `length`,
   `startsWith`, and `identity`.
@@ -2439,7 +2444,7 @@ shaped for every root surface and core method from the start.
 5. Resolve object type ids, property ids, association roles, evidence grains,
    projection dependencies, temporal cuts, branch modes, tombstone modes, and
    security context during planning.
-6. Lower predicates to Cove-OQL logical predicate forms and record
+6. Lower predicates to CoveQL logical predicate forms and record
    COVE-COVERAGE-compatible forms for diagnostics and later proof validation.
 7. Produce direct Arrow output for simple object/evidence/association
    projections and keep JSON as a debug/fallback output.

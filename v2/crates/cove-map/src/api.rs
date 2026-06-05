@@ -19,9 +19,10 @@ use crate::{
         project_cove_o_bytes_output, project_cove_o_bytes_record_batch,
         project_cove_o_bytes_record_batches, project_cove_o_bytes_record_batches_with_catalog,
         project_cove_o_path, project_cove_o_path_output, project_rows_with_source_states,
-        project_rows_with_source_states_output, projection_catalog_from_cove_o_path,
-        projection_read_requirements, projection_schema_from_descriptor, ProjectionBatchOptions,
-        ProjectionFormat, ProjectionReadRequirements,
+        project_rows_with_source_states_output, projection_catalog_from_cove_o_bytes_internal,
+        projection_catalog_from_cove_o_path, projection_read_requirements,
+        projection_schema_from_descriptor, ProjectionBatchOptions, ProjectionFormat,
+        ProjectionReadRequirements,
     },
     section_kind, MaterializedModel,
 };
@@ -145,6 +146,13 @@ pub fn projected_record_batches_from_cove_o_bytes_with_catalog(
         options,
         "<bytes>",
     )
+}
+
+pub fn projection_catalog_from_cove_o_bytes(
+    object: &[u8],
+    mapping: Option<&Path>,
+) -> Result<MapProjectionCatalog, String> {
+    projection_catalog_from_cove_o_bytes_internal(object, mapping, "<bytes>")
 }
 
 pub fn projection_descriptors_from_cove_o_path(

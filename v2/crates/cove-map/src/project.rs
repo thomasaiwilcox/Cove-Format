@@ -274,7 +274,7 @@ pub(crate) fn projection_catalog_from_cove_o_path(
 ) -> Result<MapProjectionCatalog, String> {
     let bytes =
         fs::read(object).map_err(|err| format!("cannot read {}: {err}", object.display()))?;
-    projection_catalog_from_cove_o_bytes(&bytes, mapping, &object.display().to_string())
+    projection_catalog_from_cove_o_bytes_internal(&bytes, mapping, &object.display().to_string())
 }
 
 pub(crate) fn project_cove_o_bytes_output(
@@ -284,7 +284,8 @@ pub(crate) fn project_cove_o_bytes_output(
     projection_id: Option<&str>,
     object_label: &str,
 ) -> Result<Vec<u8>, String> {
-    let projection_catalog = projection_catalog_from_cove_o_bytes(bytes, mapping, object_label)?;
+    let projection_catalog =
+        projection_catalog_from_cove_o_bytes_internal(bytes, mapping, object_label)?;
     let execution_options = ProjectionBatchOptions::default();
     let surface = read_surface_for_projection(
         bytes,
@@ -314,7 +315,8 @@ pub(crate) fn project_cove_o_bytes_record_batch(
     options: &ProjectionBatchOptions,
     object_label: &str,
 ) -> Result<RecordBatch, String> {
-    let projection_catalog = projection_catalog_from_cove_o_bytes(bytes, mapping, object_label)?;
+    let projection_catalog =
+        projection_catalog_from_cove_o_bytes_internal(bytes, mapping, object_label)?;
     let surface = read_surface_for_projection(
         bytes,
         mapping,
@@ -344,7 +346,8 @@ pub(crate) fn project_cove_o_bytes_record_batches(
     options: &ProjectionBatchOptions,
     object_label: &str,
 ) -> Result<Vec<RecordBatch>, String> {
-    let projection_catalog = projection_catalog_from_cove_o_bytes(bytes, mapping, object_label)?;
+    let projection_catalog =
+        projection_catalog_from_cove_o_bytes_internal(bytes, mapping, object_label)?;
     project_cove_o_bytes_record_batches_with_catalog(
         bytes,
         mapping,
@@ -382,7 +385,7 @@ pub(crate) fn project_cove_o_bytes_record_batches_with_catalog(
     )
 }
 
-fn projection_catalog_from_cove_o_bytes(
+pub(crate) fn projection_catalog_from_cove_o_bytes_internal(
     bytes: &[u8],
     mapping: Option<&Path>,
     object_label: &str,
@@ -511,10 +514,7 @@ fn compile_projection_access_plan(
     options: &ProjectionBatchOptions,
 ) -> Result<ProjectionAccessPlan, String> {
     let selected = select_projections(catalog, projection_id, format)?;
-    let output_columns = options
-        .output_columns
-        .as_ref()
-        .map(|columns| columns.iter().cloned().collect::<BTreeSet<_>>());
+    let output_columns = required_projection_columns(options);
     let mut requested_property_names = BTreeSet::new();
     let mut requested_object_type_names = BTreeSet::new();
     let mut requested_evidence_metadata_keys = BTreeSet::new();
@@ -861,9 +861,9 @@ fn project_tables(
 
     let mut tables = Vec::new();
     for projection in selected {
-        validate_executable_projection(projection, model, function_ids)?;
         ensure_projection_declares_format(projection, format)?;
         let projection = trim_projection_columns(projection, output_columns.as_ref())?;
+        validate_executable_projection(&projection, model, function_ids)?;
         let rows = project_one(model, &projection, options)?
             .into_iter()
             .map(|value| match value {
@@ -902,6 +902,14 @@ fn required_projection_columns(options: &ProjectionBatchOptions) -> Option<BTree
     (!columns.is_empty()).then_some(columns)
 }
 
+fn output_projection_columns(options: &ProjectionBatchOptions) -> Option<BTreeSet<String>> {
+    options
+        .output_columns
+        .as_ref()
+        .map(|columns| columns.iter().cloned().collect::<BTreeSet<_>>())
+        .filter(|columns| !columns.is_empty())
+}
+
 fn project_arrow_record_batches_from_surface(
     surface: &CoveObjectSurface,
     catalog: &MapProjectionCatalog,
@@ -917,51 +925,58 @@ fn project_arrow_record_batches_from_surface(
     )?;
     let model = ProjectionModel::from_surface_with_access_plan(surface, &access_plan)
         .map_err(|err| err.to_string())?;
-    let output_columns = required_projection_columns(options);
     let selected = select_projections(catalog, Some(projection_id), ProjectionFormat::Arrow)?;
     let projection = match selected.as_slice() {
         [projection] => *projection,
         _ => return Err("Arrow projection output requires exactly one projection".into()),
     };
-    validate_executable_projection(projection, &model, function_ids)?;
     ensure_projection_declares_format(projection, ProjectionFormat::Arrow)?;
-    let projection = trim_projection_columns(projection, output_columns.as_ref())?;
-    let projected_columns = projection
+    let access_columns = required_projection_columns(options);
+    let output_columns = output_projection_columns(options);
+    let access_projection = trim_projection_columns(projection, access_columns.as_ref())?;
+    validate_executable_projection(&access_projection, &model, function_ids)?;
+    let output_projection = trim_projection_columns(projection, output_columns.as_ref())?;
+    let output_projected_columns = output_projection
         .columns
         .iter()
         .map(projected_column_from_entry)
         .collect::<Result<Vec<_>, _>>()?;
-    if let Some(accessors) =
-        object_projection_arrow_fast_path_accessors(&projection, &projected_columns, options)
-    {
+    if let Some(plan) = object_projection_arrow_fast_path_plan(
+        &access_projection,
+        &output_projection,
+        &output_projected_columns,
+        options,
+    ) {
         return project_arrow_object_record_batches_fast(
             &model,
-            &projection,
-            &projected_columns,
-            &accessors,
+            &output_projection,
+            &output_projected_columns,
+            &plan,
             options,
         );
     }
-    if evidence_projection_arrow_fast_path_supported(&projection, &projected_columns) {
+    if evidence_projection_arrow_fast_path_supported(&output_projection, &output_projected_columns)
+        && projection_contains_filter_columns(&output_projection, options)
+    {
         return project_arrow_evidence_record_batches_fast(
             &model,
-            &projection,
-            &projected_columns,
+            &output_projection,
+            &output_projected_columns,
             options,
         );
     }
     let mut sink = ArrowRecordBatchSink::new(
         &catalog.mapping_id,
         &catalog.mapping_version,
-        &projection,
-        projected_columns,
+        &output_projection,
+        output_projected_columns,
         options
             .batch_size
             .unwrap_or(DEFAULT_ARROW_BATCH_SIZE)
             .max(1),
         options.max_rows,
     );
-    emit_projection_rows(&model, &projection, options, |row| sink.push(row))?;
+    emit_projection_rows(&model, &access_projection, options, |row| sink.push(row))?;
     sink.finish()
 }
 
@@ -971,48 +986,94 @@ enum ObjectProjectionArrowAccessor {
     Property(String),
 }
 
-fn object_projection_arrow_fast_path_accessors(
-    projection: &MapProjectionEntry,
-    projected_columns: &[ProjectedColumn],
+#[derive(Debug, Clone)]
+struct ObjectProjectionArrowFastPathPlan {
+    output_accessors: Vec<ObjectProjectionArrowAccessor>,
+    filter_accessors: BTreeMap<String, ObjectProjectionArrowAccessor>,
+}
+
+fn object_projection_arrow_fast_path_plan(
+    access_projection: &MapProjectionEntry,
+    output_projection: &MapProjectionEntry,
+    output_projected_columns: &[ProjectedColumn],
     options: &ProjectionBatchOptions,
-) -> Option<Vec<ObjectProjectionArrowAccessor>> {
-    if !options.pushed_filters.is_empty()
-        || !projection.ordering.is_empty()
-        || projection.multi_value_policy.as_deref().unwrap_or("reject") != "reject"
+) -> Option<ObjectProjectionArrowFastPathPlan> {
+    if !access_projection.ordering.is_empty()
+        || access_projection
+            .multi_value_policy
+            .as_deref()
+            .unwrap_or("reject")
+            != "reject"
     {
         return None;
     }
     if !matches!(
-        projection.row_grain.as_deref(),
+        access_projection.row_grain.as_deref(),
         Some("one_row_per_object" | "one_row_per_event_object" | "one_row_per_object_as_of_time")
     ) {
         return None;
     }
-    let anchor = projection.anchor.as_ref()?;
+    let anchor = access_projection.anchor.as_ref()?;
     if anchor.object_type.is_none() || anchor.association_type.is_some() {
         return None;
     }
-    projection
+
+    let output_accessors = output_projection
         .columns
         .iter()
-        .zip(projected_columns.iter())
-        .map(|(column, projected)| match column.value.as_str() {
-            "goid" | "object.goid" | "Object.goid" => matches!(
-                projected.logical,
-                CoveLogicalType::Uuid | CoveLogicalType::Utf8
-            )
-            .then_some(ObjectProjectionArrowAccessor::ObjectGoid),
-            value if direct_object_property_fast_path_supported(value) => {
-                Some(ObjectProjectionArrowAccessor::Property(value.to_string()))
-            }
-            _ => None,
-        })
-        .collect()
+        .zip(output_projected_columns.iter())
+        .map(|(column, projected)| object_projection_arrow_accessor_for_column(column, projected))
+        .collect::<Option<Vec<_>>>()?;
+
+    let mut filter_accessors = BTreeMap::new();
+    for filter in &options.pushed_filters {
+        let column_name = filter.column_name();
+        let column = access_projection
+            .columns
+            .iter()
+            .find(|candidate| candidate.name == column_name)?;
+        let projected = projected_column_from_entry(column).ok()?;
+        if !object_projection_fast_path_filter_column_supported(&projected) {
+            return None;
+        }
+        let accessor = object_projection_arrow_accessor_for_column(column, &projected)?;
+        filter_accessors.insert(column_name.to_string(), accessor);
+    }
+
+    Some(ObjectProjectionArrowFastPathPlan {
+        output_accessors,
+        filter_accessors,
+    })
 }
 
-fn direct_object_property_fast_path_supported(expression: &str) -> bool {
-    !expression.is_empty()
-        && !expression.contains('.')
+fn object_projection_arrow_accessor_for_column(
+    column: &MapProjectionColumn,
+    projected: &ProjectedColumn,
+) -> Option<ObjectProjectionArrowAccessor> {
+    match column.value.as_str() {
+        "goid" | "object.goid" | "Object.goid" => matches!(
+            projected.logical,
+            CoveLogicalType::Uuid | CoveLogicalType::Utf8
+        )
+        .then_some(ObjectProjectionArrowAccessor::ObjectGoid),
+        value => direct_object_property_fast_path_property_name(value)
+            .map(ObjectProjectionArrowAccessor::Property),
+    }
+}
+
+fn object_projection_fast_path_filter_column_supported(projected: &ProjectedColumn) -> bool {
+    projected.nested_shape.is_none()
+        && !matches!(
+            projected.logical,
+            CoveLogicalType::List | CoveLogicalType::Struct | CoveLogicalType::Map
+        )
+}
+
+fn direct_object_property_fast_path_property_name(expression: &str) -> Option<String> {
+    let expression = expression.trim();
+    let property_name = expression.strip_prefix("property.").unwrap_or(expression);
+    if !property_name.is_empty()
+        && !property_name.contains('.')
         && !expression.contains(char::is_whitespace)
         && !expression.chars().any(|ch| {
             matches!(
@@ -1020,13 +1081,18 @@ fn direct_object_property_fast_path_supported(expression: &str) -> bool {
                 '(' | ')' | '[' | ']' | '{' | '}' | '+' | '-' | '*' | '/' | '?' | ':'
             )
         })
+    {
+        Some(property_name.to_string())
+    } else {
+        None
+    }
 }
 
 fn project_arrow_object_record_batches_fast(
     model: &ProjectionModel,
     projection: &MapProjectionEntry,
     projected_columns: &[ProjectedColumn],
-    accessors: &[ObjectProjectionArrowAccessor],
+    plan: &ObjectProjectionArrowFastPathPlan,
     options: &ProjectionBatchOptions,
 ) -> Result<Vec<RecordBatch>, String> {
     let schema = encoding::arrow_schema_from_projected_columns(projected_columns)?;
@@ -1052,13 +1118,21 @@ fn project_arrow_object_record_batches_fast(
         if &row.object_type != object_type {
             continue;
         }
+        if !object_row_matches_fast_path_filters(
+            row,
+            &options.pushed_filters,
+            &plan.filter_accessors,
+            &projection.projection_id,
+        )? {
+            continue;
+        }
         chunk.push(row);
         emitted_rows += 1;
         if chunk.len() >= batch_size {
             batches.push(build_object_record_batch(
                 &schema,
                 projected_columns,
-                accessors,
+                &plan.output_accessors,
                 &chunk,
             )?);
             chunk.clear();
@@ -1069,12 +1143,45 @@ fn project_arrow_object_record_batches_fast(
         batches.push(build_object_record_batch(
             &schema,
             projected_columns,
-            accessors,
+            &plan.output_accessors,
             &chunk,
         )?);
     }
 
     Ok(batches)
+}
+
+fn object_row_matches_fast_path_filters(
+    row: &ProjectionRow,
+    filters: &[ProjectionFilter],
+    filter_accessors: &BTreeMap<String, ObjectProjectionArrowAccessor>,
+    projection_id: &str,
+) -> Result<bool, String> {
+    for filter in filters {
+        let column = filter.column_name();
+        let accessor = filter_accessors.get(column).ok_or_else(|| {
+            format!(
+                "object projection '{projection_id}' fast path is missing filter column '{column}'"
+            )
+        })?;
+        let value = object_projection_accessor_value(row, accessor, projection_id, column)?;
+        if !projection_filter_matches_value(filter, value.as_ref()) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn projection_contains_filter_columns(
+    projection: &MapProjectionEntry,
+    options: &ProjectionBatchOptions,
+) -> bool {
+    options.pushed_filters.iter().all(|filter| {
+        projection
+            .columns
+            .iter()
+            .any(|column| column.name == filter.column_name())
+    })
 }
 
 fn evidence_projection_arrow_fast_path_supported(
@@ -1237,14 +1344,48 @@ fn build_object_record_batch_column(
     match accessor {
         ObjectProjectionArrowAccessor::ObjectGoid => build_object_goid_array(rows, projected),
         ObjectProjectionArrowAccessor::Property(property_name) => {
-            let null_value = Value::Null;
-            let values = rows
+            let owned = rows
                 .iter()
                 .map(|row| {
-                    projection_property_ref_by_name(row, property_name).unwrap_or(&null_value)
+                    object_projection_accessor_value(
+                        row,
+                        accessor,
+                        "<arrow-fast-path>",
+                        property_name,
+                    )
                 })
-                .collect::<Vec<_>>();
+                .collect::<Result<Vec<_>, _>>()?;
+            let values = owned.iter().map(Cow::as_ref).collect::<Vec<_>>();
             encoding::encode_arrow_values(&values, projected)
+        }
+    }
+}
+
+fn object_projection_accessor_value<'a>(
+    row: &'a ProjectionRow,
+    accessor: &ObjectProjectionArrowAccessor,
+    projection_id: &str,
+    column_name: &str,
+) -> Result<Cow<'a, Value>, String> {
+    match accessor {
+        ObjectProjectionArrowAccessor::ObjectGoid => {
+            Ok(Cow::Owned(Value::String(hex_encode(&row.goid))))
+        }
+        ObjectProjectionArrowAccessor::Property(property_name) => {
+            let Some(value) = projection_property_ref_by_name(row, property_name) else {
+                return Ok(Cow::Owned(Value::Null));
+            };
+            let Some(values) = value.as_array() else {
+                return Ok(Cow::Borrowed(value));
+            };
+            match values.as_slice() {
+                [] => Ok(Cow::Owned(Value::Null)),
+                [value] => Ok(Cow::Borrowed(value)),
+                _ => Err(format!(
+                    "projection '{projection_id}' column '{column_name}' produced {} values with multi_value_policy='reject'",
+                    values.len()
+                )),
+            }
         }
     }
 }
@@ -3007,43 +3148,8 @@ impl ProjectionFilter {
     }
 
     fn matches(&self, row: &Map<String, Value>) -> bool {
-        match self {
-            Self::Compare {
-                column,
-                op,
-                literal,
-            } => {
-                let value = row.get(column).unwrap_or(&Value::Null);
-                match op {
-                    ProjectionFilterOp::Eq => projection_filter_eq(value, literal),
-                    ProjectionFilterOp::Ne => projection_filter_cmp(value, literal)
-                        .is_some_and(|ordering| !ordering.is_eq()),
-                    ProjectionFilterOp::Lt => projection_filter_cmp(value, literal)
-                        .is_some_and(|ordering| ordering.is_lt()),
-                    ProjectionFilterOp::LtEq => projection_filter_cmp(value, literal)
-                        .is_some_and(|ordering| !ordering.is_gt()),
-                    ProjectionFilterOp::Gt => projection_filter_cmp(value, literal)
-                        .is_some_and(|ordering| ordering.is_gt()),
-                    ProjectionFilterOp::GtEq => projection_filter_cmp(value, literal)
-                        .is_some_and(|ordering| !ordering.is_lt()),
-                }
-            }
-            Self::InList { column, literals } => {
-                let value = row.get(column).unwrap_or(&Value::Null);
-                !value.is_null()
-                    && literals
-                        .iter()
-                        .any(|literal| projection_filter_eq(value, literal))
-            }
-            Self::IsNull { column, negated } => {
-                let is_null = row.get(column).unwrap_or(&Value::Null).is_null();
-                if *negated {
-                    !is_null
-                } else {
-                    is_null
-                }
-            }
-        }
+        let value = row.get(self.column_name()).unwrap_or(&Value::Null);
+        projection_filter_matches_value(self, value)
     }
 }
 
@@ -3079,6 +3185,43 @@ mod tests {
             &null,
             std::slice::from_ref(&filter)
         ));
+    }
+}
+
+fn projection_filter_matches_value(filter: &ProjectionFilter, value: &Value) -> bool {
+    match filter {
+        ProjectionFilter::Compare { op, literal, .. } => match op {
+            ProjectionFilterOp::Eq => projection_filter_eq(value, literal),
+            ProjectionFilterOp::Ne => {
+                projection_filter_cmp(value, literal).is_some_and(|ordering| !ordering.is_eq())
+            }
+            ProjectionFilterOp::Lt => {
+                projection_filter_cmp(value, literal).is_some_and(|ordering| ordering.is_lt())
+            }
+            ProjectionFilterOp::LtEq => {
+                projection_filter_cmp(value, literal).is_some_and(|ordering| !ordering.is_gt())
+            }
+            ProjectionFilterOp::Gt => {
+                projection_filter_cmp(value, literal).is_some_and(|ordering| ordering.is_gt())
+            }
+            ProjectionFilterOp::GtEq => {
+                projection_filter_cmp(value, literal).is_some_and(|ordering| !ordering.is_lt())
+            }
+        },
+        ProjectionFilter::InList { literals, .. } => {
+            !value.is_null()
+                && literals
+                    .iter()
+                    .any(|literal| projection_filter_eq(value, literal))
+        }
+        ProjectionFilter::IsNull { negated, .. } => {
+            let is_null = value.is_null();
+            if *negated {
+                !is_null
+            } else {
+                is_null
+            }
+        }
     }
 }
 

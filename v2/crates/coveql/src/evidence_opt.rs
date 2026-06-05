@@ -197,6 +197,10 @@ pub enum EvidenceGrainKind {
     Association,
     Projection,
     Row,
+    Column,
+    Node,
+    Edge,
+    Path,
     Source,
     Unknown,
 }
@@ -209,6 +213,11 @@ pub enum EvidenceTargetIndexKind {
     Property,
     AssociationType,
     Projection,
+    TableRow,
+    TableColumn,
+    GraphNode,
+    GraphEdge,
+    GraphPath,
 }
 
 impl From<&ResolvedEvidenceTarget> for EvidenceTargetIndexKind {
@@ -218,6 +227,11 @@ impl From<&ResolvedEvidenceTarget> for EvidenceTargetIndexKind {
             ResolvedEvidenceTarget::ObjectType { .. } => Self::ObjectType,
             ResolvedEvidenceTarget::AssociationType { .. } => Self::AssociationType,
             ResolvedEvidenceTarget::Projection { .. } => Self::Projection,
+            ResolvedEvidenceTarget::TableRow { .. } => Self::TableRow,
+            ResolvedEvidenceTarget::TableColumn { .. } => Self::TableColumn,
+            ResolvedEvidenceTarget::GraphNode { .. } => Self::GraphNode,
+            ResolvedEvidenceTarget::GraphEdge { .. } => Self::GraphEdge,
+            ResolvedEvidenceTarget::GraphPath { .. } => Self::GraphPath,
             ResolvedEvidenceTarget::Property { .. } => Self::Property,
         }
     }
@@ -364,11 +378,29 @@ impl EvidenceGrainIndex {
             ResolvedEvidenceTarget::Projection { projection_id } => {
                 self.by_projection.get(projection_id)
             }
+            ResolvedEvidenceTarget::TableRow { projection_id, .. } => {
+                self.by_projection.get(projection_id)
+            }
+            ResolvedEvidenceTarget::TableColumn { column_name, .. } => {
+                self.by_property.get(column_name)
+            }
             ResolvedEvidenceTarget::Property { property_name, .. } => {
                 self.by_property.get(property_name)
             }
             ResolvedEvidenceTarget::AssociationType { type_name, .. } => {
                 self.by_association.get(type_name)
+            }
+            ResolvedEvidenceTarget::GraphEdge { type_name, .. } => {
+                self.by_association.get(type_name)
+            }
+            ResolvedEvidenceTarget::GraphPath { .. } => None,
+            ResolvedEvidenceTarget::GraphNode { .. } => {
+                current_row_goid(current_row).and_then(|goid| {
+                    self.by_object.get(&(
+                        current_row_dataset_file_ordinal(current_row),
+                        goid.to_string(),
+                    ))
+                })
             }
             ResolvedEvidenceTarget::ObjectType { .. } => {
                 current_row_goid(current_row).and_then(|goid| {
@@ -395,6 +427,11 @@ impl From<AstEvidenceGrain> for EvidenceGrainKind {
             AstEvidenceGrain::Property => Self::Property,
             AstEvidenceGrain::Association => Self::Association,
             AstEvidenceGrain::Row => Self::Row,
+            AstEvidenceGrain::Column => Self::Column,
+            AstEvidenceGrain::Projection => Self::Projection,
+            AstEvidenceGrain::Node => Self::Node,
+            AstEvidenceGrain::Edge => Self::Edge,
+            AstEvidenceGrain::Path => Self::Path,
             AstEvidenceGrain::Source => Self::Source,
         }
     }
@@ -498,6 +535,21 @@ fn materialized_target_matches(
         Some(ResolvedEvidenceTarget::Projection { projection_id }) => {
             materialized_str(row, "projection_id").map_or(true, |value| value == projection_id)
         }
+        Some(ResolvedEvidenceTarget::TableRow { projection_id, .. }) => {
+            materialized_str(row, "projection_id").map_or(true, |value| value == projection_id)
+        }
+        Some(ResolvedEvidenceTarget::TableColumn {
+            projection_id,
+            column_name,
+            ..
+        }) => {
+            if materialized_str(row, "projection_id").is_some_and(|value| value != projection_id) {
+                return false;
+            }
+            materialized_str(row, "column_name")
+                .or_else(|| materialized_str(row, "property_name"))
+                .map_or(true, |value| value == column_name)
+        }
         Some(ResolvedEvidenceTarget::Property {
             object_type_id,
             property_id,
@@ -535,6 +587,27 @@ fn materialized_target_matches(
                 .or_else(|| materialized_str(row, "target_kind"));
             target.map_or(true, |value| value == "association" || value == type_name)
         }
+        Some(ResolvedEvidenceTarget::GraphEdge {
+            object_type_id,
+            type_name,
+            ..
+        }) => {
+            if materialized_u64(row, "object_type_id")
+                .is_some_and(|value| value != u64::from(*object_type_id))
+            {
+                return false;
+            }
+            if let Some(value) = materialized_str(row, "association_type")
+                .or_else(|| materialized_str(row, "type_name"))
+            {
+                return value == type_name;
+            }
+            let target = materialized_str(row, "operation_target")
+                .or_else(|| materialized_str(row, "target_kind"));
+            target.map_or(true, |value| {
+                value == "edge" || value == "association" || value == type_name
+            })
+        }
         Some(ResolvedEvidenceTarget::ObjectType {
             object_type_id,
             type_name,
@@ -559,6 +632,39 @@ fn materialized_target_matches(
             let target = materialized_str(row, "operation_target")
                 .or_else(|| materialized_str(row, "target_kind"));
             target.map_or(true, |value| value == "object" || value == type_name)
+        }
+        Some(ResolvedEvidenceTarget::GraphNode {
+            object_type_id,
+            type_name,
+            ..
+        }) => {
+            if let Some(current_goid) = current_row.and_then(current_row_goid) {
+                if materialized_str(row, "output_object_id")
+                    .is_some_and(|value| value != current_goid)
+                {
+                    return false;
+                }
+            }
+            if materialized_u64(row, "object_type_id")
+                .is_some_and(|value| value != u64::from(*object_type_id))
+            {
+                return false;
+            }
+            if let Some(value) =
+                materialized_str(row, "object_type").or_else(|| materialized_str(row, "type_name"))
+            {
+                return value == type_name;
+            }
+            let target = materialized_str(row, "operation_target")
+                .or_else(|| materialized_str(row, "target_kind"));
+            target.map_or(true, |value| {
+                value == "node" || value == "object" || value == type_name
+            })
+        }
+        Some(ResolvedEvidenceTarget::GraphPath { .. }) => {
+            let target = materialized_str(row, "operation_target")
+                .or_else(|| materialized_str(row, "target_kind"));
+            target.map_or(true, |value| value == "path")
         }
     }
 }
@@ -628,6 +734,21 @@ fn target_matches(entry: &MapEvidenceEntry, target: Option<&ResolvedEvidenceTarg
             metadata_str(entry, "projection_id")
                 .map_or(true, |value| value == projection_id.as_str())
         }
+        Some(ResolvedEvidenceTarget::TableRow { projection_id, .. }) => {
+            metadata_str(entry, "projection_id").map_or(true, |value| value == projection_id)
+        }
+        Some(ResolvedEvidenceTarget::TableColumn {
+            projection_id,
+            column_name,
+            ..
+        }) => {
+            if metadata_str(entry, "projection_id").is_some_and(|value| value != projection_id) {
+                return false;
+            }
+            metadata_str(entry, "column_name")
+                .or_else(|| metadata_str(entry, "property_name"))
+                .map_or(true, |value| value == column_name)
+        }
         Some(ResolvedEvidenceTarget::Property {
             object_type_id,
             property_id,
@@ -668,6 +789,27 @@ fn target_matches(entry: &MapEvidenceEntry, target: Option<&ResolvedEvidenceTarg
                 value == "association" || value == type_name.as_str()
             })
         }
+        Some(ResolvedEvidenceTarget::GraphEdge {
+            object_type_id,
+            type_name,
+            ..
+        }) => {
+            if metadata_u64(entry, "object_type_id")
+                .is_some_and(|value| value != u64::from(*object_type_id))
+            {
+                return false;
+            }
+            if let Some(value) =
+                metadata_str(entry, "association_type").or_else(|| metadata_str(entry, "type_name"))
+            {
+                return value == type_name.as_str();
+            }
+            let target = metadata_str(entry, "operation_target")
+                .or_else(|| metadata_str(entry, "target_kind"));
+            target.map_or(true, |value| {
+                value == "edge" || value == "association" || value == type_name.as_str()
+            })
+        }
         Some(ResolvedEvidenceTarget::ObjectType {
             object_type_id,
             type_name,
@@ -688,6 +830,32 @@ fn target_matches(entry: &MapEvidenceEntry, target: Option<&ResolvedEvidenceTarg
                 value == "object" || value == type_name.as_str()
             })
         }
+        Some(ResolvedEvidenceTarget::GraphNode {
+            object_type_id,
+            type_name,
+            ..
+        }) => {
+            if metadata_u64(entry, "object_type_id")
+                .is_some_and(|value| value != u64::from(*object_type_id))
+            {
+                return false;
+            }
+            if let Some(value) =
+                metadata_str(entry, "object_type").or_else(|| metadata_str(entry, "type_name"))
+            {
+                return value == type_name.as_str();
+            }
+            let target = metadata_str(entry, "operation_target")
+                .or_else(|| metadata_str(entry, "target_kind"));
+            target.map_or(true, |value| {
+                value == "node" || value == "object" || value == type_name.as_str()
+            })
+        }
+        Some(ResolvedEvidenceTarget::GraphPath { .. }) => {
+            let target = metadata_str(entry, "operation_target")
+                .or_else(|| metadata_str(entry, "target_kind"));
+            target.map_or(true, |value| value == "path")
+        }
     }
 }
 
@@ -706,6 +874,10 @@ fn grain_from_metadata(value: &str) -> EvidenceGrainKind {
         "association" | "link" => EvidenceGrainKind::Association,
         "projection" | "projection_row" => EvidenceGrainKind::Projection,
         "row" | "output_row" => EvidenceGrainKind::Row,
+        "column" | "output_column" => EvidenceGrainKind::Column,
+        "node" | "graph_node" => EvidenceGrainKind::Node,
+        "edge" | "graph_edge" => EvidenceGrainKind::Edge,
+        "path" | "graph_path" => EvidenceGrainKind::Path,
         "source" | "source_row" | "source_record" => EvidenceGrainKind::Source,
         _ => EvidenceGrainKind::Unknown,
     }
