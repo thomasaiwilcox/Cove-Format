@@ -34,31 +34,34 @@ enum Command {
         full: bool,
         json: bool,
     },
-    Query {
-        file: Option<PathBuf>,
-        query: String,
-        query_file: Option<PathBuf>,
-        format: OutputFormat,
-        take: Option<usize>,
-        explain: Option<String>,
-        mapping: Option<PathBuf>,
-        members: Vec<(String, PathBuf)>,
-        dataset: Option<PathBuf>,
-        engine: QueryEngine,
-        batch_size: Option<usize>,
-        graph_budget: GraphBudgetOverrides,
-        enable_graph_traversal: bool,
-        allow_index_only: bool,
-        allow_zero_copy: bool,
-        physical_sidecars: QueryPhysicalSidecarPaths,
-        external_tables: Vec<ExternalTableSpec>,
-        no_auto_sidecars: bool,
-        strict_performance: bool,
-        perf_report: bool,
-        json_diagnostics: bool,
-        max_cell_width: usize,
-    },
+    Query(Box<QueryCommand>),
     Help,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QueryCommand {
+    file: Option<PathBuf>,
+    query: String,
+    query_file: Option<PathBuf>,
+    format: OutputFormat,
+    take: Option<usize>,
+    explain: Option<String>,
+    mapping: Option<PathBuf>,
+    members: Vec<(String, PathBuf)>,
+    dataset: Option<PathBuf>,
+    engine: QueryEngine,
+    batch_size: Option<usize>,
+    graph_budget: GraphBudgetOverrides,
+    enable_graph_traversal: bool,
+    allow_index_only: bool,
+    allow_zero_copy: bool,
+    physical_sidecars: QueryPhysicalSidecarPaths,
+    external_tables: Vec<ExternalTableSpec>,
+    no_auto_sidecars: bool,
+    strict_performance: bool,
+    perf_report: bool,
+    json_diagnostics: bool,
+    max_cell_width: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,53 +90,30 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<(), String> {
             full,
             json,
         } => run_optimize(&file, out_dir.as_deref(), full, json),
-        Command::Query {
-            file,
-            query,
-            query_file,
-            format,
-            take,
-            explain,
-            mapping,
-            members,
-            dataset,
-            engine,
-            batch_size,
-            graph_budget,
-            enable_graph_traversal,
-            allow_index_only,
-            allow_zero_copy,
-            physical_sidecars,
-            external_tables,
-            no_auto_sidecars,
-            strict_performance,
-            perf_report,
-            json_diagnostics,
-            max_cell_width,
-        } => run_query(
-            file.as_deref(),
-            &query,
+        Command::Query(command) => run_query(
+            command.file.as_deref(),
+            &command.query,
             QueryCommandOptions {
-                query_file,
-                format,
-                take,
-                explain,
-                mapping,
-                members,
-                dataset,
-                engine,
-                batch_size,
-                graph_budget,
-                enable_graph_traversal,
-                allow_index_only,
-                allow_zero_copy,
-                physical_sidecars,
-                external_tables,
-                no_auto_sidecars,
-                strict_performance,
-                perf_report,
-                json_diagnostics,
-                max_cell_width,
+                query_file: command.query_file,
+                format: command.format,
+                take: command.take,
+                explain: command.explain,
+                mapping: command.mapping,
+                members: command.members,
+                dataset: command.dataset,
+                engine: command.engine,
+                batch_size: command.batch_size,
+                graph_budget: command.graph_budget,
+                enable_graph_traversal: command.enable_graph_traversal,
+                allow_index_only: command.allow_index_only,
+                allow_zero_copy: command.allow_zero_copy,
+                physical_sidecars: command.physical_sidecars,
+                external_tables: command.external_tables,
+                no_auto_sidecars: command.no_auto_sidecars,
+                strict_performance: command.strict_performance,
+                perf_report: command.perf_report,
+                json_diagnostics: command.json_diagnostics,
+                max_cell_width: command.max_cell_width,
             },
         ),
     }
@@ -168,19 +148,14 @@ struct ExternalTableSpec {
     path: PathBuf,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum QueryEngine {
+    #[default]
     Auto,
     Materialized,
     Physical,
     Compare,
     Kernel,
-}
-
-impl Default for QueryEngine {
-    fn default() -> Self {
-        Self::Auto
-    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -241,8 +216,7 @@ fn parse_inspect(args: Vec<String>) -> Result<Command, String> {
     let mut json = false;
     let mut performance = false;
     let mut file = None;
-    let mut iter = args.into_iter();
-    while let Some(arg) = iter.next() {
+    for arg in args {
         match arg.as_str() {
             "--queries" => queries = true,
             "--json" => json = true,
@@ -537,7 +511,7 @@ fn parse_query(args: Vec<String>) -> Result<Command, String> {
             (Some(file), query)
         }
     };
-    Ok(Command::Query {
+    Ok(Command::Query(Box::new(QueryCommand {
         file,
         query,
         query_file,
@@ -560,7 +534,7 @@ fn parse_query(args: Vec<String>) -> Result<Command, String> {
         perf_report,
         json_diagnostics,
         max_cell_width,
-    })
+    })))
 }
 
 fn parse_query_engine(value: &str) -> Result<QueryEngine, String> {
@@ -1245,19 +1219,23 @@ fn configure_execution_engine(
     if !physical_requested {
         return Ok(());
     }
-    let mut physical_options = PhysicalPlanOptions::default();
-    physical_options.allow_index_only_answers = options.allow_index_only;
-    physical_options.allow_zero_copy_output = options.allow_zero_copy;
-    physical_options.sidecars = physical_sidecars_from_paths(&options.physical_sidecars)?;
+    let physical_options = PhysicalPlanOptions {
+        allow_index_only_answers: options.allow_index_only,
+        allow_zero_copy_output: options.allow_zero_copy,
+        sidecars: physical_sidecars_from_paths(&options.physical_sidecars)?,
+        ..Default::default()
+    };
 
-    let mut kernel_options = KernelExecutionOptions::default();
-    kernel_options.batch_size = options.batch_size;
-    kernel_options.mode = match options.engine {
-        QueryEngine::Auto => KernelExecutionMode::Auto,
-        QueryEngine::Materialized => KernelExecutionMode::Auto,
-        QueryEngine::Physical => KernelExecutionMode::Auto,
-        QueryEngine::Compare => KernelExecutionMode::CompareWithMaterialized,
-        QueryEngine::Kernel => KernelExecutionMode::ForceKernel,
+    let kernel_options = KernelExecutionOptions {
+        batch_size: options.batch_size,
+        mode: match options.engine {
+            QueryEngine::Auto => KernelExecutionMode::Auto,
+            QueryEngine::Materialized => KernelExecutionMode::Auto,
+            QueryEngine::Physical => KernelExecutionMode::Auto,
+            QueryEngine::Compare => KernelExecutionMode::CompareWithMaterialized,
+            QueryEngine::Kernel => KernelExecutionMode::ForceKernel,
+        },
+        ..Default::default()
     };
     execute_options.execution_engine = ArtifactExecutionEngine::Physical {
         physical_options,
@@ -1588,15 +1566,19 @@ fn write_csv(value: &Value) -> Result<(), String> {
 }
 
 fn writeln_csv_row(out: &mut impl Write, values: &[String]) -> Result<(), String> {
-    let line = values.iter().map(csv_escape).collect::<Vec<_>>().join(",");
+    let line = values
+        .iter()
+        .map(|value| csv_escape(value))
+        .collect::<Vec<_>>()
+        .join(",");
     writeln!(out, "{line}").map_err(|error| format!("cannot write CSV: {error}"))
 }
 
-fn csv_escape(value: &String) -> String {
+fn csv_escape(value: &str) -> String {
     if value.contains(',') || value.contains('"') || value.contains('\n') || value.contains('\r') {
         format!("\"{}\"", value.replace('"', "\"\""))
     } else {
-        value.clone()
+        value.to_owned()
     }
 }
 
@@ -1718,7 +1700,7 @@ fn format_artifact_query_error(error: ExecuteArtifactQueryError, json_diagnostic
             format_execution_error(error, json_diagnostics)
         }
         ExecuteArtifactQueryError::NotQueryable(discovery) if json_diagnostics => {
-            serde_json::to_string_pretty(&discovery).unwrap_or_else(|_| discovery.guidance)
+            serde_json::to_string_pretty(&discovery).unwrap_or(discovery.guidance)
         }
         other => other.to_string(),
     }

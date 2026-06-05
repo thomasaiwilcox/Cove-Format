@@ -480,10 +480,7 @@ fn apply_paths_to_inputs(
         if sidecar.status != CoveAccelerationSidecarStatus::Present {
             continue;
         }
-        let bytes = match fs::read(&sidecar.path) {
-            Ok(bytes) => Some(bytes),
-            Err(_) => None,
-        };
+        let bytes = fs::read(&sidecar.path).ok();
         match sidecar.kind.as_str() {
             "COVE-I" => inputs.covi_artifact_bytes = bytes,
             "COVX" => inputs.covx_artifact_bytes = bytes,
@@ -797,10 +794,22 @@ mod tests {
 
     #[test]
     fn cove_e_sidecar_generation_writes_valid_engine_metadata() {
+        let thread_name = std::thread::current()
+            .name()
+            .unwrap_or("test")
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                    ch
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>();
         let path = std::env::temp_dir().join(format!(
             "coveql-cove-e-{}-{}.covee",
             std::process::id(),
-            std::thread::current().name().unwrap_or("test")
+            thread_name
         ));
         let bytes = b"source bytes for execution-code sidecar";
         let written = generate_cove_e(bytes, &path).unwrap().unwrap();

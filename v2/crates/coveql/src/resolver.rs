@@ -1489,7 +1489,7 @@ impl Resolver {
         let key = key_expr
             .map(|expr| self.resolve_expr(expr, &ResolvedRoot::Table(table.clone())))
             .transpose()?;
-        if recursive && step_table.is_some() {
+        if let (true, Some(step_table_ref)) = (recursive, step_table.as_ref()) {
             let key = key.as_ref().ok_or_else(|| {
                 profile_rejection(
                     "E_UNSUPPORTED_PROFILE_METHOD",
@@ -1497,12 +1497,19 @@ impl Resolver {
                     &self.options,
                 )
             })?;
+            let max_iterations = max_iterations.ok_or_else(|| {
+                profile_rejection(
+                    "E_UNSUPPORTED_PROFILE_METHOD",
+                    "withRecursive requires finite maxIterations",
+                    &self.options,
+                )
+            })?;
             table = self.materialized_recursive_cte_table(
                 name.as_str(),
                 table,
-                step_table.as_ref().expect("checked above"),
+                step_table_ref,
                 key,
-                max_iterations.expect("recursive maxIterations checked above"),
+                max_iterations,
             )?;
         }
         Ok(ResolvedCommonTableExpression {

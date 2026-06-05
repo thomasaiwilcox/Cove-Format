@@ -198,7 +198,7 @@ pub struct QueryArtifactMember {
 
 #[derive(Debug)]
 pub enum ExecuteArtifactQueryError {
-    NotQueryable(QuerySurfaceDiscovery),
+    NotQueryable(Box<QuerySurfaceDiscovery>),
     Manifest(BuildOperationContextError),
     Execution(BuildExecutionError),
     Planning(String),
@@ -460,7 +460,7 @@ pub fn execute_query_from_artifact(
             }
         }
         QueryArtifactKind::Covm => execute_query_from_manifest(bytes, query, options),
-        _ => Err(ExecuteArtifactQueryError::NotQueryable(discovery)),
+        _ => Err(ExecuteArtifactQueryError::NotQueryable(Box::new(discovery))),
     }
 }
 
@@ -501,7 +501,7 @@ fn execute_query_from_manifest(
 ) -> Result<ExecutedQuery, ExecuteArtifactQueryError> {
     if options.manifest_members.is_empty() {
         let discovery = discover_query_surfaces(bytes, QuerySurfaceDiscoveryOptions::default());
-        return Err(ExecuteArtifactQueryError::NotQueryable(discovery));
+        return Err(ExecuteArtifactQueryError::NotQueryable(Box::new(discovery)));
     }
     let members = options
         .manifest_members
