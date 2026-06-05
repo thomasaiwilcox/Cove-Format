@@ -1,0 +1,3 @@
+{"id":"p1","active":true,"score":10,"rating":15,"status":"open","nickname":"ada"}
+{"id":"p2","active":false,"score":20,"rating":25,"status":"closed","nickname":null}
+{"id":"p3","active":true,"score":30,"rating":35,"status":"open","nickname":"grace"}

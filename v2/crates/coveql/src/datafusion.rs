@@ -1501,8 +1501,13 @@ fn can_apply_datafusion_row_filters(planned: &PlannedQuery) -> bool {
 
 fn coveql_plan_is_simple_scan_shape(planned: &PlannedQuery) -> bool {
     let chain = &planned.resolved.method_chain;
-    chain.lookups.is_empty()
+    chain.ctes.is_empty()
+        && chain.lookups.is_empty()
+        && chain.joins.is_empty()
+        && chain.set_operations.is_empty()
+        && chain.windows.is_empty()
         && chain.traversals.is_empty()
+        && chain.graph_algorithms.is_empty()
         && chain
             .where_predicate
             .as_ref()
@@ -2722,6 +2727,12 @@ fn combined_projection_proof_state(
 fn provider_residuals(planned: &PlannedQuery) -> Vec<String> {
     let chain = &planned.resolved.method_chain;
     let mut residuals = Vec::new();
+    if !chain.ctes.is_empty() {
+        residuals.push(
+            "planned CoveQL common table expressions execute inside materialized table semantics"
+                .into(),
+        );
+    }
     if chain.where_predicate.is_some() {
         residuals
             .push("planned CoveQL where predicate executes before DataFusion scan output".into());
@@ -2729,6 +2740,21 @@ fn provider_residuals(planned: &PlannedQuery) -> Vec<String> {
     if !chain.lookups.is_empty() {
         residuals.push(
             "planned CoveQL table lookup joins execute inside materialized table semantics".into(),
+        );
+    }
+    if !chain.joins.is_empty() {
+        residuals.push(
+            "planned CoveQL relational joins execute inside materialized table semantics".into(),
+        );
+    }
+    if !chain.set_operations.is_empty() {
+        residuals.push(
+            "planned CoveQL set operations execute inside materialized table semantics".into(),
+        );
+    }
+    if !chain.windows.is_empty() {
+        residuals.push(
+            "planned CoveQL window functions execute inside materialized table semantics".into(),
         );
     }
     if chain
@@ -2744,6 +2770,11 @@ fn provider_residuals(planned: &PlannedQuery) -> Vec<String> {
     if !chain.traversals.is_empty() {
         residuals.push(
             "planned CoveQL graph traversal executes inside materialized graph semantics".into(),
+        );
+    }
+    if !chain.graph_algorithms.is_empty() {
+        residuals.push(
+            "planned CoveQL graph algorithms execute inside materialized graph semantics".into(),
         );
     }
     if chain.group_by.is_some() {

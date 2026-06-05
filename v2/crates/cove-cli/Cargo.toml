@@ -1,0 +1,19 @@
+[package]
+name = "cove-cli"
+version = "0.1.0"
+edition = "2021"
+description = "Beginner-friendly Cove Format and CoveQL command line interface"
+license = "MIT"
+
+[[bin]]
+name = "cove"
+path = "src/main.rs"
+
+[dependencies]
+cove-core = { path = "../cove-core" }
+coveql = { path = "../coveql" }
+csv = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
+
+[dev-dependencies]
+cove-map = { path = "../cove-map" }

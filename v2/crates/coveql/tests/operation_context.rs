@@ -144,6 +144,101 @@ fn projection_backed_thing_table_contract() -> coveql::TableSurfaceContract {
     }
 }
 
+fn registered_people_table_authority(
+    authority_kind: coveql::TableSurfaceAuthorityKind,
+    execution_authority: coveql::TableExecutionAuthority,
+) -> coveql::TableSurfaceAuthority {
+    coveql::TableSurfaceAuthority {
+        contract: coveql::TableSurfaceContract {
+            table_id: "table:people".into(),
+            table_name: "people".into(),
+            contract_version: coveql::COVEQL_PROFILE_CONTRACT_VERSION.into(),
+            authority_kind,
+            authority_fingerprint: "people:v1".into(),
+            schema_fingerprint: "people-schema:v1".into(),
+            logical_column_map: vec![
+                coveql::TableSurfaceColumnContract {
+                    name: "id".into(),
+                    logical_type: Some("utf8".into()),
+                    nullable: false,
+                    source_path: Some("id".into()),
+                    code_domain: None,
+                    collation: None,
+                },
+                coveql::TableSurfaceColumnContract {
+                    name: "active".into(),
+                    logical_type: Some("bool".into()),
+                    nullable: false,
+                    source_path: Some("active".into()),
+                    code_domain: None,
+                    collation: None,
+                },
+            ],
+            row_grain: "registered_table_row".into(),
+            row_identity: vec!["id".into()],
+            canonical_order: vec!["id".into()],
+            visibility_authority: "registered_visibility".into(),
+            redaction_authority: "registered_redaction".into(),
+            temporal_authority: coveql::TableTemporalAuthority::StaticTableSnapshot,
+            evidence_capabilities: vec![coveql::AstEvidenceGrain::Row],
+            null_missing_nan_policy: "missing_is_null".into(),
+            collation_policy: "binary".into(),
+            code_domain_contexts: Vec::new(),
+            code_domain_bridges: Vec::new(),
+            projection_dependency_contract_id: None,
+            datafusion_interop_contract: Some("registered_materialized_rows".into()),
+        },
+        execution_authority,
+    }
+}
+
+fn people_rows(rows: &[(&str, bool)]) -> Vec<coveql::TableSurfaceRow> {
+    rows.iter()
+        .map(|(id, active)| {
+            BTreeMap::from([("id".into(), json!(id)), ("active".into(), json!(active))])
+        })
+        .collect()
+}
+
+fn score_table_authority() -> coveql::TableSurfaceAuthority {
+    let mut authority = registered_people_table_authority(
+        coveql::TableSurfaceAuthorityKind::MaterializedTable,
+        coveql::TableExecutionAuthority::MaterializedRows {
+            rows: vec![
+                BTreeMap::from([
+                    ("id".into(), json!("a")),
+                    ("active".into(), json!(true)),
+                    ("score".into(), json!(1)),
+                ]),
+                BTreeMap::from([
+                    ("id".into(), json!("b")),
+                    ("active".into(), json!(false)),
+                    ("score".into(), json!(2)),
+                ]),
+                BTreeMap::from([
+                    ("id".into(), json!("c")),
+                    ("active".into(), json!(true)),
+                    ("score".into(), json!(3)),
+                ]),
+            ],
+        },
+    );
+    authority.contract.table_id = "table:scores".into();
+    authority.contract.table_name = "scores".into();
+    authority
+        .contract
+        .logical_column_map
+        .push(coveql::TableSurfaceColumnContract {
+            name: "score".into(),
+            logical_type: Some("int64".into()),
+            nullable: false,
+            source_path: Some("score".into()),
+            code_domain: None,
+            collation: None,
+        });
+    authority
+}
+
 fn graph_traversal_contract() -> coveql::GraphTraversalContract {
     coveql::GraphTraversalContract {
         contract_version: coveql::COVEQL_PROFILE_CONTRACT_VERSION.into(),
@@ -393,6 +488,27 @@ fn conformance_profile_declares_full_coveql_surface_defaults() {
     assert!(graph_contract
         .materialization_boundaries
         .contains(&"variable_length_traversal_requires_explicit_contract"));
+    let bridges = coveql::builtin_coveql_bridge_contracts()
+        .iter()
+        .map(|bridge| {
+            (
+                bridge.source_profile.as_str().to_string(),
+                bridge.target_profile.as_str().to_string(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        bridges,
+        BTreeSet::from([
+            ("object".to_string(), "table".to_string()),
+            ("table".to_string(), "object".to_string()),
+            ("object".to_string(), "graph".to_string()),
+            ("graph".to_string(), "object".to_string()),
+            ("table".to_string(), "graph".to_string()),
+            ("graph".to_string(), "table".to_string()),
+            ("table".to_string(), "table".to_string()),
+        ])
+    );
 }
 
 #[test]
@@ -419,6 +535,28 @@ fn query_builder_matches_handwritten_query_fingerprints() {
         parsed_built.parsed_ast_fingerprint,
         parsed_handwritten.parsed_ast_fingerprint
     );
+
+    let recursive_built = coveql::CoveQlQueryBuilder::table("people")
+        .with_recursive_table_step(
+            "reach",
+            "people",
+            None::<&str>,
+            "people_step",
+            None::<&str>,
+            "row-key",
+            4,
+        )
+        .select(["id"]);
+    let parsed_built = recursive_built.parse(ParseOptions::default()).unwrap();
+    let parsed_handwritten = coveql::parse_query(
+        "table(people).withRecursive(name: reach, seed: table(people), step: table(people_step), key: `row-key`, maxIterations: 4).select(id)",
+        ParseOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        parsed_built.parsed_ast_fingerprint,
+        parsed_handwritten.parsed_ast_fingerprint
+    );
 }
 
 #[test]
@@ -430,6 +568,26 @@ fn query_builder_matches_table_and_graph_profile_syntax() {
     let parsed_built = table_built.parse(ParseOptions::default()).unwrap();
     let parsed_handwritten = coveql::parse_query(
         "table(thing_projection) as l.lookup(table(thing_projection) as r, on: l.active == r.active, cardinality: many, unmatched: nulls, duplicate: many, nulls_match: false).select(left_active: l.active, right_active: r.active)",
+        ParseOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        parsed_built.parsed_ast_fingerprint,
+        parsed_handwritten.parsed_ast_fingerprint
+    );
+
+    let cte_built = coveql::CoveQlQueryBuilder::table("people")
+        .with_table("right", "people_right", None::<&str>)
+        .join_table(
+            "right",
+            Some("r"),
+            "people.id == r.id",
+            coveql::TableJoinKind::Inner,
+        )
+        .select(["people.id"]);
+    let parsed_built = cte_built.parse(ParseOptions::default()).unwrap();
+    let parsed_handwritten = coveql::parse_query(
+        "table(people).with(right: table(people_right)).join(table(right) as r, on: people.id == r.id, kind: inner).select(people.id)",
         ParseOptions::default(),
     )
     .unwrap();
@@ -452,6 +610,40 @@ fn query_builder_matches_table_and_graph_profile_syntax() {
     let parsed_built = graph_built.parse(ParseOptions::default()).unwrap();
     let parsed_handwritten = coveql::parse_query(
         "node(Customer) as c.traverse(out(edge(CustomerPlacedOrder) as placed).to(node(Order) as o)).select(customer: c.goid, order: o.goid)",
+        ParseOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        parsed_built.parsed_ast_fingerprint,
+        parsed_handwritten.parsed_ast_fingerprint
+    );
+
+    let algorithm_built = coveql::CoveQlQueryBuilder::node("Customer")
+        .alias("c")
+        .degree(Some("out(edge(CustomerPlacedOrder))"))
+        .select(["c.goid", "degree"]);
+    let parsed_built = algorithm_built.parse(ParseOptions::default()).unwrap();
+    let parsed_handwritten = coveql::parse_query(
+        "node(Customer) as c.degree(out(edge(CustomerPlacedOrder))).select(c.goid, degree)",
+        ParseOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        parsed_built.parsed_ast_fingerprint,
+        parsed_handwritten.parsed_ast_fingerprint
+    );
+
+    let algorithm_variant_built = coveql::CoveQlQueryBuilder::node("Customer")
+        .alias("c")
+        .degree_kind(Some("out(edge(CustomerPlacedOrder))"), "total")
+        .centrality_kind(Some("out(edge(CustomerPlacedOrder))"), "degree")
+        .spanning_tree_kind(Some("out(edge(CustomerPlacedOrder))"), "dfs")
+        .select(["c.goid", "degree", "centrality", "tree_depth"]);
+    let parsed_built = algorithm_variant_built
+        .parse(ParseOptions::default())
+        .unwrap();
+    let parsed_handwritten = coveql::parse_query(
+        "node(Customer) as c.degree(out(edge(CustomerPlacedOrder)), kind: total).centrality(out(edge(CustomerPlacedOrder)), kind: degree).spanningTree(out(edge(CustomerPlacedOrder)), kind: dfs).select(c.goid, degree, centrality, tree_depth)",
         ParseOptions::default(),
     )
     .unwrap();
@@ -1275,8 +1467,439 @@ fn table_surface_contract_override_must_prove_row_identity() {
     )
     .unwrap_err();
 
-    assert_eq!(err.diagnostics[0].code, "E_UNKNOWN_TABLE_SURFACE");
+    assert_eq!(err.diagnostics[0].code, "E_TABLE_ROW_IDENTITY_MISSING");
     assert!(err.diagnostics[0].message.contains("row_identity"));
+}
+
+#[test]
+fn registered_materialized_table_authority_executes_without_projection_catalog() {
+    let mut resolve_options = ResolveOptions::default();
+    resolve_options.table_authorities.insert(
+        "people".into(),
+        registered_people_table_authority(
+            coveql::TableSurfaceAuthorityKind::MaterializedTable,
+            coveql::TableExecutionAuthority::MaterializedRows {
+                rows: people_rows(&[("a", true), ("b", false)]),
+            },
+        ),
+    );
+
+    let executed = parse_resolve_plan_and_execute_query(
+        &minimal_object_file(),
+        "table(people).where(active == true).select(id, active)",
+        ParseOptions::default(),
+        resolve_options,
+        PlanOptions::default(),
+        ExecutionOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+
+    let ResolvedRoot::Table(table) = &executed.planned.resolved.root else {
+        panic!("expected table root");
+    };
+    assert_eq!(
+        table.authority_kind,
+        coveql::TableSurfaceAuthorityKind::MaterializedTable
+    );
+    assert_eq!(table.projection.projection_id, "table:people");
+    let explain = executed.explain_json();
+    let CoveQlExecutionResult::JsonRows(rows) = executed.result else {
+        panic!("expected materialized table JSON rows");
+    };
+    assert_eq!(rows, vec![json!({"id": "a", "active": true})]);
+    let table_contract = &explain["profile_contracts"][0]["query_contract"];
+    assert_eq!(
+        table_contract["authority_kind"],
+        json!("materialized_table")
+    );
+    assert_eq!(table_contract["authority_fingerprint"], json!("people:v1"));
+    assert_eq!(
+        table_contract["execution_authority"],
+        json!({
+            "kind": "materialized_rows",
+            "row_count": 2,
+        })
+    );
+}
+
+#[test]
+fn registered_table_authority_validates_identity_and_kind_match() {
+    let mut authority = registered_people_table_authority(
+        coveql::TableSurfaceAuthorityKind::RawTable,
+        coveql::TableExecutionAuthority::MaterializedRows {
+            rows: people_rows(&[("a", true)]),
+        },
+    );
+    authority.contract.row_identity.clear();
+    let mut resolve_options = ResolveOptions::default();
+    resolve_options
+        .table_authorities
+        .insert("people".into(), authority);
+
+    let err = parse_and_resolve_query(
+        &minimal_object_file(),
+        "table(people).select(id)",
+        ParseOptions::default(),
+        resolve_options,
+        validation_options(),
+    )
+    .unwrap_err();
+    assert_eq!(err.diagnostics[0].code, "E_TABLE_ROW_IDENTITY_MISSING");
+
+    let mut resolve_options = ResolveOptions::default();
+    resolve_options.table_authorities.insert(
+        "people".into(),
+        registered_people_table_authority(
+            coveql::TableSurfaceAuthorityKind::RawTable,
+            coveql::TableExecutionAuthority::MaterializedRows {
+                rows: people_rows(&[("a", true)]),
+            },
+        ),
+    );
+    let err = parse_and_resolve_query(
+        &minimal_object_file(),
+        "table(people).select(id)",
+        ParseOptions::default(),
+        resolve_options,
+        validation_options(),
+    )
+    .unwrap_err();
+    assert_eq!(err.diagnostics[0].code, "E_TABLE_AUTHORITY_UNSUPPORTED");
+}
+
+#[test]
+fn table_join_set_and_window_execute_over_registered_authorities() {
+    let mut resolve_options = ResolveOptions::default();
+    resolve_options.table_authorities.insert(
+        "people".into(),
+        registered_people_table_authority(
+            coveql::TableSurfaceAuthorityKind::MaterializedTable,
+            coveql::TableExecutionAuthority::MaterializedRows {
+                rows: people_rows(&[("a", true), ("b", false)]),
+            },
+        ),
+    );
+    resolve_options.table_authorities.insert(
+        "people_right".into(),
+        coveql::TableSurfaceAuthority {
+            contract: coveql::TableSurfaceContract {
+                table_id: "table:people_right".into(),
+                table_name: "people_right".into(),
+                ..registered_people_table_authority(
+                    coveql::TableSurfaceAuthorityKind::MaterializedTable,
+                    coveql::TableExecutionAuthority::MaterializedRows { rows: Vec::new() },
+                )
+                .contract
+            },
+            execution_authority: coveql::TableExecutionAuthority::MaterializedRows {
+                rows: people_rows(&[("a", true), ("c", true)]),
+            },
+        },
+    );
+    let joined = parse_resolve_plan_and_execute_query(
+        &minimal_object_file(),
+        "table(people) as l.join(table(people_right) as r, on: l.id == r.id, kind: inner).window(orderBy: l.id).select(left_id: l.id, right_active: r.active, rn: row_number())",
+        ParseOptions::default(),
+        resolve_options.clone(),
+        PlanOptions::default(),
+        ExecutionOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+    assert_eq!(joined.planned.resolved.method_chain.joins.len(), 1);
+    assert_eq!(joined.planned.resolved.method_chain.windows.len(), 1);
+    let CoveQlExecutionResult::JsonRows(rows) = joined.result else {
+        panic!("expected join JSON rows");
+    };
+    assert_eq!(
+        rows,
+        vec![json!({"left_id": "a", "right_active": true, "rn": 1})]
+    );
+
+    let unioned = parse_resolve_plan_and_execute_query(
+        &minimal_object_file(),
+        "table(people).union(table(people_right), all: false).select(id)",
+        ParseOptions::default(),
+        resolve_options,
+        PlanOptions::default(),
+        ExecutionOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+    assert_eq!(
+        unioned.planned.resolved.method_chain.set_operations.len(),
+        1
+    );
+    let CoveQlExecutionResult::JsonRows(rows) = unioned.result else {
+        panic!("expected union JSON rows");
+    };
+    assert_eq!(rows.len(), 3);
+}
+
+#[test]
+fn table_windows_execute_full_materialized_function_set() {
+    let mut resolve_options = ResolveOptions::default();
+    resolve_options
+        .table_authorities
+        .insert("scores".into(), score_table_authority());
+
+    let executed = parse_resolve_plan_and_execute_query(
+        &minimal_object_file(),
+        "table(scores).window(partitionBy: active, orderBy: id).select(id, rn: row_number(), r: rank(), dr: dense_rank(), prev: lag(score), next: lead(score), first: first_value(score), last: last_value(score), c: count(), s: sum(score), a: avg(score), mn: min(score), mx: max(score))",
+        ParseOptions::default(),
+        resolve_options,
+        PlanOptions::default(),
+        ExecutionOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+    let CoveQlExecutionResult::JsonRows(rows) = executed.result else {
+        panic!("expected window JSON rows");
+    };
+    assert_eq!(
+        rows,
+        vec![
+            json!({
+                "id": "a",
+                "rn": 1,
+                "r": 1,
+                "dr": 1,
+                "prev": null,
+                "next": 3,
+                "first": 1,
+                "last": 1,
+                "c": 1,
+                "s": 1,
+                "a": 1,
+                "mn": 1,
+                "mx": 1,
+            }),
+            json!({
+                "id": "b",
+                "rn": 1,
+                "r": 1,
+                "dr": 1,
+                "prev": null,
+                "next": null,
+                "first": 2,
+                "last": 2,
+                "c": 1,
+                "s": 2,
+                "a": 2,
+                "mn": 2,
+                "mx": 2,
+            }),
+            json!({
+                "id": "c",
+                "rn": 2,
+                "r": 2,
+                "dr": 2,
+                "prev": 1,
+                "next": null,
+                "first": 1,
+                "last": 3,
+                "c": 2,
+                "s": 4,
+                "a": 2,
+                "mn": 1,
+                "mx": 3,
+            }),
+        ]
+    );
+
+    let mut resolve_options = ResolveOptions::default();
+    resolve_options
+        .table_authorities
+        .insert("scores".into(), score_table_authority());
+    let err = parse_and_resolve_query(
+        &minimal_object_file(),
+        "table(scores).select(rn: row_number())",
+        ParseOptions::default(),
+        resolve_options,
+        validation_options(),
+    )
+    .unwrap_err();
+    assert_eq!(err.diagnostics[0].code, "E_FUNCTION_CONTRACT");
+}
+
+#[test]
+fn table_join_requires_exact_bridge_for_distinct_code_domains() {
+    let mut left = registered_people_table_authority(
+        coveql::TableSurfaceAuthorityKind::MaterializedTable,
+        coveql::TableExecutionAuthority::MaterializedRows {
+            rows: people_rows(&[("a", true)]),
+        },
+    );
+    left.contract.code_domain_contexts = vec!["domain:left:v1".into()];
+    let mut right = registered_people_table_authority(
+        coveql::TableSurfaceAuthorityKind::MaterializedTable,
+        coveql::TableExecutionAuthority::MaterializedRows {
+            rows: people_rows(&[("a", true)]),
+        },
+    );
+    right.contract.table_id = "table:people_right".into();
+    right.contract.table_name = "people_right".into();
+    right.contract.code_domain_contexts = vec!["domain:right:v1".into()];
+
+    let mut resolve_options = ResolveOptions::default();
+    resolve_options
+        .table_authorities
+        .insert("people".into(), left.clone());
+    resolve_options
+        .table_authorities
+        .insert("people_right".into(), right.clone());
+
+    let err = parse_and_resolve_query(
+        &minimal_object_file(),
+        "table(people) as l.join(table(people_right) as r, on: l.id == r.id).select(l.id)",
+        ParseOptions::default(),
+        resolve_options.clone(),
+        validation_options(),
+    )
+    .unwrap_err();
+    assert_eq!(err.diagnostics[0].code, "E_UNKNOWN_BRIDGE");
+
+    resolve_options
+        .bridge_contracts
+        .push(coveql::CoveQlBridgeRegistration {
+            bridge_id: "bridge:people:left-right".into(),
+            bridge_version: coveql::COVEQL_PROFILE_CONTRACT_VERSION.into(),
+            source_profile: coveql::CoveQlProfileId::Table,
+            target_profile: coveql::CoveQlProfileId::Table,
+            source_grain: left.contract.row_grain.clone(),
+            target_grain: right.contract.row_grain.clone(),
+            identity_mapping: vec![coveql::CoveQlBridgeIdentityMapping {
+                source: "id".into(),
+                target: "id".into(),
+            }],
+            temporal_alignment: "snapshot_equal".into(),
+            null_missing_policy: "missing_is_null".into(),
+            code_domain_policy: "exact_remap".into(),
+            visibility_compatibility: "same_policy".into(),
+            redaction_compatibility: "same_policy".into(),
+            fallback_behavior: "materialized_canonical_values".into(),
+            exact: true,
+        });
+
+    let resolved = parse_and_resolve_query(
+        &minimal_object_file(),
+        "table(people) as l.join(table(people_right) as r, on: l.id == r.id).select(l.id)",
+        ParseOptions::default(),
+        resolve_options,
+        validation_options(),
+    )
+    .unwrap();
+    assert_eq!(
+        resolved.method_chain.joins[0]
+            .bridge_contract
+            .as_ref()
+            .map(|bridge| bridge.bridge_id.as_str()),
+        Some("bridge:people:left-right")
+    );
+}
+
+#[test]
+fn table_cte_methods_register_scoped_table_bindings() {
+    let mut resolve_options = ResolveOptions::default();
+    resolve_options.table_authorities.insert(
+        "people".into(),
+        registered_people_table_authority(
+            coveql::TableSurfaceAuthorityKind::MaterializedTable,
+            coveql::TableExecutionAuthority::MaterializedRows {
+                rows: people_rows(&[("a", true), ("b", false)]),
+            },
+        ),
+    );
+    resolve_options.table_authorities.insert(
+        "people_right".into(),
+        coveql::TableSurfaceAuthority {
+            contract: coveql::TableSurfaceContract {
+                table_id: "table:people_right".into(),
+                table_name: "people_right".into(),
+                ..registered_people_table_authority(
+                    coveql::TableSurfaceAuthorityKind::MaterializedTable,
+                    coveql::TableExecutionAuthority::MaterializedRows { rows: Vec::new() },
+                )
+                .contract
+            },
+            execution_authority: coveql::TableExecutionAuthority::MaterializedRows {
+                rows: people_rows(&[("a", true)]),
+            },
+        },
+    );
+    resolve_options.table_authorities.insert(
+        "people_step".into(),
+        coveql::TableSurfaceAuthority {
+            contract: coveql::TableSurfaceContract {
+                table_id: "table:people_step".into(),
+                table_name: "people_step".into(),
+                ..registered_people_table_authority(
+                    coveql::TableSurfaceAuthorityKind::MaterializedTable,
+                    coveql::TableExecutionAuthority::MaterializedRows { rows: Vec::new() },
+                )
+                .contract
+            },
+            execution_authority: coveql::TableExecutionAuthority::MaterializedRows {
+                rows: people_rows(&[("a", true), ("b", false), ("c", true)]),
+            },
+        },
+    );
+
+    let executed = parse_resolve_plan_and_execute_query(
+        &minimal_object_file(),
+        "table(people) as l.with(right: table(people_right)).join(table(right) as r, on: l.id == r.id).select(id: l.id, active: r.active)",
+        ParseOptions::default(),
+        resolve_options.clone(),
+        PlanOptions::default(),
+        ExecutionOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+    assert_eq!(executed.planned.resolved.method_chain.ctes.len(), 1);
+    assert_eq!(
+        executed.planned.resolved.method_chain.ctes[0].execution_authority,
+        "materialized_cte_table_authority"
+    );
+    let CoveQlExecutionResult::JsonRows(rows) = executed.result else {
+        panic!("expected CTE join JSON rows");
+    };
+    assert_eq!(rows, vec![json!({"id": "a", "active": true})]);
+
+    let recursive = parse_and_resolve_query(
+        &minimal_object_file(),
+        "table(people).withRecursive(name: seed, seed: table(people), maxIterations: 4).select(id)",
+        ParseOptions::default(),
+        resolve_options.clone(),
+        validation_options(),
+    )
+    .unwrap();
+    assert!(recursive.method_chain.ctes[0].recursive);
+    assert_eq!(recursive.method_chain.ctes[0].max_iterations, Some(4));
+
+    let executed_recursive = parse_resolve_plan_and_execute_query(
+        &minimal_object_file(),
+        "table(people).withRecursive(name: reach, seed: table(people), step: table(people_step), key: id, maxIterations: 4).join(table(reach) as r, on: people.id == r.id, kind: right, cardinality: many).select(id: r.id)",
+        ParseOptions::default(),
+        resolve_options,
+        PlanOptions::default(),
+        ExecutionOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+    assert!(executed_recursive.planned.resolved.method_chain.ctes[0].recursive);
+    assert!(executed_recursive.planned.resolved.method_chain.ctes[0]
+        .step_table
+        .is_some());
+    let CoveQlExecutionResult::JsonRows(rows) = executed_recursive.result else {
+        panic!("expected recursive CTE JSON rows");
+    };
+    assert_eq!(
+        rows.iter()
+            .map(|row| row["id"].as_str().unwrap().to_string())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from(["a".to_string(), "b".to_string(), "c".to_string()])
+    );
 }
 
 #[test]
@@ -1780,6 +2403,150 @@ fn graph_traverse_executes_variable_length_with_contract() {
             "00000000000000000000000000000000>03030303030303030303030303030303".to_string(),
         ])
     );
+}
+
+#[test]
+fn graph_algorithm_executes_materialized_degree_and_reports_contract() {
+    let executed = parse_resolve_plan_and_execute_query(
+        &object_file_with_three_person_two_association_records(),
+        "node(Person) as p.degree(out(edge(CustomerPlacedOrder))).select(id: p.goid, degree)",
+        ParseOptions::default(),
+        ResolveOptions::default(),
+        PlanOptions::default(),
+        ExecutionOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        executed
+            .planned
+            .resolved
+            .method_chain
+            .graph_algorithms
+            .len(),
+        1
+    );
+    let contract =
+        &executed.explain_json()["profile_contracts"][0]["query_contract"]["algorithms"][0];
+    assert_eq!(contract["algorithm"], json!("degree"));
+    assert_eq!(
+        contract["contract"]["disclosure_policy"],
+        json!("redaction_safe_no_partial_results")
+    );
+    let CoveQlExecutionResult::JsonRows(rows) = executed.result else {
+        panic!("expected graph algorithm JSON rows");
+    };
+    let degrees = rows
+        .iter()
+        .map(|row| {
+            (
+                row["id"].as_str().unwrap().to_string(),
+                row["degree"].as_u64().unwrap(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(degrees["00000000000000000000000000000000"], 1);
+    assert_eq!(degrees["02020202020202020202020202020202"], 1);
+    assert_eq!(degrees["03030303030303030303030303030303"], 0);
+}
+
+#[test]
+fn graph_algorithms_execute_iterative_materialized_scores() {
+    let executed = parse_resolve_plan_and_execute_query(
+        &object_file_with_three_person_two_association_records(),
+        "node(Person) as p.pageRank(out(edge(CustomerPlacedOrder)), maxIterations: 20).hits(out(edge(CustomerPlacedOrder)), maxIterations: 20).centrality(out(edge(CustomerPlacedOrder))).select(id: p.goid, pagerank, authority, hub, centrality)",
+        ParseOptions::default(),
+        ResolveOptions::default(),
+        PlanOptions::default(),
+        ExecutionOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        executed
+            .planned
+            .resolved
+            .method_chain
+            .graph_algorithms
+            .len(),
+        3
+    );
+    let CoveQlExecutionResult::JsonRows(rows) = executed.result else {
+        panic!("expected graph algorithm JSON rows");
+    };
+    let by_id = rows
+        .iter()
+        .map(|row| (row["id"].as_str().unwrap().to_string(), row.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let start = &by_id["00000000000000000000000000000000"];
+    let middle = &by_id["02020202020202020202020202020202"];
+    let sink = &by_id["03030303030303030303030303030303"];
+    assert!(start["pagerank"].as_f64().unwrap() < middle["pagerank"].as_f64().unwrap());
+    assert!(middle["pagerank"].as_f64().unwrap() < sink["pagerank"].as_f64().unwrap());
+    assert!(start["hub"].as_f64().unwrap().is_finite());
+    assert!(sink["authority"].as_f64().unwrap().is_finite());
+    assert_eq!(sink["centrality"], json!(0.0));
+}
+
+#[test]
+fn graph_algorithm_variants_execute_materialized_oracle() {
+    let executed = parse_resolve_plan_and_execute_query(
+        &object_file_with_three_person_two_association_records(),
+        "node(Person) as p.connectedComponents(out(edge(CustomerPlacedOrder)), kind: strong).degree(out(edge(CustomerPlacedOrder)), kind: total).centrality(out(edge(CustomerPlacedOrder)), kind: degree).community(out(edge(CustomerPlacedOrder)), kind: label_propagation).spanningTree(out(edge(CustomerPlacedOrder)), kind: bfs).select(id: p.goid, component_id, degree, centrality, community_id, tree_parent, tree_depth)",
+        ParseOptions::default(),
+        ResolveOptions::default(),
+        PlanOptions::default(),
+        ExecutionOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+
+    let algorithms =
+        &executed.explain_json()["profile_contracts"][0]["query_contract"]["algorithms"];
+    assert_eq!(algorithms[0]["variant"], json!("strong"));
+    assert_eq!(algorithms[1]["variant"], json!("total"));
+    assert_eq!(algorithms[4]["variant"], json!("bfs"));
+
+    let CoveQlExecutionResult::JsonRows(rows) = executed.result else {
+        panic!("expected graph algorithm JSON rows");
+    };
+    let by_id = rows
+        .iter()
+        .map(|row| (row["id"].as_str().unwrap().to_string(), row.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let start = &by_id["00000000000000000000000000000000"];
+    let middle = &by_id["02020202020202020202020202020202"];
+    let sink = &by_id["03030303030303030303030303030303"];
+
+    assert_eq!(start["degree"], json!(1));
+    assert_eq!(middle["degree"], json!(2));
+    assert_eq!(sink["degree"], json!(1));
+    assert_eq!(middle["centrality"], json!(1.0));
+    assert!(start["community_id"].is_u64());
+    assert_eq!(start["tree_parent"], Value::Null);
+    assert_eq!(
+        middle["tree_parent"],
+        json!("00000000000000000000000000000000")
+    );
+    assert_eq!(
+        sink["tree_parent"],
+        json!("02020202020202020202020202020202")
+    );
+    assert_eq!(start["tree_depth"], json!(0));
+    assert_eq!(middle["tree_depth"], json!(1));
+    assert_eq!(sink["tree_depth"], json!(2));
+
+    let err = parse_and_resolve_query(
+        &object_file_with_three_person_two_association_records(),
+        "node(Person) as p.spanningTree(out(edge(CustomerPlacedOrder)), kind: min_weight).select(p.goid)",
+        ParseOptions::default(),
+        ResolveOptions::default(),
+        validation_options(),
+    )
+    .expect_err("min_weight requires an explicit weight expression");
+    assert_eq!(err.diagnostics[0].code, "E_UNSUPPORTED_PROFILE_METHOD");
 }
 
 #[test]

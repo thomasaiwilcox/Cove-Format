@@ -713,6 +713,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "cove-cli"
+version = "0.1.0"
+dependencies = [
+ "cove-core",
+ "cove-map",
+ "coveql",
+ "csv",
+ "serde_json",
+]
+
+[[package]]
 name = "cove-codec"
 version = "0.1.0"
 dependencies = [

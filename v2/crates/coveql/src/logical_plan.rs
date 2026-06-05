@@ -7,8 +7,10 @@ use crate::{
     AggregateDisclosurePolicy, AstHistoryMode, AstNullOrdering, AstOrderDirection,
     BuildResolvedQueryError, CoveQlDiagnostic, CoveQlOutputMode, CoveQlSelectedOperation,
     DiagnosticSeverity, ExplainMode, MetadataDisclosurePolicy, ParseOptions, RedactionReference,
-    ResolveOptions, ResolvedExpr, ResolvedPath, ResolvedPredicate, ResolvedQuery, ResolvedRoot,
-    SecurityContext, TemporalContext, TombstoneContext, VisibilityReference,
+    ResolveOptions, ResolvedCommonTableExpression, ResolvedExpr, ResolvedGraphAlgorithm,
+    ResolvedPath, ResolvedPredicate, ResolvedQuery, ResolvedRoot, ResolvedSetOperation,
+    ResolvedTableJoin, ResolvedWindowSpec, SecurityContext, TemporalContext, TombstoneContext,
+    VisibilityReference,
 };
 use cove_core::collation::CollationKind;
 use cove_core::reader::ValidationOptions;
@@ -189,6 +191,21 @@ pub enum LogicalPlanNodeKind {
     ProjectionRead {
         projection_ids: Vec<String>,
         projection_columns: Vec<String>,
+    },
+    CommonTableExpression {
+        ctes: Vec<ResolvedCommonTableExpression>,
+    },
+    TableJoin {
+        joins: Vec<ResolvedTableJoin>,
+    },
+    TableSetOperation {
+        operations: Vec<ResolvedSetOperation>,
+    },
+    Window {
+        windows: Vec<ResolvedWindowSpec>,
+    },
+    GraphAlgorithm {
+        algorithms: Vec<ResolvedGraphAlgorithm>,
     },
     Aggregate {
         group_by: Vec<ResolvedExpr>,
@@ -459,6 +476,31 @@ pub fn build_logical_plan(
         nodes.push(LogicalPlanNodeKind::ProjectionRead {
             projection_ids: dependencies.projection_ids.iter().cloned().collect(),
             projection_columns: dependencies.projection_columns.iter().cloned().collect(),
+        });
+    }
+    if !resolved.method_chain.ctes.is_empty() {
+        nodes.push(LogicalPlanNodeKind::CommonTableExpression {
+            ctes: resolved.method_chain.ctes.clone(),
+        });
+    }
+    if !resolved.method_chain.joins.is_empty() {
+        nodes.push(LogicalPlanNodeKind::TableJoin {
+            joins: resolved.method_chain.joins.clone(),
+        });
+    }
+    if !resolved.method_chain.set_operations.is_empty() {
+        nodes.push(LogicalPlanNodeKind::TableSetOperation {
+            operations: resolved.method_chain.set_operations.clone(),
+        });
+    }
+    if !resolved.method_chain.windows.is_empty() {
+        nodes.push(LogicalPlanNodeKind::Window {
+            windows: resolved.method_chain.windows.clone(),
+        });
+    }
+    if !resolved.method_chain.graph_algorithms.is_empty() {
+        nodes.push(LogicalPlanNodeKind::GraphAlgorithm {
+            algorithms: resolved.method_chain.graph_algorithms.clone(),
         });
     }
     if grouping_or_aggregates_present(&resolved) {

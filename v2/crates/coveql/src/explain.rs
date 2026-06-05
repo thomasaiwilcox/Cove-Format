@@ -1592,17 +1592,34 @@ fn query_specific_profile_contract_json(
                 "table_name": table.table_surface_contract.table_name,
                 "contract_version": table.table_surface_contract.contract_version,
                 "authority_kind": table.table_surface_contract.authority_kind,
+                "authority_fingerprint": table.table_surface_contract.authority_fingerprint,
+                "schema_fingerprint": table.table_surface_contract.schema_fingerprint,
+                "execution_authority": table_execution_authority_summary(&table.execution_authority),
                 "row_grain": table.table_surface_contract.row_grain,
                 "row_identity": table.table_surface_contract.row_identity,
                 "canonical_order": table.table_surface_contract.canonical_order,
+                "visibility_authority": table.table_surface_contract.visibility_authority,
+                "redaction_authority": table.table_surface_contract.redaction_authority,
                 "temporal_authority": table.table_surface_contract.temporal_authority,
                 "evidence_capabilities": table.table_surface_contract.evidence_capabilities,
+                "null_missing_nan_policy": table.table_surface_contract.null_missing_nan_policy,
+                "collation_policy": table.table_surface_contract.collation_policy,
+                "code_domain_contexts": table.table_surface_contract.code_domain_contexts,
+                "code_domain_bridges": table.table_surface_contract.code_domain_bridges,
                 "projection_dependency_contract_id": table.table_surface_contract.projection_dependency_contract_id,
                 "datafusion_interop_contract": table.table_surface_contract.datafusion_interop_contract,
+                "relational_methods": {
+                    "ctes": resolved.method_chain.ctes.len(),
+                    "joins": resolved.method_chain.joins.len(),
+                    "set_operations": resolved.method_chain.set_operations.len(),
+                    "windows": resolved.method_chain.windows.len(),
+                },
             }))
         }
         crate::CoveQlProfileId::Graph => {
-            if resolved.method_chain.traversals.is_empty() {
+            if resolved.method_chain.traversals.is_empty()
+                && resolved.method_chain.graph_algorithms.is_empty()
+            {
                 return None;
             }
             Some(json!({
@@ -1634,9 +1651,59 @@ fn query_specific_profile_contract_json(
                         }),
                     })
                 }).collect::<Vec<_>>()
+                ,
+                "algorithms": resolved.method_chain.graph_algorithms.iter().map(|algorithm| {
+                    json!({
+                        "algorithm": algorithm.kind.as_str(),
+                        "variant": algorithm.variant,
+                        "direction": algorithm.direction,
+                        "edge_type": algorithm.edge.as_ref().map(|edge| edge.association.type_name.clone()),
+                        "target_label": algorithm.target.as_ref().map(|target| target.label.clone()),
+                        "max_depth": algorithm.max_depth,
+                        "max_paths": algorithm.max_paths,
+                        "max_iterations": algorithm.max_iterations,
+                        "approx": algorithm.approx,
+                        "contract": {
+                            "contract_version": algorithm.contract.contract_version,
+                            "allowed_algorithms": algorithm.contract.allowed_algorithms,
+                            "direction_policy": algorithm.contract.direction_policy,
+                            "weight_policy": algorithm.contract.weight_policy,
+                            "temporal_policy": algorithm.contract.temporal_policy,
+                            "visibility_authority": algorithm.contract.visibility_authority,
+                            "redaction_authority": algorithm.contract.redaction_authority,
+                            "max_depth": algorithm.contract.max_depth,
+                            "max_paths": algorithm.contract.max_paths,
+                            "max_iterations": algorithm.contract.max_iterations,
+                            "disclosure_policy": algorithm.contract.disclosure_policy,
+                            "ordering_policy": algorithm.contract.ordering_policy,
+                        }
+                    })
+                }).collect::<Vec<_>>()
             }))
         }
         crate::CoveQlProfileId::Object => None,
+    }
+}
+
+fn table_execution_authority_summary(authority: &crate::TableExecutionAuthority) -> Value {
+    match authority {
+        crate::TableExecutionAuthority::DeterministicProjection { projection_id } => json!({
+            "kind": "deterministic_projection",
+            "projection_id": projection_id,
+        }),
+        crate::TableExecutionAuthority::MaterializedRows { rows } => json!({
+            "kind": "materialized_rows",
+            "row_count": rows.len(),
+        }),
+        crate::TableExecutionAuthority::RawRows { rows } => json!({
+            "kind": "raw_rows",
+            "row_count": rows.len(),
+        }),
+        crate::TableExecutionAuthority::ExternalRows { provider_id, rows } => json!({
+            "kind": "external_rows",
+            "provider_id": provider_id,
+            "row_count": rows.len(),
+        }),
     }
 }
 
