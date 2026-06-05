@@ -96,16 +96,11 @@ pub struct CoveObjectReadOptions {
     pub redaction_read_policy: CoveObjectRedactionReadPolicy,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum CoveObjectRedactionReadPolicy {
+    #[default]
     Refuse,
     PreserveMarker,
-}
-
-impl Default for CoveObjectRedactionReadPolicy {
-    fn default() -> Self {
-        Self::Refuse
-    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -137,7 +132,7 @@ fn redacted_value_marker() -> Value {
     })
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CoveObjectReadPushdownOptions {
     pub enabled: bool,
     pub temporal_cut: Option<CoveObjectTemporalCut>,
@@ -194,33 +189,10 @@ pub struct CoveObjectAssociationEndpointCandidate {
     pub include_tombstones: Option<bool>,
 }
 
-impl Default for CoveObjectReadPushdownOptions {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            temporal_cut: None,
-            branch_key: None,
-            candidate_goids: Vec::new(),
-            include_tombstones: None,
-            association_endpoint_candidates: Vec::new(),
-            property_candidates: Vec::new(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CoveObjectReadWithPushdownOptions {
     pub read: CoveObjectReadOptions,
     pub pushdown: CoveObjectReadPushdownOptions,
-}
-
-impl Default for CoveObjectReadWithPushdownOptions {
-    fn default() -> Self {
-        Self {
-            read: CoveObjectReadOptions::default(),
-            pushdown: CoveObjectReadPushdownOptions::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -255,17 +227,9 @@ pub struct CoveObjectRetainedTemporalReadResult {
     pub segments: Vec<RetainedTemporalSegmentData>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CoveObjectKernelReadOptions {
     pub read: CoveObjectReadWithPushdownOptions,
-}
-
-impl Default for CoveObjectKernelReadOptions {
-    fn default() -> Self {
-        Self {
-            read: CoveObjectReadWithPushdownOptions::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -337,6 +301,10 @@ impl CoveObjectKernelPropertyValues {
             Self::String(values) => values.len(),
             Self::Json(values) => values.len(),
         }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 

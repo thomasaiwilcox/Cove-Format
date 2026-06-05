@@ -32,6 +32,7 @@ pub use crate::options::{
     CoveTableOptions, CoviDiscovery, CovmTrustPolicy, CovxDiscovery, ExecutionCodePolicy,
     FilterResidualPolicy, SidecarDigestPolicy,
 };
+pub use datafusion as df;
 
 #[derive(Debug, Clone)]
 pub struct RegisteredCoveProjection {

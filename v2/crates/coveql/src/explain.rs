@@ -508,9 +508,13 @@ pub(crate) fn error_explain_json(
 pub(crate) fn redact_explain_value(value: &mut Value) -> bool {
     match value {
         Value::Object(object) => redact_object(object),
-        Value::Array(values) => values.iter_mut().fold(false, |redacted, value| {
-            redact_explain_value(value) || redacted
-        }),
+        Value::Array(values) => {
+            let mut redacted = false;
+            for value in values {
+                redacted = redact_explain_value(value) || redacted;
+            }
+            redacted
+        }
         _ => false,
     }
 }

@@ -1193,7 +1193,7 @@ mod tests {
 
         assert!(matches!(
             validate_embedded_index_only_capabilities(
-                &[capability.clone()],
+                std::slice::from_ref(&capability),
                 &entry,
                 Some(&request)
             ),

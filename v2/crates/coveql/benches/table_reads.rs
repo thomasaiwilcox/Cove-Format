@@ -18,6 +18,10 @@ use cove_core::{
     segment::{TableColumnDirectoryEntryV1, TABLE_COLUMN_DIRECTORY_ENTRY_LEN},
     writer::{MinimalCoveWriter, SectionPayload},
 };
+use cove_datafusion::register::df::{
+    execution::context::{SessionConfig, SessionContext},
+    physical_plan::collect as collect_physical_plan,
+};
 use cove_map::{
     projected_record_batches_from_cove_o_bytes, ProjectionBatchOptions, ProjectionFilter,
     ProjectionFilterLiteral, ProjectionFilterOp,
@@ -29,8 +33,6 @@ use coveql::{
     ExecutionOptions, KernelExecutionMode, KernelExecutionOptions, ParseOptions,
     PhysicalPlanOptions, PlanOptions, ResolveOptions,
 };
-use datafusion::execution::context::{SessionConfig, SessionContext};
-use datafusion::physical_plan::collect as collect_physical_plan;
 use serde_json::json;
 use tokio::runtime::Runtime;
 

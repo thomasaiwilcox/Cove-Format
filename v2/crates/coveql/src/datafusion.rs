@@ -6,17 +6,19 @@ use arrow_schema::{DataType, SchemaRef};
 use async_trait::async_trait;
 use cove_core::profile::cove_map::MapProjectionCatalog;
 use cove_datafusion::{
-    adapter_v53::table_provider::CoveTableProvider, dataset_state::DatasetState,
-    projection_provider, register,
+    adapter_v53::table_provider::CoveTableProvider,
+    dataset_state::DatasetState,
+    projection_provider,
+    register::{self, df},
 };
 use cove_map::{
     projected_record_batches_from_cove_o_bytes,
     projected_record_batches_from_cove_o_bytes_with_catalog, projection_catalog_from_cove_o_bytes,
     ProjectionBatchOptions, ProjectionFilter, ProjectionFilterLiteral, ProjectionFilterOp,
 };
-use datafusion::datasource::MemTable;
-use datafusion::logical_expr::Expr;
-use datafusion::{
+use df::datasource::MemTable;
+use df::logical_expr::Expr;
+use df::{
     catalog::{Session, TableProvider},
     common::{stats::Precision, DataFusionError, Result, Statistics},
     execution::{context::SessionContext, SendableRecordBatchStream, TaskContext},
@@ -2003,15 +2005,15 @@ pub fn register_datafusion_coveql_memtable_for_plan(
         arrow_planned,
         options,
     )
-    .map_err(|err| datafusion::common::DataFusionError::Execution(err.to_string()))?;
+    .map_err(|err| DataFusionError::Execution(err.to_string()))?;
     let authority = executed.authority.clone();
     let CoveQlExecutionResult::ArrowRecordBatches(batches) = executed.result else {
-        return Err(datafusion::common::DataFusionError::Execution(
+        return Err(DataFusionError::Execution(
             "CoveQL DataFusion MemTable registration requires ArrowRecordBatch output".into(),
         ));
     };
     let schema = batches.first().map(|batch| batch.schema()).ok_or_else(|| {
-        datafusion::common::DataFusionError::Execution(
+        DataFusionError::Execution(
             "CoveQL DataFusion MemTable registration produced no Arrow batches".into(),
         )
     })?;
@@ -2154,7 +2156,7 @@ pub fn register_datafusion_projection_for_plan(
     planned: &PlannedQuery,
 ) -> Result<()> {
     if !can_apply_datafusion_projection_filters(planned) {
-        return Err(datafusion::common::DataFusionError::Execution(
+        return Err(DataFusionError::Execution(
             "CoveQL raw DataFusion projection registration requires a trivial projection-backed plan; use register_datafusion_coveql_provider_for_plan for planned CoveQL semantics"
                 .into(),
         ));
@@ -2163,7 +2165,7 @@ pub fn register_datafusion_projection_for_plan(
         ResolvedRoot::Projection(root) => root.projection_id.as_str(),
         ResolvedRoot::Table(root) => root.projection.projection_id.as_str(),
         _ => {
-            return Err(datafusion::common::DataFusionError::Execution(
+            return Err(DataFusionError::Execution(
                 "CoveQL DataFusion registration requires a projection-backed plan".into(),
             ));
         }
@@ -2174,13 +2176,13 @@ pub fn register_datafusion_projection_for_plan(
 
 fn validate_dataset_datafusion_plan(planned: &PlannedQuery) -> Result<()> {
     if planned.resolved.output_mode != crate::CoveQlOutputMode::DataFusionTableProvider {
-        return Err(datafusion::common::DataFusionError::Plan(
+        return Err(DataFusionError::Plan(
             "CoveQL dataset DataFusion provider requires DataFusionTableProvider output mode"
                 .into(),
         ));
     }
     if !matches!(planned.resolved.root, ResolvedRoot::Object(_)) {
-        return Err(datafusion::common::DataFusionError::Plan(
+        return Err(DataFusionError::Plan(
             "CoveQL dataset DataFusion provider exposes object-root table scans; use the planned manifest CoveQL provider for other roots"
                 .into(),
         ));
@@ -2194,7 +2196,7 @@ fn validate_dataset_datafusion_plan(planned: &PlannedQuery) -> Result<()> {
         || chain.history.is_some()
         || chain.changes.is_some()
     {
-        return Err(datafusion::common::DataFusionError::Plan(
+        return Err(DataFusionError::Plan(
             "CoveQL dataset DataFusion provider only exposes ungated object-root scans until CoveQL residual execution is attached"
                 .into(),
         ));
@@ -2237,7 +2239,7 @@ pub fn datafusion_projection_pushdown_report_for_plan(
         ResolvedRoot::Projection(root) => root.projection_id.clone(),
         ResolvedRoot::Table(root) => root.projection.projection_id.clone(),
         _ => {
-            return Err(datafusion::common::DataFusionError::Execution(
+            return Err(DataFusionError::Execution(
                 "CoveQL DataFusion pushdown reporting requires a projection-backed plan".into(),
             ));
         }

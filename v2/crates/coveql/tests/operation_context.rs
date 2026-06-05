@@ -1,3 +1,11 @@
+#![allow(
+    clippy::field_reassign_with_default,
+    clippy::manual_repeat_n,
+    clippy::too_many_arguments,
+    clippy::unnecessary_find_map,
+    clippy::useless_vec
+)]
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
@@ -86,6 +94,9 @@ use coveql::{
     VisibilityOverlay, VisibilityPolicy,
 };
 use serde_json::{json, Value};
+
+#[cfg(feature = "datafusion")]
+use cove_datafusion::register::df as datafusion;
 
 fn validation_options() -> ValidationOptions {
     ValidationOptions {

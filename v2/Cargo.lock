@@ -979,7 +979,6 @@ dependencies = [
  "cove-map",
  "cove-profile-validation",
  "cove-runtime",
- "datafusion",
  "serde",
  "serde_json",
  "sha2",

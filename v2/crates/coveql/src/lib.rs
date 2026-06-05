@@ -23,13 +23,37 @@
 //! candidates stay fail-closed or diagnostic-only unless a runtime branch proves
 //! equivalence to the materialized executor.
 
+#![allow(
+    clippy::cloned_ref_to_slice_refs,
+    clippy::collapsible_match,
+    clippy::derivable_impls,
+    clippy::field_reassign_with_default,
+    clippy::if_same_then_else,
+    clippy::items_after_test_module,
+    clippy::large_enum_variant,
+    clippy::len_zero,
+    clippy::manual_inspect,
+    clippy::manual_is_multiple_of,
+    clippy::manual_map,
+    clippy::match_like_matches_macro,
+    clippy::needless_borrow,
+    clippy::needless_lifetimes,
+    clippy::redundant_closure,
+    clippy::too_many_arguments,
+    clippy::trim_split_whitespace,
+    clippy::type_complexity,
+    clippy::unnecessary_lazy_evaluations,
+    clippy::unnecessary_map_or
+)]
+
 mod arrow_output;
 mod association_opt;
 mod ast;
 mod builder;
-#[cfg(feature = "datafusion")]
-mod datafusion;
 mod dependencies;
+#[cfg(feature = "datafusion")]
+#[path = "datafusion.rs"]
+mod df_provider;
 mod evidence_opt;
 mod execution;
 mod explain;
@@ -88,8 +112,9 @@ pub use association_opt::{
 };
 pub use ast::*;
 pub use builder::*;
+pub use dependencies::*;
 #[cfg(feature = "datafusion")]
-pub use datafusion::{
+pub use df_provider::{
     datafusion_coveql_provider_for_plan, datafusion_dataset_provider_for_plan,
     datafusion_manifest_coveql_provider_for_plan, datafusion_object_pushdown_report_for_plan,
     datafusion_projection_pushdown_report_for_plan, datafusion_row_pushdown_report_for_plan,
@@ -100,7 +125,6 @@ pub use datafusion::{
     DataFusionCoveQlPushdownReport, DataFusionCoveQlScanNegotiationReport,
     ManifestCoveQlTableProvider,
 };
-pub use dependencies::*;
 pub use evidence_opt::{
     EvidenceGrainIndexReport, EvidenceGrainKind, EvidenceOptimizationReport,
     EvidenceTargetIndexKind,
