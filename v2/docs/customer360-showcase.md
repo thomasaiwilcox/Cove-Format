@@ -1,9 +1,27 @@
 # Customer 360 Data-Science Showcase
 
-The Customer 360 showcase is the main approachable demo for CoveQL and the
-unified `cove` CLI. It generates deterministic CRM, support, billing, and event
-sources, then builds a queryable mapped COVE archive with projected table and
-Parquet baselines.
+The Customer 360 showcase is the main approachable semantic-archive demo for
+CoveQL and the unified `cove` CLI. It generates deterministic CRM, support,
+billing, and event sources, keeps those source rows as provenance, and builds a
+queryable mapped COVE-O archive with canonical customers, evidence, projected
+COVE-T tables, and Parquet baselines.
+
+This is the COVE-O / COVE-MAP path: the original data starts as ordinary tables,
+but the durable meaning becomes customer objects, properties, associations,
+evidence, and deterministic projections. The projected tables keep the workflow
+familiar for SQL, pandas, Polars, Arrow, and DataFusion users.
+
+## What This Shows
+
+- Source tables remain provenance rather than disappearing behind a black-box
+  entity-resolution step.
+- Canonical customer rows provide the stable semantic surface for readback,
+  aggregation, and joins.
+- Evidence rows make lineage queryable, including which sources contributed to
+  the canonical customer view.
+- Projected COVE-T and Parquet outputs keep the data-science workflow practical.
+- Optional acceleration sidecars can improve reads, but they remain subordinate
+  to the mapped archive's logical truth.
 
 ## Generate
 
@@ -72,7 +90,8 @@ cove query --engine compare --perf-report examples/customer360/events.cove \
 
 For the mapped customer archive, materialized CoveQL remains the authority. Use
 `--engine compare --perf-report` to see whether available sidecars were used,
-skipped, or fell back.
+skipped, or fell back. Acceleration can make the generated showcase cheaper to
+read, but it must not change the customer, evidence, or projection results.
 
 ## Notebook-Style Analysis
 

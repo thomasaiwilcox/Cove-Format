@@ -1216,58 +1216,58 @@ fn run_publication_gap_cases(corpus: &Path) -> Result<Vec<Value>, String> {
 
 fn run_customer360_cases(corpus: &Path) -> Result<Vec<Value>, String> {
     let dir = corpus.join("customer360");
-    let mut cases = Vec::new();
-    cases.push(run_query_case(
-        "customer360_projection_scan",
-        "Customer 360 projected canonical customer scan",
-        &dir.join("customers_projection.cove"),
-        ExplainOptions {
-            projection: Some(vec![
-                "customer_id".into(),
-                "region".into(),
-                "tier".into(),
-                "score".into(),
-                "status".into(),
-                "mrr".into(),
-            ]),
-            ..ExplainOptions::default()
-        },
-    )?);
-    cases.push(run_query_case(
-        "customer360_selective_filter",
-        "Customer 360 projected selective score filter",
-        &dir.join("customers_projection.cove"),
-        ExplainOptions {
-            projection: Some(vec!["customer_id".into(), "tier".into(), "score".into()]),
-            filters: vec![FilterDsl {
-                column: "score".into(),
-                op: FilterOp::Gte,
-                value: Some("80".into()),
-            }],
-            ..ExplainOptions::default()
-        },
-    )?);
-    cases.push(run_query_case(
-        "customer360_event_filter",
-        "Customer 360 event fact selective filter",
-        &dir.join("events.cove"),
-        ExplainOptions {
-            projection: Some(vec![
-                "event_id".into(),
-                "customer_id".into(),
-                "event_kind".into(),
-                "score".into(),
-            ]),
-            filters: vec![FilterDsl {
-                column: "score".into(),
-                op: FilterOp::Gte,
-                value: Some("80".into()),
-            }],
-            ..ExplainOptions::default()
-        },
-    )?);
-    cases.push(run_customer360_object_store_case(corpus)?);
-    Ok(cases)
+    Ok(vec![
+        run_query_case(
+            "customer360_projection_scan",
+            "Customer 360 projected canonical customer scan",
+            &dir.join("customers_projection.cove"),
+            ExplainOptions {
+                projection: Some(vec![
+                    "customer_id".into(),
+                    "region".into(),
+                    "tier".into(),
+                    "score".into(),
+                    "status".into(),
+                    "mrr".into(),
+                ]),
+                ..ExplainOptions::default()
+            },
+        )?,
+        run_query_case(
+            "customer360_selective_filter",
+            "Customer 360 projected selective score filter",
+            &dir.join("customers_projection.cove"),
+            ExplainOptions {
+                projection: Some(vec!["customer_id".into(), "tier".into(), "score".into()]),
+                filters: vec![FilterDsl {
+                    column: "score".into(),
+                    op: FilterOp::Gte,
+                    value: Some("80".into()),
+                }],
+                ..ExplainOptions::default()
+            },
+        )?,
+        run_query_case(
+            "customer360_event_filter",
+            "Customer 360 event fact selective filter",
+            &dir.join("events.cove"),
+            ExplainOptions {
+                projection: Some(vec![
+                    "event_id".into(),
+                    "customer_id".into(),
+                    "event_kind".into(),
+                    "score".into(),
+                ]),
+                filters: vec![FilterDsl {
+                    column: "score".into(),
+                    op: FilterOp::Gte,
+                    value: Some("80".into()),
+                }],
+                ..ExplainOptions::default()
+            },
+        )?,
+        run_customer360_object_store_case(corpus)?,
+    ])
 }
 
 fn run_query_case(
