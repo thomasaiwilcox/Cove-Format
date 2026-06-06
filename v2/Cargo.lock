@@ -716,8 +716,18 @@ dependencies = [
 name = "cove-cli"
 version = "0.1.0"
 dependencies = [
+ "cove-cache",
+ "cove-convert-parquet",
  "cove-core",
+ "cove-coverage",
+ "cove-datafusion",
+ "cove-dump",
+ "cove-index",
+ "cove-inspect",
+ "cove-layout",
  "cove-map",
+ "cove-runtime",
+ "cove-validate",
  "coveql",
  "csv",
  "serde_json",

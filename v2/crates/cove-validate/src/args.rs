@@ -4,7 +4,7 @@ use cove_core::{
     reader::{OptionalPushdownPolicy, ValidationOptions},
 };
 
-pub(crate) const USAGE: &str = "Usage: cove-validate [--semantic] [--verify-digests] [--fail-open-optional-pushdown] [--json] [--explain] [--requested-profile N] [--requested-operation NAME|N] [--needed-section ID] [--needed-page SECTION_ID:TARGET_REF] [--needed-column-page SECTION_ID:COLUMN_ID:MORSEL_ID] <file.cove|file.covemap> [<file2> ...]";
+pub(crate) const USAGE: &str = "Usage: cove validate [--semantic] [--verify-digests] [--fail-open-optional-pushdown] [--json] [--explain] [--requested-profile N] [--requested-operation NAME|N] [--needed-section ID] [--needed-page SECTION_ID:TARGET_REF] [--needed-column-page SECTION_ID:COLUMN_ID:MORSEL_ID] <file.cove|file.covemap> [<file2> ...]";
 
 #[derive(Clone)]
 pub(crate) struct CliArgs {

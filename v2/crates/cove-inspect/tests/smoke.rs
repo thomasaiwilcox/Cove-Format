@@ -1,5 +1,13 @@
 use std::{path::PathBuf, process::Command};
 
+fn cove_command() -> Command {
+    let mut command = Command::new(env!("CARGO"));
+    command
+        .current_dir(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.."))
+        .args(["run", "-p", "cove-cli", "--quiet", "--"]);
+    command
+}
+
 fn accept_fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../conformance/accept")
@@ -8,10 +16,12 @@ fn accept_fixture(name: &str) -> PathBuf {
 
 #[test]
 fn inspect_cli_smoke() {
-    let output = Command::new(env!("CARGO_BIN_EXE_cove-inspect"))
+    let output = cove_command()
+        .arg("inspect")
+        .args(["--sections", "all"])
         .arg(accept_fixture("min_empty.cove"))
         .output()
-        .expect("run cove-inspect");
+        .expect("run cove inspect");
 
     assert!(
         output.status.success(),
@@ -26,10 +36,12 @@ fn inspect_cli_smoke() {
 
 #[test]
 fn inspect_reports_semantic_mapping_profile_and_feature() {
-    let output = Command::new(env!("CARGO_BIN_EXE_cove-inspect"))
+    let output = cove_command()
+        .arg("inspect")
+        .args(["--sections", "all"])
         .arg(accept_fixture("cove_map_valid.cove"))
         .output()
-        .expect("run cove-inspect");
+        .expect("run cove inspect");
 
     assert!(
         output.status.success(),
@@ -47,12 +59,14 @@ fn inspect_reports_semantic_mapping_profile_and_feature() {
 
 #[test]
 fn inspect_reports_page_payload_elision_feature() {
-    let output = Command::new(env!("CARGO_BIN_EXE_cove-inspect"))
+    let output = cove_command()
+        .arg("inspect")
+        .args(["--sections", "all"])
         .arg(accept_fixture(
             "cove_t_payload_elision_stats_only_all_null_valid.cove",
         ))
         .output()
-        .expect("run cove-inspect");
+        .expect("run cove inspect");
 
     assert!(
         output.status.success(),
@@ -66,10 +80,12 @@ fn inspect_reports_page_payload_elision_feature() {
 
 #[test]
 fn inspect_reports_table_and_segment_summary() {
-    let output = Command::new(env!("CARGO_BIN_EXE_cove-inspect"))
+    let output = cove_command()
+        .arg("inspect")
+        .args(["--sections", "all"])
         .arg(accept_fixture("cove_t_scan_table.cove"))
         .output()
-        .expect("run cove-inspect");
+        .expect("run cove inspect");
 
     assert!(
         output.status.success(),
@@ -85,11 +101,12 @@ fn inspect_reports_table_and_segment_summary() {
 
 #[test]
 fn inspect_json_reports_decoded_summary_groups() {
-    let output = Command::new(env!("CARGO_BIN_EXE_cove-inspect"))
+    let output = cove_command()
+        .arg("inspect")
         .args(["--json", "--sections", "stats,indexes,execution,optional"])
         .arg(accept_fixture("cove_e_profile_bundle_valid.cove"))
         .output()
-        .expect("run cove-inspect --json");
+        .expect("run cove inspect --json");
 
     assert!(
         output.status.success(),
@@ -107,11 +124,12 @@ fn inspect_json_reports_decoded_summary_groups() {
 
 #[test]
 fn inspect_json_reports_zone_stats_details() {
-    let output = Command::new(env!("CARGO_BIN_EXE_cove-inspect"))
+    let output = cove_command()
+        .arg("inspect")
         .args(["--json", "--sections", "stats"])
         .arg(accept_fixture("cove_t_zone_stats_valid.cove"))
         .output()
-        .expect("run cove-inspect --json");
+        .expect("run cove inspect --json");
 
     assert!(
         output.status.success(),
@@ -127,10 +145,12 @@ fn inspect_json_reports_zone_stats_details() {
 
 #[test]
 fn inspect_reports_standalone_covemap_artifact() {
-    let output = Command::new(env!("CARGO_BIN_EXE_cove-inspect"))
+    let output = cove_command()
+        .arg("inspect")
+        .args(["--sections", "all"])
         .arg(accept_fixture("covemap_valid.covemap"))
         .output()
-        .expect("run cove-inspect");
+        .expect("run cove inspect");
 
     assert!(
         output.status.success(),

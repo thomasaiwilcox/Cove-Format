@@ -5,19 +5,27 @@ use std::{
     process::{Command, Output, Stdio},
 };
 
+use cove_cache::CoveCoverageCacheHeaderV2;
 use cove_core::{
     artifact::{
         covemap::{CovemapFile, CovemapHeaderV1, CovemapPostscriptV1},
         covm::{CovmFile, CovmFileEntryV1, CovmHeaderV1, CovmPostscriptV1},
     },
     constants::{
-        CoveEncodingKind, CoveLogicalType, CovePhysicalKind, DigestAlgorithm, FEATURE_SEMANTIC_MAP,
+        CoveEncodingKind, CoveLogicalType, CovePhysicalKind, DigestAlgorithm, PrimaryProfile,
+        FEATURE_SEMANTIC_MAP,
     },
     digest::compute_digest,
     reader::validate_bytes,
     table::{ColumnEntry, TableCatalog, TableEntry},
     writer::{ScanPageSpec, ScanProfileCoveWriter, ScanSegment},
 };
+use cove_coverage::{
+    CoverageExactnessV2, CoverageGranularityV2, CoverageProofStrengthV2,
+    CoverageProviderDescriptorV2,
+};
+use cove_layout::{LayoutPlanHeaderV2, LayoutPlanNodeV2, LayoutPlanV2};
+use cove_runtime::{RuntimeCompatibilityHintV2, RuntimeHintKindV2};
 
 fn temp_file(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
@@ -258,6 +266,61 @@ fn cove_t_relational_bytes() -> Vec<u8> {
     writer.write().unwrap()
 }
 
+fn cove_t_medium_bytes() -> Vec<u8> {
+    fn column(column_id: u32, name: &str) -> ColumnEntry {
+        ColumnEntry {
+            column_id,
+            name: name.into(),
+            logical: CoveLogicalType::Int64,
+            physical: CovePhysicalKind::NumCode,
+            nullable: false,
+            sort_order: 0,
+            collation_id: 0,
+            precision: 0,
+            scale: 0,
+            flags: 0,
+        }
+    }
+
+    let catalog = TableCatalog {
+        flags: 0,
+        tables: vec![TableEntry {
+            table_id: 1,
+            namespace: "public".into(),
+            name: "metrics".into(),
+            row_count: 25,
+            primary_sort_key_count: 0,
+            clustering_key_count: 0,
+            flags: 0,
+            columns: vec![column(1, "id"), column(2, "bucket"), column(3, "score")],
+        }],
+    };
+    let mut ids = Vec::new();
+    let mut buckets = Vec::new();
+    let mut scores = Vec::new();
+    for id in 1u64..=25 {
+        ids.extend_from_slice(&id.to_le_bytes());
+        buckets.extend_from_slice(&(id % 5).to_le_bytes());
+        scores.extend_from_slice(&(id * 3).to_le_bytes());
+    }
+    let mut segment = ScanSegment::new(1, 0, 0, 25, 3);
+    segment.set_column_pages(
+        1,
+        vec![ScanPageSpec::new(25, ids).with_encoding_root(CoveEncodingKind::NumCode as u32)],
+    );
+    segment.set_column_pages(
+        2,
+        vec![ScanPageSpec::new(25, buckets).with_encoding_root(CoveEncodingKind::NumCode as u32)],
+    );
+    segment.set_column_pages(
+        3,
+        vec![ScanPageSpec::new(25, scores).with_encoding_root(CoveEncodingKind::NumCode as u32)],
+    );
+    let mut writer = ScanProfileCoveWriter::new(catalog);
+    writer.push_segment(segment);
+    writer.write().unwrap()
+}
+
 fn covemap_bytes() -> Vec<u8> {
     CovemapFile {
         header: CovemapHeaderV1::new([0x11; 16], 0),
@@ -271,6 +334,100 @@ fn covemap_bytes() -> Vec<u8> {
             header_length: 0,
             checksum: 0,
         },
+    }
+    .serialize()
+    .unwrap()
+}
+
+fn coverage_provider_bytes() -> Vec<u8> {
+    CoverageProviderDescriptorV2 {
+        provider_id: 1,
+        provider_kind: 0,
+        profile: PrimaryProfile::TableScan as u8,
+        granularity: CoverageGranularityV2::File,
+        proof_strength: CoverageProofStrengthV2::ExactTight,
+        exactness: CoverageExactnessV2::Exact,
+        flags: 0,
+        referenced_table_id: 1,
+        referenced_column_id: u32::MAX,
+        referenced_path_ref: u32::MAX,
+        logical_type: 0,
+        collation_id: 0,
+        null_semantics: 0,
+        snapshot_validity_ref: u32::MAX,
+        predicate_form_ref: u32::MAX,
+        producer_ref: u32::MAX,
+        checksum: 0,
+    }
+    .serialize()
+    .to_vec()
+}
+
+fn layout_plan_bytes() -> Vec<u8> {
+    LayoutPlanV2 {
+        header: LayoutPlanHeaderV2 {
+            layout_id: 1,
+            node_count: 1,
+            root_node_id: 1,
+            flags: 0,
+            checksum: 0,
+        },
+        nodes: vec![LayoutPlanNodeV2 {
+            node_id: 1,
+            parent_node_id: u32::MAX,
+            node_kind: 0,
+            flags: 0,
+            table_id: u32::MAX,
+            column_id: u32::MAX,
+            segment_id: u32::MAX,
+            first_morsel_id: 0,
+            morsel_count: 0,
+            row_start: 0,
+            row_count: 0,
+            section_id: u32::MAX,
+            cluster_id: u32::MAX,
+            first_child_index: 0,
+            child_count: 0,
+            stats_ref: u32::MAX,
+            split_ref: u32::MAX,
+            checksum: 0,
+        }],
+    }
+    .serialize()
+    .unwrap()
+}
+
+fn cache_bytes() -> Vec<u8> {
+    CoveCoverageCacheHeaderV2 {
+        cache_format_namespace_ref: 0,
+        cache_format_version_major: 1,
+        cache_format_version_minor: 0,
+        flags: 0,
+        cache_id: [1; 16],
+        dataset_id: [2; 16],
+        snapshot_id: [3; 16],
+        entry_count: 0,
+        created_at_us: 0,
+        producer_engine_ref: u32::MAX,
+        reserved: [0; 32],
+        checksum: 0,
+    }
+    .serialize()
+    .to_vec()
+}
+
+fn runtime_hint_bytes() -> Vec<u8> {
+    RuntimeCompatibilityHintV2 {
+        hint_id: 1,
+        hint_kind: RuntimeHintKindV2::EngineAdapter,
+        required: true,
+        flags: 0,
+        namespace: "org.cove".into(),
+        name: "adapter".into(),
+        version_major: 1,
+        version_minor: 0,
+        payload_ref: u32::MAX,
+        checksum: 0,
     }
     .serialize()
     .unwrap()
@@ -1057,4 +1214,561 @@ fn query_covemap_sidecar_reports_guidance() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("COVE-MAP mapping artifact"));
     assert!(stderr.contains("Use it with"));
+}
+
+#[test]
+fn examples_and_doctor_commands_are_beginner_friendly() {
+    let examples = run_cove(&["examples"]);
+    assert!(
+        examples.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&examples.stderr)
+    );
+    let examples_stdout = String::from_utf8_lossy(&examples.stdout);
+    assert!(examples_stdout.contains("CoveQL examples"));
+    assert!(examples_stdout.contains("cove inspect --queries --performance"));
+    assert!(examples_stdout.contains("cove query examples/coveql/events.cove"));
+
+    let examples_json = run_cove(&["examples", "--json"]);
+    assert!(
+        examples_json.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&examples_json.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&examples_json.stdout).unwrap();
+    assert_eq!(value["sample_dir"], serde_json::json!("examples/coveql"));
+    assert!(value["examples"].as_array().unwrap().len() >= 4);
+
+    let file = temp_file("doctor events.cove");
+    fs::write(&file, cove_t_events_bytes()).unwrap();
+    let doctor = run_cove(&["doctor", file.to_str().unwrap()]);
+    assert!(
+        doctor.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&doctor.stderr)
+    );
+    let doctor_stdout = String::from_utf8_lossy(&doctor.stdout);
+    assert!(doctor_stdout.contains("Doctor:"));
+    assert!(doctor_stdout.contains("Queryable: yes"));
+    assert!(doctor_stdout.contains("cove optimize"));
+    assert!(doctor_stdout.contains("table(events).select(id, score).take(10)"));
+
+    let doctor_json = run_cove(&["doctor", "--json", file.to_str().unwrap()]);
+    assert!(
+        doctor_json.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&doctor_json.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&doctor_json.stdout).unwrap();
+    assert_eq!(value["queryable"], serde_json::json!(true));
+    assert!(value["findings"].as_array().unwrap().iter().any(|finding| {
+        finding
+            .as_str()
+            .unwrap_or_default()
+            .contains("artifact exposes queryable rows")
+    }));
+}
+
+#[test]
+fn cli_outputs_have_stable_golden_shapes() {
+    let file = temp_file("golden-events.cove");
+    fs::write(&file, cove_t_events_bytes()).unwrap();
+    let file = file.to_str().unwrap();
+
+    let table = run_cove(&[
+        "query",
+        file,
+        "table(events).where(score >= 20).select(id, score)",
+    ]);
+    assert!(
+        table.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&table.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&table.stdout),
+        "+----+-------+\n| id | score |\n+----+-------+\n| 2  | 20    |\n| 3  | 30    |\n+----+-------+\n2 rows\n"
+    );
+
+    let csv = run_cove(&[
+        "query",
+        file,
+        "--format",
+        "csv",
+        "table(events).where(score >= 20).select(id, score)",
+    ]);
+    assert!(
+        csv.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&csv.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&csv.stdout),
+        "id,score\n2,20\n3,30\n"
+    );
+
+    let jsonl = run_cove(&[
+        "query",
+        file,
+        "--format",
+        "jsonl",
+        "table(events).where(score >= 20).select(id, score)",
+    ]);
+    assert!(
+        jsonl.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&jsonl.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&jsonl.stdout),
+        "{\"id\":2,\"score\":20}\n{\"id\":3,\"score\":30}\n"
+    );
+}
+
+#[test]
+fn cli_negative_paths_report_actionable_errors() {
+    let missing = run_cove(&["inspect", "/tmp/cove-cli-definitely-missing-file.cove"]);
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("cannot read"));
+
+    let mixed_inspect = run_cove(&["inspect", "--queries", "--sections", "stats", "file.cove"]);
+    assert!(!mixed_inspect.status.success());
+    let stderr = String::from_utf8_lossy(&mixed_inspect.stderr);
+    assert!(
+        stderr.contains("cannot be combined") && stderr.contains("--sections"),
+        "stderr={stderr}"
+    );
+
+    let bad_flag = run_cove(&["query", "--wat", "table(events).take(1)"]);
+    assert!(!bad_flag.status.success());
+    assert!(String::from_utf8_lossy(&bad_flag.stderr).contains("unknown query option"));
+
+    let bad_format = run_cove(&[
+        "query",
+        "--external-table",
+        "people=/tmp/nope.jsonl",
+        "--format",
+        "xml",
+        "table(people).take(1)",
+    ]);
+    assert!(!bad_format.status.success());
+    assert!(String::from_utf8_lossy(&bad_format.stderr).contains("unsupported --format"));
+
+    let file = temp_file("negative-events.cove");
+    fs::write(&file, cove_t_events_bytes()).unwrap();
+
+    let malformed = run_cove(&["query", file.to_str().unwrap(), "table(events).where("]);
+    assert!(!malformed.status.success());
+    let stderr = String::from_utf8_lossy(&malformed.stderr);
+    assert!(stderr.contains("E_PARSE"), "stderr={stderr}");
+    assert!(
+        stderr.contains("Check the CoveQL syntax"),
+        "stderr={stderr}"
+    );
+
+    let people = sample_path("people.cove");
+    let unknown_table = run_cove(&[
+        "query",
+        people.to_str().unwrap(),
+        "table(missing).select(id).take(1)",
+    ]);
+    assert!(!unknown_table.status.success());
+    let stderr = String::from_utf8_lossy(&unknown_table.stderr);
+    assert!(
+        stderr.contains("E_UNKNOWN_TABLE_SURFACE"),
+        "stderr={stderr}"
+    );
+    assert!(stderr.contains("cove inspect --queries"), "stderr={stderr}");
+
+    let bad_jsonl = temp_file("bad-external.jsonl");
+    fs::write(&bad_jsonl, "{\"id\":1}\nnot-json\n").unwrap();
+    let external_arg = format!("bad={}", bad_jsonl.display());
+    let bad_external = run_cove(&[
+        "query",
+        "--external-table",
+        &external_arg,
+        "table(bad).select(id)",
+    ]);
+    assert!(!bad_external.status.success());
+    assert!(String::from_utf8_lossy(&bad_external.stderr).contains("cannot parse JSONL"));
+}
+
+#[test]
+fn parent_command_help_exits_successfully() {
+    for args in [
+        &["convert", "--help"][..],
+        &["convert"][..],
+        &["export", "--help"][..],
+        &["export"][..],
+        &["perf", "--help"][..],
+        &["perf"][..],
+        &["digest", "--help"][..],
+        &["digest"][..],
+    ] {
+        let output = run_cove(args);
+        assert!(
+            output.status.success(),
+            "args={args:?} stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("Usage:"), "args={args:?} stdout={stdout}");
+    }
+}
+
+#[test]
+fn paths_with_spaces_and_query_files_work() {
+    let file = temp_file("events final (v1).cove");
+    let query_file = temp_file("query with spaces.coveql");
+    fs::write(&file, cove_t_events_bytes()).unwrap();
+    fs::write(
+        &query_file,
+        "table(events).where(score >= 30).select(id, score)",
+    )
+    .unwrap();
+
+    let from_query_file = run_cove(&[
+        "query",
+        "--query-file",
+        query_file.to_str().unwrap(),
+        "--format",
+        "jsonl",
+        file.to_str().unwrap(),
+    ]);
+    assert!(
+        from_query_file.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&from_query_file.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&from_query_file.stdout).trim(),
+        r#"{"id":3,"score":30}"#
+    );
+
+    let inspect = run_cove(&["inspect", "--queries", file.to_str().unwrap()]);
+    assert!(
+        inspect.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&inspect.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&inspect.stdout);
+    assert!(stdout.contains("Try next:"));
+    assert!(stdout.contains("events final (v1).cove"));
+}
+
+#[test]
+fn medium_cove_t_fixture_covers_group_sort_and_windows() {
+    let file = temp_file("metrics-medium.cove");
+    fs::write(&file, cove_t_medium_bytes()).unwrap();
+    let file = file.to_str().unwrap();
+
+    let grouped = run_cove(&[
+        "query",
+        file,
+        "--format",
+        "jsonl",
+        "table(metrics).groupBy(bucket).select(bucket, rows: count(*), total: sum(score)).orderBy(bucket)",
+    ]);
+    assert!(
+        grouped.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&grouped.stderr)
+    );
+    let grouped_stdout = String::from_utf8_lossy(&grouped.stdout);
+    assert_eq!(grouped_stdout.lines().count(), 5);
+    assert!(grouped_stdout.contains(r#""bucket":0,"rows":5"#));
+    assert!(grouped_stdout.contains(r#""bucket":4,"rows":5"#));
+
+    let window = run_cove(&[
+        "query",
+        file,
+        "--format",
+        "jsonl",
+        "table(metrics).where(bucket == 2).window(partitionBy: bucket, orderBy: score).select(bucket, score, rn: row_number()).take(3)",
+    ]);
+    assert!(
+        window.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&window.stderr)
+    );
+    let window_stdout = String::from_utf8_lossy(&window.stdout);
+    assert!(window_stdout.contains(r#""rn":1"#));
+    assert!(window_stdout.contains(r#""rn":2"#));
+    assert!(window_stdout.contains(r#""rn":3"#));
+}
+
+#[test]
+fn doctor_reports_sidecar_guidance_for_nonqueryable_artifacts() {
+    let file = temp_file("mapping-doctor.covemap");
+    fs::write(&file, covemap_bytes()).unwrap();
+
+    let output = run_cove(&["doctor", file.to_str().unwrap()]);
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Queryable: no"));
+    assert!(stdout.contains("COVE-MAP mapping artifact"));
+
+    let output = run_cove(&["doctor", "--json", file.to_str().unwrap()]);
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["queryable"], serde_json::json!(false));
+}
+
+#[test]
+fn unified_file_utility_commands_cover_validate_inspect_dump_export_and_perf() {
+    let file = temp_file("unified-events.cove");
+    fs::write(&file, cove_t_events_bytes()).unwrap();
+    let path = file.to_str().unwrap();
+
+    let validate = run_cove(&["validate", "--json", path]);
+    assert!(
+        validate.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&validate.stderr)
+    );
+    assert!(String::from_utf8_lossy(&validate.stdout).contains("\"ok\":true"));
+
+    let inspect = run_cove(&["inspect", "--json", "--sections", "stats", path]);
+    assert!(
+        inspect.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&inspect.stderr)
+    );
+    let inspect_json: serde_json::Value = serde_json::from_slice(&inspect.stdout).unwrap();
+    assert_eq!(inspect_json["artifact"], serde_json::json!("COVE"));
+
+    let dump = run_cove(&["dump", path, "--metadata"]);
+    assert!(
+        dump.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&dump.stderr)
+    );
+    assert!(String::from_utf8_lossy(&dump.stdout).contains("metadata"));
+
+    let exported = temp_file("events-export.json");
+    let export = run_cove(&[
+        "export",
+        "arrow",
+        "--format",
+        "json",
+        path,
+        exported.to_str().unwrap(),
+        "--report",
+        "-",
+    ]);
+    assert!(
+        export.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&export.stderr)
+    );
+    assert!(exported.metadata().unwrap().len() > 0);
+    assert!(String::from_utf8_lossy(&export.stdout).contains("\"rows\""));
+
+    let pruning = run_cove(&["perf", "explain-pruning", path]);
+    assert!(
+        pruning.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&pruning.stderr)
+    );
+    assert!(String::from_utf8_lossy(&pruning.stdout).contains("\"version\""));
+
+    let cost = run_cove(&["perf", "plan-cost", "--execute", path]);
+    assert!(
+        cost.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&cost.stderr)
+    );
+    assert!(String::from_utf8_lossy(&cost.stdout).contains("\"version\""));
+}
+
+#[test]
+fn unified_convert_and_map_commands_delegate_existing_tools() {
+    let csv = temp_file("unified-source.csv");
+    let cove = temp_file("unified-source.cove");
+    fs::write(&csv, "id,name\n1,Ada\n2,Linus\n").unwrap();
+
+    let convert = run_cove(&[
+        "convert",
+        "csv",
+        csv.to_str().unwrap(),
+        cove.to_str().unwrap(),
+        "--report",
+        "-",
+    ]);
+    assert!(
+        convert.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&convert.stderr)
+    );
+    assert!(cove.metadata().unwrap().len() > 0);
+    assert!(String::from_utf8_lossy(&convert.stdout).contains("\"source_identifier\""));
+
+    let report = run_cove(&[
+        "convert",
+        "report",
+        "--source-format",
+        "csv",
+        csv.to_str().unwrap(),
+    ]);
+    assert!(
+        report.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&report.stderr)
+    );
+    assert!(String::from_utf8_lossy(&report.stdout).contains("\"source_identifier\""));
+
+    let map = temp_file("unified-map.covemap");
+    fs::write(&map, covemap_bytes()).unwrap();
+    let map_validate = run_cove(&["map", "validate", map.to_str().unwrap()]);
+    assert!(
+        map_validate.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&map_validate.stderr)
+    );
+    assert!(String::from_utf8_lossy(&map_validate.stdout).contains("\"ok\":true"));
+
+    let map_preview = run_cove(&["map", "preview", map.to_str().unwrap()]);
+    assert!(
+        map_preview.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&map_preview.stderr)
+    );
+    assert!(String::from_utf8_lossy(&map_preview.stdout).contains("test/v1"));
+}
+
+#[test]
+fn unified_sidecar_profile_digest_and_canonicalise_commands_work() {
+    let file = temp_file("sidecar-events.cove");
+    fs::write(&file, cove_t_events_bytes()).unwrap();
+
+    let covi = temp_file("sidecar-events.covi");
+    let covi_build = run_cove(&[
+        "sidecar",
+        "build",
+        "covi",
+        file.to_str().unwrap(),
+        covi.to_str().unwrap(),
+        "--all-columns",
+    ]);
+    assert!(
+        covi_build.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&covi_build.stderr)
+    );
+    let covi_inspect = run_cove(&["sidecar", "inspect", "index", covi.to_str().unwrap()]);
+    assert!(
+        covi_inspect.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&covi_inspect.stderr)
+    );
+    assert!(String::from_utf8_lossy(&covi_inspect.stdout).contains("valid COVE-I"));
+
+    let covm = temp_file("sidecar-events.covm");
+    let covm_build = run_cove(&[
+        "sidecar",
+        "build",
+        "covm",
+        covm.to_str().unwrap(),
+        file.to_str().unwrap(),
+    ]);
+    assert!(
+        covm_build.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&covm_build.stderr)
+    );
+    assert!(covm.metadata().unwrap().len() > 0);
+
+    let covx = temp_file("sidecar-events.covx");
+    let covx_build = run_cove(&[
+        "sidecar",
+        "build",
+        "covx",
+        covx.to_str().unwrap(),
+        file.to_str().unwrap(),
+    ]);
+    assert!(
+        covx_build.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&covx_build.stderr)
+    );
+    assert!(covx.metadata().unwrap().len() > 0);
+
+    for (kind, bytes, expected) in [
+        ("coverage", coverage_provider_bytes(), "valid COVE-COVERAGE"),
+        ("layout", layout_plan_bytes(), "valid COVE-L"),
+        ("cache", cache_bytes(), "valid COVE-CACHE"),
+        ("runtime", runtime_hint_bytes(), "valid COVE-R"),
+    ] {
+        let path = temp_file(&format!("{kind}.bin"));
+        fs::write(&path, bytes).unwrap();
+        let inspect = run_cove(&["sidecar", "inspect", kind, path.to_str().unwrap()]);
+        assert!(
+            inspect.status.success(),
+            "kind={kind}\nstderr={}",
+            String::from_utf8_lossy(&inspect.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&inspect.stdout).contains(expected),
+            "stdout={}",
+            String::from_utf8_lossy(&inspect.stdout)
+        );
+    }
+
+    let digest = run_cove(&["digest", "verify", file.to_str().unwrap()]);
+    assert!(
+        digest.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&digest.stderr)
+    );
+    assert!(String::from_utf8_lossy(&digest.stdout).contains("missing_manifest"));
+
+    let profile_section = temp_file("execution-code.bin");
+    let profile = run_cove(&[
+        "profile",
+        "generate",
+        "--kind",
+        "execution-code",
+        "--out",
+        profile_section.to_str().unwrap(),
+    ]);
+    assert!(
+        profile.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&profile.stderr)
+    );
+    let profile_validate = run_cove(&[
+        "profile",
+        "validate-section",
+        profile_section.to_str().unwrap(),
+        "--kind",
+        "execution-code",
+    ]);
+    assert!(
+        profile_validate.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&profile_validate.stderr)
+    );
+
+    let canonicalise = run_cove(&[
+        "canonicalise",
+        "validate-payload",
+        "--tag",
+        "int64",
+        "--hex",
+        "2a00000000000000",
+    ]);
+    assert!(
+        canonicalise.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&canonicalise.stderr)
+    );
+    assert!(String::from_utf8_lossy(&canonicalise.stdout).contains("\"valid\": true"));
 }

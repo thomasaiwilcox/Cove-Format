@@ -1,17 +1,14 @@
 use std::{
-    env, fs,
+    fs,
     path::{Path, PathBuf},
-    process::ExitCode,
     sync::Arc,
 };
 
+use crate::cli::source_digest;
+use crate::source::{convert_bytes_to_cove, ConversionOptions, SourceFormat as FacadeSourceFormat};
 use arrow_csv::WriterBuilder as CsvWriterBuilder;
 use arrow_ipc::writer::FileWriter as IpcFileWriter;
 use cove_arrow::convert::{ParquetConversionOptions, ParquetConversionResult};
-use cove_convert_parquet::cli::source_digest;
-use cove_convert_parquet::source::{
-    convert_bytes_to_cove, ConversionOptions, SourceFormat as FacadeSourceFormat,
-};
 use cove_core::{durable, reader};
 use cove_datafusion::explain::{execute_planned_scan, plan_local_file, ExplainOptions};
 use orc_rust::ArrowWriterBuilder as OrcWriterBuilder;
@@ -60,17 +57,7 @@ impl Default for ReverseOptions {
     }
 }
 
-fn main() -> ExitCode {
-    match run(env::args().skip(1).collect()) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(message) => {
-            eprintln!("cove-conversion-report: {message}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-fn run(args: Vec<String>) -> Result<(), String> {
+pub fn run(args: Vec<String>) -> Result<(), String> {
     let Some((direction, format, target_format, reverse_options, input)) = parse_args(args)? else {
         print_usage();
         return Ok(());
@@ -563,6 +550,6 @@ fn validate_orc_field(field: &arrow_schema::FieldRef, path: &str) -> Result<(), 
 
 fn print_usage() {
     eprintln!(
-        "usage: cove-conversion-report [--direction source-to-cove|cove-to-source] [--source-format parquet|arrow|orc] [--target-format parquet|arrow|csv|orc] [--output path] [--csv-header|--no-csv-header] [--csv-delimiter byte|tab|\\t] [--csv-null text] <input>"
+        "usage: cove convert report [--direction source-to-cove|cove-to-source] [--source-format parquet|arrow|orc|csv] [--target-format parquet|arrow|csv|orc] [--output path] [--csv-header|--no-csv-header] [--csv-delimiter byte|tab|\\t] [--csv-null text] <input>"
     );
 }

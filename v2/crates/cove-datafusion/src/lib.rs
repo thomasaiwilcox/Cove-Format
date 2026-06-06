@@ -33,6 +33,10 @@ pub mod register;
 pub mod scan_program;
 pub mod task_graph;
 
+pub mod arrow_export_cli;
+pub mod explain_pruning_cli;
+pub mod plan_cost_cli;
+
 #[cfg(test)]
 mod tests {
     #[test]

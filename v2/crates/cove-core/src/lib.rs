@@ -118,6 +118,9 @@ pub mod utility;
 pub mod validity;
 pub mod wire;
 pub mod writer;
+
+pub mod canonicalise_cli;
+pub mod profile_cli;
 pub mod zone_stats;
 
 pub use error::CoveError;

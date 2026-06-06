@@ -781,7 +781,7 @@ fn discover_covemap(
         artifact_label: "COVEMAP".into(),
         primary_profile: Some("COVE-MAP mapping definition".into()),
         queryable: false,
-        guidance: "This is a COVE-MAP mapping artifact. Use it with `cove query --mapping <file.covemap> <data.cove> '<query>'` or convert source data with `cove-map convert`.".into(),
+        guidance: "This is a COVE-MAP mapping artifact. Use it with `cove query --mapping <file.covemap> <data.cove> '<query>'` or convert source data with `cove map convert`.".into(),
         object_types: Vec::new(),
         tables: Vec::new(),
         projections: Vec::new(),

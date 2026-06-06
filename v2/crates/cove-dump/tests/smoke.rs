@@ -1,5 +1,13 @@
 use std::{path::PathBuf, process::Command};
 
+fn cove_command() -> Command {
+    let mut command = Command::new(env!("CARGO"));
+    command
+        .current_dir(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.."))
+        .args(["run", "-p", "cove-cli", "--quiet", "--"]);
+    command
+}
+
 fn accept_fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../conformance/accept")
@@ -8,11 +16,12 @@ fn accept_fixture(name: &str) -> PathBuf {
 
 #[test]
 fn dump_cli_smoke() {
-    let output = Command::new(env!("CARGO_BIN_EXE_cove-dump"))
+    let output = cove_command()
+        .arg("dump")
         .arg(accept_fixture("min_empty.cove"))
         .arg("--metadata")
         .output()
-        .expect("run cove-dump");
+        .expect("run cove dump");
 
     assert!(
         output.status.success(),
@@ -29,13 +38,14 @@ fn dump_cli_smoke() {
 
 #[test]
 fn dump_pages_mode_reports_scan_pages() {
-    let output = Command::new(env!("CARGO_BIN_EXE_cove-dump"))
+    let output = cove_command()
+        .arg("dump")
         .arg(accept_fixture("cove_t_scan_table.cove"))
         .arg("--pages")
         .arg("--max-bytes")
         .arg("8")
         .output()
-        .expect("run cove-dump --pages");
+        .expect("run cove dump --pages");
 
     assert!(
         output.status.success(),
@@ -49,13 +59,14 @@ fn dump_pages_mode_reports_scan_pages() {
 
 #[test]
 fn dump_stats_mode_reports_stat_sections() {
-    let output = Command::new(env!("CARGO_BIN_EXE_cove-dump"))
+    let output = cove_command()
+        .arg("dump")
         .arg(accept_fixture("cove_t_zone_stats_valid.cove"))
         .arg("--stats")
         .arg("--max-bytes")
         .arg("8")
         .output()
-        .expect("run cove-dump --stats");
+        .expect("run cove dump --stats");
 
     assert!(
         output.status.success(),
@@ -68,11 +79,12 @@ fn dump_stats_mode_reports_stat_sections() {
 
 #[test]
 fn dump_indexes_mode_reports_empty_index_set() {
-    let output = Command::new(env!("CARGO_BIN_EXE_cove-dump"))
+    let output = cove_command()
+        .arg("dump")
         .arg(accept_fixture("min_empty.cove"))
         .arg("--indexes")
         .output()
-        .expect("run cove-dump --indexes");
+        .expect("run cove dump --indexes");
 
     assert!(
         output.status.success(),
@@ -85,11 +97,12 @@ fn dump_indexes_mode_reports_empty_index_set() {
 
 #[test]
 fn dump_nested_mode_reports_nested_columns() {
-    let output = Command::new(env!("CARGO_BIN_EXE_cove-dump"))
+    let output = cove_command()
+        .arg("dump")
         .arg(accept_fixture("cove_t_nested_list_valid.cove"))
         .arg("--nested")
         .output()
-        .expect("run cove-dump --nested");
+        .expect("run cove dump --nested");
 
     assert!(
         output.status.success(),

@@ -4,10 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "CLI dumper for Cove Format (COVE) v2.0 files"
 license = "MIT"
-
-[[bin]]
-name = "cove-dump"
-path = "src/main.rs"
+autobins = false
 
 [dependencies]
 cove-datafusion = { path = "../cove-datafusion" }

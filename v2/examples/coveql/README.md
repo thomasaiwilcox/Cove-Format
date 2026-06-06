@@ -10,6 +10,8 @@ Files:
 Try from `v2/`:
 
 ```bash
+cargo run -p cove-cli -- examples
+cargo run -p cove-cli -- doctor examples/coveql/people.cove
 cargo run -p cove-cli -- inspect examples/coveql/people.cove --queries
 cargo run -p cove-cli -- query examples/coveql/people.cove 'table(people).select(score, status, nickname).take(5)'
 cargo run -p cove-cli -- query examples/coveql/events.cove 'table(events).where(score >= 20).select(id, score)'

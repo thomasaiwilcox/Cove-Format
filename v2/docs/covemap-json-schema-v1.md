@@ -142,7 +142,7 @@ must match the live source input.
 
 `MAP_PROJECTION_CATALOG.projections[]` supports the expanded schema below.
 Legacy entries containing only `projection_id` and `assertion_ids` still parse
-as metadata, but `cove-map project` rejects them because they do not define a
+as metadata, but `cove map project` rejects them because they do not define a
 deterministic read surface.
 
 Required for executable projections:
@@ -157,7 +157,7 @@ Required for executable projections:
 - `output_modes`
 
 Executable projection `output_modes` are `json`, `arrow`, `cove-t`, `sql`, and
-`cove-o`. `cove-map project --format cove-o` materializes the selected
+`cove-o`. `cove map project --format cove-o` materializes the selected
 projection as a COVE-O file with embedded projection metadata so persisted
 projection readback can reconstruct the declared table surface.
 
