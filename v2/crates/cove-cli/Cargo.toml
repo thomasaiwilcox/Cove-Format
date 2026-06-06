@@ -9,11 +9,23 @@ license = "MIT"
 name = "cove"
 path = "src/main.rs"
 
+[[bench]]
+name = "cli_regression"
+harness = false
+
 [dependencies]
+cove-cache = { path = "../cove-cache" }
+cove-convert-parquet = { path = "../cove-convert-parquet" }
 cove-core = { path = "../cove-core" }
+cove-coverage = { path = "../cove-coverage" }
+cove-datafusion = { path = "../cove-datafusion", features = ["covi"] }
+cove-dump = { path = "../cove-dump" }
+cove-index = { path = "../cove-index" }
+cove-inspect = { path = "../cove-inspect" }
+cove-layout = { path = "../cove-layout" }
+cove-map = { path = "../cove-map" }
+cove-runtime = { path = "../cove-runtime" }
+cove-validate = { path = "../cove-validate" }
 coveql = { path = "../coveql" }
 csv = "1"
 serde_json = { version = "1", features = ["preserve_order"] }
-
-[dev-dependencies]
-cove-map = { path = "../cove-map" }

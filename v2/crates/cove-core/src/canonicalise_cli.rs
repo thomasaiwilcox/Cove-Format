@@ -1,6 +1,6 @@
-use std::{env, fs, path::PathBuf, process::ExitCode};
+use std::{fs, path::PathBuf};
 
-use cove_core::{
+use crate::{
     canonical::{validate_canonical_payload, CanonicalValue},
     constants::{CoveLogicalType, SectionKind, ValueTag},
     reader::{validate_bytes_with_options, ValidationOptions},
@@ -9,18 +9,7 @@ use cove_core::{
 };
 use serde_json::{json, Value};
 
-fn main() -> ExitCode {
-    match run(env::args().skip(1).collect()) {
-        Ok(success) if success => ExitCode::SUCCESS,
-        Ok(_) => ExitCode::FAILURE,
-        Err(message) => {
-            eprintln!("cove-canonicalise: {message}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-fn run(args: Vec<String>) -> Result<bool, String> {
+pub fn run(args: Vec<String>) -> Result<bool, String> {
     let Some((command, rest)) = args.split_first() else {
         print_usage();
         return Ok(true);
@@ -94,7 +83,7 @@ fn encode_json(args: &[String]) -> Result<bool, String> {
 
 fn check_file(args: &[String], kind: SectionKind, label: &str) -> Result<bool, String> {
     if args.len() != 1 || args.iter().any(|arg| arg == "-h" || arg == "--help") {
-        eprintln!("usage: cove-canonicalise check-{label} <file.cove>");
+        eprintln!("usage: cove canonicalise check-{label} <file.cove>");
         return Ok(true);
     }
     let path = PathBuf::from(&args[0]);
@@ -388,6 +377,6 @@ fn print_json(value: Value) -> Result<(), String> {
 
 fn print_usage() {
     eprintln!(
-        "usage: cove-canonicalise validate-payload --tag <tag> --hex <payload> | encode-json --logical <type> --value <json> | check-domain <file.cove> | check-trust <file.cove>"
+        "usage: cove canonicalise validate-payload --tag <tag> --hex <payload> | encode-json --logical <type> --value <json> | check-domain <file.cove> | check-trust <file.cove>"
     );
 }

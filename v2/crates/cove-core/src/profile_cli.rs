@@ -1,6 +1,6 @@
-use std::{env, fs, path::PathBuf, process::ExitCode};
+use std::{fs, path::PathBuf};
 
-use cove_core::{
+use crate::{
     checksum,
     constants::SectionKind,
     profile::cove_e::{
@@ -15,18 +15,7 @@ use cove_core::{
 };
 use serde_json::json;
 
-fn main() -> ExitCode {
-    match run(env::args().skip(1).collect()) {
-        Ok(success) if success => ExitCode::SUCCESS,
-        Ok(_) => ExitCode::FAILURE,
-        Err(message) => {
-            eprintln!("cove-profile: {message}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-fn run(args: Vec<String>) -> Result<bool, String> {
+pub fn run(args: Vec<String>) -> Result<bool, String> {
     let Some((command, rest)) = args.split_first() else {
         print_usage();
         return Ok(true);
@@ -45,7 +34,7 @@ fn run(args: Vec<String>) -> Result<bool, String> {
 
 fn inspect(args: &[String]) -> Result<bool, String> {
     if args.len() != 1 {
-        eprintln!("usage: cove-profile inspect <file.cove>");
+        eprintln!("usage: cove profile inspect <file.cove>");
         return Ok(true);
     }
     let path = PathBuf::from(&args[0]);
@@ -493,13 +482,14 @@ fn print_json(value: serde_json::Value) -> Result<(), String> {
 
 fn print_usage() {
     eprintln!(
-        "usage: cove-profile inspect <file.cove> | generate --kind <engine-registry|execution-code|execution-scope|code-space|mount-policy> --out <section.bin> | validate-section <section.bin> --kind <engine-registry|execution-code|execution-scope|code-space|mount-policy>"
+        "usage: cove profile inspect <file.cove> | generate --kind <engine-registry|execution-code|execution-scope|code-space|mount-policy> --out <section.bin> | validate-section <section.bin> --kind <engine-registry|execution-code|execution-scope|code-space|mount-policy>"
     );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
 
     #[test]
     fn generate_round_trips_all_profile_payload_kinds() {

@@ -5,7 +5,15 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use cove_core::{artifact::covm::CovmFile, table::TableCatalog, writer::ScanProfileCoveWriter};
+use cove_core::{
+    artifact::covm::CovmFile,
+    constants::SectionKind,
+    durable,
+    reader::{validate_bytes_with_options, ValidationOptions},
+    table::TableCatalog,
+    utility::{build_covm_artifact, build_covx_artifact},
+    writer::ScanProfileCoveWriter,
+};
 use coveql::{
     acceleration_report_json, apply_acceleration_bundle, coveql_identifier,
     discover_acceleration_bundle, discover_query_surfaces, execute_query_from_artifact,
@@ -22,6 +30,13 @@ use serde_json::Value;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Command {
+    Examples {
+        json: bool,
+    },
+    Doctor {
+        file: PathBuf,
+        json: bool,
+    },
     Inspect {
         file: PathBuf,
         queries: bool,
@@ -35,7 +50,63 @@ enum Command {
         json: bool,
     },
     Query(Box<QueryCommand>),
+    Convert {
+        format: ConvertFormat,
+        args: Vec<String>,
+    },
+    Validate {
+        args: Vec<String>,
+    },
+    InspectDetailed {
+        args: Vec<String>,
+    },
+    Dump {
+        args: Vec<String>,
+    },
+    Map {
+        args: Vec<String>,
+    },
+    Export {
+        format: ExportFormat,
+        args: Vec<String>,
+    },
+    Perf {
+        command: PerfCommand,
+        args: Vec<String>,
+    },
+    Sidecar {
+        args: Vec<String>,
+    },
+    Digest {
+        args: Vec<String>,
+    },
+    Profile {
+        args: Vec<String>,
+    },
+    Canonicalise {
+        args: Vec<String>,
+    },
     Help,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConvertFormat {
+    Parquet,
+    Arrow,
+    Orc,
+    Csv,
+    Report,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExportFormat {
+    Arrow,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PerfCommand {
+    ExplainPruning,
+    PlanCost,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,6 +149,8 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<(), String> {
             print_usage();
             Ok(())
         }
+        Command::Examples { json } => run_examples(json),
+        Command::Doctor { file, json } => run_doctor(&file, json),
         Command::Inspect {
             file,
             queries,
@@ -116,6 +189,17 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<(), String> {
                 max_cell_width: command.max_cell_width,
             },
         ),
+        Command::Convert { format, args } => run_convert(format, args),
+        Command::Validate { args } => run_validate(args),
+        Command::InspectDetailed { args } => run_inspect_detailed(args),
+        Command::Dump { args } => cove_dump::run_cli(args),
+        Command::Map { args } => cove_map::run_cli(args),
+        Command::Export { format, args } => run_export(format, args),
+        Command::Perf { command, args } => run_perf(command, args),
+        Command::Sidecar { args } => run_sidecar(args),
+        Command::Digest { args } => run_digest(args),
+        Command::Profile { args } => run_profile(args),
+        Command::Canonicalise { args } => run_canonicalise(args),
     }
 }
 
@@ -204,14 +288,63 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, String>
     let command = args.remove(0);
     match command.as_str() {
         "-h" | "--help" | "help" => Ok(Command::Help),
+        "examples" => parse_examples(args),
+        "doctor" => parse_doctor(args),
         "inspect" => parse_inspect(args),
         "optimize" => parse_optimize(args),
         "query" => parse_query(args),
+        "convert" => parse_convert(args),
+        "validate" => Ok(Command::Validate { args }),
+        "dump" => Ok(Command::Dump { args }),
+        "map" => Ok(Command::Map { args }),
+        "export" => parse_export(args),
+        "perf" => parse_perf(args),
+        "sidecar" => Ok(Command::Sidecar { args }),
+        "digest" => parse_digest(args),
+        "profile" => Ok(Command::Profile { args }),
+        "canonicalise" | "canonicalize" => Ok(Command::Canonicalise { args }),
         other => Err(format!("unknown command '{other}'\n\n{}", usage())),
     }
 }
 
+fn parse_examples(args: Vec<String>) -> Result<Command, String> {
+    let mut json = false;
+    for arg in args {
+        match arg.as_str() {
+            "--json" => json = true,
+            "-h" | "--help" => return Ok(Command::Help),
+            arg if arg.starts_with("--") => return Err(format!("unknown examples option '{arg}'")),
+            _ => return Err("examples does not accept positional arguments".into()),
+        }
+    }
+    Ok(Command::Examples { json })
+}
+
+fn parse_doctor(args: Vec<String>) -> Result<Command, String> {
+    let mut json = false;
+    let mut file = None;
+    for arg in args {
+        match arg.as_str() {
+            "--json" => json = true,
+            "-h" | "--help" => return Ok(Command::Help),
+            arg if arg.starts_with("--") => return Err(format!("unknown doctor option '{arg}'")),
+            path => {
+                if file.replace(PathBuf::from(path)).is_some() {
+                    return Err("doctor accepts one file path".into());
+                }
+            }
+        }
+    }
+    Ok(Command::Doctor {
+        file: file.ok_or_else(|| "usage: cove doctor [--json] <file>".to_string())?,
+        json,
+    })
+}
+
 fn parse_inspect(args: Vec<String>) -> Result<Command, String> {
+    if wants_detailed_inspect(&args) {
+        return Ok(Command::InspectDetailed { args });
+    }
     let mut queries = false;
     let mut json = false;
     let mut performance = false;
@@ -238,6 +371,79 @@ fn parse_inspect(args: Vec<String>) -> Result<Command, String> {
         json,
         performance,
     })
+}
+
+fn wants_detailed_inspect(args: &[String]) -> bool {
+    let mut positional = 0usize;
+    for arg in args {
+        match arg.as_str() {
+            "--sections" => return true,
+            "--queries" | "--json" | "--performance" | "-h" | "--help" => {}
+            _ if arg.starts_with("--") => {}
+            _ => positional += 1,
+        }
+    }
+    positional > 1
+}
+
+fn parse_convert(mut args: Vec<String>) -> Result<Command, String> {
+    if args.is_empty() || args[0] == "-h" || args[0] == "--help" {
+        return Err("usage: cove convert <parquet|arrow|orc|csv|report> [options]".into());
+    }
+    let raw = args.remove(0);
+    let format = match raw.as_str() {
+        "parquet" => ConvertFormat::Parquet,
+        "arrow" => ConvertFormat::Arrow,
+        "orc" => ConvertFormat::Orc,
+        "csv" => ConvertFormat::Csv,
+        "report" => ConvertFormat::Report,
+        other => {
+            return Err(format!(
+                "unknown convert format '{other}'; expected parquet, arrow, orc, csv, or report"
+            ))
+        }
+    };
+    Ok(Command::Convert { format, args })
+}
+
+fn parse_export(mut args: Vec<String>) -> Result<Command, String> {
+    if args.is_empty() || args[0] == "-h" || args[0] == "--help" {
+        return Err("usage: cove export <arrow> [options]".into());
+    }
+    let raw = args.remove(0);
+    let format = match raw.as_str() {
+        "arrow" => ExportFormat::Arrow,
+        other => return Err(format!("unknown export format '{other}'; expected arrow")),
+    };
+    Ok(Command::Export { format, args })
+}
+
+fn parse_perf(mut args: Vec<String>) -> Result<Command, String> {
+    if args.is_empty() || args[0] == "-h" || args[0] == "--help" {
+        return Err("usage: cove perf <explain-pruning|plan-cost> [options]".into());
+    }
+    let raw = args.remove(0);
+    let command = match raw.as_str() {
+        "explain-pruning" => PerfCommand::ExplainPruning,
+        "plan-cost" => PerfCommand::PlanCost,
+        other => {
+            return Err(format!(
+                "unknown perf command '{other}'; expected explain-pruning or plan-cost"
+            ))
+        }
+    };
+    Ok(Command::Perf { command, args })
+}
+
+fn parse_digest(mut args: Vec<String>) -> Result<Command, String> {
+    if args.is_empty() || args[0] == "-h" || args[0] == "--help" {
+        return Err("usage: cove digest verify <file.cove> [--require]".into());
+    }
+    let command = args.remove(0);
+    match command.as_str() {
+        "verify" => Ok(Command::Digest { args }),
+        other => Err(format!("unknown digest command '{other}'; expected verify")),
+    }
 }
 
 fn parse_optimize(args: Vec<String>) -> Result<Command, String> {
@@ -598,6 +804,578 @@ fn explain_policy_for_cli(mode: &str) -> ExplainDisclosurePolicy {
         "forensic" => ExplainDisclosurePolicy::Forensic,
         _ => ExplainDisclosurePolicy::PublicOnly,
     }
+}
+
+fn run_convert(format: ConvertFormat, args: Vec<String>) -> Result<(), String> {
+    match format {
+        ConvertFormat::Parquet => cove_convert_parquet::commands::run_parquet(args),
+        ConvertFormat::Arrow => cove_convert_parquet::commands::run_arrow(args),
+        ConvertFormat::Orc => cove_convert_parquet::commands::run_orc(args),
+        ConvertFormat::Csv => cove_convert_parquet::commands::run_csv(args),
+        ConvertFormat::Report => cove_convert_parquet::commands::run_report(args),
+    }
+}
+
+fn run_validate(args: Vec<String>) -> Result<(), String> {
+    if cove_validate::run_cli(args)? {
+        Ok(())
+    } else {
+        Err("validation failed".into())
+    }
+}
+
+fn run_inspect_detailed(args: Vec<String>) -> Result<(), String> {
+    if cove_inspect::run_cli(args)? {
+        Ok(())
+    } else {
+        Err("inspection failed".into())
+    }
+}
+
+fn run_export(format: ExportFormat, args: Vec<String>) -> Result<(), String> {
+    match format {
+        ExportFormat::Arrow => cove_datafusion::arrow_export_cli::run(args),
+    }
+}
+
+fn run_perf(command: PerfCommand, args: Vec<String>) -> Result<(), String> {
+    match command {
+        PerfCommand::ExplainPruning => cove_datafusion::explain_pruning_cli::run(args),
+        PerfCommand::PlanCost => cove_datafusion::plan_cost_cli::run(args),
+    }
+}
+
+fn run_profile(args: Vec<String>) -> Result<(), String> {
+    if cove_core::profile_cli::run(args)? {
+        Ok(())
+    } else {
+        Err("profile command failed".into())
+    }
+}
+
+fn run_canonicalise(args: Vec<String>) -> Result<(), String> {
+    if cove_core::canonicalise_cli::run(args)? {
+        Ok(())
+    } else {
+        Err("canonicalise command failed".into())
+    }
+}
+
+fn run_digest(args: Vec<String>) -> Result<(), String> {
+    if run_digest_verify(args)? {
+        Ok(())
+    } else {
+        Err("digest verification failed".into())
+    }
+}
+
+fn run_digest_verify(args: Vec<String>) -> Result<bool, String> {
+    let mut require = false;
+    let mut input = None;
+    for arg in args {
+        match arg.as_str() {
+            "--require" => require = true,
+            "-h" | "--help" => {
+                println!("usage: cove digest verify <file.cove> [--require]");
+                return Ok(true);
+            }
+            _ if arg.starts_with('-') => return Err(format!("unknown digest option {arg}")),
+            _ => {
+                if input.replace(PathBuf::from(arg)).is_some() {
+                    return Err("expected one <file.cove>".into());
+                }
+            }
+        }
+    }
+    let input = input.ok_or_else(|| "expected <file.cove>".to_string())?;
+    let bytes =
+        fs::read(&input).map_err(|error| format!("cannot read {}: {error}", input.display()))?;
+    let structural = validate_bytes_with_options(
+        &bytes,
+        ValidationOptions {
+            semantic: false,
+            verify_digests: false,
+            ..ValidationOptions::default()
+        },
+    )
+    .map_err(|error| format!("cannot validate {}: {error}", input.display()))?;
+    let has_manifest = structural
+        .validated
+        .footer
+        .sections
+        .iter()
+        .any(|entry| entry.section_kind == SectionKind::DigestManifest as u16);
+    let (status, success, error) = if !has_manifest {
+        ("missing_manifest", !require, None)
+    } else {
+        match validate_bytes_with_options(
+            &bytes,
+            ValidationOptions {
+                semantic: true,
+                verify_digests: true,
+                ..ValidationOptions::default()
+            },
+        ) {
+            Ok(_) => ("verified", true, None),
+            Err(error) => ("mismatch", false, Some(error.to_string())),
+        }
+    };
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "version": 1,
+            "file": input.display().to_string(),
+            "status": status,
+            "require": require,
+            "digest_manifest_present": has_manifest,
+            "error": error,
+        }))
+        .map_err(|error| format!("cannot serialize report: {error}"))?
+    );
+    Ok(success)
+}
+
+fn run_sidecar(mut args: Vec<String>) -> Result<(), String> {
+    if args.is_empty() || args[0] == "-h" || args[0] == "--help" {
+        println!("usage: cove sidecar <inspect|build> ...");
+        return Ok(());
+    }
+    let command = args.remove(0);
+    match command.as_str() {
+        "inspect" => run_sidecar_inspect(args),
+        "build" => run_sidecar_build(args),
+        other => Err(format!(
+            "unknown sidecar command '{other}'; expected inspect or build"
+        )),
+    }
+}
+
+fn run_sidecar_inspect(mut args: Vec<String>) -> Result<(), String> {
+    if args.len() != 2 || args[0] == "-h" || args[0] == "--help" {
+        return Err(
+            "usage: cove sidecar inspect <index|coverage|layout|cache|runtime> <file>".into(),
+        );
+    }
+    let kind = args.remove(0);
+    let path = PathBuf::from(args.remove(0));
+    let bytes =
+        fs::read(&path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    match kind.as_str() {
+        "index" | "covi" => inspect_index_sidecar(&path, &bytes),
+        "coverage" => inspect_coverage_sidecar(&path, &bytes),
+        "layout" => inspect_layout_sidecar(&path, &bytes),
+        "cache" => inspect_cache_sidecar(&path, &bytes),
+        "runtime" => inspect_runtime_sidecar(&path, &bytes),
+        other => Err(format!(
+            "unknown sidecar kind '{other}'; expected index, coverage, layout, cache, or runtime"
+        )),
+    }
+}
+
+fn run_sidecar_build(mut args: Vec<String>) -> Result<(), String> {
+    if args.is_empty() || args[0] == "-h" || args[0] == "--help" {
+        return Err("usage: cove sidecar build <covi|covx|covm> ...".into());
+    }
+    let kind = args.remove(0);
+    match kind.as_str() {
+        "covi" => build_covi_sidecar(args),
+        "covx" => build_covx_or_covm_sidecar(args, true),
+        "covm" => build_covx_or_covm_sidecar(args, false),
+        other => Err(format!(
+            "unknown sidecar build kind '{other}'; expected covi, covx, or covm"
+        )),
+    }
+}
+
+fn inspect_index_sidecar(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    if bytes.len() >= 4 && bytes[bytes.len() - 4..] == *b"CVI2" {
+        let artifact = cove_index::CoviArtifactV2::parse(bytes)
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        println!(
+            "valid COVE-I artifact: sections={} roots={} files={} capabilities={} key_blocks={} entry_blocks={} postings_blocks={}",
+            artifact.sections.len(),
+            artifact.header.index_root_count,
+            artifact.header.referenced_file_count,
+            artifact.header.capability_count,
+            artifact.key_blocks.len(),
+            artifact.entry_blocks.len(),
+            artifact.postings_blocks.len()
+        );
+        return Ok(());
+    }
+    if let Ok(capabilities) = cove_index::IndexCapabilityV2::parse_many(bytes) {
+        println!(
+            "valid COVE-I index capability section: {} capabilities",
+            capabilities.len()
+        );
+        return Ok(());
+    }
+    if let Ok(capabilities) = cove_index::IndexOnlyCapabilityV2::parse_many(bytes) {
+        println!(
+            "valid COVE-I index-only capability section: {} capabilities",
+            capabilities.len()
+        );
+        return Ok(());
+    }
+    let artifact = cove_index::CoviArtifactV2::parse(bytes)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    println!(
+        "valid COVE-I artifact: sections={} roots={} files={} capabilities={} key_blocks={} entry_blocks={} postings_blocks={}",
+        artifact.sections.len(),
+        artifact.header.index_root_count,
+        artifact.header.referenced_file_count,
+        artifact.header.capability_count,
+        artifact.key_blocks.len(),
+        artifact.entry_blocks.len(),
+        artifact.postings_blocks.len()
+    );
+    Ok(())
+}
+
+fn inspect_coverage_sidecar(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    if let Ok(providers) = cove_coverage::CoverageProviderDescriptorV2::parse_many(bytes) {
+        println!(
+            "valid COVE-COVERAGE provider registry: {} providers",
+            providers.len()
+        );
+        return Ok(());
+    }
+    if let Ok(set) = cove_coverage::CoverageSetV2::parse(bytes) {
+        println!(
+            "valid COVE-COVERAGE set: id={} provider={} entries={} pruning_safe={}",
+            set.header.coverage_set_id,
+            set.header.provider_id,
+            set.entries.len(),
+            cove_coverage::can_use_for_pruning(&set.header)
+        );
+        return Ok(());
+    }
+    if let Ok(records) = cove_coverage::CoverageProofRecordV2::parse_many(bytes) {
+        println!(
+            "valid COVE-COVERAGE proof records: {} pruning_safe={}",
+            records.len(),
+            records.iter().all(cove_coverage::can_use_proof_for_pruning)
+        );
+        return Ok(());
+    }
+    if let Ok(candidates) = cove_coverage::CoveragePlanCandidateV2::parse_many(bytes) {
+        println!("valid COVE-COVERAGE plan candidates: {}", candidates.len());
+        return Ok(());
+    }
+    if let Ok(forms) = cove_coverage::PredicateNormalFormV2::parse_many(bytes) {
+        println!("valid COVE-COVERAGE predicate forms: {}", forms.len());
+        return Ok(());
+    }
+    match cove_coverage::IntervalPredicateV2::parse_many(bytes) {
+        Ok(intervals) => {
+            println!(
+                "valid COVE-COVERAGE interval predicates: {}",
+                intervals.len()
+            );
+            Ok(())
+        }
+        Err(error) => Err(format!(
+            "{}: not a valid provider registry, coverage set, proof record, predicate form, interval predicate, or plan candidate: {error}",
+            path.display()
+        )),
+    }
+}
+
+fn inspect_layout_sidecar(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    if let Ok(plan) = cove_layout::LayoutPlanV2::parse(bytes) {
+        println!(
+            "valid COVE-L layout plan: layout_id={} nodes={} root={}",
+            plan.header.layout_id,
+            plan.nodes.len(),
+            plan.header.root_node_id
+        );
+        return Ok(());
+    }
+    if let Ok(index) = cove_layout::ScanSplitIndexV2::parse(bytes) {
+        println!(
+            "valid COVE-L scan split index: splits={}",
+            index.entries.len()
+        );
+        return Ok(());
+    }
+    match cove_layout::ZeroCopyBufferMapV2::parse(bytes) {
+        Ok(map) => {
+            println!(
+                "valid COVE-L zero-copy buffer map: targets={} entries={}",
+                map.targets.len(),
+                map.entries.len()
+            );
+            Ok(())
+        }
+        Err(error) => Err(format!(
+            "{}: not a valid COVE-L layout plan, scan split index, or zero-copy map: {error}",
+            path.display()
+        )),
+    }
+}
+
+fn inspect_cache_sidecar(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    match cove_cache::CoverageCacheV2::parse(bytes) {
+        Ok(cache) => {
+            println!(
+                "valid COVE-CACHE diagnostic record: entries={} version={}.{}",
+                cache.entries.len(),
+                cache.header.cache_format_version_major,
+                cache.header.cache_format_version_minor
+            );
+            Ok(())
+        }
+        Err(error) => Err(format!("{}: {error}", path.display())),
+    }
+}
+
+fn inspect_runtime_sidecar(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    match cove_runtime::RuntimeCompatibilityHintV2::parse_many(bytes) {
+        Ok(hints) => {
+            println!("valid COVE-R runtime hints: {} hints", hints.len());
+            for hint in hints {
+                println!(
+                    "hint_id={} kind={:?} required={} {}::{} v{}.{}",
+                    hint.hint_id,
+                    hint.hint_kind,
+                    hint.required,
+                    hint.namespace,
+                    hint.name,
+                    hint.version_major,
+                    hint.version_minor
+                );
+            }
+            Ok(())
+        }
+        Err(error) => Err(format!("{}: {error}", path.display())),
+    }
+}
+
+fn build_covx_or_covm_sidecar(mut args: Vec<String>, covx: bool) -> Result<(), String> {
+    if args.len() < 2 {
+        return Err(if covx {
+            "usage: cove sidecar build covx <output.covx> <input.cove>...".into()
+        } else {
+            "usage: cove sidecar build covm <output.covm> <input.cove>...".into()
+        });
+    }
+    let output = PathBuf::from(args.remove(0));
+    let inputs = args.into_iter().map(PathBuf::from).collect::<Vec<_>>();
+    let (bytes, report) = if covx {
+        build_covx_artifact(&output, &inputs).map_err(|error| error.to_string())?
+    } else {
+        build_covm_artifact(&output, &inputs).map_err(|error| error.to_string())?
+    };
+    durable::durable_replace(&output, &bytes)
+        .map_err(|error| format!("cannot durably publish {}: {error}", output.display()))?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report.to_json_value())
+            .map_err(|error| format!("cannot serialize report: {error}"))?
+    );
+    Ok(())
+}
+
+fn build_covi_sidecar(args: Vec<String>) -> Result<(), String> {
+    use cove_index::build::{build_covi_from_cove_bytes, CoviBuildOptions};
+
+    if args.len() == 1 {
+        let output = &args[0];
+        let artifact = cove_index::CoviArtifactV2::new_empty([0u8; 16], [0u8; 16]);
+        let bytes = artifact
+            .serialize_empty()
+            .map_err(|error| format!("failed to build empty COVE-I artifact: {error}"))?;
+        fs::write(output, bytes).map_err(|error| format!("{output}: {error}"))?;
+        println!("wrote empty COVE-I artifact to {output}");
+        return Ok(());
+    }
+
+    let mut positionals = Vec::new();
+    let mut options = CoviBuildOptions::default();
+    let mut iter = args.into_iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--table-id" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--table-id requires a value".to_string())?;
+                options.table_id = Some(
+                    value
+                        .parse::<u32>()
+                        .map_err(|_| format!("invalid --table-id value: {value}"))?,
+                );
+            }
+            "--column-id" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--column-id requires a value".to_string())?;
+                options.column_ids.push(
+                    value
+                        .parse::<u32>()
+                        .map_err(|_| format!("invalid --column-id value: {value}"))?,
+                );
+            }
+            "--all-columns" => options.all_columns = true,
+            "--index-only-counts" => options.include_index_only_counts = true,
+            "--index-only-exists" => options.include_index_only_exists = true,
+            "--index-only-min-max" => options.include_index_only_min_max = true,
+            "--index-only-distinct-count" => options.include_index_only_distinct_count = true,
+            "--index-only-sum-avg" => options.include_index_only_sum_avg = true,
+            "-h" | "--help" => {
+                println!("usage: cove sidecar build covi <input.cove> <output.covi> [--table-id <id>] [--column-id <id> ... | --all-columns] [--index-only-counts] [--index-only-exists] [--index-only-min-max] [--index-only-distinct-count] [--index-only-sum-avg]");
+                return Ok(());
+            }
+            _ if arg.starts_with("--") => return Err(format!("unknown option: {arg}")),
+            _ => positionals.push(arg),
+        }
+    }
+    if positionals.len() != 2 {
+        return Err("usage: cove sidecar build covi <input.cove> <output.covi> [options]".into());
+    }
+    if options.all_columns && !options.column_ids.is_empty() {
+        return Err("--all-columns cannot be combined with --column-id".into());
+    }
+    let input_path = positionals.remove(0);
+    let output_path = positionals.remove(0);
+    let input = fs::read(&input_path).map_err(|error| format!("{input_path}: {error}"))?;
+    let bytes = build_covi_from_cove_bytes(&input, &options)
+        .map_err(|error| format!("{input_path}: {error}"))?;
+    fs::write(&output_path, bytes).map_err(|error| format!("{output_path}: {error}"))?;
+    println!("wrote COVE-I artifact to {output_path}");
+    Ok(())
+}
+
+fn run_examples(json: bool) -> Result<(), String> {
+    let sample_dir = "examples/coveql";
+    let examples = vec![
+        (
+            "Inspect an object sample",
+            "cove inspect --queries --performance examples/coveql/people.cove",
+        ),
+        (
+            "Query mapped object rows as a table",
+            "cove query examples/coveql/people.cove 'table(people).select(score, status, nickname).take(5)'",
+        ),
+        (
+            "Query a COVE-T table",
+            "cove query examples/coveql/events.cove 'table(events).where(score >= 20).select(id, score)'",
+        ),
+        (
+            "Check acceleration decisions",
+            "cove query --engine compare --perf-report examples/coveql/events.cove 'table(events).where(score >= 20).select(id, score)'",
+        ),
+        (
+            "Join an external CSV file",
+            "cove query --external-table people=/tmp/people.csv 'table(people).where(score >= 20).select(id, score)'",
+        ),
+    ];
+    if json {
+        let value = serde_json::json!({
+            "sample_dir": sample_dir,
+            "examples": examples.iter().map(|(title, command)| {
+                serde_json::json!({
+                    "title": title,
+                    "command": command,
+                })
+            }).collect::<Vec<_>>(),
+        });
+        println!("{}", serde_json::to_string_pretty(&value).unwrap());
+        return Ok(());
+    }
+
+    println!("CoveQL examples");
+    println!("Sample directory: {sample_dir}");
+    println!();
+    for (title, command) in examples {
+        println!("{title}:");
+        println!("  {command}");
+    }
+    println!();
+    println!("Regenerate samples from v2/ with:");
+    println!("  cargo run -p cove-cli --example generate_beginner_samples -- examples/coveql");
+    Ok(())
+}
+
+fn run_doctor(file: &Path, json: bool) -> Result<(), String> {
+    let bytes =
+        fs::read(file).map_err(|error| format!("cannot read {}: {error}", file.display()))?;
+    let discovery = discover_query_surfaces(
+        &bytes,
+        QuerySurfaceDiscoveryOptions {
+            source_name: Some(file.display().to_string()),
+        },
+    );
+    let bundle = discover_acceleration_bundle(
+        &bytes,
+        file,
+        AccelerationBundleOptions {
+            auto_discover: true,
+            strict_source_digest: true,
+        },
+    );
+    let suggestions = suggest_queries(&discovery);
+    let mut findings = Vec::new();
+    if discovery.queryable {
+        findings.push("artifact exposes queryable rows".to_string());
+    } else {
+        findings.push(discovery.guidance.clone());
+    }
+    if bundle.has_usable_sidecars() {
+        findings.push("validated acceleration sidecars are available".to_string());
+    } else if discovery.queryable {
+        findings.push(format!(
+            "no validated acceleration bundle found; run `cove optimize {}`",
+            file.display()
+        ));
+    }
+    for diagnostic in &discovery.diagnostics {
+        findings.push(format!("{}: {}", diagnostic.code, diagnostic.message));
+    }
+    for diagnostic in &bundle.diagnostics {
+        findings.push(format!("{}: {}", diagnostic.code, diagnostic.message));
+    }
+
+    if json {
+        let value = serde_json::json!({
+            "file": file.display().to_string(),
+            "artifact": discovery.artifact_label,
+            "queryable": discovery.queryable,
+            "guidance": discovery.guidance,
+            "findings": findings,
+            "suggested_queries": suggestions,
+            "performance": acceleration_report_json(&bundle),
+        });
+        println!("{}", serde_json::to_string_pretty(&value).unwrap());
+        return Ok(());
+    }
+
+    println!("Doctor: {}", file.display());
+    println!("Artifact: {}", discovery.artifact_label);
+    println!(
+        "Queryable: {}",
+        if discovery.queryable { "yes" } else { "no" }
+    );
+    println!("Guidance: {}", discovery.guidance);
+    println!();
+    println!("Findings:");
+    for finding in &findings {
+        println!("  - {finding}");
+    }
+    if !suggestions.is_empty() {
+        println!();
+        println!("Try next:");
+        for suggestion in suggestions.iter().take(3) {
+            println!("  - {}", suggestion.query);
+        }
+    }
+    println!();
+    println!("Useful commands:");
+    println!("  cove inspect --queries --performance {}", file.display());
+    if discovery.queryable && !bundle.has_usable_sidecars() {
+        println!("  cove optimize {}", file.display());
+    }
+    println!("  cove query --help");
+    Ok(())
 }
 
 fn run_inspect(file: &Path, queries: bool, json: bool, performance: bool) -> Result<(), String> {
@@ -1414,8 +2192,16 @@ fn print_discovery(discovery: &QuerySurfaceDiscovery, queries: bool) {
         let suggestions = suggest_queries(discovery);
         if !suggestions.is_empty() {
             println!("\nSuggested queries:");
-            for suggestion in suggestions {
+            for suggestion in &suggestions {
                 println!("  - {}: {}", suggestion.title, suggestion.query);
+            }
+            if let Some(first) = suggestions.first() {
+                println!("\nTry next:");
+                println!(
+                    "  cove query {} '{}'",
+                    discovery.source_name.as_deref().unwrap_or("<file>"),
+                    first.query
+                );
             }
         }
     }
@@ -1742,5 +2528,5 @@ fn print_usage() {
 }
 
 fn usage() -> String {
-    "Usage:\n  cove inspect [--queries] [--performance] [--json] <file>\n  cove optimize <file> [--out-dir dir] [--full] [--json]\n  cove query [--format table|json|jsonl|csv] [--take n] [--max-cell-width n] [--explain [public|developer|proof|coded|forensic]] [--engine auto|materialized|physical|compare|kernel] [--no-auto-sidecars] [--strict-performance] [--perf-report] [--batch-size n] [--external-table name=path.csv|json|jsonl] [--enable-graph-traversal] [--max-graph-depth n] [--max-graph-paths n] [--max-graph-fanout n] [--mapping file.covemap] [--member id=path] [--dataset dir] [--covi file] [--covx file] [--cove-e file] [file] '<coveql>'\n  cove query [options] --query-file <path|-> [file]\n\nExamples:\n  cove inspect --queries --performance people.cove\n  cove optimize people.cove\n  cove query people.cove 'object(Person).select(name).take(10)'\n  cove query --format jsonl people.cove 'table(people).where(active == true)'\n  cove query --external-table people=people.csv 'table(people).where(score >= 20)'\n  cove query --engine compare --perf-report events.cove 'table(events).where(score >= 20)'\n  cove query --query-file query.coveql people.cove".into()
+    "Usage:\n  cove examples [--json]\n  cove doctor [--json] <file>\n  cove inspect [--queries] [--performance] [--json] <file>\n  cove inspect [--json] [--sections stats,dictionary,execution,indexes,optional] <file...>\n  cove optimize <file> [--out-dir dir] [--full] [--json]\n  cove query [--format table|json|jsonl|csv] [--take n] [--max-cell-width n] [--explain [public|developer|proof|coded|forensic]] [--engine auto|materialized|physical|compare|kernel] [--no-auto-sidecars] [--strict-performance] [--perf-report] [--batch-size n] [--external-table name=path.csv|json|jsonl] [--enable-graph-traversal] [--max-graph-depth n] [--max-graph-paths n] [--max-graph-fanout n] [--mapping file.covemap] [--member id=path] [--dataset dir] [--covi file] [--covx file] [--cove-e file] [file] '<coveql>'\n  cove query [options] --query-file <path|-> [file]\n  cove convert <parquet|arrow|orc|csv|report> ...\n  cove validate ...\n  cove dump ...\n  cove map <validate|preview|plan-keys|convert|explain|diff|project|test> ...\n  cove export arrow ...\n  cove perf <explain-pruning|plan-cost> ...\n  cove sidecar inspect <index|coverage|layout|cache|runtime> <file>\n  cove sidecar build <covi|covx|covm> ...\n  cove digest verify <file.cove> [--require]\n  cove profile <inspect|generate|validate-section> ...\n  cove canonicalise <validate-payload|encode-json|check-domain|check-trust> ...\n\nExamples:\n  cove examples\n  cove doctor people.cove\n  cove inspect --queries --performance people.cove\n  cove convert parquet source.parquet output.cove\n  cove validate --semantic output.cove\n  cove optimize output.cove\n  cove query output.cove 'table(source).take(10)'\n  cove query --format jsonl people.cove 'table(people).where(active == true)'\n  cove map preview mapping.covemap\n  cove sidecar build covi output.cove output.covi --all-columns\n  cove query --query-file query.coveql people.cove".into()
 }

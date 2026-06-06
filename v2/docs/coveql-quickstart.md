@@ -13,6 +13,22 @@ cargo run -p cove-cli -- --help
 
 The binary name is `cove`; with Cargo, pass commands after `--`.
 
+## Find A Starting Point
+
+Ask the CLI for copy-paste examples:
+
+```bash
+cargo run -p cove-cli -- examples
+```
+
+For one specific file, use `doctor`. It combines queryability, performance
+sidecar status, suggested queries, and next-step commands:
+
+```bash
+cargo run -p cove-cli -- doctor examples/coveql/people.cove
+cargo run -p cove-cli -- doctor --json examples/coveql/events.cove
+```
+
 ## Inspect A File
 
 Start with the checked-in samples:

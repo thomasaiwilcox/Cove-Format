@@ -182,7 +182,7 @@ fn rows() -> Vec<Row> {
             parsed: "yes",
             validated: "yes",
             written: "yes",
-            notes: "domain.rs; accept/reject corpus plus cove-validate negative integration; `ColumnDomain::serialize` round-trips with parser",
+            notes: "domain.rs; accept/reject corpus plus `cove validate` negative integration; `ColumnDomain::serialize` round-trips with parser",
         },
         Row {
             section: "§24",
@@ -317,7 +317,7 @@ fn rows() -> Vec<Row> {
             parsed: "yes",
             validated: "yes",
             written: "yes",
-            notes: "cove-index validates `.covi` framing, CIK2 key-data checksums, referenced-file digest freshness, snapshot/schema/map/visibility validity, root-to-block identity, sorted keys, duplicate chains, all fixed posting payload layouts, row-ordinal bitsets, and byte-range bounds; cove-build-covi emits SHA-256-bound row-range roots for selected columns",
+            notes: "cove-index validates `.covi` framing, CIK2 key-data checksums, referenced-file digest freshness, snapshot/schema/map/visibility validity, root-to-block identity, sorted keys, duplicate chains, all fixed posting payload layouts, row-ordinal bitsets, and byte-range bounds; `cove sidecar build covi` emits SHA-256-bound row-range roots for selected columns",
         },
         Row {
             section: "§33.2",
@@ -794,7 +794,7 @@ fn rows() -> Vec<Row> {
             parsed: "n/a",
             validated: "yes",
             written: "n/a",
-            notes: "reader stages + cove-validate; required/optional profile corpus; shared, COVE-T, and COVE-O semantic invariants exercised end to end",
+            notes: "reader stages + `cove validate`; required/optional profile corpus; shared, COVE-T, and COVE-O semantic invariants exercised end to end",
         },
         Row {
             section: "§74",
@@ -821,7 +821,7 @@ fn rows() -> Vec<Row> {
             parsed: "n/a",
             validated: "yes",
             written: "n/a",
-            notes: "error.rs spec_code()/ALL_SPEC_CODES, cove-validate JSON output, and generated reject fixtures including error_surface_case coverage",
+            notes: "error.rs spec_code()/ALL_SPEC_CODES, `cove validate` JSON output, and generated reject fixtures including error_surface_case coverage",
         },
         Row {
             section: "§77",
@@ -866,7 +866,7 @@ fn rows() -> Vec<Row> {
             parsed: "n/a",
             validated: "yes",
             written: "yes",
-            notes: "cove-plan-cost reports range plan, coverage metrics, fallbacks, and optional observed DecodeStats; cove-explain-pruning exposes kept/pruned decisions and residual status through JSON",
+            notes: "`cove perf plan-cost` reports range plan, coverage metrics, fallbacks, and optional observed DecodeStats; `cove perf explain-pruning` exposes kept/pruned decisions and residual status through JSON",
         },
     ]
 }

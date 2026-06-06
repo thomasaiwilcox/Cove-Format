@@ -14,13 +14,13 @@ use serde_json::{json, Value};
 use crate::format::{comp_name, feature_names, profile_name, section_kind_name};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum InspectSections {
+pub enum InspectSections {
     All,
     Only(BTreeSet<String>),
 }
 
 impl InspectSections {
-    pub(crate) fn parse(raw: &str) -> Result<Self, String> {
+    pub fn parse(raw: &str) -> Result<Self, String> {
         let mut groups = BTreeSet::new();
         for group in raw
             .split(',')

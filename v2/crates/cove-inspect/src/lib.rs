@@ -1,26 +1,16 @@
+//! Library entrypoint for detailed COVE inspection command behavior.
+
 mod format;
 mod inspect;
 
-use std::{path::Path, process};
+use std::path::Path;
 
-fn main() {
-    let raw_args = std::env::args().skip(1).collect::<Vec<_>>();
-    let args = match parse_args(&raw_args) {
-        Ok(args) => args,
-        Err(error) => {
-            eprintln!("{error}");
-            eprintln!(
-                "Usage: cove-inspect [--json] [--sections <stats,dictionary,execution,indexes,optional>] <file.cove> [<file2.cove> ...]"
-            );
-            process::exit(2);
-        }
-    };
+pub use inspect::InspectSections;
 
+pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<bool, String> {
+    let args = parse_args(args.into_iter().collect::<Vec<_>>())?;
     if args.file_paths.is_empty() {
-        eprintln!(
-            "Usage: cove-inspect [--json] [--sections <stats,dictionary,execution,indexes,optional>] <file.cove> [<file2.cove> ...]"
-        );
-        process::exit(2);
+        return Err(usage().into());
     }
 
     if args.json {
@@ -42,7 +32,7 @@ fn main() {
                 println!("{}", serde_json::to_string_pretty(&values).unwrap());
             }
         }
-        process::exit(if all_ok { 0 } else { 1 });
+        return Ok(all_ok);
     }
 
     let mut all_ok = true;
@@ -52,8 +42,11 @@ fn main() {
             eprintln!("ERROR: {error}");
         }
     }
+    Ok(all_ok)
+}
 
-    process::exit(if all_ok { 0 } else { 1 });
+pub fn usage() -> &'static str {
+    "Usage: cove inspect [--json] [--sections <stats,dictionary,execution,indexes,optional>] <file.cove> [<file2.cove> ...]"
 }
 
 struct Args {
@@ -62,7 +55,7 @@ struct Args {
     file_paths: Vec<String>,
 }
 
-fn parse_args(raw_args: &[String]) -> Result<Args, String> {
+fn parse_args(raw_args: Vec<String>) -> Result<Args, String> {
     let mut json = false;
     let mut sections = inspect::InspectSections::All;
     let mut file_paths = Vec::new();

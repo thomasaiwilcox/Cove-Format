@@ -7903,14 +7903,14 @@ A COVE-MAP converter that targets object-and-association-based COVE SHOULD imple
 14. Validate the produced COVE outputs independently of the mapping artifact.
 
 **Recommended tools:**
-- `cove-map validate`,
-- `cove-map preview`,
-- `cove-map plan-keys`,
-- `cove-map convert`,
-- `cove-map explain`,
-- `cove-map diff`,
-- `cove-map project`,
-- `cove-map test`.
+- `cove map validate`,
+- `cove map preview`,
+- `cove map plan-keys`,
+- `cove map convert`,
+- `cove map explain`,
+- `cove map diff`,
+- `cove map project`,
+- `cove map test`.
 
 ### 70.16 Non-Goals
 
@@ -8568,9 +8568,9 @@ A public interoperability release of COVE SHOULD NOT claim broad v2 readiness wi
 **An open COVE release SHOULD include:**
 1. Reference reader.
 2. Reference writer.
-3. cove-validate CLI.
-4. cove-inspect CLI.
-5. cove-convert-parquet CLI.
+3. Unified `cove validate` CLI.
+4. Unified `cove inspect` and `cove dump` CLI.
+5. Unified `cove convert parquet` CLI.
 6. Binary conformance vectors.
 7. Property-based fuzz tests.
 8. Corruption/negative test corpus.
@@ -8611,7 +8611,7 @@ A public interoperability release of COVE SHOULD NOT claim broad v2 readiness wi
 **Each public conformance vector SHOULD include:**
 - one or more binary .cove/.covx/.covm files,
 - a machine-readable expected logical result set or expected validation error,
-- expected cove-inspect/cove-dump metadata summaries,
+- expected `cove inspect`/`cove dump` metadata summaries,
 - declared conformance level and required feature bits,
 - producer version and vector version,
 - checksum and digest expectations where applicable.
@@ -8700,39 +8700,25 @@ The public COVE project SHOULD ship the following utilities and artifacts.
 
 ### 80.2 CLI Tools
 
-- **cove-validate:** Validate structure, CRCs, digests, schema, dictionaries, sections, indexes, profiles, extensions, and conformance.
-- **cove-inspect:** Print human-readable file layout, sections, catalog, stats, dictionary summaries, execution profiles, and index summaries.
-- **cove-dump:** Dump selected rows, columns, pages, morsels, dictionary values, or encoded array structures.
-- **cove-convert-parquet:** Convert Parquet files to COVE-T.
-- **cove-convert-arrow:** Convert Arrow IPC/Feather/RecordBatch streams to COVE-T.
-- **cove-convert-orc:** Convert ORC files to COVE-T.
-- **cove-bench:** Run standard benchmarks against COVE, Parquet, ORC, and optionally other formats.
-- **cove-build-covm:** Build or refresh COVM dataset manifest.
-- **cove-build-covx:** Build optional COVX accelerator sidecar.
-- **cove-verify-digest:** Verify cryptographic digests and Merkle roots.
-- **cove-fuzz:** Run corpus and property-based fuzz tests.
-- **cove-canonicalise:** Verify canonical value encodings, collation ordering, domain-rank construction, and trust input canonicalisation.
-- **cove-profile:** Inspect or generate COVE-E engine profile metadata.
-- **cove-arrow-export:** Export COVE-T tables to Arrow-compatible batches.
-- **cove-conversion-report:** Emit machine-readable conversion fidelity reports for source-to-COVE and COVE-to-source conversions.
-- **cove-map-validate:** Validate COVE-MAP artifacts, source declarations, deterministic function registries, identity rules, row semantics, and output profiles.
-- **cove-map-preview:** Show source-row to semantic-assertion output before materialisation.
-- **cove-map-convert:** Convert multiple declared sources into object-and-association-based COVE-O output and optional COVE-T projections.
-- **cove-map-explain:** Explain how source rows, join keys, rules, conflicts, and evidence produced an object/property/association output or projected table row.
-- **cove-map-diff:** Compare outputs from two mapping versions or two source snapshots.
-- **cove-map-test:** Run mapping fixtures with known input rows, expected join-key values, expected GOIDs, expected conflicts, and expected COVE-O output.
-- **cove-map-plan-keys:** Inspect multi-column join keys, component null rates, duplicate rates, candidate conflicts, and do-not-merge collisions before conversion.
-- **cove-map-project:** Expose COVE-O object/association data as deterministic projected tables, Arrow record batches, or materialised COVE-T outputs using declared projection rules.
+The public user-facing CLI is a single `cove` command with grouped subcommands:
 
-- **cove-explain-pruning:** Explain file, segment, morsel, and page pruning decisions, including which statistic, domain, exact set, bloom, lookup index, synopsis, COVM entry, or COVX artifact produced DefinitelyNo, DefinitelyYes, or Unknown.
-- **cove-plan-cost:** Estimate projected I/O, morsel pruning, index utility, and expected scan work for representative predicates.
-- **cove-codec-validate:** Validate registered codec descriptors, codec envelopes, fallback payloads, and codec conformance vectors.
-- **cove-layout-inspect:** Inspect COVE-L layout plans, scan splits, page clusters, zero-copy maps, and fast metadata indexes.
-- **cove-runtime-inspect:** Inspect runtime compatibility hints and registry bindings without treating them as logical file authority.
-- **cove-coverage-inspect:** Inspect coverage providers, coverage sets, predicate forms, proof strength, coverage degree, tightness degree, and fallback policy.
-- **cove-build-covi:** Build or refresh COVE-I secondary index artifacts for selected columns, object paths, semantic dimensions, or projection fragments.
-- **cove-index-inspect:** Inspect `.covi` index roots, capabilities, validity, index-only answers, and coverage mappings.
-- **cove-cache-inspect:** Inspect local COVE-CACHE entries, invalidation state, predicate containment, and observed coverage costs.
+- **cove validate:** Validate structure, CRCs, digests, schema, dictionaries, sections, indexes, profiles, extensions, and conformance.
+- **cove inspect:** Print beginner-friendly artifact summaries by default, with detailed section inspection via `--sections`.
+- **cove dump:** Dump selected rows, columns, pages, morsels, dictionary values, or encoded array structures.
+- **cove query:** Execute CoveQL against queryable COVE artifacts and mappings.
+- **cove optimize:** Build safe acceleration sidecars and a performance discovery manifest.
+- **cove convert parquet|arrow|orc|csv:** Convert source files to COVE-T.
+- **cove convert report:** Emit machine-readable conversion fidelity reports for source-to-COVE and COVE-to-source conversions.
+- **cove map validate|preview|plan-keys|convert|explain|diff|project|test:** Validate, preview, convert, explain, compare, project, and test COVE-MAP artifacts.
+- **cove export arrow:** Export COVE-T tables to Arrow-compatible batches.
+- **cove perf explain-pruning|plan-cost:** Explain pruning decisions and estimate projected scan work.
+- **cove sidecar inspect index|coverage|layout|cache|runtime:** Inspect COVE-I, COVE-COVERAGE, COVE-L, COVE-CACHE, and COVE-R artifacts.
+- **cove sidecar build covi|covx|covm:** Build or refresh COVE-I, COVX, and COVM sidecars.
+- **cove digest verify:** Verify cryptographic digests and Merkle roots.
+- **cove canonicalise:** Verify canonical value encodings, collation ordering, domain-rank construction, and trust input canonicalisation.
+- **cove profile:** Inspect or generate COVE-E engine profile metadata.
+
+Developer-only tools such as **cove-bench**, **cove-fuzz**, **cove-conformance**, and **cove-codec-validate** may remain separate because they are not end-user data utilities.
 
 ### 80.3 Engine Integrations
 

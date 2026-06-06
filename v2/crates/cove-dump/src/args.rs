@@ -1,4 +1,4 @@
-pub(crate) const USAGE: &str = "Usage: cove-dump <file.cove> [--metadata | --section <id> | --rows | --columns <a,b> | --morsels | --encoded-array <section[:column[:morsel]]> | --pages | --stats | --indexes | --nested | --dictionary | --dictionary-entry <code>] [--max-bytes <n>]";
+pub(crate) const USAGE: &str = "Usage: cove dump <file.cove> [--metadata | --section <id> | --rows | --columns <a,b> | --morsels | --encoded-array <section[:column[:morsel]]> | --pages | --stats | --indexes | --nested | --dictionary | --dictionary-entry <code>] [--max-bytes <n>]";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DumpMode {

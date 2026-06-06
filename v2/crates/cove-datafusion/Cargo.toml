@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "DataFusion integration for the Cove Format (COVE)"
 license = "MIT"
+autobins = false
 
 [features]
 default = ["native", "compat"]
@@ -50,15 +51,3 @@ harness = false
 [[bench]]
 name = "m7_sql_mix"
 harness = false
-
-[[bin]]
-name = "cove-explain-pruning"
-path = "src/bin/cove-explain-pruning.rs"
-
-[[bin]]
-name = "cove-plan-cost"
-path = "src/bin/cove-plan-cost.rs"
-
-[[bin]]
-name = "cove-arrow-export"
-path = "src/bin/cove-arrow-export.rs"

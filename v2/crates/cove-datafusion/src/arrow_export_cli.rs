@@ -1,11 +1,11 @@
-use std::{env, path::PathBuf, process::ExitCode};
+use std::path::PathBuf;
 
+use crate::explain::{
+    execute_planned_scan, parse_filter_dsl, parse_projection_dsl, plan_local_file, ExplainOptions,
+};
 use arrow_ipc::writer::FileWriter;
 use arrow_json::writer::{LineDelimited, WriterBuilder};
 use cove_core::durable;
-use cove_datafusion::explain::{
-    execute_planned_scan, parse_filter_dsl, parse_projection_dsl, plan_local_file, ExplainOptions,
-};
 use serde_json::json;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,17 +20,7 @@ enum ReportTarget {
     Path(PathBuf),
 }
 
-fn main() -> ExitCode {
-    match run(env::args().skip(1).collect()) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(message) => {
-            eprintln!("cove-arrow-export: {message}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-fn run(args: Vec<String>) -> Result<(), String> {
+pub fn run(args: Vec<String>) -> Result<(), String> {
     let Some((input, output, options, format, report)) = parse_args(args)? else {
         print_usage();
         return Ok(());
@@ -181,6 +171,6 @@ fn next_value(iter: &mut impl Iterator<Item = String>, option: &str) -> Result<S
 
 fn print_usage() {
     eprintln!(
-        "usage: cove-arrow-export [--columns a,b] [--filter column=<name|index>,op=<eq|lt|lte|gt|gte|is-null|is-not-null>,value=<literal>] [--format ipc|json] [--report -|path] <input.cove> <output.arrow|output.json>"
+        "usage: cove export arrow [--columns a,b] [--filter column=<name|index>,op=<eq|lt|lte|gt|gte|is-null|is-not-null>,value=<literal>] [--format ipc|json] [--report -|path] <input.cove> <output.arrow|output.json>"
     );
 }

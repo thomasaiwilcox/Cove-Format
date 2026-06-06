@@ -92,7 +92,7 @@ pub(crate) fn write_or_print(output: Option<PathBuf>, value: &Value) -> Result<(
 
 pub(crate) fn print_usage() {
     println!(
-        "Usage: cove-map <subcommand> [options]\n\n\
+        "Usage: cove map <subcommand> [options]\n\n\
 Subcommands:\n  \
 validate <mapping.covemap>\n  \
 preview <mapping.covemap>\n  \

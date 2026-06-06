@@ -1,10 +1,18 @@
-use std::{fs, io::Cursor, process::Command, sync::Arc};
+use std::{fs, io::Cursor, path::PathBuf, process::Command, sync::Arc};
 
 use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
 use cove_core::reader::{validate_bytes_with_options, ValidationOptions};
 use orc_rust::ArrowReaderBuilder;
 use parquet::arrow::ArrowWriter;
 use serde_json::Value;
+
+fn cove_command() -> Command {
+    let mut command = Command::new(env!("CARGO"));
+    command
+        .current_dir(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.."))
+        .args(["run", "-p", "cove-cli", "--quiet", "--"]);
+    command
+}
 
 #[test]
 fn cli_converts_parquet_to_valid_cove_and_prints_report() {
@@ -15,7 +23,8 @@ fn cli_converts_parquet_to_valid_cove_and_prints_report() {
     let output = dir.join("output.cove");
     fs::write(&input, parquet_bytes()).unwrap();
 
-    let result = Command::new(env!("CARGO_BIN_EXE_cove-convert-parquet"))
+    let result = cove_command()
+        .args(["convert", "parquet"])
         .args([
             "--table-name",
             "cli_demo",
@@ -64,7 +73,8 @@ fn cli_converts_csv_with_explicit_delimiter_and_header_policy() {
     let output = dir.join("output.cove");
     fs::write(&input, "10|Ada\n20|Linus\n").unwrap();
 
-    let result = Command::new(env!("CARGO_BIN_EXE_cove-convert-csv"))
+    let result = cove_command()
+        .args(["convert", "csv"])
         .args([
             "--no-csv-header",
             "--csv-delimiter",
@@ -103,7 +113,8 @@ fn conversion_report_source_to_cove_uses_file_identifier_and_digest_for_csv() {
     let input = dir.join("input.csv");
     fs::write(&input, "id,name\n10,Ada\n20,Linus\n").unwrap();
 
-    let result = Command::new(env!("CARGO_BIN_EXE_cove-conversion-report"))
+    let result = cove_command()
+        .args(["convert", "report"])
         .args(["--source-format", "csv", input.to_str().unwrap()])
         .output()
         .unwrap();
@@ -130,7 +141,8 @@ fn conversion_report_exports_cove_t_to_arrow_csv_parquet_and_orc() {
     let cove = dir.join("output.cove");
     fs::write(&input, parquet_bytes()).unwrap();
 
-    let convert = Command::new(env!("CARGO_BIN_EXE_cove-convert-parquet"))
+    let convert = cove_command()
+        .args(["convert", "parquet"])
         .args([input.to_str().unwrap(), cove.to_str().unwrap()])
         .output()
         .unwrap();
@@ -148,7 +160,8 @@ fn conversion_report_exports_cove_t_to_arrow_csv_parquet_and_orc() {
         ("orc", "reverse.orc"),
     ] {
         let output = dir.join(file_name);
-        let result = Command::new(env!("CARGO_BIN_EXE_cove-conversion-report"))
+        let result = cove_command()
+            .args(["convert", "report"])
             .args([
                 "--direction",
                 "cove-to-source",

@@ -16,6 +16,14 @@ use cove_layout::{LayoutPlanHeaderV2, LayoutPlanNodeV2, LayoutPlanV2};
 use cove_runtime::{RuntimeCompatibilityHintV2, RuntimeHintKindV2};
 use std::io::Write;
 
+fn cove_command() -> std::process::Command {
+    let mut command = std::process::Command::new(env!("CARGO"));
+    command
+        .current_dir(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.."))
+        .args(["run", "-p", "cove-cli", "--quiet", "--"]);
+    command
+}
+
 fn write_temp_file(name: &str, bytes: &[u8]) -> std::path::PathBuf {
     let path = std::env::temp_dir().join(format!(
         "cove_validate_{name}_{}_{}.cove",
@@ -46,7 +54,8 @@ fn runtime_fixture(name: &str) -> std::path::PathBuf {
 }
 
 fn run_validate(path: &std::path::Path, semantic: bool) -> std::process::Output {
-    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_cove-validate"));
+    let mut cmd = cove_command();
+    cmd.arg("validate");
     if semantic {
         cmd.arg("--semantic");
     }
@@ -54,7 +63,8 @@ fn run_validate(path: &std::path::Path, semantic: bool) -> std::process::Output 
 }
 
 fn run_validate_json_explain(path: &std::path::Path, semantic: bool) -> std::process::Output {
-    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_cove-validate"));
+    let mut cmd = cove_command();
+    cmd.arg("validate");
     if semantic {
         cmd.arg("--semantic");
     }
@@ -66,7 +76,8 @@ fn run_validate_json_explain(path: &std::path::Path, semantic: bool) -> std::pro
 }
 
 fn run_validate_with_args(path: &std::path::Path, args: &[&str]) -> std::process::Output {
-    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_cove-validate"));
+    let mut cmd = cove_command();
+    cmd.arg("validate");
     for arg in args {
         cmd.arg(arg);
     }
@@ -440,15 +451,16 @@ fn validate_empty_file() {
     let bytes = MinimalCoveWriter::write_empty_file().unwrap();
     let path = write_temp_file("empty", &bytes);
 
-    // Run cove-validate on the file.
-    let status = std::process::Command::new(env!("CARGO_BIN_EXE_cove-validate"))
+    // Run cove validate on the file.
+    let status = cove_command()
+        .arg("validate")
         .arg(&path)
         .status()
-        .expect("cove-validate binary should be runnable");
+        .expect("cove validate should be runnable");
 
     assert!(
         status.success(),
-        "cove-validate should return exit code 0 for a valid file"
+        "cove validate should return exit code 0 for a valid file"
     );
     // Cleanup is best-effort; if removal fails the test OS will clean up temp files.
     let _ = std::fs::remove_file(&path);
@@ -463,14 +475,15 @@ fn validate_corrupted_file() {
 
     let path = write_temp_file("corrupt", &bytes);
 
-    let status = std::process::Command::new(env!("CARGO_BIN_EXE_cove-validate"))
+    let status = cove_command()
+        .arg("validate")
         .arg(&path)
         .status()
-        .expect("cove-validate binary should be runnable");
+        .expect("cove validate should be runnable");
 
     assert!(
         !status.success(),
-        "cove-validate should return non-zero for a corrupt file"
+        "cove validate should return non-zero for a corrupt file"
     );
     // Cleanup is best-effort; if removal fails the test OS will clean up temp files.
     let _ = std::fs::remove_file(&path);

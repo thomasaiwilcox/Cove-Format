@@ -100,7 +100,7 @@ pub fn build_covm_artifact(
     let validation_result = CovmFile::parse(&bytes).is_ok();
     let digest = compute_digest(DigestAlgorithm::Sha256, &bytes)?;
     let report = UtilityArtifactReport {
-        tool: "cove-build-covm".into(),
+        tool: "cove sidecar build covm".into(),
         inputs: input_json(&identities),
         output: output.as_ref().display().to_string(),
         file_id: dataset_id,
@@ -142,7 +142,7 @@ pub fn build_covx_artifact(
     let validation_result = CovxFile::parse(&bytes).is_ok();
     let digest = compute_digest(DigestAlgorithm::Sha256, &bytes)?;
     let report = UtilityArtifactReport {
-        tool: "cove-build-covx".into(),
+        tool: "cove sidecar build covx".into(),
         inputs: input_json(&identities),
         output: output.as_ref().display().to_string(),
         file_id: accelerator_id,

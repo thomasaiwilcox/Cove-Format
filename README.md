@@ -113,6 +113,8 @@ Key paths:
 Try the beginner CLI from `v2/`:
 
 ```bash
+cargo run -p cove-cli -- examples
+cargo run -p cove-cli -- doctor examples/coveql/people.cove
 cargo run -p cove-cli -- inspect examples/coveql/people.cove --queries
 cargo run -p cove-cli -- optimize examples/coveql/events.cove
 cargo run -p cove-cli -- inspect examples/coveql/events.cove --performance
@@ -132,6 +134,9 @@ cargo run -p cove-cli -- query examples/coveql/people.cove \
 
 Longer CoveQL snippets can be supplied with `--query-file <path>` or
 `--query-file -` for stdin, and terminal tables support `--max-cell-width`.
+Use `cove examples` when you want copy-paste starting points, and `cove doctor
+<file>` when you want queryability, performance, and next-step guidance in one
+place.
 `cove query` uses safe-auto execution by default: validated acceleration
 sidecars are used when available, and materialized CoveQL remains the semantic
 authority. Use `cove optimize` to create sibling `.covperf.json`, COVE-I/COVX,
@@ -141,6 +146,20 @@ COVE-E, and COVE-L sidecars without rewriting the source file. Use
 execution; use `--enable-graph-traversal` with bounded graph budgets for
 variable-length traversals. Use `--external-table name=path` to mount CSV, JSON
 array, or JSONL rows as file-backed `ExternalRegisteredTable` providers.
+
+The public utility surface is grouped under the single `cove` binary:
+
+- `cove convert parquet|arrow|orc|csv|report ...` converts between COVE and
+  common columnar or row-oriented source formats.
+- `cove validate`, `cove inspect`, and `cove dump` cover structural
+  validation, readable summaries, and lower-level metadata inspection.
+- `cove map validate|preview|plan-keys|convert|explain|diff|project|test ...`
+  works with COVE-MAP mapping definitions and projection workflows.
+- `cove sidecar inspect ...` and `cove sidecar build ...` expose expert COVE-I,
+  COVX, COVM, COVE-COVERAGE, COVE-L, COVE-CACHE, and COVE-R sidecar tooling.
+- `cove export arrow`, `cove perf explain-pruning`, `cove perf plan-cost`,
+  `cove digest verify`, `cove profile`, and `cove canonicalise` provide
+  integration, planning, integrity, profile, and canonical-value utilities.
 
 ## Repository Status
 
@@ -330,13 +349,14 @@ Important v2 paths:
   compatibility hints.
 - [`v2/crates/cove-cache`](./v2/crates/cove-cache): runtime/local coverage-cache
   artifact helpers.
-- [`v2/crates/cove-validate`](./v2/crates/cove-validate): validation CLI.
+- [`v2/crates/cove-validate`](./v2/crates/cove-validate): validation logic used
+  by `cove validate`.
 - [`v2/crates/cove-inspect`](./v2/crates/cove-inspect): readable file layout
-  inspection.
+  inspection used by `cove inspect --sections`.
 - [`v2/crates/cove-dump`](./v2/crates/cove-dump): metadata and section byte
-  dumping for debugging.
+  dumping used by `cove dump`.
 - [`v2/crates/cove-convert-parquet`](./v2/crates/cove-convert-parquet):
-  reference Parquet-to-COVE conversion CLI.
+  Parquet, Arrow IPC, ORC, and CSV conversion logic used by `cove convert`.
 - [`v2/crates/cove-conformance`](./v2/crates/cove-conformance): conformance
   runner and generated capability matrix support.
 - [`v2/conformance`](./v2/conformance): generated accept/reject corpus,

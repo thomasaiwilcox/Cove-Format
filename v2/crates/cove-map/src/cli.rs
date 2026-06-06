@@ -240,7 +240,7 @@ pub(crate) fn parse_args(
 fn one_path(args: &mut impl Iterator<Item = String>, usage: &str) -> Result<PathBuf, String> {
     args.next()
         .map(PathBuf::from)
-        .ok_or_else(|| format!("usage: cove-map {usage}"))
+        .ok_or_else(|| format!("usage: cove map {usage}"))
 }
 
 fn parse_output_format_and_positionals(
