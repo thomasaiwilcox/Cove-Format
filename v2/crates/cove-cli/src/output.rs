@@ -107,10 +107,10 @@ fn write_table(value: &Value, max_cell_width: usize) -> Result<(), String> {
         .map(|(index, column)| {
             let value_width = rendered
                 .iter()
-                .map(|row| display_cell(&row[index], max_cell_width).len())
+                .map(|row| character_count(&display_cell(&row[index], max_cell_width)))
                 .max()
                 .unwrap_or_default();
-            column.len().max(value_width).min(max_cell_width)
+            character_count(column).max(value_width).min(max_cell_width)
         })
         .collect::<Vec<_>>();
     print_table_separator(&widths);
@@ -123,7 +123,7 @@ fn write_table(value: &Value, max_cell_width: usize) -> Result<(), String> {
     let truncated = rendered
         .iter()
         .flatten()
-        .any(|cell| display_cell(cell, max_cell_width).len() < cell.len());
+        .any(|cell| character_count(&display_cell(cell, max_cell_width)) < character_count(cell));
     println!(
         "{} row{}{}",
         rows.len(),
@@ -181,7 +181,7 @@ fn cell_text(value: &Value) -> String {
 
 fn display_cell(value: &str, max_cell_width: usize) -> String {
     let clean = value.replace(['\n', '\r', '\t'], " ");
-    if clean.chars().count() <= max_cell_width {
+    if character_count(&clean) <= max_cell_width {
         return clean;
     }
     let mut out = clean
@@ -190,4 +190,8 @@ fn display_cell(value: &str, max_cell_width: usize) -> String {
         .collect::<String>();
     out.push_str("...");
     out
+}
+
+fn character_count(value: &str) -> usize {
+    value.chars().count()
 }

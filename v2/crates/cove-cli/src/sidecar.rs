@@ -1,7 +1,6 @@
 use std::{fs, path::PathBuf};
 
 use cove_core::{
-    artifact::covm::CovmFile,
     durable,
     utility::{build_covm_artifact, build_covx_artifact},
 };
@@ -317,6 +316,3 @@ fn build_covi_sidecar(args: Vec<String>) -> Result<(), String> {
     println!("wrote COVE-I artifact to {}", output_path.display());
     Ok(())
 }
-
-#[allow(dead_code)]
-fn _assert_covm_link(_: &CovmFile) {}
