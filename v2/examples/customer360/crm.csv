@@ -1,0 +1,13 @@
+id,full_name,region,tier
+c000000,,north,bronze
+c000001,Customer 000001,south,silver
+c000002,Customer 000002,east,gold
+c000003,Customer 000003,west,platinum
+c000004,Customer 000004,emea,bronze
+c000005,Customer 000005,apac,silver
+c000006,Customer 000006,north,gold
+c000007,Customer 000007,south,platinum
+c000008,Customer 000008,east,bronze
+c000009,Customer 000009,west,silver
+c000010,Customer 000010,emea,gold
+c000011,Customer 000011,apac,platinum

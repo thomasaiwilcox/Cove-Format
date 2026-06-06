@@ -14,6 +14,8 @@ name = "cli_regression"
 harness = false
 
 [dependencies]
+arrow-array = "58"
+arrow-schema = "58"
 cove-cache = { path = "../cove-cache" }
 cove-convert-parquet = { path = "../cove-convert-parquet" }
 cove-core = { path = "../cove-core" }
@@ -28,4 +30,5 @@ cove-runtime = { path = "../cove-runtime" }
 cove-validate = { path = "../cove-validate" }
 coveql = { path = "../coveql" }
 csv = "1"
+parquet = { version = "58", default-features = false, features = ["arrow"] }
 serde_json = { version = "1", features = ["preserve_order"] }

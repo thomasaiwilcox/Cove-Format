@@ -2015,3 +2015,151 @@ fn showcase_generator_rebuilds_valid_artifacts() {
     );
     assert!(String::from_utf8_lossy(&query_events.stdout).contains("\"event_id\":1005"));
 }
+
+#[test]
+fn customer360_showcase_command_generates_queryable_artifacts() {
+    let out_dir = temp_file("customer360-generated");
+    let generated = run_cove(&[
+        "showcase",
+        "customer360",
+        "--profile",
+        "quick",
+        "--out",
+        out_dir.to_str().unwrap(),
+        "--force",
+    ]);
+    assert!(
+        generated.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&generated.stdout),
+        String::from_utf8_lossy(&generated.stderr)
+    );
+
+    for name in [
+        "crm.csv",
+        "support.jsonl",
+        "billing.parquet",
+        "events.jsonl",
+        "events.cove",
+        "customer360.covemap",
+        "customers.cove",
+        "customers_projection.cove",
+        "evidence_projection.cove",
+        "customers_projection.parquet",
+        "evidence_projection.parquet",
+        "customer360-manifest.json",
+        "notebooks/customer360_analysis.py",
+    ] {
+        assert!(out_dir.join(name).exists(), "missing generated {name}");
+    }
+
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(out_dir.join("customer360-manifest.json")).unwrap())
+            .unwrap();
+    assert_eq!(manifest["profile"], "quick");
+    assert_eq!(manifest["row_counts"]["canonical_customers"], 12);
+    assert_eq!(
+        manifest["pipeline"]["canonical_readback_source"],
+        "customers_360.jsonl"
+    );
+    assert!(manifest["recommended_queries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|query| query["title"] == "Customer events through an external JSONL table"));
+    assert!(manifest["recommended_queries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|query| query["command"]
+            .as_str()
+            .unwrap()
+            .contains("groupBy(source_id)")));
+    let benchmark_cases = manifest["benchmark_cases"].as_array().unwrap();
+    assert!(benchmark_cases.contains(&serde_json::json!("customer360_event_filter")));
+    assert!(!benchmark_cases.contains(&serde_json::json!("customer360_evidence_aggregate")));
+    assert!(!benchmark_cases.contains(&serde_json::json!("customer360_customer_event_join")));
+
+    let inspect = run_cove(&[
+        "inspect",
+        "--queries",
+        out_dir.join("customers.cove").to_str().unwrap(),
+    ]);
+    assert!(
+        inspect.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&inspect.stderr)
+    );
+    let inspect_stdout = String::from_utf8_lossy(&inspect.stdout);
+    assert!(inspect_stdout.contains("table=customers"));
+    assert!(inspect_stdout.contains("table=customer_evidence"));
+
+    let customers = run_cove(&[
+        "query",
+        out_dir.join("customers.cove").to_str().unwrap(),
+        "--format",
+        "jsonl",
+        "table(customers).where(score >= 80).select(customer_id, tier, score, status).take(5)",
+    ]);
+    assert!(
+        customers.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&customers.stderr)
+    );
+    assert!(String::from_utf8_lossy(&customers.stdout).contains("\"customer_id\""));
+
+    let joined = run_cove(&[
+        "query",
+        out_dir.join("customers.cove").to_str().unwrap(),
+        "--external-table",
+        &format!("events={}", out_dir.join("events.jsonl").display()),
+        "--format",
+        "jsonl",
+        "table(customers) as c.join(table(events) as e, on: c.customer_id == e.customer_id).select(customer_id: c.customer_id, event_kind: e.event_kind, event_score: e.score).take(5)",
+    ]);
+    assert!(
+        joined.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&joined.stderr)
+    );
+    assert!(String::from_utf8_lossy(&joined.stdout).contains("\"event_kind\""));
+}
+
+#[test]
+fn customer360_showcase_requires_force_for_non_empty_output() {
+    let missing_out = run_cove(&["showcase", "customer360", "--profile", "quick"]);
+    assert!(!missing_out.status.success());
+    assert!(String::from_utf8_lossy(&missing_out.stderr).contains("--out is required"));
+
+    let out_dir = temp_file("customer360-force");
+    fs::create_dir_all(&out_dir).unwrap();
+    fs::write(out_dir.join("keep.txt"), "existing").unwrap();
+    let rejected = run_cove(&[
+        "showcase",
+        "customer360",
+        "--out",
+        out_dir.to_str().unwrap(),
+    ]);
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("--force"));
+}
+
+#[test]
+fn examples_json_includes_customer360_showcase() {
+    let examples = run_cove(&["examples", "--json"]);
+    assert!(
+        examples.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&examples.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&examples.stdout).unwrap();
+    assert_eq!(value["showcases"][0]["name"], "customer360");
+    assert!(value["showcases"][0]["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|command| command["command"]
+            .as_str()
+            .unwrap()
+            .contains("cove showcase customer360")));
+}

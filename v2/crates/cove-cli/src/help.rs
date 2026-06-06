@@ -4,6 +4,7 @@ pub(crate) enum HelpTopic {
     Query,
     Inspect,
     Optimize,
+    Showcase,
     Sidecar,
     Convert,
     Map,
@@ -19,6 +20,7 @@ pub(crate) fn usage(topic: HelpTopic) -> String {
         HelpTopic::Query => query_usage(),
         HelpTopic::Inspect => inspect_usage(),
         HelpTopic::Optimize => optimize_usage(),
+        HelpTopic::Showcase => showcase_usage(),
         HelpTopic::Sidecar => sidecar_usage(),
         HelpTopic::Convert => convert_usage(),
         HelpTopic::Map => map_usage(),
@@ -27,7 +29,7 @@ pub(crate) fn usage(topic: HelpTopic) -> String {
 }
 
 fn global_usage() -> &'static str {
-    "Usage:\n  cove examples [--json]\n  cove doctor [--json] <file>\n  cove inspect [--queries] [--performance] [--json] <file>\n  cove inspect [--json] [--sections stats,dictionary,execution,indexes,optional] <file...>\n  cove optimize <file> [--out-dir dir] [--full] [--json]\n  cove query [--format table|json|jsonl|csv] [--take n] [--max-cell-width n] [--explain [public|developer|proof|coded|forensic]] [--engine auto|materialized|physical|compare|kernel] [--no-auto-sidecars] [--strict-performance] [--perf-report] [--batch-size n] [--external-table name=path.csv|json|jsonl] [--enable-graph-traversal] [--max-graph-depth n] [--max-graph-paths n] [--max-graph-fanout n] [--mapping file.covemap] [--member id=path] [--dataset dir] [--covi file] [--covx file] [--cove-e file] [file] '<coveql>'\n  cove query [options] --query-file <path|-> [file]\n  cove convert <parquet|arrow|orc|csv|report> ...\n  cove validate ...\n  cove dump ...\n  cove map <validate|preview|plan-keys|convert|explain|diff|project|test> ...\n  cove export arrow ...\n  cove perf <explain-pruning|plan-cost> ...\n  cove sidecar inspect <index|coverage|layout|cache|runtime> <file>\n  cove sidecar build <covi|covx|covm> ...\n  cove digest verify <file.cove> [--require]\n  cove profile <inspect|generate|validate-section> ...\n  cove canonicalise <validate-payload|encode-json|check-domain|check-trust> ...\n\nExamples:\n  cove examples\n  cove doctor people.cove\n  cove inspect --queries --performance people.cove\n  cove convert parquet source.parquet output.cove\n  cove validate --semantic output.cove\n  cove optimize output.cove\n  cove query output.cove 'table(source).take(10)'\n  cove query --format jsonl people.cove 'table(people).where(active == true)'\n  cove map preview mapping.covemap\n  cove sidecar build covi output.cove output.covi --all-columns\n  cove query --query-file query.coveql people.cove"
+    "Usage:\n  cove examples [--json]\n  cove showcase customer360 --out <dir> [--profile quick|standard|publication] [--force] [--json]\n  cove doctor [--json] <file>\n  cove inspect [--queries] [--performance] [--json] <file>\n  cove inspect [--json] [--sections stats,dictionary,execution,indexes,optional] <file...>\n  cove optimize <file> [--out-dir dir] [--full] [--json]\n  cove query [--format table|json|jsonl|csv] [--take n] [--max-cell-width n] [--explain [public|developer|proof|coded|forensic]] [--engine auto|materialized|physical|compare|kernel] [--no-auto-sidecars] [--strict-performance] [--perf-report] [--batch-size n] [--external-table name=path.csv|json|jsonl] [--enable-graph-traversal] [--max-graph-depth n] [--max-graph-paths n] [--max-graph-fanout n] [--mapping file.covemap] [--member id=path] [--dataset dir] [--covi file] [--covx file] [--cove-e file] [file] '<coveql>'\n  cove query [options] --query-file <path|-> [file]\n  cove convert <parquet|arrow|orc|csv|report> ...\n  cove validate ...\n  cove dump ...\n  cove map <validate|preview|plan-keys|convert|explain|diff|project|test> ...\n  cove export arrow ...\n  cove perf <explain-pruning|plan-cost> ...\n  cove sidecar inspect <index|coverage|layout|cache|runtime> <file>\n  cove sidecar build <covi|covx|covm> ...\n  cove digest verify <file.cove> [--require]\n  cove profile <inspect|generate|validate-section> ...\n  cove canonicalise <validate-payload|encode-json|check-domain|check-trust> ...\n\nExamples:\n  cove examples\n  cove showcase customer360 --profile quick --out examples/customer360 --force\n  cove doctor people.cove\n  cove inspect --queries --performance people.cove\n  cove convert parquet source.parquet output.cove\n  cove validate --semantic output.cove\n  cove optimize output.cove\n  cove query output.cove 'table(source).take(10)'\n  cove query --format jsonl people.cove 'table(people).where(active == true)'\n  cove map preview mapping.covemap\n  cove sidecar build covi output.cove output.covi --all-columns\n  cove query --query-file query.coveql people.cove"
 }
 
 fn query_usage() -> &'static str {
@@ -40,6 +42,10 @@ fn inspect_usage() -> &'static str {
 
 fn optimize_usage() -> &'static str {
     "Usage:\n  cove optimize <file.cove> [--out-dir dir] [--full] [--json]\n\nBehavior:\n  Writes a sibling .covperf.json discovery manifest plus applicable acceleration\n  sidecars such as COVE-I, COVX, COVE-E, and COVE-L artifacts. Source files are\n  not rewritten. Generated sidecars are acceleration metadata, not portable\n  logical truth; query results remain governed by materialized readback unless\n  validated sidecars prove an optimized path equivalent.\n\nExamples:\n  cove optimize examples/coveql/events.cove\n  cove inspect --performance examples/coveql/events.cove\n  cove query --engine compare --perf-report examples/coveql/events.cove 'table(events).where(score >= 20).select(id, score)'"
+}
+
+fn showcase_usage() -> &'static str {
+    "Usage:\n  cove showcase customer360 --out <dir> [--profile quick|standard|publication] [--force] [--json]\n\nBehavior:\n  Generates a deterministic Customer 360 data-science showcase. The output\n  includes CRM CSV, support JSONL, billing Parquet, event JSONL/COVE-T facts,\n  COVE-MAP metadata, reconciled canonical JSONL, a queryable COVE-O customer\n  archive, projected COVE-T and Parquet baselines, a stable manifest, and a\n  notebook-style Python script.\n\nProfiles:\n  quick        Tiny checked-in/demo-sized data.\n  standard     Larger local benchmark data written under target/.\n  publication  Largest deterministic public-report profile.\n\nExamples:\n  cove showcase customer360 --profile quick --out examples/customer360 --force\n  cove showcase customer360 --profile standard --out target/customer360-standard --force\n  cove inspect --queries --performance target/customer360-standard/customers.cove"
 }
 
 fn sidecar_usage() -> &'static str {

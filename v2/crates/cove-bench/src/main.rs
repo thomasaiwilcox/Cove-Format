@@ -18,6 +18,7 @@ use cove_arrow::convert::{
     ParquetConversionOptions, ParquetDictionaryPolicy, ParquetStatsPolicy,
 };
 use cove_cache::{CoveCoverageCacheHeaderV2, CoverageCacheEntryV2, CoverageCacheV2};
+use cove_cli::customer360::{generate_customer360, Customer360Options, Customer360Profile};
 use cove_core::{
     artifact::covemap::{
         CovemapFile, CovemapHeaderV1, CovemapPayloadEncodingV2, CovemapSection,
@@ -615,6 +616,67 @@ fn generate_publication_gap_datasets(
         )?);
     }
 
+    let customer360_dir = out.join("customer360");
+    let customer360_profile = match profile {
+        "ci" => Customer360Profile::Quick,
+        "standard" => Customer360Profile::Standard,
+        "publication" => Customer360Profile::Publication,
+        other => return Err(format!("unknown benchmark profile {other:?}")),
+    };
+    let customer360_manifest = generate_customer360(&Customer360Options {
+        out_dir: customer360_dir.clone(),
+        profile: customer360_profile,
+        force: true,
+    })
+    .map_err(|err| format!("cannot build Customer 360 benchmark corpus: {err}"))?;
+    let customer360_manifest_bytes =
+        serde_json::to_vec_pretty(&customer360_manifest).map_err(|err| err.to_string())?;
+    for (name, rel) in [
+        ("customer360-crm", "customer360/crm.csv"),
+        ("customer360-support", "customer360/support.jsonl"),
+        ("customer360-billing", "customer360/billing.parquet"),
+        ("customer360-reconciled", "customer360/customers_360.jsonl"),
+        ("customer360-events-jsonl", "customer360/events.jsonl"),
+        ("customer360-events-cove", "customer360/events.cove"),
+        ("customer360-covemap", "customer360/customer360.covemap"),
+        (
+            "customer360-readback-covemap",
+            "customer360/customer360_readback.covemap",
+        ),
+        ("customer360-mapped-cove-o", "customer360/customers.cove"),
+        (
+            "customer360-customers-cove-t",
+            "customer360/customers_projection.cove",
+        ),
+        (
+            "customer360-evidence-cove-t",
+            "customer360/evidence_projection.cove",
+        ),
+        (
+            "customer360-customers-parquet",
+            "customer360/customers_projection.parquet",
+        ),
+        (
+            "customer360-evidence-parquet",
+            "customer360/evidence_projection.parquet",
+        ),
+        (
+            "customer360-notebook-script",
+            "customer360/notebooks/customer360_analysis.py",
+        ),
+    ] {
+        locks.push(dataset_lock(
+            name,
+            rel,
+            &fs::read(out.join(rel)).map_err(|err| err.to_string())?,
+        )?);
+    }
+    locks.push(dataset_lock(
+        "customer360-manifest",
+        "customer360/customer360-manifest.json",
+        &customer360_manifest_bytes,
+    )?);
+
     Ok(locks)
 }
 
@@ -1147,8 +1209,65 @@ fn run_publication_gap_cases(corpus: &Path) -> Result<Vec<Value>, String> {
     }));
     cases.push(run_semantic_projection_object_store_case(corpus)?);
     cases.push(run_semantic_showcase_bundle_object_store_case(corpus)?);
+    cases.extend(run_customer360_cases(corpus)?);
 
     Ok(cases)
+}
+
+fn run_customer360_cases(corpus: &Path) -> Result<Vec<Value>, String> {
+    let dir = corpus.join("customer360");
+    Ok(vec![
+        run_query_case(
+            "customer360_projection_scan",
+            "Customer 360 projected canonical customer scan",
+            &dir.join("customers_projection.cove"),
+            ExplainOptions {
+                projection: Some(vec![
+                    "customer_id".into(),
+                    "region".into(),
+                    "tier".into(),
+                    "score".into(),
+                    "status".into(),
+                    "mrr".into(),
+                ]),
+                ..ExplainOptions::default()
+            },
+        )?,
+        run_query_case(
+            "customer360_selective_filter",
+            "Customer 360 projected selective score filter",
+            &dir.join("customers_projection.cove"),
+            ExplainOptions {
+                projection: Some(vec!["customer_id".into(), "tier".into(), "score".into()]),
+                filters: vec![FilterDsl {
+                    column: "score".into(),
+                    op: FilterOp::Gte,
+                    value: Some("80".into()),
+                }],
+                ..ExplainOptions::default()
+            },
+        )?,
+        run_query_case(
+            "customer360_event_filter",
+            "Customer 360 event fact selective filter",
+            &dir.join("events.cove"),
+            ExplainOptions {
+                projection: Some(vec![
+                    "event_id".into(),
+                    "customer_id".into(),
+                    "event_kind".into(),
+                    "score".into(),
+                ]),
+                filters: vec![FilterDsl {
+                    column: "score".into(),
+                    op: FilterOp::Gte,
+                    value: Some("80".into()),
+                }],
+                ..ExplainOptions::default()
+            },
+        )?,
+        run_customer360_object_store_case(corpus)?,
+    ])
 }
 
 fn run_query_case(
@@ -1793,6 +1912,174 @@ fn run_semantic_showcase_bundle_object_store_case(corpus: &Path) -> Result<Value
     }))
 }
 
+fn run_customer360_object_store_case(corpus: &Path) -> Result<Value, String> {
+    let dir = corpus.join("customer360");
+    let mapped_path = dir.join("customers.cove");
+    let customers_cove_t_path = dir.join("customers_projection.cove");
+    let evidence_cove_t_path = dir.join("evidence_projection.cove");
+    let customers_parquet_path = dir.join("customers_projection.parquet");
+    let evidence_parquet_path = dir.join("evidence_projection.parquet");
+    let start = Instant::now();
+    let mapped_bytes = fs::read(&mapped_path)
+        .map_err(|err| format!("cannot read Customer 360 mapped COVE-O: {err}"))?;
+    let customers_cove_t_bytes = fs::read(&customers_cove_t_path)
+        .map_err(|err| format!("cannot read Customer 360 customers COVE-T: {err}"))?;
+    let evidence_cove_t_bytes = fs::read(&evidence_cove_t_path)
+        .map_err(|err| format!("cannot read Customer 360 evidence COVE-T: {err}"))?;
+    let customers_parquet_bytes = fs::read(&customers_parquet_path)
+        .map_err(|err| format!("cannot read Customer 360 customers Parquet: {err}"))?;
+    let evidence_parquet_bytes = fs::read(&evidence_parquet_path)
+        .map_err(|err| format!("cannot read Customer 360 evidence Parquet: {err}"))?;
+
+    let (mapped_cold, mapped_warm, mapped_original, mapped_coalesced) =
+        simulate_object_store_cold_warm("customer360/customers.cove", mapped_bytes.clone())?;
+    let (
+        customers_cove_t_cold,
+        customers_cove_t_warm,
+        customers_cove_t_original,
+        customers_cove_t_coalesced,
+    ) = simulate_object_store_cold_warm(
+        "customer360/customers_projection.cove",
+        customers_cove_t_bytes.clone(),
+    )?;
+    let (
+        evidence_cove_t_cold,
+        evidence_cove_t_warm,
+        evidence_cove_t_original,
+        evidence_cove_t_coalesced,
+    ) = simulate_object_store_cold_warm(
+        "customer360/evidence_projection.cove",
+        evidence_cove_t_bytes.clone(),
+    )?;
+    let (
+        customers_parquet_cold,
+        customers_parquet_warm,
+        customers_parquet_original,
+        customers_parquet_coalesced,
+    ) = simulate_object_store_cold_warm(
+        "customer360/customers_projection.parquet",
+        customers_parquet_bytes.clone(),
+    )?;
+    let (
+        evidence_parquet_cold,
+        evidence_parquet_warm,
+        evidence_parquet_original,
+        evidence_parquet_coalesced,
+    ) = simulate_object_store_cold_warm(
+        "customer360/evidence_projection.parquet",
+        evidence_parquet_bytes.clone(),
+    )?;
+
+    let projected_cove_t_cold = sum_offline_object_store_stats(&[
+        customers_cove_t_cold.clone(),
+        evidence_cove_t_cold.clone(),
+    ]);
+    let projected_cove_t_warm = sum_offline_object_store_stats(&[
+        customers_cove_t_warm.clone(),
+        evidence_cove_t_warm.clone(),
+    ]);
+    let parquet_bundle_cold = sum_offline_object_store_stats(&[
+        customers_parquet_cold.clone(),
+        evidence_parquet_cold.clone(),
+    ]);
+    let parquet_bundle_warm = sum_offline_object_store_stats(&[
+        customers_parquet_warm.clone(),
+        evidence_parquet_warm.clone(),
+    ]);
+
+    let projected_cove_t_bytes = customers_cove_t_bytes.len() + evidence_cove_t_bytes.len();
+    let parquet_bundle_bytes = customers_parquet_bytes.len() + evidence_parquet_bytes.len();
+    let elapsed = start.elapsed().as_nanos();
+    Ok(json!({
+        "id": "customer360_object_store_compare",
+        "category": "Customer 360 mapped COVE-O vs projected COVE-T bundle vs Parquet bundle object-store comparison",
+        "status": "measured",
+        "metrics": {
+            "planning_ns": 0,
+            "scan_ns": elapsed,
+            "end_to_end_ns": elapsed,
+            "rows_materialized": Value::Null,
+            "mapped_cove_o_bytes": mapped_bytes.len(),
+            "cove_bytes": projected_cove_t_bytes,
+            "parquet_bytes": parquet_bundle_bytes,
+            "bytes_read": mapped_cold.bytes_requested + projected_cove_t_cold.bytes_requested + parquet_bundle_cold.bytes_requested,
+            "request_count": mapped_cold.range_gets + projected_cove_t_cold.range_gets + parquet_bundle_cold.range_gets,
+            "fragments_visited": 0,
+            "pages_visited": 0,
+            "pruning_tightness": 0.0,
+            "coverage_cache": {"hits": 0, "misses": 0, "entries_loaded": 0},
+            "index_use": {"covi_used": false, "lookup_hits": 0, "lookup_misses": 0, "index_fallbacks": 0},
+            "memory_peak_bytes": Value::Null,
+            "artifact_sizes": {
+                "mapped_cove_o_bytes": mapped_bytes.len(),
+                "cove_bytes": projected_cove_t_bytes,
+                "parquet_bytes": parquet_bundle_bytes,
+                "orc_bytes": 0,
+                "covx_bytes": 0
+            },
+            "delta": {
+                "mapped_bytes_saved_vs_parquet_bundle": parquet_bundle_bytes as i64 - mapped_bytes.len() as i64,
+                "projected_bundle_bytes_saved_vs_parquet_bundle": parquet_bundle_bytes as i64 - projected_cove_t_bytes as i64,
+                "mapped_cold_request_delta_vs_parquet_bundle": parquet_bundle_cold.range_gets as i64 - mapped_cold.range_gets as i64,
+                "projected_bundle_cold_request_delta_vs_parquet_bundle": parquet_bundle_cold.range_gets as i64 - projected_cove_t_cold.range_gets as i64,
+                "mapped_cold_bytes_requested_delta_vs_parquet_bundle": parquet_bundle_cold.bytes_requested as i64 - mapped_cold.bytes_requested as i64,
+                "projected_bundle_cold_bytes_requested_delta_vs_parquet_bundle": parquet_bundle_cold.bytes_requested as i64 - projected_cove_t_cold.bytes_requested as i64
+            }
+        },
+        "cost": {
+            "simulation": "offline deterministic object-store harness",
+            "object_store_harness": {
+                "mapped_cove_o": {
+                    "file_bytes": mapped_bytes.len(),
+                    "cold": object_store_stats_json(&mapped_cold),
+                    "warm": object_store_stats_json(&mapped_warm),
+                    "ranges": {"original": mapped_original.len(), "coalesced": mapped_coalesced.len()}
+                },
+                "projected_cove_t_bundle": {
+                    "file_bytes": projected_cove_t_bytes,
+                    "cold": object_store_stats_json(&projected_cove_t_cold),
+                    "warm": object_store_stats_json(&projected_cove_t_warm),
+                    "artifacts": {
+                        "customers_projection": {
+                            "file_bytes": customers_cove_t_bytes.len(),
+                            "cold": object_store_stats_json(&customers_cove_t_cold),
+                            "warm": object_store_stats_json(&customers_cove_t_warm),
+                            "ranges": {"original": customers_cove_t_original.len(), "coalesced": customers_cove_t_coalesced.len()}
+                        },
+                        "evidence_projection": {
+                            "file_bytes": evidence_cove_t_bytes.len(),
+                            "cold": object_store_stats_json(&evidence_cove_t_cold),
+                            "warm": object_store_stats_json(&evidence_cove_t_warm),
+                            "ranges": {"original": evidence_cove_t_original.len(), "coalesced": evidence_cove_t_coalesced.len()}
+                        }
+                    }
+                },
+                "parquet_bundle": {
+                    "file_bytes": parquet_bundle_bytes,
+                    "cold": object_store_stats_json(&parquet_bundle_cold),
+                    "warm": object_store_stats_json(&parquet_bundle_warm),
+                    "artifacts": {
+                        "customers_projection": {
+                            "file_bytes": customers_parquet_bytes.len(),
+                            "cold": object_store_stats_json(&customers_parquet_cold),
+                            "warm": object_store_stats_json(&customers_parquet_warm),
+                            "ranges": {"original": customers_parquet_original.len(), "coalesced": customers_parquet_coalesced.len()}
+                        },
+                        "evidence_projection": {
+                            "file_bytes": evidence_parquet_bytes.len(),
+                            "cold": object_store_stats_json(&evidence_parquet_cold),
+                            "warm": object_store_stats_json(&evidence_parquet_warm),
+                            "ranges": {"original": evidence_parquet_original.len(), "coalesced": evidence_parquet_coalesced.len()}
+                        }
+                    }
+                },
+                "caveat": "Hermetic object-store semantics for corpus artifacts, not live cloud storage performance."
+            }
+        },
+        "optional_features": ["cove_map", "parquet_compare", "object_store_harness", "customer360"],
+    }))
+}
+
 type ColdWarmRangeStats = (
     OfflineObjectStoreStats,
     OfflineObjectStoreStats,
@@ -2367,6 +2654,10 @@ fn validate_report_cases(cases: &[Value]) -> Result<(), String> {
         "semantic_mapping_corpus",
         "semantic_projection_object_store_compare",
         "semantic_showcase_bundle_object_store_compare",
+        "customer360_projection_scan",
+        "customer360_selective_filter",
+        "customer360_event_filter",
+        "customer360_object_store_compare",
     ];
     for id in required {
         if !cases.iter().any(|case| case.get("id") == Some(&json!(id))) {
@@ -3047,6 +3338,10 @@ mod tests {
             "negative_corrupt_validation",
             "canonicalisation_vectors",
             "semantic_mapping_corpus",
+            "customer360_projection_scan",
+            "customer360_selective_filter",
+            "customer360_event_filter",
+            "customer360_object_store_compare",
         ] {
             assert!(groups.iter().any(|group| group.as_str() == Some(required)));
         }

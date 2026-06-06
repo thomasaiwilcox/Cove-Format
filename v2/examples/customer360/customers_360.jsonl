@@ -1,0 +1,12 @@
+{"id":"c000000","customer_id":"c000000","full_name":null,"region":"north","tier":"silver","active":false,"score":0,"status":"dormant","plan":"free","mrr":null,"billing_status":"past_due"}
+{"id":"c000001","customer_id":"c000001","full_name":"Customer 000001","region":"south","tier":"gold","active":true,"score":37,"status":"active","plan":"team","mrr":29,"billing_status":"current"}
+{"id":"c000002","customer_id":"c000002","full_name":"Customer 000002","region":"east","tier":"platinum","active":true,"score":74,"status":"active","plan":"business","mrr":58,"billing_status":"current"}
+{"id":"c000003","customer_id":"c000003","full_name":"Customer 000003","region":"west","tier":"bronze","active":true,"score":11,"status":"active","plan":"enterprise","mrr":87,"billing_status":"current"}
+{"id":"c000004","customer_id":"c000004","full_name":"Customer 000004","region":"emea","tier":"silver","active":true,"score":48,"status":"active","plan":"free","mrr":116,"billing_status":"current"}
+{"id":"c000005","customer_id":"c000005","full_name":"Customer 000005","region":"apac","tier":"gold","active":true,"score":85,"status":"watch","plan":"team","mrr":145,"billing_status":"current"}
+{"id":"c000006","customer_id":"c000006","full_name":"Customer 000006","region":"north","tier":"platinum","active":true,"score":22,"status":"active","plan":"business","mrr":174,"billing_status":"current"}
+{"id":"c000007","customer_id":"c000007","full_name":"Customer 000007","region":"south","tier":"bronze","active":true,"score":59,"status":"active","plan":"enterprise","mrr":203,"billing_status":"current"}
+{"id":"c000008","customer_id":"c000008","full_name":"Customer 000008","region":"east","tier":"silver","active":true,"score":96,"status":"active","plan":"free","mrr":232,"billing_status":"current"}
+{"id":"c000009","customer_id":"c000009","full_name":"Customer 000009","region":"west","tier":"gold","active":false,"score":33,"status":"active","plan":"team","mrr":261,"billing_status":"current"}
+{"id":"c000010","customer_id":"c000010","full_name":"Customer 000010","region":"emea","tier":"platinum","active":true,"score":70,"status":"watch","plan":"business","mrr":290,"billing_status":"current"}
+{"id":"c000011","customer_id":"c000011","full_name":"Customer 000011","region":"apac","tier":"bronze","active":true,"score":7,"status":"active","plan":"enterprise","mrr":319,"billing_status":"past_due"}

@@ -1,0 +1,68 @@
+{
+  "version": 1,
+  "profile": "quick",
+  "row_counts": {
+    "crm": 12,
+    "support": 12,
+    "billing": 12,
+    "events": 36,
+    "canonical_customers": 12,
+    "expected_evidence_rows": 12
+  },
+  "pipeline": {
+    "source_inputs": [
+      "crm.csv",
+      "support.jsonl",
+      "billing.parquet"
+    ],
+    "source_mapping_contract": "customer360.covemap",
+    "canonical_readback_source": "customers_360.jsonl",
+    "mapped_cove_o_materialization": "customers_360.jsonl + customer360_readback.covemap",
+    "note": "The runnable COVE-O archive is materialized from reconciled canonical rows so CoveQL readback is deterministic; the CRM/support/billing files and customer360.covemap document the messy multi-source mapping surface."
+  },
+  "artifacts": {
+    "sources": {
+      "crm": "crm.csv",
+      "support": "support.jsonl",
+      "billing": "billing.parquet",
+      "reconciled": "customers_360.jsonl",
+      "events_jsonl": "events.jsonl"
+    },
+    "mapping": "customer360.covemap",
+    "readback_mapping": "customer360_readback.covemap",
+    "mapped_cove_o": "customers.cove",
+    "events_cove_t": "events.cove",
+    "projected_cove_t": {
+      "customers": "customers_projection.cove",
+      "evidence": "evidence_projection.cove"
+    },
+    "parquet_baselines": {
+      "customers": "customers_projection.parquet",
+      "evidence": "evidence_projection.parquet"
+    }
+  },
+  "recommended_queries": [
+    {
+      "title": "Canonical customers",
+      "command": "cove query customers.cove 'table(customers).select(customer_id, full_name, region, tier, score, status, plan, mrr).take(10)'"
+    },
+    {
+      "title": "Evidence by source",
+      "command": "cove query customers.cove 'table(customer_evidence).groupBy(source_id).select(source_id, rows: count(*))'"
+    },
+    {
+      "title": "High value customers",
+      "command": "cove query --engine compare --perf-report customers.cove 'table(customers).where(score >= 80).select(customer_id, tier, score, status, mrr).take(10)'"
+    },
+    {
+      "title": "Customer events through an external JSONL table",
+      "command": "cove query customers.cove --external-table events=events.jsonl 'table(customers) as c.join(table(events) as e, on: c.customer_id == e.customer_id).select(customer_id: c.customer_id, tier: c.tier, event_kind: e.event_kind, event_score: e.score).take(10)'"
+    }
+  ],
+  "benchmark_cases": [
+    "customer360_projection_scan",
+    "customer360_selective_filter",
+    "customer360_event_filter",
+    "customer360_object_store_compare"
+  ]
+}

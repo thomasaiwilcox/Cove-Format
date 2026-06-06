@@ -3,30 +3,43 @@
 This quickstart uses the beginner `cove` command. It is a friendly umbrella CLI
 for discovering and querying COVE artifacts without writing Rust.
 
-## Build The CLI
+## Choose A Path
 
-From `v2/`:
+COVE has two main read surfaces. If your data is already table-shaped and
+should remain table-shaped, start with a COVE-T table such as
+`examples/coveql/events.cove`. If repeated real-world entities, provenance,
+associations, or deterministic projections matter, start with a mapped COVE-O
+file such as `examples/coveql/people.cove` or the Customer 360 showcase.
+
+The same `cove inspect`, `cove doctor`, and `cove query` workflow works for
+both paths. Acceleration sidecars are optional: they may help readers skip work,
+but materialized CoveQL remains the semantic authority.
+
+## Run The CLI
+
+If `cove` is installed:
 
 ```bash
-cargo run -p cove-cli -- --help
+cove --help
 ```
 
-The binary name is `cove`; with Cargo, pass commands after `--`.
+When developing from the repository, run the same commands through Cargo from
+`v2/`, for example `cargo run -p cove-cli -- --help`.
 
 ## Find A Starting Point
 
 Ask the CLI for copy-paste examples:
 
 ```bash
-cargo run -p cove-cli -- examples
+cove examples
 ```
 
 For one specific file, use `doctor`. It combines queryability, performance
 sidecar status, suggested queries, and next-step commands:
 
 ```bash
-cargo run -p cove-cli -- doctor examples/coveql/people.cove
-cargo run -p cove-cli -- doctor --json examples/coveql/events.cove
+cove doctor examples/coveql/people.cove
+cove doctor --json examples/coveql/events.cove
 ```
 
 ## Inspect A File
@@ -34,8 +47,8 @@ cargo run -p cove-cli -- doctor --json examples/coveql/events.cove
 Start with the checked-in samples:
 
 ```bash
-cargo run -p cove-cli -- inspect examples/coveql/people.cove --queries
-cargo run -p cove-cli -- inspect examples/coveql/events.cove --queries
+cove inspect examples/coveql/people.cove --queries
+cove inspect examples/coveql/events.cove --queries
 ```
 
 `inspect` detects the artifact type, shows whether it is queryable, lists
@@ -45,7 +58,7 @@ queries from the file metadata.
 Sidecars are first-class too:
 
 ```bash
-cargo run -p cove-cli -- inspect examples/coveql/people.covemap --queries
+cove inspect examples/coveql/people.covemap --queries
 ```
 
 That file is COVE-MAP metadata, not row data, so `cove` explains how to use it
@@ -56,7 +69,7 @@ with a related data file instead of pretending it can be scanned as rows.
 `events.cove` is a tiny COVE-T table file:
 
 ```bash
-cargo run -p cove-cli -- query examples/coveql/events.cove \
+cove query examples/coveql/events.cove \
   'table(events).where(score >= 20).select(id, score)'
 ```
 
@@ -65,11 +78,11 @@ By default, results are printed as a terminal table.
 Export formats are available for scripts:
 
 ```bash
-cargo run -p cove-cli -- query examples/coveql/events.cove \
+cove query examples/coveql/events.cove \
   --format jsonl \
   'table(events).select(id, score)'
 
-cargo run -p cove-cli -- query examples/coveql/events.cove \
+cove query examples/coveql/events.cove \
   --format csv \
   'table(events).select(id, score)'
 ```
@@ -77,7 +90,7 @@ cargo run -p cove-cli -- query examples/coveql/events.cove \
 Use `--take` for quick sampling when the query has no explicit `.take(...)`:
 
 ```bash
-cargo run -p cove-cli -- query examples/coveql/events.cove \
+cove query examples/coveql/events.cove \
   --take 2 \
   'table(events).select(id, score)'
 ```
@@ -86,21 +99,21 @@ For longer queries, keep the CoveQL text in a file:
 
 ```bash
 printf 'table(events).where(score >= 20).select(id, score)\n' > /tmp/events.coveql
-cargo run -p cove-cli -- query --query-file /tmp/events.coveql examples/coveql/events.cove
+cove query --query-file /tmp/events.coveql examples/coveql/events.cove
 ```
 
 Or pipe a query through stdin:
 
 ```bash
 printf 'table(events).select(id, score)\n' | \
-  cargo run -p cove-cli -- query --query-file - examples/coveql/events.cove
+  cove query --query-file - examples/coveql/events.cove
 ```
 
 If table cells are too wide or too narrow for your terminal, adjust the display
 width:
 
 ```bash
-cargo run -p cove-cli -- query examples/coveql/events.cove \
+cove query examples/coveql/events.cove \
   --max-cell-width 16 \
   'table(events).select(id, score)'
 ```
@@ -113,7 +126,7 @@ cargo run -p cove-cli -- query examples/coveql/events.cove \
 Object roots expose semantic object rows:
 
 ```bash
-cargo run -p cove-cli -- query examples/coveql/people.cove \
+cove query examples/coveql/people.cove \
   'object(Person).take(5)'
 ```
 
@@ -122,7 +135,7 @@ COVE-O projection output tables are exposed through the same `table(...)`
 surface as COVE-T:
 
 ```bash
-cargo run -p cove-cli -- query examples/coveql/people.cove \
+cove query examples/coveql/people.cove \
   'table(people).where(score >= 20).select(score, status, nickname)'
 ```
 
@@ -132,13 +145,13 @@ The same table-shaped CoveQL methods work for COVE-T tables and COVE-O mapped
 tables:
 
 ```bash
-cargo run -p cove-cli -- query examples/coveql/events.cove \
+cove query examples/coveql/events.cove \
   'table(events).select(rows: count(*), total: sum(score), average: avg(score))'
 
-cargo run -p cove-cli -- query examples/coveql/people.cove \
+cove query examples/coveql/people.cove \
   'table(people).orderBy(score, desc).select(score, status).take(2)'
 
-cargo run -p cove-cli -- query examples/coveql/people.cove \
+cove query examples/coveql/people.cove \
   'table(people).window(orderBy: score).select(score, rn: row_number()).take(3)'
 ```
 
@@ -155,9 +168,9 @@ acceleration sidecars and falls back to the materialized authority when proof is
 missing. Generate sibling sidecars without rewriting the source file:
 
 ```bash
-cargo run -p cove-cli -- optimize examples/coveql/events.cove
-cargo run -p cove-cli -- inspect --performance examples/coveql/events.cove
-cargo run -p cove-cli -- query --perf-report examples/coveql/events.cove \
+cove optimize examples/coveql/events.cove
+cove inspect --performance examples/coveql/events.cove
+cove query --perf-report examples/coveql/events.cove \
   'table(events).where(score >= 20).select(id, score)'
 ```
 
@@ -169,11 +182,11 @@ Sidecars are acceleration metadata, not portable logical truth.
 The CLI can also run the physical/kernel planner explicitly:
 
 ```bash
-cargo run -p cove-cli -- query examples/coveql/events.cove \
+cove query examples/coveql/events.cove \
   --engine physical \
   'table(events).where(score >= 20).select(id, score)'
 
-cargo run -p cove-cli -- query examples/coveql/people.cove \
+cove query examples/coveql/people.cove \
   --engine compare \
   'table(people).where(score >= 20).select(score).take(2)'
 ```
@@ -192,7 +205,7 @@ external table. The CLI accepts CSV, JSON arrays, and JSONL/NDJSON rows:
 
 ```bash
 printf 'id,score\n1,10\n2,20\n3,30\n' > /tmp/people.csv
-cargo run -p cove-cli -- query \
+cove query \
   --external-table people=/tmp/people.csv \
   'table(people).where(score >= 20).select(id, score)'
 ```
@@ -200,7 +213,7 @@ cargo run -p cove-cli -- query \
 External tables can also join with COVE-T or mapped COVE-O tables:
 
 ```bash
-cargo run -p cove-cli -- query examples/coveql/events.cove \
+cove query examples/coveql/events.cove \
   --external-table weights=/tmp/weights.jsonl \
   'table(events) as e.join(table(weights) as w, on: e.id == w.id).select(id: e.id, score: e.score, weight: w.weight)'
 ```
@@ -212,14 +225,14 @@ Graph roots and graph algorithms work over COVE-O graph-shaped object and
 association surfaces:
 
 ```bash
-cargo run -p cove-cli -- query examples/coveql/people.cove \
+cove query examples/coveql/people.cove \
   'node(Person) as p.connectedComponents().degree(kind: total).select(id: p.goid, component_id, degree).take(3)'
 ```
 
 Variable-length traversal is budgeted and must be enabled explicitly:
 
 ```bash
-cargo run -p cove-cli -- query graph.cove \
+cove query graph.cove \
   --enable-graph-traversal --max-graph-depth 4 --max-graph-paths 1000 \
   'node(Person) as p.traverse(out(edge(Knows)), min: 1, max: 4, distinct: path).select(p.goid)'
 ```
@@ -227,7 +240,7 @@ cargo run -p cove-cli -- query graph.cove \
 Evidence rows are available when the file includes COVE-MAP evidence metadata:
 
 ```bash
-cargo run -p cove-cli -- query examples/coveql/people.cove \
+cove query examples/coveql/people.cove \
   'evidence(Person, grain: object).select(source_id, source_row_identity).take(5)'
 ```
 
@@ -236,7 +249,7 @@ cargo run -p cove-cli -- query examples/coveql/people.cove \
 Ask CoveQL why a query planned the way it did:
 
 ```bash
-cargo run -p cove-cli -- query examples/coveql/events.cove \
+cove query examples/coveql/events.cove \
   --explain coded \
   'table(events).where(score >= 20).select(id, score)'
 ```
