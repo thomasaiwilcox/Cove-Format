@@ -312,7 +312,8 @@ COVE v2 is a standards suite, not a single mandatory feature pile. Baseline
 interoperability is COVE-Core plus COVE-T table scan reading, safe predicate
 metadata interpretation, Arrow-compatible export for supported logical types,
 and conformance vectors. Optional profiles are implemented or claimed
-independently.
+independently. You do not need the optional profiles below to understand or
+implement the baseline tabular archive path.
 
 - **COVE-Core and COVE-T**: file layout, sections, dictionaries, encoded
   arrays, table catalogs, segments, morsels, page indexes, checksums,

@@ -29,6 +29,20 @@ contract for the showcase.
 - Optional acceleration sidecars can improve reads, but they remain subordinate
   to the mapped archive's logical truth.
 
+## Why This Is A COVE-Shaped Problem
+
+A normal table export can store reconciled customer rows. COVE adds a stronger
+archive contract:
+
+1. The canonical customer view, evidence surface, and projected tables are kept
+   together.
+2. The same archive can be inspected as semantic objects, provenance/evidence,
+   or familiar table-shaped projections.
+3. Optional sidecars can accelerate reads without becoming the source of truth.
+
+The current showcase keeps the messy CRM/support/billing inputs visible and uses
+a reconciled canonical readback source for deterministic CoveQL examples.
+
 ## Generate
 
 From `v2/`:
@@ -48,7 +62,8 @@ The output includes:
 - `crm.csv`, `support.jsonl`, and `billing.parquet` source data;
 - `events.jsonl` and `events.cove` activity facts;
 - `customer360.covemap` for the messy source mapping surface;
-- `customers.cove`, the queryable mapped COVE-O archive;
+- `customers.cove`, the queryable COVE-O archive materialized from the
+  reconciled canonical readback source;
 - `customers_projection.cove` and `evidence_projection.cove` projected COVE-T baselines;
 - matching Parquet projection baselines;
 - `customer360-manifest.json` with paths, row counts, recommended queries, and benchmark IDs;
