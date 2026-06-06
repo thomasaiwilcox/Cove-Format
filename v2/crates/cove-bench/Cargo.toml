@@ -8,6 +8,7 @@ license = "MIT"
 [dependencies]
 cove-arrow = { path = "../cove-arrow" }
 cove-cache = { path = "../cove-cache" }
+cove-cli = { path = "../cove-cli" }
 cove-coverage = { path = "../cove-coverage" }
 cove-core = { path = "../cove-core" }
 cove-datafusion = { path = "../cove-datafusion", features = ["covm", "covx", "covi", "parquet-compare"] }

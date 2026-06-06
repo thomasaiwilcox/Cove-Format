@@ -694,6 +694,7 @@ dependencies = [
  "arrow-schema",
  "cove-arrow",
  "cove-cache",
+ "cove-cli",
  "cove-core",
  "cove-coverage",
  "cove-datafusion",
@@ -716,6 +717,9 @@ dependencies = [
 name = "cove-cli"
 version = "0.1.0"
 dependencies = [
+ "arrow-array",
+ "arrow-ipc",
+ "arrow-schema",
  "cove-cache",
  "cove-convert-parquet",
  "cove-core",
@@ -730,6 +734,7 @@ dependencies = [
  "cove-validate",
  "coveql",
  "csv",
+ "parquet",
  "serde_json",
 ]
 

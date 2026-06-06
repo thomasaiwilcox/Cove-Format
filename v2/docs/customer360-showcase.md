@@ -1,0 +1,95 @@
+# Customer 360 Data-Science Showcase
+
+The Customer 360 showcase is the main approachable demo for CoveQL and the
+unified `cove` CLI. It generates deterministic CRM, support, billing, and event
+sources, then builds a queryable mapped COVE archive with projected table and
+Parquet baselines.
+
+## Generate
+
+From `v2/`:
+
+```bash
+cove showcase customer360 --profile quick --out examples/customer360 --force
+```
+
+For larger local runs, keep generated data under `target/`:
+
+```bash
+cove showcase customer360 --profile standard --out target/customer360-standard --force
+```
+
+The output includes:
+
+- `crm.csv`, `support.jsonl`, and `billing.parquet` source data;
+- `events.jsonl` and `events.cove` activity facts;
+- `customer360.covemap` for the messy source mapping surface;
+- `customers.cove`, the queryable mapped COVE-O archive;
+- `customers_projection.cove` and `evidence_projection.cove` projected COVE-T baselines;
+- matching Parquet projection baselines;
+- `customer360-manifest.json` with paths, row counts, recommended queries, and benchmark IDs;
+- `notebooks/customer360_analysis.py` for pandas/Polars-oriented exploration.
+
+## Inspect And Query
+
+```bash
+cove doctor examples/customer360/customers.cove
+cove inspect --queries --performance examples/customer360/customers.cove
+```
+
+Query canonical customer rows:
+
+```bash
+cove query examples/customer360/customers.cove \
+  'table(customers).select(customer_id, full_name, region, tier, score, status, plan, mrr).take(10)'
+```
+
+Inspect provenance/evidence rows:
+
+```bash
+cove query examples/customer360/customers.cove \
+  'table(customer_evidence).select(source_id, source_row_identity, rule_id).take(10)'
+```
+
+Join canonical customers to generated activity facts through an external JSONL
+table:
+
+```bash
+cove query examples/customer360/customers.cove \
+  --external-table events=examples/customer360/events.jsonl \
+  'table(customers) as c.join(table(events) as e, on: c.customer_id == e.customer_id).select(customer_id: c.customer_id, tier: c.tier, event_kind: e.event_kind, event_score: e.score).take(10)'
+```
+
+## Optimize And Compare
+
+Generate acceleration sidecars for the event fact table:
+
+```bash
+cove optimize examples/customer360/events.cove
+cove query --engine compare --perf-report examples/customer360/events.cove \
+  'table(events).where(score >= 80).select(event_id, customer_id, event_kind, score)'
+```
+
+For the mapped customer archive, materialized CoveQL remains the authority. Use
+`--engine compare --perf-report` to see whether available sidecars were used,
+skipped, or fell back.
+
+## Notebook-Style Analysis
+
+The generated script is intentionally a plain Python file so it can run in CI
+and also be copied into a notebook:
+
+```bash
+python3 examples/customer360/notebooks/customer360_analysis.py --input-dir examples/customer360
+```
+
+It loads the generated JSONL sources, prints row-count and distribution
+summaries, uses pandas when installed, and uses Polars when installed.
+
+## Developer Setup
+
+When the `cove` binary is not installed, run the same commands through Cargo:
+
+```bash
+cargo run -p cove-cli -- showcase customer360 --profile quick --out examples/customer360 --force
+```

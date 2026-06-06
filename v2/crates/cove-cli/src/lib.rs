@@ -1,3 +1,4 @@
+pub mod customer360;
 mod external_tables;
 mod help;
 mod output;
@@ -26,6 +27,7 @@ use coveql::{
     PhysicalPlanOptions, PhysicalSidecarInputs, QueryArtifactMember, QuerySurfaceDiscovery,
     QuerySurfaceDiscoveryOptions, COVEQL_PROFILE_CONTRACT_VERSION,
 };
+use customer360::{generate_customer360, Customer360Options, Customer360Profile};
 use external_tables::{register_external_tables, ExternalTableSpec};
 use help::{print_usage, usage, HelpTopic};
 use output::{write_result, OutputFormat};
@@ -50,6 +52,12 @@ enum Command {
         file: PathBuf,
         out_dir: Option<PathBuf>,
         full: bool,
+        json: bool,
+    },
+    ShowcaseCustomer360 {
+        out_dir: PathBuf,
+        profile: Customer360Profile,
+        force: bool,
         json: bool,
     },
     Query(Box<QueryCommand>),
@@ -158,6 +166,12 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<(), String> {
             full,
             json,
         } => run_optimize(&file, out_dir.as_deref(), full, json),
+        Command::ShowcaseCustomer360 {
+            out_dir,
+            profile,
+            force,
+            json,
+        } => run_showcase_customer360(&out_dir, profile, force, json),
         Command::Query(command) => run_query(
             command.file.as_deref(),
             &command.query,
@@ -281,6 +295,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, String>
         "doctor" => parse_doctor(args),
         "inspect" => parse_inspect(args),
         "optimize" => parse_optimize(args),
+        "showcase" => parse_showcase(args),
         "query" => parse_query(args),
         "convert" => parse_convert(args),
         "validate" => Ok(Command::Validate { args }),
@@ -498,6 +513,53 @@ fn parse_optimize(args: Vec<String>) -> Result<Command, String> {
         })?,
         out_dir,
         full,
+        json,
+    })
+}
+
+fn parse_showcase(mut args: Vec<String>) -> Result<Command, String> {
+    if args.is_empty() || args[0] == "-h" || args[0] == "--help" {
+        return Ok(Command::Help(HelpTopic::Showcase));
+    }
+    let name = args.remove(0);
+    if name != "customer360" {
+        return Err(format!(
+            "unknown showcase '{name}'; expected customer360\n\n{}",
+            usage(HelpTopic::Showcase)
+        ));
+    }
+    let mut out_dir = None;
+    let mut profile = Customer360Profile::Quick;
+    let mut force = false;
+    let mut json = false;
+    let mut iter = args.into_iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--out" => {
+                out_dir =
+                    Some(PathBuf::from(iter.next().ok_or_else(|| {
+                        "--out requires a directory path".to_string()
+                    })?));
+            }
+            "--profile" => {
+                let value = iter.next().ok_or_else(|| {
+                    "--profile requires quick, standard, or publication".to_string()
+                })?;
+                profile = Customer360Profile::parse(&value)?;
+            }
+            "--force" => force = true,
+            "--json" => json = true,
+            "-h" | "--help" => return Ok(Command::Help(HelpTopic::Showcase)),
+            arg if arg.starts_with("--") => {
+                return Err(format!("unknown customer360 showcase option '{arg}'"))
+            }
+            _ => return Err("showcase customer360 does not accept positional arguments".into()),
+        }
+    }
+    Ok(Command::ShowcaseCustomer360 {
+        out_dir: out_dir.unwrap_or_else(|| PathBuf::from("examples/customer360")),
+        profile,
+        force,
         json,
     })
 }
@@ -958,6 +1020,25 @@ fn run_digest_verify(args: Vec<String>) -> Result<bool, String> {
 
 fn run_examples(json: bool) -> Result<(), String> {
     let sample_dir = "examples/coveql";
+    let showcase_dir = "examples/customer360";
+    let showcase_examples = vec![
+        (
+            "Generate the Customer 360 data-science showcase",
+            "cove showcase customer360 --profile quick --out examples/customer360 --force",
+        ),
+        (
+            "Inspect canonical customer surfaces",
+            "cove inspect --queries --performance examples/customer360/customers.cove",
+        ),
+        (
+            "Query canonical customer rows",
+            "cove query examples/customer360/customers.cove 'table(customers).select(customer_id, full_name, region, tier, score, status, plan, mrr).take(10)'",
+        ),
+        (
+            "Join customers to generated events",
+            "cove query examples/customer360/customers.cove --external-table events=examples/customer360/events.jsonl 'table(customers) as c.join(table(events) as e, on: c.customer_id == e.customer_id).select(customer_id: c.customer_id, tier: c.tier, event_kind: e.event_kind, event_score: e.score).take(10)'",
+        ),
+    ];
     let examples = vec![
         (
             "Inspect an object sample",
@@ -983,6 +1064,17 @@ fn run_examples(json: bool) -> Result<(), String> {
     if json {
         let value = serde_json::json!({
             "sample_dir": sample_dir,
+            "showcase_dir": showcase_dir,
+            "showcases": [{
+                "name": "customer360",
+                "profile": "quick",
+                "commands": showcase_examples.iter().map(|(title, command)| {
+                    serde_json::json!({
+                        "title": title,
+                        "command": command,
+                    })
+                }).collect::<Vec<_>>(),
+            }],
             "examples": examples.iter().map(|(title, command)| {
                 serde_json::json!({
                     "title": title,
@@ -995,6 +1087,14 @@ fn run_examples(json: bool) -> Result<(), String> {
     }
 
     println!("CoveQL examples");
+    println!("Customer 360 showcase directory: {showcase_dir}");
+    println!();
+    println!("Data-science showcase:");
+    for (title, command) in &showcase_examples {
+        println!("{title}:");
+        println!("  {command}");
+    }
+    println!();
     println!("Sample directory: {sample_dir}");
     println!();
     for (title, command) in examples {
@@ -1004,6 +1104,48 @@ fn run_examples(json: bool) -> Result<(), String> {
     println!();
     println!("Regenerate samples from v2/ with:");
     println!("  cargo run -p cove-cli --example generate_beginner_samples -- examples/coveql");
+    Ok(())
+}
+
+fn run_showcase_customer360(
+    out_dir: &Path,
+    profile: Customer360Profile,
+    force: bool,
+    json: bool,
+) -> Result<(), String> {
+    let manifest = generate_customer360(&Customer360Options {
+        out_dir: out_dir.to_path_buf(),
+        profile,
+        force,
+    })?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&manifest)
+                .map_err(|error| format!("cannot serialize Customer 360 manifest: {error}"))?
+        );
+    } else {
+        println!(
+            "Generated Customer 360 showcase ({}) at {}",
+            profile.as_str(),
+            out_dir.display()
+        );
+        println!(
+            "Manifest: {}",
+            out_dir.join("customer360-manifest.json").display()
+        );
+        println!("Try next:");
+        println!(
+            "  cove inspect --queries --performance {}/customers.cove",
+            out_dir.display()
+        );
+        println!("  cove query {}/customers.cove 'table(customers).select(customer_id, full_name, region, tier, score, status, plan, mrr).take(10)'", out_dir.display());
+        println!(
+            "  python3 {}/notebooks/customer360_analysis.py --input-dir {}",
+            out_dir.display(),
+            out_dir.display()
+        );
+    }
     Ok(())
 }
 

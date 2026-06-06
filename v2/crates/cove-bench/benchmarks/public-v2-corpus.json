@@ -134,6 +134,13 @@
       "seed": 27,
       "artifacts": ["semantic-showcase/showcase.covemap", "semantic-showcase/crm.csv", "semantic-showcase/directory.parquet", "semantic-showcase/subscription.csv", "semantic-showcase/showcase_mapped.cove", "semantic-showcase/people_projection.cove", "semantic-showcase/evidence_projection.cove", "semantic-showcase/people_projection.parquet", "semantic-showcase/evidence_projection.parquet", "semantic-showcase/expected.json"],
       "purpose": "multi-source semantic showcase bundle benchmark"
+    },
+    {
+      "id": "customer360",
+      "kind": "deterministic-customer360-data-science-showcase",
+      "seed": 28,
+      "artifacts": ["customer360/crm.csv", "customer360/support.jsonl", "customer360/billing.parquet", "customer360/customers_360.jsonl", "customer360/events.jsonl", "customer360/events.cove", "customer360/customer360.covemap", "customer360/customer360_readback.covemap", "customer360/customers.cove", "customer360/customers_projection.cove", "customer360/evidence_projection.cove", "customer360/customers_projection.parquet", "customer360/evidence_projection.parquet", "customer360/customer360-manifest.json"],
+      "purpose": "Customer 360 semantic archive, provenance, notebook, and benchmark workload"
     }
   ],
   "query_groups": [
@@ -148,6 +155,10 @@
     "object_store_cold_warm",
     "semantic_projection_object_store_compare",
     "semantic_showcase_bundle_object_store_compare",
+    "customer360_projection_scan",
+    "customer360_selective_filter",
+    "customer360_event_filter",
+    "customer360_object_store_compare",
     "covm_many_file_planning",
     "parquet_conversion_cost",
     "orc_conversion_cost",
