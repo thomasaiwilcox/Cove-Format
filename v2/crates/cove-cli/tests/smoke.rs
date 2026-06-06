@@ -1331,6 +1331,14 @@ fn cli_negative_paths_report_actionable_errors() {
     assert!(!missing.status.success());
     assert!(String::from_utf8_lossy(&missing.stderr).contains("cannot read"));
 
+    let mixed_inspect = run_cove(&["inspect", "--queries", "--sections", "stats", "file.cove"]);
+    assert!(!mixed_inspect.status.success());
+    let stderr = String::from_utf8_lossy(&mixed_inspect.stderr);
+    assert!(
+        stderr.contains("cannot be combined") && stderr.contains("--sections"),
+        "stderr={stderr}"
+    );
+
     let bad_flag = run_cove(&["query", "--wat", "table(events).take(1)"]);
     assert!(!bad_flag.status.success());
     assert!(String::from_utf8_lossy(&bad_flag.stderr).contains("unknown query option"));
@@ -1383,6 +1391,29 @@ fn cli_negative_paths_report_actionable_errors() {
     ]);
     assert!(!bad_external.status.success());
     assert!(String::from_utf8_lossy(&bad_external.stderr).contains("cannot parse JSONL"));
+}
+
+#[test]
+fn parent_command_help_exits_successfully() {
+    for args in [
+        &["convert", "--help"][..],
+        &["convert"][..],
+        &["export", "--help"][..],
+        &["export"][..],
+        &["perf", "--help"][..],
+        &["perf"][..],
+        &["digest", "--help"][..],
+        &["digest"][..],
+    ] {
+        let output = run_cove(args);
+        assert!(
+            output.status.success(),
+            "args={args:?} stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("Usage:"), "args={args:?} stdout={stdout}");
+    }
 }
 
 #[test]

@@ -342,6 +342,7 @@ fn parse_doctor(args: Vec<String>) -> Result<Command, String> {
 }
 
 fn parse_inspect(args: Vec<String>) -> Result<Command, String> {
+    reject_mixed_inspect_modes(&args)?;
     if wants_detailed_inspect(&args) {
         return Ok(Command::InspectDetailed { args });
     }
@@ -373,6 +374,20 @@ fn parse_inspect(args: Vec<String>) -> Result<Command, String> {
     })
 }
 
+fn reject_mixed_inspect_modes(args: &[String]) -> Result<(), String> {
+    let detailed = args.iter().any(|arg| arg == "--sections");
+    let beginner = args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "--queries" | "--performance"));
+    if detailed && beginner {
+        return Err(
+            "`cove inspect --sections` cannot be combined with `--queries` or `--performance`; use beginner inspect without `--sections`, or detailed inspect without beginner-only options"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 fn wants_detailed_inspect(args: &[String]) -> bool {
     let mut positional = 0usize;
     for arg in args {
@@ -388,7 +403,7 @@ fn wants_detailed_inspect(args: &[String]) -> bool {
 
 fn parse_convert(mut args: Vec<String>) -> Result<Command, String> {
     if args.is_empty() || args[0] == "-h" || args[0] == "--help" {
-        return Err("usage: cove convert <parquet|arrow|orc|csv|report> [options]".into());
+        return Ok(Command::Help);
     }
     let raw = args.remove(0);
     let format = match raw.as_str() {
@@ -408,7 +423,7 @@ fn parse_convert(mut args: Vec<String>) -> Result<Command, String> {
 
 fn parse_export(mut args: Vec<String>) -> Result<Command, String> {
     if args.is_empty() || args[0] == "-h" || args[0] == "--help" {
-        return Err("usage: cove export <arrow> [options]".into());
+        return Ok(Command::Help);
     }
     let raw = args.remove(0);
     let format = match raw.as_str() {
@@ -420,7 +435,7 @@ fn parse_export(mut args: Vec<String>) -> Result<Command, String> {
 
 fn parse_perf(mut args: Vec<String>) -> Result<Command, String> {
     if args.is_empty() || args[0] == "-h" || args[0] == "--help" {
-        return Err("usage: cove perf <explain-pruning|plan-cost> [options]".into());
+        return Ok(Command::Help);
     }
     let raw = args.remove(0);
     let command = match raw.as_str() {
@@ -437,7 +452,7 @@ fn parse_perf(mut args: Vec<String>) -> Result<Command, String> {
 
 fn parse_digest(mut args: Vec<String>) -> Result<Command, String> {
     if args.is_empty() || args[0] == "-h" || args[0] == "--help" {
-        return Err("usage: cove digest verify <file.cove> [--require]".into());
+        return Ok(Command::Help);
     }
     let command = args.remove(0);
     match command.as_str() {
