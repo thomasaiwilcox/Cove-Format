@@ -2,6 +2,8 @@
 name = "cove-index"
 version = "0.1.0"
 edition = "2021"
+description = "COVE-I secondary index artifact parsing, validation, and building"
+license = "MIT"
 autobins = false
 
 [dependencies]

@@ -2,6 +2,8 @@
 name = "cove-layout"
 version = "0.1.0"
 edition = "2021"
+description = "COVE-L layout plans, scan splits, and zero-copy metadata"
+license = "MIT"
 autobins = false
 
 [dependencies]

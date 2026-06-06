@@ -1,32 +1,35 @@
+mod external_tables;
+mod help;
+mod output;
+mod sidecar;
+
 use std::{
-    collections::{BTreeMap, BTreeSet},
     fs,
-    io::{self, Read, Write},
+    io::{self, Read},
     path::{Path, PathBuf},
 };
 
 use cove_core::{
     artifact::covm::CovmFile,
     constants::SectionKind,
-    durable,
     reader::{validate_bytes_with_options, ValidationOptions},
     table::TableCatalog,
-    utility::{build_covm_artifact, build_covx_artifact},
     writer::ScanProfileCoveWriter,
 };
 use coveql::{
-    acceleration_report_json, apply_acceleration_bundle, coveql_identifier,
-    discover_acceleration_bundle, discover_query_surfaces, execute_query_from_artifact,
-    generate_acceleration_sidecars, plan_acceleration, suggest_queries, AccelerationBundleOptions,
-    ArtifactExecutionEngine, AstEvidenceGrain, CoveAccelerationBundle, CoveOptimizationOptions,
-    ExecuteArtifactOptions, ExecuteArtifactQueryError, ExplainDisclosurePolicy,
-    GraphTraversalContract, GraphTraversalDistinctPolicy, GraphTraversalMode, KernelExecutionMode,
-    KernelExecutionOptions, PhysicalPlanOptions, PhysicalSidecarInputs, QueryArtifactMember,
-    QuerySurfaceDiscovery, QuerySurfaceDiscoveryOptions, TableExecutionAuthority,
-    TableSurfaceAuthority, TableSurfaceAuthorityKind, TableSurfaceColumnContract,
-    TableSurfaceContract, TableSurfaceRow, TableTemporalAuthority, COVEQL_PROFILE_CONTRACT_VERSION,
+    acceleration_report_json, apply_acceleration_bundle, discover_acceleration_bundle,
+    discover_query_surfaces, execute_query_from_artifact, generate_acceleration_sidecars,
+    plan_acceleration, suggest_queries, AccelerationBundleOptions, ArtifactExecutionEngine,
+    CoveAccelerationBundle, CoveOptimizationOptions, ExecuteArtifactOptions,
+    ExecuteArtifactQueryError, ExplainDisclosurePolicy, GraphTraversalContract,
+    GraphTraversalDistinctPolicy, GraphTraversalMode, KernelExecutionMode, KernelExecutionOptions,
+    PhysicalPlanOptions, PhysicalSidecarInputs, QueryArtifactMember, QuerySurfaceDiscovery,
+    QuerySurfaceDiscoveryOptions, COVEQL_PROFILE_CONTRACT_VERSION,
 };
-use serde_json::Value;
+use external_tables::{register_external_tables, ExternalTableSpec};
+use help::{print_usage, usage, HelpTopic};
+use output::{write_result, OutputFormat};
+use sidecar::run_sidecar;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Command {
@@ -86,7 +89,7 @@ enum Command {
     Canonicalise {
         args: Vec<String>,
     },
-    Help,
+    Help(HelpTopic),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,18 +138,10 @@ struct QueryCommand {
     max_cell_width: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OutputFormat {
-    Table,
-    Json,
-    Jsonl,
-    Csv,
-}
-
 pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<(), String> {
     match parse_args(args)? {
-        Command::Help => {
-            print_usage();
+        Command::Help(topic) => {
+            print_usage(topic);
             Ok(())
         }
         Command::Examples { json } => run_examples(json),
@@ -226,12 +221,6 @@ struct QueryCommandOptions {
     max_cell_width: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ExternalTableSpec {
-    table_name: String,
-    path: PathBuf,
-}
-
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum QueryEngine {
     #[default]
@@ -283,11 +272,11 @@ impl QueryPhysicalSidecarPaths {
 fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, String> {
     let mut args = args.into_iter().collect::<Vec<_>>();
     if args.is_empty() {
-        return Ok(Command::Help);
+        return Ok(Command::Help(HelpTopic::Global));
     }
     let command = args.remove(0);
     match command.as_str() {
-        "-h" | "--help" | "help" => Ok(Command::Help),
+        "-h" | "--help" | "help" => Ok(Command::Help(HelpTopic::Global)),
         "examples" => parse_examples(args),
         "doctor" => parse_doctor(args),
         "inspect" => parse_inspect(args),
@@ -296,14 +285,31 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, String>
         "convert" => parse_convert(args),
         "validate" => Ok(Command::Validate { args }),
         "dump" => Ok(Command::Dump { args }),
+        "map"
+            if args
+                .first()
+                .is_some_and(|arg| arg == "-h" || arg == "--help") =>
+        {
+            Ok(Command::Help(HelpTopic::Map))
+        }
         "map" => Ok(Command::Map { args }),
         "export" => parse_export(args),
         "perf" => parse_perf(args),
+        "sidecar"
+            if args
+                .first()
+                .is_some_and(|arg| arg == "-h" || arg == "--help") =>
+        {
+            Ok(Command::Help(HelpTopic::Sidecar))
+        }
         "sidecar" => Ok(Command::Sidecar { args }),
         "digest" => parse_digest(args),
         "profile" => Ok(Command::Profile { args }),
         "canonicalise" | "canonicalize" => Ok(Command::Canonicalise { args }),
-        other => Err(format!("unknown command '{other}'\n\n{}", usage())),
+        other => Err(format!(
+            "unknown command '{other}'\n\n{}",
+            usage(HelpTopic::Global)
+        )),
     }
 }
 
@@ -312,7 +318,7 @@ fn parse_examples(args: Vec<String>) -> Result<Command, String> {
     for arg in args {
         match arg.as_str() {
             "--json" => json = true,
-            "-h" | "--help" => return Ok(Command::Help),
+            "-h" | "--help" => return Ok(Command::Help(HelpTopic::Global)),
             arg if arg.starts_with("--") => return Err(format!("unknown examples option '{arg}'")),
             _ => return Err("examples does not accept positional arguments".into()),
         }
@@ -326,7 +332,7 @@ fn parse_doctor(args: Vec<String>) -> Result<Command, String> {
     for arg in args {
         match arg.as_str() {
             "--json" => json = true,
-            "-h" | "--help" => return Ok(Command::Help),
+            "-h" | "--help" => return Ok(Command::Help(HelpTopic::Global)),
             arg if arg.starts_with("--") => return Err(format!("unknown doctor option '{arg}'")),
             path => {
                 if file.replace(PathBuf::from(path)).is_some() {
@@ -355,7 +361,7 @@ fn parse_inspect(args: Vec<String>) -> Result<Command, String> {
             "--queries" => queries = true,
             "--json" => json = true,
             "--performance" => performance = true,
-            "-h" | "--help" => return Ok(Command::Help),
+            "-h" | "--help" => return Ok(Command::Help(HelpTopic::Inspect)),
             arg if arg.starts_with("--") => return Err(format!("unknown inspect option '{arg}'")),
             path => {
                 if file.replace(PathBuf::from(path)).is_some() {
@@ -403,7 +409,7 @@ fn wants_detailed_inspect(args: &[String]) -> bool {
 
 fn parse_convert(mut args: Vec<String>) -> Result<Command, String> {
     if args.is_empty() || args[0] == "-h" || args[0] == "--help" {
-        return Ok(Command::Help);
+        return Ok(Command::Help(HelpTopic::Convert));
     }
     let raw = args.remove(0);
     let format = match raw.as_str() {
@@ -423,7 +429,7 @@ fn parse_convert(mut args: Vec<String>) -> Result<Command, String> {
 
 fn parse_export(mut args: Vec<String>) -> Result<Command, String> {
     if args.is_empty() || args[0] == "-h" || args[0] == "--help" {
-        return Ok(Command::Help);
+        return Ok(Command::Help(HelpTopic::Global));
     }
     let raw = args.remove(0);
     let format = match raw.as_str() {
@@ -435,7 +441,7 @@ fn parse_export(mut args: Vec<String>) -> Result<Command, String> {
 
 fn parse_perf(mut args: Vec<String>) -> Result<Command, String> {
     if args.is_empty() || args[0] == "-h" || args[0] == "--help" {
-        return Ok(Command::Help);
+        return Ok(Command::Help(HelpTopic::Global));
     }
     let raw = args.remove(0);
     let command = match raw.as_str() {
@@ -452,7 +458,7 @@ fn parse_perf(mut args: Vec<String>) -> Result<Command, String> {
 
 fn parse_digest(mut args: Vec<String>) -> Result<Command, String> {
     if args.is_empty() || args[0] == "-h" || args[0] == "--help" {
-        return Ok(Command::Help);
+        return Ok(Command::Help(HelpTopic::Global));
     }
     let command = args.remove(0);
     match command.as_str() {
@@ -477,7 +483,7 @@ fn parse_optimize(args: Vec<String>) -> Result<Command, String> {
             }
             "--full" => full = true,
             "--json" => json = true,
-            "-h" | "--help" => return Ok(Command::Help),
+            "-h" | "--help" => return Ok(Command::Help(HelpTopic::Optimize)),
             arg if arg.starts_with("--") => return Err(format!("unknown optimize option '{arg}'")),
             path => {
                 if file.replace(PathBuf::from(path)).is_some() {
@@ -709,7 +715,7 @@ fn parse_query(args: Vec<String>) -> Result<Command, String> {
                 })?));
             }
             "--json-diagnostics" => json_diagnostics = true,
-            "-h" | "--help" => return Ok(Command::Help),
+            "-h" | "--help" => return Ok(Command::Help(HelpTopic::Query)),
             arg if arg.starts_with("--") => return Err(format!("unknown query option '{arg}'")),
             positional => positionals.push(positional.to_string()),
         }
@@ -948,316 +954,6 @@ fn run_digest_verify(args: Vec<String>) -> Result<bool, String> {
         .map_err(|error| format!("cannot serialize report: {error}"))?
     );
     Ok(success)
-}
-
-fn run_sidecar(mut args: Vec<String>) -> Result<(), String> {
-    if args.is_empty() || args[0] == "-h" || args[0] == "--help" {
-        println!("usage: cove sidecar <inspect|build> ...");
-        return Ok(());
-    }
-    let command = args.remove(0);
-    match command.as_str() {
-        "inspect" => run_sidecar_inspect(args),
-        "build" => run_sidecar_build(args),
-        other => Err(format!(
-            "unknown sidecar command '{other}'; expected inspect or build"
-        )),
-    }
-}
-
-fn run_sidecar_inspect(mut args: Vec<String>) -> Result<(), String> {
-    if args.len() != 2 || args[0] == "-h" || args[0] == "--help" {
-        return Err(
-            "usage: cove sidecar inspect <index|coverage|layout|cache|runtime> <file>".into(),
-        );
-    }
-    let kind = args.remove(0);
-    let path = PathBuf::from(args.remove(0));
-    let bytes =
-        fs::read(&path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-    match kind.as_str() {
-        "index" | "covi" => inspect_index_sidecar(&path, &bytes),
-        "coverage" => inspect_coverage_sidecar(&path, &bytes),
-        "layout" => inspect_layout_sidecar(&path, &bytes),
-        "cache" => inspect_cache_sidecar(&path, &bytes),
-        "runtime" => inspect_runtime_sidecar(&path, &bytes),
-        other => Err(format!(
-            "unknown sidecar kind '{other}'; expected index, coverage, layout, cache, or runtime"
-        )),
-    }
-}
-
-fn run_sidecar_build(mut args: Vec<String>) -> Result<(), String> {
-    if args.is_empty() || args[0] == "-h" || args[0] == "--help" {
-        return Err("usage: cove sidecar build <covi|covx|covm> ...".into());
-    }
-    let kind = args.remove(0);
-    match kind.as_str() {
-        "covi" => build_covi_sidecar(args),
-        "covx" => build_covx_or_covm_sidecar(args, true),
-        "covm" => build_covx_or_covm_sidecar(args, false),
-        other => Err(format!(
-            "unknown sidecar build kind '{other}'; expected covi, covx, or covm"
-        )),
-    }
-}
-
-fn inspect_index_sidecar(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    if bytes.len() >= 4 && bytes[bytes.len() - 4..] == *b"CVI2" {
-        let artifact = cove_index::CoviArtifactV2::parse(bytes)
-            .map_err(|error| format!("{}: {error}", path.display()))?;
-        println!(
-            "valid COVE-I artifact: sections={} roots={} files={} capabilities={} key_blocks={} entry_blocks={} postings_blocks={}",
-            artifact.sections.len(),
-            artifact.header.index_root_count,
-            artifact.header.referenced_file_count,
-            artifact.header.capability_count,
-            artifact.key_blocks.len(),
-            artifact.entry_blocks.len(),
-            artifact.postings_blocks.len()
-        );
-        return Ok(());
-    }
-    if let Ok(capabilities) = cove_index::IndexCapabilityV2::parse_many(bytes) {
-        println!(
-            "valid COVE-I index capability section: {} capabilities",
-            capabilities.len()
-        );
-        return Ok(());
-    }
-    if let Ok(capabilities) = cove_index::IndexOnlyCapabilityV2::parse_many(bytes) {
-        println!(
-            "valid COVE-I index-only capability section: {} capabilities",
-            capabilities.len()
-        );
-        return Ok(());
-    }
-    let artifact = cove_index::CoviArtifactV2::parse(bytes)
-        .map_err(|error| format!("{}: {error}", path.display()))?;
-    println!(
-        "valid COVE-I artifact: sections={} roots={} files={} capabilities={} key_blocks={} entry_blocks={} postings_blocks={}",
-        artifact.sections.len(),
-        artifact.header.index_root_count,
-        artifact.header.referenced_file_count,
-        artifact.header.capability_count,
-        artifact.key_blocks.len(),
-        artifact.entry_blocks.len(),
-        artifact.postings_blocks.len()
-    );
-    Ok(())
-}
-
-fn inspect_coverage_sidecar(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    if let Ok(providers) = cove_coverage::CoverageProviderDescriptorV2::parse_many(bytes) {
-        println!(
-            "valid COVE-COVERAGE provider registry: {} providers",
-            providers.len()
-        );
-        return Ok(());
-    }
-    if let Ok(set) = cove_coverage::CoverageSetV2::parse(bytes) {
-        println!(
-            "valid COVE-COVERAGE set: id={} provider={} entries={} pruning_safe={}",
-            set.header.coverage_set_id,
-            set.header.provider_id,
-            set.entries.len(),
-            cove_coverage::can_use_for_pruning(&set.header)
-        );
-        return Ok(());
-    }
-    if let Ok(records) = cove_coverage::CoverageProofRecordV2::parse_many(bytes) {
-        println!(
-            "valid COVE-COVERAGE proof records: {} pruning_safe={}",
-            records.len(),
-            records.iter().all(cove_coverage::can_use_proof_for_pruning)
-        );
-        return Ok(());
-    }
-    if let Ok(candidates) = cove_coverage::CoveragePlanCandidateV2::parse_many(bytes) {
-        println!("valid COVE-COVERAGE plan candidates: {}", candidates.len());
-        return Ok(());
-    }
-    if let Ok(forms) = cove_coverage::PredicateNormalFormV2::parse_many(bytes) {
-        println!("valid COVE-COVERAGE predicate forms: {}", forms.len());
-        return Ok(());
-    }
-    match cove_coverage::IntervalPredicateV2::parse_many(bytes) {
-        Ok(intervals) => {
-            println!(
-                "valid COVE-COVERAGE interval predicates: {}",
-                intervals.len()
-            );
-            Ok(())
-        }
-        Err(error) => Err(format!(
-            "{}: not a valid provider registry, coverage set, proof record, predicate form, interval predicate, or plan candidate: {error}",
-            path.display()
-        )),
-    }
-}
-
-fn inspect_layout_sidecar(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    if let Ok(plan) = cove_layout::LayoutPlanV2::parse(bytes) {
-        println!(
-            "valid COVE-L layout plan: layout_id={} nodes={} root={}",
-            plan.header.layout_id,
-            plan.nodes.len(),
-            plan.header.root_node_id
-        );
-        return Ok(());
-    }
-    if let Ok(index) = cove_layout::ScanSplitIndexV2::parse(bytes) {
-        println!(
-            "valid COVE-L scan split index: splits={}",
-            index.entries.len()
-        );
-        return Ok(());
-    }
-    match cove_layout::ZeroCopyBufferMapV2::parse(bytes) {
-        Ok(map) => {
-            println!(
-                "valid COVE-L zero-copy buffer map: targets={} entries={}",
-                map.targets.len(),
-                map.entries.len()
-            );
-            Ok(())
-        }
-        Err(error) => Err(format!(
-            "{}: not a valid COVE-L layout plan, scan split index, or zero-copy map: {error}",
-            path.display()
-        )),
-    }
-}
-
-fn inspect_cache_sidecar(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    match cove_cache::CoverageCacheV2::parse(bytes) {
-        Ok(cache) => {
-            println!(
-                "valid COVE-CACHE diagnostic record: entries={} version={}.{}",
-                cache.entries.len(),
-                cache.header.cache_format_version_major,
-                cache.header.cache_format_version_minor
-            );
-            Ok(())
-        }
-        Err(error) => Err(format!("{}: {error}", path.display())),
-    }
-}
-
-fn inspect_runtime_sidecar(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    match cove_runtime::RuntimeCompatibilityHintV2::parse_many(bytes) {
-        Ok(hints) => {
-            println!("valid COVE-R runtime hints: {} hints", hints.len());
-            for hint in hints {
-                println!(
-                    "hint_id={} kind={:?} required={} {}::{} v{}.{}",
-                    hint.hint_id,
-                    hint.hint_kind,
-                    hint.required,
-                    hint.namespace,
-                    hint.name,
-                    hint.version_major,
-                    hint.version_minor
-                );
-            }
-            Ok(())
-        }
-        Err(error) => Err(format!("{}: {error}", path.display())),
-    }
-}
-
-fn build_covx_or_covm_sidecar(mut args: Vec<String>, covx: bool) -> Result<(), String> {
-    if args.len() < 2 {
-        return Err(if covx {
-            "usage: cove sidecar build covx <output.covx> <input.cove>...".into()
-        } else {
-            "usage: cove sidecar build covm <output.covm> <input.cove>...".into()
-        });
-    }
-    let output = PathBuf::from(args.remove(0));
-    let inputs = args.into_iter().map(PathBuf::from).collect::<Vec<_>>();
-    let (bytes, report) = if covx {
-        build_covx_artifact(&output, &inputs).map_err(|error| error.to_string())?
-    } else {
-        build_covm_artifact(&output, &inputs).map_err(|error| error.to_string())?
-    };
-    durable::durable_replace(&output, &bytes)
-        .map_err(|error| format!("cannot durably publish {}: {error}", output.display()))?;
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&report.to_json_value())
-            .map_err(|error| format!("cannot serialize report: {error}"))?
-    );
-    Ok(())
-}
-
-fn build_covi_sidecar(args: Vec<String>) -> Result<(), String> {
-    use cove_index::build::{build_covi_from_cove_bytes, CoviBuildOptions};
-
-    if args.len() == 1 {
-        let output = &args[0];
-        let artifact = cove_index::CoviArtifactV2::new_empty([0u8; 16], [0u8; 16]);
-        let bytes = artifact
-            .serialize_empty()
-            .map_err(|error| format!("failed to build empty COVE-I artifact: {error}"))?;
-        fs::write(output, bytes).map_err(|error| format!("{output}: {error}"))?;
-        println!("wrote empty COVE-I artifact to {output}");
-        return Ok(());
-    }
-
-    let mut positionals = Vec::new();
-    let mut options = CoviBuildOptions::default();
-    let mut iter = args.into_iter();
-    while let Some(arg) = iter.next() {
-        match arg.as_str() {
-            "--table-id" => {
-                let value = iter
-                    .next()
-                    .ok_or_else(|| "--table-id requires a value".to_string())?;
-                options.table_id = Some(
-                    value
-                        .parse::<u32>()
-                        .map_err(|_| format!("invalid --table-id value: {value}"))?,
-                );
-            }
-            "--column-id" => {
-                let value = iter
-                    .next()
-                    .ok_or_else(|| "--column-id requires a value".to_string())?;
-                options.column_ids.push(
-                    value
-                        .parse::<u32>()
-                        .map_err(|_| format!("invalid --column-id value: {value}"))?,
-                );
-            }
-            "--all-columns" => options.all_columns = true,
-            "--index-only-counts" => options.include_index_only_counts = true,
-            "--index-only-exists" => options.include_index_only_exists = true,
-            "--index-only-min-max" => options.include_index_only_min_max = true,
-            "--index-only-distinct-count" => options.include_index_only_distinct_count = true,
-            "--index-only-sum-avg" => options.include_index_only_sum_avg = true,
-            "-h" | "--help" => {
-                println!("usage: cove sidecar build covi <input.cove> <output.covi> [--table-id <id>] [--column-id <id> ... | --all-columns] [--index-only-counts] [--index-only-exists] [--index-only-min-max] [--index-only-distinct-count] [--index-only-sum-avg]");
-                return Ok(());
-            }
-            _ if arg.starts_with("--") => return Err(format!("unknown option: {arg}")),
-            _ => positionals.push(arg),
-        }
-    }
-    if positionals.len() != 2 {
-        return Err("usage: cove sidecar build covi <input.cove> <output.covi> [options]".into());
-    }
-    if options.all_columns && !options.column_ids.is_empty() {
-        return Err("--all-columns cannot be combined with --column-id".into());
-    }
-    let input_path = positionals.remove(0);
-    let output_path = positionals.remove(0);
-    let input = fs::read(&input_path).map_err(|error| format!("{input_path}: {error}"))?;
-    let bytes = build_covi_from_cove_bytes(&input, &options)
-        .map_err(|error| format!("{input_path}: {error}"))?;
-    fs::write(&output_path, bytes).map_err(|error| format!("{output_path}: {error}"))?;
-    println!("wrote COVE-I artifact to {output_path}");
-    Ok(())
 }
 
 fn run_examples(json: bool) -> Result<(), String> {
@@ -1593,323 +1289,6 @@ fn external_only_context_bytes() -> Vec<u8> {
     })
     .write()
     .expect("empty COVE-T context file is valid")
-}
-
-fn register_external_tables(
-    execute_options: &mut ExecuteArtifactOptions,
-    specs: &[ExternalTableSpec],
-) -> Result<(), String> {
-    for spec in specs {
-        let rows = read_external_table_rows(&spec.path)?;
-        let authority = external_table_authority(&spec.table_name, &spec.path, rows)?;
-        execute_options
-            .resolve_options
-            .table_authorities
-            .insert(spec.table_name.clone(), authority);
-    }
-    Ok(())
-}
-
-fn read_external_table_rows(path: &Path) -> Result<Vec<TableSurfaceRow>, String> {
-    match path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .map(|extension| extension.to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("csv") => read_external_csv_rows(path),
-        Some("jsonl") | Some("ndjson") => read_external_jsonl_rows(path),
-        Some("json") => read_external_json_rows(path),
-        _ => {
-            let text = fs::read_to_string(path).map_err(|error| {
-                format!("cannot read external table {}: {error}", path.display())
-            })?;
-            if text.trim_start().starts_with('[') || text.trim_start().starts_with('{') {
-                rows_from_json_text(&text, path)
-            } else {
-                read_external_jsonl_text(&text, path)
-            }
-        }
-    }
-}
-
-fn read_external_csv_rows(path: &Path) -> Result<Vec<TableSurfaceRow>, String> {
-    let mut reader = csv::Reader::from_path(path)
-        .map_err(|error| format!("cannot read CSV external table {}: {error}", path.display()))?;
-    let headers = reader
-        .headers()
-        .map_err(|error| format!("cannot read CSV headers {}: {error}", path.display()))?
-        .iter()
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    let mut rows = Vec::new();
-    for record in reader.records() {
-        let record =
-            record.map_err(|error| format!("cannot read CSV row {}: {error}", path.display()))?;
-        let mut row = BTreeMap::new();
-        for (header, value) in headers.iter().zip(record.iter()) {
-            row.insert(header.clone(), parse_external_csv_cell(value));
-        }
-        rows.push(row);
-    }
-    Ok(rows)
-}
-
-fn parse_external_csv_cell(value: &str) -> Value {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return Value::Null;
-    }
-    if trimmed.eq_ignore_ascii_case("true") {
-        return Value::Bool(true);
-    }
-    if trimmed.eq_ignore_ascii_case("false") {
-        return Value::Bool(false);
-    }
-    if let Ok(value) = trimmed.parse::<i64>() {
-        return Value::Number(value.into());
-    }
-    if let Ok(value) = trimmed.parse::<u64>() {
-        return Value::Number(value.into());
-    }
-    if let Ok(value) = trimmed.parse::<f64>() {
-        if let Some(number) = serde_json::Number::from_f64(value) {
-            return Value::Number(number);
-        }
-    }
-    Value::String(value.to_string())
-}
-
-fn read_external_json_rows(path: &Path) -> Result<Vec<TableSurfaceRow>, String> {
-    let text = fs::read_to_string(path).map_err(|error| {
-        format!(
-            "cannot read JSON external table {}: {error}",
-            path.display()
-        )
-    })?;
-    rows_from_json_text(&text, path)
-}
-
-fn rows_from_json_text(text: &str, path: &Path) -> Result<Vec<TableSurfaceRow>, String> {
-    let value: Value = serde_json::from_str(text).map_err(|error| {
-        format!(
-            "cannot parse JSON external table {}: {error}",
-            path.display()
-        )
-    })?;
-    let rows = match value {
-        Value::Array(rows) => rows,
-        Value::Object(mut object) => match object.remove("rows") {
-            Some(Value::Array(rows)) => rows,
-            _ => {
-                return Err(format!(
-                "JSON external table {} must be an array of objects or an object with a rows array",
-                path.display()
-            ))
-            }
-        },
-        _ => {
-            return Err(format!(
-                "JSON external table {} must be an array of objects",
-                path.display()
-            ))
-        }
-    };
-    rows.into_iter()
-        .enumerate()
-        .map(|(index, value)| value_to_table_row(value, path, index + 1))
-        .collect()
-}
-
-fn read_external_jsonl_rows(path: &Path) -> Result<Vec<TableSurfaceRow>, String> {
-    let text = fs::read_to_string(path).map_err(|error| {
-        format!(
-            "cannot read JSONL external table {}: {error}",
-            path.display()
-        )
-    })?;
-    read_external_jsonl_text(&text, path)
-}
-
-fn read_external_jsonl_text(text: &str, path: &Path) -> Result<Vec<TableSurfaceRow>, String> {
-    text.lines()
-        .enumerate()
-        .filter(|(_, line)| !line.trim().is_empty())
-        .map(|(index, line)| {
-            let value = serde_json::from_str::<Value>(line).map_err(|error| {
-                format!(
-                    "cannot parse JSONL external table {} line {}: {error}",
-                    path.display(),
-                    index + 1
-                )
-            })?;
-            value_to_table_row(value, path, index + 1)
-        })
-        .collect()
-}
-
-fn value_to_table_row(
-    value: Value,
-    path: &Path,
-    row_number: usize,
-) -> Result<TableSurfaceRow, String> {
-    let Value::Object(object) = value else {
-        return Err(format!(
-            "external table {} row {} must be a JSON object",
-            path.display(),
-            row_number
-        ));
-    };
-    Ok(object.into_iter().collect::<BTreeMap<_, _>>())
-}
-
-fn external_table_authority(
-    table_name: &str,
-    path: &Path,
-    mut rows: Vec<TableSurfaceRow>,
-) -> Result<TableSurfaceAuthority, String> {
-    let columns = external_table_columns(&rows);
-    if columns.is_empty() {
-        return Err(format!(
-            "external table {table_name} from {} has no columns",
-            path.display()
-        ));
-    }
-    let row_identity = if columns.iter().any(|column| column.name == "id") {
-        vec!["id".into()]
-    } else {
-        vec![columns[0].name.clone()]
-    };
-    let canonical_order = row_identity.clone();
-    let provider_id = format!("external-file:{}", path.display());
-    let table_id = format!("external:{}", coveql_identifier(table_name));
-    for row in &mut rows {
-        for column in &columns {
-            row.entry(column.name.clone()).or_insert(Value::Null);
-        }
-    }
-    Ok(TableSurfaceAuthority {
-        contract: TableSurfaceContract {
-            table_id: table_id.clone(),
-            table_name: table_name.to_string(),
-            contract_version: COVEQL_PROFILE_CONTRACT_VERSION.into(),
-            authority_kind: TableSurfaceAuthorityKind::ExternalRegisteredTable,
-            authority_fingerprint: external_table_fingerprint(
-                table_name,
-                path,
-                rows.len(),
-                &columns,
-            ),
-            schema_fingerprint: external_table_schema_fingerprint(table_name, &columns),
-            logical_column_map: columns,
-            row_grain: "external_file_row".into(),
-            row_identity,
-            canonical_order,
-            visibility_authority: "external_file_visible_rows".into(),
-            redaction_authority: "external_file_no_redaction_metadata".into(),
-            temporal_authority: TableTemporalAuthority::StaticTableSnapshot,
-            evidence_capabilities: vec![AstEvidenceGrain::Row],
-            null_missing_nan_policy: "json_null_and_missing_are_null".into(),
-            collation_policy: "binary_utf8".into(),
-            code_domain_contexts: Vec::new(),
-            code_domain_bridges: Vec::new(),
-            projection_dependency_contract_id: None,
-            datafusion_interop_contract: Some("cli_external_file_rows".into()),
-        },
-        execution_authority: TableExecutionAuthority::ExternalRows { provider_id, rows },
-    })
-}
-
-fn external_table_columns(rows: &[TableSurfaceRow]) -> Vec<TableSurfaceColumnContract> {
-    let mut names = BTreeSet::new();
-    for row in rows {
-        names.extend(row.keys().cloned());
-    }
-    names
-        .into_iter()
-        .map(|name| {
-            let values = rows
-                .iter()
-                .map(|row| row.get(&name).unwrap_or(&Value::Null))
-                .collect::<Vec<_>>();
-            TableSurfaceColumnContract {
-                name,
-                logical_type: Some(infer_external_logical_type(&values).into()),
-                nullable: values.iter().any(|value| value.is_null()),
-                source_path: None,
-                code_domain: None,
-                collation: None,
-            }
-        })
-        .collect()
-}
-
-fn infer_external_logical_type(values: &[&Value]) -> &'static str {
-    let non_null = values
-        .iter()
-        .copied()
-        .filter(|value| !value.is_null())
-        .collect::<Vec<_>>();
-    if non_null.is_empty() {
-        return "null";
-    }
-    if non_null.iter().all(|value| value.is_boolean()) {
-        return "bool";
-    }
-    if non_null.iter().all(|value| {
-        value.as_i64().is_some()
-            || value
-                .as_u64()
-                .is_some_and(|value| i64::try_from(value).is_ok())
-    }) {
-        return "int64";
-    }
-    if non_null.iter().all(|value| value.is_number()) {
-        return "float64";
-    }
-    if non_null.iter().all(|value| value.is_string()) {
-        return "utf8";
-    }
-    "json"
-}
-
-fn external_table_fingerprint(
-    table_name: &str,
-    path: &Path,
-    row_count: usize,
-    columns: &[TableSurfaceColumnContract],
-) -> String {
-    format!(
-        "external-file:{}:{}:{}:{}",
-        table_name,
-        path.display(),
-        row_count,
-        columns
-            .iter()
-            .map(|column| column.name.as_str())
-            .collect::<Vec<_>>()
-            .join(",")
-    )
-}
-
-fn external_table_schema_fingerprint(
-    table_name: &str,
-    columns: &[TableSurfaceColumnContract],
-) -> String {
-    format!(
-        "external-schema:{}:{}",
-        table_name,
-        columns
-            .iter()
-            .map(|column| format!(
-                "{}:{}:{}",
-                column.name,
-                column.logical_type.as_deref().unwrap_or("unknown"),
-                column.nullable
-            ))
-            .collect::<Vec<_>>()
-            .join(",")
-    )
 }
 
 fn apply_graph_budget(options: &mut ExecuteArtifactOptions, budget: GraphBudgetOverrides) {
@@ -2320,181 +1699,6 @@ fn print_columns(columns: &[coveql::QueryColumnSurface]) {
     );
 }
 
-fn write_result(value: &Value, format: OutputFormat, max_cell_width: usize) -> Result<(), String> {
-    match format {
-        OutputFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(value).unwrap());
-            Ok(())
-        }
-        OutputFormat::Jsonl => write_jsonl(value),
-        OutputFormat::Csv => write_csv(value),
-        OutputFormat::Table => write_table(value, max_cell_width),
-    }
-}
-
-fn rows_array(value: &Value) -> Result<&[Value], String> {
-    value
-        .as_array()
-        .map(Vec::as_slice)
-        .ok_or_else(|| "query output is not a row array".to_string())
-}
-
-fn write_jsonl(value: &Value) -> Result<(), String> {
-    for row in rows_array(value)? {
-        println!("{}", serde_json::to_string(row).unwrap());
-    }
-    Ok(())
-}
-
-fn write_csv(value: &Value) -> Result<(), String> {
-    let rows = rows_array(value)?;
-    let columns = output_columns(rows);
-    let mut out = io::BufWriter::new(io::stdout());
-    writeln_csv_row(&mut out, &columns)?;
-    for row in rows {
-        let values = columns
-            .iter()
-            .map(|column| {
-                row.as_object()
-                    .and_then(|object| object.get(column))
-                    .map(cell_text)
-                    .unwrap_or_default()
-            })
-            .collect::<Vec<_>>();
-        writeln_csv_row(&mut out, &values)?;
-    }
-    Ok(())
-}
-
-fn writeln_csv_row(out: &mut impl Write, values: &[String]) -> Result<(), String> {
-    let line = values
-        .iter()
-        .map(|value| csv_escape(value))
-        .collect::<Vec<_>>()
-        .join(",");
-    writeln!(out, "{line}").map_err(|error| format!("cannot write CSV: {error}"))
-}
-
-fn csv_escape(value: &str) -> String {
-    if value.contains(',') || value.contains('"') || value.contains('\n') || value.contains('\r') {
-        format!("\"{}\"", value.replace('"', "\"\""))
-    } else {
-        value.to_owned()
-    }
-}
-
-fn write_table(value: &Value, max_cell_width: usize) -> Result<(), String> {
-    let rows = rows_array(value)?;
-    let columns = output_columns(rows);
-    if columns.is_empty() {
-        println!("(0 columns, {} rows)", rows.len());
-        return Ok(());
-    }
-    let rendered = rows
-        .iter()
-        .map(|row| {
-            columns
-                .iter()
-                .map(|column| {
-                    row.as_object()
-                        .and_then(|object| object.get(column))
-                        .map(cell_text)
-                        .unwrap_or_default()
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
-    let widths = columns
-        .iter()
-        .enumerate()
-        .map(|(index, column)| {
-            let value_width = rendered
-                .iter()
-                .map(|row| display_cell(&row[index], max_cell_width).len())
-                .max()
-                .unwrap_or_default();
-            column.len().max(value_width).min(max_cell_width)
-        })
-        .collect::<Vec<_>>();
-    print_table_separator(&widths);
-    print_table_row(&columns, &widths);
-    print_table_separator(&widths);
-    for row in &rendered {
-        print_table_row(row, &widths);
-    }
-    print_table_separator(&widths);
-    let truncated = rendered
-        .iter()
-        .flatten()
-        .any(|cell| display_cell(cell, max_cell_width).len() < cell.len());
-    println!(
-        "{} row{}{}",
-        rows.len(),
-        if rows.len() == 1 { "" } else { "s" },
-        if truncated {
-            " (long cells truncated)"
-        } else {
-            ""
-        }
-    );
-    Ok(())
-}
-
-fn output_columns(rows: &[Value]) -> Vec<String> {
-    let mut seen = BTreeSet::new();
-    let mut columns = Vec::new();
-    for row in rows {
-        if let Some(object) = row.as_object() {
-            for key in object.keys() {
-                if seen.insert(key.clone()) {
-                    columns.push(key.clone());
-                }
-            }
-        }
-    }
-    columns
-}
-
-fn print_table_separator(widths: &[usize]) {
-    print!("+");
-    for width in widths {
-        print!("{}+", "-".repeat(width + 2));
-    }
-    println!();
-}
-
-fn print_table_row(values: &[String], widths: &[usize]) {
-    print!("|");
-    for (value, width) in values.iter().zip(widths) {
-        let cell = display_cell(value, *width);
-        print!(" {cell:<width$} |");
-    }
-    println!();
-}
-
-fn cell_text(value: &Value) -> String {
-    match value {
-        Value::Null => String::new(),
-        Value::Bool(value) => value.to_string(),
-        Value::Number(value) => value.to_string(),
-        Value::String(value) => value.clone(),
-        Value::Array(_) | Value::Object(_) => serde_json::to_string(value).unwrap_or_default(),
-    }
-}
-
-fn display_cell(value: &str, max_cell_width: usize) -> String {
-    let clean = value.replace(['\n', '\r', '\t'], " ");
-    if clean.chars().count() <= max_cell_width {
-        return clean;
-    }
-    let mut out = clean
-        .chars()
-        .take(max_cell_width.saturating_sub(3))
-        .collect::<String>();
-    out.push_str("...");
-    out
-}
-
 fn format_artifact_query_error(error: ExecuteArtifactQueryError, json_diagnostics: bool) -> String {
     match error {
         ExecuteArtifactQueryError::Execution(error) => {
@@ -2536,12 +1740,4 @@ fn beginner_suggestion(code: &str) -> &'static str {
         "E_PARSE" => "Check the CoveQL syntax or start from a suggested query.",
         _ => "Run with `--json-diagnostics` for structured diagnostic details.",
     }
-}
-
-fn print_usage() {
-    println!("{}", usage());
-}
-
-fn usage() -> String {
-    "Usage:\n  cove examples [--json]\n  cove doctor [--json] <file>\n  cove inspect [--queries] [--performance] [--json] <file>\n  cove inspect [--json] [--sections stats,dictionary,execution,indexes,optional] <file...>\n  cove optimize <file> [--out-dir dir] [--full] [--json]\n  cove query [--format table|json|jsonl|csv] [--take n] [--max-cell-width n] [--explain [public|developer|proof|coded|forensic]] [--engine auto|materialized|physical|compare|kernel] [--no-auto-sidecars] [--strict-performance] [--perf-report] [--batch-size n] [--external-table name=path.csv|json|jsonl] [--enable-graph-traversal] [--max-graph-depth n] [--max-graph-paths n] [--max-graph-fanout n] [--mapping file.covemap] [--member id=path] [--dataset dir] [--covi file] [--covx file] [--cove-e file] [file] '<coveql>'\n  cove query [options] --query-file <path|-> [file]\n  cove convert <parquet|arrow|orc|csv|report> ...\n  cove validate ...\n  cove dump ...\n  cove map <validate|preview|plan-keys|convert|explain|diff|project|test> ...\n  cove export arrow ...\n  cove perf <explain-pruning|plan-cost> ...\n  cove sidecar inspect <index|coverage|layout|cache|runtime> <file>\n  cove sidecar build <covi|covx|covm> ...\n  cove digest verify <file.cove> [--require]\n  cove profile <inspect|generate|validate-section> ...\n  cove canonicalise <validate-payload|encode-json|check-domain|check-trust> ...\n\nExamples:\n  cove examples\n  cove doctor people.cove\n  cove inspect --queries --performance people.cove\n  cove convert parquet source.parquet output.cove\n  cove validate --semantic output.cove\n  cove optimize output.cove\n  cove query output.cove 'table(source).take(10)'\n  cove query --format jsonl people.cove 'table(people).where(active == true)'\n  cove map preview mapping.covemap\n  cove sidecar build covi output.cove output.covi --all-columns\n  cove query --query-file query.coveql people.cove".into()
 }

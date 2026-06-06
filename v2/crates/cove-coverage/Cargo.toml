@@ -2,6 +2,8 @@
 name = "cove-coverage"
 version = "0.1.0"
 edition = "2021"
+description = "COVE-COVERAGE provider, proof, and predicate metadata validation"
+license = "MIT"
 autobins = false
 
 [dependencies]

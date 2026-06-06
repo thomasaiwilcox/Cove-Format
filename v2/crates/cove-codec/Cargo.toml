@@ -2,6 +2,8 @@
 name = "cove-codec"
 version = "0.1.0"
 edition = "2021"
+description = "COVE-CX registered codec descriptors and validation tools"
+license = "MIT"
 
 [dependencies]
 cove-core = { path = "../cove-core" }

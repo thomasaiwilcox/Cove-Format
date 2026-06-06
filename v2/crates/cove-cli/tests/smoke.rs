@@ -47,6 +47,16 @@ fn sample_path(name: &str) -> PathBuf {
         .join(name)
 }
 
+fn showcase_path(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/showcase")
+        .join(name)
+}
+
+fn workspace_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
 fn run_cove(args: &[&str]) -> Output {
     Command::new(cove_bin()).args(args).output().unwrap()
 }
@@ -1417,6 +1427,74 @@ fn parent_command_help_exits_successfully() {
 }
 
 #[test]
+fn command_specific_help_surfaces_reference_workflows() {
+    let cases = [
+        (
+            &["query", "--help"][..],
+            "Authority model:",
+            "sidecar-backed execution",
+        ),
+        (
+            &["inspect", "--help"][..],
+            "Beginner inspect",
+            "--performance",
+        ),
+        (
+            &["optimize", "--help"][..],
+            "Writes a sibling",
+            "materialized readback",
+        ),
+        (
+            &["sidecar", "--help"][..],
+            "cove sidecar build covi",
+            "--all-columns",
+        ),
+        (
+            &["convert", "--help"][..],
+            "cove convert parquet",
+            "cove-to-source",
+        ),
+        (
+            &["map", "--help"][..],
+            "cove map project",
+            "cove map convert",
+        ),
+    ];
+    for (args, expected_a, expected_b) in cases {
+        let output = run_cove(args);
+        assert!(
+            output.status.success(),
+            "args={args:?} stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("Usage:"), "args={args:?} stdout={stdout}");
+        assert!(
+            stdout.contains(expected_a) && stdout.contains(expected_b),
+            "args={args:?} stdout={stdout}"
+        );
+    }
+}
+
+#[test]
+fn release_gate_help_does_not_run_gate() {
+    let output = Command::new("sh")
+        .arg("scripts/release-gates.sh")
+        .arg("--help")
+        .current_dir(workspace_dir())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("--quick"));
+    assert!(!stdout.contains("cargo test"));
+}
+
+#[test]
 fn paths_with_spaces_and_query_files_work() {
     let file = temp_file("events final (v1).cove");
     let query_file = temp_file("query with spaces.coveql");
@@ -1771,4 +1849,169 @@ fn unified_sidecar_profile_digest_and_canonicalise_commands_work() {
         String::from_utf8_lossy(&canonicalise.stderr)
     );
     assert!(String::from_utf8_lossy(&canonicalise.stdout).contains("\"valid\": true"));
+}
+
+#[test]
+fn checked_in_showcase_exercises_reference_workflow() {
+    let customers = showcase_path("customers.cove");
+    let events = showcase_path("events.cove");
+    let map = showcase_path("customer_identity.covemap");
+    let crm = showcase_path("crm_people.jsonl");
+    let support = showcase_path("support_people.jsonl");
+
+    for path in [&customers, &events, &map, &crm, &support] {
+        assert!(
+            path.exists(),
+            "missing showcase artifact {}",
+            path.display()
+        );
+    }
+
+    let doctor = run_cove(&["doctor", customers.to_str().unwrap()]);
+    assert!(
+        doctor.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&doctor.stderr)
+    );
+    assert!(String::from_utf8_lossy(&doctor.stdout).contains("Queryable: yes"));
+
+    let inspect = run_cove(&[
+        "inspect",
+        "--queries",
+        "--performance",
+        customers.to_str().unwrap(),
+    ]);
+    assert!(
+        inspect.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&inspect.stderr)
+    );
+    let inspect_stdout = String::from_utf8_lossy(&inspect.stdout);
+    assert!(inspect_stdout.contains("table=customers"));
+    assert!(inspect_stdout.contains("Show evidence rows"));
+
+    let projected = run_cove(&[
+        "map",
+        "project",
+        "--format",
+        "json",
+        map.to_str().unwrap(),
+        crm.to_str().unwrap(),
+        support.to_str().unwrap(),
+    ]);
+    assert!(
+        projected.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&projected.stderr)
+    );
+    let projected_stdout = String::from_utf8_lossy(&projected.stdout);
+    assert!(projected_stdout.contains("\"mapping_id\": \"showcase-customer-identity\""));
+    assert!(projected_stdout.contains("\"output_table\": \"customers\""));
+
+    let customer_query = run_cove(&[
+        "query",
+        customers.to_str().unwrap(),
+        "--format",
+        "jsonl",
+        "table(customers).select(full_name, score, status)",
+    ]);
+    assert!(
+        customer_query.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&customer_query.stderr)
+    );
+    let customer_stdout = String::from_utf8_lossy(&customer_query.stdout);
+    assert!(customer_stdout.contains("\"full_name\":\"Ada Lovelace\""));
+    assert!(customer_stdout.contains("\"status\":\"dormant\""));
+
+    let evidence = run_cove(&[
+        "query",
+        customers.to_str().unwrap(),
+        "evidence().select(source_id, source_row_identity, rule_id).take(10)",
+    ]);
+    assert!(
+        evidence.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&evidence.stderr)
+    );
+    assert!(String::from_utf8_lossy(&evidence.stdout).contains("customers_360"));
+
+    let optimized_events = temp_file("showcase-events-for-optimize.cove");
+    fs::copy(&events, &optimized_events).unwrap();
+    let optimized = run_cove(&["optimize", optimized_events.to_str().unwrap()]);
+    assert!(
+        optimized.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&optimized.stderr)
+    );
+    assert!(String::from_utf8_lossy(&optimized.stdout).contains("Generated sidecars"));
+
+    let compare = run_cove(&[
+        "query",
+        "--engine",
+        "compare",
+        "--perf-report",
+        optimized_events.to_str().unwrap(),
+        "table(events).where(score >= 25).select(event_id, person_id, score)",
+    ]);
+    assert!(
+        compare.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&compare.stderr)
+    );
+    assert!(String::from_utf8_lossy(&compare.stdout).contains("1005"));
+    assert!(String::from_utf8_lossy(&compare.stderr).contains("Performance report"));
+}
+
+#[test]
+fn showcase_generator_rebuilds_valid_artifacts() {
+    let out_dir = temp_file("regenerated-showcase");
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    let output = Command::new(cargo)
+        .args([
+            "run",
+            "-q",
+            "-p",
+            "cove-cli",
+            "--example",
+            "generate_beginner_samples",
+            "--",
+            "--showcase",
+            out_dir.to_str().unwrap(),
+        ])
+        .current_dir(workspace_dir())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let generated_customers = out_dir.join("customers.cove");
+    let generated_events = out_dir.join("events.cove");
+    let validate_customers = run_cove(&[
+        "validate",
+        "--semantic",
+        generated_customers.to_str().unwrap(),
+    ]);
+    assert!(
+        validate_customers.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&validate_customers.stderr)
+    );
+    let query_events = run_cove(&[
+        "query",
+        generated_events.to_str().unwrap(),
+        "--format",
+        "jsonl",
+        "table(events).where(score >= 25).select(event_id, person_id, score)",
+    ]);
+    assert!(
+        query_events.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&query_events.stderr)
+    );
+    assert!(String::from_utf8_lossy(&query_events.stdout).contains("\"event_id\":1005"));
 }
