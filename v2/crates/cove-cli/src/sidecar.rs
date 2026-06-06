@@ -1,0 +1,318 @@
+use std::{fs, path::PathBuf};
+
+use cove_core::{
+    durable,
+    utility::{build_covm_artifact, build_covx_artifact},
+};
+
+pub(crate) fn run_sidecar(mut args: Vec<String>) -> Result<(), String> {
+    if args.is_empty() || args[0] == "-h" || args[0] == "--help" {
+        println!("usage: cove sidecar <inspect|build> ...");
+        return Ok(());
+    }
+    let command = args.remove(0);
+    match command.as_str() {
+        "inspect" => run_sidecar_inspect(args),
+        "build" => run_sidecar_build(args),
+        other => Err(format!(
+            "unknown sidecar command '{other}'; expected inspect or build"
+        )),
+    }
+}
+
+fn run_sidecar_inspect(mut args: Vec<String>) -> Result<(), String> {
+    if args.len() != 2 || args[0] == "-h" || args[0] == "--help" {
+        return Err(
+            "usage: cove sidecar inspect <index|coverage|layout|cache|runtime> <file>".into(),
+        );
+    }
+    let kind = args.remove(0);
+    let path = PathBuf::from(args.remove(0));
+    let bytes =
+        fs::read(&path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    match kind.as_str() {
+        "index" | "covi" => inspect_index_sidecar(&path, &bytes),
+        "coverage" => inspect_coverage_sidecar(&path, &bytes),
+        "layout" => inspect_layout_sidecar(&path, &bytes),
+        "cache" => inspect_cache_sidecar(&path, &bytes),
+        "runtime" => inspect_runtime_sidecar(&path, &bytes),
+        other => Err(format!(
+            "unknown sidecar kind '{other}'; expected index, coverage, layout, cache, or runtime"
+        )),
+    }
+}
+
+fn run_sidecar_build(mut args: Vec<String>) -> Result<(), String> {
+    if args.is_empty() || args[0] == "-h" || args[0] == "--help" {
+        return Err("usage: cove sidecar build <covi|covx|covm> ...".into());
+    }
+    let kind = args.remove(0);
+    match kind.as_str() {
+        "covi" => build_covi_sidecar(args),
+        "covx" => build_covx_or_covm_sidecar(args, true),
+        "covm" => build_covx_or_covm_sidecar(args, false),
+        other => Err(format!(
+            "unknown sidecar build kind '{other}'; expected covi, covx, or covm"
+        )),
+    }
+}
+
+fn inspect_index_sidecar(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    if bytes.len() >= 4 && bytes[bytes.len() - 4..] == *b"CVI2" {
+        let artifact = cove_index::CoviArtifactV2::parse(bytes)
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        println!(
+            "valid COVE-I artifact: sections={} roots={} files={} capabilities={} key_blocks={} entry_blocks={} postings_blocks={}",
+            artifact.sections.len(),
+            artifact.header.index_root_count,
+            artifact.header.referenced_file_count,
+            artifact.header.capability_count,
+            artifact.key_blocks.len(),
+            artifact.entry_blocks.len(),
+            artifact.postings_blocks.len()
+        );
+        return Ok(());
+    }
+    if let Ok(capabilities) = cove_index::IndexCapabilityV2::parse_many(bytes) {
+        println!(
+            "valid COVE-I index capability section: {} capabilities",
+            capabilities.len()
+        );
+        return Ok(());
+    }
+    if let Ok(capabilities) = cove_index::IndexOnlyCapabilityV2::parse_many(bytes) {
+        println!(
+            "valid COVE-I index-only capability section: {} capabilities",
+            capabilities.len()
+        );
+        return Ok(());
+    }
+    let artifact = cove_index::CoviArtifactV2::parse(bytes)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    println!(
+        "valid COVE-I artifact: sections={} roots={} files={} capabilities={} key_blocks={} entry_blocks={} postings_blocks={}",
+        artifact.sections.len(),
+        artifact.header.index_root_count,
+        artifact.header.referenced_file_count,
+        artifact.header.capability_count,
+        artifact.key_blocks.len(),
+        artifact.entry_blocks.len(),
+        artifact.postings_blocks.len()
+    );
+    Ok(())
+}
+
+fn inspect_coverage_sidecar(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    if let Ok(providers) = cove_coverage::CoverageProviderDescriptorV2::parse_many(bytes) {
+        println!(
+            "valid COVE-COVERAGE provider registry: {} providers",
+            providers.len()
+        );
+        return Ok(());
+    }
+    if let Ok(set) = cove_coverage::CoverageSetV2::parse(bytes) {
+        println!(
+            "valid COVE-COVERAGE set: id={} provider={} entries={} pruning_safe={}",
+            set.header.coverage_set_id,
+            set.header.provider_id,
+            set.entries.len(),
+            cove_coverage::can_use_for_pruning(&set.header)
+        );
+        return Ok(());
+    }
+    if let Ok(records) = cove_coverage::CoverageProofRecordV2::parse_many(bytes) {
+        println!(
+            "valid COVE-COVERAGE proof records: {} pruning_safe={}",
+            records.len(),
+            records.iter().all(cove_coverage::can_use_proof_for_pruning)
+        );
+        return Ok(());
+    }
+    if let Ok(candidates) = cove_coverage::CoveragePlanCandidateV2::parse_many(bytes) {
+        println!("valid COVE-COVERAGE plan candidates: {}", candidates.len());
+        return Ok(());
+    }
+    if let Ok(forms) = cove_coverage::PredicateNormalFormV2::parse_many(bytes) {
+        println!("valid COVE-COVERAGE predicate forms: {}", forms.len());
+        return Ok(());
+    }
+    match cove_coverage::IntervalPredicateV2::parse_many(bytes) {
+        Ok(intervals) => {
+            println!(
+                "valid COVE-COVERAGE interval predicates: {}",
+                intervals.len()
+            );
+            Ok(())
+        }
+        Err(error) => Err(format!(
+            "{}: not a valid provider registry, coverage set, proof record, predicate form, interval predicate, or plan candidate: {error}",
+            path.display()
+        )),
+    }
+}
+
+fn inspect_layout_sidecar(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    if let Ok(plan) = cove_layout::LayoutPlanV2::parse(bytes) {
+        println!(
+            "valid COVE-L layout plan: layout_id={} nodes={} root={}",
+            plan.header.layout_id,
+            plan.nodes.len(),
+            plan.header.root_node_id
+        );
+        return Ok(());
+    }
+    if let Ok(index) = cove_layout::ScanSplitIndexV2::parse(bytes) {
+        println!(
+            "valid COVE-L scan split index: splits={}",
+            index.entries.len()
+        );
+        return Ok(());
+    }
+    match cove_layout::ZeroCopyBufferMapV2::parse(bytes) {
+        Ok(map) => {
+            println!(
+                "valid COVE-L zero-copy buffer map: targets={} entries={}",
+                map.targets.len(),
+                map.entries.len()
+            );
+            Ok(())
+        }
+        Err(error) => Err(format!(
+            "{}: not a valid COVE-L layout plan, scan split index, or zero-copy map: {error}",
+            path.display()
+        )),
+    }
+}
+
+fn inspect_cache_sidecar(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    match cove_cache::CoverageCacheV2::parse(bytes) {
+        Ok(cache) => {
+            println!(
+                "valid COVE-CACHE diagnostic record: entries={} version={}.{}",
+                cache.entries.len(),
+                cache.header.cache_format_version_major,
+                cache.header.cache_format_version_minor
+            );
+            Ok(())
+        }
+        Err(error) => Err(format!("{}: {error}", path.display())),
+    }
+}
+
+fn inspect_runtime_sidecar(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    match cove_runtime::RuntimeCompatibilityHintV2::parse_many(bytes) {
+        Ok(hints) => {
+            println!("valid COVE-R runtime hints: {} hints", hints.len());
+            for hint in hints {
+                println!(
+                    "hint_id={} kind={:?} required={} {}::{} v{}.{}",
+                    hint.hint_id,
+                    hint.hint_kind,
+                    hint.required,
+                    hint.namespace,
+                    hint.name,
+                    hint.version_major,
+                    hint.version_minor
+                );
+            }
+            Ok(())
+        }
+        Err(error) => Err(format!("{}: {error}", path.display())),
+    }
+}
+
+fn build_covx_or_covm_sidecar(mut args: Vec<String>, covx: bool) -> Result<(), String> {
+    if args.len() < 2 {
+        return Err(if covx {
+            "usage: cove sidecar build covx <output.covx> <input.cove>...".into()
+        } else {
+            "usage: cove sidecar build covm <output.covm> <input.cove>...".into()
+        });
+    }
+    let output = PathBuf::from(args.remove(0));
+    let inputs = args.into_iter().map(PathBuf::from).collect::<Vec<_>>();
+    let (bytes, report) = if covx {
+        build_covx_artifact(&output, &inputs).map_err(|error| error.to_string())?
+    } else {
+        build_covm_artifact(&output, &inputs).map_err(|error| error.to_string())?
+    };
+    durable::durable_replace(&output, &bytes)
+        .map_err(|error| format!("cannot durably publish {}: {error}", output.display()))?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report.to_json_value())
+            .map_err(|error| format!("cannot serialize report: {error}"))?
+    );
+    Ok(())
+}
+
+fn build_covi_sidecar(args: Vec<String>) -> Result<(), String> {
+    use cove_index::build::{build_covi_from_cove_bytes, CoviBuildOptions};
+
+    if args.len() == 1 {
+        let output = PathBuf::from(&args[0]);
+        let artifact = cove_index::CoviArtifactV2::new_empty([0u8; 16], [0u8; 16]);
+        let bytes = artifact
+            .serialize_empty()
+            .map_err(|error| format!("failed to build empty COVE-I artifact: {error}"))?;
+        durable::durable_replace(&output, &bytes)
+            .map_err(|error| format!("cannot durably publish {}: {error}", output.display()))?;
+        println!("wrote empty COVE-I artifact to {}", output.display());
+        return Ok(());
+    }
+
+    let mut positionals = Vec::new();
+    let mut options = CoviBuildOptions::default();
+    let mut iter = args.into_iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--table-id" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--table-id requires a value".to_string())?;
+                options.table_id = Some(
+                    value
+                        .parse::<u32>()
+                        .map_err(|_| format!("invalid --table-id value: {value}"))?,
+                );
+            }
+            "--column-id" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--column-id requires a value".to_string())?;
+                options.column_ids.push(
+                    value
+                        .parse::<u32>()
+                        .map_err(|_| format!("invalid --column-id value: {value}"))?,
+                );
+            }
+            "--all-columns" => options.all_columns = true,
+            "--index-only-counts" => options.include_index_only_counts = true,
+            "--index-only-exists" => options.include_index_only_exists = true,
+            "--index-only-min-max" => options.include_index_only_min_max = true,
+            "--index-only-distinct-count" => options.include_index_only_distinct_count = true,
+            "--index-only-sum-avg" => options.include_index_only_sum_avg = true,
+            "-h" | "--help" => {
+                println!("usage: cove sidecar build covi <input.cove> <output.covi> [--table-id <id>] [--column-id <id> ... | --all-columns] [--index-only-counts] [--index-only-exists] [--index-only-min-max] [--index-only-distinct-count] [--index-only-sum-avg]");
+                return Ok(());
+            }
+            _ if arg.starts_with("--") => return Err(format!("unknown option: {arg}")),
+            _ => positionals.push(arg),
+        }
+    }
+    if positionals.len() != 2 {
+        return Err("usage: cove sidecar build covi <input.cove> <output.covi> [options]".into());
+    }
+    if options.all_columns && !options.column_ids.is_empty() {
+        return Err("--all-columns cannot be combined with --column-id".into());
+    }
+    let input_path = positionals.remove(0);
+    let output_path = PathBuf::from(positionals.remove(0));
+    let input = fs::read(&input_path).map_err(|error| format!("{input_path}: {error}"))?;
+    let bytes = build_covi_from_cove_bytes(&input, &options)
+        .map_err(|error| format!("{input_path}: {error}"))?;
+    durable::durable_replace(&output_path, &bytes)
+        .map_err(|error| format!("cannot durably publish {}: {error}", output_path.display()))?;
+    println!("wrote COVE-I artifact to {}", output_path.display());
+    Ok(())
+}

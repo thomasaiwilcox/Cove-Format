@@ -2,6 +2,8 @@
 name = "cove-profile-validation"
 version = "0.1.0"
 edition = "2021"
+description = "Shared semantic validation for optional COVE profile payloads"
+license = "MIT"
 
 [dependencies]
 cove-core = { path = "../cove-core" }

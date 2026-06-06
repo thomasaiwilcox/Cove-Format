@@ -2,6 +2,8 @@
 name = "cove-cache"
 version = "0.1.0"
 edition = "2021"
+description = "COVE-CACHE coverage-cache diagnostics for COVE v2"
+license = "MIT"
 autobins = false
 
 [dependencies]

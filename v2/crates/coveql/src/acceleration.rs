@@ -8,6 +8,7 @@ use cove_core::{
     compression,
     constants::{PrimaryProfile, SectionKind, FEATURE_ENGINE_PROFILE},
     digest::compute_digest,
+    durable,
     mount::{mount_cove_file, MountOptions},
     profile::cove_e::{
         CodeSpaceDescriptorV1, EngineMountPolicyV1, EngineProfileEntryV1, EngineProfileRegistry,
@@ -411,7 +412,7 @@ pub fn generate_acceleration_sidecars(
     };
     let manifest = serde_json::to_vec_pretty(&report)
         .map_err(|error| CoveError::BadSection(error.to_string()))?;
-    fs::write(&manifest_path, manifest)?;
+    durable::durable_replace(&manifest_path, &manifest)?;
     Ok(report)
 }
 
@@ -509,7 +510,7 @@ fn generate_covi(bytes: &[u8], path: &Path) -> Result<Option<u64>, CoveError> {
         ..CoviBuildOptions::default()
     };
     let out = build_covi_from_cove_bytes(bytes, &options)?;
-    fs::write(path, &out)?;
+    durable::durable_replace(path, &out)?;
     Ok(Some(out.len() as u64))
 }
 
@@ -518,7 +519,7 @@ fn generate_covx(plan: &CoveOptimizationPlan, path: &Path) -> Result<Option<u64>
         return Ok(None);
     };
     let (out, _) = build_covx_artifact(path, std::slice::from_ref(source_path))?;
-    fs::write(path, &out)?;
+    durable::durable_replace(path, &out)?;
     Ok(Some(out.len() as u64))
 }
 
@@ -594,7 +595,7 @@ fn generate_cove_e(bytes: &[u8], path: &Path) -> Result<Option<u64>, CoveError> 
     ];
     let out = writer.write()?;
     let _ = validate_bytes(&out)?;
-    fs::write(path, &out)?;
+    durable::durable_replace(path, &out)?;
     Ok(Some(out.len() as u64))
 }
 
@@ -622,7 +623,7 @@ fn generate_scan_splits(shape: &Option<TableShape>, path: &Path) -> Result<Optio
     };
     let splits = build_default_scan_split_index(table, &shape.segments.entries)?;
     let out = splits.serialize()?;
-    fs::write(path, &out)?;
+    durable::durable_replace(path, &out)?;
     Ok(Some(out.len() as u64))
 }
 
@@ -636,7 +637,7 @@ fn generate_layout_plan(shape: &Option<TableShape>, path: &Path) -> Result<Optio
     let splits = build_default_scan_split_index(table, &shape.segments.entries)?;
     let plan = build_default_layout_plan(table, &shape.segments.entries, Some(&splits))?;
     let out = plan.serialize()?;
-    fs::write(path, &out)?;
+    durable::durable_replace(path, &out)?;
     Ok(Some(out.len() as u64))
 }
 
