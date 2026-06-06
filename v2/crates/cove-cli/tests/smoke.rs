@@ -2058,11 +2058,27 @@ fn customer360_showcase_command_generates_queryable_artifacts() {
             .unwrap();
     assert_eq!(manifest["profile"], "quick");
     assert_eq!(manifest["row_counts"]["canonical_customers"], 12);
+    assert_eq!(
+        manifest["pipeline"]["canonical_readback_source"],
+        "customers_360.jsonl"
+    );
     assert!(manifest["recommended_queries"]
         .as_array()
         .unwrap()
         .iter()
         .any(|query| query["title"] == "Customer events through an external JSONL table"));
+    assert!(manifest["recommended_queries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|query| query["command"]
+            .as_str()
+            .unwrap()
+            .contains("groupBy(source_id)")));
+    let benchmark_cases = manifest["benchmark_cases"].as_array().unwrap();
+    assert!(benchmark_cases.contains(&serde_json::json!("customer360_event_filter")));
+    assert!(!benchmark_cases.contains(&serde_json::json!("customer360_evidence_aggregate")));
+    assert!(!benchmark_cases.contains(&serde_json::json!("customer360_customer_event_join")));
 
     let inspect = run_cove(&[
         "inspect",
@@ -2111,6 +2127,10 @@ fn customer360_showcase_command_generates_queryable_artifacts() {
 
 #[test]
 fn customer360_showcase_requires_force_for_non_empty_output() {
+    let missing_out = run_cove(&["showcase", "customer360", "--profile", "quick"]);
+    assert!(!missing_out.status.success());
+    assert!(String::from_utf8_lossy(&missing_out.stderr).contains("--out is required"));
+
     let out_dir = temp_file("customer360-force");
     fs::create_dir_all(&out_dir).unwrap();
     fs::write(out_dir.join("keep.txt"), "existing").unwrap();

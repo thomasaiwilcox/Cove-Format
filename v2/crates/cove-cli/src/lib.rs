@@ -556,8 +556,14 @@ fn parse_showcase(mut args: Vec<String>) -> Result<Command, String> {
             _ => return Err("showcase customer360 does not accept positional arguments".into()),
         }
     }
+    let out_dir = out_dir.ok_or_else(|| {
+        format!(
+            "--out is required for showcase customer360\n\n{}",
+            usage(HelpTopic::Showcase)
+        )
+    })?;
     Ok(Command::ShowcaseCustomer360 {
-        out_dir: out_dir.unwrap_or_else(|| PathBuf::from("examples/customer360")),
+        out_dir,
         profile,
         force,
         json,

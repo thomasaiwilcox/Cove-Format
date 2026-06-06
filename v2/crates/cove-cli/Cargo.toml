@@ -15,7 +15,6 @@ harness = false
 
 [dependencies]
 arrow-array = "58"
-arrow-ipc = "58"
 arrow-schema = "58"
 cove-cache = { path = "../cove-cache" }
 cove-convert-parquet = { path = "../cove-convert-parquet" }

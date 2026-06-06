@@ -139,7 +139,7 @@
       "id": "customer360",
       "kind": "deterministic-customer360-data-science-showcase",
       "seed": 28,
-      "artifacts": ["customer360/crm.csv", "customer360/support.jsonl", "customer360/billing.parquet", "customer360/customers_360.jsonl", "customer360/events.jsonl", "customer360/events.cove", "customer360/customer360.covemap", "customer360/customer360_readback.covemap", "customer360/customers.cove", "customer360/customers_projection.cove", "customer360/evidence_projection.cove", "customer360/customers_projection.parquet", "customer360/evidence_projection.parquet", "customer360/customer360-manifest.json"],
+      "artifacts": ["customer360/crm.csv", "customer360/support.jsonl", "customer360/billing.parquet", "customer360/customers_360.jsonl", "customer360/events.jsonl", "customer360/events.cove", "customer360/customer360.covemap", "customer360/customer360_readback.covemap", "customer360/customers.cove", "customer360/customers_projection.cove", "customer360/evidence_projection.cove", "customer360/customers_projection.parquet", "customer360/evidence_projection.parquet", "customer360/customer360-manifest.json", "customer360/notebooks/customer360_analysis.py"],
       "purpose": "Customer 360 semantic archive, provenance, notebook, and benchmark workload"
     }
   ],

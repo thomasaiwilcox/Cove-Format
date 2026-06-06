@@ -718,7 +718,6 @@ name = "cove-cli"
 version = "0.1.0"
 dependencies = [
  "arrow-array",
- "arrow-ipc",
  "arrow-schema",
  "cove-cache",
  "cove-convert-parquet",

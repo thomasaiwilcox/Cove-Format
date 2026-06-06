@@ -2,19 +2,25 @@
 
 The Customer 360 showcase is the main approachable semantic-archive demo for
 CoveQL and the unified `cove` CLI. It generates deterministic CRM, support,
-billing, and event sources, keeps those source rows as provenance, and builds a
-queryable mapped COVE-O archive with canonical customers, evidence, projected
-COVE-T tables, and Parquet baselines.
+billing, and event sources, writes a reconciled canonical customer readback
+source, and builds a queryable COVE-O archive with canonical customers,
+evidence, projected COVE-T tables, and Parquet baselines.
 
 This is the COVE-O / COVE-MAP path: the original data starts as ordinary tables,
 but the durable meaning becomes customer objects, properties, associations,
 evidence, and deterministic projections. The projected tables keep the workflow
 familiar for SQL, pandas, Polars, Arrow, and DataFusion users.
 
+The current runnable archive is materialized from `customers_360.jsonl` with
+`customer360_readback.covemap` so CoveQL readback stays deterministic and
+copy-pasteable. The CRM/support/billing files and `customer360.covemap` are
+generated alongside it as the messy multi-source mapping surface and provenance
+contract for the showcase.
+
 ## What This Shows
 
-- Source tables remain provenance rather than disappearing behind a black-box
-  entity-resolution step.
+- Source tables remain visible provenance rather than disappearing behind the
+  generated canonical customer readback source.
 - Canonical customer rows provide the stable semantic surface for readback,
   aggregation, and joins.
 - Evidence rows make lineage queryable, including which sources contributed to

@@ -9,6 +9,17 @@
     "canonical_customers": 12,
     "expected_evidence_rows": 12
   },
+  "pipeline": {
+    "source_inputs": [
+      "crm.csv",
+      "support.jsonl",
+      "billing.parquet"
+    ],
+    "source_mapping_contract": "customer360.covemap",
+    "canonical_readback_source": "customers_360.jsonl",
+    "mapped_cove_o_materialization": "customers_360.jsonl + customer360_readback.covemap",
+    "note": "The runnable COVE-O archive is materialized from reconciled canonical rows so CoveQL readback is deterministic; the CRM/support/billing files and customer360.covemap document the messy multi-source mapping surface."
+  },
   "artifacts": {
     "sources": {
       "crm": "crm.csv",
@@ -37,7 +48,7 @@
     },
     {
       "title": "Evidence by source",
-      "command": "cove query customers.cove 'table(customer_evidence).select(source_id, rows: count(*))'"
+      "command": "cove query customers.cove 'table(customer_evidence).groupBy(source_id).select(source_id, rows: count(*))'"
     },
     {
       "title": "High value customers",
@@ -51,8 +62,7 @@
   "benchmark_cases": [
     "customer360_projection_scan",
     "customer360_selective_filter",
-    "customer360_evidence_aggregate",
-    "customer360_customer_event_join",
+    "customer360_event_filter",
     "customer360_object_store_compare"
   ]
 }
