@@ -36,6 +36,7 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
 mod api;
+mod build;
 mod cli;
 mod context;
 mod emit;
@@ -59,6 +60,7 @@ pub use api::{
     ProjectionColumnDescriptor, ProjectionDescriptor,
 };
 pub(crate) use api::{parse_map, plan_keys, preview};
+pub use build::{build_from_paths, MapBuildOptions, MapBuildProjectionOutput, MapBuildResult};
 pub(crate) use context::{mapping_context, MappingContext};
 #[cfg(test)]
 use emit::build_cove_o;
@@ -2924,6 +2926,48 @@ mod tests {
         ]
     }
 
+    fn build_projection_map() -> CovemapFile {
+        let mut file = two_source_property_map("source_priority_wins", Some(10), Some(1));
+        file.sections.push(test_section(
+            SectionKind::MapProjectionCatalog,
+            json!({
+                "mapping_id": "people-map",
+                "mapping_version": "test/v1",
+                "projections": [{
+                    "projection_id": "person_projection",
+                    "output_table": "people_projection",
+                    "row_grain": "one_row_per_object",
+                    "anchor": {"object_type": "Person"},
+                    "temporal_mode": {"as_of": "latest_committed"},
+                    "multi_value_policy": "reject",
+                    "columns": [
+                        {"name": "name", "value": "name", "logical_type": "utf8"}
+                    ],
+                    "output_modes": ["json", "cove-t"]
+                }]
+            }),
+        ));
+        file
+    }
+
+    fn temp_build_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("cove-map-{label}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_build_fixture(label: &str, file: &CovemapFile) -> (PathBuf, Vec<PathBuf>, PathBuf) {
+        let dir = temp_build_dir(label);
+        let map = dir.join("people.covemap");
+        fs::write(&map, file.serialize().unwrap()).unwrap();
+        let crm = dir.join("crm.csv");
+        let support = dir.join("support.csv");
+        fs::write(&crm, "id,name\n1,CRM Name\n").unwrap();
+        fs::write(&support, "id,name\n1,Support Name\n").unwrap();
+        (map, vec![crm, support], dir)
+    }
+
     fn primitive_projection_map() -> CovemapFile {
         test_covemap(vec![
             test_section(
@@ -3356,6 +3400,84 @@ mod tests {
                 projection_id: None,
             }
         );
+    }
+
+    #[test]
+    fn parses_build_command_defaults() {
+        let command = parse_args([
+            "build".to_string(),
+            "--out-dir".to_string(),
+            "bundle".to_string(),
+            "mapping.covemap".to_string(),
+            "source.jsonl".to_string(),
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            command,
+            Command::Build {
+                map: PathBuf::from("mapping.covemap"),
+                sources: vec![PathBuf::from("source.jsonl")],
+                out_dir: PathBuf::from("bundle"),
+                force: false,
+                json: false,
+                object_name: None,
+                projection_output: MapBuildProjectionOutput::CoveT,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_build_command_options() {
+        let command = parse_args([
+            "build".to_string(),
+            "--out-dir".to_string(),
+            "bundle".to_string(),
+            "--force".to_string(),
+            "--json".to_string(),
+            "--object-name".to_string(),
+            "people.cove".to_string(),
+            "--projection-output".to_string(),
+            "none".to_string(),
+            "mapping.covemap".to_string(),
+            "source.jsonl".to_string(),
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            command,
+            Command::Build {
+                map: PathBuf::from("mapping.covemap"),
+                sources: vec![PathBuf::from("source.jsonl")],
+                out_dir: PathBuf::from("bundle"),
+                force: true,
+                json: true,
+                object_name: Some("people.cove".into()),
+                projection_output: MapBuildProjectionOutput::None,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_build_without_out_dir_or_bad_projection_output() {
+        assert!(parse_args([
+            "build".to_string(),
+            "mapping.covemap".to_string(),
+            "source.jsonl".to_string(),
+        ])
+        .unwrap_err()
+        .contains("--out-dir"));
+        assert!(parse_args([
+            "build".to_string(),
+            "--out-dir".to_string(),
+            "bundle".to_string(),
+            "--projection-output".to_string(),
+            "parquet".to_string(),
+            "mapping.covemap".to_string(),
+            "source.jsonl".to_string(),
+        ])
+        .unwrap_err()
+        .contains("cove-t or none"));
     }
 
     #[test]
@@ -3981,6 +4103,135 @@ mod tests {
         assert_eq!(rows[0]["output_table"], json!("people_projection"));
         assert_eq!(rows[0]["name"], json!("Support Name"));
         assert!(rows[0]["person_goid"].as_str().is_some());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn map_build_writes_object_report_manifest_readme_and_projection() {
+        let file = build_projection_map();
+        let (map, sources, dir) = write_build_fixture("build-success", &file);
+        let out_dir = dir.join("bundle");
+        let result = build_from_paths(&map, &sources, MapBuildOptions::new(&out_dir)).unwrap();
+        assert_eq!(result.manifest["mapping_id"], json!("people-map"));
+        assert_eq!(result.manifest["counts"]["object_count"], json!(1));
+        let object_path = out_dir.join("people_map.cove");
+        let report_path = out_dir.join("map-build-report.json");
+        let manifest_path = out_dir.join("map-build-manifest.json");
+        let readme_path = out_dir.join("README.md");
+        let projection_path = out_dir.join("projections/people_projection.cove");
+        assert!(object_path.exists());
+        assert!(report_path.exists());
+        assert!(manifest_path.exists());
+        assert!(readme_path.exists());
+        assert!(projection_path.exists());
+        validate_bytes_with_options(
+            &fs::read(&object_path).unwrap(),
+            ValidationOptions {
+                semantic: true,
+                verify_digests: false,
+                allow_unknown_optional_extensions: true,
+                ..ValidationOptions::default()
+            },
+        )
+        .unwrap();
+        validate_bytes_with_options(
+            &fs::read(&projection_path).unwrap(),
+            ValidationOptions {
+                allow_unknown_optional_extensions: true,
+                ..ValidationOptions::default()
+            },
+        )
+        .unwrap();
+        let manifest: Value = serde_json::from_slice(&fs::read(manifest_path).unwrap()).unwrap();
+        assert_eq!(
+            manifest["artifacts"]["projections"][0]["projection_id"],
+            json!("person_projection")
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn map_build_collision_requires_force() {
+        let file = build_projection_map();
+        let (map, sources, dir) = write_build_fixture("build-collision", &file);
+        let out_dir = dir.join("bundle");
+        build_from_paths(&map, &sources, MapBuildOptions::new(&out_dir)).unwrap();
+        let err = build_from_paths(&map, &sources, MapBuildOptions::new(&out_dir)).unwrap_err();
+        assert!(err.contains("--force"));
+        let mut options = MapBuildOptions::new(&out_dir);
+        options.force = true;
+        build_from_paths(&map, &sources, options).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn map_build_rejects_duplicate_projection_output_names() {
+        let mut file = build_projection_map();
+        mutate_section_payload(&mut file, 4, |value| {
+            value["projections"] = json!([
+                {
+                    "projection_id": "person_projection",
+                    "output_table": "people_projection",
+                    "row_grain": "one_row_per_object",
+                    "anchor": {"object_type": "Person"},
+                    "temporal_mode": {"as_of": "latest_committed"},
+                    "multi_value_policy": "reject",
+                    "columns": [{"name": "name", "value": "name", "logical_type": "utf8"}],
+                    "output_modes": ["json", "cove-t"]
+                },
+                {
+                    "projection_id": "person_projection_copy",
+                    "output_table": "people_projection",
+                    "row_grain": "one_row_per_object",
+                    "anchor": {"object_type": "Person"},
+                    "temporal_mode": {"as_of": "latest_committed"},
+                    "multi_value_policy": "reject",
+                    "columns": [{"name": "name", "value": "name", "logical_type": "utf8"}],
+                    "output_modes": ["json", "cove-t"]
+                }
+            ]);
+        });
+        let (map, sources, dir) = write_build_fixture("build-duplicate-projection", &file);
+        let err =
+            build_from_paths(&map, &sources, MapBuildOptions::new(dir.join("bundle"))).unwrap_err();
+        assert!(err.contains("both map to output file"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn map_build_rejects_unsupported_source_extension_and_missing_source() {
+        let file = build_projection_map();
+        let (map, sources, dir) = write_build_fixture("build-source-errors", &file);
+        let unsupported = dir.join("crm.txt");
+        fs::write(&unsupported, "id,name\n1,Ada\n").unwrap();
+        let err = build_from_paths(
+            &map,
+            &[unsupported, sources[1].clone()],
+            MapBuildOptions::new(dir.join("unsupported")),
+        )
+        .unwrap_err();
+        assert!(err.contains("must be .jsonl, .csv"));
+
+        let err = build_from_paths(
+            &map,
+            &[sources[0].clone()],
+            MapBuildOptions::new(dir.join("missing-source")),
+        )
+        .unwrap_err();
+        assert!(err.contains("source 'support' is required"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn map_build_surfaces_projection_generation_errors() {
+        let mut file = build_projection_map();
+        mutate_section_payload(&mut file, 4, |value| {
+            value["projections"][0]["row_grain"] = json!("unsupported_row_grain");
+        });
+        let (map, sources, dir) = write_build_fixture("build-projection-error", &file);
+        let err =
+            build_from_paths(&map, &sources, MapBuildOptions::new(dir.join("bundle"))).unwrap_err();
+        assert!(err.contains("projection"), "err={err}");
         fs::remove_dir_all(&dir).unwrap();
     }
 

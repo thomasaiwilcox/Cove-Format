@@ -11,8 +11,15 @@ pub(crate) fn build_cove_o_with_source_states(
     source_states: &[ObservedSourceState],
 ) -> Result<Vec<u8>, String> {
     let materialized = materialize_with_source_states(file, rows, source_states)?;
-    let nested_shapes = nested_shapes_for_model(file, &materialized)?;
-    let file_dictionary = file_dictionary_for_model(&materialized, &nested_shapes)?;
+    build_cove_o_from_materialized(file, &materialized)
+}
+
+pub(crate) fn build_cove_o_from_materialized(
+    file: &CovemapFile,
+    materialized: &MaterializedModel,
+) -> Result<Vec<u8>, String> {
+    let nested_shapes = nested_shapes_for_model(file, materialized)?;
+    let file_dictionary = file_dictionary_for_model(materialized, &nested_shapes)?;
     let catalog = ObjectTypeCatalog {
         flags: 0,
         types: materialized.object_types.clone(),

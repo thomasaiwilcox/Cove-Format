@@ -64,6 +64,21 @@ cove inspect examples/coveql/people.covemap --queries
 That file is COVE-MAP metadata, not row data, so `cove` explains how to use it
 with a related data file instead of pretending it can be scanned as rows.
 
+## Build A Mapped Bundle
+
+Use `cove map build` when you have a COVE-MAP file and source rows and want a
+single adoption-ready output directory:
+
+```bash
+cove map build --out-dir target/people-map-build --force \
+  examples/coveql/people.covemap examples/coveql/people.jsonl
+```
+
+The bundle writes a mapped COVE-O object, `map-build-report.json`,
+`map-build-manifest.json`, and a README with suggested next commands. When the
+mapping declares COVE-T projection output, the command also writes
+`projections/*.cove` table baselines.
+
 ## Query A COVE-T Table
 
 `events.cove` is a tiny COVE-T table file:

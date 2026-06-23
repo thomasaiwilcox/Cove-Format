@@ -1227,6 +1227,38 @@ fn query_covemap_sidecar_reports_guidance() {
 }
 
 #[test]
+fn map_build_creates_adoption_bundle() {
+    let out_dir = temp_file("map-build-bundle");
+    let mapping = sample_path("people.covemap");
+    let source = sample_path("people.jsonl");
+    let output = run_cove(&[
+        "map",
+        "build",
+        "--out-dir",
+        out_dir.to_str().unwrap(),
+        "--force",
+        "--json",
+        mapping.to_str().unwrap(),
+        source.to_str().unwrap(),
+    ]);
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let manifest: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        manifest["format"],
+        serde_json::json!("cove-map-build-manifest-v1")
+    );
+    let object = manifest["artifacts"]["object"]["path"].as_str().unwrap();
+    assert!(out_dir.join(object).exists());
+    assert!(out_dir.join("map-build-report.json").exists());
+    assert!(out_dir.join("map-build-manifest.json").exists());
+    assert!(out_dir.join("README.md").exists());
+}
+
+#[test]
 fn examples_and_doctor_commands_are_beginner_friendly() {
     let examples = run_cove(&["examples"]);
     assert!(
@@ -1456,8 +1488,8 @@ fn command_specific_help_surfaces_reference_workflows() {
         ),
         (
             &["map", "--help"][..],
-            "cove map project",
-            "cove map convert",
+            "cove map build",
+            "--projection-output",
         ),
     ];
     for (args, expected_a, expected_b) in cases {

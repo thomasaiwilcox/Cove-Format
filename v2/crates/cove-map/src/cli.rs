@@ -44,6 +44,15 @@ pub(crate) enum Command {
         format: ProjectionFormat,
         projection_id: Option<String>,
     },
+    Build {
+        map: PathBuf,
+        sources: Vec<PathBuf>,
+        out_dir: PathBuf,
+        force: bool,
+        json: bool,
+        object_name: Option<String>,
+        projection_output: MapBuildProjectionOutput,
+    },
     Test {
         fixture: PathBuf,
     },
@@ -151,6 +160,31 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<(), String> {
             )?;
             write_projection_output(output, format, &projected)?;
         }
+        Command::Build {
+            map,
+            sources,
+            out_dir,
+            force,
+            json,
+            object_name,
+            projection_output,
+        } => {
+            let result = build_from_paths(
+                &map,
+                &sources,
+                MapBuildOptions {
+                    out_dir,
+                    force,
+                    object_name,
+                    projection_output,
+                },
+            )?;
+            if json {
+                print_json(&result.manifest);
+            } else {
+                print_build_summary(&result.manifest);
+            }
+        }
         Command::Test { fixture } => run_fixture_path(&fixture)?,
     }
     Ok(())
@@ -229,6 +263,27 @@ pub(crate) fn parse_args(
                 projection_id,
             }
         }
+        "build" => {
+            let (out_dir, force, json, object_name, projection_output, positional) =
+                parse_build_args(args)?;
+            let mut positional = positional.into_iter();
+            let map = positional
+                .next()
+                .ok_or_else(|| "build requires <mapping.covemap>".to_string())?;
+            let sources = positional.collect::<Vec<_>>();
+            if sources.is_empty() {
+                return Err("build requires at least one source path".into());
+            }
+            Command::Build {
+                map,
+                sources,
+                out_dir,
+                force,
+                json,
+                object_name,
+                projection_output,
+            }
+        }
         "test" => Command::Test {
             fixture: one_path(&mut args, "test <fixture.json>")?,
         },
@@ -276,6 +331,69 @@ fn parse_output_format_and_positionals(
         }
     }
     Ok((output, format, positional))
+}
+
+#[allow(clippy::type_complexity)]
+fn parse_build_args(
+    args: impl Iterator<Item = String>,
+) -> Result<
+    (
+        PathBuf,
+        bool,
+        bool,
+        Option<String>,
+        MapBuildProjectionOutput,
+        Vec<PathBuf>,
+    ),
+    String,
+> {
+    let mut out_dir = None;
+    let mut force = false;
+    let mut json = false;
+    let mut object_name = None;
+    let mut projection_output = MapBuildProjectionOutput::CoveT;
+    let mut positional = Vec::new();
+    let mut args = args.peekable();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--out-dir" => {
+                out_dir = Some(
+                    args.next()
+                        .map(PathBuf::from)
+                        .ok_or_else(|| "--out-dir requires a path".to_string())?,
+                );
+            }
+            "--force" => force = true,
+            "--json" => json = true,
+            "--object-name" => {
+                object_name = Some(
+                    args.next()
+                        .ok_or_else(|| "--object-name requires a file name".to_string())?,
+                );
+            }
+            "--projection-output" => {
+                let raw = args
+                    .next()
+                    .ok_or_else(|| "--projection-output requires cove-t or none".to_string())?;
+                projection_output = match raw.as_str() {
+                    "cove-t" => MapBuildProjectionOutput::CoveT,
+                    "none" => MapBuildProjectionOutput::None,
+                    _ => return Err("--projection-output must be cove-t or none".into()),
+                };
+            }
+            _ if arg.starts_with('-') => return Err(format!("unknown option {arg}")),
+            _ => positional.push(PathBuf::from(arg)),
+        }
+    }
+    let out_dir = out_dir.ok_or_else(|| "build requires --out-dir <dir>".to_string())?;
+    Ok((
+        out_dir,
+        force,
+        json,
+        object_name,
+        projection_output,
+        positional,
+    ))
 }
 
 #[allow(clippy::type_complexity)]
@@ -412,5 +530,43 @@ fn write_projection_output(
             "project --format {} requires --output <path>",
             format.as_str()
         )),
+    }
+}
+
+fn print_build_summary(manifest: &serde_json::Value) {
+    println!("COVE-MAP build complete");
+    if let Some(object) = manifest
+        .pointer("/artifacts/object/path")
+        .and_then(serde_json::Value::as_str)
+    {
+        println!("  object: {object}");
+    }
+    if let Some(projections) = manifest
+        .pointer("/artifacts/projections")
+        .and_then(serde_json::Value::as_array)
+    {
+        println!("  projections: {}", projections.len());
+        for projection in projections {
+            if let (Some(id), Some(path)) = (
+                projection
+                    .get("projection_id")
+                    .and_then(serde_json::Value::as_str),
+                projection.get("path").and_then(serde_json::Value::as_str),
+            ) {
+                println!("    {id}: {path}");
+            }
+        }
+    }
+    if let Some(report) = manifest
+        .pointer("/artifacts/report/path")
+        .and_then(serde_json::Value::as_str)
+    {
+        println!("  report: {report}");
+    }
+    if let Some(path) = manifest
+        .pointer("/artifacts/manifest/path")
+        .and_then(serde_json::Value::as_str)
+    {
+        println!("  manifest: {path}");
     }
 }

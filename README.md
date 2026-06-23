@@ -147,6 +147,8 @@ cove showcase customer360 --profile quick --out examples/customer360 --force
 cove inspect --queries --performance examples/customer360/customers.cove
 cove query examples/customer360/customers.cove \
   'table(customers).select(customer_id, full_name, region, tier, score, status, plan, mrr).take(10)'
+cove map build --out-dir target/people-map-build --force \
+  examples/coveql/people.covemap examples/coveql/people.jsonl
 cove doctor examples/coveql/people.cove
 cove inspect examples/coveql/people.cove --queries
 cove optimize examples/coveql/events.cove
@@ -189,8 +191,9 @@ The public utility surface is grouped under the single `cove` binary:
   common columnar or row-oriented source formats.
 - `cove validate`, `cove inspect`, and `cove dump` cover structural
   validation, readable summaries, and lower-level metadata inspection.
-- `cove map validate|preview|plan-keys|convert|explain|diff|project|test ...`
-  works with COVE-MAP mapping definitions and projection workflows.
+- `cove map validate|preview|plan-keys|convert|build|explain|diff|project|test
+  ...` works with COVE-MAP mapping definitions, build bundles, and projection
+  workflows.
 - `cove sidecar inspect ...` and `cove sidecar build ...` expose expert COVE-I,
   COVX, COVM, COVE-COVERAGE, COVE-L, COVE-CACHE, and COVE-R sidecar tooling.
 - `cove export arrow`, `cove perf explain-pruning`, `cove perf plan-cost`,
