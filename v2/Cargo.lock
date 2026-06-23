@@ -703,6 +703,7 @@ dependencies = [
  "orc-rust",
  "parquet",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

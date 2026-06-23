@@ -175,6 +175,27 @@ async fn collect_sql_with_cove_metric(
     (batches, execution_plan_metric_sum(&plan, metric_name))
 }
 
+#[cfg(feature = "covi")]
+async fn collect_sql_with_cove_metrics(
+    ctx: &SessionContext,
+    sql: &str,
+    metric_names: &[&str],
+) -> (
+    Vec<datafusion::arrow::record_batch::RecordBatch>,
+    Vec<usize>,
+) {
+    let dataframe = ctx.sql(sql).await.unwrap();
+    let plan = dataframe.create_physical_plan().await.unwrap();
+    let batches = collect_physical_plan(Arc::clone(&plan), ctx.task_ctx())
+        .await
+        .unwrap();
+    let metrics = metric_names
+        .iter()
+        .map(|metric_name| execution_plan_metric_sum(&plan, metric_name))
+        .collect();
+    (batches, metrics)
+}
+
 fn execution_plan_metric_sum(plan: &Arc<dyn ExecutionPlan>, metric_name: &str) -> usize {
     let own = plan
         .metrics()
@@ -482,6 +503,108 @@ async fn register_cove_o_projection_uses_projection_column_covi_sidecar() {
     )
     .await;
     assert_eq!(hits, 1);
+    let (_, candidate_rows) = collect_sql_with_cove_metric(
+        &ctx,
+        "SELECT membership_count FROM people_projection WHERE name = 'Ada'",
+        "cove_projection_covi_candidate_rows",
+    )
+    .await;
+    assert_eq!(candidate_rows, 1);
+    let (_, skipped_rows) = collect_sql_with_cove_metric(
+        &ctx,
+        "SELECT membership_count FROM people_projection WHERE name = 'Ada'",
+        "cove_projection_covi_rows_skipped",
+    )
+    .await;
+    assert_eq!(skipped_rows, 1);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(feature = "covi")]
+#[tokio::test]
+async fn register_cove_o_projection_reports_projection_covi_fallbacks() {
+    let dir = make_temp_dir("mapped_projection_column_covi_fallbacks");
+    let bundle = dir.join("bundle");
+    let mapping_path = conformance_accept_path("cove_map_execution.covemap");
+    let source_paths = vec![conformance_accept_path("people.parquet")];
+    let mut options = cove_map::MapBuildOptions::new(bundle.clone());
+    options.projection_output = cove_map::MapBuildProjectionOutput::None;
+    let result = cove_map::build_from_paths(&mapping_path, &source_paths, options).unwrap();
+    let object_rel = result
+        .manifest
+        .pointer("/artifacts/object/path")
+        .and_then(Value::as_str)
+        .unwrap();
+    let object_path = bundle.join(object_rel);
+    let sidecar_path = bundle.join("indexes").join("projection_columns.covi");
+    let sidecar_bytes = fs::read(&sidecar_path).unwrap();
+
+    let ctx = SessionContext::new();
+    register_cove_o_projections(&ctx, &object_path, None, None).unwrap();
+    let (batches, metrics) = collect_sql_with_cove_metrics(
+        &ctx,
+        "SELECT name FROM people_projection WHERE name IN ('Ada', 'Linus') AND name = 'Ada'",
+        &[
+            "cove_projection_covi_eligible_filters",
+            "cove_lookup_index_hits",
+            "cove_projection_covi_candidate_rows",
+            "cove_projection_covi_rows_skipped",
+        ],
+    )
+    .await;
+    let expected = ["+------+", "| name |", "+------+", "| Ada  |", "+------+"];
+    assert_batches_eq!(expected, &batches);
+    assert_eq!(metrics, vec![2, 2, 1, 1]);
+
+    fs::remove_file(&sidecar_path).unwrap();
+    let ctx = SessionContext::new();
+    register_cove_o_projections(&ctx, &object_path, None, None).unwrap();
+    let (batches, no_sidecar) = collect_sql_with_cove_metric(
+        &ctx,
+        "SELECT name FROM people_projection WHERE name = 'Ada'",
+        "cove_projection_covi_fallback_no_sidecar",
+    )
+    .await;
+    assert_batches_eq!(expected, &batches);
+    assert_eq!(no_sidecar, 1);
+
+    fs::write(&sidecar_path, &sidecar_bytes).unwrap();
+    let mut stale = sidecar_bytes;
+    stale[0] ^= 0x01;
+    fs::write(&sidecar_path, stale).unwrap();
+    let ctx = SessionContext::new();
+    register_cove_o_projections(&ctx, &object_path, None, None).unwrap();
+    let (batches, stale_count) = collect_sql_with_cove_metric(
+        &ctx,
+        "SELECT name FROM people_projection WHERE name = 'Ada'",
+        "cove_projection_covi_fallback_stale",
+    )
+    .await;
+    assert_batches_eq!(expected, &batches);
+    assert_eq!(stale_count, 1);
+
+    fs::write(
+        &sidecar_path,
+        fs::read(bundle.join("indexes").join("object_properties.covi")).unwrap(),
+    )
+    .unwrap();
+    let ctx = SessionContext::new();
+    register_cove_o_projections(&ctx, &object_path, None, None).unwrap();
+    let (batches, unsupported) = collect_sql_with_cove_metric(
+        &ctx,
+        "SELECT name FROM people_projection WHERE name != 'Ada'",
+        "cove_projection_covi_fallback_no_eligible_filter",
+    )
+    .await;
+    let expected = [
+        "+-------+",
+        "| name  |",
+        "+-------+",
+        "| Linus |",
+        "+-------+",
+    ];
+    assert_batches_eq!(expected, &batches);
+    assert_eq!(unsupported, 1);
     fs::remove_dir_all(dir).unwrap();
 }
 

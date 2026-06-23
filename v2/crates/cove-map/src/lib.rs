@@ -61,8 +61,8 @@ pub use api::{
     projected_rows_from_paths, projection_arrow_schema, projection_catalog_from_cove_o_bytes,
     projection_covi_filter_plan, projection_descriptors_from_cove_o_path,
     projection_read_requirements_for_catalog, ProjectionColumnDescriptor,
-    ProjectionColumnLineageDescriptor, ProjectionCoviFilterLookup, ProjectionCoviFilterPlan,
-    ProjectionDescriptor,
+    ProjectionColumnLineageDescriptor, ProjectionCoviFilterDiagnostic, ProjectionCoviFilterLookup,
+    ProjectionCoviFilterPlan, ProjectionDescriptor,
 };
 pub(crate) use api::{parse_map, plan_keys, preview};
 use build::verify_from_paths;
@@ -4346,6 +4346,10 @@ mod tests {
         let doctor = verify_bundle_dir(&out_dir).unwrap();
         assert_eq!(doctor["status"], json!("ok"));
         assert!(!report_has_failures(&doctor, false));
+        assert_eq!(
+            doctor["acceleration"]["projection_covi"]["available"],
+            json!(true)
+        );
 
         let projection_path = out_dir.join("projections/people_projection.cove");
         let projection_bytes = fs::read(projection_path).unwrap();
@@ -4394,6 +4398,46 @@ mod tests {
             error["code"] == json!("invalid_covi_index")
                 && error["index_id"] == json!("object_properties")
         }));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn doctor_reports_projection_covi_missing_or_invalid_readiness() {
+        let file = build_projection_map();
+        let (map, sources, dir) = write_build_fixture("doctor-projection-covi-readiness", &file);
+        let out_dir = dir.join("bundle");
+        build_from_paths(&map, &sources, MapBuildOptions::new(&out_dir)).unwrap();
+
+        match fs::remove_file(out_dir.join("indexes/projection_columns.covi")) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => panic!("cannot remove projection_columns.covi: {err}"),
+        }
+        let doctor = verify_bundle_dir(&out_dir).unwrap();
+        assert_eq!(
+            doctor["acceleration"]["projection_covi"]["sidecar_status"],
+            json!("missing")
+        );
+        assert!(doctor["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| warning["code"] == json!("missing_projection_covi_sidecar")));
+
+        let mut options = MapBuildOptions::new(&out_dir);
+        options.force = true;
+        build_from_paths(&map, &sources, options).unwrap();
+        fs::write(out_dir.join("indexes/projection_columns.covi"), b"not covi").unwrap();
+        let doctor = verify_bundle_dir(&out_dir).unwrap();
+        assert_eq!(
+            doctor["acceleration"]["projection_covi"]["sidecar_status"],
+            json!("invalid")
+        );
+        assert!(doctor["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| warning["code"] == json!("missing_projection_covi_sidecar")));
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -4706,6 +4750,108 @@ mod tests {
         assert_eq!(lineage.projection_table_id, 1);
         assert_eq!(lineage.projection_column_id, 3);
         assert_eq!(lineage.filter_pushdown, "projection_covi_prefilter");
+    }
+
+    #[test]
+    fn projection_covi_filter_plan_reports_stable_reason_codes() {
+        let descriptor = ProjectionDescriptor {
+            projection_id: "people_primitives.v1".into(),
+            output_table: Some("people_primitives".into()),
+            output_modes: vec!["arrow".into()],
+            columns: vec![
+                ProjectionColumnDescriptor {
+                    name: "score".into(),
+                    logical_type: "int64".into(),
+                    nested_shape: None,
+                    lineage: Some(ProjectionColumnLineageDescriptor {
+                        source: "object_property".into(),
+                        object_type_id: 1,
+                        object_type_name: "Person".into(),
+                        property_id: 3,
+                        property_name: "score".into(),
+                        projection_table_id: 1,
+                        projection_column_id: 3,
+                        expression: "score".into(),
+                        transform: "identity".into(),
+                        filter_pushdown: "projection_covi_prefilter".into(),
+                    }),
+                },
+                ProjectionColumnDescriptor {
+                    name: "computed".into(),
+                    logical_type: "utf8".into(),
+                    nested_shape: None,
+                    lineage: None,
+                },
+            ],
+        };
+        let filters = vec![
+            ProjectionFilter::Compare {
+                column: "score".into(),
+                op: ProjectionFilterOp::Eq,
+                literal: ProjectionFilterLiteral::Int64(10),
+            },
+            ProjectionFilter::InList {
+                column: "score".into(),
+                literals: vec![
+                    ProjectionFilterLiteral::Int64(10),
+                    ProjectionFilterLiteral::Int64(20),
+                ],
+            },
+            ProjectionFilter::Compare {
+                column: "score".into(),
+                op: ProjectionFilterOp::GtEq,
+                literal: ProjectionFilterLiteral::Int64(10),
+            },
+            ProjectionFilter::Compare {
+                column: "score".into(),
+                op: ProjectionFilterOp::Ne,
+                literal: ProjectionFilterLiteral::Int64(10),
+            },
+            ProjectionFilter::IsNull {
+                column: "score".into(),
+                negated: false,
+            },
+            ProjectionFilter::Compare {
+                column: "score".into(),
+                op: ProjectionFilterOp::Eq,
+                literal: ProjectionFilterLiteral::Null,
+            },
+            ProjectionFilter::Compare {
+                column: "computed".into(),
+                op: ProjectionFilterOp::Eq,
+                literal: ProjectionFilterLiteral::Utf8("x".into()),
+            },
+            ProjectionFilter::Compare {
+                column: "missing".into(),
+                op: ProjectionFilterOp::Eq,
+                literal: ProjectionFilterLiteral::Utf8("x".into()),
+            },
+        ];
+        let plan = projection_covi_filter_plan(&descriptor, &filters);
+        assert_eq!(plan.lookups.len(), 3);
+        let reasons = plan
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.reason.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            reasons,
+            vec![
+                "eligible",
+                "eligible",
+                "eligible",
+                "not_equal",
+                "is_null",
+                "null_literal",
+                "missing_lineage",
+                "column_not_found",
+            ]
+        );
+        assert!(plan.diagnostics[0].eligible);
+        assert_eq!(plan.diagnostics[0].op, "eq");
+        assert_eq!(plan.diagnostics[0].lineage_status, "present");
+        assert_eq!(plan.diagnostics[0].projection_table_id, Some(1));
+        assert_eq!(plan.unsupported_filters.len(), 5);
     }
 
     #[test]

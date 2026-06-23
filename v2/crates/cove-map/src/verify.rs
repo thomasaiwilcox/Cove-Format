@@ -8,6 +8,7 @@ use cove_core::{
     constants::{DigestAlgorithm, SectionKind},
     digest::compute_digest,
     postscript::CovePostscriptV1,
+    profile::cove_map::MapProjectionCatalog,
     profile::cove_o::{read_object_surface_from_bytes_with_options, CoveObjectReadOptions},
     reader::{validate_bytes_with_options, ValidationOptions},
     table::TableCatalog,
@@ -19,7 +20,10 @@ use cove_index::{
 use serde_json::{json, Value};
 
 use crate::{
-    project::{project_cove_o_bytes_output, ProjectionFormat},
+    project::{
+        project_cove_o_bytes_output, projection_catalog_from_cove_o_bytes_internal,
+        ProjectionFormat,
+    },
     sha256_hex,
 };
 
@@ -94,6 +98,11 @@ pub(crate) fn verify_bundle(bundle: &VerifiableBundle) -> Value {
         warnings.extend(index_validation.warnings);
     }
 
+    let acceleration = projection_covi_acceleration(&bundle.object_bytes, &bundle.indexes);
+    if let Some(warning_value) = acceleration.warning.clone() {
+        warnings.push(warning_value);
+    }
+
     let status = if errors.is_empty() { "ok" } else { "error" };
     json!({
         "format": "cove-map-doctor-report-v1",
@@ -103,6 +112,9 @@ pub(crate) fn verify_bundle(bundle: &VerifiableBundle) -> Value {
             "sha256": format!("sha256:{}", sha256_hex(&bundle.object_bytes)),
         },
         "checks": checks,
+        "acceleration": {
+            "projection_covi": acceleration.report,
+        },
         "warnings": warnings,
         "errors": errors,
     })
@@ -175,15 +187,24 @@ pub(crate) fn verify_bundle_dir(bundle_dir: &Path) -> Result<Value, String> {
                 .and_then(Value::as_str)
                 .ok_or_else(|| "index artifact is missing index_id".to_string())?;
             let path = bundle_dir.join(relative);
-            let bytes =
-                fs::read(&path).map_err(|err| format!("cannot read {}: {err}", path.display()))?;
+            let target = value
+                .get("target")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string();
+            let bytes = match fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(err)
+                    if err.kind() == std::io::ErrorKind::NotFound
+                        && is_projection_covi_index(index_id, &target) =>
+                {
+                    continue;
+                }
+                Err(err) => return Err(format!("cannot read {}: {err}", path.display())),
+            };
             indexes.push(VerifiableIndex {
                 index_id: index_id.to_string(),
-                target: value
-                    .get("target")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown")
-                    .to_string(),
+                target,
                 relative_path: PathBuf::from(relative),
                 bytes,
             });
@@ -209,6 +230,10 @@ pub(crate) fn report_has_failures(report: &Value, strict: bool) -> bool {
         .and_then(Value::as_array)
         .is_some_and(|warnings| !warnings.is_empty());
     has_errors || (strict && has_warnings)
+}
+
+fn is_projection_covi_index(index_id: &str, target: &str) -> bool {
+    index_id == "projection_columns" || target == "cove-o-projection-columns"
 }
 
 struct ObjectValidation {
@@ -310,6 +335,11 @@ struct IndexValidation {
     check: Value,
     warnings: Vec<Value>,
     errors: Vec<Value>,
+}
+
+struct ProjectionCoviAcceleration {
+    report: Value,
+    warning: Option<Value>,
 }
 
 fn validate_projection(
@@ -466,6 +496,136 @@ fn validate_index(object_bytes: &[u8], index: &VerifiableIndex) -> IndexValidati
         }),
         warnings,
         errors,
+    }
+}
+
+fn projection_covi_acceleration(
+    object_bytes: &[u8],
+    indexes: &[VerifiableIndex],
+) -> ProjectionCoviAcceleration {
+    let catalog = projection_catalog_from_cove_o_bytes_internal(object_bytes, None, "<doctor>")
+        .unwrap_or_else(|_| MapProjectionCatalog {
+            mapping_id: String::new(),
+            mapping_version: String::new(),
+            projections: Vec::new(),
+        });
+    let projection_index = indexes
+        .iter()
+        .find(|index| is_projection_covi_index(&index.index_id, &index.target));
+    let parsed_projection_index = projection_index
+        .and_then(|index| CoviArtifactV2::parse(&index.bytes).ok())
+        .filter(|artifact| {
+            artifact
+                .index_roots
+                .iter()
+                .any(|root| root.indexed_target_kind == CoviIndexedTargetKindV2::ProjectionColumn)
+        });
+    let root_count = parsed_projection_index
+        .as_ref()
+        .map(|artifact| {
+            artifact
+                .index_roots
+                .iter()
+                .filter(|root| {
+                    root.indexed_target_kind == CoviIndexedTargetKindV2::ProjectionColumn
+                })
+                .count()
+        })
+        .unwrap_or(0);
+
+    let mut total_lineage_columns = 0usize;
+    let mut missing_indexed_columns = 0usize;
+    let projections = catalog
+        .projections
+        .iter()
+        .map(|projection| {
+            let columns = projection
+                .columns
+                .iter()
+                .filter_map(|column| {
+                    let lineage = column.lineage.as_ref()?;
+                    if lineage.source != "object_property"
+                        || lineage.transform != "identity"
+                        || lineage.filter_pushdown != "projection_covi_prefilter"
+                    {
+                        return None;
+                    }
+                    total_lineage_columns += 1;
+                    let indexed_rows = parsed_projection_index.as_ref().and_then(|artifact| {
+                        artifact
+                            .index_roots
+                            .iter()
+                            .find(|root| {
+                                root.indexed_target_kind
+                                    == CoviIndexedTargetKindV2::ProjectionColumn
+                                    && root.table_id == lineage.projection_table_id
+                                    && root.column_id == lineage.projection_column_id
+                            })
+                            .map(|root| root.value_count)
+                    });
+                    if indexed_rows.is_none() {
+                        missing_indexed_columns += 1;
+                    }
+                    Some(json!({
+                        "column": column.name,
+                        "logical_type": column.logical_type,
+                        "projection_table_id": lineage.projection_table_id,
+                        "projection_column_id": lineage.projection_column_id,
+                        "indexed": indexed_rows.is_some(),
+                        "indexed_rows": indexed_rows,
+                    }))
+                })
+                .collect::<Vec<_>>();
+            json!({
+                "projection_id": projection.projection_id,
+                "eligible_lineage_columns": columns.len(),
+                "indexed_roots": columns.iter().filter(|column| column.get("indexed").and_then(Value::as_bool).unwrap_or(false)).count(),
+                "all_lineage_columns_indexed": !columns.is_empty() && columns.iter().all(|column| column.get("indexed").and_then(Value::as_bool).unwrap_or(false)),
+                "columns": columns,
+            })
+        })
+        .collect::<Vec<_>>();
+    let available = root_count > 0 && total_lineage_columns > 0 && missing_indexed_columns == 0;
+    let sidecar_status = if root_count > 0 {
+        "valid"
+    } else if projection_index.is_some() {
+        "invalid"
+    } else if total_lineage_columns > 0 {
+        "missing"
+    } else {
+        "not_applicable"
+    };
+    let warning = if total_lineage_columns > 0 && root_count == 0 {
+        Some(warning(
+            "missing_projection_covi_sidecar",
+            "projection lineage exists but no valid projection-column COVE-I sidecar was found",
+            json!({
+                "eligible_lineage_columns": total_lineage_columns,
+                "sidecar_status": sidecar_status,
+            }),
+        ))
+    } else if missing_indexed_columns > 0 {
+        Some(warning(
+            "projection_covi_incomplete",
+            "projection-column COVE-I sidecar does not cover every eligible lineage column",
+            json!({
+                "eligible_lineage_columns": total_lineage_columns,
+                "missing_indexed_columns": missing_indexed_columns,
+            }),
+        ))
+    } else {
+        None
+    };
+    ProjectionCoviAcceleration {
+        report: json!({
+            "available": available,
+            "sidecar_status": sidecar_status,
+            "root_count": root_count,
+            "eligible_lineage_columns": total_lineage_columns,
+            "missing_indexed_columns": missing_indexed_columns,
+            "projections": projections,
+        }),
+        warning,
     }
 }
 

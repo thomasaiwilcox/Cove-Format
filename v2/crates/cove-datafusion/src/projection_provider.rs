@@ -17,11 +17,13 @@ use cove_core::{
 #[cfg(feature = "covi")]
 use cove_index::CoviArtifactV2;
 #[cfg(feature = "covi")]
+use cove_index::CoviIndexedTargetKindV2;
+#[cfg(feature = "covi")]
 use cove_index::{
     build::projection_column_lookup_key_for_json_value,
     execution::{
-        CoviLookupComparatorContextV2, CoviLookupKeyV2, CoviLookupOpV2, CoviLookupRequestV2,
-        CoviLookupTargetV2, CoviValidationContextV2, ValidatedCoviArtifactV2,
+        CoviCandidateSetV2, CoviLookupComparatorContextV2, CoviLookupKeyV2, CoviLookupOpV2,
+        CoviLookupRequestV2, CoviLookupTargetV2, CoviValidationContextV2, ValidatedCoviArtifactV2,
     },
 };
 use cove_map::{
@@ -29,7 +31,10 @@ use cove_map::{
     ProjectionBatchOptions, ProjectionCandidateRows, ProjectionDescriptor, ProjectionFilter,
 };
 #[cfg(feature = "covi")]
-use cove_map::{projection_covi_filter_plan, ProjectionFilterLiteral, ProjectionFilterOp};
+use cove_map::{
+    projection_covi_filter_plan, ProjectionCoviFilterPlan, ProjectionFilterLiteral,
+    ProjectionFilterOp,
+};
 use datafusion::{
     catalog::{Session, TableProvider},
     common::{stats::Precision, DataFusionError, Result, Statistics},
@@ -253,13 +258,52 @@ impl DisplayAs for CoveProjectionExec {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => write!(
                 f,
-                "CoveProjectionExec: projection={}, object={}, limit={:?}",
+                "CoveProjectionExec: projection={}, object={}, limit={:?}, projection_covi={}",
                 self.projection.projection_id,
                 self.object_path.display(),
-                self.limit
+                self.limit,
+                projection_covi_display_summary(&self.projection, &self.pushed_filters)
             ),
             DisplayFormatType::TreeRender => write!(f, "CoveProjectionExec"),
         }
+    }
+}
+
+#[cfg(feature = "covi")]
+fn projection_covi_display_summary(
+    projection: &ProjectionDescriptor,
+    filters: &[ProjectionFilter],
+) -> String {
+    let plan = projection_covi_filter_plan(projection, filters);
+    if filters.is_empty() {
+        return "no_filters".into();
+    }
+    let reasons = plan
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| !diagnostic.eligible)
+        .map(|diagnostic| diagnostic.reason.as_str())
+        .collect::<Vec<_>>();
+    if reasons.is_empty() {
+        format!("eligible_filters={}", plan.lookups.len())
+    } else {
+        format!(
+            "eligible_filters={}, fallback_reasons={}",
+            plan.lookups.len(),
+            reasons.join("|")
+        )
+    }
+}
+
+#[cfg(not(feature = "covi"))]
+fn projection_covi_display_summary(
+    _projection: &ProjectionDescriptor,
+    filters: &[ProjectionFilter],
+) -> &'static str {
+    if filters.is_empty() {
+        "no_filters"
+    } else {
+        "unavailable"
     }
 }
 
@@ -395,13 +439,20 @@ fn projection_covi_candidate_rows(
     metrics
         .residual_predicates
         .add(plan.unsupported_filters.len());
-    let sidecar = load_projection_covi_sidecar(object_path, metrics)?;
+    metrics
+        .projection_covi_eligible_filters
+        .add(plan.lookups.len());
     if plan.lookups.is_empty() {
+        if !filters.is_empty() {
+            metrics.projection_covi_fallback_no_eligible_filter.add(1);
+        }
         return None;
     }
+    let sidecar = load_projection_covi_sidecar(object_path, metrics)?;
+    let indexed_rows = sidecar.matching_projection_row_count(&plan);
     let mut selected: Option<BTreeSet<u64>> = None;
-    for lookup in plan.lookups {
-        let Some(request) = projection_covi_lookup_request(&lookup) else {
+    for lookup in &plan.lookups {
+        let Some(request) = projection_covi_lookup_request(lookup) else {
             metrics.lookup_index_misses.add(1);
             continue;
         };
@@ -421,28 +472,85 @@ fn projection_covi_candidate_rows(
             }
         }
     }
-    selected.map(ProjectionCandidateRows::from_ordinals)
+    let Some(selected) = selected else {
+        metrics.projection_covi_fallback_lookup_failed.add(1);
+        return None;
+    };
+    metrics.projection_covi_candidate_rows.add(selected.len());
+    metrics
+        .projection_covi_residual_rows_checked
+        .add(selected.len());
+    if let Some(indexed_rows) = indexed_rows {
+        metrics
+            .projection_covi_rows_skipped
+            .add(indexed_rows.saturating_sub(selected.len()));
+    }
+    Some(ProjectionCandidateRows::from_ordinals(selected))
+}
+
+#[cfg(feature = "covi")]
+struct ProjectionCoviSidecar {
+    validated: ValidatedCoviArtifactV2,
+    parsed: CoviArtifactV2,
+}
+
+#[cfg(feature = "covi")]
+impl ProjectionCoviSidecar {
+    fn lookup(
+        &self,
+        request: &CoviLookupRequestV2,
+    ) -> Result<CoviCandidateSetV2, cove_core::CoveError> {
+        self.validated.lookup(request)
+    }
+
+    fn matching_projection_row_count(&self, plan: &ProjectionCoviFilterPlan) -> Option<usize> {
+        plan.lookups
+            .iter()
+            .filter_map(|lookup| {
+                self.parsed
+                    .index_roots
+                    .iter()
+                    .find(|root| {
+                        root.indexed_target_kind == CoviIndexedTargetKindV2::ProjectionColumn
+                            && root.table_id == lookup.projection_table_id
+                            && root.column_id == lookup.projection_column_id
+                    })
+                    .map(|root| root.value_count as usize)
+            })
+            .max()
+    }
 }
 
 #[cfg(feature = "covi")]
 fn load_projection_covi_sidecar(
     object_path: &Path,
     metrics: &CoveFileMetrics,
-) -> Option<ValidatedCoviArtifactV2> {
+) -> Option<ProjectionCoviSidecar> {
     let Some(covi_path) = discover_projection_columns_covi_path(object_path) else {
+        metrics.projection_covi_fallback_no_sidecar.add(1);
         metrics.sidecar_index_fallbacks.add(1);
         return None;
     };
+    metrics.projection_covi_sidecars_found.add(1);
     let Ok(object_bytes) = std::fs::read(object_path) else {
         metrics.covi_sidecars_ignored.add(1);
+        metrics.projection_covi_sidecars_ignored.add(1);
+        metrics.projection_covi_fallback_unavailable.add(1);
         return None;
     };
     let Ok(covi_bytes) = std::fs::read(&covi_path) else {
         metrics.covi_sidecars_ignored.add(1);
+        metrics.projection_covi_sidecars_ignored.add(1);
+        metrics.projection_covi_fallback_unavailable.add(1);
         return None;
     };
+    metrics
+        .projection_covi_validation_bytes
+        .add(object_bytes.len().saturating_add(covi_bytes.len()));
     let Ok(postscript) = CovePostscriptV1::parse_from_tail(&object_bytes) else {
         metrics.covi_sidecars_ignored.add(1);
+        metrics.projection_covi_sidecars_ignored.add(1);
+        metrics.projection_covi_fallback_unavailable.add(1);
         return None;
     };
     let snapshot_id = {
@@ -481,6 +589,9 @@ fn load_projection_covi_sidecar(
         Ok(validated) => {
             metrics.covi_sidecars_loaded.add(1);
             if let Some(parsed) = parsed {
+                metrics
+                    .projection_covi_root_count
+                    .add(parsed.index_roots.len());
                 metrics.inverted_index_hits.add(parsed.index_roots.len());
                 metrics.morsels_considered.add(
                     parsed
@@ -489,12 +600,19 @@ fn load_projection_covi_sidecar(
                         .map(|root| root.value_count as usize)
                         .sum::<usize>(),
                 );
+                Some(ProjectionCoviSidecar { validated, parsed })
+            } else {
+                metrics.covi_sidecars_ignored.add(1);
+                metrics.projection_covi_sidecars_ignored.add(1);
+                metrics.projection_covi_fallback_unavailable.add(1);
+                None
             }
-            Some(validated)
         }
         Err(_) => {
             metrics.covi_sidecars_stale.add(1);
+            metrics.projection_covi_sidecars_ignored.add(1);
             metrics.sidecar_index_fallbacks.add(1);
+            metrics.projection_covi_fallback_stale.add(1);
             None
         }
     }
@@ -508,6 +626,7 @@ fn projection_covi_candidate_rows(
     metrics: &CoveFileMetrics,
 ) -> Option<ProjectionCandidateRows> {
     metrics.sidecar_index_fallbacks.add(1);
+    metrics.projection_covi_fallback_unavailable.add(1);
     None
 }
 
@@ -536,11 +655,7 @@ fn discover_projection_columns_covi_path(object_path: &Path) -> Option<PathBuf> 
     if replaced.is_file() {
         return Some(replaced);
     }
-    let bundle = object_path
-        .parent()?
-        .join("indexes")
-        .join("object_properties.covi");
-    bundle.is_file().then_some(bundle)
+    None
 }
 
 #[cfg(feature = "covi")]

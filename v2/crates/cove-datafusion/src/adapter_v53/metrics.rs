@@ -25,6 +25,31 @@ pub(crate) struct CoveFileMetrics {
     #[allow(dead_code)]
     pub(crate) covi_sidecars_ignored: Count,
     pub(crate) sidecar_index_fallbacks: Count,
+    #[allow(dead_code)]
+    pub(crate) projection_covi_sidecars_found: Count,
+    #[allow(dead_code)]
+    pub(crate) projection_covi_sidecars_ignored: Count,
+    #[allow(dead_code)]
+    pub(crate) projection_covi_validation_bytes: Count,
+    #[allow(dead_code)]
+    pub(crate) projection_covi_root_count: Count,
+    #[allow(dead_code)]
+    pub(crate) projection_covi_eligible_filters: Count,
+    #[allow(dead_code)]
+    pub(crate) projection_covi_candidate_rows: Count,
+    #[allow(dead_code)]
+    pub(crate) projection_covi_rows_skipped: Count,
+    #[allow(dead_code)]
+    pub(crate) projection_covi_residual_rows_checked: Count,
+    #[allow(dead_code)]
+    pub(crate) projection_covi_fallback_no_sidecar: Count,
+    #[allow(dead_code)]
+    pub(crate) projection_covi_fallback_no_eligible_filter: Count,
+    #[allow(dead_code)]
+    pub(crate) projection_covi_fallback_lookup_failed: Count,
+    #[allow(dead_code)]
+    pub(crate) projection_covi_fallback_stale: Count,
+    pub(crate) projection_covi_fallback_unavailable: Count,
     pub(crate) covel_sections_loaded: Count,
     pub(crate) covel_sections_ignored: Count,
     pub(crate) covel_scan_splits_loaded: Count,
@@ -125,6 +150,34 @@ impl CoveFileMetrics {
                 .counter("cove_covi_sidecars_ignored", partition),
             sidecar_index_fallbacks: MetricBuilder::new(metrics)
                 .counter("cove_sidecar_index_fallbacks", partition),
+            projection_covi_sidecars_found: MetricBuilder::new(metrics)
+                .counter("cove_projection_covi_sidecars_found", partition),
+            projection_covi_sidecars_ignored: MetricBuilder::new(metrics)
+                .counter("cove_projection_covi_sidecars_ignored", partition),
+            projection_covi_validation_bytes: MetricBuilder::new(metrics)
+                .counter("cove_projection_covi_validation_bytes", partition),
+            projection_covi_root_count: MetricBuilder::new(metrics)
+                .counter("cove_projection_covi_root_count", partition),
+            projection_covi_eligible_filters: MetricBuilder::new(metrics)
+                .counter("cove_projection_covi_eligible_filters", partition),
+            projection_covi_candidate_rows: MetricBuilder::new(metrics)
+                .counter("cove_projection_covi_candidate_rows", partition),
+            projection_covi_rows_skipped: MetricBuilder::new(metrics)
+                .counter("cove_projection_covi_rows_skipped", partition),
+            projection_covi_residual_rows_checked: MetricBuilder::new(metrics)
+                .counter("cove_projection_covi_residual_rows_checked", partition),
+            projection_covi_fallback_no_sidecar: MetricBuilder::new(metrics)
+                .counter("cove_projection_covi_fallback_no_sidecar", partition),
+            projection_covi_fallback_no_eligible_filter: MetricBuilder::new(metrics).counter(
+                "cove_projection_covi_fallback_no_eligible_filter",
+                partition,
+            ),
+            projection_covi_fallback_lookup_failed: MetricBuilder::new(metrics)
+                .counter("cove_projection_covi_fallback_lookup_failed", partition),
+            projection_covi_fallback_stale: MetricBuilder::new(metrics)
+                .counter("cove_projection_covi_fallback_stale", partition),
+            projection_covi_fallback_unavailable: MetricBuilder::new(metrics)
+                .counter("cove_projection_covi_fallback_unavailable", partition),
             covel_sections_loaded: MetricBuilder::new(metrics)
                 .counter("cove_covel_sections_loaded", partition),
             covel_sections_ignored: MetricBuilder::new(metrics)

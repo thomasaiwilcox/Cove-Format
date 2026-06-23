@@ -187,7 +187,13 @@
     "semantic_mapping_corpus",
     "cove_map_build_tiny",
     "cove_map_build_medium",
-    "cove_map_build_messy_multisource"
+    "cove_map_build_messy_multisource",
+    "projection_covi_equality_valid",
+    "projection_covi_in_valid",
+    "projection_covi_range_valid",
+    "projection_covi_missing_sidecar_fallback",
+    "projection_covi_stale_sidecar_fallback",
+    "projection_covi_unsupported_predicate_fallback"
   ],
   "required_report_fields": [
     "planning_ns",
