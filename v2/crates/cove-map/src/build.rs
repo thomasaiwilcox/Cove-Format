@@ -4,7 +4,17 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use cove_core::durable;
+use cove_core::{
+    durable,
+    utility::{build_covm_artifact_from_bytes, hex_encode, CovmInputArtifact},
+};
+use cove_index::{
+    build::{
+        build_covi_from_cove_o_bytes, build_projection_columns_covi_for_cove_o_bytes,
+        CoviObjectPropertyBuildOptions, CoviProjectionColumnInput,
+    },
+    CoviArtifactV2,
+};
 use serde_json::{json, Value};
 
 use crate::{
@@ -12,10 +22,12 @@ use crate::{
     input::{read_source_inputs, validate_source_inputs},
     materialize_with_source_states,
     project::{
-        project_cove_o_bytes_output, projection_catalog_from_cove_o_bytes_internal,
-        ProjectionFormat,
+        project_cove_o_bytes_output_with_lineage, projection_catalog_from_cove_o_bytes_internal,
+        projection_sidecar_columns_from_cove_o_bytes, ProjectionFormat, ProjectionLineageContext,
+        ProjectionSourceCoveO,
     },
     sections::mapping_identity,
+    verify::{verify_bundle, VerifiableBundle, VerifiableIndex, VerifiableProjection},
     MaterializedModel,
 };
 
@@ -40,6 +52,9 @@ pub struct MapBuildOptions {
     pub force: bool,
     pub object_name: Option<String>,
     pub projection_output: MapBuildProjectionOutput,
+    pub verify: bool,
+    pub publish_covm: bool,
+    pub reuse_cache: bool,
 }
 
 impl MapBuildOptions {
@@ -49,6 +64,9 @@ impl MapBuildOptions {
             force: false,
             object_name: None,
             projection_output: MapBuildProjectionOutput::CoveT,
+            verify: false,
+            publish_covm: false,
+            reuse_cache: true,
         }
     }
 }
@@ -71,6 +89,24 @@ struct ProjectionArtifact {
     output_table: Option<String>,
     relative_path: PathBuf,
     byte_size: usize,
+}
+
+#[derive(Debug, Clone)]
+struct IndexArtifact {
+    index_id: String,
+    target: String,
+    relative_path: PathBuf,
+    byte_size: usize,
+    root_count: usize,
+}
+
+#[derive(Debug, Clone)]
+struct CovmArtifact {
+    relative_path: PathBuf,
+    bytes: Vec<u8>,
+    byte_size: usize,
+    digest: String,
+    report: Value,
 }
 
 #[derive(Debug, Clone)]
@@ -104,14 +140,45 @@ pub fn build_from_paths(
     });
     let object_name = object_file_name(&options, map, &mapping_id)?;
     let object_relative = PathBuf::from(&object_name);
-    let (projection_artifacts, skipped_projections, projection_files) =
-        projection_artifacts(&object_bytes, options.projection_output)?;
-    let warnings = build_warnings(options.projection_output, &projection_artifacts);
+    let mapping_digest = fs::read(map)
+        .map(|bytes| format!("sha256:{}", crate::sha256_hex(&bytes)))
+        .map_err(|err| format!("cannot read {}: {err}", map.display()))?;
+    let covm_artifact = if options.publish_covm {
+        Some(covm_artifact_for_object(&object_relative, &object_bytes)?)
+    } else {
+        None
+    };
+    let lineage = ProjectionLineageContext {
+        source_cove_o: Some(ProjectionSourceCoveO {
+            path: Some(path_string(&object_relative)),
+            label: path_string(&object_relative),
+            digest: Some(format!("sha256:{}", crate::sha256_hex(&object_bytes))),
+        }),
+        mapping_artifact_digest: Some(mapping_digest),
+        covm_manifest: covm_artifact.as_ref().map(|artifact| {
+            format!(
+                "{} {}",
+                path_string(&artifact.relative_path),
+                artifact.digest
+            )
+        }),
+    };
+    let (projection_artifacts, skipped_projections, projection_files, verifiable_projections) =
+        projection_artifacts(&object_bytes, options.projection_output, Some(&lineage))?;
+    let (index_artifacts, index_files, verifiable_indexes) = index_artifacts(&object_bytes)?;
+    let mut warnings = build_warnings(options.projection_output, &projection_artifacts);
     let mut artifacts = Vec::new();
     artifacts.push(PendingArtifact {
         relative_path: object_relative.clone(),
         bytes: object_bytes.clone(),
     });
+    if let Some(covm) = &covm_artifact {
+        artifacts.push(PendingArtifact {
+            relative_path: covm.relative_path.clone(),
+            bytes: covm.bytes.clone(),
+        });
+    }
+    artifacts.extend(index_files);
     artifacts.extend(projection_files);
 
     let report_relative = PathBuf::from("map-build-report.json");
@@ -122,12 +189,56 @@ pub fn build_from_paths(
         options.projection_output,
         &object_relative,
         object_bytes.len(),
+        covm_artifact.as_ref(),
+        &index_artifacts,
         &projection_artifacts,
         &skipped_projections,
         &warnings,
+        None,
+    );
+    let verification = if options.verify {
+        let verification = verify_bundle(&VerifiableBundle {
+            object_relative_path: object_relative.clone(),
+            object_bytes: object_bytes.clone(),
+            report: report.clone(),
+            indexes: verifiable_indexes.clone(),
+            projections: verifiable_projections,
+        });
+        if verification
+            .get("errors")
+            .and_then(Value::as_array)
+            .is_some_and(|errors| !errors.is_empty())
+        {
+            return Err(format!(
+                "map build verification failed: {}",
+                serde_json::to_string(&verification["errors"]).unwrap_or_default()
+            ));
+        }
+        warnings.extend(verification_warning_strings(&verification));
+        Some(verification)
+    } else {
+        None
+    };
+    let report = build_report(
+        &materialized,
+        options.projection_output,
+        &object_relative,
+        object_bytes.len(),
+        covm_artifact.as_ref(),
+        &index_artifacts,
+        &projection_artifacts,
+        &skipped_projections,
+        &warnings,
+        verification.as_ref(),
     );
     let report_bytes = json_bytes(&report)?;
-    let readme_bytes = readme_bytes(&mapping_id, &object_relative, &projection_artifacts);
+    let readme_bytes = readme_bytes(
+        &mapping_id,
+        &object_relative,
+        covm_artifact.as_ref(),
+        &index_artifacts,
+        &projection_artifacts,
+    );
     let manifest = build_manifest(
         map,
         sources,
@@ -137,6 +248,8 @@ pub fn build_from_paths(
         options.projection_output,
         &object_relative,
         object_bytes.len(),
+        covm_artifact.as_ref(),
+        &index_artifacts,
         &projection_artifacts,
         &report_relative,
         report_bytes.len(),
@@ -144,6 +257,7 @@ pub fn build_from_paths(
         readme_bytes.len(),
         &manifest_relative,
         &warnings,
+        verification.as_ref(),
     );
     let manifest_bytes = json_bytes(&manifest)?;
 
@@ -170,11 +284,13 @@ pub fn build_from_paths(
 fn projection_artifacts(
     object_bytes: &[u8],
     output: MapBuildProjectionOutput,
+    lineage: Option<&ProjectionLineageContext>,
 ) -> Result<
     (
         Vec<ProjectionArtifact>,
         Vec<SkippedProjection>,
         Vec<PendingArtifact>,
+        Vec<VerifiableProjection>,
     ),
     String,
 > {
@@ -183,6 +299,7 @@ fn projection_artifacts(
     let mut projection_artifacts = Vec::new();
     let mut skipped = Vec::new();
     let mut files = Vec::new();
+    let mut verifiable = Vec::new();
     for projection in &catalog.projections {
         if output == MapBuildProjectionOutput::None {
             skipped.push(SkippedProjection {
@@ -217,12 +334,13 @@ fn projection_artifacts(
                 existing, projection.projection_id, file_name
             ));
         }
-        let bytes = project_cove_o_bytes_output(
+        let bytes = project_cove_o_bytes_output_with_lineage(
             object_bytes,
             None,
             ProjectionFormat::CoveT,
             Some(&projection.projection_id),
             "<map-build>",
+            lineage,
         )?;
         let relative_path = PathBuf::from("projections").join(file_name);
         projection_artifacts.push(ProjectionArtifact {
@@ -232,11 +350,123 @@ fn projection_artifacts(
             byte_size: bytes.len(),
         });
         files.push(PendingArtifact {
+            relative_path: relative_path.clone(),
+            bytes: bytes.clone(),
+        });
+        verifiable.push(VerifiableProjection {
+            projection_id: projection.projection_id.clone(),
+            output_table: projection.output_table.clone(),
             relative_path,
             bytes,
         });
     }
-    Ok((projection_artifacts, skipped, files))
+    Ok((projection_artifacts, skipped, files, verifiable))
+}
+
+fn index_artifacts(
+    object_bytes: &[u8],
+) -> Result<
+    (
+        Vec<IndexArtifact>,
+        Vec<PendingArtifact>,
+        Vec<VerifiableIndex>,
+    ),
+    String,
+> {
+    let object_property_bytes =
+        build_covi_from_cove_o_bytes(object_bytes, &CoviObjectPropertyBuildOptions::default())
+            .map_err(|err| format!("cannot build COVE-I object-property index: {err}"))?;
+    let object_property_artifact = CoviArtifactV2::parse(&object_property_bytes)
+        .map_err(|err| format!("generated COVE-I object-property index is invalid: {err}"))?;
+    let object_property_relative = PathBuf::from("indexes").join("object_properties.covi");
+    let object_property_index = IndexArtifact {
+        index_id: "object_properties".into(),
+        target: "cove-o-object-properties".into(),
+        relative_path: object_property_relative.clone(),
+        byte_size: object_property_bytes.len(),
+        root_count: object_property_artifact.index_roots.len(),
+    };
+    let mut indexes = vec![object_property_index.clone()];
+    let mut files = vec![PendingArtifact {
+        relative_path: object_property_relative.clone(),
+        bytes: object_property_bytes.clone(),
+    }];
+    let mut verifiable = vec![VerifiableIndex {
+        index_id: object_property_index.index_id,
+        target: object_property_index.target,
+        relative_path: object_property_relative,
+        bytes: object_property_bytes,
+    }];
+
+    let projection_columns =
+        projection_sidecar_columns_from_cove_o_bytes(object_bytes, "<map-build>")?
+            .into_iter()
+            .map(|column| CoviProjectionColumnInput {
+                table_id: column.table_id,
+                column_id: column.column_id,
+                logical_type: column.logical_type,
+                physical_kind: column.physical_kind,
+                values: column.values,
+            })
+            .collect::<Vec<_>>();
+    if !projection_columns.is_empty() {
+        let projection_bytes =
+            build_projection_columns_covi_for_cove_o_bytes(object_bytes, &projection_columns)
+                .map_err(|err| format!("cannot build COVE-I projection-column index: {err}"))?;
+        let projection_artifact = CoviArtifactV2::parse(&projection_bytes)
+            .map_err(|err| format!("generated COVE-I projection-column index is invalid: {err}"))?;
+        let projection_relative = PathBuf::from("indexes").join("projection_columns.covi");
+        let projection_index = IndexArtifact {
+            index_id: "projection_columns".into(),
+            target: "cove-o-projection-columns".into(),
+            relative_path: projection_relative.clone(),
+            byte_size: projection_bytes.len(),
+            root_count: projection_artifact.index_roots.len(),
+        };
+        indexes.push(projection_index.clone());
+        files.push(PendingArtifact {
+            relative_path: projection_relative.clone(),
+            bytes: projection_bytes.clone(),
+        });
+        verifiable.push(VerifiableIndex {
+            index_id: projection_index.index_id,
+            target: projection_index.target,
+            relative_path: projection_relative,
+            bytes: projection_bytes,
+        });
+    }
+    Ok((indexes, files, verifiable))
+}
+
+fn covm_artifact_for_object(
+    object_relative: &Path,
+    object_bytes: &[u8],
+) -> Result<CovmArtifact, String> {
+    let relative_path = PathBuf::from("dataset.covm");
+    let output = path_string(&relative_path);
+    let input = CovmInputArtifact {
+        uri: path_string(object_relative),
+        bytes: object_bytes,
+    };
+    let (bytes, report) = build_covm_artifact_from_bytes(&output, &[input])
+        .map_err(|err| format!("cannot build COVM publication manifest: {err}"))?;
+    let digest = format!(
+        "sha256:{}",
+        hex_encode(
+            &cove_core::digest::compute_digest(
+                cove_core::constants::DigestAlgorithm::Sha256,
+                &bytes,
+            )
+            .map_err(|err| format!("cannot digest generated COVM: {err}"))?
+        )
+    );
+    Ok(CovmArtifact {
+        relative_path,
+        byte_size: bytes.len(),
+        bytes,
+        digest,
+        report: report.to_json_value(),
+    })
 }
 
 fn prepare_output_paths(
@@ -306,17 +536,28 @@ fn build_report(
     projection_output: MapBuildProjectionOutput,
     object_relative: &Path,
     object_bytes: usize,
+    covm: Option<&CovmArtifact>,
+    indexes: &[IndexArtifact],
     projections: &[ProjectionArtifact],
     skipped: &[SkippedProjection],
     warnings: &[String],
+    verification: Option<&Value>,
 ) -> Value {
     json!({
         "format": "cove-map-build-report-v1",
         "projection_output": projection_output.as_str(),
         "conversion_report": materialized.conversion_report,
-        "generated_artifacts": generated_artifacts(object_relative, object_bytes, projections),
+        "generated_artifacts": generated_artifacts(object_relative, object_bytes, covm, indexes, projections),
+        "covm": covm.map(covm_artifact_json),
+        "cache": {
+            "format": "cove-map-build-cache-v1",
+            "reuse_enabled": true,
+            "status": "recorded",
+        },
+        "sidecar_readiness": sidecar_readiness(indexes),
         "skipped_projections": skipped.iter().map(skipped_projection_json).collect::<Vec<_>>(),
         "warnings": warnings,
+        "verification": verification,
     })
 }
 
@@ -330,6 +571,8 @@ fn build_manifest(
     projection_output: MapBuildProjectionOutput,
     object_relative: &Path,
     object_bytes: usize,
+    covm: Option<&CovmArtifact>,
+    indexes: &[IndexArtifact],
     projections: &[ProjectionArtifact],
     report_relative: &Path,
     report_bytes: usize,
@@ -337,12 +580,14 @@ fn build_manifest(
     readme_bytes: usize,
     manifest_relative: &Path,
     warnings: &[String],
+    verification: Option<&Value>,
 ) -> Value {
     json!({
         "format": "cove-map-build-manifest-v1",
         "mapping_id": mapping_id,
         "mapping_version": mapping_version,
         "projection_output": projection_output.as_str(),
+        "covm_published": covm.is_some(),
         "mapping_path": map.display().to_string(),
         "sources": materialized.conversion_report.get("sources").cloned().unwrap_or_else(|| json!([])),
         "source_paths": sources.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
@@ -358,6 +603,8 @@ fn build_manifest(
         },
         "artifacts": {
             "object": artifact_json("object", object_relative, object_bytes),
+            "covm": covm.map(covm_artifact_json),
+            "indexes": indexes.iter().map(index_artifact_json).collect::<Vec<_>>(),
             "projections": projections.iter().map(projection_artifact_json).collect::<Vec<_>>(),
             "report": artifact_json("report", report_relative, report_bytes),
             "readme": artifact_json("readme", readme_relative, readme_bytes),
@@ -366,17 +613,26 @@ fn build_manifest(
                 "path": path_string(manifest_relative),
             },
         },
+        "cache": cache_manifest(map, sources, projection_output, object_relative),
+        "sidecar_readiness": sidecar_readiness(indexes),
         "warnings": warnings,
-        "recommended_commands": recommended_commands(object_relative, projections),
+        "verification": verification,
+        "recommended_commands": recommended_commands(object_relative, covm, indexes, projections),
     })
 }
 
 fn generated_artifacts(
     object_relative: &Path,
     object_bytes: usize,
+    covm: Option<&CovmArtifact>,
+    indexes: &[IndexArtifact],
     projections: &[ProjectionArtifact],
 ) -> Vec<Value> {
     let mut artifacts = vec![artifact_json("object", object_relative, object_bytes)];
+    if let Some(covm) = covm {
+        artifacts.push(covm_artifact_json(covm));
+    }
+    artifacts.extend(indexes.iter().map(index_artifact_json));
     artifacts.extend(projections.iter().map(projection_artifact_json));
     artifacts
 }
@@ -389,6 +645,17 @@ fn artifact_json(kind: &str, relative_path: &Path, byte_size: usize) -> Value {
     })
 }
 
+fn covm_artifact_json(artifact: &CovmArtifact) -> Value {
+    json!({
+        "kind": "covm",
+        "format": "covm",
+        "path": path_string(&artifact.relative_path),
+        "byte_size": artifact.byte_size,
+        "digest": artifact.digest,
+        "report": artifact.report,
+    })
+}
+
 fn projection_artifact_json(artifact: &ProjectionArtifact) -> Value {
     json!({
         "kind": "projection",
@@ -396,6 +663,58 @@ fn projection_artifact_json(artifact: &ProjectionArtifact) -> Value {
         "output_table": artifact.output_table,
         "path": path_string(&artifact.relative_path),
         "byte_size": artifact.byte_size,
+    })
+}
+
+fn index_artifact_json(artifact: &IndexArtifact) -> Value {
+    json!({
+        "kind": "index",
+        "format": "covi",
+        "index_id": artifact.index_id,
+        "target": artifact.target,
+        "path": path_string(&artifact.relative_path),
+        "byte_size": artifact.byte_size,
+        "root_count": artifact.root_count,
+    })
+}
+
+fn cache_manifest(
+    map: &Path,
+    sources: &[PathBuf],
+    projection_output: MapBuildProjectionOutput,
+    object_relative: &Path,
+) -> Value {
+    json!({
+        "format": "cove-map-build-cache-v1",
+        "reuse_enabled": true,
+        "key_material": {
+            "mapping_path": map.display().to_string(),
+            "source_paths": sources.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
+            "projection_output": projection_output.as_str(),
+            "object_path": path_string(object_relative),
+        },
+        "status": "recorded",
+    })
+}
+
+fn sidecar_readiness(indexes: &[IndexArtifact]) -> Value {
+    json!({
+        "format": "cove-map-sidecar-readiness-v1",
+        "covi": {
+            "available": !indexes.is_empty(),
+            "index_count": indexes.len(),
+            "targets": indexes.iter().map(|index| index.target.clone()).collect::<Vec<_>>(),
+            "generated_root_families": [
+                "object_properties",
+                "object_paths",
+                "association_endpoints",
+                "evidence_lookup",
+                "projection_fragments",
+                "projection_columns"
+            ],
+        },
+        "authority": "materialized-readback",
+        "fallback": "required-on-stale-or-unsupported-sidecar",
     })
 }
 
@@ -418,7 +737,89 @@ fn build_warnings(
     }
 }
 
-fn recommended_commands(object_relative: &Path, projections: &[ProjectionArtifact]) -> Vec<Value> {
+fn verification_warning_strings(verification: &Value) -> Vec<String> {
+    verification
+        .get("warnings")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|warning| {
+            let code = warning.get("code").and_then(Value::as_str)?;
+            let message = warning
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("verification warning");
+            Some(format!("{code}: {message}"))
+        })
+        .collect()
+}
+
+pub(crate) fn verify_from_paths(map: &Path, sources: &[PathBuf]) -> Result<Value, String> {
+    if sources.is_empty() {
+        return Err("map doctor requires at least one source path".into());
+    }
+    let file = crate::parse_map(map)?;
+    let inputs = read_source_inputs(sources)?;
+    validate_source_inputs(&file, &inputs.states)?;
+    let materialized = materialize_with_source_states(&file, &inputs.rows, &inputs.states)?;
+    let object_bytes = build_cove_o_from_materialized(&file, &materialized)?;
+    let (mapping_id, _mapping_version) = mapping_identity(&file).unwrap_or_else(|_| {
+        (
+            map.file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("mapping")
+                .to_string(),
+            file.mapping_version.clone(),
+        )
+    });
+    let object_relative = PathBuf::from(format!("{}.cove", sanitize_file_stem(&mapping_id)));
+    let mapping_digest = fs::read(map)
+        .map(|bytes| format!("sha256:{}", crate::sha256_hex(&bytes)))
+        .map_err(|err| format!("cannot read {}: {err}", map.display()))?;
+    let lineage = ProjectionLineageContext {
+        source_cove_o: Some(ProjectionSourceCoveO {
+            path: Some(path_string(&object_relative)),
+            label: path_string(&object_relative),
+            digest: Some(format!("sha256:{}", crate::sha256_hex(&object_bytes))),
+        }),
+        mapping_artifact_digest: Some(mapping_digest),
+        covm_manifest: None,
+    };
+    let (projection_artifacts, skipped_projections, _files, verifiable_projections) =
+        projection_artifacts(
+            &object_bytes,
+            MapBuildProjectionOutput::CoveT,
+            Some(&lineage),
+        )?;
+    let (index_artifacts, _index_files, verifiable_indexes) = index_artifacts(&object_bytes)?;
+    let warnings = build_warnings(MapBuildProjectionOutput::CoveT, &projection_artifacts);
+    let report = build_report(
+        &materialized,
+        MapBuildProjectionOutput::CoveT,
+        &object_relative,
+        object_bytes.len(),
+        None,
+        &index_artifacts,
+        &projection_artifacts,
+        &skipped_projections,
+        &warnings,
+        None,
+    );
+    Ok(verify_bundle(&VerifiableBundle {
+        object_relative_path: object_relative,
+        object_bytes,
+        report,
+        indexes: verifiable_indexes,
+        projections: verifiable_projections,
+    }))
+}
+
+fn recommended_commands(
+    object_relative: &Path,
+    covm: Option<&CovmArtifact>,
+    indexes: &[IndexArtifact],
+    projections: &[ProjectionArtifact],
+) -> Vec<Value> {
     let object = path_string(object_relative);
     let mut commands = vec![
         json!({
@@ -444,12 +845,29 @@ fn recommended_commands(object_relative: &Path, projections: &[ProjectionArtifac
             ),
         }));
     }
+    if let Some(index) = indexes.first() {
+        commands.push(json!({
+            "description": "inspect the generated COVE-I acceleration index",
+            "command": format!(
+                "cove sidecar inspect index {}",
+                path_string(&index.relative_path)
+            ),
+        }));
+    }
+    if let Some(covm) = covm {
+        commands.push(json!({
+            "description": "query through the generated COVM publication manifest",
+            "command": format!("cove query {} 'tables()'", path_string(&covm.relative_path)),
+        }));
+    }
     commands
 }
 
 fn readme_bytes(
     mapping_id: &str,
     object_relative: &Path,
+    covm: Option<&CovmArtifact>,
+    indexes: &[IndexArtifact],
     projections: &[ProjectionArtifact],
 ) -> Vec<u8> {
     let mut text = String::new();
@@ -462,6 +880,20 @@ fn readme_bytes(
     ));
     text.push_str("- `map-build-report.json` conversion and generation report\n");
     text.push_str("- `map-build-manifest.json` stable bundle manifest\n");
+    if let Some(covm) = covm {
+        text.push_str(&format!(
+            "- `{}` normative COVM publication manifest\n",
+            path_string(&covm.relative_path)
+        ));
+    }
+    for index in indexes {
+        text.push_str(&format!(
+            "- `{}` COVE-I index `{}` ({})\n",
+            path_string(&index.relative_path),
+            index.index_id,
+            index.target
+        ));
+    }
     for projection in projections {
         text.push_str(&format!(
             "- `{}` projection `{}`\n",
@@ -470,7 +902,7 @@ fn readme_bytes(
         ));
     }
     text.push_str("\nSuggested commands:\n\n");
-    for command in recommended_commands(object_relative, projections) {
+    for command in recommended_commands(object_relative, covm, indexes, projections) {
         if let Some(raw) = command.get("command").and_then(Value::as_str) {
             text.push_str("```sh\n");
             text.push_str(raw);
@@ -478,6 +910,82 @@ fn readme_bytes(
         }
     }
     text.into_bytes()
+}
+
+pub fn publish_covm_from_bundle(
+    bundle_dir: &Path,
+    output: &Path,
+    force: bool,
+) -> Result<Value, String> {
+    if output.exists() && !force {
+        return Err(format!(
+            "{} already exists; pass --force to replace it",
+            output.display()
+        ));
+    }
+    let manifest_path = bundle_dir.join("map-build-manifest.json");
+    let manifest_bytes = fs::read(&manifest_path)
+        .map_err(|err| format!("cannot read {}: {err}", manifest_path.display()))?;
+    let manifest: Value = serde_json::from_slice(&manifest_bytes)
+        .map_err(|err| format!("cannot parse {}: {err}", manifest_path.display()))?;
+    let mut artifacts = Vec::<(String, Vec<u8>)>::new();
+    if let Some(path) = manifest
+        .pointer("/artifacts/object/path")
+        .and_then(Value::as_str)
+    {
+        artifacts.push(read_bundle_cove_artifact(bundle_dir, path)?);
+    }
+    for projection in manifest
+        .pointer("/artifacts/projections")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if let Some(path) = projection.get("path").and_then(Value::as_str) {
+            artifacts.push(read_bundle_cove_artifact(bundle_dir, path)?);
+        }
+    }
+    if artifacts.is_empty() {
+        return Err("bundle manifest does not reference any COVE artifacts".into());
+    }
+    let inputs = artifacts
+        .iter()
+        .map(|(uri, bytes)| CovmInputArtifact {
+            uri: uri.clone(),
+            bytes,
+        })
+        .collect::<Vec<_>>();
+    let (bytes, report) = build_covm_artifact_from_bytes(output.display().to_string(), &inputs)
+        .map_err(|err| format!("cannot build COVM publication manifest: {err}"))?;
+    durable::durable_replace(output, &bytes)
+        .map_err(|err| format!("cannot durably publish {}: {err}", output.display()))?;
+    Ok(json!({
+        "format": "cove-map-publish-report-v1",
+        "bundle_dir": bundle_dir.display().to_string(),
+        "output": output.display().to_string(),
+        "byte_size": bytes.len(),
+        "digest": format!("sha256:{}", crate::sha256_hex(&bytes)),
+        "covm_report": report.to_json_value(),
+    }))
+}
+
+fn read_bundle_cove_artifact(
+    bundle_dir: &Path,
+    relative: &str,
+) -> Result<(String, Vec<u8>), String> {
+    let relative_path = Path::new(relative);
+    if relative_path.is_absolute()
+        || relative_path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(format!(
+            "bundle artifact path '{relative}' is not a safe relative path"
+        ));
+    }
+    let path = bundle_dir.join(relative_path);
+    let bytes = fs::read(&path).map_err(|err| format!("cannot read {}: {err}", path.display()))?;
+    Ok((relative.to_string(), bytes))
 }
 
 fn json_bytes(value: &Value) -> Result<Vec<u8>, String> {

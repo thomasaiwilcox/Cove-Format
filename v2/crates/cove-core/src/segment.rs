@@ -483,6 +483,11 @@ impl TableSegmentPayloadV1 {
         if morsels.sum_rows() != header.row_count as u64 {
             return Err(CoveError::SegmentCorrupt);
         }
+        morsels.validate_fixed_layout(
+            header.row_count,
+            header.morsel_count,
+            header.morsel_row_count,
+        )?;
 
         let column_dir_len = (header.column_count as usize)
             .checked_mul(TABLE_COLUMN_DIRECTORY_ENTRY_LEN)
@@ -749,6 +754,52 @@ impl RowMorselDirectory {
             next_row = next_row
                 .checked_add(e.row_count)
                 .ok_or(CoveError::ArithOverflow)?;
+        }
+        Ok(())
+    }
+
+    /// Validate the fixed-size morsel layout implied by the segment header.
+    ///
+    /// Morsel ids may be sparse, but the entry order and row ranges must match
+    /// the header's `morsel_row_count`; consumers that need exact row ranges
+    /// must still use the directory entry for the chosen morsel id.
+    pub fn validate_fixed_layout(
+        &self,
+        segment_row_count: u32,
+        segment_morsel_count: u32,
+        segment_morsel_row_count: u32,
+    ) -> Result<(), CoveError> {
+        if self.entries.len() != segment_morsel_count as usize {
+            return Err(CoveError::SegmentCorrupt);
+        }
+        if segment_row_count == 0 {
+            if segment_morsel_count == 0 && self.entries.is_empty() {
+                return Ok(());
+            }
+            return Err(CoveError::SegmentCorrupt);
+        }
+        if segment_morsel_row_count == 0 {
+            return Err(CoveError::SegmentCorrupt);
+        }
+
+        let expected_count =
+            u64::from(segment_row_count).div_ceil(u64::from(segment_morsel_row_count));
+        if u64::from(segment_morsel_count) != expected_count {
+            return Err(CoveError::SegmentCorrupt);
+        }
+
+        for (index, entry) in self.entries.iter().enumerate() {
+            let index = u32::try_from(index).map_err(|_| CoveError::ArithOverflow)?;
+            let expected_first = index
+                .checked_mul(segment_morsel_row_count)
+                .ok_or(CoveError::ArithOverflow)?;
+            let remaining = segment_row_count
+                .checked_sub(expected_first)
+                .ok_or(CoveError::SegmentCorrupt)?;
+            let expected_rows = remaining.min(segment_morsel_row_count);
+            if entry.first_row_in_segment != expected_first || entry.row_count != expected_rows {
+                return Err(CoveError::SegmentCorrupt);
+            }
         }
         Ok(())
     }
@@ -1107,6 +1158,38 @@ mod tests {
     }
 
     #[test]
+    fn morsel_directory_rejects_irregular_fixed_layout() {
+        let dir = RowMorselDirectory {
+            entries: vec![morsel(0, 0, 2), morsel(1, 2, 3)],
+        };
+        let bytes = dir.serialize();
+        let parsed = RowMorselDirectory::parse(&bytes, 2).unwrap();
+        assert_eq!(
+            parsed.validate_fixed_layout(5, 2, 4),
+            Err(CoveError::SegmentCorrupt)
+        );
+    }
+
+    #[test]
+    fn morsel_directory_accepts_sparse_ids_with_fixed_layout() {
+        let dir = RowMorselDirectory {
+            entries: vec![morsel(3, 0, 4), morsel(u32::MAX, 4, 1)],
+        };
+        let bytes = dir.serialize();
+        let parsed = RowMorselDirectory::parse(&bytes, 2).unwrap();
+        assert_eq!(parsed.validate_fixed_layout(5, 2, 4), Ok(()));
+    }
+
+    #[test]
+    fn morsel_directory_accepts_large_fixed_layout_without_u32_add_overflow() {
+        let dir = RowMorselDirectory {
+            entries: vec![morsel(0, 0, u32::MAX)],
+        };
+
+        assert_eq!(dir.validate_fixed_layout(u32::MAX, 1, u32::MAX), Ok(()));
+    }
+
+    #[test]
     fn page_index_coverage_accepts_sparse_morsel_ids() {
         let dir = RowMorselDirectory {
             entries: vec![morsel(3, 0, 4), morsel(9, 4, 1)],
@@ -1305,6 +1388,37 @@ mod tests {
         };
         let dir = RowMorselDirectory {
             entries: vec![morsel(0, 0, 9)],
+        };
+
+        let mut bytes = header.serialize().to_vec();
+        bytes.extend_from_slice(&dir.serialize());
+        assert_eq!(
+            TableSegmentPayloadV1::parse(&bytes),
+            Err(CoveError::SegmentCorrupt)
+        );
+    }
+
+    #[test]
+    fn table_segment_payload_rejects_irregular_morsel_layout() {
+        let morsel_len = ROW_MORSEL_ENTRY_LEN * 2;
+        let dir_end = TABLE_SEGMENT_HEADER_LEN + morsel_len;
+        let header = TableSegmentHeaderV1 {
+            table_id: 1,
+            segment_id: 0,
+            row_start: 0,
+            row_count: 5,
+            morsel_count: 2,
+            morsel_row_count: 4,
+            column_count: 0,
+            morsel_directory_offset: TABLE_SEGMENT_HEADER_LEN as u64,
+            column_directory_offset: dir_end as u64,
+            page_index_offset: dir_end as u64,
+            data_offset: dir_end as u64,
+            flags: 0,
+            checksum: 0,
+        };
+        let dir = RowMorselDirectory {
+            entries: vec![morsel(0, 0, 2), morsel(1, 2, 3)],
         };
 
         let mut bytes = header.serialize().to_vec();

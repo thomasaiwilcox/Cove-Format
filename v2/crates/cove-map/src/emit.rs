@@ -33,7 +33,7 @@ pub(crate) fn build_cove_o_from_materialized(
     writer.primary_profile = PrimaryProfile::ObjectTemporal as u8;
     writer.required_features = FEATURE_OBJECT_PROFILE | FEATURE_TRUST_CHAIN;
     writer.optional_features = FEATURE_SEMANTIC_MAP;
-    for section in map_passthrough_sections(file) {
+    for section in map_passthrough_sections(file, materialized)? {
         writer.sections.push(section);
     }
     writer.sections.push(object_section(

@@ -1183,6 +1183,7 @@ fn parse_projection_columns(
                     "nested_shape",
                     "conflict_policy",
                     "missing_policy",
+                    "lineage",
                 ],
             )?;
             Ok(MapProjectionColumn {
@@ -1194,9 +1195,55 @@ fn parse_projection_columns(
                     .unwrap_or_else(|| "canonical_value".to_string()),
                 missing_policy: optional_non_empty_str(entry, "missing_policy")?
                     .unwrap_or_else(|| "null".to_string()),
+                lineage: parse_projection_column_lineage(entry)?,
             })
         })
         .collect()
+}
+
+fn parse_projection_column_lineage(
+    entry: &Map<String, Value>,
+) -> Result<Option<MapProjectionColumnLineage>, CoveError> {
+    let Some(lineage) = entry.get("lineage") else {
+        return Ok(None);
+    };
+    let lineage = as_object(lineage)?;
+    validate_keys(
+        lineage,
+        &[
+            "source",
+            "object_type_id",
+            "object_type_name",
+            "property_id",
+            "property_name",
+            "projection_table_id",
+            "projection_column_id",
+            "expression",
+            "transform",
+            "filter_pushdown",
+        ],
+    )?;
+    let source = required_non_empty_str(lineage, "source")?;
+    let transform = required_non_empty_str(lineage, "transform")?;
+    let filter_pushdown = required_non_empty_str(lineage, "filter_pushdown")?;
+    if source != "object_property"
+        || transform != "identity"
+        || filter_pushdown != "projection_covi_prefilter"
+    {
+        return Err(CoveError::MapInvalid);
+    }
+    Ok(Some(MapProjectionColumnLineage {
+        source,
+        object_type_id: required_u32(lineage, "object_type_id")?,
+        object_type_name: required_non_empty_str(lineage, "object_type_name")?,
+        property_id: required_u32(lineage, "property_id")?,
+        property_name: required_non_empty_str(lineage, "property_name")?,
+        projection_table_id: required_u32(lineage, "projection_table_id")?,
+        projection_column_id: required_u32(lineage, "projection_column_id")?,
+        expression: required_non_empty_str(lineage, "expression")?,
+        transform,
+        filter_pushdown,
+    }))
 }
 
 fn validate_row_semantics_kind(kind: &str) -> Result<(), CoveError> {
@@ -1671,6 +1718,14 @@ fn optional_i64(object: &Map<String, Value>, key: &str) -> Result<Option<i64>, C
         None => Ok(None),
         Some(value) => value.as_i64().map(Some).ok_or(CoveError::MapInvalid),
     }
+}
+
+fn required_u32(object: &Map<String, Value>, key: &str) -> Result<u32, CoveError> {
+    object
+        .get(key)
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or(CoveError::MapInvalid)
 }
 
 fn required_bool(object: &Map<String, Value>, key: &str) -> Result<bool, CoveError> {

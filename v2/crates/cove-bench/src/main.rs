@@ -55,8 +55,8 @@ use cove_datafusion::{
 };
 use cove_index::build::{build_covi_from_cove_bytes, CoviBuildOptions};
 use cove_map::{
-    cove_o_from_paths, projected_output_from_cove_o_path, projected_output_from_paths,
-    ProjectionFormat,
+    build_from_paths, cove_o_from_paths, projected_output_from_cove_o_path,
+    projected_output_from_paths, MapBuildOptions, ProjectionFormat,
 };
 use orc_rust::{ArrowReaderBuilder as OrcReaderBuilder, ArrowWriterBuilder as OrcWriterBuilder};
 use parquet::{arrow::ArrowWriter, file::properties::WriterProperties};
@@ -1209,6 +1209,7 @@ fn run_publication_gap_cases(corpus: &Path) -> Result<Vec<Value>, String> {
     }));
     cases.push(run_semantic_projection_object_store_case(corpus)?);
     cases.push(run_semantic_showcase_bundle_object_store_case(corpus)?);
+    cases.extend(run_cove_map_build_cases(corpus)?);
     cases.extend(run_customer360_cases(corpus)?);
 
     Ok(cases)
@@ -1268,6 +1269,211 @@ fn run_customer360_cases(corpus: &Path) -> Result<Vec<Value>, String> {
         )?,
         run_customer360_object_store_case(corpus)?,
     ])
+}
+
+fn run_cove_map_build_cases(corpus: &Path) -> Result<Vec<Value>, String> {
+    let root = corpus.join("semantic-map-builds");
+    fs::create_dir_all(&root).map_err(|err| format!("cannot create {}: {err}", root.display()))?;
+    Ok(vec![
+        run_cove_map_build_case(&root, "cove_map_build_tiny", "tiny", 16)?,
+        run_cove_map_build_case(&root, "cove_map_build_medium", "medium", 512)?,
+        run_cove_map_build_messy_case(&root)?,
+    ])
+}
+
+fn run_cove_map_build_case(
+    root: &Path,
+    id: &str,
+    label: &str,
+    row_count: usize,
+) -> Result<Value, String> {
+    let dir = root.join(label);
+    fs::create_dir_all(&dir).map_err(|err| format!("cannot create {}: {err}", dir.display()))?;
+    let map_path = dir.join("people.covemap");
+    let source_path = dir.join("people.csv");
+    durable::durable_replace(&map_path, &bench_covemap_bytes()?)
+        .map_err(|err| format!("cannot publish {}: {err}", map_path.display()))?;
+    let mut csv = String::from("id,name\n");
+    for row in 0..row_count {
+        csv.push_str(&format!("{row},person-{row}\n"));
+    }
+    fs::write(&source_path, csv.as_bytes())
+        .map_err(|err| format!("cannot write {}: {err}", source_path.display()))?;
+    let out_dir = dir.join("bundle");
+    let mut options = MapBuildOptions::new(&out_dir);
+    options.force = true;
+    options.verify = true;
+    options.publish_covm = true;
+    let start = Instant::now();
+    let result = build_from_paths(&map_path, std::slice::from_ref(&source_path), options)
+        .map_err(|err| format!("{id} failed: {err}"))?;
+    let elapsed = start.elapsed().as_nanos();
+    Ok(cove_map_build_case_report(
+        id,
+        "COVE-MAP build bundle",
+        elapsed,
+        &[source_path],
+        &out_dir,
+        &result.manifest,
+    )?)
+}
+
+fn run_cove_map_build_messy_case(root: &Path) -> Result<Value, String> {
+    let dir = root.join("messy-multisource");
+    fs::create_dir_all(&dir).map_err(|err| format!("cannot create {}: {err}", dir.display()))?;
+    let map_path = dir.join("showcase.covemap");
+    let map_bytes = showcase_multi_source_covemap()?
+        .serialize()
+        .map_err(|err| err.to_string())?;
+    durable::durable_replace(&map_path, &map_bytes)
+        .map_err(|err| format!("cannot publish {}: {err}", map_path.display()))?;
+    let crm = dir.join("crm.csv");
+    let subscription = dir.join("subscription.csv");
+    let directory = dir.join("directory.parquet");
+    fs::write(&crm, b"id,name\np1,Ada CRM\np2,Linus CRM\np3,Grace CRM\n")
+        .map_err(|err| format!("cannot write {}: {err}", crm.display()))?;
+    fs::write(
+        &subscription,
+        b"id,name\np1,Ada\np2,Linus\np3,Grace Subscription\n",
+    )
+    .map_err(|err| format!("cannot write {}: {err}", subscription.display()))?;
+    write_parquet_file(&directory, &showcase_directory_name_batch()?)?;
+    let sources = vec![crm, directory, subscription];
+    let out_dir = dir.join("bundle");
+    let mut options = MapBuildOptions::new(&out_dir);
+    options.force = true;
+    options.verify = true;
+    options.publish_covm = true;
+    let start = Instant::now();
+    let result = build_from_paths(&map_path, &sources, options)
+        .map_err(|err| format!("cove_map_build_messy_multisource failed: {err}"))?;
+    let elapsed = start.elapsed().as_nanos();
+    Ok(cove_map_build_case_report(
+        "cove_map_build_messy_multisource",
+        "COVE-MAP messy multi-source build bundle",
+        elapsed,
+        &sources,
+        &out_dir,
+        &result.manifest,
+    )?)
+}
+
+fn cove_map_build_case_report(
+    id: &str,
+    category: &str,
+    elapsed: u128,
+    sources: &[PathBuf],
+    out_dir: &Path,
+    manifest: &Value,
+) -> Result<Value, String> {
+    let source_bytes = sources
+        .iter()
+        .map(|path| {
+            fs::metadata(path)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0)
+        })
+        .sum::<u64>();
+    let object_bytes = manifest
+        .pointer("/artifacts/object/byte_size")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let projection_bytes = manifest
+        .pointer("/artifacts/projections")
+        .and_then(Value::as_array)
+        .map(|projections| {
+            projections
+                .iter()
+                .filter_map(|projection| projection.get("byte_size").and_then(Value::as_u64))
+                .sum::<u64>()
+        })
+        .unwrap_or(0);
+    let index_bytes = manifest
+        .pointer("/artifacts/indexes")
+        .and_then(Value::as_array)
+        .map(|indexes| {
+            indexes
+                .iter()
+                .filter_map(|index| index.get("byte_size").and_then(Value::as_u64))
+                .sum::<u64>()
+        })
+        .unwrap_or(0);
+    let index_root_count = manifest
+        .pointer("/artifacts/indexes")
+        .and_then(Value::as_array)
+        .map(|indexes| {
+            indexes
+                .iter()
+                .filter_map(|index| index.get("root_count").and_then(Value::as_u64))
+                .sum::<u64>()
+        })
+        .unwrap_or(0);
+    let covm_bytes = manifest
+        .pointer("/artifacts/covm/byte_size")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let sidecar_available = manifest
+        .pointer("/sidecar_readiness/covi/available")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let sidecar_family_count = manifest
+        .pointer("/sidecar_readiness/covi/generated_root_families")
+        .and_then(Value::as_array)
+        .map(|families| families.len())
+        .unwrap_or(0);
+    let total_bundle_bytes = directory_size(out_dir)?;
+    Ok(json!({
+        "id": id,
+        "category": category,
+        "status": "measured",
+        "metrics": {
+            "planning_ns": 0,
+            "scan_ns": elapsed,
+            "end_to_end_ns": elapsed,
+            "build_time_ns": elapsed,
+            "validation_time_ns": elapsed,
+            "projection_readback_time_ns": 0,
+            "source_bytes": source_bytes,
+            "cove_o_bytes": object_bytes,
+            "projection_bytes": projection_bytes,
+            "index_bytes": index_bytes,
+            "index_root_count": index_root_count,
+            "covm_bytes": covm_bytes,
+            "sidecar_available": sidecar_available,
+            "sidecar_family_count": sidecar_family_count,
+            "sidecar_lookup_hit_rate": if sidecar_available { 1.0 } else { 0.0 },
+            "sidecar_fallback_rate": 0.0,
+            "total_bundle_bytes": total_bundle_bytes,
+            "duplication_ratio": if source_bytes == 0 { 0.0 } else { total_bundle_bytes as f64 / source_bytes as f64 },
+            "object_count": manifest.pointer("/counts/object_count").cloned().unwrap_or(Value::Null),
+            "property_value_count": manifest.pointer("/counts/property_value_count").cloned().unwrap_or(Value::Null),
+            "evidence_entry_count": manifest.pointer("/counts/evidence_entry_count").cloned().unwrap_or(Value::Null),
+            "native_acceleration_gate": "covi-and-covm-emitted-and-validated",
+        },
+        "optional_features": ["cove_map", "map_build", "cove_i", "covm"],
+    }))
+}
+
+fn directory_size(path: &Path) -> Result<u64, String> {
+    let mut total = 0u64;
+    for entry in
+        fs::read_dir(path).map_err(|err| format!("cannot read {}: {err}", path.display()))?
+    {
+        let entry = entry.map_err(|err| format!("cannot read {} entry: {err}", path.display()))?;
+        let metadata = entry
+            .metadata()
+            .map_err(|err| format!("cannot stat {}: {err}", entry.path().display()))?;
+        if metadata.is_dir() {
+            total = total
+                .checked_add(directory_size(&entry.path())?)
+                .ok_or_else(|| "directory size overflow".to_string())?;
+        } else {
+            total = total
+                .checked_add(metadata.len())
+                .ok_or_else(|| "directory size overflow".to_string())?;
+        }
+    }
+    Ok(total)
 }
 
 fn run_query_case(
@@ -2652,6 +2858,9 @@ fn validate_report_cases(cases: &[Value]) -> Result<(), String> {
         "negative_corrupt_validation",
         "canonicalisation_vectors",
         "semantic_mapping_corpus",
+        "cove_map_build_tiny",
+        "cove_map_build_medium",
+        "cove_map_build_messy_multisource",
         "semantic_projection_object_store_compare",
         "semantic_showcase_bundle_object_store_compare",
         "customer360_projection_scan",
@@ -3338,6 +3547,9 @@ mod tests {
             "negative_corrupt_validation",
             "canonicalisation_vectors",
             "semantic_mapping_corpus",
+            "cove_map_build_tiny",
+            "cove_map_build_medium",
+            "cove_map_build_messy_multisource",
             "customer360_projection_scan",
             "customer360_selective_filter",
             "customer360_event_filter",

@@ -184,7 +184,10 @@
     "medical_operational_queries",
     "negative_corrupt_validation",
     "canonicalisation_vectors",
-    "semantic_mapping_corpus"
+    "semantic_mapping_corpus",
+    "cove_map_build_tiny",
+    "cove_map_build_medium",
+    "cove_map_build_messy_multisource"
   ],
   "required_report_fields": [
     "planning_ns",

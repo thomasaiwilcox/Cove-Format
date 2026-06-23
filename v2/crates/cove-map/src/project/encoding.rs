@@ -363,7 +363,10 @@ where
     Ok(Arc::new(A::from(converted)) as ArrayRef)
 }
 
-pub(super) fn encode_cove_t_projection(table: &ProjectedTable) -> Result<Vec<u8>, String> {
+pub(super) fn encode_cove_t_projection(
+    table: &ProjectedTable,
+    lineage: Option<&ProjectionLineageContext>,
+) -> Result<Vec<u8>, String> {
     let columns = table
         .columns
         .iter()
@@ -442,12 +445,28 @@ pub(super) fn encode_cove_t_projection(table: &ProjectedTable) -> Result<Vec<u8>
             .push_nested_schema(&NestedSchemaSectionV1::new(nested_entries))
             .map_err(|err| err.to_string())?;
     }
-    writer.metadata_json = serde_json::to_vec(&json!({
+    let mut metadata = json!({
+        "format": "cove-map-projection-lineage-v1",
         "projection_id": table.projection_id,
         "mapping_id": table.mapping_id,
         "mapping_version": table.mapping_version,
-    }))
-    .map_err(|err| err.to_string())?;
+        "projection_version": table.mapping_version,
+        "temporal_cut": table.temporal_cut.as_deref(),
+        "covm_manifest": lineage.and_then(|lineage| lineage.covm_manifest.clone()),
+    });
+    if let Some(lineage) = lineage {
+        if let Some(source) = &lineage.source_cove_o {
+            metadata["source_cove_o"] = json!({
+                "path": source.path.as_deref(),
+                "label": source.label.as_str(),
+                "digest": source.digest.as_deref(),
+            });
+        }
+        if let Some(digest) = &lineage.mapping_artifact_digest {
+            metadata["mapping_artifact_digest"] = json!(digest);
+        }
+    }
+    writer.metadata_json = serde_json::to_vec(&metadata).map_err(|err| err.to_string())?;
     writer.push_segment(segment);
     writer.write().map_err(|err| err.to_string())
 }

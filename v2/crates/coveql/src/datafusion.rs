@@ -1356,6 +1356,7 @@ fn execute_projection_scan_arrow(
         output_columns: Some(output_columns),
         pushed_filters: scan_filters.to_vec(),
         batch_size: options.batch_size,
+        candidate_projection_rows: None,
     };
     let batches = if let Some(catalog) = projection_catalog {
         projected_record_batches_from_cove_o_bytes_with_catalog(

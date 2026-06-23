@@ -1236,6 +1236,7 @@ fn map_build_creates_adoption_bundle() {
         "build",
         "--out-dir",
         out_dir.to_str().unwrap(),
+        "--verify",
         "--force",
         "--json",
         mapping.to_str().unwrap(),
@@ -1253,9 +1254,58 @@ fn map_build_creates_adoption_bundle() {
     );
     let object = manifest["artifacts"]["object"]["path"].as_str().unwrap();
     assert!(out_dir.join(object).exists());
+    let index = manifest["artifacts"]["indexes"][0]["path"]
+        .as_str()
+        .unwrap();
+    assert!(out_dir.join(index).exists());
     assert!(out_dir.join("map-build-report.json").exists());
     assert!(out_dir.join("map-build-manifest.json").exists());
     assert!(out_dir.join("README.md").exists());
+
+    let inspect_index = run_cove(&[
+        "sidecar",
+        "inspect",
+        "index",
+        out_dir.join(index).to_str().unwrap(),
+    ]);
+    assert!(
+        inspect_index.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&inspect_index.stderr)
+    );
+    assert!(String::from_utf8_lossy(&inspect_index.stdout).contains("COVE-I"));
+
+    let doctor = run_cove(&[
+        "map",
+        "doctor",
+        "--bundle-dir",
+        out_dir.to_str().unwrap(),
+        "--json",
+    ]);
+    assert!(
+        doctor.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&doctor.stderr)
+    );
+    let doctor_report: serde_json::Value = serde_json::from_slice(&doctor.stdout).unwrap();
+    assert_eq!(
+        doctor_report["format"],
+        serde_json::json!("cove-map-doctor-report-v1")
+    );
+    assert_eq!(doctor_report["status"], serde_json::json!("ok"));
+
+    let suggestions = run_cove(&["map", "suggest", "--json", source.to_str().unwrap()]);
+    assert!(
+        suggestions.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&suggestions.stderr)
+    );
+    let suggestions: serde_json::Value = serde_json::from_slice(&suggestions.stdout).unwrap();
+    assert_eq!(
+        suggestions["format"],
+        serde_json::json!("cove-map-suggestions-v1")
+    );
+    assert_eq!(suggestions["non_authoritative"], serde_json::json!(true));
 }
 
 #[test]
@@ -1479,18 +1529,14 @@ fn command_specific_help_surfaces_reference_workflows() {
         (
             &["sidecar", "--help"][..],
             "cove sidecar build covi",
-            "--all-columns",
+            "--object-properties",
         ),
         (
             &["convert", "--help"][..],
             "cove convert parquet",
             "cove-to-source",
         ),
-        (
-            &["map", "--help"][..],
-            "cove map build",
-            "--projection-output",
-        ),
+        (&["map", "--help"][..], "cove map build", "COVE-I"),
     ];
     for (args, expected_a, expected_b) in cases {
         let output = run_cove(args);

@@ -734,35 +734,42 @@ fn morsel_visibility_decision(
     if visibility.is_all() {
         return CoveragePlanDecision::Included;
     }
-    let Some(segment) = state
-        .segments()
-        .iter()
-        .find(|segment| segment.segment_id == segment_id)
-    else {
+    let mut matched_segment = None;
+    for file in state.files() {
+        let Some(segment) = file
+            .segments()
+            .iter()
+            .find(|segment| segment.segment_id == segment_id)
+        else {
+            continue;
+        };
+        if matched_segment.is_some() {
+            return CoveragePlanDecision::Unknown;
+        }
+        matched_segment = Some((file, segment));
+    }
+    let Some((file, segment)) = matched_segment else {
         return CoveragePlanDecision::Unknown;
     };
-    if segment.morsel_row_count == 0 || morsel_id >= segment.morsel_count {
+    if segment.morsel_row_count == 0 {
         return CoveragePlanDecision::Unknown;
     }
-    let first_row_in_segment = u64::from(morsel_id) * u64::from(segment.morsel_row_count);
-    let remaining = u64::from(segment.row_count).saturating_sub(first_row_in_segment);
-    if remaining == 0 {
+    let Ok(morsels) = file.row_morsels_for_segment(segment) else {
         return CoveragePlanDecision::Unknown;
-    }
-    let row_count = remaining.min(u64::from(segment.morsel_row_count));
-    let Ok(row_count) = u32::try_from(row_count) else {
+    };
+    let Some(morsel) = morsels.iter().find(|morsel| morsel.morsel_id == morsel_id) else {
         return CoveragePlanDecision::Unknown;
     };
     let Ok(absolute_start) = segment
         .row_start
-        .checked_add(first_row_in_segment)
+        .checked_add(u64::from(morsel.first_row_in_segment))
         .ok_or(CoveError::ArithOverflow)
     else {
         return CoveragePlanDecision::Unknown;
     };
     let total_rows = state.table().row_count;
-    match visibility.hidden_rows_in_range(absolute_start, row_count, total_rows) {
-        Ok(hidden) if hidden == row_count => CoveragePlanDecision::Pruned,
+    match visibility.hidden_rows_in_range(absolute_start, morsel.row_count, total_rows) {
+        Ok(hidden) if hidden == morsel.row_count => CoveragePlanDecision::Pruned,
         Ok(0) => CoveragePlanDecision::Included,
         Ok(_) => CoveragePlanDecision::Unknown,
         Err(_) => CoveragePlanDecision::Unknown,
@@ -1072,15 +1079,24 @@ fn inverted_prunes_file_codes(
 
 fn global_morsel_ordinal(state: &DatasetState, segment_id: u32, morsel_id: u32) -> Option<u32> {
     let mut ordinal = 0u32;
-    for segment in state.segments() {
-        if segment.segment_id == segment_id {
-            return (morsel_id < segment.morsel_count)
-                .then(|| ordinal.checked_add(morsel_id))
-                .flatten();
+    let mut found = None;
+    for file in state.files() {
+        for segment in file.segments() {
+            if segment.segment_id == segment_id {
+                if found.is_some() {
+                    return None;
+                }
+                let morsels = file.row_morsels_for_segment(segment).ok()?;
+                let position = morsels
+                    .iter()
+                    .position(|morsel| morsel.morsel_id == morsel_id)?;
+                let position = u32::try_from(position).ok()?;
+                found = ordinal.checked_add(position);
+            }
+            ordinal = ordinal.checked_add(segment.morsel_count)?;
         }
-        ordinal = ordinal.checked_add(segment.morsel_count)?;
     }
-    None
+    found
 }
 
 fn bitmap_contains(bitmap_data: &[u8], offset: u64, length: u32, bit_index: u32) -> bool {
@@ -1169,8 +1185,24 @@ fn numeric_stat_value(literal: PredicateLiteral) -> Result<NumericStatValue, Cov
 
 #[cfg(test)]
 mod tests {
-    use super::{coverage_entry_covers_morsel, coverage_granularity_maps_to_morsels, CandidateSet};
+    use super::{
+        coverage_entry_covers_morsel, coverage_granularity_maps_to_morsels, global_morsel_ordinal,
+        CandidateSet,
+    };
+    use cove_core::{
+        compression,
+        constants::{CoveEncodingKind, CoveLogicalType, CovePhysicalKind},
+        page::{ColumnPageIndexEntryV1, COLUMN_PAGE_INDEX_ENTRY_LEN},
+        reader,
+        segment::{RowMorselEntryV1, TableSegmentHeaderV1},
+        table::{ColumnEntry, TableCatalog, TableEntry},
+        writer::{
+            MinimalCoveWriter, ScanPageSpec, ScanProfileCoveWriter, ScanSegment, SectionPayload,
+        },
+    };
     use cove_coverage::{CoverageGranularityV2, CoverageSetEntryV2};
+
+    use crate::dataset_state::DatasetState;
 
     #[test]
     fn candidate_sets_intersect_all_sparse_and_bitmap() {
@@ -1270,6 +1302,17 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn global_morsel_ordinal_uses_directory_position_not_sparse_id() {
+        let bytes = rewrite_first_segment_data(ordinal_test_file(), |data| {
+            set_morsel_and_page_ids(data, &[1, 0]);
+        });
+        let state = DatasetState::from_bytes("sparse-ordinal", bytes).unwrap();
+
+        assert_eq!(global_morsel_ordinal(&state, 0, 1), Some(0));
+        assert_eq!(global_morsel_ordinal(&state, 0, 0), Some(1));
+    }
+
     fn coverage_entry(
         target_kind: CoverageGranularityV2,
         file_ref: u32,
@@ -1293,6 +1336,117 @@ mod tests {
             row_ordinal_bitmap_ref: u32::MAX,
             byte_range_ref: u32::MAX,
             checksum: 0,
+        }
+    }
+
+    fn ordinal_test_table() -> TableCatalog {
+        TableCatalog {
+            flags: 0,
+            tables: vec![TableEntry {
+                table_id: 1,
+                namespace: "public".into(),
+                name: "events".into(),
+                row_count: 2,
+                primary_sort_key_count: 0,
+                clustering_key_count: 0,
+                flags: 0,
+                columns: vec![ColumnEntry {
+                    column_id: 1,
+                    name: "id".into(),
+                    logical: CoveLogicalType::Int64,
+                    physical: CovePhysicalKind::NumCode,
+                    nullable: false,
+                    sort_order: 0,
+                    collation_id: 0,
+                    precision: 0,
+                    scale: 0,
+                    flags: 0,
+                }],
+            }],
+        }
+    }
+
+    fn ordinal_test_file() -> Vec<u8> {
+        let mut writer = ScanProfileCoveWriter::new(ordinal_test_table());
+        let mut segment = ScanSegment::new(1, 0, 0, 2, 1);
+        segment.morsel_row_count = 1;
+        segment.set_column_pages(
+            1,
+            vec![
+                ScanPageSpec::new(1, 1i64.to_le_bytes().to_vec())
+                    .with_encoding_root(CoveEncodingKind::NumCode as u32),
+                ScanPageSpec::new(1, 2i64.to_le_bytes().to_vec())
+                    .with_encoding_root(CoveEncodingKind::NumCode as u32),
+            ],
+        );
+        writer.push_segment(segment);
+        writer.write().unwrap()
+    }
+
+    fn rewrite_first_segment_data<F>(bytes: Vec<u8>, mut mutate: F) -> Vec<u8>
+    where
+        F: FnMut(&mut Vec<u8>),
+    {
+        let validated = reader::validate_bytes(&bytes).unwrap();
+        let mut writer = MinimalCoveWriter::new();
+        writer.created_at_us = validated.header.created_at_us;
+        writer.file_id = validated.header.file_id;
+        writer.producer_scope_id = validated.header.producer_scope_id;
+        writer.producer_scope_kind = validated.header.producer_scope_kind;
+        writer.primary_profile = validated.header.primary_profile;
+        writer.required_features = validated.header.required_features;
+        writer.optional_features = validated.header.optional_features;
+        writer.metadata_json = validated.footer.metadata_json.clone();
+
+        let mut mutated = false;
+        for entry in &validated.footer.sections {
+            let mut data = compression::section_payload(&bytes, entry)
+                .unwrap()
+                .into_owned();
+            if !mutated
+                && entry.section_kind == cove_core::constants::SectionKind::TableSegmentData as u16
+            {
+                mutate(&mut data);
+                mutated = true;
+            }
+            writer.sections.push(SectionPayload {
+                section_kind: entry.section_kind,
+                profile: entry.profile,
+                flags: entry.flags,
+                item_count: entry.item_count,
+                row_count: entry.row_count,
+                compression: entry.compression,
+                alignment_log2: entry.alignment_log2,
+                required_features: entry.required_features,
+                optional_features: entry.optional_features,
+                data,
+            });
+        }
+        assert!(
+            mutated,
+            "fixture should contain a table segment data section"
+        );
+        writer.write().unwrap()
+    }
+
+    fn set_morsel_and_page_ids(segment_data: &mut [u8], ids: &[u32]) {
+        let header = TableSegmentHeaderV1::parse(segment_data).unwrap();
+        assert_eq!(header.morsel_count as usize, ids.len());
+        let morsel_dir = header.morsel_directory_offset as usize;
+        for (index, morsel_id) in ids.iter().copied().enumerate() {
+            let offset = morsel_dir + index * cove_core::segment::ROW_MORSEL_ENTRY_LEN;
+            let mut entry = RowMorselEntryV1::parse(&segment_data[offset..]).unwrap();
+            entry.morsel_id = morsel_id;
+            segment_data[offset..offset + cove_core::segment::ROW_MORSEL_ENTRY_LEN]
+                .copy_from_slice(&entry.serialize());
+        }
+        let page_index = header.page_index_offset as usize;
+        for (index, morsel_id) in ids.iter().copied().enumerate() {
+            let offset = page_index + index * COLUMN_PAGE_INDEX_ENTRY_LEN;
+            let mut page = ColumnPageIndexEntryV1::parse(&segment_data[offset..]).unwrap();
+            page.morsel_id = morsel_id;
+            segment_data[offset..offset + COLUMN_PAGE_INDEX_ENTRY_LEN]
+                .copy_from_slice(&page.serialize());
         }
     }
 }

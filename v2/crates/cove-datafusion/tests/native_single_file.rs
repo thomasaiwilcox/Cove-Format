@@ -437,6 +437,54 @@ async fn register_cove_o_projections_pushes_exact_scalar_filters() {
     fs::remove_file(object_path).unwrap();
 }
 
+#[cfg(feature = "covi")]
+#[tokio::test]
+async fn register_cove_o_projection_uses_projection_column_covi_sidecar() {
+    let dir = make_temp_dir("mapped_projection_column_covi");
+    let bundle = dir.join("bundle");
+    let mapping_path = conformance_accept_path("cove_map_execution.covemap");
+    let source_paths = vec![conformance_accept_path("people.parquet")];
+    let mut options = cove_map::MapBuildOptions::new(bundle.clone());
+    options.projection_output = cove_map::MapBuildProjectionOutput::None;
+    let result = cove_map::build_from_paths(&mapping_path, &source_paths, options).unwrap();
+    let object_rel = result
+        .manifest
+        .pointer("/artifacts/object/path")
+        .and_then(Value::as_str)
+        .unwrap();
+    let object_path = bundle.join(object_rel);
+    assert!(bundle
+        .join("indexes")
+        .join("projection_columns.covi")
+        .is_file());
+
+    let ctx = SessionContext::new();
+    register_cove_o_projections(&ctx, &object_path, None, None).unwrap();
+    let (batches, loaded) = collect_sql_with_cove_metric(
+        &ctx,
+        "SELECT membership_count FROM people_projection WHERE name = 'Ada'",
+        "cove_covi_sidecars_loaded",
+    )
+    .await;
+    let expected = [
+        "+------------------+",
+        "| membership_count |",
+        "+------------------+",
+        "| 1                |",
+        "+------------------+",
+    ];
+    assert_batches_eq!(expected, &batches);
+    assert_eq!(loaded, 1);
+    let (_, hits) = collect_sql_with_cove_metric(
+        &ctx,
+        "SELECT membership_count FROM people_projection WHERE name = 'Ada'",
+        "cove_lookup_index_hits",
+    )
+    .await;
+    assert_eq!(hits, 1);
+    fs::remove_dir_all(dir).unwrap();
+}
+
 #[tokio::test]
 async fn mapped_cove_o_end_to_end_builds_registers_and_queries_in_datafusion() {
     let mapping_path = conformance_accept_path("cove_map_execution.covemap");

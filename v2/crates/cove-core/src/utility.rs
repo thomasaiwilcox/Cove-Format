@@ -63,11 +63,41 @@ struct InputIdentity {
     segment_count: u32,
 }
 
+#[derive(Debug, Clone)]
+pub struct CovmInputArtifact<'a> {
+    pub uri: String,
+    pub bytes: &'a [u8],
+}
+
 pub fn build_covm_artifact(
     output: impl AsRef<Path>,
     inputs: &[PathBuf],
 ) -> Result<(Vec<u8>, UtilityArtifactReport), CoveError> {
     let identities = input_identities(inputs)?;
+    build_covm_artifact_from_identities(output, "cove sidecar build covm", &identities)
+}
+
+pub fn build_covm_artifact_from_bytes(
+    output: impl AsRef<Path>,
+    inputs: &[CovmInputArtifact<'_>],
+) -> Result<(Vec<u8>, UtilityArtifactReport), CoveError> {
+    if inputs.is_empty() {
+        return Err(CoveError::BadSection(
+            "expected at least one COVE input".into(),
+        ));
+    }
+    let identities = inputs
+        .iter()
+        .map(|input| input_identity_from_bytes(input.uri.clone(), input.bytes))
+        .collect::<Result<Vec<_>, _>>()?;
+    build_covm_artifact_from_identities(output, "cove map publish", &identities)
+}
+
+fn build_covm_artifact_from_identities(
+    output: impl AsRef<Path>,
+    tool: &str,
+    identities: &[InputIdentity],
+) -> Result<(Vec<u8>, UtilityArtifactReport), CoveError> {
     let dataset_id = artifact_id(&identities)?;
     let files = identities
         .iter()
@@ -100,7 +130,7 @@ pub fn build_covm_artifact(
     let validation_result = CovmFile::parse(&bytes).is_ok();
     let digest = compute_digest(DigestAlgorithm::Sha256, &bytes)?;
     let report = UtilityArtifactReport {
-        tool: "cove sidecar build covm".into(),
+        tool: tool.into(),
         inputs: input_json(&identities),
         output: output.as_ref().display().to_string(),
         file_id: dataset_id,
@@ -202,18 +232,22 @@ fn input_identities(inputs: &[PathBuf]) -> Result<Vec<InputIdentity>, CoveError>
 
 fn input_identity(path: &Path) -> Result<InputIdentity, CoveError> {
     let bytes = fs::read(path)?;
+    input_identity_from_bytes(path.display().to_string(), &bytes)
+}
+
+fn input_identity_from_bytes(uri: String, bytes: &[u8]) -> Result<InputIdentity, CoveError> {
     let report = validate_bytes_with_options(
-        &bytes,
+        bytes,
         ValidationOptions {
             semantic: true,
             verify_digests: false,
             ..ValidationOptions::default()
         },
     )?;
-    let digest = compute_digest(DigestAlgorithm::Sha256, &bytes)?;
-    let (row_count, segment_count) = table_shape(&bytes, &report.validated.footer)?;
+    let digest = compute_digest(DigestAlgorithm::Sha256, bytes)?;
+    let (row_count, segment_count) = table_shape(bytes, &report.validated.footer)?;
     Ok(InputIdentity {
-        path: path.to_path_buf(),
+        path: PathBuf::from(uri),
         file_id: report.validated.header.file_id,
         file_len: bytes.len() as u64,
         footer_crc32c: report.validated.postscript.footer.crc32c,

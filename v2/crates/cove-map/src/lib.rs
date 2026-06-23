@@ -42,10 +42,13 @@ mod context;
 mod emit;
 mod identity;
 mod input;
+mod parity;
 mod project;
 mod sections;
+mod suggest;
 mod support;
 mod ui;
+mod verify;
 
 #[cfg(test)]
 use crate::cli::{parse_args, Command, OutputFormat};
@@ -56,11 +59,17 @@ pub use api::{
     projected_record_batches_from_cove_o_bytes,
     projected_record_batches_from_cove_o_bytes_with_catalog, projected_rows_from_cove_o_path,
     projected_rows_from_paths, projection_arrow_schema, projection_catalog_from_cove_o_bytes,
-    projection_descriptors_from_cove_o_path, projection_read_requirements_for_catalog,
-    ProjectionColumnDescriptor, ProjectionDescriptor,
+    projection_covi_filter_plan, projection_descriptors_from_cove_o_path,
+    projection_read_requirements_for_catalog, ProjectionColumnDescriptor,
+    ProjectionColumnLineageDescriptor, ProjectionCoviFilterLookup, ProjectionCoviFilterPlan,
+    ProjectionDescriptor,
 };
 pub(crate) use api::{parse_map, plan_keys, preview};
-pub use build::{build_from_paths, MapBuildOptions, MapBuildProjectionOutput, MapBuildResult};
+use build::verify_from_paths;
+pub use build::{
+    build_from_paths, publish_covm_from_bundle, MapBuildOptions, MapBuildProjectionOutput,
+    MapBuildResult,
+};
 pub(crate) use context::{mapping_context, MappingContext};
 #[cfg(test)]
 use emit::build_cove_o;
@@ -71,24 +80,27 @@ use input::read_csv;
 use input::{
     read_source_inputs, read_sources, validate_source_inputs, ObservedSourceState, SourceRow,
 };
+use parity::{parity_from_cove_o_path, parity_from_paths, parity_has_failures, ParityOptions};
 use project::{
     diff_maps, project_cove_o_path_output, project_rows_with_source_states_output, run_fixture_path,
 };
 #[cfg(test)]
 use project::{project_cove_o_path, project_rows, property_by_name};
 pub use project::{
-    ProjectionBatchOptions, ProjectionFilter, ProjectionFilterLiteral, ProjectionFilterOp,
-    ProjectionFormat, ProjectionReadRequirements,
+    ProjectionBatchOptions, ProjectionCandidateRows, ProjectionFilter, ProjectionFilterLiteral,
+    ProjectionFilterOp, ProjectionFormat, ProjectionReadRequirements,
 };
 pub(crate) use sections::{embedded_sections, mapping_identity, section_kind};
 #[cfg(test)]
 use std::path::PathBuf;
+use suggest::suggest_from_paths;
 pub(crate) use support::*;
 pub(crate) use ui::{
     candidate_assertion_id, candidate_match_id, evidence_entry_for_candidate,
     evidence_entry_for_identity, explain, identity_assertion_id, print_json, print_usage,
     write_or_print,
 };
+use verify::{report_has_failures, verify_bundle_dir};
 
 pub use cli::run_cli;
 
@@ -2270,7 +2282,10 @@ fn ensure_covemap_payload_envelope(kind: SectionKind, data: Vec<u8>) -> Vec<u8> 
     serde_json::to_vec_pretty(&value).unwrap_or(data)
 }
 
-fn map_passthrough_sections(file: &CovemapFile) -> Vec<SectionPayload> {
+fn map_passthrough_sections(
+    file: &CovemapFile,
+    materialized: &MaterializedModel,
+) -> Result<Vec<SectionPayload>, String> {
     file.sections
         .iter()
         .filter_map(|section| {
@@ -2285,9 +2300,34 @@ fn map_passthrough_sections(file: &CovemapFile) -> Vec<SectionPayload> {
                     | SectionKind::MapRowSemanticsCatalog
                     | SectionKind::MapProjectionCatalog
             )
-            .then(|| map_section(kind, 1, section.payload.clone()))
+            .then(|| {
+                let data = if kind == SectionKind::MapProjectionCatalog {
+                    enriched_projection_catalog_payload(section.payload.as_slice(), materialized)
+                } else {
+                    Ok(section.payload.clone())
+                };
+                data.map(|data| map_section(kind, 1, data))
+            })
         })
         .collect()
+}
+
+fn enriched_projection_catalog_payload(
+    payload: &[u8],
+    materialized: &MaterializedModel,
+) -> Result<Vec<u8>, String> {
+    let section = cove_core::profile::cove_map::parse_embedded_section(
+        SectionKind::MapProjectionCatalog,
+        payload,
+    )
+    .map_err(|err| format!("cannot parse MAP_PROJECTION_CATALOG for lineage enrichment: {err}"))?;
+    let cove_core::profile::cove_map::EmbeddedMapSection::ProjectionCatalog(catalog) = section
+    else {
+        return Err("MAP_PROJECTION_CATALOG parser returned a non-projection section".into());
+    };
+    let catalog = project::enrich_projection_catalog_lineage(catalog, &materialized.object_types);
+    serde_json::to_vec_pretty(&project::projection_catalog_json_value(&catalog))
+        .map_err(|err| format!("cannot encode enriched MAP_PROJECTION_CATALOG: {err}"))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3423,6 +3463,8 @@ mod tests {
                 json: false,
                 object_name: None,
                 projection_output: MapBuildProjectionOutput::CoveT,
+                verify: false,
+                publish_covm: false,
             }
         );
     }
@@ -3435,6 +3477,8 @@ mod tests {
             "bundle".to_string(),
             "--force".to_string(),
             "--json".to_string(),
+            "--verify".to_string(),
+            "--publish-covm".to_string(),
             "--object-name".to_string(),
             "people.cove".to_string(),
             "--projection-output".to_string(),
@@ -3454,8 +3498,134 @@ mod tests {
                 json: true,
                 object_name: Some("people.cove".into()),
                 projection_output: MapBuildProjectionOutput::None,
+                verify: true,
+                publish_covm: true,
             }
         );
+        assert_eq!(
+            parse_args([
+                "publish".to_string(),
+                "--bundle-dir".to_string(),
+                "bundle".to_string(),
+                "--out".to_string(),
+                "dataset.covm".to_string(),
+                "--force".to_string(),
+                "--json".to_string(),
+            ])
+            .unwrap()
+            .unwrap(),
+            Command::Publish {
+                bundle_dir: PathBuf::from("bundle"),
+                output: PathBuf::from("dataset.covm"),
+                force: true,
+                json: true,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_doctor_suggest_and_parity_commands() {
+        assert_eq!(
+            parse_args([
+                "doctor".to_string(),
+                "--json".to_string(),
+                "--strict".to_string(),
+                "--bundle-dir".to_string(),
+                "bundle".to_string(),
+            ])
+            .unwrap()
+            .unwrap(),
+            Command::Doctor {
+                bundle_dir: Some(PathBuf::from("bundle")),
+                map: None,
+                sources: Vec::new(),
+                json: true,
+                strict: true,
+            }
+        );
+        assert_eq!(
+            parse_args([
+                "suggest".to_string(),
+                "--json".to_string(),
+                "--out".to_string(),
+                "suggestions.json".to_string(),
+                "people.csv".to_string(),
+            ])
+            .unwrap()
+            .unwrap(),
+            Command::Suggest {
+                sources: vec![PathBuf::from("people.csv")],
+                output: Some(PathBuf::from("suggestions.json")),
+                json: true,
+            }
+        );
+        assert_eq!(
+            parse_args([
+                "parity".to_string(),
+                "--json".to_string(),
+                "--projection-id".to_string(),
+                "people.v1".to_string(),
+                "--expected".to_string(),
+                "expected.csv".to_string(),
+                "--key".to_string(),
+                "id,name".to_string(),
+                "mapping.covemap".to_string(),
+                "people.csv".to_string(),
+            ])
+            .unwrap()
+            .unwrap(),
+            Command::Parity {
+                map: PathBuf::from("mapping.covemap"),
+                sources: vec![PathBuf::from("people.csv")],
+                options: ParityOptions {
+                    projection_id: "people.v1".into(),
+                    expected: PathBuf::from("expected.csv"),
+                    expected_query: None,
+                    key: vec!["id".into(), "name".into()],
+                },
+                json: true,
+            }
+        );
+        assert_eq!(
+            parse_args([
+                "parity-cove-o".to_string(),
+                "--projection-id".to_string(),
+                "people.v1".to_string(),
+                "--expected".to_string(),
+                "expected.csv".to_string(),
+                "--expected-query".to_string(),
+                r#"where(status == "open")"#.to_string(),
+                "object.cove".to_string(),
+            ])
+            .unwrap()
+            .unwrap(),
+            Command::ParityCoveO {
+                object: PathBuf::from("object.cove"),
+                options: ParityOptions {
+                    projection_id: "people.v1".into(),
+                    expected: PathBuf::from("expected.csv"),
+                    expected_query: Some(r#"where(status == "open")"#.into()),
+                    key: Vec::new(),
+                },
+                json: false,
+            }
+        );
+        assert!(parse_args([
+            "doctor".to_string(),
+            "--bundle-dir".to_string(),
+            "bundle".to_string(),
+            "mapping.covemap".to_string(),
+        ])
+        .unwrap_err()
+        .contains("either --bundle-dir"));
+        assert!(parse_args([
+            "parity-cove-o".to_string(),
+            "--expected".to_string(),
+            "expected.csv".to_string(),
+            "object.cove".to_string(),
+        ])
+        .unwrap_err()
+        .contains("--projection-id"));
     }
 
     #[test]
@@ -4118,11 +4288,13 @@ mod tests {
         let report_path = out_dir.join("map-build-report.json");
         let manifest_path = out_dir.join("map-build-manifest.json");
         let readme_path = out_dir.join("README.md");
+        let index_path = out_dir.join("indexes/object_properties.covi");
         let projection_path = out_dir.join("projections/people_projection.cove");
         assert!(object_path.exists());
         assert!(report_path.exists());
         assert!(manifest_path.exists());
         assert!(readme_path.exists());
+        assert!(index_path.exists());
         assert!(projection_path.exists());
         validate_bytes_with_options(
             &fs::read(&object_path).unwrap(),
@@ -4142,11 +4314,220 @@ mod tests {
             },
         )
         .unwrap();
+        let index = cove_index::CoviArtifactV2::parse(&fs::read(&index_path).unwrap()).unwrap();
+        assert!(index.header.index_root_count > 0);
         let manifest: Value = serde_json::from_slice(&fs::read(manifest_path).unwrap()).unwrap();
+        assert_eq!(
+            manifest["artifacts"]["indexes"][0]["target"],
+            json!("cove-o-object-properties")
+        );
         assert_eq!(
             manifest["artifacts"]["projections"][0]["projection_id"],
             json!("person_projection")
         );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn map_build_verify_runs_doctor_and_writes_projection_lineage() {
+        let file = build_projection_map();
+        let (map, sources, dir) = write_build_fixture("build-verify", &file);
+        let out_dir = dir.join("bundle");
+        let mut options = MapBuildOptions::new(&out_dir);
+        options.verify = true;
+        let result = build_from_paths(&map, &sources, options).unwrap();
+        assert_eq!(
+            result.report["verification"]["format"],
+            json!("cove-map-doctor-report-v1")
+        );
+        assert_eq!(result.report["verification"]["status"], json!("ok"));
+        assert!(!report_has_failures(&result.report["verification"], false));
+
+        let doctor = verify_bundle_dir(&out_dir).unwrap();
+        assert_eq!(doctor["status"], json!("ok"));
+        assert!(!report_has_failures(&doctor, false));
+
+        let projection_path = out_dir.join("projections/people_projection.cove");
+        let projection_bytes = fs::read(projection_path).unwrap();
+        let report = validate_bytes_with_options(
+            &projection_bytes,
+            ValidationOptions {
+                allow_unknown_optional_extensions: true,
+                ..ValidationOptions::default()
+            },
+        )
+        .unwrap();
+        let lineage: Value =
+            serde_json::from_slice(&report.validated.footer.metadata_json).unwrap();
+        assert_eq!(lineage["format"], json!("cove-map-projection-lineage-v1"));
+        assert_eq!(lineage["mapping_id"], json!("people-map"));
+        assert_eq!(lineage["mapping_version"], json!("test/v1"));
+        assert_eq!(lineage["projection_id"], json!("person_projection"));
+        assert_eq!(lineage["projection_version"], json!("test/v1"));
+        assert_eq!(lineage["source_cove_o"]["path"], json!("people_map.cove"));
+        assert!(lineage["source_cove_o"]["digest"].as_str().is_some());
+        assert!(lineage["mapping_artifact_digest"].as_str().is_some());
+        assert!(lineage["covm_manifest"].is_null());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn doctor_reports_invalid_bundle_artifacts() {
+        let file = build_projection_map();
+        let (map, sources, dir) = write_build_fixture("doctor-invalid", &file);
+        let out_dir = dir.join("bundle");
+        build_from_paths(&map, &sources, MapBuildOptions::new(&out_dir)).unwrap();
+        fs::write(
+            out_dir.join("projections/people_projection.cove"),
+            b"not cove",
+        )
+        .unwrap();
+        fs::write(out_dir.join("indexes/object_properties.covi"), b"not covi").unwrap();
+
+        let doctor = verify_bundle_dir(&out_dir).unwrap();
+        assert!(report_has_failures(&doctor, false));
+        assert!(doctor["errors"].as_array().unwrap().iter().any(|error| {
+            error["code"] == json!("invalid_cove_t_projection")
+                && error["projection_id"] == json!("person_projection")
+        }));
+        assert!(doctor["errors"].as_array().unwrap().iter().any(|error| {
+            error["code"] == json!("invalid_covi_index")
+                && error["index_id"] == json!("object_properties")
+        }));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn doctor_strict_treats_skipped_projection_warning_as_failure() {
+        let file = build_projection_map();
+        let (map, sources, dir) = write_build_fixture("doctor-skipped-projection", &file);
+        let out_dir = dir.join("bundle");
+        let mut options = MapBuildOptions::new(&out_dir);
+        options.projection_output = MapBuildProjectionOutput::None;
+        build_from_paths(&map, &sources, options).unwrap();
+
+        let doctor = verify_bundle_dir(&out_dir).unwrap();
+        assert!(!report_has_failures(&doctor, false));
+        assert!(report_has_failures(&doctor, true));
+        assert!(doctor["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| {
+                warning["code"] == json!("skipped_projection")
+                    && warning["details"]["projection_id"] == json!("person_projection")
+            }));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn suggest_outputs_non_authoritative_identity_and_join_candidates() {
+        let dir = temp_build_dir("suggest");
+        let crm = dir.join("crm.csv");
+        let support = dir.join("support.csv");
+        fs::write(
+            &crm,
+            "customer_id,email,name\n1,a@example.com,Ada\n2,b@example.com,Bo\n",
+        )
+        .unwrap();
+        fs::write(
+            &support,
+            "customer_id,email,ticket_count\n1,a@example.com,3\n3,c@example.com,1\n",
+        )
+        .unwrap();
+
+        let suggestions = suggest_from_paths(&[crm, support]).unwrap();
+        assert_eq!(suggestions["format"], json!("cove-map-suggestions-v1"));
+        assert_eq!(suggestions["non_authoritative"], json!(true));
+        assert!(suggestions["identity_candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|source| {
+                source["source_id"] == json!("crm")
+                    && source["candidates"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|candidate| {
+                            candidate["column"] == json!("customer_id")
+                                && candidate["non_authoritative"] == json!(true)
+                        })
+            }));
+        assert!(suggestions["join_key_candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|candidate| {
+                candidate["left_column"] == json!("customer_id")
+                    && candidate["right_column"] == json!("customer_id")
+            }));
+        assert!(suggestions["starter_projections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|projection| projection["projection_id"] == json!("crm_starter.v1")));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn parity_reports_matches_and_keyed_differences() {
+        let file = build_projection_map();
+        let (map, sources, dir) = write_build_fixture("parity", &file);
+        let expected = dir.join("expected.csv");
+        fs::write(&expected, "name\nSupport Name\n").unwrap();
+
+        let options = ParityOptions {
+            projection_id: "person_projection".into(),
+            expected: expected.clone(),
+            expected_query: None,
+            key: vec!["name".into()],
+        };
+        let report = parity_from_paths(&map, &sources, &options).unwrap();
+        assert_eq!(report["status"], json!("ok"));
+        assert!(!parity_has_failures(&report));
+
+        fs::write(&expected, "name\nWrong Name\n").unwrap();
+        let options = ParityOptions {
+            projection_id: "person_projection".into(),
+            expected,
+            expected_query: None,
+            key: vec!["name".into()],
+        };
+        let report = parity_from_paths(&map, &sources, &options).unwrap();
+        assert_eq!(report["status"], json!("mismatch"));
+        assert_eq!(report["diff"]["missing_count"], json!(1));
+        assert_eq!(report["diff"]["extra_count"], json!(1));
+        assert!(parity_has_failures(&report));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn parity_cove_o_supports_expected_query_and_unordered_warning() {
+        let file = build_projection_map();
+        let (map, sources, dir) = write_build_fixture("parity-cove-o", &file);
+        let object = dir.join("object.cove");
+        let bytes = cove_o_from_paths(&map, &sources).unwrap();
+        fs::write(&object, bytes).unwrap();
+        let expected = dir.join("expected.csv");
+        fs::write(&expected, "name\nIgnored Name\nSupport Name\n").unwrap();
+
+        let report = parity_from_cove_o_path(
+            &object,
+            &ParityOptions {
+                projection_id: "person_projection".into(),
+                expected,
+                expected_query: Some(r#"where(name == "Support Name")"#.into()),
+                key: Vec::new(),
+            },
+        )
+        .unwrap();
+        assert_eq!(report["status"], json!("ok"));
+        assert!(report["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| { warning["code"] == json!("ordered_comparison_without_key") }));
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -4297,6 +4678,83 @@ mod tests {
     }
 
     #[test]
+    fn projection_catalog_readback_enriches_direct_property_lineage() {
+        let file = primitive_projection_map();
+        let rows = primitive_projection_rows();
+        let bytes = build_cove_o(&file, &rows).unwrap();
+        let catalog = projection_catalog_from_cove_o_bytes(&bytes, None).unwrap();
+        let projection = catalog
+            .projections
+            .iter()
+            .find(|projection| projection.projection_id == "people_primitives.v1")
+            .unwrap();
+        let goid = projection
+            .columns
+            .iter()
+            .find(|column| column.name == "goid")
+            .unwrap();
+        assert!(goid.lineage.is_none());
+        let score = projection
+            .columns
+            .iter()
+            .find(|column| column.name == "score")
+            .unwrap();
+        let lineage = score.lineage.as_ref().unwrap();
+        assert_eq!(lineage.source, "object_property");
+        assert_eq!(lineage.object_type_name, "Person");
+        assert_eq!(lineage.property_name, "score");
+        assert_eq!(lineage.projection_table_id, 1);
+        assert_eq!(lineage.projection_column_id, 3);
+        assert_eq!(lineage.filter_pushdown, "projection_covi_prefilter");
+    }
+
+    #[test]
+    fn projection_candidate_rows_prefilter_before_residual_filters() {
+        let file = primitive_projection_map();
+        let rows = primitive_projection_rows();
+        let bytes = build_cove_o(&file, &rows).unwrap();
+        let batches = projected_record_batches_from_cove_o_bytes(
+            &bytes,
+            None,
+            "people_primitives.v1",
+            &ProjectionBatchOptions {
+                max_rows: None,
+                output_columns: Some(vec!["score".into()]),
+                pushed_filters: vec![ProjectionFilter::Compare {
+                    column: "active".into(),
+                    op: ProjectionFilterOp::Eq,
+                    literal: ProjectionFilterLiteral::Boolean(true),
+                }],
+                batch_size: None,
+                candidate_projection_rows: Some(ProjectionCandidateRows::from_ordinals([0, 2])),
+            },
+        )
+        .unwrap();
+        assert_eq!(int64_column_values(&batches, "score"), vec![10, 30]);
+    }
+
+    #[test]
+    fn map_build_emits_projection_column_covi_sidecar() {
+        let file = build_projection_map();
+        let (map, sources, dir) = write_build_fixture("build-projection-column-covi", &file);
+        let out = dir.join("bundle");
+        let result = build_from_paths(&map, &sources, MapBuildOptions::new(&out)).unwrap();
+        assert!(out
+            .join("indexes")
+            .join("projection_columns.covi")
+            .is_file());
+        let indexes = result
+            .manifest
+            .pointer("/artifacts/indexes")
+            .and_then(Value::as_array)
+            .unwrap();
+        assert!(indexes.iter().any(|artifact| {
+            artifact.get("path").and_then(Value::as_str) == Some("indexes/projection_columns.covi")
+        }));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn projected_record_batches_filter_primitives_without_leaking_filter_columns() {
         let file = primitive_projection_map();
         let rows = primitive_projection_rows();
@@ -4377,6 +4835,7 @@ mod tests {
                     literal: ProjectionFilterLiteral::Boolean(true),
                 }],
                 batch_size: Some(1),
+                candidate_projection_rows: None,
             },
         )
         .unwrap();

@@ -109,10 +109,13 @@ pub fn build_task_graph(state: &DatasetState, plan: &ScanPlan) -> Result<TaskGra
                         .checked_add(take)
                         .ok_or(CoveError::ArithOverflow)?;
                     let morsels = segment_morsels_for_task_graph(&file_state, segment)?;
-                    for morsel in morsels
-                        .iter()
-                        .filter(|morsel| morsel_in_split_range(morsel, start_morsel, morsel_end))
-                    {
+                    let start =
+                        usize::try_from(start_morsel).map_err(|_| CoveError::ArithOverflow)?;
+                    let end = usize::try_from(morsel_end).map_err(|_| CoveError::ArithOverflow)?;
+                    let Some(split_morsels) = morsels.get(start..end) else {
+                        return Err(CoveError::BadLayoutPlan);
+                    };
+                    for morsel in split_morsels {
                         maybe_push_task(
                             &file_state,
                             &file_plan,
@@ -446,6 +449,11 @@ fn segment_morsels_for_task_graph(
     if directory.sum_rows() != u64::from(header.row_count) {
         return Err(CoveError::SegmentCorrupt);
     }
+    directory.validate_fixed_layout(
+        header.row_count,
+        header.morsel_count,
+        header.morsel_row_count,
+    )?;
     Ok(directory.entries)
 }
 
@@ -457,10 +465,6 @@ fn morsel_by_id(
         .iter()
         .find(|morsel| morsel.morsel_id == morsel_id)
         .ok_or(CoveError::SegmentCorrupt)
-}
-
-fn morsel_in_split_range(morsel: &RowMorselEntryV1, first_morsel_id: u32, morsel_end: u32) -> bool {
-    morsel.morsel_id >= first_morsel_id && morsel.morsel_id < morsel_end
 }
 
 fn morsel_row_start(
@@ -699,6 +703,13 @@ mod tests {
     }
 
     fn one_segment_two_morsel_file(with_lookup: bool) -> Vec<u8> {
+        one_segment_two_morsel_file_with_extra_sections(with_lookup, Vec::new())
+    }
+
+    fn one_segment_two_morsel_file_with_extra_sections(
+        with_lookup: bool,
+        extra_sections: Vec<SectionPayload>,
+    ) -> Vec<u8> {
         let mut writer = ScanProfileCoveWriter::new(one_segment_test_table());
         let mut segment = ScanSegment::new(1, 0, 0, 2, 1);
         segment.morsel_row_count = 1;
@@ -706,6 +717,9 @@ mod tests {
         writer.push_segment(segment);
         if with_lookup {
             writer.push_extra_section(sparse_lookup_index_section());
+        }
+        for section in extra_sections {
+            writer.push_extra_section(section);
         }
         writer.write().unwrap()
     }
@@ -1017,26 +1031,63 @@ mod tests {
     }
 
     #[test]
-    fn sparse_morsel_split_filtering_uses_id_range() {
-        let left = RowMorselEntryV1 {
-            morsel_id: 10,
-            first_row_in_segment: 0,
-            row_count: 1,
+    fn sparse_morsel_scan_split_uses_ordinal_range_and_real_ids() {
+        let split_index = scan_split_section_payload(vec![ScanSplitEntryV2 {
+            split_id: 1,
+            table_id: 1,
+            row_start: 0,
+            row_count: 2,
+            first_segment_id: 0,
+            segment_count: 1,
+            first_morsel_id: 0,
+            morsel_count: 2,
+            first_cluster_id: 0,
+            cluster_count: 0,
+            stats_ref: u32::MAX,
+            estimated_uncompressed_bytes: 2,
+            estimated_encoded_bytes: 2,
             flags: 0,
-            stats_ref: 0,
             checksum: 0,
-        };
-        let right = RowMorselEntryV1 {
-            morsel_id: 20,
-            first_row_in_segment: 1,
-            row_count: 1,
-            flags: 0,
-            stats_ref: 0,
-            checksum: 0,
-        };
+        }]);
+        let file = one_segment_two_morsel_file_with_extra_sections(
+            false,
+            vec![SectionPayload {
+                section_kind: SectionKind::ScanSplitIndex as u16,
+                profile: PrimaryProfile::LayoutPlanning as u8,
+                flags: 0,
+                item_count: 1,
+                row_count: 2,
+                compression: cove_core::constants::CompressionCodec::None as u8,
+                alignment_log2: 0,
+                required_features: 0,
+                optional_features: cove_core::constants::FEATURE_SCAN_SPLIT_INDEX,
+                data: split_index,
+            }],
+        );
+        let state = DatasetState::from_bytes(
+            "sparse-split",
+            rewrite_first_segment_data(file, |data| set_morsel_and_page_ids(data, &[10, 20])),
+        )
+        .unwrap();
+        let plan = plan_scan(&state, None, Vec::new()).unwrap();
 
-        assert!(!morsel_in_split_range(&left, 20, 21));
-        assert!(morsel_in_split_range(&right, 20, 21));
+        let graph = build_task_graph(&state, &plan).unwrap();
+
+        assert_eq!(state.bootstrap_stats().covel_scan_splits_loaded, 1);
+        assert_eq!(graph.scan_splits_used, 1);
+        assert_eq!(
+            graph
+                .tasks
+                .iter()
+                .map(|task| (
+                    task.split_id,
+                    task.morsel_id,
+                    task.row_start,
+                    task.row_count
+                ))
+                .collect::<Vec<_>>(),
+            vec![(Some(1), 10, 0, 1), (Some(1), 20, 1, 1)]
+        );
     }
 
     #[test]

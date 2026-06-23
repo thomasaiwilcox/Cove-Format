@@ -9,3 +9,4 @@ autobins = false
 [dependencies]
 cove-core = { path = "../cove-core" }
 cove-coverage = { path = "../cove-coverage" }
+serde_json = "1"

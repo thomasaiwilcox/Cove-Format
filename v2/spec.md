@@ -7756,6 +7756,8 @@ projections:
 - A projection rule MUST declare whether it uses latest values, full history, valid-time state, observed-time state, or COVE-O commit/file-ordering state.
 - A projected table view MUST NOT change object identity, association identity, canonical property truth, tombstone semantics, or evidence lineage.
 - If a projected view is materialised as COVE-T, the COVE-T output SHOULD include lineage to the source COVE-O files, COVM dataset state where applicable, projection_id, projection_version, mapping/projection artifact digest, and temporal cut.
+- A projection catalog MAY include per-column optimizer lineage. For direct scalar object-property columns this MAY identify `source = "object_property"`, stable object type/property IDs, stable projection table/column IDs, the original expression, `transform = "identity"`, and `filter_pushdown = "projection_covi_prefilter"`. This lineage is a proof surface for optional acceleration only; it MUST NOT redefine projected values.
+- A COVE-I projection-column sidecar MAY index materialized projection row ordinals by projection table/column ID. Readers MAY use such sidecars to prefilter candidate projection rows only after validating the sidecar against the COVE-O snapshot and proving the pushed predicate matches the declared lineage. Readers MUST still apply the logical projection and residual predicate semantics to the candidate rows. Missing, stale, unsupported, ambiguous, or non-equivalent projection sidecars MUST fall back to materialized projection readback unless the caller explicitly requested strict accelerated execution.
 
 
 ### 70.10.1 Semantic Dimensions and Object/Dimensional Coverage Maps
@@ -7899,8 +7901,13 @@ A COVE-MAP converter that targets object-and-association-based COVE SHOULD imple
 10. Validate object-association readback semantics for the materialised output when association readback is claimed.
 11. Optionally materialise or register COVE-MAP projection rules for COVE-T/Arrow/SQL relational query engines.
 12. Emit evidence indexes and conversion report when auditability is claimed.
-13. Emit COVM manifest references when a dataset has multiple output files or lineage artifacts.
-14. Validate the produced COVE outputs independently of the mapping artifact.
+13. Optionally emit COVE-I secondary-index sidecars for COVE-O object-property, object-path, association, projection-fragment, or semantic-dimension lookup when the sidecar can be validated against the generated object artifact.
+14. Emit COVM manifest references when a dataset has multiple output files or lineage artifacts.
+15. Validate the produced COVE outputs independently of the mapping artifact.
+
+`cove map build` is the reference CLI orchestration command for this pipeline. It validates a reusable `.covemap` artifact, reads one or more declared source tables, materialises COVE-O object/association output, optionally materialises COVE-T projections, emits standard optional COVE-I acceleration sidecars when supported, and writes implementation reports plus a bundle manifest for adoption workflows. The `map-build-manifest.json` bundle manifest is not a normative COVM manifest. Implementations that need dataset publication semantics SHOULD emit a separate `.covm` artifact, for example through `cove map build --publish-covm` or `cove map publish --bundle-dir <dir> --out <dataset.covm>`. Generated COVE-I and COVM artifacts are optional companion artifacts: they MUST validate against the generated COVE snapshot before use, stale or corrupt artifacts MUST be ignored unless the caller explicitly requires them, and they MUST NOT change object readback, projection, parity, or validation results.
+
+Reference COVE-MAP tooling MAY place object-property, object-path, association-endpoint, evidence-lookup, and projection-fragment COVE-I roots in a command-owned `indexes/` directory. Query and projection engines MAY discover those roots by bundle convention or explicit sidecar path, but materialised COVE-O/COVE-T readback remains the semantic authority. Where projection descriptors do not expose stable object-property lineage, implementations SHOULD validate and report sidecar readiness while falling back to ordinary projection materialisation instead of guessing a pruning mapping.
 
 **Recommended tools:**
 - `cove map validate`,
@@ -8709,7 +8716,7 @@ The public user-facing CLI is a single `cove` command with grouped subcommands:
 - **cove optimize:** Build safe acceleration sidecars and a performance discovery manifest.
 - **cove convert parquet|arrow|orc|csv:** Convert source files to COVE-T.
 - **cove convert report:** Emit machine-readable conversion fidelity reports for source-to-COVE and COVE-to-source conversions.
-- **cove map validate|preview|plan-keys|convert|explain|diff|project|test:** Validate, preview, convert, explain, compare, project, and test COVE-MAP artifacts.
+- **cove map validate|preview|plan-keys|convert|build|doctor|suggest|parity|explain|diff|project|test:** Validate, preview, convert, build bundles, verify outputs, suggest starter mappings, compare projections, explain, diff, project, and test COVE-MAP artifacts.
 - **cove export arrow:** Export COVE-T tables to Arrow-compatible batches.
 - **cove perf explain-pruning|plan-cost:** Explain pruning decisions and estimate projected scan work.
 - **cove sidecar inspect index|coverage|layout|cache|runtime:** Inspect COVE-I, COVE-COVERAGE, COVE-L, COVE-CACHE, and COVE-R artifacts.

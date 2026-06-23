@@ -21,8 +21,8 @@ use crate::{
         project_cove_o_path, project_cove_o_path_output, project_rows_with_source_states,
         project_rows_with_source_states_output, projection_catalog_from_cove_o_bytes_internal,
         projection_catalog_from_cove_o_path, projection_read_requirements,
-        projection_schema_from_descriptor, ProjectionBatchOptions, ProjectionFormat,
-        ProjectionReadRequirements,
+        projection_schema_from_descriptor, ProjectionBatchOptions, ProjectionFilter,
+        ProjectionFilterLiteral, ProjectionFilterOp, ProjectionFormat, ProjectionReadRequirements,
     },
     section_kind, MaterializedModel,
 };
@@ -40,6 +40,36 @@ pub struct ProjectionColumnDescriptor {
     pub name: String,
     pub logical_type: String,
     pub nested_shape: Option<String>,
+    pub lineage: Option<ProjectionColumnLineageDescriptor>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectionColumnLineageDescriptor {
+    pub source: String,
+    pub object_type_id: u32,
+    pub object_type_name: String,
+    pub property_id: u32,
+    pub property_name: String,
+    pub projection_table_id: u32,
+    pub projection_column_id: u32,
+    pub expression: String,
+    pub transform: String,
+    pub filter_pushdown: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProjectionCoviFilterPlan {
+    pub lookups: Vec<ProjectionCoviFilterLookup>,
+    pub unsupported_filters: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProjectionCoviFilterLookup {
+    pub column: String,
+    pub projection_table_id: u32,
+    pub projection_column_id: u32,
+    pub logical_type: String,
+    pub filter: ProjectionFilter,
 }
 
 pub fn conversion_report_from_paths(map: &Path, sources: &[PathBuf]) -> Result<Value, String> {
@@ -171,6 +201,20 @@ pub fn projection_descriptors_from_cove_o_path(
                     name: column.name,
                     logical_type: column.logical_type.unwrap_or_else(|| "utf8".to_string()),
                     nested_shape: column.nested_shape,
+                    lineage: column
+                        .lineage
+                        .map(|lineage| ProjectionColumnLineageDescriptor {
+                            source: lineage.source,
+                            object_type_id: lineage.object_type_id,
+                            object_type_name: lineage.object_type_name,
+                            property_id: lineage.property_id,
+                            property_name: lineage.property_name,
+                            projection_table_id: lineage.projection_table_id,
+                            projection_column_id: lineage.projection_column_id,
+                            expression: lineage.expression,
+                            transform: lineage.transform,
+                            filter_pushdown: lineage.filter_pushdown,
+                        }),
                 })
                 .collect(),
             projection_id: projection.projection_id,
@@ -182,6 +226,78 @@ pub fn projection_descriptors_from_cove_o_path(
 
 pub fn projection_arrow_schema(descriptor: &ProjectionDescriptor) -> Result<SchemaRef, String> {
     projection_schema_from_descriptor(descriptor)
+}
+
+pub fn projection_covi_filter_plan(
+    descriptor: &ProjectionDescriptor,
+    filters: &[ProjectionFilter],
+) -> ProjectionCoviFilterPlan {
+    let columns = descriptor
+        .columns
+        .iter()
+        .map(|column| (column.name.as_str(), column))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut lookups = Vec::new();
+    let mut unsupported_filters = Vec::new();
+    for filter in filters {
+        let column_name = projection_filter_column(filter);
+        let Some(column) = columns.get(column_name) else {
+            unsupported_filters.push(format!("{column_name}: column not found"));
+            continue;
+        };
+        let Some(lineage) = &column.lineage else {
+            unsupported_filters.push(format!("{column_name}: no projection lineage"));
+            continue;
+        };
+        if lineage.source != "object_property"
+            || lineage.transform != "identity"
+            || lineage.filter_pushdown != "projection_covi_prefilter"
+        {
+            unsupported_filters.push(format!("{column_name}: lineage is not COVE-I eligible"));
+            continue;
+        }
+        if !projection_filter_shape_supported(filter) {
+            unsupported_filters.push(format!(
+                "{column_name}: filter shape is not COVE-I eligible"
+            ));
+            continue;
+        }
+        lookups.push(ProjectionCoviFilterLookup {
+            column: column_name.to_string(),
+            projection_table_id: lineage.projection_table_id,
+            projection_column_id: lineage.projection_column_id,
+            logical_type: column.logical_type.clone(),
+            filter: filter.clone(),
+        });
+    }
+    ProjectionCoviFilterPlan {
+        lookups,
+        unsupported_filters,
+    }
+}
+
+fn projection_filter_column(filter: &ProjectionFilter) -> &str {
+    match filter {
+        ProjectionFilter::Compare { column, .. }
+        | ProjectionFilter::InList { column, .. }
+        | ProjectionFilter::IsNull { column, .. } => column,
+    }
+}
+
+fn projection_filter_shape_supported(filter: &ProjectionFilter) -> bool {
+    match filter {
+        ProjectionFilter::Compare { op, literal, .. } => {
+            !matches!(op, ProjectionFilterOp::Ne)
+                && !matches!(literal, ProjectionFilterLiteral::Null)
+        }
+        ProjectionFilter::InList { literals, .. } => {
+            !literals.is_empty()
+                && literals
+                    .iter()
+                    .all(|literal| !matches!(literal, ProjectionFilterLiteral::Null))
+        }
+        ProjectionFilter::IsNull { .. } => false,
+    }
 }
 
 pub fn projection_read_requirements_for_catalog(

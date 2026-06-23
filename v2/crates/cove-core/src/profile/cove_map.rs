@@ -286,6 +286,21 @@ pub struct MapProjectionColumn {
     pub nested_shape: Option<String>,
     pub conflict_policy: String,
     pub missing_policy: String,
+    pub lineage: Option<MapProjectionColumnLineage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MapProjectionColumnLineage {
+    pub source: String,
+    pub object_type_id: u32,
+    pub object_type_name: String,
+    pub property_id: u32,
+    pub property_name: String,
+    pub projection_table_id: u32,
+    pub projection_column_id: u32,
+    pub expression: String,
+    pub transform: String,
+    pub filter_pushdown: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

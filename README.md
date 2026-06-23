@@ -1,56 +1,104 @@
 # Cove Format
 
-COVE is an immutable archive format for queryable data. It has two primary
-user-facing surfaces:
+COVE is an experimental immutable archive format for datasets that need to stay
+queryable after the original pipeline, catalog, or application context has
+gone away. It explores a narrow question: what should an offline data artifact
+carry so a future reader can validate it, understand its schema and provenance,
+respect redaction/visibility rules, and skip work only when the metadata proves
+the answer is unchanged?
+
+The baseline `.cove` file is engine-neutral. A reader can validate and decode
+logical values without depending on DataFusion, Arrow IPC, Harbor, a lakehouse
+catalog, or an object store. Optional acceleration can help engines read the
+same truth more cheaply, but it must never change logical results.
+
+COVE has two primary user-facing surfaces:
 
 1. **COVE-T: tabular archives.** For ordinary table-shaped data that should
    stay table-shaped. COVE-T stores immutable tables with dictionaries,
-   encodings, checksums, morsels, zone statistics, and proof-safe pruning
-   metadata built into the read contract.
-2. **COVE-O / COVE-MAP: semantic archives.** For datasets where source tables
-   remain provenance, but durable meaning is better represented as canonical
-   objects, properties, associations, evidence, and deterministic projected
-   table views.
+   encodings, checksums, morsels, zone statistics, and metadata that can prove
+   when data may be skipped safely.
+2. **COVE-O / COVE-MAP: mapped archives.** For fragmented source tables where
+   the archive should also preserve deterministic mappings, provenance,
+   evidence, and projected table readback. In plain terms: source rows remain
+   auditable, while repeated business entities such as customers, products, or
+   accounts can be represented once as declared objects and associations.
 
 Everything else in the COVE suite supports those two surfaces: CoveQL, Arrow
 and DataFusion access, validation tooling, conformance tests, benchmarks,
 sidecars, coverage proofs, layout plans, caches, indexes, and runtime planning
 hints. The rule is simple: authoritative data and validated metadata define
-truth. Optional acceleration can help engines read that truth more cheaply, but
-it must never change logical results.
+truth.
 
-CoveQL is the optional query layer that sits next to the format. It is not
-required to read or write COVE files, but it is a first-class companion for
-projects that want table, object, association, evidence, projection, graph,
-temporal, explain, Arrow, DataFusion, and coded-execution semantics over COVE's
-validated metadata.
+## Current Status
 
-## Long-Term Direction
+This repository is a working standards-suite prototype, not a production data
+standard with external adoption.
 
-COVE's long-term goal is to make archived tabular data both physically
-efficient and semantically canonical. Many source tables repeat the same
-real-world values and entities: company names, products, customers, locations,
-instruments, accounts, and other business objects. COVE's object and mapping
-profiles are intended to let those repeated facts be represented once as
-canonical objects and associations, while preserving deterministic metadata
-that can project the data back into table-shaped views compatible with the
-original sources.
+- [`v2/`](./v2/) is the current COVE v2 standards-suite workspace. Its
+  normative baseline is [`v2/spec.md`](./v2/spec.md).
+- [`v1/`](./v1/) preserves the COVE v1 specification and implementation under
+  [`v1/Spec.md`](./v1/Spec.md).
+- The reference implementation is Rust and includes readers, writers,
+  validators, conversion tools, DataFusion access, CoveQL, mapping, sidecar
+  tooling, benchmark harnesses, and conformance generators.
+- The v2 implementation is staged and evidence-tracked rather than described
+  by a single blanket compliance claim. The generated matrix in
+  [`v2/conformance/capability_matrix.md`](./v2/conformance/capability_matrix.md)
+  is the source of truth for which areas are modeled, parsed, validated,
+  written, and exercised by corpus fixtures.
+- COVE v2 uses new magic and major-version fields. v2 readers may choose to
+  support v1 files, but v1 readers must reject v2 files.
 
-In that model, the original tables remain readable, but they are no longer the
-only semantic structure. Source rows become provenance. Objects, properties,
-associations, evidence, and projection rules describe the canonical meaning.
-This can reduce duplicated storage and repeated read work, but the larger goal
-is that data becomes easier for engines and humans to understand consistently
-across fragmented sources.
+The reference code is AI-assisted. Compatibility claims are based on executable
+evidence, not generated prose: CI runs formatting, clippy with warnings denied,
+locked dependency checks, cross-platform tests, documentation builds with
+warnings denied, release gates, conformance corpus checks, capability-matrix
+regeneration checks, and fuzz smoke tests.
 
-## What COVE Is
+## Why Not Parquet, Iceberg, Delta, Or Vortex?
 
-COVE stores immutable offline data in `.cove` files. The baseline format is
-engine-neutral: a reader can validate and decode the logical values without
-depending on DataFusion, Arrow IPC, Harbor, a catalog service, or an object
-store.
+COVE is not trying to replace Parquet as the default columnar file format, and
+it is not a table format like Iceberg or Delta. Those projects are mature and
+should remain the default answer for most lakehouse workloads.
 
-The standards suite is easiest to approach in layers:
+COVE is aimed at a different experiment: immutable archive artifacts that carry
+more of their read contract with them.
+
+| System | What it is best at | How COVE differs |
+| --- | --- | --- |
+| Parquet / ORC | Mature columnar storage for analytics engines | COVE focuses on self-contained validation, proof-scoped metadata, archive semantics, and optional deterministic mapping/provenance. |
+| Iceberg / Delta / Hudi | Mutable lakehouse table metadata, snapshots, deletes, and catalog integration | COVE files are immutable artifacts; sidecars can accelerate reads but do not define table transactions. |
+| Avro / Arrow IPC | Row/message interchange or in-memory/IPC columnar exchange | COVE is a durable archive format with validation, conformance, and query-planning metadata. |
+| Vortex and newer analytic formats | High-performance compressed analytics layouts | COVE is not only a physical encoding experiment; it also explores portable proof semantics, provenance, and mapped archive readback. |
+| Semantic layers and catalogs | Centralized meaning, governance, and metric definitions | COVE-MAP stores deterministic mapping evidence inside portable artifacts; it is not a catalog service or AI schema matcher. |
+
+If all you need is fast analytics over active lakehouse data, use the mature
+formats first. COVE is for cases where the archive itself should remain
+validatable, explainable, and queryable when the surrounding system is gone.
+
+## Tiny Example
+
+From the v2 workspace, a skeptical first pass should be: generate a small
+sample, validate it, inspect what query surfaces exist, run a query, and inspect
+which acceleration is available.
+
+```bash
+cd v2
+cargo run -p cove-cli -- examples
+cargo run -p cove-cli -- doctor examples/coveql/people.cove
+cargo run -p cove-cli -- inspect --queries examples/coveql/people.cove
+cargo run -p cove-cli -- query examples/coveql/people.cove \
+  'table(people).select(score, status, nickname).take(5)'
+cargo run -p cove-cli -- optimize examples/coveql/events.cove
+cargo run -p cove-cli -- query examples/coveql/events.cove --perf-report \
+  'table(events).where(score >= 20).select(id, score)'
+```
+
+## What Works Today
+
+The standards suite is easiest to approach in layers rather than as one
+mandatory feature pile:
 
 - **Data surfaces:** COVE-Core, COVE-T, COVE-O, and COVE-MAP define the data,
   meaning, provenance, and deterministic projections.
@@ -77,6 +125,20 @@ only when the spec defines the proof semantics and the reader validates the
 metadata under the relevant logical type, collation, null semantics, feature
 scope, and snapshot. Advisory metadata can help planning, but it must not change
 query results.
+
+## Current Limitations
+
+- COVE is experimental and has no independent ecosystem adoption yet.
+- The repository intentionally contains both normative/spec work and reference
+  implementation code, so some surfaces are standards-suite scaffolding rather
+  than independently deep libraries.
+- Some crates are thin stable facades over larger implementation crates.
+- Performance numbers are local deterministic benchmark results, not universal
+  file-format claims.
+- Some conversion/export paths are reference-grade and report unsupported
+  features rather than pretending to be complete.
+- COVE-MAP is deterministic mapping and provenance machinery, not probabilistic
+  entity resolution, ETL orchestration, or AI schema matching.
 
 ## CoveQL Companion Query Layer
 
@@ -200,24 +262,6 @@ The public utility surface is grouped under the single `cove` binary:
   `cove digest verify`, `cove profile`, and `cove canonicalise` provide
   integration, planning, integrity, profile, and canonical-value utilities.
 
-## Repository Status
-
-This repository currently contains two workspaces:
-
-- [`v2/`](./v2/) is the current COVE v2 standards-suite workspace. Its
-  normative baseline is [`v2/spec.md`](./v2/spec.md).
-- [`v1/`](./v1/) preserves the COVE v1 specification and implementation under
-  [`v1/Spec.md`](./v1/Spec.md).
-
-COVE v2 uses new magic and major-version fields. v2 readers may choose to
-support v1 files, but v1 readers must reject v2 files.
-
-The v2 implementation is staged and evidence-tracked rather than described by a
-single blanket compliance claim. The generated matrix in
-[`v2/conformance/capability_matrix.md`](./v2/conformance/capability_matrix.md)
-is the source of truth for which areas are modeled, parsed, validated, written,
-and exercised by corpus fixtures.
-
 ## How It Works
 
 ### FileCodes and ExecutionCodes
@@ -287,6 +331,24 @@ projection semantics.
 CoveQL is the optional read/query layer over that semantic surface. It is
 described above because it is a companion to COVE-O and COVE-MAP rather than a
 requirement for basic COVE file interoperability.
+
+### Long-Term Direction
+
+COVE's long-term goal is to make archived tabular data physically efficient
+and easier to understand across fragmented sources. Many datasets repeat the
+same real-world values and entities: company names, products, customers,
+locations, instruments, accounts, and other business objects. COVE's object
+and mapping profiles are intended to let those repeated facts be represented
+as declared objects and associations while preserving deterministic metadata
+that can project the data back into table-shaped views compatible with the
+original sources.
+
+In that model, the original tables remain readable, but they are no longer the
+only structure available to readers. Source rows become provenance. Objects,
+properties, associations, evidence, and projection rules describe the declared
+meaning. This can reduce duplicated storage and repeated read work, but the
+larger goal is that archived data remains explainable without requiring the
+original application stack.
 
 ### Object Storage and Cheaper Reads
 

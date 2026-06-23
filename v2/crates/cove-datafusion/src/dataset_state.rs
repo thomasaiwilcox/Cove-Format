@@ -832,6 +832,11 @@ impl FileMetadata {
         if directory.sum_rows() != u64::from(header.row_count) {
             return Err(CoveError::SegmentCorrupt);
         }
+        directory.validate_fixed_layout(
+            header.row_count,
+            header.morsel_count,
+            header.morsel_row_count,
+        )?;
         Ok(directory.entries)
     }
 

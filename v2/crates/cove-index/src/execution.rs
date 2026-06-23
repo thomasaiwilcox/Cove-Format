@@ -276,6 +276,10 @@ pub enum CoviLookupTargetV2 {
         table_id: u32,
         column_id: u32,
     },
+    ProjectionColumn {
+        table_id: u32,
+        column_id: u32,
+    },
     ObjectProperty {
         object_type_id: u32,
         property_id: u32,
@@ -330,6 +334,10 @@ impl CoviLookupRequestV2 {
             CoviLookupTargetV2::TableColumn {
                 table_id,
                 column_id,
+            }
+            | CoviLookupTargetV2::ProjectionColumn {
+                table_id,
+                column_id,
             } => (table_id, column_id),
             _ => (ABSENT_U32, ABSENT_U32),
         };
@@ -375,6 +383,10 @@ impl CoviLookupRequestV2 {
         }
         let (table_id, column_id) = match target {
             CoviLookupTargetV2::TableColumn {
+                table_id,
+                column_id,
+            }
+            | CoviLookupTargetV2::ProjectionColumn {
                 table_id,
                 column_id,
             } => (table_id, column_id),
@@ -457,6 +469,20 @@ impl CoviLookupRequestV2 {
         keys: impl IntoIterator<Item = CoviLookupKeyV2>,
     ) -> Self {
         Self::membership(table_id, column_id, keys)
+    }
+
+    pub fn projection_column_membership(
+        table_id: u32,
+        column_id: u32,
+        keys: impl IntoIterator<Item = CoviLookupKeyV2>,
+    ) -> Self {
+        Self::membership_target(
+            CoviLookupTargetV2::ProjectionColumn {
+                table_id,
+                column_id,
+            },
+            keys,
+        )
     }
 
     pub fn object_property_membership(
@@ -1289,6 +1315,14 @@ fn root_matches_target(root: &CoviIndexRootV2, target: CoviLookupTargetV2) -> bo
                 && root.table_id == table_id
                 && root.column_id == column_id
         }
+        CoviLookupTargetV2::ProjectionColumn {
+            table_id,
+            column_id,
+        } => {
+            root.indexed_target_kind == CoviIndexedTargetKindV2::ProjectionColumn
+                && root.table_id == table_id
+                && root.column_id == column_id
+        }
         CoviLookupTargetV2::ObjectProperty {
             object_type_id,
             property_id,
@@ -1328,6 +1362,13 @@ fn root_matches_index_only_target(
     match target {
         CoviLookupTargetV2::TableColumn { table_id, .. } => {
             root.indexed_target_kind == CoviIndexedTargetKindV2::TableColumn
+                && root.table_id == table_id
+                && request_column_id
+                    .map(|column_id| root.column_id == column_id)
+                    .unwrap_or(true)
+        }
+        CoviLookupTargetV2::ProjectionColumn { table_id, .. } => {
+            root.indexed_target_kind == CoviIndexedTargetKindV2::ProjectionColumn
                 && root.table_id == table_id
                 && request_column_id
                     .map(|column_id| root.column_id == column_id)

@@ -18,6 +18,12 @@ pub(crate) struct CoveFileMetrics {
     pub(crate) covx_sidecars_loaded: Count,
     pub(crate) covx_sidecars_stale: Count,
     pub(crate) covx_sidecars_ignored: Count,
+    #[allow(dead_code)]
+    pub(crate) covi_sidecars_loaded: Count,
+    #[allow(dead_code)]
+    pub(crate) covi_sidecars_stale: Count,
+    #[allow(dead_code)]
+    pub(crate) covi_sidecars_ignored: Count,
     pub(crate) sidecar_index_fallbacks: Count,
     pub(crate) covel_sections_loaded: Count,
     pub(crate) covel_sections_ignored: Count,
@@ -111,6 +117,12 @@ impl CoveFileMetrics {
                 .counter("cove_covx_sidecars_stale", partition),
             covx_sidecars_ignored: MetricBuilder::new(metrics)
                 .counter("cove_covx_sidecars_ignored", partition),
+            covi_sidecars_loaded: MetricBuilder::new(metrics)
+                .counter("cove_covi_sidecars_loaded", partition),
+            covi_sidecars_stale: MetricBuilder::new(metrics)
+                .counter("cove_covi_sidecars_stale", partition),
+            covi_sidecars_ignored: MetricBuilder::new(metrics)
+                .counter("cove_covi_sidecars_ignored", partition),
             sidecar_index_fallbacks: MetricBuilder::new(metrics)
                 .counter("cove_sidecar_index_fallbacks", partition),
             covel_sections_loaded: MetricBuilder::new(metrics)
