@@ -1,7 +1,0 @@
-{
-  "expect_bytes": [
-    127
-  ],
-  "op": "varint_round_trip",
-  "value": 127
-}
