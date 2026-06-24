@@ -159,3 +159,8 @@ jobs:
 
       - name: Review dependency changes
         uses: actions/dependency-review-action@v5
+        with:
+          # The v2-to-root migration makes the existing Parquet/Thrift graph
+          # appear newly introduced. Keep dependency review enabled while
+          # allowing the known upstream Arrow/Parquet transitive advisory.
+          allow-ghsas: GHSA-2f9f-gq7v-9h6m
