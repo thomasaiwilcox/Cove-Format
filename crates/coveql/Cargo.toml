@@ -12,7 +12,7 @@ default = []
 [dependencies]
 arrow-array = "58"
 arrow-data = "58"
-arrow-schema = "58"
+arrow-schema = "59"
 async-trait = "0.1"
 cove-arrow = { path = "../cove-arrow" }
 cove-core = { path = "../cove-core" }

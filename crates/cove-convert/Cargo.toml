@@ -11,7 +11,7 @@ cove-core = { path = "../cove-core" }
 arrow-csv = "58"
 arrow-ipc = "58"
 arrow-array = "58"
-arrow-schema = "58"
+arrow-schema = "59"
 bytes = "1"
 orc-rust = "0.8"
 parquet = { version = "58", default-features = false, features = ["arrow"] }

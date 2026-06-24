@@ -10,7 +10,7 @@ autobins = false
 arrow-array = "58"
 arrow-ipc = "58"
 arrow-json = "58"
-arrow-schema = "58"
+arrow-schema = "59"
 cove-convert = { path = "../cove-convert" }
 cove-core = { path = "../cove-core" }
 cove-index = { path = "../cove-index" }
