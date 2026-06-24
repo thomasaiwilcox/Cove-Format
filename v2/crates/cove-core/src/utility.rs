@@ -98,7 +98,7 @@ fn build_covm_artifact_from_identities(
     tool: &str,
     identities: &[InputIdentity],
 ) -> Result<(Vec<u8>, UtilityArtifactReport), CoveError> {
-    let dataset_id = artifact_id(&identities)?;
+    let dataset_id = artifact_id(identities)?;
     let files = identities
         .iter()
         .map(|identity| CovmFileEntryV1 {
@@ -131,7 +131,7 @@ fn build_covm_artifact_from_identities(
     let digest = compute_digest(DigestAlgorithm::Sha256, &bytes)?;
     let report = UtilityArtifactReport {
         tool: tool.into(),
-        inputs: input_json(&identities),
+        inputs: input_json(identities),
         output: output.as_ref().display().to_string(),
         file_id: dataset_id,
         file_len: bytes.len() as u64,

@@ -259,14 +259,16 @@ pub fn projection_covi_filter_plan(
             let reason = "column_not_found";
             unsupported_filters.push(format!("{column_name}: {reason}"));
             diagnostics.push(projection_covi_filter_diagnostic(
-                column_name,
                 filter,
-                "column_not_found",
-                None,
-                false,
-                None,
-                None,
-                reason,
+                ProjectionCoviFilterDiagnosticParams {
+                    column: column_name,
+                    lineage_status: "column_not_found",
+                    logical_type: None,
+                    eligible: false,
+                    projection_table_id: None,
+                    projection_column_id: None,
+                    reason,
+                },
             ));
             continue;
         };
@@ -274,14 +276,16 @@ pub fn projection_covi_filter_plan(
             let reason = "missing_lineage";
             unsupported_filters.push(format!("{column_name}: {reason}"));
             diagnostics.push(projection_covi_filter_diagnostic(
-                column_name,
                 filter,
-                "missing",
-                Some(column.logical_type.clone()),
-                false,
-                None,
-                None,
-                reason,
+                ProjectionCoviFilterDiagnosticParams {
+                    column: column_name,
+                    lineage_status: "missing",
+                    logical_type: Some(column.logical_type.clone()),
+                    eligible: false,
+                    projection_table_id: None,
+                    projection_column_id: None,
+                    reason,
+                },
             ));
             continue;
         };
@@ -292,40 +296,46 @@ pub fn projection_covi_filter_plan(
             let reason = "lineage_not_covi_eligible";
             unsupported_filters.push(format!("{column_name}: {reason}"));
             diagnostics.push(projection_covi_filter_diagnostic(
-                column_name,
                 filter,
-                "ineligible",
-                Some(column.logical_type.clone()),
-                false,
-                Some(lineage.projection_table_id),
-                Some(lineage.projection_column_id),
-                reason,
+                ProjectionCoviFilterDiagnosticParams {
+                    column: column_name,
+                    lineage_status: "ineligible",
+                    logical_type: Some(column.logical_type.clone()),
+                    eligible: false,
+                    projection_table_id: Some(lineage.projection_table_id),
+                    projection_column_id: Some(lineage.projection_column_id),
+                    reason,
+                },
             ));
             continue;
         }
         if let Some(reason) = projection_filter_shape_unsupported_reason(filter) {
             unsupported_filters.push(format!("{column_name}: {reason}"));
             diagnostics.push(projection_covi_filter_diagnostic(
-                column_name,
                 filter,
-                "present",
-                Some(column.logical_type.clone()),
-                false,
-                Some(lineage.projection_table_id),
-                Some(lineage.projection_column_id),
-                reason,
+                ProjectionCoviFilterDiagnosticParams {
+                    column: column_name,
+                    lineage_status: "present",
+                    logical_type: Some(column.logical_type.clone()),
+                    eligible: false,
+                    projection_table_id: Some(lineage.projection_table_id),
+                    projection_column_id: Some(lineage.projection_column_id),
+                    reason,
+                },
             ));
             continue;
         }
         diagnostics.push(projection_covi_filter_diagnostic(
-            column_name,
             filter,
-            "present",
-            Some(column.logical_type.clone()),
-            true,
-            Some(lineage.projection_table_id),
-            Some(lineage.projection_column_id),
-            "eligible",
+            ProjectionCoviFilterDiagnosticParams {
+                column: column_name,
+                lineage_status: "present",
+                logical_type: Some(column.logical_type.clone()),
+                eligible: true,
+                projection_table_id: Some(lineage.projection_table_id),
+                projection_column_id: Some(lineage.projection_column_id),
+                reason: "eligible",
+            },
         ));
         lookups.push(ProjectionCoviFilterLookup {
             column: column_name.to_string(),
@@ -378,25 +388,29 @@ fn projection_filter_shape_unsupported_reason(filter: &ProjectionFilter) -> Opti
 }
 
 fn projection_covi_filter_diagnostic(
-    column: &str,
     filter: &ProjectionFilter,
-    lineage_status: &str,
+    params: ProjectionCoviFilterDiagnosticParams,
+) -> ProjectionCoviFilterDiagnostic {
+    ProjectionCoviFilterDiagnostic {
+        column: params.column.to_string(),
+        op: projection_filter_op(filter).to_string(),
+        lineage_status: params.lineage_status.to_string(),
+        logical_type: params.logical_type,
+        eligible: params.eligible,
+        projection_table_id: params.projection_table_id,
+        projection_column_id: params.projection_column_id,
+        reason: params.reason.to_string(),
+    }
+}
+
+struct ProjectionCoviFilterDiagnosticParams<'a> {
+    column: &'a str,
+    lineage_status: &'a str,
     logical_type: Option<String>,
     eligible: bool,
     projection_table_id: Option<u32>,
     projection_column_id: Option<u32>,
-    reason: &str,
-) -> ProjectionCoviFilterDiagnostic {
-    ProjectionCoviFilterDiagnostic {
-        column: column.to_string(),
-        op: projection_filter_op(filter).to_string(),
-        lineage_status: lineage_status.to_string(),
-        logical_type,
-        eligible,
-        projection_table_id,
-        projection_column_id,
-        reason: reason.to_string(),
-    }
+    reason: &'a str,
 }
 
 fn projection_filter_op(filter: &ProjectionFilter) -> &'static str {

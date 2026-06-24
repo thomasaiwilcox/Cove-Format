@@ -155,6 +155,36 @@ struct SkippedProjection {
     reason: String,
 }
 
+struct ProjectionArtifactsResult {
+    artifacts: Vec<ProjectionArtifact>,
+    skipped: Vec<SkippedProjection>,
+    files: Vec<PendingArtifact>,
+    verifiable: Vec<VerifiableProjection>,
+}
+
+struct IndexArtifactsResult {
+    artifacts: Vec<IndexArtifact>,
+    files: Vec<PendingArtifact>,
+    verifiable: Vec<VerifiableIndex>,
+}
+
+struct BuildReportContext<'a> {
+    materialized: &'a MaterializedModel,
+    projection_output: MapBuildProjectionOutput,
+    evidence_encoding: MapEvidenceEncoding,
+    section_compression: MapBuildSectionCompression,
+    object_relative: &'a Path,
+    object_bytes: usize,
+    evidence_summary: &'a EvidenceEncodingSummary,
+    compression_summary: &'a CoveOCompressionSummary,
+    covm: Option<&'a CovmArtifact>,
+    indexes: &'a [IndexArtifact],
+    projections: &'a [ProjectionArtifact],
+    skipped: &'a [SkippedProjection],
+    warnings: &'a [String],
+    verification: Option<&'a Value>,
+}
+
 pub fn build_from_paths(
     map: &Path,
     sources: &[PathBuf],
@@ -210,10 +240,10 @@ pub fn build_from_paths(
             )
         }),
     };
-    let (projection_artifacts, skipped_projections, projection_files, verifiable_projections) =
+    let projection_result =
         projection_artifacts(&object_bytes, options.projection_output, Some(&lineage))?;
-    let (index_artifacts, index_files, verifiable_indexes) = index_artifacts(&object_bytes)?;
-    let mut warnings = build_warnings(options.projection_output, &projection_artifacts);
+    let index_result = index_artifacts(&object_bytes)?;
+    let mut warnings = build_warnings(options.projection_output, &projection_result.artifacts);
     let mut artifacts = Vec::new();
     artifacts.push(PendingArtifact {
         relative_path: object_relative.clone(),
@@ -225,35 +255,35 @@ pub fn build_from_paths(
             bytes: covm.bytes.clone(),
         });
     }
-    artifacts.extend(index_files);
-    artifacts.extend(projection_files);
+    artifacts.extend(index_result.files.clone());
+    artifacts.extend(projection_result.files.clone());
 
     let report_relative = PathBuf::from("map-build-report.json");
     let readme_relative = PathBuf::from("README.md");
     let manifest_relative = PathBuf::from("map-build-manifest.json");
-    let report = build_report(
-        &materialized,
-        options.projection_output,
-        options.evidence_encoding,
-        options.section_compression,
-        &object_relative,
-        object_bytes.len(),
-        &evidence_summary,
-        &compression_summary,
-        covm_artifact.as_ref(),
-        &index_artifacts,
-        &projection_artifacts,
-        &skipped_projections,
-        &warnings,
-        None,
-    );
+    let report = build_report(BuildReportContext {
+        materialized: &materialized,
+        projection_output: options.projection_output,
+        evidence_encoding: options.evidence_encoding,
+        section_compression: options.section_compression,
+        object_relative: &object_relative,
+        object_bytes: object_bytes.len(),
+        evidence_summary: &evidence_summary,
+        compression_summary: &compression_summary,
+        covm: covm_artifact.as_ref(),
+        indexes: &index_result.artifacts,
+        projections: &projection_result.artifacts,
+        skipped: &projection_result.skipped,
+        warnings: &warnings,
+        verification: None,
+    });
     let verification = if options.verify {
         let verification = verify_bundle(&VerifiableBundle {
             object_relative_path: object_relative.clone(),
             object_bytes: object_bytes.clone(),
             report: report.clone(),
-            indexes: verifiable_indexes.clone(),
-            projections: verifiable_projections,
+            indexes: index_result.verifiable.clone(),
+            projections: projection_result.verifiable.clone(),
         });
         if verification
             .get("errors")
@@ -270,29 +300,29 @@ pub fn build_from_paths(
     } else {
         None
     };
-    let report = build_report(
-        &materialized,
-        options.projection_output,
-        options.evidence_encoding,
-        options.section_compression,
-        &object_relative,
-        object_bytes.len(),
-        &evidence_summary,
-        &compression_summary,
-        covm_artifact.as_ref(),
-        &index_artifacts,
-        &projection_artifacts,
-        &skipped_projections,
-        &warnings,
-        verification.as_ref(),
-    );
+    let report = build_report(BuildReportContext {
+        materialized: &materialized,
+        projection_output: options.projection_output,
+        evidence_encoding: options.evidence_encoding,
+        section_compression: options.section_compression,
+        object_relative: &object_relative,
+        object_bytes: object_bytes.len(),
+        evidence_summary: &evidence_summary,
+        compression_summary: &compression_summary,
+        covm: covm_artifact.as_ref(),
+        indexes: &index_result.artifacts,
+        projections: &projection_result.artifacts,
+        skipped: &projection_result.skipped,
+        warnings: &warnings,
+        verification: verification.as_ref(),
+    });
     let report_bytes = json_bytes(&report)?;
     let readme_bytes = readme_bytes(
         &mapping_id,
         &object_relative,
         covm_artifact.as_ref(),
-        &index_artifacts,
-        &projection_artifacts,
+        &index_result.artifacts,
+        &projection_result.artifacts,
     );
     let manifest = build_manifest(
         map,
@@ -308,8 +338,8 @@ pub fn build_from_paths(
         &evidence_summary,
         &compression_summary,
         covm_artifact.as_ref(),
-        &index_artifacts,
-        &projection_artifacts,
+        &index_result.artifacts,
+        &projection_result.artifacts,
         &report_relative,
         report_bytes.len(),
         &readme_relative,
@@ -344,15 +374,7 @@ fn projection_artifacts(
     object_bytes: &[u8],
     output: MapBuildProjectionOutput,
     lineage: Option<&ProjectionLineageContext>,
-) -> Result<
-    (
-        Vec<ProjectionArtifact>,
-        Vec<SkippedProjection>,
-        Vec<PendingArtifact>,
-        Vec<VerifiableProjection>,
-    ),
-    String,
-> {
+) -> Result<ProjectionArtifactsResult, String> {
     let catalog = projection_catalog_from_cove_o_bytes_internal(object_bytes, None, "<map-build>")?;
     let mut used_names = BTreeMap::<String, String>::new();
     let mut projection_artifacts = Vec::new();
@@ -419,19 +441,15 @@ fn projection_artifacts(
             bytes,
         });
     }
-    Ok((projection_artifacts, skipped, files, verifiable))
+    Ok(ProjectionArtifactsResult {
+        artifacts: projection_artifacts,
+        skipped,
+        files,
+        verifiable,
+    })
 }
 
-fn index_artifacts(
-    object_bytes: &[u8],
-) -> Result<
-    (
-        Vec<IndexArtifact>,
-        Vec<PendingArtifact>,
-        Vec<VerifiableIndex>,
-    ),
-    String,
-> {
+fn index_artifacts(object_bytes: &[u8]) -> Result<IndexArtifactsResult, String> {
     let object_property_bytes =
         build_covi_from_cove_o_bytes(object_bytes, &CoviObjectPropertyBuildOptions::default())
             .map_err(|err| format!("cannot build COVE-I object-property index: {err}"))?;
@@ -494,7 +512,11 @@ fn index_artifacts(
             bytes: projection_bytes,
         });
     }
-    Ok((indexes, files, verifiable))
+    Ok(IndexArtifactsResult {
+        artifacts: indexes,
+        files,
+        verifiable,
+    })
 }
 
 fn covm_artifact_for_object(
@@ -590,46 +612,31 @@ fn write_one_artifact(out_dir: &Path, relative_path: &Path, bytes: &[u8]) -> Res
         .map_err(|err| format!("cannot durably publish {}: {err}", path.display()))
 }
 
-fn build_report(
-    materialized: &MaterializedModel,
-    projection_output: MapBuildProjectionOutput,
-    evidence_encoding: MapEvidenceEncoding,
-    section_compression: MapBuildSectionCompression,
-    object_relative: &Path,
-    object_bytes: usize,
-    evidence_summary: &EvidenceEncodingSummary,
-    compression_summary: &CoveOCompressionSummary,
-    covm: Option<&CovmArtifact>,
-    indexes: &[IndexArtifact],
-    projections: &[ProjectionArtifact],
-    skipped: &[SkippedProjection],
-    warnings: &[String],
-    verification: Option<&Value>,
-) -> Value {
+fn build_report(ctx: BuildReportContext<'_>) -> Value {
     json!({
         "format": "cove-map-build-report-v1",
-        "projection_output": projection_output.as_str(),
-        "evidence_encoding": evidence_encoding.as_str(),
-        "section_compression": section_compression.as_str(),
-        "evidence": evidence_summary_json(evidence_summary),
-        "compression_summary": compression_summary_json(compression_summary),
-        "expanded_evidence_index": if evidence_encoding == MapEvidenceEncoding::Both {
-            materialized.evidence_index.clone()
+        "projection_output": ctx.projection_output.as_str(),
+        "evidence_encoding": ctx.evidence_encoding.as_str(),
+        "section_compression": ctx.section_compression.as_str(),
+        "evidence": evidence_summary_json(ctx.evidence_summary),
+        "compression_summary": compression_summary_json(ctx.compression_summary),
+        "expanded_evidence_index": if ctx.evidence_encoding == MapEvidenceEncoding::Both {
+            ctx.materialized.evidence_index.clone()
         } else {
             Value::Null
         },
-        "conversion_report": materialized.conversion_report,
-        "generated_artifacts": generated_artifacts(object_relative, object_bytes, covm, indexes, projections),
-        "covm": covm.map(covm_artifact_json),
+        "conversion_report": ctx.materialized.conversion_report,
+        "generated_artifacts": generated_artifacts(ctx.object_relative, ctx.object_bytes, ctx.covm, ctx.indexes, ctx.projections),
+        "covm": ctx.covm.map(covm_artifact_json),
         "cache": {
             "format": "cove-map-build-cache-v1",
             "reuse_enabled": true,
             "status": "recorded",
         },
-        "sidecar_readiness": sidecar_readiness(indexes),
-        "skipped_projections": skipped.iter().map(skipped_projection_json).collect::<Vec<_>>(),
-        "warnings": warnings,
-        "verification": verification,
+        "sidecar_readiness": sidecar_readiness(ctx.indexes),
+        "skipped_projections": ctx.skipped.iter().map(skipped_projection_json).collect::<Vec<_>>(),
+        "warnings": ctx.warnings,
+        "verification": ctx.verification,
     })
 }
 
@@ -922,36 +929,38 @@ pub(crate) fn verify_from_paths(map: &Path, sources: &[PathBuf]) -> Result<Value
         mapping_artifact_digest: Some(mapping_digest),
         covm_manifest: None,
     };
-    let (projection_artifacts, skipped_projections, _files, verifiable_projections) =
-        projection_artifacts(
-            &object_bytes,
-            MapBuildProjectionOutput::CoveT,
-            Some(&lineage),
-        )?;
-    let (index_artifacts, _index_files, verifiable_indexes) = index_artifacts(&object_bytes)?;
-    let warnings = build_warnings(MapBuildProjectionOutput::CoveT, &projection_artifacts);
-    let report = build_report(
-        &materialized,
+    let projection_result = projection_artifacts(
+        &object_bytes,
         MapBuildProjectionOutput::CoveT,
+        Some(&lineage),
+    )?;
+    let index_result = index_artifacts(&object_bytes)?;
+    let warnings = build_warnings(
+        MapBuildProjectionOutput::CoveT,
+        &projection_result.artifacts,
+    );
+    let report = build_report(BuildReportContext {
+        materialized: &materialized,
+        projection_output: MapBuildProjectionOutput::CoveT,
         evidence_encoding,
         section_compression,
-        &object_relative,
-        object_bytes.len(),
-        &evidence_summary,
-        &compression_summary,
-        None,
-        &index_artifacts,
-        &projection_artifacts,
-        &skipped_projections,
-        &warnings,
-        None,
-    );
+        object_relative: &object_relative,
+        object_bytes: object_bytes.len(),
+        evidence_summary: &evidence_summary,
+        compression_summary: &compression_summary,
+        covm: None,
+        indexes: &index_result.artifacts,
+        projections: &projection_result.artifacts,
+        skipped: &projection_result.skipped,
+        warnings: &warnings,
+        verification: None,
+    });
     Ok(verify_bundle(&VerifiableBundle {
         object_relative_path: object_relative,
         object_bytes,
         report,
-        indexes: verifiable_indexes,
-        projections: verifiable_projections,
+        indexes: index_result.verifiable,
+        projections: projection_result.verifiable,
     }))
 }
 

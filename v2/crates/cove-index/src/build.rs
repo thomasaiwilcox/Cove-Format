@@ -1105,12 +1105,9 @@ fn append_projection_column_index(
                 ProjectionColumnKeyMode::NumCode => CoviKeyEncodingKindV2::NumCode,
                 ProjectionColumnKeyMode::Canonical => CoviKeyEncodingKindV2::CanonicalValueBytes,
             },
-            comparator_kind: if supports_range {
-                CoviComparatorKindV2::NumCodeLogicalOrdering
-            } else if key_mode == ProjectionColumnKeyMode::NumCode {
-                CoviComparatorKindV2::NumCodeLogicalOrdering
-            } else {
-                CoviComparatorKindV2::CanonicalEquality
+            comparator_kind: match key_mode {
+                ProjectionColumnKeyMode::NumCode => CoviComparatorKindV2::NumCodeLogicalOrdering,
+                ProjectionColumnKeyMode::Canonical => CoviComparatorKindV2::CanonicalEquality,
             },
             supports_range,
             null_count,
@@ -2619,7 +2616,7 @@ fn hex_uuid_bytes(value: &str) -> Option<[u8; 16]> {
             continue;
         }
         let nibble = hex_nibble(byte)?;
-        if nibble_count % 2 == 0 {
+        if (nibble_count & 1) == 0 {
             high = nibble << 4;
         } else {
             bytes[nibble_count / 2] = high | nibble;

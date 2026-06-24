@@ -633,18 +633,18 @@ fn generate_claims_proof_scenario(
         .cloned()
         .unwrap_or_else(|| json!({"status": "not_run"}));
     write_json_pretty(&root.join("doctor-report.json"), &doctor)?;
-    let size_report = proof_size_report(
-        "claims",
+    let size_report = proof_size_report(ProofSizeReportInput {
+        scenario: "claims",
         profile,
-        &sources,
-        &[claims_parquet, events_parquet, providers_baseline_parquet],
-        &[denormalized_claims, denormalized_evidence],
-        &out_dir,
-        &build.manifest,
-        build.elapsed_ns,
-        &doctor,
-        &parity_reports,
-    )?;
+        sources: &sources,
+        source_parquet: &[claims_parquet, events_parquet, providers_baseline_parquet],
+        denormalized_parquet: &[denormalized_claims, denormalized_evidence],
+        bundle_dir: &out_dir,
+        manifest: &build.manifest,
+        build_time_ns: build.elapsed_ns,
+        doctor: &doctor,
+        parity_reports: &parity_reports,
+    })?;
     let manifest = json!({
         "format": "cove-proof-scenario-v1",
         "scenario": "claims",
@@ -723,22 +723,22 @@ fn generate_catalog_proof_scenario(
         .cloned()
         .unwrap_or_else(|| json!({"status": "not_run"}));
     write_json_pretty(&root.join("doctor-report.json"), &doctor)?;
-    let size_report = proof_size_report(
-        "catalog",
+    let size_report = proof_size_report(ProofSizeReportInput {
+        scenario: "catalog",
         profile,
-        &sources,
-        &[
+        sources: &sources,
+        source_parquet: &[
             products_parquet,
             prices_parquet,
             attributes_baseline_parquet,
         ],
-        &[denormalized_products, denormalized_evidence],
-        &out_dir,
-        &build.manifest,
-        build.elapsed_ns,
-        &doctor,
-        &parity_reports,
-    )?;
+        denormalized_parquet: &[denormalized_products, denormalized_evidence],
+        bundle_dir: &out_dir,
+        manifest: &build.manifest,
+        build_time_ns: build.elapsed_ns,
+        doctor: &doctor,
+        parity_reports: &parity_reports,
+    })?;
     let manifest = json!({
         "format": "cove-proof-scenario-v1",
         "scenario": "catalog",
@@ -822,18 +822,18 @@ fn write_customer360_proof_artifacts(
         .cloned()
         .unwrap_or_else(|| json!({"status": "not_run"}));
     write_json_pretty(&doctor_path, &doctor)?;
-    let size_report = proof_size_report(
-        "customer360",
+    let size_report = proof_size_report(ProofSizeReportInput {
+        scenario: "customer360",
         profile,
         sources,
-        &[crm_parquet, support_parquet, billing_parquet],
-        &[denormalized_customers, denormalized_evidence],
-        &out_dir,
-        &build.manifest,
-        build.elapsed_ns,
-        &doctor,
-        &parity_reports,
-    )?;
+        source_parquet: &[crm_parquet, support_parquet, billing_parquet],
+        denormalized_parquet: &[denormalized_customers, denormalized_evidence],
+        bundle_dir: &out_dir,
+        manifest: &build.manifest,
+        build_time_ns: build.elapsed_ns,
+        doctor: &doctor,
+        parity_reports: &parity_reports,
+    })?;
     let size_path = root.join("proof-size-comparison.json");
     write_json_pretty(&size_path, &size_report)?;
     Ok(json!({
@@ -979,45 +979,51 @@ fn aggregate_parity_status(reports: &[Value]) -> Value {
     }
 }
 
-fn proof_size_report(
-    scenario: &str,
+struct ProofSizeReportInput<'a> {
+    scenario: &'a str,
     profile: Customer360Profile,
-    sources: &[PathBuf],
-    source_parquet: &[PathBuf],
-    denormalized_parquet: &[PathBuf],
-    bundle_dir: &Path,
-    manifest: &Value,
+    sources: &'a [PathBuf],
+    source_parquet: &'a [PathBuf],
+    denormalized_parquet: &'a [PathBuf],
+    bundle_dir: &'a Path,
+    manifest: &'a Value,
     build_time_ns: u128,
-    doctor: &Value,
-    parity_reports: &[Value],
-) -> Result<Value, String> {
-    let source_bytes = paths_size(sources);
-    let source_parquet_bundle_bytes = paths_size(source_parquet);
-    let denormalized_parquet_bytes = paths_size(denormalized_parquet);
-    let cove_o_bytes = manifest
+    doctor: &'a Value,
+    parity_reports: &'a [Value],
+}
+
+fn proof_size_report(input: ProofSizeReportInput<'_>) -> Result<Value, String> {
+    let source_bytes = paths_size(input.sources);
+    let source_parquet_bundle_bytes = paths_size(input.source_parquet);
+    let denormalized_parquet_bytes = paths_size(input.denormalized_parquet);
+    let cove_o_bytes = input
+        .manifest
         .pointer("/artifacts/object/byte_size")
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    let cove_t_bytes = manifest
+    let cove_t_bytes = input
+        .manifest
         .pointer("/artifacts/projections")
         .and_then(Value::as_array)
         .map(|items| sum_artifact_bytes(items))
         .unwrap_or(0);
-    let covi_bytes = manifest
+    let covi_bytes = input
+        .manifest
         .pointer("/artifacts/indexes")
         .and_then(Value::as_array)
         .map(|items| sum_artifact_bytes(items))
         .unwrap_or(0);
-    let covm_bytes = manifest
+    let covm_bytes = input
+        .manifest
         .pointer("/artifacts/covm/byte_size")
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    let total_bundle_bytes = directory_size_local(bundle_dir)?;
+    let total_bundle_bytes = directory_size_local(input.bundle_dir)?;
     Ok(json!({
         "format": "cove-proof-suite-size-comparison-v1",
-        "scenario": scenario,
-        "profile": profile.as_str(),
-        "build_time_ns": build_time_ns,
+        "scenario": input.scenario,
+        "profile": input.profile.as_str(),
+        "build_time_ns": input.build_time_ns,
         "source_bytes": source_bytes,
         "source_parquet_bundle_bytes": source_parquet_bundle_bytes,
         "normalized_parquet_bundle_bytes": source_parquet_bundle_bytes,
@@ -1027,15 +1033,15 @@ fn proof_size_report(
         "covi_bytes": covi_bytes,
         "covm_bytes": covm_bytes,
         "total_bundle_bytes": total_bundle_bytes,
-        "object_count": manifest.pointer("/counts/object_count").cloned().unwrap_or(Value::Null),
-        "property_value_count": manifest.pointer("/counts/property_value_count").cloned().unwrap_or(Value::Null),
-        "evidence_entry_count": manifest.pointer("/counts/evidence_entry_count").cloned().unwrap_or(Value::Null),
+        "object_count": input.manifest.pointer("/counts/object_count").cloned().unwrap_or(Value::Null),
+        "property_value_count": input.manifest.pointer("/counts/property_value_count").cloned().unwrap_or(Value::Null),
+        "evidence_entry_count": input.manifest.pointer("/counts/evidence_entry_count").cloned().unwrap_or(Value::Null),
         "duplication_ratio_vs_source": ratio(total_bundle_bytes, source_bytes),
         "cove_o_vs_source_ratio": ratio(cove_o_bytes, source_bytes),
         "cove_o_vs_source_parquet_ratio": ratio(cove_o_bytes, source_parquet_bundle_bytes),
         "bundle_vs_denormalized_parquet_ratio": ratio(total_bundle_bytes, denormalized_parquet_bytes),
-        "doctor_status_ok": doctor.get("status").and_then(Value::as_str) == Some("ok"),
-        "parity_status_ok": aggregate_parity_status(parity_reports) == json!("ok"),
+        "doctor_status_ok": input.doctor.get("status").and_then(Value::as_str) == Some("ok"),
+        "parity_status_ok": aggregate_parity_status(input.parity_reports) == json!("ok"),
     }))
 }
 
@@ -1151,10 +1157,10 @@ fn write_claims_csv(path: &Path, rows: usize) -> Result<(), String> {
     let mut csv = String::from("claim_id,policy_id,person_id,status,amount\n");
     for i in 0..rows {
         csv.push_str(&format!(
-            "{},{},{},{},{}\n",
+            "{},pol{:06},per{:06},{},{}\n",
             claim_id(i),
-            format!("pol{:06}", i % (rows / 3).max(1)),
-            format!("per{:06}", i % (rows / 2).max(1)),
+            i % (rows / 3).max(1),
+            i % (rows / 2).max(1),
             ["open", "review", "approved", "closed"][i % 4],
             500 + ((i * 91) % 50_000)
         ));
@@ -1392,19 +1398,19 @@ fn sku(index: usize) -> String {
 }
 
 fn claims_covemap() -> CovemapFile {
-    proof_covemap(
-        0xD1,
-        "claims",
-        "claims/v1",
-        "Claim",
-        "claim_by_id",
-        "claim_id",
-        vec![
+    proof_covemap(ProofCovemapSpec {
+        file_id_byte: 0xD1,
+        mapping_id: "claims",
+        mapping_version: "claims/v1",
+        object_type: "Claim",
+        identity_rule_id: "claim_by_id",
+        join_column: "claim_id",
+        sources: vec![
             source_decl("claims", "claim_by_id", 10),
             source_decl("claim_events", "claim_by_id", 20),
             source_decl("providers", "claim_by_id", 30),
         ],
-        vec![
+        rules: vec![
             row_rule_for(
                 "claim_by_id",
                 "claim_summary_row",
@@ -1440,9 +1446,9 @@ fn claims_covemap() -> CovemapFile {
                 ],
             ),
         ],
-        "claims.v1",
-        "claims",
-        vec![
+        projection_id: "claims.v1",
+        output_table: "claims",
+        projection_columns: vec![
             projection_column("goid", "object.goid", "uuid"),
             projection_column("claim_id", "claim_id", "utf8"),
             projection_column("policy_id", "policy_id", "utf8"),
@@ -1455,25 +1461,25 @@ fn claims_covemap() -> CovemapFile {
             projection_column("provider_id", "provider_id", "utf8"),
             projection_column("provider_region", "provider_region", "utf8"),
         ],
-        "claim_evidence.v1",
-        "claim_evidence",
-    )
+        evidence_projection_id: "claim_evidence.v1",
+        evidence_output_table: "claim_evidence",
+    })
 }
 
 fn catalog_covemap() -> CovemapFile {
-    proof_covemap(
-        0xD2,
-        "catalog",
-        "catalog/v1",
-        "Product",
-        "product_by_sku",
-        "sku",
-        vec![
+    proof_covemap(ProofCovemapSpec {
+        file_id_byte: 0xD2,
+        mapping_id: "catalog",
+        mapping_version: "catalog/v1",
+        object_type: "Product",
+        identity_rule_id: "product_by_sku",
+        join_column: "sku",
+        sources: vec![
             source_decl("products", "product_by_sku", 10),
             source_decl("vendor_prices", "product_by_sku", 20),
             source_decl("attributes", "product_by_sku", 30),
         ],
-        vec![
+        rules: vec![
             row_rule_for(
                 "product_by_sku",
                 "product_row",
@@ -1509,9 +1515,9 @@ fn catalog_covemap() -> CovemapFile {
                 ],
             ),
         ],
-        "products.v1",
-        "products",
-        vec![
+        projection_id: "products.v1",
+        output_table: "products",
+        projection_columns: vec![
             projection_column("goid", "object.goid", "uuid"),
             projection_column("sku", "sku", "utf8"),
             projection_column("title", "title", "utf8"),
@@ -1525,26 +1531,43 @@ fn catalog_covemap() -> CovemapFile {
             projection_column("size", "size", "utf8"),
             projection_column("rating", "rating", "int64"),
         ],
-        "product_evidence.v1",
-        "product_evidence",
-    )
+        evidence_projection_id: "product_evidence.v1",
+        evidence_output_table: "product_evidence",
+    })
 }
 
-fn proof_covemap(
+struct ProofCovemapSpec<'a> {
     file_id_byte: u8,
-    mapping_id: &str,
-    mapping_version: &str,
-    object_type: &str,
-    identity_rule_id: &str,
-    join_column: &str,
+    mapping_id: &'a str,
+    mapping_version: &'a str,
+    object_type: &'a str,
+    identity_rule_id: &'a str,
+    join_column: &'a str,
     sources: Vec<Value>,
     rules: Vec<Value>,
-    projection_id: &str,
-    output_table: &str,
+    projection_id: &'a str,
+    output_table: &'a str,
     projection_columns: Vec<Value>,
-    evidence_projection_id: &str,
-    evidence_output_table: &str,
-) -> CovemapFile {
+    evidence_projection_id: &'a str,
+    evidence_output_table: &'a str,
+}
+
+fn proof_covemap(spec: ProofCovemapSpec<'_>) -> CovemapFile {
+    let ProofCovemapSpec {
+        file_id_byte,
+        mapping_id,
+        mapping_version,
+        object_type,
+        identity_rule_id,
+        join_column,
+        sources,
+        rules,
+        projection_id,
+        output_table,
+        projection_columns,
+        evidence_projection_id,
+        evidence_output_table,
+    } = spec;
     CovemapFile {
         header: CovemapHeaderV1::new([file_id_byte; 16], 0),
         mapping_version: mapping_version.into(),

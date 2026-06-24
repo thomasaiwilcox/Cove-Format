@@ -87,8 +87,7 @@ pub(crate) fn build_cove_o_from_materialized_with_options(
         flags: 0,
         types: materialized.object_types.clone(),
     };
-    let segments =
-        build_temporal_segments(&materialized, &nested_shapes, file_dictionary.as_ref())?;
+    let segments = build_temporal_segments(materialized, &nested_shapes, file_dictionary.as_ref())?;
     let segment_index = temporal_segment_index(&segments)?;
     let trust_manifest = trust_manifest(&segments, file_dictionary.as_ref())?;
 

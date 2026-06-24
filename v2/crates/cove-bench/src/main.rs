@@ -1472,14 +1472,14 @@ fn run_cove_map_build_case(
     let result = build_from_paths(&map_path, std::slice::from_ref(&source_path), options)
         .map_err(|err| format!("{id} failed: {err}"))?;
     let elapsed = start.elapsed().as_nanos();
-    Ok(cove_map_build_case_report(
+    cove_map_build_case_report(
         id,
         "COVE-MAP build bundle",
         elapsed,
         &[source_path],
         &out_dir,
         &result.manifest,
-    )?)
+    )
 }
 
 fn run_cove_map_build_messy_case(root: &Path) -> Result<Value, String> {
@@ -1512,14 +1512,14 @@ fn run_cove_map_build_messy_case(root: &Path) -> Result<Value, String> {
     let result = build_from_paths(&map_path, &sources, options)
         .map_err(|err| format!("cove_map_build_messy_multisource failed: {err}"))?;
     let elapsed = start.elapsed().as_nanos();
-    Ok(cove_map_build_case_report(
+    cove_map_build_case_report(
         "cove_map_build_messy_multisource",
         "COVE-MAP messy multi-source build bundle",
         elapsed,
         &sources,
         &out_dir,
         &result.manifest,
-    )?)
+    )
 }
 
 fn cove_map_build_case_report(
@@ -3140,17 +3140,17 @@ fn run_projection_covi_measured_cases(corpus: &Path) -> Result<Vec<Value>, Strin
                 outcome.rows
             ));
         }
-        cases.push(projection_covi_case_report(
+        cases.push(projection_covi_case_report(ProjectionCoviCaseReportInput {
             id,
             category,
             sql,
-            &outcome,
+            outcome: &outcome,
             source_bytes,
             cove_o_bytes,
             projection_sidecar_bytes,
             total_bundle_bytes,
             duplication_ratio,
-        ));
+        }));
     }
     Ok(cases)
 }
@@ -3239,17 +3239,17 @@ fn run_customer360_projection_covi_cases(corpus: &Path) -> Result<Vec<Value>, St
                 outcome.rows
             ));
         }
-        cases.push(projection_covi_case_report(
+        cases.push(projection_covi_case_report(ProjectionCoviCaseReportInput {
             id,
             category,
             sql,
-            &outcome,
+            outcome: &outcome,
             source_bytes,
             cove_o_bytes,
             projection_sidecar_bytes,
             total_bundle_bytes,
             duplication_ratio,
-        ));
+        }));
     }
     Ok(cases)
 }
@@ -3281,9 +3281,9 @@ fn customer360_score(index: usize) -> i64 {
 }
 
 fn customer360_status(index: usize) -> &'static str {
-    if index % 13 == 0 {
+    if index.is_multiple_of(13) {
         "dormant"
-    } else if index % 5 == 0 {
+    } else if index.is_multiple_of(5) {
         "watch"
     } else {
         "active"
@@ -3394,17 +3394,20 @@ fn execution_plan_metric_sum(plan: &Arc<dyn ExecutionPlan>, metric_name: &str) -
         .sum::<usize>()
 }
 
-fn projection_covi_case_report(
-    id: &str,
-    category: &str,
-    sql: &str,
-    outcome: &ProjectionCoviQueryOutcome,
+struct ProjectionCoviCaseReportInput<'a> {
+    id: &'a str,
+    category: &'a str,
+    sql: &'a str,
+    outcome: &'a ProjectionCoviQueryOutcome,
     source_bytes: u64,
     cove_o_bytes: u64,
     projection_sidecar_bytes: u64,
     total_bundle_bytes: u64,
     duplication_ratio: f64,
-) -> Value {
+}
+
+fn projection_covi_case_report(input: ProjectionCoviCaseReportInput<'_>) -> Value {
+    let outcome = input.outcome;
     let metric = |name: &str| -> u64 { *outcome.metrics.get(name).unwrap_or(&0) as u64 };
     let fallback_no_sidecar = metric("cove_projection_covi_fallback_no_sidecar");
     let fallback_no_eligible = metric("cove_projection_covi_fallback_no_eligible_filter");
@@ -3439,21 +3442,21 @@ fn projection_covi_case_report(
     let planning_ns = outcome.planning_ns;
     let scan_ns = outcome.scan_ns;
     json!({
-        "id": id,
-        "category": category,
+        "id": input.id,
+        "category": input.category,
         "status": "measured",
-        "query": sql,
+        "query": input.sql,
         "metrics": {
             "planning_ns": planning_ns,
             "scan_ns": scan_ns,
             "end_to_end_ns": planning_ns + scan_ns,
             "rows_materialized": outcome.rows,
             "result_rows": outcome.rows,
-            "source_bytes": source_bytes,
-            "cove_o_bytes": cove_o_bytes,
-            "projection_sidecar_bytes": projection_sidecar_bytes,
-            "total_bundle_bytes": total_bundle_bytes,
-            "duplication_ratio": duplication_ratio,
+            "source_bytes": input.source_bytes,
+            "cove_o_bytes": input.cove_o_bytes,
+            "projection_sidecar_bytes": input.projection_sidecar_bytes,
+            "total_bundle_bytes": input.total_bundle_bytes,
+            "duplication_ratio": input.duplication_ratio,
             "sidecar_found": metric("cove_projection_covi_sidecars_found"),
             "sidecar_loaded": metric("cove_covi_sidecars_loaded"),
             "sidecar_stale": metric("cove_covi_sidecars_stale"),
@@ -3477,7 +3480,7 @@ fn projection_covi_case_report(
         "cost": {
             "observed": {
                 "metadata_bytes_read": validation_bytes,
-                "data_bytes_read": cove_o_bytes,
+                "data_bytes_read": input.cove_o_bytes,
                 "range_requests": if metric("cove_projection_covi_sidecars_found") > 0 { 2 } else { 1 },
                 "scan_tasks": 1,
                 "pages_decoded": outcome.rows,
