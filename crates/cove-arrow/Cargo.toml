@@ -16,7 +16,7 @@ digest-blake3 = ["cove-core/digest-blake3"]
 cove-core = { path = "../cove-core" }
 arrow-array = "58"
 arrow-buffer = "58"
-arrow-data = "58"
+arrow-data = "59"
 arrow-schema = "58"
 bytes = "1"
 parquet = { version = "58", default-features = false, features = ["arrow"] }
