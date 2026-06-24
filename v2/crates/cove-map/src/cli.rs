@@ -44,6 +44,48 @@ pub(crate) enum Command {
         format: ProjectionFormat,
         projection_id: Option<String>,
     },
+    Build {
+        map: PathBuf,
+        sources: Vec<PathBuf>,
+        out_dir: PathBuf,
+        force: bool,
+        json: bool,
+        object_name: Option<String>,
+        projection_output: MapBuildProjectionOutput,
+        evidence_encoding: MapEvidenceEncoding,
+        section_compression: MapBuildSectionCompression,
+        verify: bool,
+        publish_covm: bool,
+    },
+    Publish {
+        bundle_dir: PathBuf,
+        output: PathBuf,
+        force: bool,
+        json: bool,
+    },
+    Doctor {
+        bundle_dir: Option<PathBuf>,
+        map: Option<PathBuf>,
+        sources: Vec<PathBuf>,
+        json: bool,
+        strict: bool,
+    },
+    Suggest {
+        sources: Vec<PathBuf>,
+        output: Option<PathBuf>,
+        json: bool,
+    },
+    Parity {
+        map: PathBuf,
+        sources: Vec<PathBuf>,
+        options: ParityOptions,
+        json: bool,
+    },
+    ParityCoveO {
+        object: PathBuf,
+        options: ParityOptions,
+        json: bool,
+    },
     Test {
         fixture: PathBuf,
     },
@@ -151,6 +193,123 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<(), String> {
             )?;
             write_projection_output(output, format, &projected)?;
         }
+        Command::Build {
+            map,
+            sources,
+            out_dir,
+            force,
+            json,
+            object_name,
+            projection_output,
+            evidence_encoding,
+            section_compression,
+            verify,
+            publish_covm,
+        } => {
+            let result = build_from_paths(
+                &map,
+                &sources,
+                MapBuildOptions {
+                    out_dir,
+                    force,
+                    object_name,
+                    projection_output,
+                    evidence_encoding,
+                    section_compression,
+                    verify,
+                    publish_covm,
+                    reuse_cache: true,
+                },
+            )?;
+            if json {
+                print_json(&result.manifest);
+            } else {
+                print_build_summary(&result.manifest);
+            }
+        }
+        Command::Publish {
+            bundle_dir,
+            output,
+            force,
+            json,
+        } => {
+            let report = publish_covm_from_bundle(&bundle_dir, &output, force)?;
+            if json {
+                print_json(&report);
+            } else {
+                println!("COVE-MAP publish: wrote {}", output.display());
+            }
+        }
+        Command::Doctor {
+            bundle_dir,
+            map,
+            sources,
+            json,
+            strict,
+        } => {
+            let report = match (bundle_dir, map) {
+                (Some(bundle_dir), None) => verify_bundle_dir(&bundle_dir)?,
+                (None, Some(map)) => verify_from_paths(&map, &sources)?,
+                (Some(_), Some(_)) => {
+                    return Err(
+                        "doctor accepts either --bundle-dir or <mapping.covemap> <source...>"
+                            .into(),
+                    )
+                }
+                (None, None) => {
+                    return Err(
+                        "doctor requires --bundle-dir or <mapping.covemap> <source...>".into(),
+                    )
+                }
+            };
+            if json {
+                print_json(&report);
+            } else {
+                print_doctor_summary(&report);
+            }
+            if report_has_failures(&report, strict) {
+                return Err("map doctor found validation failures".into());
+            }
+        }
+        Command::Suggest {
+            sources,
+            output,
+            json: _,
+        } => {
+            let suggestions = suggest_from_paths(&sources)?;
+            write_or_print(output, &suggestions)?;
+        }
+        Command::Parity {
+            map,
+            sources,
+            options,
+            json,
+        } => {
+            let report = parity_from_paths(&map, &sources, &options)?;
+            if json {
+                print_json(&report);
+            } else {
+                print_parity_summary(&report);
+            }
+            if parity_has_failures(&report) {
+                return Err("map parity found differences".into());
+            }
+        }
+        Command::ParityCoveO {
+            object,
+            options,
+            json,
+        } => {
+            let report = parity_from_cove_o_path(&object, &options)?;
+            if json {
+                print_json(&report);
+            } else {
+                print_parity_summary(&report);
+            }
+            if parity_has_failures(&report) {
+                return Err("map parity found differences".into());
+            }
+        }
         Command::Test { fixture } => run_fixture_path(&fixture)?,
     }
     Ok(())
@@ -229,6 +388,105 @@ pub(crate) fn parse_args(
                 projection_id,
             }
         }
+        "build" => {
+            let (
+                out_dir,
+                force,
+                json,
+                object_name,
+                projection_output,
+                evidence_encoding,
+                section_compression,
+                verify,
+                publish_covm,
+                positional,
+            ) = parse_build_args(args)?;
+            let mut positional = positional.into_iter();
+            let map = positional
+                .next()
+                .ok_or_else(|| "build requires <mapping.covemap>".to_string())?;
+            let sources = positional.collect::<Vec<_>>();
+            if sources.is_empty() {
+                return Err("build requires at least one source path".into());
+            }
+            Command::Build {
+                map,
+                sources,
+                out_dir,
+                force,
+                json,
+                object_name,
+                projection_output,
+                evidence_encoding,
+                section_compression,
+                verify,
+                publish_covm,
+            }
+        }
+        "publish" => {
+            let (bundle_dir, output, force, json) = parse_publish_args(args)?;
+            Command::Publish {
+                bundle_dir,
+                output,
+                force,
+                json,
+            }
+        }
+        "doctor" => {
+            let (bundle_dir, json, strict, positional) = parse_doctor_args(args)?;
+            let mut positional = positional.into_iter();
+            let map = positional.next();
+            let sources = positional.collect::<Vec<_>>();
+            if bundle_dir.is_none() && map.is_some() && sources.is_empty() {
+                return Err("doctor with a mapping requires at least one source path".into());
+            }
+            Command::Doctor {
+                bundle_dir,
+                map,
+                sources,
+                json,
+                strict,
+            }
+        }
+        "suggest" => {
+            let (json, output, sources) = parse_suggest_args(args)?;
+            if sources.is_empty() {
+                return Err("suggest requires at least one source path".into());
+            }
+            Command::Suggest {
+                sources,
+                output,
+                json,
+            }
+        }
+        "parity" => {
+            let (json, options, positional) = parse_parity_args(args)?;
+            let mut positional = positional.into_iter();
+            let map = positional
+                .next()
+                .ok_or_else(|| "parity requires <mapping.covemap>".to_string())?;
+            let sources = positional.collect::<Vec<_>>();
+            if sources.is_empty() {
+                return Err("parity requires at least one source path".into());
+            }
+            Command::Parity {
+                map,
+                sources,
+                options,
+                json,
+            }
+        }
+        "parity-cove-o" => {
+            let (json, options, positional) = parse_parity_args(args)?;
+            if positional.len() != 1 {
+                return Err("parity-cove-o requires exactly one <object.cove>".into());
+            }
+            Command::ParityCoveO {
+                object: positional[0].clone(),
+                options,
+                json,
+            }
+        }
         "test" => Command::Test {
             fixture: one_path(&mut args, "test <fixture.json>")?,
         },
@@ -276,6 +534,261 @@ fn parse_output_format_and_positionals(
         }
     }
     Ok((output, format, positional))
+}
+
+#[allow(clippy::type_complexity)]
+fn parse_build_args(
+    args: impl Iterator<Item = String>,
+) -> Result<
+    (
+        PathBuf,
+        bool,
+        bool,
+        Option<String>,
+        MapBuildProjectionOutput,
+        MapEvidenceEncoding,
+        MapBuildSectionCompression,
+        bool,
+        bool,
+        Vec<PathBuf>,
+    ),
+    String,
+> {
+    let mut out_dir = None;
+    let mut force = false;
+    let mut json = false;
+    let mut object_name = None;
+    let mut projection_output = MapBuildProjectionOutput::CoveT;
+    let mut evidence_encoding = MapEvidenceEncoding::Compact;
+    let mut section_compression = MapBuildSectionCompression::Zstd;
+    let mut verify = false;
+    let mut publish_covm = false;
+    let mut positional = Vec::new();
+    let mut args = args.peekable();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--out-dir" => {
+                out_dir = Some(
+                    args.next()
+                        .map(PathBuf::from)
+                        .ok_or_else(|| "--out-dir requires a path".to_string())?,
+                );
+            }
+            "--force" => force = true,
+            "--json" => json = true,
+            "--verify" => verify = true,
+            "--publish-covm" => publish_covm = true,
+            "--object-name" => {
+                object_name = Some(
+                    args.next()
+                        .ok_or_else(|| "--object-name requires a file name".to_string())?,
+                );
+            }
+            "--projection-output" => {
+                let raw = args
+                    .next()
+                    .ok_or_else(|| "--projection-output requires cove-t or none".to_string())?;
+                projection_output = match raw.as_str() {
+                    "cove-t" => MapBuildProjectionOutput::CoveT,
+                    "none" => MapBuildProjectionOutput::None,
+                    _ => return Err("--projection-output must be cove-t or none".into()),
+                };
+            }
+            "--evidence-encoding" => {
+                let raw = args.next().ok_or_else(|| {
+                    "--evidence-encoding requires compact, expanded, or both".to_string()
+                })?;
+                evidence_encoding = match raw.as_str() {
+                    "compact" => MapEvidenceEncoding::Compact,
+                    "expanded" => MapEvidenceEncoding::Expanded,
+                    "both" => MapEvidenceEncoding::Both,
+                    _ => {
+                        return Err("--evidence-encoding must be compact, expanded, or both".into())
+                    }
+                };
+            }
+            "--section-compression" => {
+                let raw = args
+                    .next()
+                    .ok_or_else(|| "--section-compression requires zstd or none".to_string())?;
+                section_compression = match raw.as_str() {
+                    "zstd" => MapBuildSectionCompression::Zstd,
+                    "none" => MapBuildSectionCompression::None,
+                    _ => return Err("--section-compression must be zstd or none".into()),
+                };
+            }
+            _ if arg.starts_with('-') => return Err(format!("unknown option {arg}")),
+            _ => positional.push(PathBuf::from(arg)),
+        }
+    }
+    let out_dir = out_dir.ok_or_else(|| "build requires --out-dir <dir>".to_string())?;
+    Ok((
+        out_dir,
+        force,
+        json,
+        object_name,
+        projection_output,
+        evidence_encoding,
+        section_compression,
+        verify,
+        publish_covm,
+        positional,
+    ))
+}
+
+fn parse_publish_args(
+    args: impl Iterator<Item = String>,
+) -> Result<(PathBuf, PathBuf, bool, bool), String> {
+    let mut bundle_dir = None;
+    let mut output = None;
+    let mut force = false;
+    let mut json = false;
+    let mut args = args.peekable();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--bundle-dir" => {
+                bundle_dir = Some(
+                    args.next()
+                        .map(PathBuf::from)
+                        .ok_or_else(|| "--bundle-dir requires a path".to_string())?,
+                );
+            }
+            "--out" | "-o" => {
+                output = Some(
+                    args.next()
+                        .map(PathBuf::from)
+                        .ok_or_else(|| format!("{arg} requires a path"))?,
+                );
+            }
+            "--force" => force = true,
+            "--json" => json = true,
+            _ if arg.starts_with("--bundle-dir=") => {
+                bundle_dir = Some(PathBuf::from(arg.trim_start_matches("--bundle-dir=")));
+            }
+            _ if arg.starts_with("--out=") => {
+                output = Some(PathBuf::from(arg.trim_start_matches("--out=")));
+            }
+            _ if arg.starts_with('-') => return Err(format!("unknown option {arg}")),
+            _ => return Err("publish accepts --bundle-dir <dir> --out <dataset.covm>".into()),
+        }
+    }
+    let bundle_dir = bundle_dir.ok_or_else(|| "publish requires --bundle-dir <dir>".to_string())?;
+    let output = output.ok_or_else(|| "publish requires --out <dataset.covm>".to_string())?;
+    Ok((bundle_dir, output, force, json))
+}
+
+#[allow(clippy::type_complexity)]
+fn parse_doctor_args(
+    args: impl Iterator<Item = String>,
+) -> Result<(Option<PathBuf>, bool, bool, Vec<PathBuf>), String> {
+    let mut bundle_dir = None;
+    let mut json = false;
+    let mut strict = false;
+    let mut positional = Vec::new();
+    let mut args = args.peekable();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--bundle-dir" => {
+                bundle_dir = Some(
+                    args.next()
+                        .map(PathBuf::from)
+                        .ok_or_else(|| "--bundle-dir requires a path".to_string())?,
+                );
+            }
+            "--json" => json = true,
+            "--strict" => strict = true,
+            _ if arg.starts_with('-') => return Err(format!("unknown option {arg}")),
+            _ => positional.push(PathBuf::from(arg)),
+        }
+    }
+    if bundle_dir.is_some() && !positional.is_empty() {
+        return Err("doctor accepts either --bundle-dir or positional mapping inputs".into());
+    }
+    Ok((bundle_dir, json, strict, positional))
+}
+
+fn parse_suggest_args(
+    args: impl Iterator<Item = String>,
+) -> Result<(bool, Option<PathBuf>, Vec<PathBuf>), String> {
+    let mut json = false;
+    let mut output = None;
+    let mut sources = Vec::new();
+    let mut args = args.peekable();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--json" => json = true,
+            "--out" | "-o" => {
+                output = Some(
+                    args.next()
+                        .map(PathBuf::from)
+                        .ok_or_else(|| format!("{arg} requires a path"))?,
+                );
+            }
+            _ if arg.starts_with('-') => return Err(format!("unknown option {arg}")),
+            _ => sources.push(PathBuf::from(arg)),
+        }
+    }
+    Ok((json, output, sources))
+}
+
+#[allow(clippy::type_complexity)]
+fn parse_parity_args(
+    args: impl Iterator<Item = String>,
+) -> Result<(bool, ParityOptions, Vec<PathBuf>), String> {
+    let mut json = false;
+    let mut projection_id = None;
+    let mut expected = None;
+    let mut expected_query = None;
+    let mut key = Vec::new();
+    let mut positional = Vec::new();
+    let mut args = args.peekable();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--json" => json = true,
+            "--projection-id" => {
+                projection_id = Some(
+                    args.next()
+                        .ok_or_else(|| "--projection-id requires an id".to_string())?,
+                );
+            }
+            "--expected" => {
+                expected = Some(
+                    args.next()
+                        .map(PathBuf::from)
+                        .ok_or_else(|| "--expected requires a path".to_string())?,
+                );
+            }
+            "--expected-query" => {
+                expected_query =
+                    Some(args.next().ok_or_else(|| {
+                        "--expected-query requires a CoveQL expression".to_string()
+                    })?);
+            }
+            "--key" => {
+                key = args
+                    .next()
+                    .ok_or_else(|| "--key requires comma-separated columns".to_string())?
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|column| !column.is_empty())
+                    .map(str::to_string)
+                    .collect();
+            }
+            _ if arg.starts_with('-') => return Err(format!("unknown option {arg}")),
+            _ => positional.push(PathBuf::from(arg)),
+        }
+    }
+    Ok((
+        json,
+        ParityOptions {
+            projection_id: projection_id
+                .ok_or_else(|| "parity requires --projection-id <id>".to_string())?,
+            expected: expected.ok_or_else(|| "parity requires --expected <table>".to_string())?,
+            expected_query,
+            key,
+        },
+        positional,
+    ))
 }
 
 #[allow(clippy::type_complexity)]
@@ -412,5 +925,133 @@ fn write_projection_output(
             "project --format {} requires --output <path>",
             format.as_str()
         )),
+    }
+}
+
+fn print_build_summary(manifest: &serde_json::Value) {
+    println!("COVE-MAP build complete");
+    if let Some(object) = manifest
+        .pointer("/artifacts/object/path")
+        .and_then(serde_json::Value::as_str)
+    {
+        println!("  object: {object}");
+    }
+    if let Some(projections) = manifest
+        .pointer("/artifacts/projections")
+        .and_then(serde_json::Value::as_array)
+    {
+        println!("  projections: {}", projections.len());
+        for projection in projections {
+            if let (Some(id), Some(path)) = (
+                projection
+                    .get("projection_id")
+                    .and_then(serde_json::Value::as_str),
+                projection.get("path").and_then(serde_json::Value::as_str),
+            ) {
+                println!("    {id}: {path}");
+            }
+        }
+    }
+    if let Some(indexes) = manifest
+        .pointer("/artifacts/indexes")
+        .and_then(serde_json::Value::as_array)
+    {
+        println!("  indexes: {}", indexes.len());
+        for index in indexes {
+            if let (Some(id), Some(path)) = (
+                index.get("index_id").and_then(serde_json::Value::as_str),
+                index.get("path").and_then(serde_json::Value::as_str),
+            ) {
+                println!("    {id}: {path}");
+            }
+        }
+    }
+    if let Some(report) = manifest
+        .pointer("/artifacts/report/path")
+        .and_then(serde_json::Value::as_str)
+    {
+        println!("  report: {report}");
+    }
+    if let Some(path) = manifest
+        .pointer("/artifacts/manifest/path")
+        .and_then(serde_json::Value::as_str)
+    {
+        println!("  manifest: {path}");
+    }
+}
+
+fn print_doctor_summary(report: &serde_json::Value) {
+    println!(
+        "COVE-MAP doctor: {}",
+        report
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+    );
+    if let Some(checks) = report.get("checks").and_then(serde_json::Value::as_array) {
+        println!("  checks: {}", checks.len());
+        for check in checks {
+            let name = check
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("check");
+            let ok = check
+                .get("ok")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            println!("    {name}: {}", if ok { "ok" } else { "failed" });
+        }
+    }
+    if let Some(warnings) = report.get("warnings").and_then(serde_json::Value::as_array) {
+        println!("  warnings: {}", warnings.len());
+        for warning in warnings {
+            if let Some(code) = warning.get("code").and_then(serde_json::Value::as_str) {
+                println!("    {code}");
+            }
+        }
+    }
+    if let Some(errors) = report.get("errors").and_then(serde_json::Value::as_array) {
+        println!("  errors: {}", errors.len());
+        for error in errors {
+            if let Some(code) = error.get("code").and_then(serde_json::Value::as_str) {
+                println!("    {code}");
+            }
+        }
+    }
+}
+
+fn print_parity_summary(report: &serde_json::Value) {
+    println!(
+        "COVE-MAP parity: {}",
+        report
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+    );
+    if let Some(diff) = report.get("diff") {
+        println!(
+            "  missing: {}",
+            diff.get("missing_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+        );
+        println!(
+            "  extra: {}",
+            diff.get("extra_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+        );
+        println!(
+            "  changed: {}",
+            diff.get("changed_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+        );
+        println!(
+            "  duplicate keys: {}",
+            diff.get("duplicate_key_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+        );
     }
 }

@@ -3218,6 +3218,10 @@ fn covi_lookup_target_json(target: &CoviLookupTargetV2) -> Value {
             table_id,
             column_id,
         } => json!({ "kind": "table_column", "table_id": table_id, "column_id": column_id }),
+        CoviLookupTargetV2::ProjectionColumn {
+            table_id,
+            column_id,
+        } => json!({ "kind": "projection_column", "table_id": table_id, "column_id": column_id }),
         CoviLookupTargetV2::ObjectProperty {
             object_type_id,
             property_id,

@@ -1,7 +1,14 @@
-use std::{borrow::Cow, cmp::Ordering, collections::BTreeMap};
+use std::{
+    borrow::Cow,
+    cmp::Ordering,
+    collections::{BTreeMap, BTreeSet},
+};
 
 use crate::{
-    execution::{compare_key_bytes_for_order, CoviAggregateKindV2, CoviLookupComparatorContextV2},
+    execution::{
+        compare_key_bytes_for_order, CoviAggregateKindV2, CoviLookupComparatorContextV2,
+        CoviLookupKeyV2,
+    },
     CoviAggregateAnswerBlockHeaderV2, CoviAggregateAnswerBlockV2, CoviAggregateAnswerV2,
     CoviArtifactV2, CoviComparatorKindV2, CoviEntryBlockHeaderV2, CoviEntryBlockV2,
     CoviIndexEntryV2, CoviIndexKindV2, CoviIndexRootV2, CoviIndexedTargetKindV2,
@@ -26,6 +33,11 @@ use cove_core::{
     page::{page_uses_payload_elision, ColumnPageIndex},
     page_payload::{ColumnPagePayloadV1, PageBufferKind},
     postscript::CovePostscriptV1,
+    profile::cove_o::{
+        read_object_surface_from_bytes_with_options, CoveObjectReadOptions, CoveObjectRecord,
+        CoveObjectRedactionReadPolicy, ObjectTypeEntryV1, PropertyEntryV1,
+    },
+    reader::{validate_bytes_with_options, ValidationOptions},
     segment::TableSegmentPayloadV1,
     table::{ColumnEntry, TableEntry},
     types,
@@ -33,6 +45,7 @@ use cove_core::{
     wire, CoveError, StatsOnlyPageMaterializationContext,
 };
 use cove_coverage::{CoverageExactnessV2, CoverageGranularityV2, CoverageProofStrengthV2};
+use serde_json::Value;
 
 #[derive(Debug, Clone, Default)]
 pub struct CoviBuildOptions {
@@ -51,6 +64,7 @@ pub struct CoviBuildOptions {
 pub enum CoviBuildTarget {
     #[default]
     TableColumn,
+    ProjectionColumn,
     ObjectProperty {
         object_type_id: u32,
         property_id: u32,
@@ -65,6 +79,57 @@ pub enum CoviBuildTarget {
     DimensionalTuple {
         semantic_dimension_ref: u32,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoviObjectPropertyBuildOptions {
+    pub include_index_only_counts: bool,
+    pub include_index_only_min_max: bool,
+    pub include_index_only_distinct_count: bool,
+    pub include_index_only_exists: bool,
+    pub include_index_only_sum_avg: bool,
+    pub include_object_paths: bool,
+    pub include_association_endpoints: bool,
+    pub include_evidence_lookup: bool,
+    pub include_projection_fragments: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct CoviProjectionColumnInput {
+    pub table_id: u32,
+    pub column_id: u32,
+    pub logical_type: CoveLogicalType,
+    pub physical_kind: CovePhysicalKind,
+    pub values: Vec<Value>,
+}
+
+impl Default for CoviObjectPropertyBuildOptions {
+    fn default() -> Self {
+        Self {
+            include_index_only_counts: true,
+            include_index_only_min_max: true,
+            include_index_only_distinct_count: true,
+            include_index_only_exists: true,
+            include_index_only_sum_avg: true,
+            include_object_paths: true,
+            include_association_endpoints: true,
+            include_evidence_lookup: true,
+            include_projection_fragments: true,
+        }
+    }
+}
+
+impl CoviObjectPropertyBuildOptions {
+    fn as_table_options(&self) -> CoviBuildOptions {
+        CoviBuildOptions {
+            include_index_only_counts: self.include_index_only_counts,
+            include_index_only_min_max: self.include_index_only_min_max,
+            include_index_only_distinct_count: self.include_index_only_distinct_count,
+            include_index_only_exists: self.include_index_only_exists,
+            include_index_only_sum_avg: self.include_index_only_sum_avg,
+            ..CoviBuildOptions::default()
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -380,6 +445,843 @@ pub fn build_covi_from_cove_bytes(
     Ok(bytes)
 }
 
+pub fn build_covi_from_cove_o_bytes(
+    input: &[u8],
+    options: &CoviObjectPropertyBuildOptions,
+) -> Result<Vec<u8>, CoveError> {
+    let postscript = CovePostscriptV1::parse_from_tail(input)?;
+    let validation = validate_bytes_with_options(
+        input,
+        ValidationOptions {
+            semantic: true,
+            verify_digests: false,
+            allow_unknown_optional_extensions: true,
+            ..ValidationOptions::default()
+        },
+    )?;
+    let surface = read_object_surface_from_bytes_with_options(
+        input,
+        &CoveObjectReadOptions {
+            include_association_object_types: true,
+            include_records: true,
+            redaction_read_policy: CoveObjectRedactionReadPolicy::PreserveMarker,
+            ..CoveObjectReadOptions::default()
+        },
+    )?;
+
+    let dataset_id = validation.validated.header.file_id;
+    let snapshot_id = derived_snapshot_id(input, postscript.footer.crc32c);
+    let file_digest = compute_digest(DigestAlgorithm::Sha256, input)?;
+    let referenced_file = CoviReferencedFileV2 {
+        file_ref: 0,
+        flags: 0,
+        file_id: validation.validated.header.file_id,
+        file_len: input.len() as u64,
+        footer_crc32c: postscript.footer.crc32c,
+        digest_algorithm: DigestAlgorithm::Sha256 as u16,
+        digest_len: file_digest
+            .len()
+            .try_into()
+            .map_err(|_| CoveError::ArithOverflow)?,
+        digest_offset: 0,
+        uri_ref: u32::MAX,
+        schema_fingerprint_ref: u32::MAX,
+        checksum: 0,
+    };
+    let snapshot_validity = CoviSnapshotValidityV2 {
+        snapshot_validity_ref: 0,
+        dataset_id,
+        snapshot_id,
+        schema_fingerprint_ref: u32::MAX,
+        semantic_map_fingerprint_ref: u32::MAX,
+        external_visibility_ref: u32::MAX,
+        data_checksum_root_ref: u32::MAX,
+        valid_from_us: validation.validated.header.created_at_us,
+        valid_until_us: i64::MAX,
+        flags: 0,
+        checksum: 0,
+    };
+
+    let table_options = options.as_table_options();
+    let mut roots = Vec::new();
+    let mut capabilities = Vec::new();
+    let mut index_only_capabilities = Vec::new();
+    let mut section_payloads = vec![CoviSectionPayloadV2 {
+        section_id: 1,
+        section_kind: CoviSectionKindV2::StringTable,
+        payload: file_digest,
+        item_count: 1,
+        required_features: 0,
+        optional_features: 0,
+    }];
+    let mut root_id = 0u32;
+
+    for object_type in &surface.object_types {
+        let records = surface
+            .records
+            .iter()
+            .filter(|record| record.object_type_id == object_type.object_type_id)
+            .collect::<Vec<_>>();
+        let value_count = u64::try_from(records.len()).map_err(|_| CoveError::ArithOverflow)?;
+        let properties = object_properties_for_index(object_type, &records);
+        for property in &properties {
+            let current_root_id = root_id;
+            root_id = root_id.checked_add(1).ok_or(CoveError::ArithOverflow)?;
+            let key_section_id = 2 + current_root_id * 4;
+            let entry_section_id = key_section_id + 1;
+            let postings_section_id = key_section_id + 2;
+            let aggregate_section_id = key_section_id + 3;
+            let mut built_index = build_object_property_index(
+                current_root_id,
+                &records,
+                property,
+                options.include_index_only_counts.then_some(current_root_id),
+            )?;
+            let include_min_max_answers = options.include_index_only_min_max
+                && built_index.supports_range
+                && aggregate_min_max_answer_supported(property.logical_type)
+                && built_index.min_key.is_some()
+                && built_index.max_key.is_some();
+            let include_sum_avg_answers = options.include_index_only_sum_avg
+                && aggregate_sum_answer_supported(property.logical_type)
+                && (built_index.sum_payload.is_some() || built_index.null_count == value_count);
+            let include_aggregate_block = options.include_index_only_counts
+                || include_min_max_answers
+                || options.include_index_only_distinct_count
+                || options.include_index_only_exists
+                || include_sum_avg_answers;
+            let aggregate_block_section_id = if include_aggregate_block {
+                aggregate_section_id
+            } else {
+                u32::MAX
+            };
+            if include_aggregate_block {
+                built_index.entry_block =
+                    entry_block_with_aggregate_block_id(&built_index.entry_block, current_root_id)?;
+                append_index_only_capabilities(
+                    &mut index_only_capabilities,
+                    current_root_id,
+                    &table_options,
+                    include_min_max_answers,
+                    include_sum_avg_answers,
+                );
+            }
+
+            roots.push(CoviIndexRootV2 {
+                index_root_id: current_root_id,
+                indexed_target_kind: CoviIndexedTargetKindV2::ObjectProperty,
+                index_kind: built_index.index_kind,
+                coverage_granularity: CoverageGranularityV2::RowRange as u8,
+                proof_strength: CoverageProofStrengthV2::ExactConservative as u8,
+                exactness: CoverageExactnessV2::Exact as u8,
+                flags: 0,
+                table_id: u32::MAX,
+                column_id: u32::MAX,
+                object_type_id: object_type.object_type_id,
+                property_id: property.property_id,
+                path_ref: u32::MAX,
+                semantic_dimension_ref: u32::MAX,
+                logical_type: property.logical_type as u16,
+                physical_kind: property.physical_kind as u8,
+                key_encoding_kind: built_index.key_encoding_kind as u8,
+                comparator_kind: built_index.comparator_kind as u16,
+                collation_id: property.collation_id,
+                null_semantics: 0,
+                sort_order: 0,
+                value_count,
+                distinct_count: built_index.distinct_count,
+                null_count: built_index.null_count,
+                min_key_ref: built_index.min_key_ref,
+                max_key_ref: built_index.max_key_ref,
+                key_block_section_id: key_section_id,
+                entry_block_section_id: entry_section_id,
+                postings_block_section_id: postings_section_id,
+                aggregate_block_section_id,
+                coverage_set_ref: u32::MAX,
+                capability_ref: current_root_id,
+                snapshot_validity_ref: 0,
+                checksum: 0,
+            });
+            capabilities.push(IndexCapabilityV2 {
+                capability_id: current_root_id,
+                index_root_id: current_root_id,
+                flags: 0,
+                supports_eq: 1,
+                supports_range: u8::from(built_index.supports_range),
+                supports_membership: 1,
+                supports_prefix: 0,
+                supports_contains: 0,
+                supports_count: u8::from(
+                    options.include_index_only_counts
+                        || options.include_index_only_exists
+                        || include_sum_avg_answers,
+                ),
+                supports_min: u8::from(include_min_max_answers),
+                supports_max: u8::from(include_min_max_answers),
+                supports_sum: u8::from(include_sum_avg_answers),
+                supports_distinct_count: u8::from(options.include_index_only_distinct_count),
+                supports_join_coverage: 0,
+                supports_index_only: u8::from(include_aggregate_block),
+                exactness: IndexCapabilityExactnessV2::Exact,
+                proof_strength: CoverageProofStrengthV2::ExactConservative,
+                null_semantics: 0,
+                reserved: 0,
+                snapshot_validity_ref: 0,
+                coverage_provider_ref: u32::MAX,
+                checksum: 0,
+            });
+            section_payloads.extend([
+                CoviSectionPayloadV2 {
+                    section_id: key_section_id,
+                    section_kind: CoviSectionKindV2::KeyBlock,
+                    payload: built_index.key_block,
+                    item_count: built_index.distinct_count,
+                    required_features: 0,
+                    optional_features: 0,
+                },
+                CoviSectionPayloadV2 {
+                    section_id: entry_section_id,
+                    section_kind: CoviSectionKindV2::EntryBlock,
+                    payload: built_index.entry_block,
+                    item_count: built_index.distinct_count,
+                    required_features: 0,
+                    optional_features: 0,
+                },
+                CoviSectionPayloadV2 {
+                    section_id: postings_section_id,
+                    section_kind: CoviSectionKindV2::PostingsBlock,
+                    payload: built_index.postings_block,
+                    item_count: built_index.distinct_count,
+                    required_features: 0,
+                    optional_features: 0,
+                },
+            ]);
+            if include_aggregate_block {
+                let aggregate_block = aggregate_answer_block(AggregateAnswerBlockParams {
+                    root_id: current_root_id,
+                    row_count: value_count,
+                    null_count: built_index.null_count,
+                    distinct_count: built_index.distinct_count,
+                    logical_type: property.logical_type,
+                    options: &table_options,
+                    include_min_max_answers,
+                    include_sum_avg_answers,
+                    min_key: built_index.min_key.as_deref(),
+                    max_key: built_index.max_key.as_deref(),
+                    sum_payload: built_index.sum_payload.as_deref(),
+                })?;
+                section_payloads.push(CoviSectionPayloadV2 {
+                    section_id: aggregate_section_id,
+                    section_kind: CoviSectionKindV2::AggregateAnswerBlock,
+                    payload: aggregate_block,
+                    item_count: aggregate_answer_count(
+                        &table_options,
+                        include_min_max_answers,
+                        include_sum_avg_answers,
+                    ) as u64,
+                    required_features: 0,
+                    optional_features: 0,
+                });
+            }
+        }
+        if options.include_object_paths {
+            append_cove_o_auxiliary_index(
+                &mut roots,
+                &mut capabilities,
+                &mut section_payloads,
+                &mut root_id,
+                CoviIndexedTargetKindV2::ObjectPath,
+                object_type.object_type_id,
+                u32::MAX,
+                0,
+                u32::MAX,
+                &records,
+                |record| Some(format!("{}/{}", object_type.type_name, hex16(&record.goid))),
+            )?;
+        }
+        if options.include_projection_fragments {
+            append_cove_o_auxiliary_index(
+                &mut roots,
+                &mut capabilities,
+                &mut section_payloads,
+                &mut root_id,
+                CoviIndexedTargetKindV2::ProjectionColumn,
+                object_type.object_type_id,
+                u32::MAX,
+                0,
+                u32::MAX,
+                &records,
+                |record| Some(format!("{}:{}", object_type.type_name, record.segment_id)),
+            )?;
+        }
+        if options.include_association_endpoints {
+            append_cove_o_auxiliary_index(
+                &mut roots,
+                &mut capabilities,
+                &mut section_payloads,
+                &mut root_id,
+                CoviIndexedTargetKindV2::AssociationEndpoint,
+                object_type.object_type_id,
+                u32::MAX,
+                1,
+                u32::MAX,
+                &records,
+                |record| {
+                    record
+                        .association
+                        .as_ref()
+                        .and_then(|association| association.source_goid.clone())
+                },
+            )?;
+            append_cove_o_auxiliary_index(
+                &mut roots,
+                &mut capabilities,
+                &mut section_payloads,
+                &mut root_id,
+                CoviIndexedTargetKindV2::AssociationEndpoint,
+                object_type.object_type_id,
+                u32::MAX,
+                2,
+                u32::MAX,
+                &records,
+                |record| {
+                    record
+                        .association
+                        .as_ref()
+                        .and_then(|association| association.target_goid.clone())
+                },
+            )?;
+        }
+        if options.include_evidence_lookup {
+            append_cove_o_auxiliary_index(
+                &mut roots,
+                &mut capabilities,
+                &mut section_payloads,
+                &mut root_id,
+                CoviIndexedTargetKindV2::AssociationEndpoint,
+                object_type.object_type_id,
+                u32::MAX,
+                3,
+                u32::MAX,
+                &records,
+                |record| {
+                    record
+                        .association
+                        .as_ref()
+                        .and_then(|association| association.evidence_ref.clone())
+                },
+            )?;
+        }
+    }
+
+    if !index_only_capabilities.is_empty() {
+        let section_id = 2u32
+            .checked_add(root_id.checked_mul(4).ok_or(CoveError::ArithOverflow)?)
+            .ok_or(CoveError::ArithOverflow)?;
+        section_payloads.push(CoviSectionPayloadV2 {
+            section_id,
+            section_kind: CoviSectionKindV2::IndexOnlyCapabilities,
+            payload: index_only_capability_payload(&index_only_capabilities)?,
+            item_count: index_only_capabilities.len() as u64,
+            required_features: 0,
+            optional_features: FEATURE_INDEX_ONLY_CAPABILITY,
+        });
+    }
+
+    let bytes = CoviArtifactV2::serialize_with_sections(
+        dataset_id,
+        snapshot_id,
+        &[referenced_file],
+        &[snapshot_validity],
+        &roots,
+        &capabilities,
+        &section_payloads,
+    )?;
+    CoviArtifactV2::parse(&bytes)?;
+    Ok(bytes)
+}
+
+pub fn build_projection_columns_covi_for_cove_o_bytes(
+    input: &[u8],
+    columns: &[CoviProjectionColumnInput],
+) -> Result<Vec<u8>, CoveError> {
+    let postscript = CovePostscriptV1::parse_from_tail(input)?;
+    let validation = validate_bytes_with_options(
+        input,
+        ValidationOptions {
+            semantic: true,
+            verify_digests: false,
+            allow_unknown_optional_extensions: true,
+            ..ValidationOptions::default()
+        },
+    )?;
+
+    let dataset_id = validation.validated.header.file_id;
+    let snapshot_id = derived_snapshot_id(input, postscript.footer.crc32c);
+    let file_digest = compute_digest(DigestAlgorithm::Sha256, input)?;
+    let referenced_file = CoviReferencedFileV2 {
+        file_ref: 0,
+        flags: 0,
+        file_id: validation.validated.header.file_id,
+        file_len: input.len() as u64,
+        footer_crc32c: postscript.footer.crc32c,
+        digest_algorithm: DigestAlgorithm::Sha256 as u16,
+        digest_len: file_digest
+            .len()
+            .try_into()
+            .map_err(|_| CoveError::ArithOverflow)?,
+        digest_offset: 0,
+        uri_ref: u32::MAX,
+        schema_fingerprint_ref: u32::MAX,
+        checksum: 0,
+    };
+    let snapshot_validity = CoviSnapshotValidityV2 {
+        snapshot_validity_ref: 0,
+        dataset_id,
+        snapshot_id,
+        schema_fingerprint_ref: u32::MAX,
+        semantic_map_fingerprint_ref: u32::MAX,
+        external_visibility_ref: u32::MAX,
+        data_checksum_root_ref: u32::MAX,
+        valid_from_us: validation.validated.header.created_at_us,
+        valid_until_us: i64::MAX,
+        flags: 0,
+        checksum: 0,
+    };
+
+    let mut roots = Vec::new();
+    let mut capabilities = Vec::new();
+    let mut section_payloads = vec![CoviSectionPayloadV2 {
+        section_id: 1,
+        section_kind: CoviSectionKindV2::StringTable,
+        payload: file_digest,
+        item_count: 1,
+        required_features: 0,
+        optional_features: 0,
+    }];
+    let mut root_id = 0u32;
+    for column in columns {
+        append_projection_column_index(
+            &mut roots,
+            &mut capabilities,
+            &mut section_payloads,
+            &mut root_id,
+            column,
+        )?;
+    }
+
+    let bytes = CoviArtifactV2::serialize_with_sections(
+        dataset_id,
+        snapshot_id,
+        &[referenced_file],
+        &[snapshot_validity],
+        &roots,
+        &capabilities,
+        &section_payloads,
+    )?;
+    CoviArtifactV2::parse(&bytes)?;
+    Ok(bytes)
+}
+
+pub fn projection_column_lookup_key_for_json_value(
+    value: &Value,
+    logical_type: CoveLogicalType,
+) -> Result<Option<CoviLookupKeyV2>, CoveError> {
+    match projection_column_key_mode(logical_type) {
+        ProjectionColumnKeyMode::Canonical => key_for_json_property_value(value, logical_type)
+            .map(|key| key.map(CoviLookupKeyV2::CanonicalValueBytes)),
+        ProjectionColumnKeyMode::NumCode => projection_numcode_for_json_value(value, logical_type)
+            .map(|key| key.map(CoviLookupKeyV2::NumCode)),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_cove_o_auxiliary_index(
+    roots: &mut Vec<CoviIndexRootV2>,
+    capabilities: &mut Vec<IndexCapabilityV2>,
+    section_payloads: &mut Vec<CoviSectionPayloadV2>,
+    root_id: &mut u32,
+    target_kind: CoviIndexedTargetKindV2,
+    object_type_id: u32,
+    property_id: u32,
+    path_ref: u32,
+    semantic_dimension_ref: u32,
+    records: &[&CoveObjectRecord],
+    key_fn: impl Fn(&CoveObjectRecord) -> Option<String>,
+) -> Result<(), CoveError> {
+    let current_root_id = *root_id;
+    *root_id = root_id.checked_add(1).ok_or(CoveError::ArithOverflow)?;
+    let key_section_id = 2 + current_root_id * 4;
+    let entry_section_id = key_section_id + 1;
+    let postings_section_id = key_section_id + 2;
+    let mut keys = KeyPostingMap::new();
+    let mut indexed_rows = 0u64;
+    for record in records {
+        let Some(key_text) = key_fn(record) else {
+            continue;
+        };
+        indexed_rows = indexed_rows
+            .checked_add(1)
+            .ok_or(CoveError::ArithOverflow)?;
+        let key = tagged_canonical(CanonicalValue::Utf8(&key_text))?;
+        append_row_range(
+            keys.entry(key).or_default(),
+            CoviRowRangePostingV2 {
+                file_ref: 0,
+                table_id: u32::MAX,
+                segment_id: record.segment_id,
+                morsel_id: u32::MAX,
+                row_start: u64::from(record.row_index),
+                row_count: 1,
+                flags: 0,
+                checksum: 0,
+            },
+        )?;
+    }
+    let value_count = u64::try_from(records.len()).map_err(|_| CoveError::ArithOverflow)?;
+    let null_count = value_count
+        .checked_sub(indexed_rows)
+        .ok_or(CoveError::ArithOverflow)?;
+    let built_index = build_blocks_from_keys(
+        keys,
+        BuildBlocksParams {
+            root_id: current_root_id,
+            logical_type: CoveLogicalType::Utf8,
+            index_kind: CoviIndexKindV2::Sorted,
+            key_encoding_kind: CoviKeyEncodingKindV2::CanonicalValueBytes,
+            comparator_kind: CoviComparatorKindV2::CanonicalOrdering,
+            supports_range: true,
+            null_count,
+            aggregate_block_id: None,
+        },
+    )?;
+    roots.push(CoviIndexRootV2 {
+        index_root_id: current_root_id,
+        indexed_target_kind: target_kind,
+        index_kind: built_index.index_kind,
+        coverage_granularity: CoverageGranularityV2::RowRange as u8,
+        proof_strength: CoverageProofStrengthV2::ExactConservative as u8,
+        exactness: CoverageExactnessV2::Exact as u8,
+        flags: 0,
+        table_id: u32::MAX,
+        column_id: u32::MAX,
+        object_type_id,
+        property_id,
+        path_ref,
+        semantic_dimension_ref,
+        logical_type: CoveLogicalType::Utf8 as u16,
+        physical_kind: CovePhysicalKind::VarBytes as u8,
+        key_encoding_kind: built_index.key_encoding_kind as u8,
+        comparator_kind: built_index.comparator_kind as u16,
+        collation_id: 0,
+        null_semantics: 0,
+        sort_order: 0,
+        value_count,
+        distinct_count: built_index.distinct_count,
+        null_count: built_index.null_count,
+        min_key_ref: built_index.min_key_ref,
+        max_key_ref: built_index.max_key_ref,
+        key_block_section_id: key_section_id,
+        entry_block_section_id: entry_section_id,
+        postings_block_section_id: postings_section_id,
+        aggregate_block_section_id: u32::MAX,
+        coverage_set_ref: u32::MAX,
+        capability_ref: current_root_id,
+        snapshot_validity_ref: 0,
+        checksum: 0,
+    });
+    capabilities.push(IndexCapabilityV2 {
+        capability_id: current_root_id,
+        index_root_id: current_root_id,
+        flags: 0,
+        supports_eq: 1,
+        supports_range: 1,
+        supports_membership: 1,
+        supports_prefix: 0,
+        supports_contains: 0,
+        supports_count: 0,
+        supports_min: 0,
+        supports_max: 0,
+        supports_sum: 0,
+        supports_distinct_count: 0,
+        supports_join_coverage: 0,
+        supports_index_only: 0,
+        exactness: IndexCapabilityExactnessV2::Exact,
+        proof_strength: CoverageProofStrengthV2::ExactConservative,
+        null_semantics: 0,
+        reserved: 0,
+        snapshot_validity_ref: 0,
+        coverage_provider_ref: u32::MAX,
+        checksum: 0,
+    });
+    section_payloads.extend([
+        CoviSectionPayloadV2 {
+            section_id: key_section_id,
+            section_kind: CoviSectionKindV2::KeyBlock,
+            payload: built_index.key_block,
+            item_count: built_index.distinct_count,
+            required_features: 0,
+            optional_features: 0,
+        },
+        CoviSectionPayloadV2 {
+            section_id: entry_section_id,
+            section_kind: CoviSectionKindV2::EntryBlock,
+            payload: built_index.entry_block,
+            item_count: built_index.distinct_count,
+            required_features: 0,
+            optional_features: 0,
+        },
+        CoviSectionPayloadV2 {
+            section_id: postings_section_id,
+            section_kind: CoviSectionKindV2::PostingsBlock,
+            payload: built_index.postings_block,
+            item_count: built_index.distinct_count,
+            required_features: 0,
+            optional_features: 0,
+        },
+    ]);
+    Ok(())
+}
+
+fn append_projection_column_index(
+    roots: &mut Vec<CoviIndexRootV2>,
+    capabilities: &mut Vec<IndexCapabilityV2>,
+    section_payloads: &mut Vec<CoviSectionPayloadV2>,
+    root_id: &mut u32,
+    column: &CoviProjectionColumnInput,
+) -> Result<(), CoveError> {
+    let current_root_id = *root_id;
+    *root_id = root_id.checked_add(1).ok_or(CoveError::ArithOverflow)?;
+    let key_section_id = 2 + current_root_id * 4;
+    let entry_section_id = key_section_id + 1;
+    let postings_section_id = key_section_id + 2;
+    let key_mode = projection_column_key_mode(column.logical_type);
+    let mut keys = KeyPostingMap::new();
+    let mut indexed_rows = 0u64;
+    let mut has_nan = false;
+    for (row_index, value) in column.values.iter().enumerate() {
+        let Some(key) = projection_column_key(value, column.logical_type, key_mode)? else {
+            continue;
+        };
+        if matches!(
+            column.logical_type,
+            CoveLogicalType::Float32 | CoveLogicalType::Float64
+        ) {
+            has_nan |= value.as_f64().is_some_and(f64::is_nan);
+        }
+        indexed_rows = indexed_rows
+            .checked_add(1)
+            .ok_or(CoveError::ArithOverflow)?;
+        append_row_range(
+            keys.entry(key).or_default(),
+            CoviRowRangePostingV2 {
+                file_ref: 0,
+                table_id: column.table_id,
+                segment_id: u32::MAX,
+                morsel_id: u32::MAX,
+                row_start: u64::try_from(row_index).map_err(|_| CoveError::ArithOverflow)?,
+                row_count: 1,
+                flags: 0,
+                checksum: 0,
+            },
+        )?;
+    }
+    let value_count = u64::try_from(column.values.len()).map_err(|_| CoveError::ArithOverflow)?;
+    let null_count = value_count
+        .checked_sub(indexed_rows)
+        .ok_or(CoveError::ArithOverflow)?;
+    let supports_range = key_mode == ProjectionColumnKeyMode::NumCode && !has_nan;
+    let built_index = build_blocks_from_keys(
+        keys,
+        BuildBlocksParams {
+            root_id: current_root_id,
+            logical_type: column.logical_type,
+            index_kind: if supports_range {
+                CoviIndexKindV2::Sorted
+            } else {
+                CoviIndexKindV2::Hash
+            },
+            key_encoding_kind: match key_mode {
+                ProjectionColumnKeyMode::NumCode => CoviKeyEncodingKindV2::NumCode,
+                ProjectionColumnKeyMode::Canonical => CoviKeyEncodingKindV2::CanonicalValueBytes,
+            },
+            comparator_kind: match key_mode {
+                ProjectionColumnKeyMode::NumCode => CoviComparatorKindV2::NumCodeLogicalOrdering,
+                ProjectionColumnKeyMode::Canonical => CoviComparatorKindV2::CanonicalEquality,
+            },
+            supports_range,
+            null_count,
+            aggregate_block_id: None,
+        },
+    )?;
+    roots.push(CoviIndexRootV2 {
+        index_root_id: current_root_id,
+        indexed_target_kind: CoviIndexedTargetKindV2::ProjectionColumn,
+        index_kind: built_index.index_kind,
+        coverage_granularity: CoverageGranularityV2::RowRange as u8,
+        proof_strength: CoverageProofStrengthV2::ExactConservative as u8,
+        exactness: CoverageExactnessV2::Exact as u8,
+        flags: 0,
+        table_id: column.table_id,
+        column_id: column.column_id,
+        object_type_id: u32::MAX,
+        property_id: u32::MAX,
+        path_ref: u32::MAX,
+        semantic_dimension_ref: u32::MAX,
+        logical_type: column.logical_type as u16,
+        physical_kind: column.physical_kind as u8,
+        key_encoding_kind: built_index.key_encoding_kind as u8,
+        comparator_kind: built_index.comparator_kind as u16,
+        collation_id: 0,
+        null_semantics: 0,
+        sort_order: 0,
+        value_count,
+        distinct_count: built_index.distinct_count,
+        null_count: built_index.null_count,
+        min_key_ref: built_index.min_key_ref,
+        max_key_ref: built_index.max_key_ref,
+        key_block_section_id: key_section_id,
+        entry_block_section_id: entry_section_id,
+        postings_block_section_id: postings_section_id,
+        aggregate_block_section_id: u32::MAX,
+        coverage_set_ref: u32::MAX,
+        capability_ref: current_root_id,
+        snapshot_validity_ref: 0,
+        checksum: 0,
+    });
+    capabilities.push(IndexCapabilityV2 {
+        capability_id: current_root_id,
+        index_root_id: current_root_id,
+        flags: 0,
+        supports_eq: 1,
+        supports_range: u8::from(supports_range),
+        supports_membership: 1,
+        supports_prefix: 0,
+        supports_contains: 0,
+        supports_count: 0,
+        supports_min: 0,
+        supports_max: 0,
+        supports_sum: 0,
+        supports_distinct_count: 0,
+        supports_join_coverage: 0,
+        supports_index_only: 0,
+        exactness: IndexCapabilityExactnessV2::Exact,
+        proof_strength: CoverageProofStrengthV2::ExactConservative,
+        null_semantics: 0,
+        reserved: 0,
+        snapshot_validity_ref: 0,
+        coverage_provider_ref: u32::MAX,
+        checksum: 0,
+    });
+    section_payloads.extend([
+        CoviSectionPayloadV2 {
+            section_id: key_section_id,
+            section_kind: CoviSectionKindV2::KeyBlock,
+            payload: built_index.key_block,
+            item_count: built_index.distinct_count,
+            required_features: 0,
+            optional_features: 0,
+        },
+        CoviSectionPayloadV2 {
+            section_id: entry_section_id,
+            section_kind: CoviSectionKindV2::EntryBlock,
+            payload: built_index.entry_block,
+            item_count: built_index.distinct_count,
+            required_features: 0,
+            optional_features: 0,
+        },
+        CoviSectionPayloadV2 {
+            section_id: postings_section_id,
+            section_kind: CoviSectionKindV2::PostingsBlock,
+            payload: built_index.postings_block,
+            item_count: built_index.distinct_count,
+            required_features: 0,
+            optional_features: 0,
+        },
+    ]);
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectionColumnKeyMode {
+    Canonical,
+    NumCode,
+}
+
+fn projection_column_key_mode(logical_type: CoveLogicalType) -> ProjectionColumnKeyMode {
+    match logical_type {
+        CoveLogicalType::Int8
+        | CoveLogicalType::Int16
+        | CoveLogicalType::Int32
+        | CoveLogicalType::Int64
+        | CoveLogicalType::UInt8
+        | CoveLogicalType::UInt16
+        | CoveLogicalType::UInt32
+        | CoveLogicalType::UInt64
+        | CoveLogicalType::Float32
+        | CoveLogicalType::Float64
+        | CoveLogicalType::Decimal64
+        | CoveLogicalType::DateDays
+        | CoveLogicalType::TimestampMicros
+        | CoveLogicalType::TimestampNanos => ProjectionColumnKeyMode::NumCode,
+        _ => ProjectionColumnKeyMode::Canonical,
+    }
+}
+
+fn projection_column_key(
+    value: &Value,
+    logical_type: CoveLogicalType,
+    mode: ProjectionColumnKeyMode,
+) -> Result<Option<Vec<u8>>, CoveError> {
+    match mode {
+        ProjectionColumnKeyMode::Canonical => key_for_json_property_value(value, logical_type),
+        ProjectionColumnKeyMode::NumCode => projection_numcode_for_json_value(value, logical_type)
+            .map(|value| value.map(|code| code.to_le_bytes().to_vec())),
+    }
+}
+
+fn projection_numcode_for_json_value(
+    value: &Value,
+    logical_type: CoveLogicalType,
+) -> Result<Option<u64>, CoveError> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    let key = match logical_type {
+        CoveLogicalType::Int8 => json_i64(value)
+            .and_then(|value| i8::try_from(value).ok())
+            .map(|value| value as u8 as u64),
+        CoveLogicalType::Int16 => json_i64(value)
+            .and_then(|value| i16::try_from(value).ok())
+            .map(|value| value as u16 as u64),
+        CoveLogicalType::Int32 => json_i64(value)
+            .and_then(|value| i32::try_from(value).ok())
+            .map(|value| value as u32 as u64),
+        CoveLogicalType::Int64 => json_i64(value).map(|value| value as u64),
+        CoveLogicalType::UInt8 => json_u64(value)
+            .and_then(|value| u8::try_from(value).ok())
+            .map(u64::from),
+        CoveLogicalType::UInt16 => json_u64(value)
+            .and_then(|value| u16::try_from(value).ok())
+            .map(u64::from),
+        CoveLogicalType::UInt32 => json_u64(value)
+            .and_then(|value| u32::try_from(value).ok())
+            .map(u64::from),
+        CoveLogicalType::UInt64 => json_u64(value),
+        CoveLogicalType::Float32 => json_f64(value).map(|value| (value as f32).to_bits() as u64),
+        CoveLogicalType::Float64 => json_f64(value).map(|value| value.to_bits()),
+        CoveLogicalType::Decimal64 => json_i64(value).map(|value| value as u64),
+        CoveLogicalType::DateDays => json_i64(value)
+            .and_then(|value| i32::try_from(value).ok())
+            .map(|value| value as u32 as u64),
+        CoveLogicalType::TimestampMicros | CoveLogicalType::TimestampNanos => {
+            json_i64(value).map(|value| value as u64)
+        }
+        _ => return Err(CoveError::BadCovi),
+    };
+    Ok(key)
+}
+
 fn append_index_only_capabilities(
     out: &mut Vec<IndexOnlyCapabilityV2>,
     capability_id: u32,
@@ -465,6 +1367,15 @@ fn indexed_target_metadata(
     match target {
         CoviBuildTarget::TableColumn => IndexedTargetMetadata {
             indexed_target_kind: CoviIndexedTargetKindV2::TableColumn,
+            table_id,
+            column_id,
+            object_type_id: u32::MAX,
+            property_id: u32::MAX,
+            path_ref: u32::MAX,
+            semantic_dimension_ref: u32::MAX,
+        },
+        CoviBuildTarget::ProjectionColumn => IndexedTargetMetadata {
+            indexed_target_kind: CoviIndexedTargetKindV2::ProjectionColumn,
             table_id,
             column_id,
             object_type_id: u32::MAX,
@@ -750,6 +1661,127 @@ fn build_column_index(
     )?;
     built.sum_payload = sum_payload;
     Ok(built)
+}
+
+fn build_object_property_index(
+    root_id: u32,
+    records: &[&CoveObjectRecord],
+    property: &PropertyEntryV1,
+    aggregate_block_id: Option<u32>,
+) -> Result<BuiltColumnIndex, CoveError> {
+    let mut index_kind = CoviIndexKindV2::Sorted;
+    let key_encoding_kind = CoviKeyEncodingKindV2::CanonicalValueBytes;
+    let mut comparator_kind = CoviComparatorKindV2::CanonicalOrdering;
+    let mut supports_range = !matches!(
+        property.logical_type,
+        CoveLogicalType::Null
+            | CoveLogicalType::Bool
+            | CoveLogicalType::List
+            | CoveLogicalType::Struct
+            | CoveLogicalType::Map
+    );
+    let mut keys: KeyPostingMap = BTreeMap::new();
+    let mut rows_with_indexed_value = 0u64;
+
+    for record in records {
+        let mut record_keys = BTreeSet::new();
+        for value in record
+            .properties
+            .iter()
+            .filter(|value| value.property_id == property.property_id)
+        {
+            if value.redacted {
+                continue;
+            }
+            if let Some(key) = key_for_json_property_value(&value.value, property.logical_type)? {
+                record_keys.insert(key);
+            }
+        }
+        if record_keys.is_empty() {
+            continue;
+        }
+        rows_with_indexed_value = rows_with_indexed_value
+            .checked_add(1)
+            .ok_or(CoveError::ArithOverflow)?;
+        for key in record_keys {
+            append_row_range(
+                keys.entry(key).or_default(),
+                CoviRowRangePostingV2 {
+                    file_ref: 0,
+                    table_id: u32::MAX,
+                    segment_id: record.segment_id,
+                    morsel_id: u32::MAX,
+                    row_start: u64::from(record.row_index),
+                    row_count: 1,
+                    flags: 0,
+                    checksum: 0,
+                },
+            )?;
+        }
+    }
+
+    if canonical_float_keys_contain_nan(property.logical_type, &keys)? {
+        comparator_kind = CoviComparatorKindV2::CanonicalEquality;
+        index_kind = CoviIndexKindV2::Hash;
+        supports_range = false;
+    }
+    let value_count = u64::try_from(records.len()).map_err(|_| CoveError::ArithOverflow)?;
+    let null_count = value_count
+        .checked_sub(rows_with_indexed_value)
+        .ok_or(CoveError::ArithOverflow)?;
+    let sum_payload = index_only_sum_payload_from_keys(property.logical_type, &keys)?;
+    let mut built = build_blocks_from_keys(
+        keys,
+        BuildBlocksParams {
+            root_id,
+            logical_type: property.logical_type,
+            index_kind,
+            key_encoding_kind,
+            comparator_kind,
+            supports_range,
+            null_count,
+            aggregate_block_id,
+        },
+    )?;
+    built.sum_payload = sum_payload;
+    Ok(built)
+}
+
+fn object_properties_for_index(
+    object_type: &ObjectTypeEntryV1,
+    records: &[&CoveObjectRecord],
+) -> Vec<PropertyEntryV1> {
+    let mut properties = object_type
+        .properties
+        .iter()
+        .map(|property| (property.property_id, property.clone()))
+        .collect::<BTreeMap<_, _>>();
+    for record in records {
+        for value in &record.properties {
+            properties
+                .entry(value.property_id)
+                .or_insert_with(|| PropertyEntryV1 {
+                    property_id: value.property_id,
+                    property_name: value.property_name.clone(),
+                    logical_type: value.logical_type,
+                    physical_kind: value.physical_kind,
+                    nullable: true,
+                    collation_id: 0,
+                    flags: value.flags,
+                });
+        }
+    }
+    properties.into_values().collect()
+}
+
+fn hex16(bytes: &[u8; 16]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(32);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 fn build_blocks_from_keys(
@@ -1407,6 +2439,205 @@ fn key_for_value(
     }
 }
 
+fn key_for_json_property_value(
+    value: &Value,
+    logical: CoveLogicalType,
+) -> Result<Option<Vec<u8>>, CoveError> {
+    if value.is_null() {
+        return if logical == CoveLogicalType::Json {
+            let json_text = value.to_string();
+            tagged_canonical(CanonicalValue::Json(&json_text)).map(Some)
+        } else {
+            Ok(None)
+        };
+    }
+    let key = match logical {
+        CoveLogicalType::Null => None,
+        CoveLogicalType::Bool => value
+            .as_bool()
+            .map(|value| tagged_canonical(CanonicalValue::Bool(value)))
+            .transpose()?,
+        CoveLogicalType::Int8 => json_i64(value)
+            .map(|value| {
+                tagged_canonical(CanonicalValue::Int {
+                    width: 1,
+                    value: i128::from(value),
+                })
+            })
+            .transpose()?,
+        CoveLogicalType::Int16 => json_i64(value)
+            .map(|value| {
+                tagged_canonical(CanonicalValue::Int {
+                    width: 2,
+                    value: i128::from(value),
+                })
+            })
+            .transpose()?,
+        CoveLogicalType::Int32 => json_i64(value)
+            .map(|value| {
+                tagged_canonical(CanonicalValue::Int {
+                    width: 4,
+                    value: i128::from(value),
+                })
+            })
+            .transpose()?,
+        CoveLogicalType::Int64 => json_i64(value)
+            .map(|value| {
+                tagged_canonical(CanonicalValue::Int {
+                    width: 8,
+                    value: i128::from(value),
+                })
+            })
+            .transpose()?,
+        CoveLogicalType::UInt8 => json_u64(value)
+            .map(|value| {
+                tagged_canonical(CanonicalValue::Uint {
+                    width: 1,
+                    value: u128::from(value),
+                })
+            })
+            .transpose()?,
+        CoveLogicalType::UInt16 => json_u64(value)
+            .map(|value| {
+                tagged_canonical(CanonicalValue::Uint {
+                    width: 2,
+                    value: u128::from(value),
+                })
+            })
+            .transpose()?,
+        CoveLogicalType::UInt32 => json_u64(value)
+            .map(|value| {
+                tagged_canonical(CanonicalValue::Uint {
+                    width: 4,
+                    value: u128::from(value),
+                })
+            })
+            .transpose()?,
+        CoveLogicalType::UInt64 => json_u64(value)
+            .map(|value| {
+                tagged_canonical(CanonicalValue::Uint {
+                    width: 8,
+                    value: u128::from(value),
+                })
+            })
+            .transpose()?,
+        CoveLogicalType::Float32 => json_f64(value)
+            .map(|value| tagged_canonical(CanonicalValue::Float32(value as f32)))
+            .transpose()?,
+        CoveLogicalType::Float64 => json_f64(value)
+            .map(|value| tagged_canonical(CanonicalValue::Float64(value)))
+            .transpose()?,
+        CoveLogicalType::Decimal64 => json_i64(value)
+            .map(|value| tagged_canonical(CanonicalValue::Decimal64(value)))
+            .transpose()?,
+        CoveLogicalType::Decimal128 => json_i128(value)
+            .map(|value| tagged_canonical(CanonicalValue::Decimal128(value)))
+            .transpose()?,
+        CoveLogicalType::DateDays => json_i64(value)
+            .and_then(|value| i32::try_from(value).ok())
+            .map(|value| tagged_canonical(CanonicalValue::DateDays(value)))
+            .transpose()?,
+        CoveLogicalType::TimestampMicros => json_i64(value)
+            .map(|value| tagged_canonical(CanonicalValue::TimestampMicros(value)))
+            .transpose()?,
+        CoveLogicalType::TimestampNanos => json_i64(value)
+            .map(|value| tagged_canonical(CanonicalValue::TimestampNanos(value)))
+            .transpose()?,
+        CoveLogicalType::Utf8 => value
+            .as_str()
+            .map(|value| tagged_canonical(CanonicalValue::Utf8(value)))
+            .transpose()?,
+        CoveLogicalType::Binary => json_binary_bytes(value)
+            .map(|bytes| tagged_canonical(CanonicalValue::Bytes(&bytes)))
+            .transpose()?,
+        CoveLogicalType::Uuid => json_uuid_bytes(value)
+            .map(|uuid| tagged_canonical(CanonicalValue::Uuid(uuid)))
+            .transpose()?,
+        CoveLogicalType::Json => {
+            let json_text = value.to_string();
+            Some(tagged_canonical(CanonicalValue::Json(&json_text))?)
+        }
+        CoveLogicalType::List | CoveLogicalType::Struct | CoveLogicalType::Map => None,
+        _ => None,
+    };
+    Ok(key)
+}
+
+fn json_i64(value: &Value) -> Option<i64> {
+    value
+        .as_i64()
+        .or_else(|| value.as_str().and_then(|text| text.parse::<i64>().ok()))
+}
+
+fn json_i128(value: &Value) -> Option<i128> {
+    value
+        .as_i64()
+        .map(i128::from)
+        .or_else(|| value.as_str().and_then(|text| text.parse::<i128>().ok()))
+}
+
+fn json_u64(value: &Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|text| text.parse::<u64>().ok()))
+}
+
+fn json_f64(value: &Value) -> Option<f64> {
+    value.as_f64().or_else(|| {
+        value
+            .as_str()
+            .and_then(|text| text.parse::<f64>().ok())
+            .filter(|value| value.is_finite() || value.is_nan())
+    })
+}
+
+fn json_binary_bytes(value: &Value) -> Option<Vec<u8>> {
+    if let Some(text) = value.as_str() {
+        return Some(text.as_bytes().to_vec());
+    }
+    value.as_array().map(|items| {
+        items
+            .iter()
+            .map(|item| item.as_u64().and_then(|value| u8::try_from(value).ok()))
+            .collect::<Option<Vec<_>>>()
+    })?
+}
+
+fn json_uuid_bytes(value: &Value) -> Option<[u8; 16]> {
+    hex_uuid_bytes(value.as_str()?)
+}
+
+fn hex_uuid_bytes(value: &str) -> Option<[u8; 16]> {
+    let mut bytes = [0u8; 16];
+    let mut nibble_count = 0usize;
+    let mut high = 0u8;
+    for byte in value.bytes() {
+        if byte == b'-' {
+            continue;
+        }
+        let nibble = hex_nibble(byte)?;
+        if (nibble_count & 1) == 0 {
+            high = nibble << 4;
+        } else {
+            bytes[nibble_count / 2] = high | nibble;
+        }
+        nibble_count += 1;
+        if nibble_count > 32 {
+            return None;
+        }
+    }
+    (nibble_count == 32).then_some(bytes)
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
 fn key_from_numcode(logical: CoveLogicalType, code: u64) -> Result<Vec<u8>, CoveError> {
     let value = match logical {
         CoveLogicalType::Bool => match code {
@@ -1613,6 +2844,7 @@ mod tests {
             MinimalCoveWriter, ScanPageSpec, ScanProfileCoveWriter, ScanSegment, SectionPayload,
         },
     };
+    use serde_json::{json, Value};
 
     fn row_range() -> CoviRowRangePostingV2 {
         CoviRowRangePostingV2 {
@@ -2117,5 +3349,169 @@ mod tests {
         assert_eq!(rows[0].row_start, 0);
         assert_eq!(rows[1].morsel_id, 20);
         assert_eq!(rows[1].row_start, 1);
+    }
+
+    #[test]
+    fn build_covi_from_cove_o_emits_valid_covi_artifact() {
+        let bytes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../conformance/accept/cove_o_property_stats_only_all_non_null_valid.cove"
+        ));
+
+        let built = build_covi_from_cove_o_bytes(bytes, &CoviObjectPropertyBuildOptions::default())
+            .unwrap();
+        let artifact = CoviArtifactV2::parse(&built).unwrap();
+
+        assert_eq!(artifact.referenced_files[0].file_len, bytes.len() as u64);
+
+        let validated = validate_bytes_with_options(
+            bytes,
+            ValidationOptions {
+                semantic: true,
+                verify_digests: false,
+                allow_unknown_optional_extensions: true,
+                ..ValidationOptions::default()
+            },
+        )
+        .unwrap();
+        let postscript = CovePostscriptV1::parse_from_tail(bytes).unwrap();
+        crate::execution::ValidatedCoviArtifactV2::parse_and_validate(
+            &built,
+            crate::execution::CoviValidationContextV2::for_file(
+                validated.validated.header.file_id,
+                bytes.len() as u64,
+                postscript.footer.crc32c,
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn projection_column_covi_uses_projection_row_ordinals() {
+        let bytes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../conformance/accept/cove_o_property_stats_only_all_non_null_valid.cove"
+        ));
+        let built = build_projection_columns_covi_for_cove_o_bytes(
+            bytes,
+            &[CoviProjectionColumnInput {
+                table_id: 7,
+                column_id: 9,
+                logical_type: CoveLogicalType::Utf8,
+                physical_kind: CovePhysicalKind::VarBytes,
+                values: vec![json!("Ada"), json!("Grace"), json!("Ada")],
+            }],
+        )
+        .unwrap();
+        let artifact = CoviArtifactV2::parse(&built).unwrap();
+        assert_eq!(artifact.index_roots.len(), 1);
+        assert_eq!(
+            artifact.index_roots[0].indexed_target_kind,
+            CoviIndexedTargetKindV2::ProjectionColumn
+        );
+        assert_eq!(artifact.index_roots[0].table_id, 7);
+        assert_eq!(artifact.index_roots[0].column_id, 9);
+
+        let validated = validate_bytes_with_options(
+            bytes,
+            ValidationOptions {
+                semantic: true,
+                verify_digests: false,
+                allow_unknown_optional_extensions: true,
+                ..ValidationOptions::default()
+            },
+        )
+        .unwrap();
+        let postscript = CovePostscriptV1::parse_from_tail(bytes).unwrap();
+        let validated = crate::execution::ValidatedCoviArtifactV2::parse_and_validate(
+            &built,
+            crate::execution::CoviValidationContextV2::for_file(
+                validated.validated.header.file_id,
+                bytes.len() as u64,
+                postscript.footer.crc32c,
+            ),
+        )
+        .unwrap();
+        let key = projection_column_lookup_key_for_json_value(&json!("Ada"), CoveLogicalType::Utf8)
+            .unwrap()
+            .unwrap();
+        let candidates = validated
+            .lookup(
+                &crate::execution::CoviLookupRequestV2::projection_column_membership(7, 9, [key]),
+            )
+            .unwrap();
+        let rows = candidates
+            .row_ranges
+            .iter()
+            .flat_map(|range| range.row_start..range.row_start + range.row_count)
+            .collect::<Vec<_>>();
+        assert_eq!(rows, vec![0, 2]);
+    }
+
+    #[test]
+    fn object_property_index_uses_cove_o_temporal_record_row_ranges() {
+        let property = PropertyEntryV1 {
+            property_id: 9,
+            property_name: "name".into(),
+            logical_type: CoveLogicalType::Utf8,
+            physical_kind: CovePhysicalKind::VarBytes,
+            nullable: true,
+            collation_id: 0,
+            flags: 0,
+        };
+        let mut first = object_record(0, json!("Ada"));
+        let mut second = object_record(1, json!("Ada"));
+        let mut third = object_record(2, Value::Null);
+        first.properties[0].property_id = property.property_id;
+        second.properties[0].property_id = property.property_id;
+        third.properties[0].property_id = property.property_id;
+        let records = vec![&first, &second, &third];
+
+        let built = build_object_property_index(7, &records, &property, None).unwrap();
+        let block = CoviPostingsBlockV2::parse(&built.postings_block).unwrap();
+        let rows = block
+            .postings
+            .iter()
+            .flat_map(|posting| {
+                crate::parse_covi_row_range_postings(block.posting_payload(posting).unwrap())
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(built.distinct_count, 1);
+        assert_eq!(built.null_count, 1);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].table_id, u32::MAX);
+        assert_eq!(rows[0].morsel_id, u32::MAX);
+        assert_eq!(rows[0].segment_id, 3);
+        assert_eq!(rows[0].row_start, 0);
+        assert_eq!(rows[0].row_count, 2);
+    }
+
+    fn object_record(row_index: u32, value: Value) -> CoveObjectRecord {
+        CoveObjectRecord {
+            object_type_id: 1,
+            object_type_name: "Person".into(),
+            object_type_flags: 0,
+            segment_id: 3,
+            row_index,
+            timestamp_us: 0,
+            csn: u64::from(row_index),
+            branch_key: 0,
+            goid: [1; 16],
+            record_id: [row_index as u8; 16],
+            record_kind: cove_core::profile::cove_o::RecordKind::Baseline,
+            prev_ref: None,
+            properties: vec![cove_core::profile::cove_o::CoveObjectPropertyValue {
+                property_id: 1,
+                property_name: "name".into(),
+                logical_type: CoveLogicalType::Utf8,
+                physical_kind: CovePhysicalKind::VarBytes,
+                flags: 0,
+                value,
+                redacted: false,
+            }],
+            association: None,
+        }
     }
 }

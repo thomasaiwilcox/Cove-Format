@@ -78,12 +78,8 @@ impl ScanSegment {
         if self.morsel_row_count == 0 {
             return Err(CoveError::SegmentCorrupt);
         }
-        let count = self
-            .row_count
-            .checked_add(self.morsel_row_count - 1)
-            .ok_or(CoveError::ArithOverflow)?
-            / self.morsel_row_count;
-        Ok(count)
+        let count = u64::from(self.row_count).div_ceil(u64::from(self.morsel_row_count));
+        u32::try_from(count).map_err(|_| CoveError::ArithOverflow)
     }
 
     fn payload(
@@ -1137,5 +1133,18 @@ impl ScanProfileCoveWriter {
             parsed.validate_for_catalog(&self.table_catalog)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scan_segment_morsel_count_uses_wide_ceiling_division() {
+        let mut segment = ScanSegment::new(1, 0, 0, u32::MAX, 1);
+        segment.morsel_row_count = u32::MAX;
+
+        assert_eq!(segment.morsel_count(), Ok(1));
     }
 }

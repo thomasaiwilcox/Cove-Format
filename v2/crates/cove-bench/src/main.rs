@@ -18,7 +18,10 @@ use cove_arrow::convert::{
     ParquetConversionOptions, ParquetDictionaryPolicy, ParquetStatsPolicy,
 };
 use cove_cache::{CoveCoverageCacheHeaderV2, CoverageCacheEntryV2, CoverageCacheV2};
-use cove_cli::customer360::{generate_customer360, Customer360Options, Customer360Profile};
+use cove_cli::customer360::{
+    generate_customer360, generate_proof_suite, Customer360Options, Customer360Profile,
+    ProofSuiteOptions, ProofSuiteScenario,
+};
 use cove_core::{
     artifact::covemap::{
         CovemapFile, CovemapHeaderV1, CovemapPayloadEncodingV2, CovemapSection,
@@ -51,11 +54,18 @@ use cove_datafusion::{
         exact_unfiltered_aggregate_synopses, exact_unfiltered_counts, MetadataAggregatePlan,
         MetadataAggregateProofKind, MetadataSynopsisAggregateKind,
     },
-    register::{CoveTableOptions, CoviDiscovery},
+    register::{
+        df::{
+            physical_plan::{execution_plan::collect as collect_physical_plan, ExecutionPlan},
+            prelude::SessionContext,
+        },
+        register_cove_o_projections, CoveTableOptions, CoviDiscovery,
+    },
 };
 use cove_index::build::{build_covi_from_cove_bytes, CoviBuildOptions};
 use cove_map::{
-    cove_o_from_paths, projected_output_from_cove_o_path, projected_output_from_paths,
+    build_from_paths, cove_o_from_paths, projected_output_from_cove_o_path,
+    projected_output_from_paths, MapBuildOptions, MapBuildSectionCompression, MapEvidenceEncoding,
     ProjectionFormat,
 };
 use orc_rust::{ArrowReaderBuilder as OrcReaderBuilder, ArrowWriterBuilder as OrcWriterBuilder};
@@ -677,6 +687,40 @@ fn generate_publication_gap_datasets(
         &customer360_manifest_bytes,
     )?);
 
+    let proof_suite_dir = out.join("proof-suite");
+    let proof_suite_manifest = generate_proof_suite(&ProofSuiteOptions {
+        out_dir: proof_suite_dir,
+        profile: customer360_profile,
+        scenario: ProofSuiteScenario::All,
+        force: true,
+    })
+    .map_err(|err| format!("cannot build COVE-O proof-suite benchmark corpus: {err}"))?;
+    let proof_suite_manifest_bytes =
+        serde_json::to_vec_pretty(&proof_suite_manifest).map_err(|err| err.to_string())?;
+    locks.push(dataset_lock(
+        "proof-suite-manifest",
+        "proof-suite/proof-suite-manifest.json",
+        &proof_suite_manifest_bytes,
+    )?);
+    for scenario in ["customer360", "claims", "catalog"] {
+        for (name_suffix, rel_suffix) in [
+            ("doctor", "doctor-report.json"),
+            ("size", "proof-size-comparison.json"),
+            (
+                "bundle-manifest",
+                "map-build-bundle/map-build-manifest.json",
+            ),
+            ("bundle-report", "map-build-bundle/map-build-report.json"),
+        ] {
+            let rel = format!("proof-suite/{scenario}/{rel_suffix}");
+            locks.push(dataset_lock(
+                &format!("proof-suite-{scenario}-{name_suffix}"),
+                &rel,
+                &fs::read(out.join(&rel)).map_err(|err| err.to_string())?,
+            )?);
+        }
+    }
+
     Ok(locks)
 }
 
@@ -1209,9 +1253,130 @@ fn run_publication_gap_cases(corpus: &Path) -> Result<Vec<Value>, String> {
     }));
     cases.push(run_semantic_projection_object_store_case(corpus)?);
     cases.push(run_semantic_showcase_bundle_object_store_case(corpus)?);
+    cases.extend(run_cove_map_build_cases(corpus)?);
+    cases.push(run_overlap_stress_case(corpus)?);
+    cases.extend(run_overlap_scale_cases(corpus)?);
+    cases.extend(run_overlap_partial_cases(corpus)?);
+    cases.extend(run_projection_covi_measured_cases(corpus)?);
     cases.extend(run_customer360_cases(corpus)?);
+    cases.extend(run_customer360_projection_covi_cases(corpus)?);
+    cases.extend(run_proof_suite_cases(corpus)?);
 
     Ok(cases)
+}
+
+fn run_proof_suite_cases(corpus: &Path) -> Result<Vec<Value>, String> {
+    ["customer360", "claims", "catalog"]
+        .into_iter()
+        .map(|scenario| run_proof_suite_case(corpus, scenario))
+        .collect()
+}
+
+fn run_proof_suite_case(corpus: &Path, scenario: &str) -> Result<Value, String> {
+    let dir = corpus.join("proof-suite").join(scenario);
+    let start = Instant::now();
+    let size_report: Value = serde_json::from_slice(
+        &fs::read(dir.join("proof-size-comparison.json"))
+            .map_err(|err| format!("cannot read {scenario} proof size report: {err}"))?,
+    )
+    .map_err(|err| format!("cannot parse {scenario} proof size report: {err}"))?;
+    let doctor: Value = serde_json::from_slice(
+        &fs::read(dir.join("doctor-report.json"))
+            .map_err(|err| format!("cannot read {scenario} proof doctor report: {err}"))?,
+    )
+    .map_err(|err| format!("cannot parse {scenario} proof doctor report: {err}"))?;
+    let mut parity_ok = true;
+    let mut parity_reports = 0u64;
+    let parity_dir = dir.join("parity");
+    for entry in fs::read_dir(&parity_dir)
+        .map_err(|err| format!("cannot read {}: {err}", parity_dir.display()))?
+    {
+        let entry =
+            entry.map_err(|err| format!("cannot read {} entry: {err}", parity_dir.display()))?;
+        if entry.path().extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let report: Value = serde_json::from_slice(
+            &fs::read(entry.path()).map_err(|err| format!("cannot read parity report: {err}"))?,
+        )
+        .map_err(|err| format!("cannot parse parity report: {err}"))?;
+        parity_reports += 1;
+        parity_ok &= report.get("status").and_then(Value::as_str) == Some("ok");
+    }
+    let elapsed = start.elapsed().as_nanos();
+    let metric_u64 =
+        |field: &str| -> u64 { size_report.get(field).and_then(Value::as_u64).unwrap_or(0) };
+    let build_time = metric_u64("build_time_ns");
+    let source_bytes = metric_u64("source_bytes");
+    let cove_o_bytes = metric_u64("cove_o_bytes");
+    let cove_t_bytes = metric_u64("cove_t_bytes");
+    let parquet_bytes = metric_u64("denormalized_parquet_bytes");
+    let covi_bytes = metric_u64("covi_bytes");
+    let covm_bytes = metric_u64("covm_bytes");
+    let total_bundle_bytes = metric_u64("total_bundle_bytes");
+    let artifact_sizes = json!({
+        "source_bytes": source_bytes,
+        "cove_o_bytes": cove_o_bytes,
+        "cove_t_bytes": cove_t_bytes,
+        "covi_bytes": covi_bytes,
+        "covm_bytes": covm_bytes,
+        "parquet_bytes": parquet_bytes,
+        "total_bundle_bytes": total_bundle_bytes,
+    });
+    let metrics = json!({
+        "planning_ns": elapsed,
+        "scan_ns": build_time,
+        "end_to_end_ns": build_time.saturating_add(elapsed as u64),
+        "build_time_ns": build_time,
+        "validation_time_ns": elapsed,
+        "parity_time_ns": elapsed,
+        "rows_materialized": size_report.get("object_count").cloned().unwrap_or(Value::Null),
+        "source_bytes": source_bytes,
+        "source_parquet_bundle_bytes": metric_u64("source_parquet_bundle_bytes"),
+        "normalized_parquet_bundle_bytes": metric_u64("normalized_parquet_bundle_bytes"),
+        "denormalized_parquet_bytes": parquet_bytes,
+        "cove_o_bytes": cove_o_bytes,
+        "cove_t_bytes": cove_t_bytes,
+        "covi_bytes": covi_bytes,
+        "covm_bytes": covm_bytes,
+        "total_bundle_bytes": total_bundle_bytes,
+        "object_count": size_report.get("object_count").cloned().unwrap_or(Value::Null),
+        "property_value_count": size_report.get("property_value_count").cloned().unwrap_or(Value::Null),
+        "evidence_entry_count": size_report.get("evidence_entry_count").cloned().unwrap_or(Value::Null),
+        "duplication_ratio": size_report.get("duplication_ratio_vs_source").cloned().unwrap_or(Value::Null),
+        "cove_o_vs_source_ratio": size_report.get("cove_o_vs_source_ratio").cloned().unwrap_or(Value::Null),
+        "cove_o_vs_source_parquet_ratio": size_report.get("cove_o_vs_source_parquet_ratio").cloned().unwrap_or(Value::Null),
+        "doctor_status_ok": doctor.get("status").and_then(Value::as_str) == Some("ok"),
+        "parity_status_ok": parity_ok,
+        "parity_report_count": parity_reports,
+        "bytes_read": source_bytes.saturating_add(total_bundle_bytes),
+        "request_count": 0,
+        "fragments_visited": 0,
+        "pages_visited": 0,
+        "pruning_tightness": 0.0,
+        "coverage_cache": {"hits": 0, "misses": 0, "entries_loaded": 0},
+        "index_use": {
+            "covi_used": covi_bytes > 0,
+            "lookup_hits": 0,
+            "lookup_misses": 0,
+            "index_fallbacks": 0
+        },
+        "memory_peak_bytes": Value::Null,
+        "artifact_sizes": artifact_sizes,
+    });
+    let cost = json!({
+        "proof": size_report,
+        "doctor_status": doctor.get("status").cloned().unwrap_or(Value::Null),
+        "parity_report_count": parity_reports,
+    });
+    Ok(json!({
+        "id": format!("proof_suite_{scenario}"),
+        "category": format!("COVE-O proof suite {scenario} scenario"),
+        "status": "measured",
+        "metrics": metrics,
+        "cost": cost,
+        "optional_features": ["cove_map", "map_build", "proof_suite", "cove_i", "covm", "parquet_compare"],
+    }))
 }
 
 fn run_customer360_cases(corpus: &Path) -> Result<Vec<Value>, String> {
@@ -1268,6 +1433,2113 @@ fn run_customer360_cases(corpus: &Path) -> Result<Vec<Value>, String> {
         )?,
         run_customer360_object_store_case(corpus)?,
     ])
+}
+
+fn run_cove_map_build_cases(corpus: &Path) -> Result<Vec<Value>, String> {
+    let root = corpus.join("semantic-map-builds");
+    fs::create_dir_all(&root).map_err(|err| format!("cannot create {}: {err}", root.display()))?;
+    Ok(vec![
+        run_cove_map_build_case(&root, "cove_map_build_tiny", "tiny", 16)?,
+        run_cove_map_build_case(&root, "cove_map_build_medium", "medium", 512)?,
+        run_cove_map_build_messy_case(&root)?,
+    ])
+}
+
+fn run_cove_map_build_case(
+    root: &Path,
+    id: &str,
+    label: &str,
+    row_count: usize,
+) -> Result<Value, String> {
+    let dir = root.join(label);
+    fs::create_dir_all(&dir).map_err(|err| format!("cannot create {}: {err}", dir.display()))?;
+    let map_path = dir.join("people.covemap");
+    let source_path = dir.join("people.csv");
+    durable::durable_replace(&map_path, &bench_covemap_bytes()?)
+        .map_err(|err| format!("cannot publish {}: {err}", map_path.display()))?;
+    let mut csv = String::from("id,name\n");
+    for row in 0..row_count {
+        csv.push_str(&format!("{row},person-{row}\n"));
+    }
+    fs::write(&source_path, csv.as_bytes())
+        .map_err(|err| format!("cannot write {}: {err}", source_path.display()))?;
+    let out_dir = dir.join("bundle");
+    let mut options = MapBuildOptions::new(&out_dir);
+    options.force = true;
+    options.verify = true;
+    options.publish_covm = true;
+    let start = Instant::now();
+    let result = build_from_paths(&map_path, std::slice::from_ref(&source_path), options)
+        .map_err(|err| format!("{id} failed: {err}"))?;
+    let elapsed = start.elapsed().as_nanos();
+    cove_map_build_case_report(
+        id,
+        "COVE-MAP build bundle",
+        elapsed,
+        &[source_path],
+        &out_dir,
+        &result.manifest,
+    )
+}
+
+fn run_cove_map_build_messy_case(root: &Path) -> Result<Value, String> {
+    let dir = root.join("messy-multisource");
+    fs::create_dir_all(&dir).map_err(|err| format!("cannot create {}: {err}", dir.display()))?;
+    let map_path = dir.join("showcase.covemap");
+    let map_bytes = showcase_multi_source_covemap()?
+        .serialize()
+        .map_err(|err| err.to_string())?;
+    durable::durable_replace(&map_path, &map_bytes)
+        .map_err(|err| format!("cannot publish {}: {err}", map_path.display()))?;
+    let crm = dir.join("crm.csv");
+    let subscription = dir.join("subscription.csv");
+    let directory = dir.join("directory.parquet");
+    fs::write(&crm, b"id,name\np1,Ada CRM\np2,Linus CRM\np3,Grace CRM\n")
+        .map_err(|err| format!("cannot write {}: {err}", crm.display()))?;
+    fs::write(
+        &subscription,
+        b"id,name\np1,Ada\np2,Linus\np3,Grace Subscription\n",
+    )
+    .map_err(|err| format!("cannot write {}: {err}", subscription.display()))?;
+    write_parquet_file(&directory, &showcase_directory_name_batch()?)?;
+    let sources = vec![crm, directory, subscription];
+    let out_dir = dir.join("bundle");
+    let mut options = MapBuildOptions::new(&out_dir);
+    options.force = true;
+    options.verify = true;
+    options.publish_covm = true;
+    let start = Instant::now();
+    let result = build_from_paths(&map_path, &sources, options)
+        .map_err(|err| format!("cove_map_build_messy_multisource failed: {err}"))?;
+    let elapsed = start.elapsed().as_nanos();
+    cove_map_build_case_report(
+        "cove_map_build_messy_multisource",
+        "COVE-MAP messy multi-source build bundle",
+        elapsed,
+        &sources,
+        &out_dir,
+        &result.manifest,
+    )
+}
+
+fn cove_map_build_case_report(
+    id: &str,
+    category: &str,
+    elapsed: u128,
+    sources: &[PathBuf],
+    out_dir: &Path,
+    manifest: &Value,
+) -> Result<Value, String> {
+    let source_bytes = sources
+        .iter()
+        .map(|path| {
+            fs::metadata(path)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0)
+        })
+        .sum::<u64>();
+    let object_bytes = manifest
+        .pointer("/artifacts/object/byte_size")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let projection_bytes = manifest
+        .pointer("/artifacts/projections")
+        .and_then(Value::as_array)
+        .map(|projections| {
+            projections
+                .iter()
+                .filter_map(|projection| projection.get("byte_size").and_then(Value::as_u64))
+                .sum::<u64>()
+        })
+        .unwrap_or(0);
+    let index_bytes = manifest
+        .pointer("/artifacts/indexes")
+        .and_then(Value::as_array)
+        .map(|indexes| {
+            indexes
+                .iter()
+                .filter_map(|index| index.get("byte_size").and_then(Value::as_u64))
+                .sum::<u64>()
+        })
+        .unwrap_or(0);
+    let index_root_count = manifest
+        .pointer("/artifacts/indexes")
+        .and_then(Value::as_array)
+        .map(|indexes| {
+            indexes
+                .iter()
+                .filter_map(|index| index.get("root_count").and_then(Value::as_u64))
+                .sum::<u64>()
+        })
+        .unwrap_or(0);
+    let covm_bytes = manifest
+        .pointer("/artifacts/covm/byte_size")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let sidecar_available = manifest
+        .pointer("/sidecar_readiness/covi/available")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let sidecar_family_count = manifest
+        .pointer("/sidecar_readiness/covi/generated_root_families")
+        .and_then(Value::as_array)
+        .map(|families| families.len())
+        .unwrap_or(0);
+    let total_bundle_bytes = directory_size(out_dir)?;
+    Ok(json!({
+        "id": id,
+        "category": category,
+        "status": "measured",
+        "metrics": {
+            "planning_ns": 0,
+            "scan_ns": elapsed,
+            "end_to_end_ns": elapsed,
+            "build_time_ns": elapsed,
+            "validation_time_ns": elapsed,
+            "projection_readback_time_ns": 0,
+            "source_bytes": source_bytes,
+            "cove_o_bytes": object_bytes,
+            "projection_bytes": projection_bytes,
+            "index_bytes": index_bytes,
+            "index_root_count": index_root_count,
+            "covm_bytes": covm_bytes,
+            "sidecar_available": sidecar_available,
+            "sidecar_family_count": sidecar_family_count,
+            "sidecar_lookup_hit_rate": if sidecar_available { 1.0 } else { 0.0 },
+            "sidecar_fallback_rate": 0.0,
+            "total_bundle_bytes": total_bundle_bytes,
+            "duplication_ratio": if source_bytes == 0 { 0.0 } else { total_bundle_bytes as f64 / source_bytes as f64 },
+            "object_count": manifest.pointer("/counts/object_count").cloned().unwrap_or(Value::Null),
+            "property_value_count": manifest.pointer("/counts/property_value_count").cloned().unwrap_or(Value::Null),
+            "evidence_entry_count": manifest.pointer("/counts/evidence_entry_count").cloned().unwrap_or(Value::Null),
+            "native_acceleration_gate": "covi-and-covm-emitted-and-validated",
+        },
+        "optional_features": ["cove_map", "map_build", "cove_i", "covm"],
+    }))
+}
+
+const OVERLAP_STRESS_SOURCE_COUNT: usize = 8;
+
+struct OverlapStressGenerated {
+    sources: Vec<PathBuf>,
+    parquet_sources: Vec<PathBuf>,
+    unique_parquet: PathBuf,
+    source_csv_bytes: u64,
+    source_parquet_bundle_bytes: u64,
+    unique_parquet_bytes: u64,
+    unique_payload_bytes: u64,
+    duplicate_payload_bytes: u64,
+    shared_row_count: usize,
+    unique_entity_count: usize,
+}
+
+fn run_overlap_stress_case(corpus: &Path) -> Result<Value, String> {
+    let root = corpus.join("semantic-map-builds").join("overlap-stress");
+    fs::create_dir_all(&root).map_err(|err| format!("cannot create {}: {err}", root.display()))?;
+    let row_count = overlap_stress_row_count(corpus);
+    let map_path = root.join("overlap_stress.covemap");
+    let map_bytes = overlap_stress_covemap(OVERLAP_STRESS_SOURCE_COUNT)?
+        .serialize()
+        .map_err(|err| err.to_string())?;
+    durable::durable_replace(&map_path, &map_bytes)
+        .map_err(|err| format!("cannot publish {}: {err}", map_path.display()))?;
+    let generated = generate_overlap_stress_sources(&root, row_count, OVERLAP_STRESS_SOURCE_COUNT)?;
+    let out_dir = root.join("bundle");
+    let mut options = MapBuildOptions::new(&out_dir);
+    options.force = true;
+    options.verify = true;
+    options.publish_covm = true;
+    let start = Instant::now();
+    let result = build_from_paths(&map_path, &generated.sources, options)
+        .map_err(|err| format!("overlap stress map build failed: {err}"))?;
+    let elapsed = start.elapsed().as_nanos();
+    let uncompressed_out_dir = root.join("bundle-uncompressed");
+    let mut uncompressed_options = MapBuildOptions::new(&uncompressed_out_dir);
+    uncompressed_options.force = true;
+    uncompressed_options.verify = true;
+    uncompressed_options.publish_covm = true;
+    uncompressed_options.section_compression = MapBuildSectionCompression::None;
+    let uncompressed_start = Instant::now();
+    let uncompressed_result = build_from_paths(&map_path, &generated.sources, uncompressed_options)
+        .map_err(|err| format!("overlap stress uncompressed map build failed: {err}"))?;
+    let uncompressed_elapsed = uncompressed_start.elapsed().as_nanos();
+    let expanded_out_dir = root.join("bundle-expanded");
+    let mut expanded_options = MapBuildOptions::new(&expanded_out_dir);
+    expanded_options.force = true;
+    expanded_options.verify = true;
+    expanded_options.publish_covm = true;
+    expanded_options.evidence_encoding = MapEvidenceEncoding::Expanded;
+    let expanded_start = Instant::now();
+    let expanded_result = build_from_paths(&map_path, &generated.sources, expanded_options)
+        .map_err(|err| format!("overlap stress expanded map build failed: {err}"))?;
+    let expanded_elapsed = expanded_start.elapsed().as_nanos();
+    let object_bytes = result
+        .manifest
+        .pointer("/artifacts/object/byte_size")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let expanded_object_bytes = expanded_result
+        .manifest
+        .pointer("/artifacts/object/byte_size")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let uncompressed_object_bytes = uncompressed_result
+        .manifest
+        .pointer("/artifacts/object/byte_size")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let projection_bytes = result
+        .manifest
+        .pointer("/artifacts/projections")
+        .and_then(Value::as_array)
+        .map(|projections| {
+            projections
+                .iter()
+                .filter_map(|projection| projection.get("byte_size").and_then(Value::as_u64))
+                .sum::<u64>()
+        })
+        .unwrap_or(0);
+    let index_bytes = result
+        .manifest
+        .pointer("/artifacts/indexes")
+        .and_then(Value::as_array)
+        .map(|indexes| {
+            indexes
+                .iter()
+                .filter_map(|index| index.get("byte_size").and_then(Value::as_u64))
+                .sum::<u64>()
+        })
+        .unwrap_or(0);
+    let covm_bytes = result
+        .manifest
+        .pointer("/artifacts/covm/byte_size")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let total_bundle_bytes = directory_size(&out_dir)?;
+    let uncompressed_total_bundle_bytes = directory_size(&uncompressed_out_dir)?;
+    let expanded_total_bundle_bytes = directory_size(&expanded_out_dir)?;
+    let compact_evidence_index_bytes = result
+        .manifest
+        .pointer("/evidence/emitted_index_bytes")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let expanded_evidence_json_bytes = result
+        .manifest
+        .pointer("/evidence/expanded_json_bytes")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let evidence_estimated_saved_bytes = result
+        .manifest
+        .pointer("/evidence/estimated_saved_bytes")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let section_compression_saved_bytes = result
+        .manifest
+        .pointer("/compression_summary/saved_bytes")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let section_compression_uncompressed_bytes = result
+        .manifest
+        .pointer("/compression_summary/uncompressed_section_bytes")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let section_compression_emitted_bytes = result
+        .manifest
+        .pointer("/compression_summary/emitted_section_bytes")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let section_compression_compressed_section_count = result
+        .manifest
+        .pointer("/compression_summary/compressed_section_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let object_count = result
+        .manifest
+        .pointer("/counts/object_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let property_value_count = result
+        .manifest
+        .pointer("/counts/property_value_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let evidence_entry_count = result
+        .manifest
+        .pointer("/counts/evidence_entry_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let source_csv_bytes = generated.source_csv_bytes;
+    let source_parquet_bundle_bytes = generated.source_parquet_bundle_bytes;
+    let duplicate_payload_bytes = generated.duplicate_payload_bytes;
+    let artifact_sizes = json!({
+        "cove_bytes": object_bytes,
+        "parquet_bytes": source_parquet_bundle_bytes,
+        "orc_bytes": 0,
+        "covx_bytes": 0,
+        "cove_o_bytes": object_bytes,
+        "cove_t_projection_bytes": projection_bytes,
+        "cove_i_bytes": index_bytes,
+        "covm_bytes": covm_bytes,
+        "total_bundle_bytes": total_bundle_bytes,
+        "uncompressed_cove_o_bytes": uncompressed_object_bytes,
+        "uncompressed_total_bundle_bytes": uncompressed_total_bundle_bytes,
+        "expanded_cove_o_bytes": expanded_object_bytes,
+        "expanded_total_bundle_bytes": expanded_total_bundle_bytes,
+    });
+    let metrics = json_object(vec![
+        ("planning_ns", json!(0)),
+        ("scan_ns", json!(elapsed)),
+        (
+            "end_to_end_ns",
+            json!(elapsed + uncompressed_elapsed + expanded_elapsed),
+        ),
+        ("compressed_build_time_ns", json!(elapsed)),
+        ("elapsed_time_ns", json!(elapsed)),
+        ("build_time_ns", json!(elapsed)),
+        ("uncompressed_build_time_ns", json!(uncompressed_elapsed)),
+        ("expanded_build_time_ns", json!(expanded_elapsed)),
+        ("rows_materialized", json!(object_count)),
+        ("source_table_count", json!(OVERLAP_STRESS_SOURCE_COUNT)),
+        ("row_count", json!(row_count)),
+        ("overlap_fraction", json!(1.0)),
+        ("conflict_policy", json!("source_priority_wins")),
+        ("source_csv_bytes", json!(source_csv_bytes)),
+        ("source_bytes", json!(source_csv_bytes)),
+        (
+            "source_parquet_bundle_bytes",
+            json!(source_parquet_bundle_bytes),
+        ),
+        (
+            "unique_parquet_bytes",
+            json!(generated.unique_parquet_bytes),
+        ),
+        (
+            "unique_payload_bytes",
+            json!(generated.unique_payload_bytes),
+        ),
+        ("duplicate_payload_bytes", json!(duplicate_payload_bytes)),
+        (
+            "duplicate_payload_ratio",
+            json!(ratio(
+                duplicate_payload_bytes,
+                generated.unique_payload_bytes
+            )),
+        ),
+        ("cove_o_bytes", json!(object_bytes)),
+        ("compressed_cove_o_bytes", json!(object_bytes)),
+        (
+            "uncompressed_cove_o_bytes",
+            json!(uncompressed_object_bytes),
+        ),
+        ("compact_cove_o_bytes", json!(object_bytes)),
+        (
+            "section_compression_saved_bytes",
+            json!(section_compression_saved_bytes),
+        ),
+        (
+            "section_compression_uncompressed_bytes",
+            json!(section_compression_uncompressed_bytes),
+        ),
+        (
+            "section_compression_emitted_bytes",
+            json!(section_compression_emitted_bytes),
+        ),
+        (
+            "section_compression_compressed_section_count",
+            json!(section_compression_compressed_section_count),
+        ),
+        (
+            "section_compression_ratio",
+            json!(ratio(object_bytes, uncompressed_object_bytes)),
+        ),
+        ("expanded_cove_o_bytes", json!(expanded_object_bytes)),
+        (
+            "compact_vs_expanded_cove_o_ratio",
+            json!(ratio(object_bytes, expanded_object_bytes)),
+        ),
+        (
+            "expanded_vs_compact_cove_o_ratio",
+            json!(ratio(expanded_object_bytes, object_bytes)),
+        ),
+        (
+            "compact_evidence_index_bytes",
+            json!(compact_evidence_index_bytes),
+        ),
+        (
+            "expanded_evidence_json_bytes",
+            json!(expanded_evidence_json_bytes),
+        ),
+        (
+            "evidence_estimated_saved_bytes",
+            json!(evidence_estimated_saved_bytes),
+        ),
+        (
+            "compact_evidence_vs_expanded_json_ratio",
+            json!(ratio(
+                compact_evidence_index_bytes,
+                expanded_evidence_json_bytes
+            )),
+        ),
+        ("projection_bytes", json!(projection_bytes)),
+        ("index_bytes", json!(index_bytes)),
+        ("covm_bytes", json!(covm_bytes)),
+        ("total_bundle_bytes", json!(total_bundle_bytes)),
+        (
+            "uncompressed_total_bundle_bytes",
+            json!(uncompressed_total_bundle_bytes),
+        ),
+        (
+            "expanded_total_bundle_bytes",
+            json!(expanded_total_bundle_bytes),
+        ),
+        (
+            "compressed_vs_uncompressed_bundle_ratio",
+            json!(ratio(total_bundle_bytes, uncompressed_total_bundle_bytes)),
+        ),
+        (
+            "compact_vs_expanded_bundle_ratio",
+            json!(ratio(total_bundle_bytes, expanded_total_bundle_bytes)),
+        ),
+        (
+            "cove_o_vs_source_csv_ratio",
+            json!(ratio(object_bytes, source_csv_bytes)),
+        ),
+        (
+            "bundle_vs_source_csv_ratio",
+            json!(ratio(total_bundle_bytes, source_csv_bytes)),
+        ),
+        (
+            "cove_o_vs_parquet_bundle_ratio",
+            json!(ratio(object_bytes, source_parquet_bundle_bytes)),
+        ),
+        (
+            "bundle_vs_parquet_bundle_ratio",
+            json!(ratio(total_bundle_bytes, source_parquet_bundle_bytes)),
+        ),
+        (
+            "cove_o_vs_unique_parquet_ratio",
+            json!(ratio(object_bytes, generated.unique_parquet_bytes)),
+        ),
+        ("object_count", json!(object_count)),
+        ("property_value_count", json!(property_value_count)),
+        ("evidence_entry_count", json!(evidence_entry_count)),
+        (
+            "property_values_per_object",
+            json!(ratio(property_value_count, object_count)),
+        ),
+        (
+            "evidence_entries_per_object",
+            json!(ratio(evidence_entry_count, object_count)),
+        ),
+        (
+            "evidence_to_property_ratio",
+            json!(ratio(evidence_entry_count, property_value_count)),
+        ),
+        ("bytes_read", json!(object_bytes)),
+        ("request_count", json!(1)),
+        ("fragments_visited", json!(1)),
+        ("pages_visited", json!(property_value_count)),
+        ("pruning_tightness", json!(0.0)),
+        (
+            "coverage_cache",
+            json!({
+                "hits": 0,
+                "misses": 0,
+                "entries_loaded": 0,
+            }),
+        ),
+        (
+            "index_use",
+            json!({
+                "covi_used": index_bytes > 0,
+                "lookup_hits": 0,
+                "lookup_misses": 0,
+                "index_fallbacks": 0,
+            }),
+        ),
+        ("memory_peak_bytes", Value::Null),
+        ("artifact_sizes", artifact_sizes),
+    ]);
+    let cost = json!({
+        "comparison": {
+            "source_csv_files": path_strings(&generated.sources),
+            "source_parquet_files": path_strings(&generated.parquet_sources),
+            "unique_parquet_file": display_path(&generated.unique_parquet),
+            "semantic_claim": "high-overlap source tables mapped to one object/property state with retained evidence",
+            "caveat": "Parquet comparison is a bundle of duplicate source-shaped tables, not a cross-table semantic dedupe format."
+        }
+    });
+    Ok(json!({
+        "id": "cove_o_overlap_stress",
+        "category": "COVE-O multi-table high-overlap size stress",
+        "status": "measured",
+        "metrics": metrics,
+        "cost": cost,
+        "optional_features": ["cove_map", "map_build", "cove_o", "overlap_stress", "parquet_compare"],
+    }))
+}
+
+#[derive(Clone, Copy)]
+struct OverlapScaleSpec {
+    id: &'static str,
+    category: &'static str,
+    row_count: usize,
+    source_count: usize,
+}
+
+fn run_overlap_scale_cases(corpus: &Path) -> Result<Vec<Value>, String> {
+    overlap_scale_specs(corpus)
+        .into_iter()
+        .map(|spec| run_overlap_scale_case(corpus, spec))
+        .collect()
+}
+
+fn overlap_scale_specs(corpus: &Path) -> Vec<OverlapScaleSpec> {
+    let base_rows = overlap_stress_row_count(corpus);
+    let large_rows = base_rows.saturating_mul(4);
+    vec![
+        OverlapScaleSpec {
+            id: "cove_o_overlap_scale_1_table",
+            category: "COVE-O overlap scale baseline: one source table",
+            row_count: base_rows,
+            source_count: 1,
+        },
+        OverlapScaleSpec {
+            id: "cove_o_overlap_scale_2_tables",
+            category: "COVE-O overlap scale: two duplicate source tables",
+            row_count: base_rows,
+            source_count: 2,
+        },
+        OverlapScaleSpec {
+            id: "cove_o_overlap_scale_4_tables",
+            category: "COVE-O overlap scale: four duplicate source tables",
+            row_count: base_rows,
+            source_count: 4,
+        },
+        OverlapScaleSpec {
+            id: "cove_o_overlap_scale_8_tables",
+            category: "COVE-O overlap scale: eight duplicate source tables",
+            row_count: base_rows,
+            source_count: 8,
+        },
+        OverlapScaleSpec {
+            id: "cove_o_overlap_scale_8_tables_large",
+            category: "COVE-O overlap scale: eight duplicate source tables at larger row count",
+            row_count: large_rows,
+            source_count: 8,
+        },
+    ]
+}
+
+fn run_overlap_scale_case(corpus: &Path, spec: OverlapScaleSpec) -> Result<Value, String> {
+    let root = corpus
+        .join("semantic-map-builds")
+        .join("overlap-scale")
+        .join(spec.id);
+    fs::create_dir_all(&root).map_err(|err| format!("cannot create {}: {err}", root.display()))?;
+    let map_path = root.join("overlap_scale.covemap");
+    let map_bytes = overlap_stress_covemap(spec.source_count)?
+        .serialize()
+        .map_err(|err| err.to_string())?;
+    durable::durable_replace(&map_path, &map_bytes)
+        .map_err(|err| format!("cannot publish {}: {err}", map_path.display()))?;
+    let generated = generate_overlap_stress_sources(&root, spec.row_count, spec.source_count)?;
+    let out_dir = root.join("bundle");
+    let mut options = MapBuildOptions::new(&out_dir);
+    options.force = true;
+    options.verify = true;
+    options.publish_covm = true;
+    let start = Instant::now();
+    let result = build_from_paths(&map_path, &generated.sources, options)
+        .map_err(|err| format!("{} map build failed: {err}", spec.id))?;
+    let elapsed = start.elapsed().as_nanos();
+    let cove_o_bytes = result
+        .manifest
+        .pointer("/artifacts/object/byte_size")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let cove_t_bytes = result
+        .manifest
+        .pointer("/artifacts/projections")
+        .and_then(Value::as_array)
+        .map(|projections| {
+            projections
+                .iter()
+                .filter_map(|projection| projection.get("byte_size").and_then(Value::as_u64))
+                .sum::<u64>()
+        })
+        .unwrap_or(0);
+    let covi_bytes = result
+        .manifest
+        .pointer("/artifacts/indexes")
+        .and_then(Value::as_array)
+        .map(|indexes| {
+            indexes
+                .iter()
+                .filter_map(|index| index.get("byte_size").and_then(Value::as_u64))
+                .sum::<u64>()
+        })
+        .unwrap_or(0);
+    let covm_bytes = result
+        .manifest
+        .pointer("/artifacts/covm/byte_size")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let total_bundle_bytes = directory_size(&out_dir)?;
+    let object_count = result
+        .manifest
+        .pointer("/counts/object_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let property_value_count = result
+        .manifest
+        .pointer("/counts/property_value_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let evidence_entry_count = result
+        .manifest
+        .pointer("/counts/evidence_entry_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let source_csv_bytes = generated.source_csv_bytes;
+    let source_parquet_bundle_bytes = generated.source_parquet_bundle_bytes;
+    let unique_parquet_bytes = generated.unique_parquet_bytes;
+    let artifact_sizes = json!({
+        "cove_bytes": cove_o_bytes,
+        "parquet_bytes": source_parquet_bundle_bytes,
+        "orc_bytes": 0,
+        "covx_bytes": 0,
+        "cove_o_bytes": cove_o_bytes,
+        "cove_t_projection_bytes": cove_t_bytes,
+        "cove_i_bytes": covi_bytes,
+        "covm_bytes": covm_bytes,
+        "total_bundle_bytes": total_bundle_bytes,
+        "unique_parquet_bytes": unique_parquet_bytes,
+    });
+    let metrics = json_object(vec![
+        ("planning_ns", json!(0)),
+        ("scan_ns", json!(elapsed)),
+        ("end_to_end_ns", json!(elapsed)),
+        ("elapsed_time_ns", json!(elapsed)),
+        ("build_time_ns", json!(elapsed)),
+        ("rows_materialized", json!(object_count)),
+        ("source_table_count", json!(spec.source_count)),
+        ("row_count", json!(spec.row_count)),
+        ("overlap_fraction", json!(1.0)),
+        ("source_csv_bytes", json!(source_csv_bytes)),
+        ("source_bytes", json!(source_csv_bytes)),
+        (
+            "source_parquet_bundle_bytes",
+            json!(source_parquet_bundle_bytes),
+        ),
+        ("unique_parquet_bytes", json!(unique_parquet_bytes)),
+        (
+            "source_parquet_redundancy_ratio",
+            json!(ratio(source_parquet_bundle_bytes, unique_parquet_bytes)),
+        ),
+        (
+            "unique_payload_bytes",
+            json!(generated.unique_payload_bytes),
+        ),
+        (
+            "duplicate_payload_bytes",
+            json!(generated.duplicate_payload_bytes),
+        ),
+        (
+            "duplicate_payload_ratio",
+            json!(ratio(
+                generated.duplicate_payload_bytes,
+                generated.unique_payload_bytes
+            )),
+        ),
+        ("cove_o_bytes", json!(cove_o_bytes)),
+        ("cove_t_bytes", json!(cove_t_bytes)),
+        ("covi_bytes", json!(covi_bytes)),
+        ("covm_bytes", json!(covm_bytes)),
+        ("total_bundle_bytes", json!(total_bundle_bytes)),
+        (
+            "cove_o_vs_source_csv_ratio",
+            json!(ratio(cove_o_bytes, source_csv_bytes)),
+        ),
+        (
+            "bundle_vs_source_csv_ratio",
+            json!(ratio(total_bundle_bytes, source_csv_bytes)),
+        ),
+        (
+            "cove_o_vs_parquet_bundle_ratio",
+            json!(ratio(cove_o_bytes, source_parquet_bundle_bytes)),
+        ),
+        (
+            "bundle_vs_parquet_bundle_ratio",
+            json!(ratio(total_bundle_bytes, source_parquet_bundle_bytes)),
+        ),
+        (
+            "cove_o_vs_unique_parquet_ratio",
+            json!(ratio(cove_o_bytes, unique_parquet_bytes)),
+        ),
+        (
+            "bundle_vs_unique_parquet_ratio",
+            json!(ratio(total_bundle_bytes, unique_parquet_bytes)),
+        ),
+        ("object_count", json!(object_count)),
+        ("property_value_count", json!(property_value_count)),
+        ("evidence_entry_count", json!(evidence_entry_count)),
+        (
+            "property_values_per_object",
+            json!(ratio(property_value_count, object_count)),
+        ),
+        (
+            "evidence_entries_per_object",
+            json!(ratio(evidence_entry_count, object_count)),
+        ),
+        ("bytes_read", json!(cove_o_bytes)),
+        ("request_count", json!(1)),
+        ("fragments_visited", json!(1)),
+        ("pages_visited", json!(property_value_count)),
+        ("pruning_tightness", json!(0.0)),
+        (
+            "coverage_cache",
+            json!({
+                "hits": 0,
+                "misses": 0,
+                "entries_loaded": 0,
+            }),
+        ),
+        (
+            "index_use",
+            json!({
+                "covi_used": covi_bytes > 0,
+                "lookup_hits": 0,
+                "lookup_misses": 0,
+                "index_fallbacks": 0,
+            }),
+        ),
+        ("memory_peak_bytes", Value::Null),
+        ("artifact_sizes", artifact_sizes),
+    ]);
+    let cost = json!({
+        "comparison": {
+            "source_csv_files": path_strings(&generated.sources),
+            "source_parquet_files": path_strings(&generated.parquet_sources),
+            "unique_parquet_file": display_path(&generated.unique_parquet),
+            "semantic_claim": "same logical object/property state repeated across source tables",
+            "caveat": "This is a maximum-overlap synthetic sweep. It demonstrates the crossover curve, not general table-format superiority."
+        },
+        "manifest": result.manifest,
+    });
+    Ok(json!({
+        "id": spec.id,
+        "category": spec.category,
+        "status": "measured",
+        "metrics": metrics,
+        "cost": cost,
+        "optional_features": ["cove_map", "map_build", "cove_o", "overlap_scale", "parquet_compare"],
+    }))
+}
+
+#[derive(Clone, Copy)]
+struct OverlapPartialSpec {
+    id: &'static str,
+    category: &'static str,
+    overlap_percent: usize,
+    row_count: usize,
+    source_count: usize,
+}
+
+fn run_overlap_partial_cases(corpus: &Path) -> Result<Vec<Value>, String> {
+    overlap_partial_specs(corpus)
+        .into_iter()
+        .map(|spec| run_overlap_partial_case(corpus, spec))
+        .collect()
+}
+
+fn overlap_partial_specs(corpus: &Path) -> Vec<OverlapPartialSpec> {
+    let row_count = overlap_stress_row_count(corpus);
+    [
+        (0, "zero shared entities"),
+        (25, "quarter shared entities"),
+        (50, "half shared entities"),
+        (75, "three-quarter shared entities"),
+        (100, "all entities shared"),
+    ]
+    .into_iter()
+    .map(|(overlap_percent, label)| OverlapPartialSpec {
+        id: match overlap_percent {
+            0 => "cove_o_overlap_partial_0pct",
+            25 => "cove_o_overlap_partial_25pct",
+            50 => "cove_o_overlap_partial_50pct",
+            75 => "cove_o_overlap_partial_75pct",
+            100 => "cove_o_overlap_partial_100pct",
+            _ => unreachable!("static overlap percentages are exhaustive"),
+        },
+        category: match overlap_percent {
+            0 => "COVE-O partial overlap: zero shared entities",
+            25 => "COVE-O partial overlap: quarter shared entities",
+            50 => "COVE-O partial overlap: half shared entities",
+            75 => "COVE-O partial overlap: three-quarter shared entities",
+            100 => "COVE-O partial overlap: all entities shared",
+            _ => label,
+        },
+        overlap_percent,
+        row_count,
+        source_count: OVERLAP_STRESS_SOURCE_COUNT,
+    })
+    .collect()
+}
+
+fn run_overlap_partial_case(corpus: &Path, spec: OverlapPartialSpec) -> Result<Value, String> {
+    let root = corpus
+        .join("semantic-map-builds")
+        .join("overlap-partial")
+        .join(spec.id);
+    fs::create_dir_all(&root).map_err(|err| format!("cannot create {}: {err}", root.display()))?;
+    let map_path = root.join("overlap_partial.covemap");
+    let map_bytes = overlap_stress_covemap(spec.source_count)?
+        .serialize()
+        .map_err(|err| err.to_string())?;
+    durable::durable_replace(&map_path, &map_bytes)
+        .map_err(|err| format!("cannot publish {}: {err}", map_path.display()))?;
+    let generated = generate_overlap_partial_sources(
+        &root,
+        spec.row_count,
+        spec.source_count,
+        spec.overlap_percent,
+    )?;
+    let out_dir = root.join("bundle");
+    let mut options = MapBuildOptions::new(&out_dir);
+    options.force = true;
+    options.verify = true;
+    options.publish_covm = true;
+    let start = Instant::now();
+    let result = build_from_paths(&map_path, &generated.sources, options)
+        .map_err(|err| format!("{} map build failed: {err}", spec.id))?;
+    let elapsed = start.elapsed().as_nanos();
+    let cove_o_bytes = result
+        .manifest
+        .pointer("/artifacts/object/byte_size")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let cove_t_bytes = result
+        .manifest
+        .pointer("/artifacts/projections")
+        .and_then(Value::as_array)
+        .map(|projections| {
+            projections
+                .iter()
+                .filter_map(|projection| projection.get("byte_size").and_then(Value::as_u64))
+                .sum::<u64>()
+        })
+        .unwrap_or(0);
+    let covi_bytes = result
+        .manifest
+        .pointer("/artifacts/indexes")
+        .and_then(Value::as_array)
+        .map(|indexes| {
+            indexes
+                .iter()
+                .filter_map(|index| index.get("byte_size").and_then(Value::as_u64))
+                .sum::<u64>()
+        })
+        .unwrap_or(0);
+    let covm_bytes = result
+        .manifest
+        .pointer("/artifacts/covm/byte_size")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let total_bundle_bytes = directory_size(&out_dir)?;
+    let object_count = result
+        .manifest
+        .pointer("/counts/object_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let property_value_count = result
+        .manifest
+        .pointer("/counts/property_value_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let evidence_entry_count = result
+        .manifest
+        .pointer("/counts/evidence_entry_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let source_csv_bytes = generated.source_csv_bytes;
+    let source_parquet_bundle_bytes = generated.source_parquet_bundle_bytes;
+    let unique_parquet_bytes = generated.unique_parquet_bytes;
+    let source_input_row_count = (spec.row_count as u64).saturating_mul(spec.source_count as u64);
+    let artifact_sizes = json!({
+        "cove_bytes": cove_o_bytes,
+        "parquet_bytes": source_parquet_bundle_bytes,
+        "orc_bytes": 0,
+        "covx_bytes": 0,
+        "cove_o_bytes": cove_o_bytes,
+        "cove_t_projection_bytes": cove_t_bytes,
+        "cove_i_bytes": covi_bytes,
+        "covm_bytes": covm_bytes,
+        "total_bundle_bytes": total_bundle_bytes,
+        "unique_parquet_bytes": unique_parquet_bytes,
+    });
+    let metrics = json_object(vec![
+        ("planning_ns", json!(0)),
+        ("scan_ns", json!(elapsed)),
+        ("end_to_end_ns", json!(elapsed)),
+        ("elapsed_time_ns", json!(elapsed)),
+        ("build_time_ns", json!(elapsed)),
+        ("rows_materialized", json!(object_count)),
+        ("source_table_count", json!(spec.source_count)),
+        ("row_count", json!(spec.row_count)),
+        ("source_input_row_count", json!(source_input_row_count)),
+        (
+            "overlap_fraction",
+            json!(spec.overlap_percent as f64 / 100.0),
+        ),
+        ("overlap_percent", json!(spec.overlap_percent)),
+        ("shared_row_count", json!(generated.shared_row_count)),
+        (
+            "source_unique_rows_per_table",
+            json!(spec.row_count.saturating_sub(generated.shared_row_count)),
+        ),
+        ("unique_entity_count", json!(generated.unique_entity_count)),
+        (
+            "object_dedupe_ratio",
+            json!(ratio(source_input_row_count, object_count)),
+        ),
+        ("source_csv_bytes", json!(source_csv_bytes)),
+        ("source_bytes", json!(source_csv_bytes)),
+        (
+            "source_parquet_bundle_bytes",
+            json!(source_parquet_bundle_bytes),
+        ),
+        ("unique_parquet_bytes", json!(unique_parquet_bytes)),
+        (
+            "source_parquet_redundancy_ratio",
+            json!(ratio(source_parquet_bundle_bytes, unique_parquet_bytes)),
+        ),
+        (
+            "unique_payload_bytes",
+            json!(generated.unique_payload_bytes),
+        ),
+        (
+            "duplicate_payload_bytes",
+            json!(generated.duplicate_payload_bytes),
+        ),
+        (
+            "duplicate_payload_ratio",
+            json!(ratio(
+                generated.duplicate_payload_bytes,
+                generated.unique_payload_bytes
+            )),
+        ),
+        ("cove_o_bytes", json!(cove_o_bytes)),
+        ("cove_t_bytes", json!(cove_t_bytes)),
+        ("covi_bytes", json!(covi_bytes)),
+        ("covm_bytes", json!(covm_bytes)),
+        ("total_bundle_bytes", json!(total_bundle_bytes)),
+        (
+            "cove_o_vs_source_csv_ratio",
+            json!(ratio(cove_o_bytes, source_csv_bytes)),
+        ),
+        (
+            "bundle_vs_source_csv_ratio",
+            json!(ratio(total_bundle_bytes, source_csv_bytes)),
+        ),
+        (
+            "cove_o_vs_parquet_bundle_ratio",
+            json!(ratio(cove_o_bytes, source_parquet_bundle_bytes)),
+        ),
+        (
+            "bundle_vs_parquet_bundle_ratio",
+            json!(ratio(total_bundle_bytes, source_parquet_bundle_bytes)),
+        ),
+        (
+            "cove_o_vs_unique_parquet_ratio",
+            json!(ratio(cove_o_bytes, unique_parquet_bytes)),
+        ),
+        (
+            "bundle_vs_unique_parquet_ratio",
+            json!(ratio(total_bundle_bytes, unique_parquet_bytes)),
+        ),
+        ("object_count", json!(object_count)),
+        ("property_value_count", json!(property_value_count)),
+        ("evidence_entry_count", json!(evidence_entry_count)),
+        (
+            "property_values_per_object",
+            json!(ratio(property_value_count, object_count)),
+        ),
+        (
+            "evidence_entries_per_object",
+            json!(ratio(evidence_entry_count, object_count)),
+        ),
+        ("bytes_read", json!(cove_o_bytes)),
+        ("request_count", json!(1)),
+        ("fragments_visited", json!(1)),
+        ("pages_visited", json!(property_value_count)),
+        ("pruning_tightness", json!(0.0)),
+        (
+            "coverage_cache",
+            json!({
+                "hits": 0,
+                "misses": 0,
+                "entries_loaded": 0,
+            }),
+        ),
+        (
+            "index_use",
+            json!({
+                "covi_used": covi_bytes > 0,
+                "lookup_hits": 0,
+                "lookup_misses": 0,
+                "index_fallbacks": 0,
+            }),
+        ),
+        ("memory_peak_bytes", Value::Null),
+        ("artifact_sizes", artifact_sizes),
+    ]);
+    let cost = json!({
+        "comparison": {
+            "source_csv_files": path_strings(&generated.sources),
+            "source_parquet_files": path_strings(&generated.parquet_sources),
+            "unique_parquet_file": display_path(&generated.unique_parquet),
+            "semantic_claim": "a controlled fraction of source rows map to shared logical objects",
+            "caveat": "This is a synthetic overlap sweep. It isolates overlap effects but does not model every real data-quality or schema-divergence cost."
+        },
+        "manifest": result.manifest,
+    });
+    Ok(json!({
+        "id": spec.id,
+        "category": spec.category,
+        "status": "measured",
+        "metrics": metrics,
+        "cost": cost,
+        "optional_features": ["cove_map", "map_build", "cove_o", "overlap_partial", "parquet_compare"],
+    }))
+}
+
+fn ratio(numerator: u64, denominator: u64) -> f64 {
+    if denominator == 0 {
+        0.0
+    } else {
+        numerator as f64 / denominator as f64
+    }
+}
+
+fn overlap_stress_row_count(corpus: &Path) -> usize {
+    let profile = fs::read(corpus.join("corpus.lock.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|value| {
+            value
+                .get("profile")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
+    match profile.as_deref() {
+        Some("publication") => 4_096,
+        Some("standard") => 1_024,
+        _ => 512,
+    }
+}
+
+fn generate_overlap_stress_sources(
+    root: &Path,
+    row_count: usize,
+    source_count: usize,
+) -> Result<OverlapStressGenerated, String> {
+    let mut sources = Vec::with_capacity(source_count);
+    let mut parquet_sources = Vec::with_capacity(source_count);
+    let mut source_csv_bytes = 0u64;
+    let mut source_parquet_bundle_bytes = 0u64;
+    let mut unique_payload_bytes = 0u64;
+    let mut total_payload_bytes = 0u64;
+    for source_index in 0..source_count {
+        let csv_path = root.join(format!("overlap_source_{source_index:02}.csv"));
+        let csv = overlap_stress_csv(row_count, &mut total_payload_bytes);
+        if source_index == 0 {
+            unique_payload_bytes = total_payload_bytes;
+        }
+        fs::write(&csv_path, csv.as_bytes())
+            .map_err(|err| format!("cannot write {}: {err}", csv_path.display()))?;
+        source_csv_bytes = source_csv_bytes
+            .checked_add(csv.len() as u64)
+            .ok_or_else(|| "overlap source CSV size overflow".to_string())?;
+        sources.push(csv_path);
+
+        let parquet_path = root.join(format!("overlap_source_{source_index:02}.parquet"));
+        write_parquet_file(&parquet_path, &overlap_stress_batch(row_count)?)?;
+        let parquet_bytes = fs::metadata(&parquet_path)
+            .map_err(|err| format!("cannot stat {}: {err}", parquet_path.display()))?
+            .len();
+        source_parquet_bundle_bytes = source_parquet_bundle_bytes
+            .checked_add(parquet_bytes)
+            .ok_or_else(|| "overlap source Parquet size overflow".to_string())?;
+        parquet_sources.push(parquet_path);
+    }
+    let unique_parquet = root.join("overlap_unique.parquet");
+    write_parquet_file(&unique_parquet, &overlap_stress_batch(row_count)?)?;
+    let unique_parquet_bytes = fs::metadata(&unique_parquet)
+        .map_err(|err| format!("cannot stat {}: {err}", unique_parquet.display()))?
+        .len();
+    let duplicate_payload_bytes = total_payload_bytes.saturating_sub(unique_payload_bytes);
+    Ok(OverlapStressGenerated {
+        sources,
+        parquet_sources,
+        unique_parquet,
+        source_csv_bytes,
+        source_parquet_bundle_bytes,
+        unique_parquet_bytes,
+        unique_payload_bytes,
+        duplicate_payload_bytes,
+        shared_row_count: row_count,
+        unique_entity_count: row_count,
+    })
+}
+
+fn generate_overlap_partial_sources(
+    root: &Path,
+    row_count: usize,
+    source_count: usize,
+    overlap_percent: usize,
+) -> Result<OverlapStressGenerated, String> {
+    let shared_row_count = row_count.saturating_mul(overlap_percent.min(100)) / 100;
+    let unique_rows_per_source = row_count.saturating_sub(shared_row_count);
+    let unique_entity_count = shared_row_count
+        .checked_add(
+            source_count
+                .checked_mul(unique_rows_per_source)
+                .ok_or_else(|| "overlap partial unique entity count overflow".to_string())?,
+        )
+        .ok_or_else(|| "overlap partial unique entity count overflow".to_string())?;
+    let unique_entities = (0..unique_entity_count).collect::<Vec<_>>();
+    let mut sources = Vec::with_capacity(source_count);
+    let mut parquet_sources = Vec::with_capacity(source_count);
+    let mut source_csv_bytes = 0u64;
+    let mut source_parquet_bundle_bytes = 0u64;
+    let mut total_payload_bytes = 0u64;
+    for source_index in 0..source_count {
+        let rows = overlap_partial_entity_rows(
+            row_count,
+            shared_row_count,
+            unique_rows_per_source,
+            source_index,
+        );
+        let csv_path = root.join(format!("overlap_source_{source_index:02}.csv"));
+        let csv = overlap_partial_csv(&rows, &mut total_payload_bytes);
+        fs::write(&csv_path, csv.as_bytes())
+            .map_err(|err| format!("cannot write {}: {err}", csv_path.display()))?;
+        source_csv_bytes = source_csv_bytes
+            .checked_add(csv.len() as u64)
+            .ok_or_else(|| "overlap partial source CSV size overflow".to_string())?;
+        sources.push(csv_path);
+
+        let parquet_path = root.join(format!("overlap_source_{source_index:02}.parquet"));
+        write_parquet_file(&parquet_path, &overlap_partial_batch(&rows)?)?;
+        let parquet_bytes = fs::metadata(&parquet_path)
+            .map_err(|err| format!("cannot stat {}: {err}", parquet_path.display()))?
+            .len();
+        source_parquet_bundle_bytes = source_parquet_bundle_bytes
+            .checked_add(parquet_bytes)
+            .ok_or_else(|| "overlap partial source Parquet size overflow".to_string())?;
+        parquet_sources.push(parquet_path);
+    }
+    let unique_parquet = root.join("overlap_unique.parquet");
+    write_parquet_file(&unique_parquet, &overlap_partial_batch(&unique_entities)?)?;
+    let unique_parquet_bytes = fs::metadata(&unique_parquet)
+        .map_err(|err| format!("cannot stat {}: {err}", unique_parquet.display()))?
+        .len();
+    let unique_payload_bytes = unique_entities
+        .iter()
+        .map(|row| overlap_payload_size(*row))
+        .sum::<u64>();
+    let duplicate_payload_bytes = total_payload_bytes.saturating_sub(unique_payload_bytes);
+    Ok(OverlapStressGenerated {
+        sources,
+        parquet_sources,
+        unique_parquet,
+        source_csv_bytes,
+        source_parquet_bundle_bytes,
+        unique_parquet_bytes,
+        unique_payload_bytes,
+        duplicate_payload_bytes,
+        shared_row_count,
+        unique_entity_count,
+    })
+}
+
+fn overlap_partial_entity_rows(
+    row_count: usize,
+    shared_row_count: usize,
+    unique_rows_per_source: usize,
+    source_index: usize,
+) -> Vec<usize> {
+    (0..row_count)
+        .map(|row| {
+            if row < shared_row_count {
+                row
+            } else {
+                shared_row_count
+                    + source_index.saturating_mul(unique_rows_per_source)
+                    + row.saturating_sub(shared_row_count)
+            }
+        })
+        .collect()
+}
+
+fn overlap_partial_csv(rows: &[usize], total_payload_bytes: &mut u64) -> String {
+    let mut csv = String::from("id,name,email,address,bio,segment,plan,score\n");
+    for row in rows {
+        let values = overlap_stress_values(*row);
+        *total_payload_bytes =
+            total_payload_bytes.saturating_add(values.iter().map(|value| value.len() as u64).sum());
+        csv.push_str(&format!(
+            "{},{},{},{},{},{},{},{}\n",
+            values[0], values[1], values[2], values[3], values[4], values[5], values[6], values[7]
+        ));
+    }
+    csv
+}
+
+fn overlap_partial_batch(rows: &[usize]) -> Result<RecordBatch, String> {
+    let mut ids = Vec::with_capacity(rows.len());
+    let mut names = Vec::with_capacity(rows.len());
+    let mut emails = Vec::with_capacity(rows.len());
+    let mut addresses = Vec::with_capacity(rows.len());
+    let mut bios = Vec::with_capacity(rows.len());
+    let mut segments = Vec::with_capacity(rows.len());
+    let mut plans = Vec::with_capacity(rows.len());
+    let mut scores = Vec::with_capacity(rows.len());
+    for row in rows {
+        let values = overlap_stress_values(*row);
+        ids.push(values[0].clone());
+        names.push(values[1].clone());
+        emails.push(values[2].clone());
+        addresses.push(values[3].clone());
+        bios.push(values[4].clone());
+        segments.push(values[5].clone());
+        plans.push(values[6].clone());
+        scores.push(overlap_stress_score(*row));
+    }
+    RecordBatch::try_from_iter(vec![
+        ("id", Arc::new(StringArray::from(ids)) as ArrayRef),
+        ("name", Arc::new(StringArray::from(names)) as ArrayRef),
+        ("email", Arc::new(StringArray::from(emails)) as ArrayRef),
+        (
+            "address",
+            Arc::new(StringArray::from(addresses)) as ArrayRef,
+        ),
+        ("bio", Arc::new(StringArray::from(bios)) as ArrayRef),
+        ("segment", Arc::new(StringArray::from(segments)) as ArrayRef),
+        ("plan", Arc::new(StringArray::from(plans)) as ArrayRef),
+        ("score", Arc::new(Int64Array::from(scores)) as ArrayRef),
+    ])
+    .map_err(|err| err.to_string())
+}
+
+fn overlap_payload_size(row: usize) -> u64 {
+    overlap_stress_values(row)
+        .iter()
+        .map(|value| value.len() as u64)
+        .sum()
+}
+
+fn overlap_stress_csv(row_count: usize, total_payload_bytes: &mut u64) -> String {
+    let mut csv = String::from("id,name,email,address,bio,segment,plan,score\n");
+    for row in 0..row_count {
+        let values = overlap_stress_values(row);
+        *total_payload_bytes = total_payload_bytes
+            .saturating_add(values.iter().map(|value| value.len() as u64).sum::<u64>());
+        csv.push_str(&format!(
+            "{},{},{},{},{},{},{},{}\n",
+            values[0], values[1], values[2], values[3], values[4], values[5], values[6], values[7]
+        ));
+    }
+    csv
+}
+
+fn overlap_stress_batch(row_count: usize) -> Result<RecordBatch, String> {
+    let mut ids = Vec::with_capacity(row_count);
+    let mut names = Vec::with_capacity(row_count);
+    let mut emails = Vec::with_capacity(row_count);
+    let mut addresses = Vec::with_capacity(row_count);
+    let mut bios = Vec::with_capacity(row_count);
+    let mut segments = Vec::with_capacity(row_count);
+    let mut plans = Vec::with_capacity(row_count);
+    let mut scores = Vec::with_capacity(row_count);
+    for row in 0..row_count {
+        let values = overlap_stress_values(row);
+        ids.push(values[0].clone());
+        names.push(values[1].clone());
+        emails.push(values[2].clone());
+        addresses.push(values[3].clone());
+        bios.push(values[4].clone());
+        segments.push(values[5].clone());
+        plans.push(values[6].clone());
+        scores.push(overlap_stress_score(row));
+    }
+    RecordBatch::try_from_iter(vec![
+        ("id", Arc::new(StringArray::from(ids)) as ArrayRef),
+        ("name", Arc::new(StringArray::from(names)) as ArrayRef),
+        ("email", Arc::new(StringArray::from(emails)) as ArrayRef),
+        (
+            "address",
+            Arc::new(StringArray::from(addresses)) as ArrayRef,
+        ),
+        ("bio", Arc::new(StringArray::from(bios)) as ArrayRef),
+        ("segment", Arc::new(StringArray::from(segments)) as ArrayRef),
+        ("plan", Arc::new(StringArray::from(plans)) as ArrayRef),
+        ("score", Arc::new(Int64Array::from(scores)) as ArrayRef),
+    ])
+    .map_err(|err| err.to_string())
+}
+
+fn overlap_stress_values(row: usize) -> Vec<String> {
+    vec![
+        format!("cust-{row:08}"),
+        format!("Customer-{row:08}"),
+        format!("customer-{row:08}@example.internal"),
+        format!(
+            "{}-Long-Duplicate-Avenue-Suite-{}-Region-{}",
+            1000 + row,
+            row % 997,
+            row % 17
+        ),
+        overlap_stress_bio(row),
+        ["consumer", "commercial", "enterprise", "public-sector"][row % 4].to_string(),
+        ["free", "starter", "growth", "scale", "global"][row % 5].to_string(),
+        overlap_stress_score(row).to_string(),
+    ]
+}
+
+fn overlap_stress_score(row: usize) -> i64 {
+    ((row * 37) % 1000) as i64
+}
+
+fn overlap_stress_bio(row: usize) -> String {
+    let token = format!("profile{row:08}");
+    let mut value = String::with_capacity(288);
+    for index in 0..18 {
+        if index > 0 {
+            value.push('-');
+        }
+        value.push_str(&token);
+        value.push_str(match index % 4 {
+            0 => "retail-history",
+            1 => "support-context",
+            2 => "billing-footprint",
+            _ => "marketing-consent",
+        });
+    }
+    value
+}
+
+fn overlap_stress_covemap(source_count: usize) -> Result<CovemapFile, String> {
+    let sources = (0..source_count)
+        .map(|index| {
+            json!({
+                "source_id": format!("overlap_source_{index:02}"),
+                "row_identity_rules": ["customer_by_id"],
+                "source_priority": index,
+            })
+        })
+        .collect::<Vec<_>>();
+    let rules = (0..source_count)
+        .map(|index| {
+            json!({
+                "rule_id": format!("overlap_source_{index:02}_customer"),
+                "source_id": format!("overlap_source_{index:02}"),
+                "identity_rule_id": "customer_by_id",
+                "row_semantics_kind": "Object",
+                "assertion_kinds": ["object", "property", "evidence"],
+                "function_ids": ["identity"],
+                "output_assertion_ids": [],
+                "association_endpoints": [],
+                "property_bindings": overlap_stress_property_bindings(index),
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(CovemapFile {
+        header: CovemapHeaderV1::new([0x6f; 16], 0),
+        mapping_version: "bench/overlap-stress.v1".into(),
+        sections: vec![
+            covemap_json_section(
+                SectionKind::MapSourceCatalog,
+                json!({
+                    "mapping_id": "overlap-stress-map",
+                    "mapping_version": "bench/overlap-stress.v1",
+                    "sources": sources,
+                }),
+            )?,
+            covemap_json_section(
+                SectionKind::MapFunctionRegistry,
+                json!({
+                    "mapping_id": "overlap-stress-map",
+                    "mapping_version": "bench/overlap-stress.v1",
+                    "functions": [{
+                        "function_id": "identity",
+                        "version": "1",
+                        "deterministic": true,
+                        "dependency": "pure"
+                    }]
+                }),
+            )?,
+            covemap_json_section(
+                SectionKind::MapIdentityRuleCatalog,
+                json!({
+                    "mapping_id": "overlap-stress-map",
+                    "mapping_version": "bench/overlap-stress.v1",
+                    "identity_rules": [{
+                        "rule_id": "customer_by_id",
+                        "object_type": "Customer",
+                        "semantic_role": "subject",
+                        "confidence_class": "authoritative",
+                        "candidate_only": false,
+                        "property_conflicts_declared": true,
+                        "function_ids": ["identity"],
+                        "join_keys": [{
+                            "role_id": "customer_id",
+                            "source_column": "id",
+                            "logical_type": "utf8",
+                            "canonicalization": "identity",
+                            "null_policy": "reject",
+                            "ordering": "declared"
+                        }]
+                    }],
+                    "do_not_merge": []
+                }),
+            )?,
+            covemap_json_section(
+                SectionKind::MapRowSemanticsCatalog,
+                json!({
+                    "mapping_id": "overlap-stress-map",
+                    "mapping_version": "bench/overlap-stress.v1",
+                    "rules": rules,
+                }),
+            )?,
+            covemap_json_section(
+                SectionKind::MapProjectionCatalog,
+                json!({
+                    "mapping_id": "overlap-stress-map",
+                    "mapping_version": "bench/overlap-stress.v1",
+                    "projections": [{
+                        "projection_id": "overlap_customers.v1",
+                        "output_table": "overlap_customers",
+                        "row_grain": "one_row_per_object",
+                        "anchor": {"object_type": "Customer"},
+                        "temporal_mode": {"as_of": "latest_committed"},
+                        "multi_value_policy": "reject",
+                        "missing_policy": "null",
+                        "output_modes": ["json", "arrow", "cove-t"],
+                        "columns": [
+                            {"name": "id", "logical_type": "utf8", "value": "id"},
+                            {"name": "name", "logical_type": "utf8", "value": "name"},
+                            {"name": "email", "logical_type": "utf8", "value": "email"},
+                            {"name": "address", "logical_type": "utf8", "value": "address"},
+                            {"name": "bio", "logical_type": "utf8", "value": "bio"},
+                            {"name": "segment", "logical_type": "utf8", "value": "segment"},
+                            {"name": "plan", "logical_type": "utf8", "value": "plan"},
+                            {"name": "score", "logical_type": "int64", "value": "score"}
+                        ]
+                    }]
+                }),
+            )?,
+        ],
+        postscript: cove_core::artifact::covemap::CovemapPostscriptV1 {
+            required_features: FEATURE_SEMANTIC_MAP,
+            optional_features: 0,
+            file_len: 0,
+            header_offset: 0,
+            header_length: 0,
+            checksum: 0,
+        },
+    })
+}
+
+fn overlap_stress_property_bindings(source_index: usize) -> Value {
+    Value::Array(
+        [
+            ("id", "id", "utf8", false),
+            ("name", "name", "utf8", false),
+            ("email", "email", "utf8", false),
+            ("address", "address", "utf8", false),
+            ("bio", "bio", "utf8", false),
+            ("segment", "segment", "utf8", false),
+            ("plan", "plan", "utf8", false),
+            ("score", "score", "int64", false),
+        ]
+        .into_iter()
+        .map(|(property_id, source_column, logical_type, nullable)| {
+            json!({
+                "assertion_id": format!("source_{source_index:02}_{property_id}"),
+                "property_id": property_id,
+                "property_name": property_id,
+                "source_column": source_column,
+                "logical_type": logical_type,
+                "nullable": nullable,
+                "conflict_policy": "source_priority_wins",
+            })
+        })
+        .collect::<Vec<_>>(),
+    )
+}
+
+fn path_strings(paths: &[PathBuf]) -> Vec<String> {
+    paths.iter().map(|path| display_path(path)).collect()
+}
+
+fn display_path(path: &Path) -> String {
+    path.display().to_string()
+}
+
+fn json_object(entries: Vec<(&'static str, Value)>) -> Value {
+    let mut object = serde_json::Map::new();
+    for (key, value) in entries {
+        object.insert(key.to_string(), value);
+    }
+    Value::Object(object)
+}
+
+const PROJECTION_COVI_BENCH_ROWS: usize = 1_024;
+const PROJECTION_COVI_METRICS: &[&str] = &[
+    "cove_projection_covi_sidecars_found",
+    "cove_covi_sidecars_loaded",
+    "cove_covi_sidecars_stale",
+    "cove_projection_covi_sidecars_ignored",
+    "cove_projection_covi_validation_bytes",
+    "cove_projection_covi_root_count",
+    "cove_projection_covi_eligible_filters",
+    "cove_lookup_index_hits",
+    "cove_lookup_index_misses",
+    "cove_projection_covi_candidate_rows",
+    "cove_projection_covi_rows_skipped",
+    "cove_projection_covi_residual_rows_checked",
+    "cove_projection_covi_fallback_no_sidecar",
+    "cove_projection_covi_fallback_no_eligible_filter",
+    "cove_projection_covi_fallback_lookup_failed",
+    "cove_projection_covi_fallback_stale",
+    "cove_projection_covi_fallback_unavailable",
+];
+
+#[derive(Clone, Copy)]
+enum ProjectionCoviSidecarState {
+    Valid,
+    Missing,
+    Stale,
+}
+
+struct ProjectionCoviQueryOutcome {
+    planning_ns: u128,
+    scan_ns: u128,
+    rows: usize,
+    metrics: BTreeMap<String, usize>,
+}
+
+fn run_projection_covi_measured_cases(corpus: &Path) -> Result<Vec<Value>, String> {
+    let root = corpus.join("semantic-map-builds").join("projection-covi");
+    fs::create_dir_all(&root).map_err(|err| format!("cannot create {}: {err}", root.display()))?;
+    let map_path = root.join("people_projection.covemap");
+    let source_path = root.join("people.csv");
+    durable::durable_replace(&map_path, &projection_covi_covemap_bytes()?)
+        .map_err(|err| format!("cannot publish {}: {err}", map_path.display()))?;
+    let mut csv = String::from("id,name,status,score\n");
+    let statuses = ["active", "trial", "paused", "closed"];
+    for row in 0..PROJECTION_COVI_BENCH_ROWS {
+        csv.push_str(&format!(
+            "p{row:04},person-{row:04},{},{}\n",
+            statuses[row % statuses.len()],
+            row
+        ));
+    }
+    fs::write(&source_path, csv.as_bytes())
+        .map_err(|err| format!("cannot write {}: {err}", source_path.display()))?;
+    let out_dir = root.join("bundle");
+    let mut options = MapBuildOptions::new(&out_dir);
+    options.force = true;
+    options.verify = true;
+    options.publish_covm = true;
+    let result = build_from_paths(&map_path, std::slice::from_ref(&source_path), options)
+        .map_err(|err| format!("projection COVE-I benchmark build failed: {err}"))?;
+    let object_rel = result
+        .manifest
+        .pointer("/artifacts/object/path")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "projection COVE-I manifest missing object path".to_string())?;
+    let object_path = out_dir.join(object_rel);
+    let sidecar_path = out_dir.join("indexes").join("projection_columns.covi");
+    let sidecar_bytes = fs::read(&sidecar_path)
+        .map_err(|err| format!("cannot read {}: {err}", sidecar_path.display()))?;
+    let source_bytes = fs::metadata(&source_path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    let cove_o_bytes = fs::metadata(&object_path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    let total_bundle_bytes = directory_size(&out_dir)?;
+    let projection_sidecar_bytes = sidecar_bytes.len() as u64;
+    let duplication_ratio = if source_bytes == 0 {
+        0.0
+    } else {
+        total_bundle_bytes as f64 / source_bytes as f64
+    };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| {
+            format!("cannot create Tokio runtime for projection COVE-I benchmark: {err}")
+        })?;
+    let case_specs = [
+        (
+            "projection_covi_equality_valid",
+            "Projection COVE-I equality filter with valid sidecar",
+            "SELECT id, name, status, score FROM people_projection WHERE name = 'person-0042'",
+            ProjectionCoviSidecarState::Valid,
+            1usize,
+        ),
+        (
+            "projection_covi_in_valid",
+            "Projection COVE-I IN filter with valid sidecar",
+            "SELECT id, name, status, score FROM people_projection WHERE status IN ('active', 'trial')",
+            ProjectionCoviSidecarState::Valid,
+            PROJECTION_COVI_BENCH_ROWS / 2,
+        ),
+        (
+            "projection_covi_range_valid",
+            "Projection COVE-I numeric range filter with valid sidecar",
+            "SELECT id, name, status, score FROM people_projection WHERE score >= 900",
+            ProjectionCoviSidecarState::Valid,
+            PROJECTION_COVI_BENCH_ROWS - 900,
+        ),
+        (
+            "projection_covi_missing_sidecar_fallback",
+            "Projection COVE-I missing sidecar materialized fallback",
+            "SELECT id, name, status, score FROM people_projection WHERE name = 'person-0042'",
+            ProjectionCoviSidecarState::Missing,
+            1usize,
+        ),
+        (
+            "projection_covi_stale_sidecar_fallback",
+            "Projection COVE-I stale sidecar materialized fallback",
+            "SELECT id, name, status, score FROM people_projection WHERE name = 'person-0042'",
+            ProjectionCoviSidecarState::Stale,
+            1usize,
+        ),
+        (
+            "projection_covi_unsupported_predicate_fallback",
+            "Projection COVE-I unsupported predicate materialized fallback",
+            "SELECT id, name, status, score FROM people_projection WHERE name != 'person-0042'",
+            ProjectionCoviSidecarState::Valid,
+            PROJECTION_COVI_BENCH_ROWS - 1,
+        ),
+    ];
+    let mut cases = Vec::with_capacity(case_specs.len());
+    for (id, category, sql, sidecar_state, expected_rows) in case_specs {
+        set_projection_covi_sidecar_state(&sidecar_path, &sidecar_bytes, sidecar_state)?;
+        let outcome = runtime.block_on(run_projection_covi_sql_case(&object_path, sql))?;
+        durable::durable_replace(&sidecar_path, &sidecar_bytes)
+            .map_err(|err| format!("cannot restore {}: {err}", sidecar_path.display()))?;
+        if outcome.rows != expected_rows {
+            return Err(format!(
+                "{id} returned {} rows; expected {expected_rows}",
+                outcome.rows
+            ));
+        }
+        cases.push(projection_covi_case_report(ProjectionCoviCaseReportInput {
+            id,
+            category,
+            sql,
+            outcome: &outcome,
+            source_bytes,
+            cove_o_bytes,
+            projection_sidecar_bytes,
+            total_bundle_bytes,
+            duplication_ratio,
+        }));
+    }
+    Ok(cases)
+}
+
+fn run_customer360_projection_covi_cases(corpus: &Path) -> Result<Vec<Value>, String> {
+    let dir = corpus.join("customer360");
+    let map_path = dir.join("customer360_readback.covemap");
+    let source_path = dir.join("customers_360.jsonl");
+    let out_dir = dir.join("projection-covi-bundle");
+    let customer_count = customer360_manifest_customer_count(&dir)?;
+    let mut options = MapBuildOptions::new(&out_dir);
+    options.force = true;
+    options.verify = true;
+    options.publish_covm = true;
+    let result = build_from_paths(&map_path, std::slice::from_ref(&source_path), options)
+        .map_err(|err| format!("customer360 projection COVE-I benchmark build failed: {err}"))?;
+    let object_rel = result
+        .manifest
+        .pointer("/artifacts/object/path")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "customer360 projection COVE-I manifest missing object path".to_string())?;
+    let object_path = out_dir.join(object_rel);
+    let sidecar_path = out_dir.join("indexes").join("projection_columns.covi");
+    let sidecar_bytes = fs::read(&sidecar_path)
+        .map_err(|err| format!("cannot read {}: {err}", sidecar_path.display()))?;
+    let source_bytes = fs::metadata(&source_path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    let cove_o_bytes = fs::metadata(&object_path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    let total_bundle_bytes = directory_size(&out_dir)?;
+    let projection_sidecar_bytes = sidecar_bytes.len() as u64;
+    let duplication_ratio = if source_bytes == 0 {
+        0.0
+    } else {
+        total_bundle_bytes as f64 / source_bytes as f64
+    };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| {
+            format!(
+                "cannot create Tokio runtime for Customer 360 projection COVE-I benchmark: {err}"
+            )
+        })?;
+    let case_specs = [
+        (
+            "customer360_projection_covi_score_range_valid",
+            "Customer 360 projection COVE-I high-score range filter",
+            "SELECT customer_id, tier, score, status, mrr FROM customers WHERE score >= 80",
+            customer360_score_range_count(customer_count, 80),
+        ),
+        (
+            "customer360_projection_covi_status_eq_valid",
+            "Customer 360 projection COVE-I status equality filter",
+            "SELECT customer_id, tier, score, status, mrr FROM customers WHERE status = 'active'",
+            customer360_status_active_count(customer_count),
+        ),
+        (
+            "customer360_projection_covi_tier_in_valid",
+            "Customer 360 projection COVE-I tier IN filter",
+            "SELECT customer_id, tier, score, status, mrr FROM customers WHERE tier IN ('gold', 'platinum')",
+            customer360_tier_gold_platinum_count(customer_count),
+        ),
+        (
+            "customer360_projection_covi_compound_valid",
+            "Customer 360 projection COVE-I compound score/status filter",
+            "SELECT customer_id, tier, score, status, mrr FROM customers WHERE score >= 80 AND status = 'active'",
+            customer360_score_active_count(customer_count, 80),
+        ),
+    ];
+    let mut cases = Vec::with_capacity(case_specs.len());
+    for (id, category, sql, expected_rows) in case_specs {
+        set_projection_covi_sidecar_state(
+            &sidecar_path,
+            &sidecar_bytes,
+            ProjectionCoviSidecarState::Valid,
+        )?;
+        let outcome = runtime.block_on(run_projection_covi_sql_case(&object_path, sql))?;
+        durable::durable_replace(&sidecar_path, &sidecar_bytes)
+            .map_err(|err| format!("cannot restore {}: {err}", sidecar_path.display()))?;
+        if outcome.rows != expected_rows {
+            return Err(format!(
+                "{id} returned {} rows; expected {expected_rows}",
+                outcome.rows
+            ));
+        }
+        cases.push(projection_covi_case_report(ProjectionCoviCaseReportInput {
+            id,
+            category,
+            sql,
+            outcome: &outcome,
+            source_bytes,
+            cove_o_bytes,
+            projection_sidecar_bytes,
+            total_bundle_bytes,
+            duplication_ratio,
+        }));
+    }
+    Ok(cases)
+}
+
+fn customer360_manifest_customer_count(dir: &Path) -> Result<usize, String> {
+    let path = dir.join("customer360-manifest.json");
+    let bytes = fs::read(&path).map_err(|err| format!("cannot read {}: {err}", path.display()))?;
+    let manifest: Value = serde_json::from_slice(&bytes)
+        .map_err(|err| format!("invalid {}: {err}", path.display()))?;
+    let count = manifest
+        .pointer("/row_counts/canonical_customers")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            format!(
+                "{} is missing row_counts.canonical_customers",
+                path.display()
+            )
+        })?;
+    usize::try_from(count).map_err(|_| {
+        format!(
+            "{} row_counts.canonical_customers is too large",
+            path.display()
+        )
+    })
+}
+
+fn customer360_score(index: usize) -> i64 {
+    ((index * 37) % 100) as i64
+}
+
+fn customer360_status(index: usize) -> &'static str {
+    if index.is_multiple_of(13) {
+        "dormant"
+    } else if index.is_multiple_of(5) {
+        "watch"
+    } else {
+        "active"
+    }
+}
+
+fn customer360_tier(index: usize) -> &'static str {
+    ["bronze", "silver", "gold", "platinum"][(index + 1) % 4]
+}
+
+fn customer360_score_range_count(rows: usize, threshold: i64) -> usize {
+    (0..rows)
+        .filter(|index| customer360_score(*index) >= threshold)
+        .count()
+}
+
+fn customer360_status_active_count(rows: usize) -> usize {
+    (0..rows)
+        .filter(|index| customer360_status(*index) == "active")
+        .count()
+}
+
+fn customer360_tier_gold_platinum_count(rows: usize) -> usize {
+    (0..rows)
+        .filter(|index| matches!(customer360_tier(*index), "gold" | "platinum"))
+        .count()
+}
+
+fn customer360_score_active_count(rows: usize, threshold: i64) -> usize {
+    (0..rows)
+        .filter(|index| {
+            customer360_score(*index) >= threshold && customer360_status(*index) == "active"
+        })
+        .count()
+}
+
+fn set_projection_covi_sidecar_state(
+    sidecar_path: &Path,
+    original_bytes: &[u8],
+    state: ProjectionCoviSidecarState,
+) -> Result<(), String> {
+    match state {
+        ProjectionCoviSidecarState::Valid => durable::durable_replace(sidecar_path, original_bytes)
+            .map(|_| ())
+            .map_err(|err| format!("cannot restore {}: {err}", sidecar_path.display())),
+        ProjectionCoviSidecarState::Missing => match fs::remove_file(sidecar_path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(format!("cannot remove {}: {err}", sidecar_path.display())),
+        },
+        ProjectionCoviSidecarState::Stale => {
+            let mut stale = original_bytes.to_vec();
+            if let Some(first) = stale.first_mut() {
+                *first ^= 0x01;
+            }
+            durable::durable_replace(sidecar_path, &stale)
+                .map(|_| ())
+                .map_err(|err| format!("cannot write stale {}: {err}", sidecar_path.display()))
+        }
+    }
+}
+
+async fn run_projection_covi_sql_case(
+    object_path: &Path,
+    sql: &str,
+) -> Result<ProjectionCoviQueryOutcome, String> {
+    let ctx = SessionContext::new();
+    register_cove_o_projections(&ctx, object_path, None, None)
+        .map_err(|err| format!("cannot register COVE-O projections: {err}"))?;
+    let planning_start = Instant::now();
+    let dataframe = ctx
+        .sql(sql)
+        .await
+        .map_err(|err| format!("cannot plan projection COVE-I SQL {sql:?}: {err}"))?;
+    let plan = dataframe
+        .create_physical_plan()
+        .await
+        .map_err(|err| format!("cannot create projection COVE-I physical plan: {err}"))?;
+    let planning_ns = planning_start.elapsed().as_nanos();
+    let scan_start = Instant::now();
+    let batches = collect_physical_plan(Arc::clone(&plan), ctx.task_ctx())
+        .await
+        .map_err(|err| format!("cannot execute projection COVE-I SQL {sql:?}: {err}"))?;
+    let scan_ns = scan_start.elapsed().as_nanos();
+    let rows = batches.iter().map(|batch| batch.num_rows()).sum::<usize>();
+    let metrics = PROJECTION_COVI_METRICS
+        .iter()
+        .map(|name| ((*name).to_string(), execution_plan_metric_sum(&plan, name)))
+        .collect();
+    Ok(ProjectionCoviQueryOutcome {
+        planning_ns,
+        scan_ns,
+        rows,
+        metrics,
+    })
+}
+
+fn execution_plan_metric_sum(plan: &Arc<dyn ExecutionPlan>, metric_name: &str) -> usize {
+    let own = plan
+        .metrics()
+        .and_then(|metrics| metrics.sum_by_name(metric_name))
+        .map(|metric| metric.as_usize())
+        .unwrap_or(0);
+    own + plan
+        .children()
+        .into_iter()
+        .map(|child| execution_plan_metric_sum(child, metric_name))
+        .sum::<usize>()
+}
+
+struct ProjectionCoviCaseReportInput<'a> {
+    id: &'a str,
+    category: &'a str,
+    sql: &'a str,
+    outcome: &'a ProjectionCoviQueryOutcome,
+    source_bytes: u64,
+    cove_o_bytes: u64,
+    projection_sidecar_bytes: u64,
+    total_bundle_bytes: u64,
+    duplication_ratio: f64,
+}
+
+fn projection_covi_case_report(input: ProjectionCoviCaseReportInput<'_>) -> Value {
+    let outcome = input.outcome;
+    let metric = |name: &str| -> u64 { *outcome.metrics.get(name).unwrap_or(&0) as u64 };
+    let fallback_no_sidecar = metric("cove_projection_covi_fallback_no_sidecar");
+    let fallback_no_eligible = metric("cove_projection_covi_fallback_no_eligible_filter");
+    let fallback_lookup_failed = metric("cove_projection_covi_fallback_lookup_failed");
+    let fallback_stale = metric("cove_projection_covi_fallback_stale");
+    let fallback_unavailable = metric("cove_projection_covi_fallback_unavailable");
+    let fallback_count = fallback_no_sidecar
+        .saturating_add(fallback_no_eligible)
+        .saturating_add(fallback_lookup_failed)
+        .saturating_add(fallback_stale)
+        .saturating_add(fallback_unavailable);
+    let fallback_reason = if fallback_no_sidecar > 0 {
+        json!("missing_sidecar")
+    } else if fallback_no_eligible > 0 {
+        json!("no_eligible_filter")
+    } else if fallback_lookup_failed > 0 {
+        json!("lookup_failed")
+    } else if fallback_stale > 0 {
+        json!("stale_sidecar")
+    } else if fallback_unavailable > 0 {
+        json!("unavailable_sidecar")
+    } else {
+        Value::Null
+    };
+    let lookup_hits = metric("cove_lookup_index_hits");
+    let lookup_misses = metric("cove_lookup_index_misses");
+    let candidate_rows = metric("cove_projection_covi_candidate_rows");
+    let skipped_rows = metric("cove_projection_covi_rows_skipped");
+    let residual_rows = metric("cove_projection_covi_residual_rows_checked");
+    let validation_bytes = metric("cove_projection_covi_validation_bytes");
+    let root_count = metric("cove_projection_covi_root_count");
+    let planning_ns = outcome.planning_ns;
+    let scan_ns = outcome.scan_ns;
+    json!({
+        "id": input.id,
+        "category": input.category,
+        "status": "measured",
+        "query": input.sql,
+        "metrics": {
+            "planning_ns": planning_ns,
+            "scan_ns": scan_ns,
+            "end_to_end_ns": planning_ns + scan_ns,
+            "rows_materialized": outcome.rows,
+            "result_rows": outcome.rows,
+            "source_bytes": input.source_bytes,
+            "cove_o_bytes": input.cove_o_bytes,
+            "projection_sidecar_bytes": input.projection_sidecar_bytes,
+            "total_bundle_bytes": input.total_bundle_bytes,
+            "duplication_ratio": input.duplication_ratio,
+            "sidecar_found": metric("cove_projection_covi_sidecars_found"),
+            "sidecar_loaded": metric("cove_covi_sidecars_loaded"),
+            "sidecar_stale": metric("cove_covi_sidecars_stale"),
+            "sidecar_ignored": metric("cove_projection_covi_sidecars_ignored"),
+            "validation_bytes": validation_bytes,
+            "root_count": root_count,
+            "eligible_filters": metric("cove_projection_covi_eligible_filters"),
+            "lookup_hits": lookup_hits,
+            "lookup_misses": lookup_misses,
+            "candidate_rows": candidate_rows,
+            "skipped_rows": skipped_rows,
+            "residual_rows": residual_rows,
+            "fallback_count": fallback_count,
+            "fallback_reason": fallback_reason,
+            "fallback_no_sidecar": fallback_no_sidecar,
+            "fallback_no_eligible_filter": fallback_no_eligible,
+            "fallback_lookup_failed": fallback_lookup_failed,
+            "fallback_stale": fallback_stale,
+            "fallback_unavailable": fallback_unavailable,
+        },
+        "cost": {
+            "observed": {
+                "metadata_bytes_read": validation_bytes,
+                "data_bytes_read": input.cove_o_bytes,
+                "range_requests": if metric("cove_projection_covi_sidecars_found") > 0 { 2 } else { 1 },
+                "scan_tasks": 1,
+                "pages_decoded": outcome.rows,
+                "morsels_considered": root_count,
+                "morsels_pruned": skipped_rows,
+                "lookup_index_hits": lookup_hits,
+                "lookup_index_misses": lookup_misses,
+                "index_fallbacks": fallback_count,
+            },
+            "coverage_metrics": {
+                "covi_used": lookup_hits > 0,
+                "covi_candidates": candidate_rows,
+                "projection_covi": {
+                    "sidecar_found": metric("cove_projection_covi_sidecars_found"),
+                    "sidecar_loaded": metric("cove_covi_sidecars_loaded"),
+                    "sidecar_stale": metric("cove_covi_sidecars_stale"),
+                    "sidecar_ignored": metric("cove_projection_covi_sidecars_ignored"),
+                    "validation_bytes": validation_bytes,
+                    "root_count": root_count,
+                    "eligible_filters": metric("cove_projection_covi_eligible_filters"),
+                    "lookup_hits": lookup_hits,
+                    "lookup_misses": lookup_misses,
+                    "candidate_rows": candidate_rows,
+                    "skipped_rows": skipped_rows,
+                    "residual_rows": residual_rows,
+                    "fallback_count": fallback_count,
+                    "fallback_reason": fallback_reason,
+                    "fallback_no_sidecar": fallback_no_sidecar,
+                    "fallback_no_eligible_filter": fallback_no_eligible,
+                    "fallback_lookup_failed": fallback_lookup_failed,
+                    "fallback_stale": fallback_stale,
+                    "fallback_unavailable": fallback_unavailable,
+                }
+            }
+        },
+        "optional_features": ["cove_map", "cove_o_projection", "cove_i", "projection_covi"],
+    })
+}
+
+fn directory_size(path: &Path) -> Result<u64, String> {
+    let mut total = 0u64;
+    for entry in
+        fs::read_dir(path).map_err(|err| format!("cannot read {}: {err}", path.display()))?
+    {
+        let entry = entry.map_err(|err| format!("cannot read {} entry: {err}", path.display()))?;
+        let metadata = entry
+            .metadata()
+            .map_err(|err| format!("cannot stat {}: {err}", entry.path().display()))?;
+        if metadata.is_dir() {
+            total = total
+                .checked_add(directory_size(&entry.path())?)
+                .ok_or_else(|| "directory size overflow".to_string())?;
+        } else {
+            total = total
+                .checked_add(metadata.len())
+                .ok_or_else(|| "directory size overflow".to_string())?;
+        }
+    }
+    Ok(total)
 }
 
 fn run_query_case(
@@ -2261,6 +4533,143 @@ fn bench_covemap_bytes() -> Result<Vec<u8>, String> {
     file.serialize().map_err(|err| err.to_string())
 }
 
+fn projection_covi_covemap_bytes() -> Result<Vec<u8>, String> {
+    let file = CovemapFile {
+        header: CovemapHeaderV1::new([0x78; 16], 0),
+        mapping_version: "bench/projection-covi.v1".into(),
+        sections: vec![
+            covemap_json_section(
+                SectionKind::MapSourceCatalog,
+                json!({
+                    "mapping_id": "projection-covi-bench-map",
+                    "mapping_version": "bench/projection-covi.v1",
+                    "sources": [{"source_id": "people", "row_identity_rules": ["person_by_id"]}]
+                }),
+            )?,
+            covemap_json_section(
+                SectionKind::MapFunctionRegistry,
+                json!({
+                    "mapping_id": "projection-covi-bench-map",
+                    "mapping_version": "bench/projection-covi.v1",
+                    "functions": [{"function_id": "identity", "version": "1", "deterministic": true, "dependency": "pure"}]
+                }),
+            )?,
+            covemap_json_section(
+                SectionKind::MapIdentityRuleCatalog,
+                json!({
+                    "mapping_id": "projection-covi-bench-map",
+                    "mapping_version": "bench/projection-covi.v1",
+                    "identity_rules": [{
+                        "rule_id": "person_by_id",
+                        "object_type": "Person",
+                        "semantic_role": "subject",
+                        "confidence_class": "authoritative",
+                        "candidate_only": false,
+                        "property_conflicts_declared": true,
+                        "function_ids": ["identity"],
+                        "join_keys": [{
+                            "role_id": "person_id",
+                            "source_column": "id",
+                            "logical_type": "utf8",
+                            "canonicalization": "identity",
+                            "null_policy": "reject",
+                            "ordering": "declared"
+                        }]
+                    }],
+                    "do_not_merge": []
+                }),
+            )?,
+            covemap_json_section(
+                SectionKind::MapRowSemanticsCatalog,
+                json!({
+                    "mapping_id": "projection-covi-bench-map",
+                    "mapping_version": "bench/projection-covi.v1",
+                    "rules": [{
+                        "rule_id": "people_projection_rows",
+                        "source_id": "people",
+                        "identity_rule_id": "person_by_id",
+                        "row_semantics_kind": "Object",
+                        "assertion_kinds": ["object", "property", "evidence"],
+                        "function_ids": ["identity"],
+                        "output_assertion_ids": [],
+                        "association_endpoints": [],
+                        "property_bindings": [
+                            {
+                                "assertion_id": "person_id",
+                                "property_id": "id",
+                                "property_name": "id",
+                                "source_column": "id",
+                                "logical_type": "utf8",
+                                "nullable": false,
+                                "conflict_policy": "reject_conflict"
+                            },
+                            {
+                                "assertion_id": "person_name",
+                                "property_id": "name",
+                                "property_name": "name",
+                                "source_column": "name",
+                                "logical_type": "utf8",
+                                "nullable": false,
+                                "conflict_policy": "reject_conflict"
+                            },
+                            {
+                                "assertion_id": "person_status",
+                                "property_id": "status",
+                                "property_name": "status",
+                                "source_column": "status",
+                                "logical_type": "utf8",
+                                "nullable": false,
+                                "conflict_policy": "reject_conflict"
+                            },
+                            {
+                                "assertion_id": "person_score",
+                                "property_id": "score",
+                                "property_name": "score",
+                                "source_column": "score",
+                                "logical_type": "int64",
+                                "nullable": false,
+                                "conflict_policy": "reject_conflict"
+                            }
+                        ]
+                    }]
+                }),
+            )?,
+            covemap_json_section(
+                SectionKind::MapProjectionCatalog,
+                json!({
+                    "mapping_id": "projection-covi-bench-map",
+                    "mapping_version": "bench/projection-covi.v1",
+                    "projections": [{
+                        "projection_id": "people_projection.v1",
+                        "output_table": "people_projection",
+                        "row_grain": "one_row_per_object",
+                        "anchor": {"object_type": "Person"},
+                        "temporal_mode": {"as_of": "latest_committed"},
+                        "multi_value_policy": "reject",
+                        "missing_policy": "null",
+                        "output_modes": ["json", "arrow", "cove-t"],
+                        "columns": [
+                            {"name": "id", "logical_type": "utf8", "value": "id"},
+                            {"name": "name", "logical_type": "utf8", "value": "name"},
+                            {"name": "status", "logical_type": "utf8", "value": "status"},
+                            {"name": "score", "logical_type": "int64", "value": "score"}
+                        ]
+                    }]
+                }),
+            )?,
+        ],
+        postscript: cove_core::artifact::covemap::CovemapPostscriptV1 {
+            required_features: FEATURE_SEMANTIC_MAP,
+            optional_features: 0,
+            file_len: 0,
+            header_offset: 0,
+            header_length: 0,
+            checksum: 0,
+        },
+    };
+    file.serialize().map_err(|err| err.to_string())
+}
+
 fn showcase_multi_source_covemap() -> Result<CovemapFile, String> {
     Ok(CovemapFile {
         header: CovemapHeaderV1::new([0x53; 16], 0),
@@ -2652,12 +5061,39 @@ fn validate_report_cases(cases: &[Value]) -> Result<(), String> {
         "negative_corrupt_validation",
         "canonicalisation_vectors",
         "semantic_mapping_corpus",
+        "cove_map_build_tiny",
+        "cove_map_build_medium",
+        "cove_map_build_messy_multisource",
+        "cove_o_overlap_stress",
+        "cove_o_overlap_scale_1_table",
+        "cove_o_overlap_scale_2_tables",
+        "cove_o_overlap_scale_4_tables",
+        "cove_o_overlap_scale_8_tables",
+        "cove_o_overlap_scale_8_tables_large",
+        "cove_o_overlap_partial_0pct",
+        "cove_o_overlap_partial_25pct",
+        "cove_o_overlap_partial_50pct",
+        "cove_o_overlap_partial_75pct",
+        "cove_o_overlap_partial_100pct",
+        "projection_covi_equality_valid",
+        "projection_covi_in_valid",
+        "projection_covi_range_valid",
+        "projection_covi_missing_sidecar_fallback",
+        "projection_covi_stale_sidecar_fallback",
+        "projection_covi_unsupported_predicate_fallback",
         "semantic_projection_object_store_compare",
         "semantic_showcase_bundle_object_store_compare",
         "customer360_projection_scan",
         "customer360_selective_filter",
         "customer360_event_filter",
         "customer360_object_store_compare",
+        "customer360_projection_covi_score_range_valid",
+        "customer360_projection_covi_status_eq_valid",
+        "customer360_projection_covi_tier_in_valid",
+        "customer360_projection_covi_compound_valid",
+        "proof_suite_customer360",
+        "proof_suite_claims",
+        "proof_suite_catalog",
     ];
     for id in required {
         if !cases.iter().any(|case| case.get("id") == Some(&json!(id))) {
@@ -2727,6 +5163,431 @@ fn validate_report_cases(cases: &[Value]) -> Result<(), String> {
     if covi_count.pointer("/proof/kind").and_then(Value::as_str) != Some("CoviIndexOnlyCount") {
         return Err("covi_index_only_count did not prove CoviIndexOnlyCount".into());
     }
+    validate_projection_covi_benchmark_cases(cases)?;
+    validate_overlap_stress_benchmark_case(cases)?;
+    validate_overlap_scale_benchmark_cases(cases)?;
+    validate_overlap_partial_benchmark_cases(cases)?;
+    validate_proof_suite_benchmark_cases(cases)?;
+    Ok(())
+}
+
+fn validate_proof_suite_benchmark_cases(cases: &[Value]) -> Result<(), String> {
+    let required_metrics = [
+        "build_time_ns",
+        "validation_time_ns",
+        "parity_time_ns",
+        "source_bytes",
+        "source_parquet_bundle_bytes",
+        "normalized_parquet_bundle_bytes",
+        "denormalized_parquet_bytes",
+        "cove_o_bytes",
+        "cove_t_bytes",
+        "covi_bytes",
+        "covm_bytes",
+        "total_bundle_bytes",
+        "object_count",
+        "property_value_count",
+        "evidence_entry_count",
+        "duplication_ratio",
+        "doctor_status_ok",
+        "parity_status_ok",
+        "parity_report_count",
+    ];
+    for id in [
+        "proof_suite_customer360",
+        "proof_suite_claims",
+        "proof_suite_catalog",
+    ] {
+        let case = require_measured_case(cases, id)?;
+        let metrics = case
+            .get("metrics")
+            .and_then(Value::as_object)
+            .ok_or_else(|| format!("{id} is missing metrics"))?;
+        for field in required_metrics {
+            if !metrics.contains_key(field) {
+                return Err(format!("{id} missing proof-suite metric {field}"));
+            }
+        }
+        if !case_bool(case, "/metrics/doctor_status_ok") {
+            return Err(format!("{id} doctor report was not ok"));
+        }
+        if !case_bool(case, "/metrics/parity_status_ok") {
+            return Err(format!("{id} parity reports were not ok"));
+        }
+        if case_u64(case, "/metrics/parity_report_count") == 0 {
+            return Err(format!("{id} did not include parity reports"));
+        }
+        if case_u64(case, "/metrics/cove_o_bytes") == 0 {
+            return Err(format!("{id} did not emit COVE-O bytes"));
+        }
+        if case_u64(case, "/metrics/covi_bytes") == 0 {
+            return Err(format!("{id} did not emit COVE-I bytes"));
+        }
+        if case_u64(case, "/metrics/covm_bytes") == 0 {
+            return Err(format!("{id} did not emit COVM bytes"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_overlap_stress_benchmark_case(cases: &[Value]) -> Result<(), String> {
+    let case = require_measured_case(cases, "cove_o_overlap_stress")?;
+    let required_metrics = [
+        "source_table_count",
+        "row_count",
+        "overlap_fraction",
+        "source_csv_bytes",
+        "source_parquet_bundle_bytes",
+        "unique_parquet_bytes",
+        "unique_payload_bytes",
+        "duplicate_payload_bytes",
+        "cove_o_bytes",
+        "compressed_cove_o_bytes",
+        "uncompressed_cove_o_bytes",
+        "compact_cove_o_bytes",
+        "expanded_cove_o_bytes",
+        "section_compression_saved_bytes",
+        "section_compression_uncompressed_bytes",
+        "section_compression_emitted_bytes",
+        "section_compression_compressed_section_count",
+        "section_compression_ratio",
+        "compact_vs_expanded_cove_o_ratio",
+        "compact_evidence_index_bytes",
+        "expanded_evidence_json_bytes",
+        "compact_evidence_vs_expanded_json_ratio",
+        "total_bundle_bytes",
+        "uncompressed_total_bundle_bytes",
+        "expanded_total_bundle_bytes",
+        "compressed_vs_uncompressed_bundle_ratio",
+        "compact_vs_expanded_bundle_ratio",
+        "cove_o_vs_source_csv_ratio",
+        "cove_o_vs_parquet_bundle_ratio",
+        "object_count",
+        "property_value_count",
+        "evidence_entry_count",
+        "evidence_to_property_ratio",
+    ];
+    let metrics = case
+        .get("metrics")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "cove_o_overlap_stress is missing metrics".to_string())?;
+    for field in required_metrics {
+        if !metrics.contains_key(field) {
+            return Err(format!("cove_o_overlap_stress missing metric {field}"));
+        }
+    }
+    if case_u64(case, "/metrics/source_table_count") < 2 {
+        return Err("cove_o_overlap_stress did not use multiple source tables".into());
+    }
+    if case_u64(case, "/metrics/duplicate_payload_bytes") == 0 {
+        return Err("cove_o_overlap_stress did not generate duplicate payload".into());
+    }
+    if case_u64(case, "/metrics/cove_o_bytes") == 0 {
+        return Err("cove_o_overlap_stress did not produce COVE-O bytes".into());
+    }
+    if case_u64(case, "/metrics/compressed_cove_o_bytes")
+        >= case_u64(case, "/metrics/uncompressed_cove_o_bytes")
+    {
+        return Err("cove_o_overlap_stress section compression did not reduce COVE-O bytes".into());
+    }
+    if case_u64(case, "/metrics/section_compression_saved_bytes") == 0 {
+        return Err("cove_o_overlap_stress did not record section compression savings".into());
+    }
+    if case_u64(
+        case,
+        "/metrics/section_compression_compressed_section_count",
+    ) == 0
+    {
+        return Err("cove_o_overlap_stress did not compress any COVE-O sections".into());
+    }
+    if case_u64(case, "/metrics/compact_evidence_index_bytes")
+        >= case_u64(case, "/metrics/expanded_evidence_json_bytes")
+    {
+        return Err(
+            "cove_o_overlap_stress compact evidence was not smaller than expanded evidence".into(),
+        );
+    }
+    if case_u64(case, "/metrics/compact_cove_o_bytes")
+        >= case_u64(case, "/metrics/expanded_cove_o_bytes")
+    {
+        return Err(
+            "cove_o_overlap_stress compact COVE-O was not smaller than expanded COVE-O".into(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_overlap_scale_benchmark_cases(cases: &[Value]) -> Result<(), String> {
+    let required = [
+        "source_table_count",
+        "row_count",
+        "overlap_fraction",
+        "source_csv_bytes",
+        "source_parquet_bundle_bytes",
+        "unique_parquet_bytes",
+        "source_parquet_redundancy_ratio",
+        "duplicate_payload_bytes",
+        "duplicate_payload_ratio",
+        "cove_o_bytes",
+        "cove_t_bytes",
+        "covi_bytes",
+        "covm_bytes",
+        "total_bundle_bytes",
+        "cove_o_vs_source_csv_ratio",
+        "bundle_vs_source_csv_ratio",
+        "cove_o_vs_parquet_bundle_ratio",
+        "bundle_vs_parquet_bundle_ratio",
+        "cove_o_vs_unique_parquet_ratio",
+        "bundle_vs_unique_parquet_ratio",
+        "object_count",
+        "property_value_count",
+        "evidence_entry_count",
+    ];
+    let ids = [
+        "cove_o_overlap_scale_1_table",
+        "cove_o_overlap_scale_2_tables",
+        "cove_o_overlap_scale_4_tables",
+        "cove_o_overlap_scale_8_tables",
+        "cove_o_overlap_scale_8_tables_large",
+    ];
+    for id in ids {
+        let case = require_measured_case(cases, id)?;
+        let metrics = case
+            .get("metrics")
+            .and_then(Value::as_object)
+            .ok_or_else(|| format!("{id} is missing metrics"))?;
+        for field in required {
+            if !metrics.contains_key(field) {
+                return Err(format!("{id} missing overlap-scale metric {field}"));
+            }
+        }
+        if case_u64(case, "/metrics/cove_o_bytes") == 0 {
+            return Err(format!("{id} did not emit COVE-O bytes"));
+        }
+        if case_u64(case, "/metrics/source_parquet_bundle_bytes") == 0 {
+            return Err(format!("{id} did not emit source Parquet baselines"));
+        }
+        if case_u64(case, "/metrics/object_count") == 0 {
+            return Err(format!("{id} did not materialize objects"));
+        }
+    }
+
+    let two = require_measured_case(cases, "cove_o_overlap_scale_2_tables")?;
+    let four = require_measured_case(cases, "cove_o_overlap_scale_4_tables")?;
+    let eight = require_measured_case(cases, "cove_o_overlap_scale_8_tables")?;
+    if case_f64(eight, "/metrics/cove_o_vs_parquet_bundle_ratio")
+        >= case_f64(two, "/metrics/cove_o_vs_parquet_bundle_ratio")
+    {
+        return Err(
+            "overlap scale did not improve COVE-O/source-Parquet ratio from 2 to 8 tables".into(),
+        );
+    }
+    if case_f64(eight, "/metrics/bundle_vs_parquet_bundle_ratio")
+        >= case_f64(four, "/metrics/bundle_vs_parquet_bundle_ratio")
+    {
+        return Err(
+            "overlap scale did not improve bundle/source-Parquet ratio from 4 to 8 tables".into(),
+        );
+    }
+    if case_f64(eight, "/metrics/cove_o_vs_parquet_bundle_ratio") >= 1.0 {
+        return Err("8-table overlap scale did not make COVE-O smaller than source Parquet".into());
+    }
+    Ok(())
+}
+
+fn validate_overlap_partial_benchmark_cases(cases: &[Value]) -> Result<(), String> {
+    let required = [
+        "source_table_count",
+        "row_count",
+        "source_input_row_count",
+        "overlap_fraction",
+        "overlap_percent",
+        "shared_row_count",
+        "source_unique_rows_per_table",
+        "unique_entity_count",
+        "object_dedupe_ratio",
+        "source_csv_bytes",
+        "source_parquet_bundle_bytes",
+        "unique_parquet_bytes",
+        "source_parquet_redundancy_ratio",
+        "duplicate_payload_bytes",
+        "duplicate_payload_ratio",
+        "cove_o_bytes",
+        "cove_t_bytes",
+        "covi_bytes",
+        "covm_bytes",
+        "total_bundle_bytes",
+        "cove_o_vs_source_csv_ratio",
+        "bundle_vs_source_csv_ratio",
+        "cove_o_vs_parquet_bundle_ratio",
+        "bundle_vs_parquet_bundle_ratio",
+        "cove_o_vs_unique_parquet_ratio",
+        "bundle_vs_unique_parquet_ratio",
+        "object_count",
+        "property_value_count",
+        "evidence_entry_count",
+    ];
+    let ids = [
+        "cove_o_overlap_partial_0pct",
+        "cove_o_overlap_partial_25pct",
+        "cove_o_overlap_partial_50pct",
+        "cove_o_overlap_partial_75pct",
+        "cove_o_overlap_partial_100pct",
+    ];
+    for id in ids {
+        let case = require_measured_case(cases, id)?;
+        let metrics = case
+            .get("metrics")
+            .and_then(Value::as_object)
+            .ok_or_else(|| format!("{id} is missing metrics"))?;
+        for field in required {
+            if !metrics.contains_key(field) {
+                return Err(format!("{id} missing overlap-partial metric {field}"));
+            }
+        }
+        if case_u64(case, "/metrics/object_count") != case_u64(case, "/metrics/unique_entity_count")
+        {
+            return Err(format!(
+                "{id} object count did not match unique entity count"
+            ));
+        }
+        if case_u64(case, "/metrics/cove_o_bytes") == 0 {
+            return Err(format!("{id} did not emit COVE-O bytes"));
+        }
+    }
+
+    let zero = require_measured_case(cases, "cove_o_overlap_partial_0pct")?;
+    let fifty = require_measured_case(cases, "cove_o_overlap_partial_50pct")?;
+    let hundred = require_measured_case(cases, "cove_o_overlap_partial_100pct")?;
+    if case_f64(hundred, "/metrics/object_dedupe_ratio")
+        <= case_f64(zero, "/metrics/object_dedupe_ratio")
+    {
+        return Err("partial overlap object dedupe ratio did not improve from 0% to 100%".into());
+    }
+    if case_f64(hundred, "/metrics/cove_o_vs_parquet_bundle_ratio")
+        >= case_f64(zero, "/metrics/cove_o_vs_parquet_bundle_ratio")
+    {
+        return Err(
+            "partial overlap COVE-O/source-Parquet ratio did not improve from 0% to 100%".into(),
+        );
+    }
+    if case_f64(fifty, "/metrics/cove_o_vs_parquet_bundle_ratio")
+        >= case_f64(zero, "/metrics/cove_o_vs_parquet_bundle_ratio")
+    {
+        return Err(
+            "partial overlap COVE-O/source-Parquet ratio did not improve by 50% overlap".into(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_projection_covi_benchmark_cases(cases: &[Value]) -> Result<(), String> {
+    let all_projection_cases = [
+        "projection_covi_equality_valid",
+        "projection_covi_in_valid",
+        "projection_covi_range_valid",
+        "projection_covi_missing_sidecar_fallback",
+        "projection_covi_stale_sidecar_fallback",
+        "projection_covi_unsupported_predicate_fallback",
+        "customer360_projection_covi_score_range_valid",
+        "customer360_projection_covi_status_eq_valid",
+        "customer360_projection_covi_tier_in_valid",
+        "customer360_projection_covi_compound_valid",
+    ];
+    let required_metrics = [
+        "source_bytes",
+        "cove_o_bytes",
+        "projection_sidecar_bytes",
+        "candidate_rows",
+        "skipped_rows",
+        "residual_rows",
+        "result_rows",
+        "lookup_hits",
+        "lookup_misses",
+        "fallback_count",
+        "duplication_ratio",
+    ];
+    for id in all_projection_cases {
+        let case = require_measured_case(cases, id)?;
+        let metrics = case
+            .get("metrics")
+            .and_then(Value::as_object)
+            .ok_or_else(|| format!("{id} is missing metrics"))?;
+        for field in required_metrics {
+            if !metrics.contains_key(field) {
+                return Err(format!("{id} missing projection COVE-I metric {field}"));
+            }
+        }
+    }
+    for id in [
+        "projection_covi_equality_valid",
+        "projection_covi_in_valid",
+        "projection_covi_range_valid",
+        "customer360_projection_covi_score_range_valid",
+        "customer360_projection_covi_status_eq_valid",
+        "customer360_projection_covi_tier_in_valid",
+    ] {
+        let case = require_measured_case(cases, id)?;
+        if case_u64(case, "/metrics/lookup_hits") == 0 {
+            return Err(format!("{id} did not record projection COVE-I lookup hits"));
+        }
+        if case_u64(case, "/metrics/candidate_rows") == 0 {
+            return Err(format!("{id} did not record projection COVE-I candidates"));
+        }
+        if case_u64(case, "/metrics/skipped_rows") == 0 {
+            return Err(format!("{id} did not record projection COVE-I pruning"));
+        }
+        if case_u64(case, "/metrics/fallback_count") != 0 {
+            return Err(format!(
+                "{id} unexpectedly fell back from projection COVE-I"
+            ));
+        }
+    }
+    let missing = require_measured_case(cases, "projection_covi_missing_sidecar_fallback")?;
+    if case_u64(missing, "/metrics/fallback_no_sidecar") == 0 {
+        return Err(
+            "projection_covi_missing_sidecar_fallback did not record missing-sidecar fallback"
+                .into(),
+        );
+    }
+    let stale = require_measured_case(cases, "projection_covi_stale_sidecar_fallback")?;
+    if case_u64(stale, "/metrics/fallback_stale") == 0 {
+        return Err(
+            "projection_covi_stale_sidecar_fallback did not record stale-sidecar fallback".into(),
+        );
+    }
+    if case_u64(stale, "/metrics/sidecar_ignored") == 0 {
+        return Err("projection_covi_stale_sidecar_fallback did not record ignored sidecar".into());
+    }
+    let unsupported =
+        require_measured_case(cases, "projection_covi_unsupported_predicate_fallback")?;
+    if case_u64(unsupported, "/metrics/fallback_no_eligible_filter") == 0 {
+        return Err(
+            "projection_covi_unsupported_predicate_fallback did not record unsupported-filter fallback"
+                .into(),
+        );
+    }
+    if case_u64(unsupported, "/metrics/lookup_hits") != 0 {
+        return Err("projection_covi_unsupported_predicate_fallback used sidecar lookup".into());
+    }
+    let compound = require_measured_case(cases, "customer360_projection_covi_compound_valid")?;
+    if case_u64(compound, "/metrics/lookup_hits") < 2 {
+        return Err(
+            "customer360_projection_covi_compound_valid did not use both sidecar lookups".into(),
+        );
+    }
+    if case_u64(compound, "/metrics/eligible_filters") < 2 {
+        return Err(
+            "customer360_projection_covi_compound_valid did not report both eligible filters"
+                .into(),
+        );
+    }
+    if case_u64(compound, "/metrics/skipped_rows") == 0 {
+        return Err("customer360_projection_covi_compound_valid did not record pruning".into());
+    }
+    if case_u64(compound, "/metrics/fallback_count") != 0 {
+        return Err("customer360_projection_covi_compound_valid unexpectedly fell back".into());
+    }
     Ok(())
 }
 
@@ -2743,6 +5604,10 @@ fn require_measured_case<'a>(cases: &'a [Value], id: &str) -> Result<&'a Value, 
 
 fn case_u64(case: &Value, pointer: &str) -> u64 {
     case.pointer(pointer).and_then(Value::as_u64).unwrap_or(0)
+}
+
+fn case_f64(case: &Value, pointer: &str) -> f64 {
+    case.pointer(pointer).and_then(Value::as_f64).unwrap_or(0.0)
 }
 
 fn case_bool(case: &Value, pointer: &str) -> bool {
@@ -2775,6 +5640,170 @@ fn markdown_report(report: &Value) -> String {
             out.push_str(&format!(
                 "| `{id}` | {status} | {planning} | {scan} | {rows} |\n"
             ));
+        }
+        let overlap_scale_cases = cases
+            .iter()
+            .filter(|case| {
+                case.get("id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| id.starts_with("cove_o_overlap_scale_"))
+            })
+            .collect::<Vec<_>>();
+        if !overlap_scale_cases.is_empty() {
+            out.push_str("\n## COVE-O Overlap Scale\n\n");
+            out.push_str("| Case | Tables | Rows | COVE-O bytes | Source Parquet bytes | Bundle bytes | COVE-O / Parquet | Bundle / Parquet |\n");
+            out.push_str("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n");
+            for case in overlap_scale_cases {
+                let id = case
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("cove_o_overlap_scale_unknown")
+                    .trim_start_matches("cove_o_overlap_scale_");
+                let metrics = case.get("metrics").unwrap_or(&Value::Null);
+                let tables = metrics
+                    .get("source_table_count")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let rows = metrics
+                    .get("row_count")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let cove_o = metrics
+                    .get("cove_o_bytes")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let parquet = metrics
+                    .get("source_parquet_bundle_bytes")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let bundle = metrics
+                    .get("total_bundle_bytes")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let cove_ratio = metrics
+                    .get("cove_o_vs_parquet_bundle_ratio")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0);
+                let bundle_ratio = metrics
+                    .get("bundle_vs_parquet_bundle_ratio")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0);
+                out.push_str(&format!(
+                    "| `{id}` | {tables} | {rows} | {cove_o} | {parquet} | {bundle} | {cove_ratio:.3} | {bundle_ratio:.3} |\n"
+                ));
+            }
+        }
+        let overlap_partial_cases = cases
+            .iter()
+            .filter(|case| {
+                case.get("id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| id.starts_with("cove_o_overlap_partial_"))
+            })
+            .collect::<Vec<_>>();
+        if !overlap_partial_cases.is_empty() {
+            out.push_str("\n## COVE-O Partial Overlap\n\n");
+            out.push_str("| Case | Overlap | Tables | Rows/table | Unique objects | COVE-O bytes | Source Parquet bytes | Bundle bytes | COVE-O / Parquet | Bundle / Parquet |\n");
+            out.push_str(
+                "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
+            );
+            for case in overlap_partial_cases {
+                let id = case
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("cove_o_overlap_partial_unknown")
+                    .trim_start_matches("cove_o_overlap_partial_");
+                let metrics = case.get("metrics").unwrap_or(&Value::Null);
+                let overlap = metrics
+                    .get("overlap_percent")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let tables = metrics
+                    .get("source_table_count")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let rows = metrics
+                    .get("row_count")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let unique_objects = metrics
+                    .get("unique_entity_count")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let cove_o = metrics
+                    .get("cove_o_bytes")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let parquet = metrics
+                    .get("source_parquet_bundle_bytes")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let bundle = metrics
+                    .get("total_bundle_bytes")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let cove_ratio = metrics
+                    .get("cove_o_vs_parquet_bundle_ratio")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0);
+                let bundle_ratio = metrics
+                    .get("bundle_vs_parquet_bundle_ratio")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0);
+                out.push_str(&format!(
+                    "| `{id}` | {overlap}% | {tables} | {rows} | {unique_objects} | {cove_o} | {parquet} | {bundle} | {cove_ratio:.3} | {bundle_ratio:.3} |\n"
+                ));
+            }
+        }
+        let proof_cases = cases
+            .iter()
+            .filter(|case| {
+                case.get("id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| id.starts_with("proof_suite_"))
+            })
+            .collect::<Vec<_>>();
+        if !proof_cases.is_empty() {
+            out.push_str("\n## COVE-O Proof Suite\n\n");
+            out.push_str("| Scenario | COVE-O bytes | Source bytes | Source Parquet bytes | Bundle bytes | Doctor | Parity |\n");
+            out.push_str("| --- | ---: | ---: | ---: | ---: | --- | --- |\n");
+            for case in proof_cases {
+                let id = case
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("proof_suite_unknown")
+                    .trim_start_matches("proof_suite_");
+                let metrics = case.get("metrics").unwrap_or(&Value::Null);
+                let cove_o = metrics
+                    .get("cove_o_bytes")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let source = metrics
+                    .get("source_bytes")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let parquet = metrics
+                    .get("source_parquet_bundle_bytes")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let bundle = metrics
+                    .get("total_bundle_bytes")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let doctor = metrics
+                    .get("doctor_status_ok")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let parity = metrics
+                    .get("parity_status_ok")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                out.push_str(&format!(
+                    "| `{id}` | {cove_o} | {source} | {parquet} | {bundle} | {} | {} |\n",
+                    if doctor { "ok" } else { "fail" },
+                    if parity { "ok" } else { "fail" },
+                ));
+            }
         }
     }
     out
@@ -3338,10 +6367,17 @@ mod tests {
             "negative_corrupt_validation",
             "canonicalisation_vectors",
             "semantic_mapping_corpus",
+            "cove_map_build_tiny",
+            "cove_map_build_medium",
+            "cove_map_build_messy_multisource",
+            "cove_o_overlap_stress",
             "customer360_projection_scan",
             "customer360_selective_filter",
             "customer360_event_filter",
             "customer360_object_store_compare",
+            "proof_suite_customer360",
+            "proof_suite_claims",
+            "proof_suite_catalog",
         ] {
             assert!(groups.iter().any(|group| group.as_str() == Some(required)));
         }

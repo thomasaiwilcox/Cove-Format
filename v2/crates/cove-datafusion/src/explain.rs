@@ -273,13 +273,29 @@ pub fn pruning_report(planned: &PlannedScan) -> PruningExplainReport {
             continue;
         };
         for (segment_index, segment) in file.segments().iter().enumerate() {
-            for morsel_id in 0..segment.morsel_count {
-                let row_start = u64::from(segment.row_start).saturating_add(
-                    u64::from(morsel_id).saturating_mul(u64::from(segment.morsel_row_count)),
-                );
-                let row_count = morsel_row_count_for(segment, morsel_id).unwrap_or(0);
+            let morsels = match file.row_morsels_for_segment(segment) {
+                Ok(morsels) => morsels
+                    .into_iter()
+                    .map(|morsel| {
+                        (
+                            morsel.morsel_id,
+                            segment
+                                .row_start
+                                .saturating_add(u64::from(morsel.first_row_in_segment)),
+                            morsel.row_count,
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                Err(_) => synthetic_report_morsels(segment),
+            };
+            for (morsel_id, row_start, row_count) in morsels {
                 let key = (file_ordinal, segment.segment_id, morsel_id);
-                let kept_task = kept.contains(&key);
+                let task = graph.tasks.iter().find(|task| {
+                    task.file_ordinal == file_ordinal
+                        && task.segment_id == segment.segment_id
+                        && task.morsel_id == morsel_id
+                });
+                let kept_task = task.is_some() || kept.contains(&key);
                 decisions.push(json!({
                     "file_ordinal": file_ordinal,
                     "source": file.source(),
@@ -291,24 +307,8 @@ pub fn pruning_report(planned: &PlannedScan) -> PruningExplainReport {
                     "decision": if kept_task { "kept" } else { "pruned" },
                     "evidence_kind": if kept_task { "metadata_task_graph" } else { "metadata_pruning_or_visibility_overlay" },
                     "fallback_reason": fallback_reason(planned),
-                    "split_id": graph
-                        .tasks
-                        .iter()
-                        .find(|task| {
-                            task.file_ordinal == file_ordinal
-                                && task.segment_id == segment.segment_id
-                                && task.morsel_id == morsel_id
-                        })
-                        .and_then(|task| task.split_id),
-                    "cluster_id": graph
-                        .tasks
-                        .iter()
-                        .find(|task| {
-                            task.file_ordinal == file_ordinal
-                                && task.segment_id == segment.segment_id
-                                && task.morsel_id == morsel_id
-                        })
-                        .and_then(|task| task.cluster_id),
+                    "split_id": task.and_then(|task| task.split_id),
+                    "cluster_id": task.and_then(|task| task.cluster_id),
                 }));
             }
         }
@@ -960,6 +960,20 @@ fn morsel_row_count_for(
     Ok(remaining.min(segment.morsel_row_count))
 }
 
+fn synthetic_report_morsels(
+    segment: &cove_core::segment::TableSegmentIndexEntryV1,
+) -> Vec<(u32, u64, u32)> {
+    (0..segment.morsel_count)
+        .map(|morsel_id| {
+            let row_start = u64::from(segment.row_start).saturating_add(
+                u64::from(morsel_id).saturating_mul(u64::from(segment.morsel_row_count)),
+            );
+            let row_count = morsel_row_count_for(segment, morsel_id).unwrap_or(0);
+            (morsel_id, row_start, row_count)
+        })
+        .collect()
+}
+
 fn decode_stats_json(stats: DecodeStats) -> Value {
     json!({
         "metadata_bytes_read": stats.metadata_bytes_read,
@@ -1002,6 +1016,17 @@ impl Default for CoalescedRangeStats {
 mod tests {
     use super::*;
     use arrow_schema::{Schema, SchemaRef};
+    use cove_core::{
+        compression,
+        constants::{CoveEncodingKind, CoveLogicalType, CovePhysicalKind, SectionKind},
+        page::{ColumnPageIndexEntryV1, COLUMN_PAGE_INDEX_ENTRY_LEN},
+        reader,
+        segment::{RowMorselEntryV1, TableSegmentHeaderV1},
+        table::{ColumnEntry, TableCatalog, TableEntry},
+        writer::{
+            MinimalCoveWriter, ScanPageSpec, ScanProfileCoveWriter, ScanSegment, SectionPayload,
+        },
+    };
 
     #[test]
     fn parses_filter_dsl() {
@@ -1041,5 +1066,150 @@ mod tests {
             reject_residual_required(&plan),
             Err(CoveError::UnsupportedEncoding(_))
         ));
+    }
+
+    #[test]
+    fn pruning_report_uses_sparse_morsel_ids_and_directory_rows() {
+        let state =
+            Arc::new(DatasetState::from_bytes("sparse-explain", sparse_morsel_file()).unwrap());
+        let plan = plan_scan(&state, None, Vec::new()).unwrap();
+        let graph = build_task_graph(&state, &plan).unwrap();
+        let report = pruning_report(&PlannedScan { state, plan, graph });
+
+        let decisions = report
+            .decisions
+            .iter()
+            .map(|decision| {
+                (
+                    decision["morsel_id"].as_u64().unwrap(),
+                    decision["row_start"].as_u64().unwrap(),
+                    decision["row_count"].as_u64().unwrap(),
+                    decision["decision"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            decisions,
+            vec![
+                (10, 0, 1, "kept".to_string()),
+                (20, 1, 1, "kept".to_string())
+            ]
+        );
+    }
+
+    fn sparse_morsel_file() -> Vec<u8> {
+        rewrite_first_segment_data(two_morsel_file(), |data| {
+            set_morsel_and_page_ids(data, &[10, 20]);
+        })
+    }
+
+    fn two_morsel_file() -> Vec<u8> {
+        let mut writer = ScanProfileCoveWriter::new(test_table());
+        let mut segment = ScanSegment::new(1, 0, 0, 2, 1);
+        segment.morsel_row_count = 1;
+        segment.set_column_pages(
+            1,
+            vec![
+                ScanPageSpec::new(1, 1i64.to_le_bytes().to_vec())
+                    .with_encoding_root(CoveEncodingKind::NumCode as u32),
+                ScanPageSpec::new(1, 2i64.to_le_bytes().to_vec())
+                    .with_encoding_root(CoveEncodingKind::NumCode as u32),
+            ],
+        );
+        writer.push_segment(segment);
+        writer.write().unwrap()
+    }
+
+    fn test_table() -> TableCatalog {
+        TableCatalog {
+            flags: 0,
+            tables: vec![TableEntry {
+                table_id: 1,
+                namespace: "public".into(),
+                name: "events".into(),
+                row_count: 2,
+                primary_sort_key_count: 0,
+                clustering_key_count: 0,
+                flags: 0,
+                columns: vec![ColumnEntry {
+                    column_id: 1,
+                    name: "id".into(),
+                    logical: CoveLogicalType::Int64,
+                    physical: CovePhysicalKind::NumCode,
+                    nullable: false,
+                    sort_order: 0,
+                    collation_id: 0,
+                    precision: 0,
+                    scale: 0,
+                    flags: 0,
+                }],
+            }],
+        }
+    }
+
+    fn rewrite_first_segment_data<F>(bytes: Vec<u8>, mut mutate: F) -> Vec<u8>
+    where
+        F: FnMut(&mut Vec<u8>),
+    {
+        let validated = reader::validate_bytes(&bytes).unwrap();
+        let mut writer = MinimalCoveWriter::new();
+        writer.created_at_us = validated.header.created_at_us;
+        writer.file_id = validated.header.file_id;
+        writer.producer_scope_id = validated.header.producer_scope_id;
+        writer.producer_scope_kind = validated.header.producer_scope_kind;
+        writer.primary_profile = validated.header.primary_profile;
+        writer.required_features = validated.header.required_features;
+        writer.optional_features = validated.header.optional_features;
+        writer.metadata_json = validated.footer.metadata_json.clone();
+
+        let mut mutated = false;
+        for entry in &validated.footer.sections {
+            let mut data = compression::section_payload(&bytes, entry)
+                .unwrap()
+                .into_owned();
+            if !mutated && entry.section_kind == SectionKind::TableSegmentData as u16 {
+                mutate(&mut data);
+                mutated = true;
+            }
+            writer.sections.push(SectionPayload {
+                section_kind: entry.section_kind,
+                profile: entry.profile,
+                flags: entry.flags,
+                item_count: entry.item_count,
+                row_count: entry.row_count,
+                compression: entry.compression,
+                alignment_log2: entry.alignment_log2,
+                required_features: entry.required_features,
+                optional_features: entry.optional_features,
+                data,
+            });
+        }
+        assert!(
+            mutated,
+            "fixture should contain a table segment data section"
+        );
+        writer.write().unwrap()
+    }
+
+    fn set_morsel_and_page_ids(segment_data: &mut [u8], ids: &[u32]) {
+        let header = TableSegmentHeaderV1::parse(segment_data).unwrap();
+        assert_eq!(header.morsel_count as usize, ids.len());
+        let morsel_dir = header.morsel_directory_offset as usize;
+        for (index, morsel_id) in ids.iter().copied().enumerate() {
+            let offset = morsel_dir + index * cove_core::segment::ROW_MORSEL_ENTRY_LEN;
+            let mut entry = RowMorselEntryV1::parse(&segment_data[offset..]).unwrap();
+            entry.morsel_id = morsel_id;
+            segment_data[offset..offset + cove_core::segment::ROW_MORSEL_ENTRY_LEN]
+                .copy_from_slice(&entry.serialize());
+        }
+        let page_index = header.page_index_offset as usize;
+        for (index, morsel_id) in ids.iter().copied().enumerate() {
+            let offset = page_index + index * COLUMN_PAGE_INDEX_ENTRY_LEN;
+            let mut page = ColumnPageIndexEntryV1::parse(&segment_data[offset..]).unwrap();
+            page.morsel_id = morsel_id;
+            segment_data[offset..offset + COLUMN_PAGE_INDEX_ENTRY_LEN]
+                .copy_from_slice(&page.serialize());
+        }
     }
 }

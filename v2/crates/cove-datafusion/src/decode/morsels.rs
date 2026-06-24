@@ -290,6 +290,11 @@ fn parse_segment_metadata(
     if morsels.sum_rows() != header.row_count as u64 {
         return Err(CoveError::SegmentCorrupt);
     }
+    morsels.validate_fixed_layout(
+        header.row_count,
+        header.morsel_count,
+        header.morsel_row_count,
+    )?;
     let column_dir_len = (header.column_count as usize)
         .checked_mul(TABLE_COLUMN_DIRECTORY_ENTRY_LEN)
         .ok_or(CoveError::ArithOverflow)?;
@@ -470,6 +475,56 @@ mod tests {
                 .row_count,
             4
         );
+    }
+
+    #[test]
+    fn parse_segment_metadata_rejects_irregular_morsel_layout() {
+        let morsel_directory_offset = TABLE_SEGMENT_HEADER_LEN;
+        let column_directory_offset =
+            morsel_directory_offset + cove_core::segment::ROW_MORSEL_ENTRY_LEN * 2;
+        let header = TableSegmentHeaderV1 {
+            table_id: 1,
+            segment_id: 7,
+            row_start: 0,
+            row_count: 5,
+            morsel_count: 2,
+            morsel_row_count: 4,
+            column_count: 0,
+            morsel_directory_offset: morsel_directory_offset as u64,
+            column_directory_offset: column_directory_offset as u64,
+            page_index_offset: column_directory_offset as u64,
+            data_offset: column_directory_offset as u64,
+            flags: 0,
+            checksum: 0,
+        };
+        let morsels = RowMorselDirectory {
+            entries: vec![
+                RowMorselEntryV1 {
+                    morsel_id: 0,
+                    first_row_in_segment: 0,
+                    row_count: 2,
+                    flags: 0,
+                    stats_ref: 0,
+                    checksum: 0,
+                },
+                RowMorselEntryV1 {
+                    morsel_id: 1,
+                    first_row_in_segment: 2,
+                    row_count: 3,
+                    flags: 0,
+                    stats_ref: 0,
+                    checksum: 0,
+                },
+            ],
+        };
+
+        let mut bytes = header.serialize().to_vec();
+        bytes.extend_from_slice(&morsels.serialize());
+
+        assert!(matches!(
+            parse_segment_metadata(&bytes, bytes.len() as u64, 0),
+            Err(CoveError::SegmentCorrupt)
+        ));
     }
 }
 

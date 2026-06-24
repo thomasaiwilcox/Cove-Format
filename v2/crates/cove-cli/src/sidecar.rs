@@ -247,7 +247,10 @@ fn build_covx_or_covm_sidecar(mut args: Vec<String>, covx: bool) -> Result<(), S
 }
 
 fn build_covi_sidecar(args: Vec<String>) -> Result<(), String> {
-    use cove_index::build::{build_covi_from_cove_bytes, CoviBuildOptions};
+    use cove_index::build::{
+        build_covi_from_cove_bytes, build_covi_from_cove_o_bytes, CoviBuildOptions,
+        CoviObjectPropertyBuildOptions,
+    };
 
     if args.len() == 1 {
         let output = PathBuf::from(&args[0]);
@@ -263,6 +266,8 @@ fn build_covi_sidecar(args: Vec<String>) -> Result<(), String> {
 
     let mut positionals = Vec::new();
     let mut options = CoviBuildOptions::default();
+    let mut object_options = CoviObjectPropertyBuildOptions::default();
+    let mut object_properties = false;
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -287,13 +292,29 @@ fn build_covi_sidecar(args: Vec<String>) -> Result<(), String> {
                 );
             }
             "--all-columns" => options.all_columns = true,
-            "--index-only-counts" => options.include_index_only_counts = true,
-            "--index-only-exists" => options.include_index_only_exists = true,
-            "--index-only-min-max" => options.include_index_only_min_max = true,
-            "--index-only-distinct-count" => options.include_index_only_distinct_count = true,
-            "--index-only-sum-avg" => options.include_index_only_sum_avg = true,
+            "--object-properties" => object_properties = true,
+            "--index-only-counts" => {
+                options.include_index_only_counts = true;
+                object_options.include_index_only_counts = true;
+            }
+            "--index-only-exists" => {
+                options.include_index_only_exists = true;
+                object_options.include_index_only_exists = true;
+            }
+            "--index-only-min-max" => {
+                options.include_index_only_min_max = true;
+                object_options.include_index_only_min_max = true;
+            }
+            "--index-only-distinct-count" => {
+                options.include_index_only_distinct_count = true;
+                object_options.include_index_only_distinct_count = true;
+            }
+            "--index-only-sum-avg" => {
+                options.include_index_only_sum_avg = true;
+                object_options.include_index_only_sum_avg = true;
+            }
             "-h" | "--help" => {
-                println!("usage: cove sidecar build covi <input.cove> <output.covi> [--table-id <id>] [--column-id <id> ... | --all-columns] [--index-only-counts] [--index-only-exists] [--index-only-min-max] [--index-only-distinct-count] [--index-only-sum-avg]");
+                println!("usage: cove sidecar build covi <input.cove> <output.covi> [--table-id <id>] [--column-id <id> ... | --all-columns | --object-properties] [--index-only-counts] [--index-only-exists] [--index-only-min-max] [--index-only-distinct-count] [--index-only-sum-avg]");
                 return Ok(());
             }
             _ if arg.starts_with("--") => return Err(format!("unknown option: {arg}")),
@@ -306,11 +327,20 @@ fn build_covi_sidecar(args: Vec<String>) -> Result<(), String> {
     if options.all_columns && !options.column_ids.is_empty() {
         return Err("--all-columns cannot be combined with --column-id".into());
     }
+    if object_properties
+        && (options.all_columns || options.table_id.is_some() || !options.column_ids.is_empty())
+    {
+        return Err("--object-properties cannot be combined with table or column selection".into());
+    }
     let input_path = positionals.remove(0);
     let output_path = PathBuf::from(positionals.remove(0));
     let input = fs::read(&input_path).map_err(|error| format!("{input_path}: {error}"))?;
-    let bytes = build_covi_from_cove_bytes(&input, &options)
-        .map_err(|error| format!("{input_path}: {error}"))?;
+    let bytes = if object_properties {
+        build_covi_from_cove_o_bytes(&input, &object_options)
+    } else {
+        build_covi_from_cove_bytes(&input, &options)
+    }
+    .map_err(|error| format!("{input_path}: {error}"))?;
     durable::durable_replace(&output_path, &bytes)
         .map_err(|error| format!("cannot durably publish {}: {error}", output_path.display()))?;
     println!("wrote COVE-I artifact to {}", output_path.display());

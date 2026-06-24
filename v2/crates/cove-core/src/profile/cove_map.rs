@@ -286,6 +286,21 @@ pub struct MapProjectionColumn {
     pub nested_shape: Option<String>,
     pub conflict_policy: String,
     pub missing_policy: String,
+    pub lineage: Option<MapProjectionColumnLineage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MapProjectionColumnLineage {
+    pub source: String,
+    pub object_type_id: u32,
+    pub object_type_name: String,
+    pub property_id: u32,
+    pub property_name: String,
+    pub projection_table_id: u32,
+    pub projection_column_id: u32,
+    pub expression: String,
+    pub transform: String,
+    pub filter_pushdown: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -322,9 +337,19 @@ pub fn validate_embedded_sections(sections: &[EmbeddedMapSection]) -> Result<(),
     embedded::validate_embedded_sections(sections)
 }
 
+pub fn compact_evidence_index_bytes(index: &MapEvidenceIndex) -> Result<Vec<u8>, CoveError> {
+    embedded::compact_evidence_index_bytes(index)
+}
+
+pub fn is_compact_evidence_index_bytes(bytes: &[u8]) -> bool {
+    embedded::is_compact_evidence_index_bytes(bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
+
     use serde_json::{json, Value};
 
     fn parse_json(kind: SectionKind, value: Value) -> EmbeddedMapSection {
@@ -411,6 +436,73 @@ mod tests {
         assert!(!index.entries[0]
             .operation_metadata
             .contains_key("source_operation_kind"));
+    }
+
+    #[test]
+    fn compact_evidence_index_round_trips_and_filters_metadata() {
+        let index = MapEvidenceIndex {
+            mapping_id: "demo-map".into(),
+            mapping_version: "2026.06".into(),
+            entries: vec![
+                MapEvidenceEntry {
+                    source_id: "crm".into(),
+                    source_row_identity: "crm:1".into(),
+                    rule_id: "upsert_person".into(),
+                    assertion_id: "assert:name".into(),
+                    output_object_id: "goid:person:1".into(),
+                    observed_schema_fingerprint: Some("schema:crm:v1".into()),
+                    observed_snapshot_digest: Some("sha256:crm-snapshot".into()),
+                    operation_metadata: BTreeMap::from([
+                        ("source_operation_kind".into(), json!("Upsert")),
+                        ("operation_effect".into(), json!("merged")),
+                        ("property_name".into(), json!("name")),
+                    ]),
+                },
+                MapEvidenceEntry {
+                    source_id: "support".into(),
+                    source_row_identity: "support:1".into(),
+                    rule_id: "upsert_person".into(),
+                    assertion_id: "assert:name".into(),
+                    output_object_id: "goid:person:1".into(),
+                    observed_schema_fingerprint: Some("schema:support:v1".into()),
+                    observed_snapshot_digest: Some("sha256:support-snapshot".into()),
+                    operation_metadata: BTreeMap::from([
+                        ("source_operation_kind".into(), json!("Upsert")),
+                        ("operation_effect".into(), json!("merged")),
+                        ("property_name".into(), json!("name")),
+                    ]),
+                },
+            ],
+        };
+
+        let compact = compact_evidence_index_bytes(&index).unwrap();
+        assert!(is_compact_evidence_index_bytes(&compact));
+        assert_eq!(MapEvidenceIndex::parse(&compact).unwrap(), index);
+
+        let filtered = MapEvidenceIndex::parse_with_requested_operation_metadata_keys(
+            &compact,
+            &[String::from("source_operation_kind")],
+        )
+        .unwrap();
+        assert_eq!(
+            filtered.entries[0]
+                .operation_metadata
+                .get("source_operation_kind"),
+            Some(&json!("Upsert"))
+        );
+        assert!(!filtered.entries[0]
+            .operation_metadata
+            .contains_key("operation_effect"));
+        assert!(!filtered.entries[0]
+            .operation_metadata
+            .contains_key("property_name"));
+
+        let mut corrupt = compact;
+        *corrupt.last_mut().unwrap() ^= 0x80;
+        assert_eq!(
+            MapEvidenceIndex::parse(&corrupt),
+            Err(CoveError::MapEvidenceInvalid)
+        );
     }
 
     fn row_rule_with_operation(

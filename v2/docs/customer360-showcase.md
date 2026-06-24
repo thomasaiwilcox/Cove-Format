@@ -15,7 +15,8 @@ The current runnable archive is materialized from `customers_360.jsonl` with
 `customer360_readback.covemap` so CoveQL readback stays deterministic and
 copy-pasteable. The CRM/support/billing files and `customer360.covemap` are
 generated alongside it as the messy multi-source mapping surface and provenance
-contract for the showcase.
+contract for the showcase. The generated `map-build-bundle/` is built directly
+from those messy sources with `cove map build --verify --publish-covm`.
 
 ## What This Shows
 
@@ -28,6 +29,8 @@ contract for the showcase.
 - Projected COVE-T and Parquet outputs keep the data-science workflow practical.
 - Optional acceleration sidecars can improve reads, but they remain subordinate
   to the mapped archive's logical truth.
+- The map-build proof bundle verifies generated COVE-O/COVE-T/COVE-I/COVM
+  artifacts and writes parity plus size reports for reproducible comparison.
 
 ## Why This Is A COVE-Shaped Problem
 
@@ -64,6 +67,8 @@ The output includes:
 - `customer360.covemap` for the messy source mapping surface;
 - `customers.cove`, the queryable COVE-O archive materialized from the
   reconciled canonical readback source;
+- `map-build-bundle/`, the verified COVE-MAP build from CRM/support/billing;
+- `doctor-report.json`, `parity/`, and `proof-size-comparison.json` proof artifacts;
 - `customers_projection.cove` and `evidence_projection.cove` projected COVE-T baselines;
 - matching Parquet projection baselines;
 - `customer360-manifest.json` with paths, row counts, recommended queries, and benchmark IDs;
@@ -97,6 +102,12 @@ table:
 cove query examples/customer360/customers.cove \
   --external-table events=examples/customer360/events.jsonl \
   'table(customers) as c.join(table(events) as e, on: c.customer_id == e.customer_id).select(customer_id: c.customer_id, tier: c.tier, event_kind: e.event_kind, event_score: e.score).take(10)'
+```
+
+Verify the messy-source map-build proof bundle:
+
+```bash
+cove map doctor --bundle-dir examples/customer360/map-build-bundle
 ```
 
 ## Optimize And Compare

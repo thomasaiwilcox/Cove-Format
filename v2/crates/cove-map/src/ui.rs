@@ -98,6 +98,13 @@ validate <mapping.covemap>\n  \
 preview <mapping.covemap>\n  \
   plan-keys <mapping.covemap> <source.csv|source.jsonl|source.parquet|source.orc|source.arrow>...\n  \
   convert [--format json|cove-o] [-o output] <mapping.covemap> <source.csv|source.jsonl|source.parquet|source.orc|source.arrow>...\n  \
+build --out-dir <dir> [--verify] [--publish-covm] [--force] [--json] [--object-name name.cove] [--projection-output cove-t|none] [--evidence-encoding compact|expanded|both] [--section-compression zstd|none] <mapping.covemap> <source.csv|source.jsonl|source.parquet|source.orc|source.arrow>...\n  \
+publish --bundle-dir <dir> --out <dataset.covm> [--force] [--json]\n  \
+doctor [--json] [--strict] --bundle-dir <dir>\n  \
+doctor [--json] [--strict] <mapping.covemap> <source.csv|source.jsonl|source.parquet|source.orc|source.arrow>...\n  \
+suggest [--json] [--out suggestions.json] <source.csv|source.jsonl|source.parquet>...\n  \
+parity [--json] --projection-id <id> --expected <table.csv|jsonl|parquet> [--expected-query <coveql>] [--key col[,col...]] <mapping.covemap> <source...>\n  \
+parity-cove-o [--json] --projection-id <id> --expected <table.csv|jsonl|parquet> [--expected-query <coveql>] [--key col[,col...]] <object.cove>\n  \
 explain <mapping.covemap> <goid|assertion-id>\n  \
 diff <left.covemap> <right.covemap>\n  \
   project [-o output.json] <mapping.covemap> <source.csv|source.jsonl|source.parquet|source.orc|source.arrow>...\n  \

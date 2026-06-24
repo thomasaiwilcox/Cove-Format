@@ -1227,6 +1227,88 @@ fn query_covemap_sidecar_reports_guidance() {
 }
 
 #[test]
+fn map_build_creates_adoption_bundle() {
+    let out_dir = temp_file("map-build-bundle");
+    let mapping = sample_path("people.covemap");
+    let source = sample_path("people.jsonl");
+    let output = run_cove(&[
+        "map",
+        "build",
+        "--out-dir",
+        out_dir.to_str().unwrap(),
+        "--verify",
+        "--force",
+        "--json",
+        mapping.to_str().unwrap(),
+        source.to_str().unwrap(),
+    ]);
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let manifest: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        manifest["format"],
+        serde_json::json!("cove-map-build-manifest-v1")
+    );
+    let object = manifest["artifacts"]["object"]["path"].as_str().unwrap();
+    assert!(out_dir.join(object).exists());
+    let index = manifest["artifacts"]["indexes"][0]["path"]
+        .as_str()
+        .unwrap();
+    assert!(out_dir.join(index).exists());
+    assert!(out_dir.join("map-build-report.json").exists());
+    assert!(out_dir.join("map-build-manifest.json").exists());
+    assert!(out_dir.join("README.md").exists());
+
+    let inspect_index = run_cove(&[
+        "sidecar",
+        "inspect",
+        "index",
+        out_dir.join(index).to_str().unwrap(),
+    ]);
+    assert!(
+        inspect_index.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&inspect_index.stderr)
+    );
+    assert!(String::from_utf8_lossy(&inspect_index.stdout).contains("COVE-I"));
+
+    let doctor = run_cove(&[
+        "map",
+        "doctor",
+        "--bundle-dir",
+        out_dir.to_str().unwrap(),
+        "--json",
+    ]);
+    assert!(
+        doctor.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&doctor.stderr)
+    );
+    let doctor_report: serde_json::Value = serde_json::from_slice(&doctor.stdout).unwrap();
+    assert_eq!(
+        doctor_report["format"],
+        serde_json::json!("cove-map-doctor-report-v1")
+    );
+    assert_eq!(doctor_report["status"], serde_json::json!("ok"));
+
+    let suggestions = run_cove(&["map", "suggest", "--json", source.to_str().unwrap()]);
+    assert!(
+        suggestions.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&suggestions.stderr)
+    );
+    let suggestions: serde_json::Value = serde_json::from_slice(&suggestions.stdout).unwrap();
+    assert_eq!(
+        suggestions["format"],
+        serde_json::json!("cove-map-suggestions-v1")
+    );
+    assert_eq!(suggestions["non_authoritative"], serde_json::json!(true));
+}
+
+#[test]
 fn examples_and_doctor_commands_are_beginner_friendly() {
     let examples = run_cove(&["examples"]);
     assert!(
@@ -1447,18 +1529,14 @@ fn command_specific_help_surfaces_reference_workflows() {
         (
             &["sidecar", "--help"][..],
             "cove sidecar build covi",
-            "--all-columns",
+            "--object-properties",
         ),
         (
             &["convert", "--help"][..],
             "cove convert parquet",
             "cove-to-source",
         ),
-        (
-            &["map", "--help"][..],
-            "cove map project",
-            "cove map convert",
-        ),
+        (&["map", "--help"][..], "cove map build", "COVE-I"),
     ];
     for (args, expected_a, expected_b) in cases {
         let output = run_cove(args);
@@ -2047,6 +2125,9 @@ fn customer360_showcase_command_generates_queryable_artifacts() {
         "evidence_projection.cove",
         "customers_projection.parquet",
         "evidence_projection.parquet",
+        "map-build-bundle/map-build-manifest.json",
+        "doctor-report.json",
+        "proof-size-comparison.json",
         "customer360-manifest.json",
         "notebooks/customer360_analysis.py",
     ] {
@@ -2062,6 +2143,8 @@ fn customer360_showcase_command_generates_queryable_artifacts() {
         manifest["pipeline"]["canonical_readback_source"],
         "customers_360.jsonl"
     );
+    assert_eq!(manifest["proof"]["doctor_status"], serde_json::json!("ok"));
+    assert_eq!(manifest["proof"]["parity_status"], serde_json::json!("ok"));
     assert!(manifest["recommended_queries"]
         .as_array()
         .unwrap()
@@ -2123,6 +2206,57 @@ fn customer360_showcase_command_generates_queryable_artifacts() {
         String::from_utf8_lossy(&joined.stderr)
     );
     assert!(String::from_utf8_lossy(&joined.stdout).contains("\"event_kind\""));
+}
+
+#[test]
+fn proof_suite_showcase_command_generates_verified_scenario() {
+    let out_dir = temp_file("proof-suite-generated");
+    let generated = run_cove(&[
+        "showcase",
+        "proof-suite",
+        "--scenario",
+        "claims",
+        "--profile",
+        "quick",
+        "--out",
+        out_dir.to_str().unwrap(),
+        "--force",
+        "--json",
+    ]);
+    assert!(
+        generated.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&generated.stdout),
+        String::from_utf8_lossy(&generated.stderr)
+    );
+    let manifest: serde_json::Value = serde_json::from_slice(&generated.stdout).unwrap();
+    assert_eq!(
+        manifest["format"],
+        serde_json::json!("cove-proof-suite-manifest-v1")
+    );
+    assert_eq!(
+        manifest["scenarios"][0]["scenario"],
+        serde_json::json!("claims")
+    );
+    assert_eq!(
+        manifest["scenarios"][0]["doctor_status"],
+        serde_json::json!("ok")
+    );
+    assert_eq!(
+        manifest["scenarios"][0]["parity_status"],
+        serde_json::json!("ok")
+    );
+    for name in [
+        "proof-suite-manifest.json",
+        "claims/claims.covemap",
+        "claims/map-build-bundle/map-build-manifest.json",
+        "claims/doctor-report.json",
+        "claims/proof-size-comparison.json",
+        "claims/parity/claims.v1.json",
+        "claims/proof-baselines/source-parquet/claims.parquet",
+    ] {
+        assert!(out_dir.join(name).exists(), "missing proof-suite {name}");
+    }
 }
 
 #[test]

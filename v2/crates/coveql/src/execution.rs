@@ -2469,6 +2469,7 @@ pub(crate) fn execute_projection_root(
         output_columns,
         pushed_filters: pushed_filters.clone(),
         batch_size: options.batch_size,
+        candidate_projection_rows: None,
     };
     let batches = projected_record_batches_from_cove_o_bytes(
         bytes,
@@ -2796,6 +2797,7 @@ pub(crate) fn projection_root_execution_rows(
         output_columns,
         pushed_filters,
         batch_size: options.batch_size,
+        candidate_projection_rows: None,
     };
     let batches = projected_record_batches_from_cove_o_bytes(
         bytes,
@@ -2832,6 +2834,7 @@ fn projection_rows_all_columns(
         output_columns: None,
         pushed_filters: Vec::new(),
         batch_size: options.batch_size,
+        candidate_projection_rows: None,
     };
     let batches = projected_record_batches_from_cove_o_bytes(
         bytes,

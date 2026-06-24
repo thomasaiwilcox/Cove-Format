@@ -23,16 +23,16 @@ use cove_core::artifact::covemap::{
 use cove_core::profile::{
     cove_map::{
         EmbeddedMapSection, MapEvidenceEntry, MapProjectionCatalog, MapProjectionColumn,
-        MapProjectionEntry,
+        MapProjectionColumnLineage, MapProjectionEntry,
     },
     cove_o::{
         read_object_surface_from_bytes_with_options, CoveObjectReadOptions, CoveObjectRecord,
-        CoveObjectSurface, CoveRecordRefV1, RecordKind, OBJECT_TYPE_FLAG_ASSOCIATION_OBJECT,
-        OBJECT_TYPE_FLAG_LINK_OBJECT, PROPERTY_FLAG_ASSOCIATION_FROM_GOID,
-        PROPERTY_FLAG_ASSOCIATION_OBSERVED_AT, PROPERTY_FLAG_ASSOCIATION_TO_GOID,
-        PROPERTY_FLAG_ASSOCIATION_TYPE, PROPERTY_FLAG_ASSOCIATION_VALID_FROM,
-        PROPERTY_FLAG_ASSOCIATION_VALID_TO, PROPERTY_FLAG_EVIDENCE_REF,
-        PROPERTY_FLAG_MAPPING_RULE_REF,
+        CoveObjectSurface, CoveRecordRefV1, ObjectTypeEntryV1, RecordKind,
+        OBJECT_TYPE_FLAG_ASSOCIATION_OBJECT, OBJECT_TYPE_FLAG_LINK_OBJECT,
+        PROPERTY_FLAG_ASSOCIATION_FROM_GOID, PROPERTY_FLAG_ASSOCIATION_OBSERVED_AT,
+        PROPERTY_FLAG_ASSOCIATION_TO_GOID, PROPERTY_FLAG_ASSOCIATION_TYPE,
+        PROPERTY_FLAG_ASSOCIATION_VALID_FROM, PROPERTY_FLAG_ASSOCIATION_VALID_TO,
+        PROPERTY_FLAG_EVIDENCE_REF, PROPERTY_FLAG_MAPPING_RULE_REF,
     },
 };
 use cove_core::{
@@ -79,6 +79,28 @@ pub struct ProjectionBatchOptions {
     pub output_columns: Option<Vec<String>>,
     pub pushed_filters: Vec<ProjectionFilter>,
     pub batch_size: Option<usize>,
+    pub candidate_projection_rows: Option<ProjectionCandidateRows>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProjectionCandidateRows {
+    pub row_ordinals: BTreeSet<u64>,
+}
+
+impl ProjectionCandidateRows {
+    pub fn from_ordinals(row_ordinals: impl IntoIterator<Item = u64>) -> Self {
+        Self {
+            row_ordinals: row_ordinals.into_iter().collect(),
+        }
+    }
+
+    fn contains(&self, ordinal: u64) -> bool {
+        self.row_ordinals.contains(&ordinal)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.row_ordinals.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,6 +159,15 @@ pub struct ProjectionReadRequirements {
     pub include_records: bool,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ProjectionSidecarColumnValues {
+    pub table_id: u32,
+    pub column_id: u32,
+    pub logical_type: CoveLogicalType,
+    pub physical_kind: CovePhysicalKind,
+    pub values: Vec<Value>,
+}
+
 pub(crate) use encoding::nested_schema_node_from_shape;
 
 #[derive(Debug, Clone)]
@@ -152,8 +183,23 @@ struct ProjectedTable {
     mapping_version: String,
     projection_id: String,
     output_table: String,
+    temporal_cut: Option<String>,
     columns: Vec<ProjectedColumn>,
     rows: Vec<Map<String, Value>>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ProjectionLineageContext {
+    pub(crate) source_cove_o: Option<ProjectionSourceCoveO>,
+    pub(crate) mapping_artifact_digest: Option<String>,
+    pub(crate) covm_manifest: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ProjectionSourceCoveO {
+    pub(crate) path: Option<String>,
+    pub(crate) label: String,
+    pub(crate) digest: Option<String>,
 }
 
 const DEFAULT_ARROW_BATCH_SIZE: usize = 1024;
@@ -243,7 +289,7 @@ pub(crate) fn project_rows_with_source_states_output(
         format,
         &ProjectionBatchOptions::default(),
     )?;
-    encode_projection_output(format, &projection_catalog, &tables)
+    encode_projection_output(format, &projection_catalog, &tables, None)
 }
 
 pub(crate) fn project_cove_o_path(object: &Path, mapping: Option<&Path>) -> Result<Value, String> {
@@ -259,12 +305,28 @@ pub(crate) fn project_cove_o_path_output(
 ) -> Result<Vec<u8>, String> {
     let bytes =
         fs::read(object).map_err(|err| format!("cannot read {}: {err}", object.display()))?;
-    project_cove_o_bytes_output(
+    let lineage = ProjectionLineageContext {
+        source_cove_o: Some(ProjectionSourceCoveO {
+            path: Some(object.display().to_string()),
+            label: object.display().to_string(),
+            digest: Some(format!("sha256:{}", sha256_hex(&bytes))),
+        }),
+        mapping_artifact_digest: mapping
+            .map(|path| {
+                fs::read(path)
+                    .map(|bytes| format!("sha256:{}", sha256_hex(&bytes)))
+                    .map_err(|err| format!("cannot read {}: {err}", path.display()))
+            })
+            .transpose()?,
+        covm_manifest: None,
+    };
+    project_cove_o_bytes_output_with_lineage(
         &bytes,
         mapping,
         format,
         projection_id,
         &object.display().to_string(),
+        Some(&lineage),
     )
 }
 
@@ -283,6 +345,24 @@ pub(crate) fn project_cove_o_bytes_output(
     format: ProjectionFormat,
     projection_id: Option<&str>,
     object_label: &str,
+) -> Result<Vec<u8>, String> {
+    project_cove_o_bytes_output_with_lineage(
+        bytes,
+        mapping,
+        format,
+        projection_id,
+        object_label,
+        None,
+    )
+}
+
+pub(crate) fn project_cove_o_bytes_output_with_lineage(
+    bytes: &[u8],
+    mapping: Option<&Path>,
+    format: ProjectionFormat,
+    projection_id: Option<&str>,
+    object_label: &str,
+    lineage: Option<&ProjectionLineageContext>,
 ) -> Result<Vec<u8>, String> {
     let projection_catalog =
         projection_catalog_from_cove_o_bytes_internal(bytes, mapping, object_label)?;
@@ -305,7 +385,7 @@ pub(crate) fn project_cove_o_bytes_output(
         format,
         &execution_options,
     )?;
-    encode_projection_output(format, &projection_catalog, &tables)
+    encode_projection_output(format, &projection_catalog, &tables, lineage)
 }
 
 pub(crate) fn project_cove_o_bytes_record_batch(
@@ -385,6 +465,68 @@ pub(crate) fn project_cove_o_bytes_record_batches_with_catalog(
     )
 }
 
+pub(crate) fn projection_sidecar_columns_from_cove_o_bytes(
+    bytes: &[u8],
+    object_label: &str,
+) -> Result<Vec<ProjectionSidecarColumnValues>, String> {
+    let catalog = projection_catalog_from_cove_o_bytes_internal(bytes, None, object_label)?;
+    let mut out = Vec::new();
+    let options = ProjectionBatchOptions::default();
+    for projection in &catalog.projections {
+        if !projection
+            .columns
+            .iter()
+            .any(|column| column.lineage.is_some())
+        {
+            continue;
+        }
+        let surface = read_surface_for_projection(
+            bytes,
+            None,
+            object_label,
+            &catalog,
+            Some(&projection.projection_id),
+            ProjectionFormat::Json,
+            &options,
+        )?;
+        let function_ids = projection_function_ids(None, &surface)?;
+        let access_plan = compile_projection_access_plan(
+            &catalog,
+            Some(&projection.projection_id),
+            ProjectionFormat::Json,
+            &options,
+        )?;
+        let model = ProjectionModel::from_surface_with_access_plan(&surface, &access_plan)
+            .map_err(|err| err.to_string())?;
+        validate_executable_projection(projection, &model, &function_ids)?;
+        let rows = project_one(&model, projection, &options)?
+            .into_iter()
+            .map(|value| match value {
+                Value::Object(row) => Ok(projected_table_row(projection, row)),
+                _ => Err("projection produced a non-object row".to_string()),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        for column in &projection.columns {
+            let Some(lineage) = &column.lineage else {
+                continue;
+            };
+            let logical_type =
+                projection_column_logical_type(column.logical_type.as_deref().unwrap_or("utf8"))?;
+            out.push(ProjectionSidecarColumnValues {
+                table_id: lineage.projection_table_id,
+                column_id: lineage.projection_column_id,
+                physical_kind: physical_for_logical(logical_type),
+                logical_type,
+                values: rows
+                    .iter()
+                    .map(|row| row.get(&column.name).cloned().unwrap_or(Value::Null))
+                    .collect(),
+            });
+        }
+    }
+    Ok(out)
+}
+
 pub(crate) fn projection_catalog_from_cove_o_bytes_internal(
     bytes: &[u8],
     mapping: Option<&Path>,
@@ -401,7 +543,7 @@ pub(crate) fn projection_catalog_from_cove_o_bytes_internal(
         },
     )
     .map_err(|err| format!("{object_label}: {err}"))?;
-    match &catalog_surface.projection_catalog {
+    let catalog = match &catalog_surface.projection_catalog {
         Some(catalog) => Ok(catalog.clone()),
         None => {
             let mapping = mapping.ok_or_else(|| {
@@ -413,7 +555,11 @@ pub(crate) fn projection_catalog_from_cove_o_bytes_internal(
                 "fallback mapping requires a MAP_PROJECTION_CATALOG section".to_string()
             })
         }
-    }
+    }?;
+    Ok(enrich_projection_catalog_lineage(
+        catalog,
+        &catalog_surface.object_types,
+    ))
 }
 
 pub(crate) fn projection_read_requirements(
@@ -467,6 +613,190 @@ fn projection_catalog(file: &CovemapFile) -> Result<Option<MapProjectionCatalog>
         }
     }
     Ok(None)
+}
+
+pub(crate) fn enrich_projection_catalog_lineage(
+    mut catalog: MapProjectionCatalog,
+    object_types: &[ObjectTypeEntryV1],
+) -> MapProjectionCatalog {
+    let object_types_by_name = object_types
+        .iter()
+        .map(|object_type| (object_type.type_name.as_str(), object_type))
+        .collect::<BTreeMap<_, _>>();
+    for (projection_index, projection) in catalog.projections.iter_mut().enumerate() {
+        let projection_table_id = (projection_index as u32).saturating_add(1);
+        let projection_shape = projection.clone();
+        for (column_index, column) in projection.columns.iter_mut().enumerate() {
+            let projection_column_id = (column_index as u32).saturating_add(1);
+            column.lineage = projection_column_object_property_lineage(
+                &projection_shape,
+                column,
+                projection_table_id,
+                projection_column_id,
+                &object_types_by_name,
+            );
+        }
+    }
+    catalog
+}
+
+fn projection_column_object_property_lineage(
+    projection: &MapProjectionEntry,
+    column: &MapProjectionColumn,
+    projection_table_id: u32,
+    projection_column_id: u32,
+    object_types_by_name: &BTreeMap<&str, &ObjectTypeEntryV1>,
+) -> Option<MapProjectionColumnLineage> {
+    let row_grain = projection.row_grain.as_deref()?;
+    if !matches!(
+        row_grain,
+        "one_row_per_object" | "one_row_per_event_object" | "one_row_per_object_as_of_time"
+    ) {
+        return None;
+    }
+    if column.conflict_policy != "canonical_value" || column.nested_shape.is_some() {
+        return None;
+    }
+    let anchor = projection.anchor.as_ref()?;
+    if anchor.association_type.is_some() {
+        return None;
+    }
+    let object_type_name = anchor.object_type.as_ref()?;
+    let object_type = object_types_by_name.get(object_type_name.as_str())?;
+    let expression = column.value.trim();
+    if !direct_property_expression(expression) {
+        return None;
+    }
+    let property_name = expression.rsplit('.').next()?;
+    let property = object_type
+        .properties
+        .iter()
+        .find(|property| property.property_name == property_name)?;
+    if !projection_property_lineage_type_supported(property.logical_type) {
+        return None;
+    }
+    if let Some(logical_type) = &column.logical_type {
+        if projection_column_logical_type(logical_type).ok()? != property.logical_type {
+            return None;
+        }
+    }
+    Some(MapProjectionColumnLineage {
+        source: "object_property".into(),
+        object_type_id: object_type.object_type_id,
+        object_type_name: object_type.type_name.clone(),
+        property_id: property.property_id,
+        property_name: property.property_name.clone(),
+        projection_table_id,
+        projection_column_id,
+        expression: expression.to_string(),
+        transform: "identity".into(),
+        filter_pushdown: "projection_covi_prefilter".into(),
+    })
+}
+
+fn direct_property_expression(expression: &str) -> bool {
+    if expression.is_empty()
+        || expression.contains('(')
+        || expression.contains(')')
+        || expression.starts_with("association.")
+        || expression.starts_with("evidence.")
+        || literal_value(expression).is_some()
+        || known_projection_path(expression)
+        || split_comparison_expression(expression).is_some()
+        || parse_association_traversal(expression).is_some()
+    {
+        return false;
+    }
+    expression
+        .rsplit('.')
+        .next()
+        .is_some_and(|property_name| !property_name.is_empty())
+}
+
+fn projection_property_lineage_type_supported(logical_type: CoveLogicalType) -> bool {
+    !matches!(
+        logical_type,
+        CoveLogicalType::Null
+            | CoveLogicalType::List
+            | CoveLogicalType::Struct
+            | CoveLogicalType::Map
+    )
+}
+
+pub(crate) fn projection_catalog_json_value(catalog: &MapProjectionCatalog) -> Value {
+    json!({
+        "mapping_id": catalog.mapping_id,
+        "mapping_version": catalog.mapping_version,
+        "projections": catalog.projections.iter().map(projection_entry_json_value).collect::<Vec<_>>()
+    })
+}
+
+fn projection_entry_json_value(projection: &MapProjectionEntry) -> Value {
+    let mut value = json!({
+        "projection_id": projection.projection_id,
+        "assertion_ids": projection.assertion_ids,
+        "output_table": projection.output_table,
+        "row_grain": projection.row_grain,
+        "anchor": projection.anchor.as_ref().map(|anchor| json!({
+            "object_type": anchor.object_type,
+            "association_type": anchor.association_type,
+        })),
+        "temporal_mode": projection.temporal_mode,
+        "columns": projection.columns.iter().map(projection_column_json_value).collect::<Vec<_>>(),
+        "multi_value_policy": projection.multi_value_policy,
+        "missing_policy": projection.missing_policy,
+        "ordering": projection.ordering,
+        "evidence_policy": projection.evidence_policy,
+        "output_modes": projection.output_modes,
+    });
+    strip_null_json_fields(&mut value);
+    value
+}
+
+fn projection_column_json_value(column: &MapProjectionColumn) -> Value {
+    let mut value = json!({
+        "name": column.name,
+        "value": column.value,
+        "logical_type": column.logical_type,
+        "nested_shape": column.nested_shape,
+        "conflict_policy": column.conflict_policy,
+        "missing_policy": column.missing_policy,
+        "lineage": column.lineage.as_ref().map(projection_column_lineage_json_value),
+    });
+    strip_null_json_fields(&mut value);
+    value
+}
+
+fn projection_column_lineage_json_value(lineage: &MapProjectionColumnLineage) -> Value {
+    json!({
+        "source": lineage.source,
+        "object_type_id": lineage.object_type_id,
+        "object_type_name": lineage.object_type_name,
+        "property_id": lineage.property_id,
+        "property_name": lineage.property_name,
+        "projection_table_id": lineage.projection_table_id,
+        "projection_column_id": lineage.projection_column_id,
+        "expression": lineage.expression,
+        "transform": lineage.transform,
+        "filter_pushdown": lineage.filter_pushdown,
+    })
+}
+
+fn strip_null_json_fields(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            for value in object.values_mut() {
+                strip_null_json_fields(value);
+            }
+            object.retain(|_, value| !value.is_null());
+        }
+        Value::Array(values) => {
+            for value in values {
+                strip_null_json_fields(value);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn function_registry(file: &CovemapFile) -> Result<std::collections::BTreeSet<String>, String> {
@@ -879,6 +1209,7 @@ fn project_tables(
                 .output_table
                 .clone()
                 .unwrap_or_else(|| projection.projection_id.clone()),
+            temporal_cut: projection.temporal_mode.clone(),
             columns: projection
                 .columns
                 .iter()
@@ -1110,12 +1441,18 @@ fn project_arrow_object_record_batches_fast(
     let mut batches = Vec::new();
     let mut chunk = Vec::new();
     let mut emitted_rows = 0usize;
+    let mut projection_row_ordinal = 0u64;
 
     for row in rows.iter() {
         if emitted_rows >= max_rows {
             break;
         }
         if &row.object_type != object_type {
+            continue;
+        }
+        let row_ordinal = projection_row_ordinal;
+        projection_row_ordinal = projection_row_ordinal.saturating_add(1);
+        if !candidate_projection_row_allowed(options, row_ordinal) {
             continue;
         }
         if !object_row_matches_fast_path_filters(
@@ -1218,10 +1555,16 @@ fn project_arrow_evidence_record_batches_fast(
     let mut chunk = Vec::new();
     let max_rows = options.max_rows.unwrap_or(usize::MAX);
     let mut emitted_rows = 0usize;
+    let mut projection_row_ordinal = 0u64;
 
     for entry in &model.evidence_entries {
         if emitted_rows >= max_rows {
             break;
+        }
+        let row_ordinal = projection_row_ordinal;
+        projection_row_ordinal = projection_row_ordinal.saturating_add(1);
+        if !candidate_projection_row_allowed(options, row_ordinal) {
+            continue;
         }
         if !evidence_matches_projection_filters(entry, &filter_keys, &options.pushed_filters) {
             continue;
@@ -1561,6 +1904,7 @@ impl ArrowRecordBatchSink {
             mapping_version: self.mapping_version.clone(),
             projection_id: self.projection_id.clone(),
             output_table: self.output_table.clone(),
+            temporal_cut: None,
             columns: self.columns.clone(),
             rows: std::mem::take(&mut self.buffered_rows),
         };
@@ -1614,6 +1958,7 @@ where
         .as_ref()
         .ok_or_else(|| "projection anchor is required".to_string())?;
     let rows = model.rows_for_projection(projection)?;
+    let mut projection_row_ordinal = 0u64;
     for row in rows.iter() {
         if associations {
             let Some(association_type) = &anchor.association_type else {
@@ -1639,6 +1984,11 @@ where
             let Value::Object(row) = projected else {
                 return Err("projection produced a non-object row".into());
             };
+            let row_ordinal = projection_row_ordinal;
+            projection_row_ordinal = projection_row_ordinal.saturating_add(1);
+            if !candidate_projection_row_allowed(options, row_ordinal) {
+                continue;
+            }
             if !row_matches_projection_filters(&row, &options.pushed_filters) {
                 continue;
             }
@@ -1660,6 +2010,7 @@ where
     F: FnMut(Map<String, Value>) -> Result<bool, String>,
 {
     let rows = model.rows_for_projection(projection)?;
+    let mut projection_row_ordinal = 0u64;
     for row in rows.iter() {
         for property in &row.properties {
             let mut out = Map::new();
@@ -1668,6 +2019,11 @@ where
             out.insert("property_id".into(), json!(property.property_id));
             out.insert("property_name".into(), json!(property.property_name));
             out.insert("value".into(), property.value.clone());
+            let row_ordinal = projection_row_ordinal;
+            projection_row_ordinal = projection_row_ordinal.saturating_add(1);
+            if !candidate_projection_row_allowed(options, row_ordinal) {
+                continue;
+            }
             if !row_matches_projection_filters(&out, &options.pushed_filters) {
                 continue;
             }
@@ -1688,6 +2044,7 @@ fn emit_evidence_projection_rows<F>(
 where
     F: FnMut(Map<String, Value>) -> Result<bool, String>,
 {
+    let mut projection_row_ordinal = 0u64;
     for evidence in &model.evidence_entries {
         let mut out = Map::new();
         out.insert("projection_id".into(), json!(projection.projection_id));
@@ -1700,6 +2057,11 @@ where
                 column.name.clone(),
                 projection_evidence_value(evidence, key),
             );
+        }
+        let row_ordinal = projection_row_ordinal;
+        projection_row_ordinal = projection_row_ordinal.saturating_add(1);
+        if !candidate_projection_row_allowed(options, row_ordinal) {
+            continue;
         }
         if !row_matches_projection_filters(&out, &options.pushed_filters) {
             continue;
@@ -1816,6 +2178,7 @@ fn encode_projection_output(
     format: ProjectionFormat,
     catalog: &MapProjectionCatalog,
     tables: &[ProjectedTable],
+    lineage: Option<&ProjectionLineageContext>,
 ) -> Result<Vec<u8>, String> {
     match format {
         ProjectionFormat::Json => serde_json::to_vec_pretty(&json!({
@@ -1843,7 +2206,7 @@ fn encode_projection_output(
         }
         ProjectionFormat::CoveT => {
             let table = single_projection_table(tables, "COVE-T")?;
-            encoding::encode_cove_t_projection(table)
+            encoding::encode_cove_t_projection(table, lineage)
         }
     }
 }
@@ -2920,6 +3283,7 @@ fn project_object_rows(
         .ok_or_else(|| "projection anchor is required".to_string())?;
     let mut rows = Vec::new();
     let projection_rows = model.rows_for_projection(projection)?;
+    let mut projection_row_ordinal = 0u64;
     for row in projection_rows.iter() {
         if associations {
             let Some(association_type) = &anchor.association_type else {
@@ -2945,6 +3309,11 @@ fn project_object_rows(
             let Value::Object(projected_row) = projected else {
                 return Err("projection produced a non-object row".into());
             };
+            let row_ordinal = projection_row_ordinal;
+            projection_row_ordinal = projection_row_ordinal.saturating_add(1);
+            if !candidate_projection_row_allowed(options, row_ordinal) {
+                continue;
+            }
             if !row_matches_projection_filters(&projected_row, &options.pushed_filters) {
                 continue;
             }
@@ -3084,6 +3453,7 @@ fn project_property_versions(
 ) -> Result<Vec<Value>, String> {
     let mut rows = Vec::new();
     let projection_rows = model.rows_for_projection(projection)?;
+    let mut projection_row_ordinal = 0u64;
     for row in projection_rows.iter() {
         for property in &row.properties {
             let mut out = Map::new();
@@ -3092,6 +3462,11 @@ fn project_property_versions(
             out.insert("property_id".into(), json!(property.property_id));
             out.insert("property_name".into(), json!(property.property_name));
             out.insert("value".into(), property.value.clone());
+            let row_ordinal = projection_row_ordinal;
+            projection_row_ordinal = projection_row_ordinal.saturating_add(1);
+            if !candidate_projection_row_allowed(options, row_ordinal) {
+                continue;
+            }
             if !row_matches_projection_filters(&out, &options.pushed_filters) {
                 continue;
             }
@@ -3110,6 +3485,7 @@ fn project_evidence_rows(
     options: &ProjectionBatchOptions,
 ) -> Result<Vec<Value>, String> {
     let mut rows = Vec::new();
+    let mut projection_row_ordinal = 0u64;
     for evidence in &model.evidence_entries {
         let mut out = Map::new();
         out.insert("projection_id".into(), json!(projection.projection_id));
@@ -3123,6 +3499,11 @@ fn project_evidence_rows(
                 projection_evidence_value(evidence, key),
             );
         }
+        let row_ordinal = projection_row_ordinal;
+        projection_row_ordinal = projection_row_ordinal.saturating_add(1);
+        if !candidate_projection_row_allowed(options, row_ordinal) {
+            continue;
+        }
         if !row_matches_projection_filters(&out, &options.pushed_filters) {
             continue;
         }
@@ -3132,6 +3513,14 @@ fn project_evidence_rows(
         }
     }
     Ok(rows)
+}
+
+fn candidate_projection_row_allowed(options: &ProjectionBatchOptions, row_ordinal: u64) -> bool {
+    options
+        .candidate_projection_rows
+        .as_ref()
+        .map(|candidates| !candidates.is_empty() && candidates.contains(row_ordinal))
+        .unwrap_or(true)
 }
 
 fn row_matches_projection_filters(row: &Map<String, Value>, filters: &[ProjectionFilter]) -> bool {

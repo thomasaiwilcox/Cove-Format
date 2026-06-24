@@ -557,7 +557,12 @@ fn repack_selected_cove_sections(
     if let Some((entry_index, start, flags, _, index_entries)) = temporal_index_placeholder {
         let section_offsets = rebuilt_entries
             .iter()
-            .map(|entry| (entry.section_id, (entry.offset, entry.length)))
+            .map(|entry| {
+                (
+                    entry.section_id,
+                    (entry.offset, entry.length, entry.uncompressed_length),
+                )
+            })
             .collect::<BTreeMap<_, _>>();
         let rewritten_entries = index_entries
             .into_iter()
@@ -570,14 +575,15 @@ fn repack_selected_cove_sections(
                             index_entry.segment_id, index_entry.object_type_id
                         ))
                     })?;
-                let (offset, length) = section_offsets.get(section_id).ok_or_else(|| {
-                    DataFusionError::Execution(format!(
-                        "missing rebuilt temporal segment section {}",
-                        section_id
-                    ))
-                })?;
+                let (offset, _length, uncompressed_length) =
+                    section_offsets.get(section_id).ok_or_else(|| {
+                        DataFusionError::Execution(format!(
+                            "missing rebuilt temporal segment section {}",
+                            section_id
+                        ))
+                    })?;
                 index_entry.offset = *offset;
-                index_entry.length = *length;
+                index_entry.length = *uncompressed_length;
                 Ok(index_entry)
             })
             .collect::<Result<Vec<_>>>()?;

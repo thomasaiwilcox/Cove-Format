@@ -114,6 +114,7 @@ fn run_filtered_suite(
                         literal: ProjectionFilterLiteral::Boolean(true),
                     }],
                     batch_size: execution_options().batch_size,
+                    candidate_projection_rows: None,
                 },
             )
             .expect("raw COVE-MAP projection readback");

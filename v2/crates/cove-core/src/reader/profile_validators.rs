@@ -1861,7 +1861,16 @@ fn validate_segment_against_catalog(
     if segment.columns.len() != table.columns.len() {
         return Err(CoveError::SegmentCorrupt);
     }
+    let expected_column_ids = table
+        .columns
+        .iter()
+        .map(|column| column.column_id)
+        .collect::<BTreeSet<_>>();
+    let mut seen_column_ids = BTreeSet::new();
     for column_dir in &segment.columns {
+        if !seen_column_ids.insert(column_dir.column_id) {
+            return Err(CoveError::SegmentCorrupt);
+        }
         let column = columns.get(&column_dir.column_id).ok_or_else(|| {
             CoveError::BadSchema(format!(
                 "segment references unknown column_id {}",
@@ -1885,6 +1894,9 @@ fn validate_segment_against_catalog(
             segment_bytes,
             refs,
         )?;
+    }
+    if seen_column_ids != expected_column_ids {
+        return Err(CoveError::SegmentCorrupt);
     }
     Ok(())
 }
@@ -3154,6 +3166,95 @@ mod tests {
         let mut payloads_by_key = BTreeMap::new();
         payloads_by_key.insert((1, 1), (1, 0, payload, bytes));
         (payloads_by_key, payload, bytes)
+    }
+
+    #[test]
+    fn segment_catalog_validation_rejects_duplicate_segment_columns() {
+        let table = TableEntry {
+            table_id: 1,
+            namespace: String::new(),
+            name: "t".into(),
+            row_count: 0,
+            primary_sort_key_count: 0,
+            clustering_key_count: 0,
+            flags: 0,
+            columns: vec![
+                ColumnEntry {
+                    column_id: 1,
+                    name: "a".into(),
+                    logical: CoveLogicalType::Int64,
+                    physical: CovePhysicalKind::NumCode,
+                    nullable: false,
+                    sort_order: 0,
+                    collation_id: 0,
+                    precision: 0,
+                    scale: 0,
+                    flags: 0,
+                },
+                ColumnEntry {
+                    column_id: 2,
+                    name: "b".into(),
+                    logical: CoveLogicalType::Int64,
+                    physical: CovePhysicalKind::NumCode,
+                    nullable: false,
+                    sort_order: 0,
+                    collation_id: 0,
+                    precision: 0,
+                    scale: 0,
+                    flags: 0,
+                },
+            ],
+        };
+        let empty_column = TableColumnDirectoryEntryV1 {
+            column_id: 1,
+            logical_type: CoveLogicalType::Int64,
+            physical_kind: CovePhysicalKind::NumCode,
+            flags: 0,
+            page_index_offset: 0,
+            page_index_length: 0,
+            data_offset: 0,
+            data_length: 0,
+            stats_ref: u32::MAX,
+            domain_ref: u32::MAX,
+            checksum: 0,
+        };
+        let segment = TableSegmentPayloadV1 {
+            header: TableSegmentHeaderV1 {
+                table_id: 1,
+                segment_id: 0,
+                row_start: 0,
+                row_count: 0,
+                morsel_count: 0,
+                morsel_row_count: 0,
+                column_count: 2,
+                morsel_directory_offset: 0,
+                column_directory_offset: 0,
+                page_index_offset: 0,
+                data_offset: 0,
+                flags: 0,
+                checksum: 0,
+            },
+            morsels: RowMorselDirectory { entries: vec![] },
+            columns: vec![empty_column.clone(), empty_column],
+        };
+        let bytes = Vec::new();
+
+        assert_eq!(
+            validate_segment_against_catalog(
+                &table,
+                1,
+                &segment,
+                &bytes,
+                SegmentValidationRefs {
+                    dictionary: None,
+                    zone_stats: &[],
+                    codec_descriptors: &[],
+                    nested_schema: None,
+                    registered_page_scope: RegisteredPageValidationScope::All,
+                },
+            ),
+            Err(CoveError::SegmentCorrupt)
+        );
     }
 
     fn zone_stat_entry(row_count: u64, non_null_count: u32, null_count: u64) -> ZoneStatsEntry {

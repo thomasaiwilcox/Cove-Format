@@ -703,6 +703,7 @@ dependencies = [
  "orc-rust",
  "parquet",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -896,6 +897,7 @@ version = "0.1.0"
 dependencies = [
  "cove-core",
  "cove-coverage",
+ "serde_json",
 ]
 
 [[package]]
@@ -934,6 +936,7 @@ dependencies = [
  "arrow-schema",
  "cove-convert",
  "cove-core",
+ "cove-index",
  "icu_casemap",
  "icu_normalizer",
  "orc-rust",
