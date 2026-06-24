@@ -31,7 +31,7 @@ arrow-json = "58"
 arrow-select = "58"
 arrow-schema = "58"
 async-trait = "0.1"
-datafusion = { version = "53.1.0", default-features = false, features = ["sql"] }
+datafusion = { version = "54.0.0", default-features = false, features = ["sql"] }
 datafusion-datasource = { version = "53.1.0", default-features = false }
 futures = "0.3"
 memmap2 = "0.9"
