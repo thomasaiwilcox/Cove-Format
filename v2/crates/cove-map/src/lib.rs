@@ -68,7 +68,7 @@ pub(crate) use api::{parse_map, plan_keys, preview};
 use build::verify_from_paths;
 pub use build::{
     build_from_paths, publish_covm_from_bundle, MapBuildOptions, MapBuildProjectionOutput,
-    MapBuildResult,
+    MapBuildResult, MapBuildSectionCompression, MapEvidenceEncoding,
 };
 pub(crate) use context::{mapping_context, MappingContext};
 #[cfg(test)]
@@ -1139,6 +1139,9 @@ fn identity_equivalence_index(
             continue;
         };
         for member in members.iter().skip(1) {
+            if member.identity_alias == anchor.identity_alias {
+                continue;
+            }
             equivalences.push(json!({
                 "left_identity": anchor.identity_alias,
                 "right_identity": member.identity_alias,
@@ -2625,7 +2628,8 @@ mod tests {
             CovemapSectionEntryV1,
         },
         compression,
-        constants::FEATURE_SEMANTIC_MAP,
+        constants::{FEATURE_CODEC_ZSTD, FEATURE_SEMANTIC_MAP},
+        profile::cove_map::{is_compact_evidence_index_bytes, MapEvidenceIndex},
         profile::cove_o::{
             read_object_surface_from_bytes, TemporalSegmentData,
             PROPERTY_FLAG_ASSOCIATION_FROM_GOID, PROPERTY_FLAG_ASSOCIATION_TO_GOID,
@@ -3463,6 +3467,8 @@ mod tests {
                 json: false,
                 object_name: None,
                 projection_output: MapBuildProjectionOutput::CoveT,
+                evidence_encoding: MapEvidenceEncoding::Compact,
+                section_compression: MapBuildSectionCompression::Zstd,
                 verify: false,
                 publish_covm: false,
             }
@@ -3483,6 +3489,10 @@ mod tests {
             "people.cove".to_string(),
             "--projection-output".to_string(),
             "none".to_string(),
+            "--evidence-encoding".to_string(),
+            "expanded".to_string(),
+            "--section-compression".to_string(),
+            "none".to_string(),
             "mapping.covemap".to_string(),
             "source.jsonl".to_string(),
         ])
@@ -3498,10 +3508,34 @@ mod tests {
                 json: true,
                 object_name: Some("people.cove".into()),
                 projection_output: MapBuildProjectionOutput::None,
+                evidence_encoding: MapEvidenceEncoding::Expanded,
+                section_compression: MapBuildSectionCompression::None,
                 verify: true,
                 publish_covm: true,
             }
         );
+        let err = parse_args([
+            "build".to_string(),
+            "--out-dir".to_string(),
+            "bundle".to_string(),
+            "--evidence-encoding".to_string(),
+            "json".to_string(),
+            "mapping.covemap".to_string(),
+            "source.jsonl".to_string(),
+        ])
+        .unwrap_err();
+        assert!(err.contains("--evidence-encoding"));
+        let err = parse_args([
+            "build".to_string(),
+            "--out-dir".to_string(),
+            "bundle".to_string(),
+            "--section-compression".to_string(),
+            "brotli".to_string(),
+            "mapping.covemap".to_string(),
+            "source.jsonl".to_string(),
+        ])
+        .unwrap_err();
+        assert!(err.contains("--section-compression"));
         assert_eq!(
             parse_args([
                 "publish".to_string(),
@@ -3744,7 +3778,12 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert_eq!(goids.len(), 1);
         let index = identity_equivalence_index("people-map", "test/v1", &planned.canonical);
-        assert_eq!(index["equivalences"].as_array().unwrap().len(), 1);
+        assert_eq!(index["equivalences"].as_array().unwrap().len(), 0);
+        assert_eq!(index["components"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            index["components"][0]["members"].as_array().unwrap().len(),
+            2
+        );
     }
 
     #[test]
@@ -4284,6 +4323,9 @@ mod tests {
         let result = build_from_paths(&map, &sources, MapBuildOptions::new(&out_dir)).unwrap();
         assert_eq!(result.manifest["mapping_id"], json!("people-map"));
         assert_eq!(result.manifest["counts"]["object_count"], json!(1));
+        let expected_evidence_count = result.manifest["counts"]["evidence_entry_count"]
+            .as_u64()
+            .unwrap() as usize;
         let object_path = out_dir.join("people_map.cove");
         let report_path = out_dir.join("map-build-report.json");
         let manifest_path = out_dir.join("map-build-manifest.json");
@@ -4306,6 +4348,28 @@ mod tests {
             },
         )
         .unwrap();
+        let object_bytes = fs::read(&object_path).unwrap();
+        let object_report = validate_bytes_with_options(
+            &object_bytes,
+            ValidationOptions {
+                semantic: true,
+                verify_digests: false,
+                allow_unknown_optional_extensions: true,
+                ..ValidationOptions::default()
+            },
+        )
+        .unwrap();
+        let evidence_entry = object_report
+            .validated
+            .footer
+            .sections
+            .iter()
+            .find(|entry| entry.section_kind == SectionKind::MapEvidenceIndex as u16)
+            .unwrap();
+        let evidence_bytes = compression::section_payload(&object_bytes, evidence_entry).unwrap();
+        assert!(is_compact_evidence_index_bytes(&evidence_bytes));
+        let evidence_index = MapEvidenceIndex::parse(&evidence_bytes).unwrap();
+        assert_eq!(evidence_index.entries.len(), expected_evidence_count);
         validate_bytes_with_options(
             &fs::read(&projection_path).unwrap(),
             ValidationOptions {
@@ -4317,14 +4381,170 @@ mod tests {
         let index = cove_index::CoviArtifactV2::parse(&fs::read(&index_path).unwrap()).unwrap();
         assert!(index.header.index_root_count > 0);
         let manifest: Value = serde_json::from_slice(&fs::read(manifest_path).unwrap()).unwrap();
+        assert_eq!(manifest["evidence_encoding"], json!("compact"));
+        assert_eq!(
+            manifest["evidence"]["logical_entry_count"],
+            json!(expected_evidence_count)
+        );
+        assert!(
+            manifest["evidence"]["compact_binary_bytes"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
         assert_eq!(
             manifest["artifacts"]["indexes"][0]["target"],
             json!("cove-o-object-properties")
+        );
+        assert_eq!(manifest["section_compression"], json!("zstd"));
+        assert_eq!(
+            manifest["compression_summary"]["format"],
+            json!("cove-map-section-compression-summary-v1")
+        );
+        assert_eq!(
+            manifest["cache"]["key_material"]["section_compression"],
+            json!("zstd")
         );
         assert_eq!(
             manifest["artifacts"]["projections"][0]["projection_id"],
             json!("person_projection")
         );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn map_build_compresses_large_sections_and_none_disables_it() {
+        let file = build_projection_map();
+        let dir = temp_build_dir("build-section-compression");
+        let map = dir.join("people.covemap");
+        fs::write(&map, file.serialize().unwrap()).unwrap();
+        let crm = dir.join("crm.csv");
+        let support = dir.join("support.csv");
+        let mut crm_csv = String::from("id,name\n");
+        let mut support_csv = String::from("id,name\n");
+        let repeated = "same-overlap-payload-".repeat(16);
+        for index in 0..256 {
+            crm_csv.push_str(&format!("{index},CRM {repeated}{index}\n"));
+            support_csv.push_str(&format!("{index},Support {repeated}{index}\n"));
+        }
+        fs::write(&crm, crm_csv).unwrap();
+        fs::write(&support, support_csv).unwrap();
+        let sources = vec![crm, support];
+
+        let compressed_out = dir.join("compressed");
+        let compressed =
+            build_from_paths(&map, &sources, MapBuildOptions::new(&compressed_out)).unwrap();
+        assert_eq!(compressed.manifest["section_compression"], json!("zstd"));
+        assert!(
+            compressed.manifest["compression_summary"]["compressed_section_count"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        assert!(
+            compressed.manifest["compression_summary"]["saved_bytes"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        let compressed_object_path = compressed_out.join("people_map.cove");
+        let compressed_bytes = fs::read(&compressed_object_path).unwrap();
+        let compressed_report = validate_bytes_with_options(
+            &compressed_bytes,
+            ValidationOptions {
+                semantic: true,
+                verify_digests: false,
+                allow_unknown_optional_extensions: true,
+                ..ValidationOptions::default()
+            },
+        )
+        .unwrap();
+        assert_ne!(
+            compressed_report.validated.header.required_features & FEATURE_CODEC_ZSTD,
+            0
+        );
+        assert!(compressed_report
+            .validated
+            .footer
+            .sections
+            .iter()
+            .any(|entry| entry.compression == CompressionCodec::Zstd as u8));
+
+        let uncompressed_out = dir.join("uncompressed");
+        let mut uncompressed_options = MapBuildOptions::new(&uncompressed_out);
+        uncompressed_options.section_compression = MapBuildSectionCompression::None;
+        let uncompressed = build_from_paths(&map, &sources, uncompressed_options).unwrap();
+        assert_eq!(uncompressed.manifest["section_compression"], json!("none"));
+        assert_eq!(
+            uncompressed.manifest["compression_summary"]["compressed_section_count"],
+            json!(0)
+        );
+        let uncompressed_object_path = uncompressed_out.join("people_map.cove");
+        let uncompressed_bytes = fs::read(&uncompressed_object_path).unwrap();
+        let uncompressed_report = validate_bytes_with_options(
+            &uncompressed_bytes,
+            ValidationOptions {
+                semantic: true,
+                verify_digests: false,
+                allow_unknown_optional_extensions: true,
+                ..ValidationOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(uncompressed_report
+            .validated
+            .footer
+            .sections
+            .iter()
+            .all(|entry| entry.compression == CompressionCodec::None as u8));
+        assert!(compressed_bytes.len() < uncompressed_bytes.len());
+
+        let compressed_projection = project_cove_o_path(&compressed_object_path, None).unwrap();
+        let uncompressed_projection = project_cove_o_path(&uncompressed_object_path, None).unwrap();
+        assert_eq!(
+            compressed_projection["rows"],
+            uncompressed_projection["rows"]
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn map_build_can_emit_expanded_evidence_index_for_compatibility() {
+        let file = build_projection_map();
+        let (map, sources, dir) = write_build_fixture("build-expanded-evidence", &file);
+        let out_dir = dir.join("bundle");
+        let mut options = MapBuildOptions::new(&out_dir);
+        options.evidence_encoding = MapEvidenceEncoding::Expanded;
+        let result = build_from_paths(&map, &sources, options).unwrap();
+        assert_eq!(result.manifest["evidence_encoding"], json!("expanded"));
+        assert!(result.manifest["evidence"]["compact_binary_bytes"].is_null());
+        let expected_evidence_count = result.manifest["counts"]["evidence_entry_count"]
+            .as_u64()
+            .unwrap() as usize;
+
+        let object_path = out_dir.join("people_map.cove");
+        let object_bytes = fs::read(&object_path).unwrap();
+        let object_report = validate_bytes_with_options(
+            &object_bytes,
+            ValidationOptions {
+                semantic: true,
+                verify_digests: false,
+                allow_unknown_optional_extensions: true,
+                ..ValidationOptions::default()
+            },
+        )
+        .unwrap();
+        let evidence_entry = object_report
+            .validated
+            .footer
+            .sections
+            .iter()
+            .find(|entry| entry.section_kind == SectionKind::MapEvidenceIndex as u16)
+            .unwrap();
+        let evidence_bytes = compression::section_payload(&object_bytes, evidence_entry).unwrap();
+        assert!(!is_compact_evidence_index_bytes(&evidence_bytes));
+        let evidence_index = MapEvidenceIndex::parse(&evidence_bytes).unwrap();
+        assert_eq!(evidence_index.entries.len(), expected_evidence_count);
         fs::remove_dir_all(&dir).unwrap();
     }
 

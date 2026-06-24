@@ -18,7 +18,10 @@ use cove_index::{
 use serde_json::{json, Value};
 
 use crate::{
-    emit::build_cove_o_from_materialized,
+    emit::{
+        build_cove_o_from_materialized_with_options, evidence_encoding_summary,
+        CoveOCompressionSummary, EvidenceEncodingSummary,
+    },
     input::{read_source_inputs, validate_source_inputs},
     materialize_with_source_states,
     project::{
@@ -46,12 +49,46 @@ impl MapBuildProjectionOutput {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MapEvidenceEncoding {
+    Compact,
+    Expanded,
+    Both,
+}
+
+impl MapEvidenceEncoding {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Compact => "compact",
+            Self::Expanded => "expanded",
+            Self::Both => "both",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MapBuildSectionCompression {
+    Zstd,
+    None,
+}
+
+impl MapBuildSectionCompression {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Zstd => "zstd",
+            Self::None => "none",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MapBuildOptions {
     pub out_dir: PathBuf,
     pub force: bool,
     pub object_name: Option<String>,
     pub projection_output: MapBuildProjectionOutput,
+    pub evidence_encoding: MapEvidenceEncoding,
+    pub section_compression: MapBuildSectionCompression,
     pub verify: bool,
     pub publish_covm: bool,
     pub reuse_cache: bool,
@@ -64,6 +101,8 @@ impl MapBuildOptions {
             force: false,
             object_name: None,
             projection_output: MapBuildProjectionOutput::CoveT,
+            evidence_encoding: MapEvidenceEncoding::Compact,
+            section_compression: MapBuildSectionCompression::Zstd,
             verify: false,
             publish_covm: false,
             reuse_cache: true,
@@ -128,7 +167,15 @@ pub fn build_from_paths(
     let inputs = read_source_inputs(sources)?;
     validate_source_inputs(&file, &inputs.states)?;
     let materialized = materialize_with_source_states(&file, &inputs.rows, &inputs.states)?;
-    let object_bytes = build_cove_o_from_materialized(&file, &materialized)?;
+    let object_output = build_cove_o_from_materialized_with_options(
+        &file,
+        &materialized,
+        options.evidence_encoding,
+        options.section_compression,
+    )?;
+    let object_bytes = object_output.bytes;
+    let compression_summary = object_output.compression_summary;
+    let evidence_summary = evidence_encoding_summary(&materialized, options.evidence_encoding)?;
     let (mapping_id, mapping_version) = mapping_identity(&file).unwrap_or_else(|_| {
         (
             map.file_stem()
@@ -187,8 +234,12 @@ pub fn build_from_paths(
     let report = build_report(
         &materialized,
         options.projection_output,
+        options.evidence_encoding,
+        options.section_compression,
         &object_relative,
         object_bytes.len(),
+        &evidence_summary,
+        &compression_summary,
         covm_artifact.as_ref(),
         &index_artifacts,
         &projection_artifacts,
@@ -222,8 +273,12 @@ pub fn build_from_paths(
     let report = build_report(
         &materialized,
         options.projection_output,
+        options.evidence_encoding,
+        options.section_compression,
         &object_relative,
         object_bytes.len(),
+        &evidence_summary,
+        &compression_summary,
         covm_artifact.as_ref(),
         &index_artifacts,
         &projection_artifacts,
@@ -246,8 +301,12 @@ pub fn build_from_paths(
         &mapping_id,
         &mapping_version,
         options.projection_output,
+        options.evidence_encoding,
+        options.section_compression,
         &object_relative,
         object_bytes.len(),
+        &evidence_summary,
+        &compression_summary,
         covm_artifact.as_ref(),
         &index_artifacts,
         &projection_artifacts,
@@ -534,8 +593,12 @@ fn write_one_artifact(out_dir: &Path, relative_path: &Path, bytes: &[u8]) -> Res
 fn build_report(
     materialized: &MaterializedModel,
     projection_output: MapBuildProjectionOutput,
+    evidence_encoding: MapEvidenceEncoding,
+    section_compression: MapBuildSectionCompression,
     object_relative: &Path,
     object_bytes: usize,
+    evidence_summary: &EvidenceEncodingSummary,
+    compression_summary: &CoveOCompressionSummary,
     covm: Option<&CovmArtifact>,
     indexes: &[IndexArtifact],
     projections: &[ProjectionArtifact],
@@ -546,6 +609,15 @@ fn build_report(
     json!({
         "format": "cove-map-build-report-v1",
         "projection_output": projection_output.as_str(),
+        "evidence_encoding": evidence_encoding.as_str(),
+        "section_compression": section_compression.as_str(),
+        "evidence": evidence_summary_json(evidence_summary),
+        "compression_summary": compression_summary_json(compression_summary),
+        "expanded_evidence_index": if evidence_encoding == MapEvidenceEncoding::Both {
+            materialized.evidence_index.clone()
+        } else {
+            Value::Null
+        },
         "conversion_report": materialized.conversion_report,
         "generated_artifacts": generated_artifacts(object_relative, object_bytes, covm, indexes, projections),
         "covm": covm.map(covm_artifact_json),
@@ -569,8 +641,12 @@ fn build_manifest(
     mapping_id: &str,
     mapping_version: &str,
     projection_output: MapBuildProjectionOutput,
+    evidence_encoding: MapEvidenceEncoding,
+    section_compression: MapBuildSectionCompression,
     object_relative: &Path,
     object_bytes: usize,
+    evidence_summary: &EvidenceEncodingSummary,
+    compression_summary: &CoveOCompressionSummary,
     covm: Option<&CovmArtifact>,
     indexes: &[IndexArtifact],
     projections: &[ProjectionArtifact],
@@ -587,6 +663,10 @@ fn build_manifest(
         "mapping_id": mapping_id,
         "mapping_version": mapping_version,
         "projection_output": projection_output.as_str(),
+        "evidence_encoding": evidence_encoding.as_str(),
+        "section_compression": section_compression.as_str(),
+        "evidence": evidence_summary_json(evidence_summary),
+        "compression_summary": compression_summary_json(compression_summary),
         "covm_published": covm.is_some(),
         "mapping_path": map.display().to_string(),
         "sources": materialized.conversion_report.get("sources").cloned().unwrap_or_else(|| json!([])),
@@ -613,11 +693,54 @@ fn build_manifest(
                 "path": path_string(manifest_relative),
             },
         },
-        "cache": cache_manifest(map, sources, projection_output, object_relative),
+        "cache": cache_manifest(map, sources, projection_output, evidence_encoding, section_compression, object_relative),
         "sidecar_readiness": sidecar_readiness(indexes),
         "warnings": warnings,
         "verification": verification,
         "recommended_commands": recommended_commands(object_relative, covm, indexes, projections),
+    })
+}
+
+fn evidence_summary_json(summary: &EvidenceEncodingSummary) -> Value {
+    json!({
+        "format": "cove-map-evidence-encoding-summary-v1",
+        "encoding": summary.encoding.as_str(),
+        "logical_entry_count": summary.logical_entry_count,
+        "expanded_json_bytes": summary.expanded_json_bytes,
+        "emitted_index_bytes": summary.emitted_index_bytes,
+        "compact_binary_bytes": summary.compact_binary_bytes,
+        "estimated_saved_bytes": summary.estimated_saved_bytes,
+        "savings_ratio": if summary.expanded_json_bytes == 0 {
+            0.0
+        } else {
+            summary.estimated_saved_bytes as f64 / summary.expanded_json_bytes as f64
+        },
+    })
+}
+
+fn compression_summary_json(summary: &CoveOCompressionSummary) -> Value {
+    json!({
+        "format": "cove-map-section-compression-summary-v1",
+        "mode": summary.mode.as_str(),
+        "threshold_bytes": summary.threshold_bytes,
+        "uncompressed_section_bytes": summary.uncompressed_section_bytes,
+        "emitted_section_bytes": summary.emitted_section_bytes,
+        "saved_bytes": summary.saved_bytes,
+        "savings_ratio": if summary.uncompressed_section_bytes == 0 {
+            0.0
+        } else {
+            summary.saved_bytes as f64 / summary.uncompressed_section_bytes as f64
+        },
+        "compressed_section_count": summary.compressed_section_count,
+        "sections": summary.sections.iter().map(|section| json!({
+            "section_kind": section.section_kind,
+            "section_name": section.section_name,
+            "profile": section.profile,
+            "compression": section.compression,
+            "uncompressed_bytes": section.uncompressed_bytes,
+            "emitted_bytes": section.emitted_bytes,
+            "saved_bytes": section.saved_bytes,
+        })).collect::<Vec<_>>(),
     })
 }
 
@@ -682,6 +805,8 @@ fn cache_manifest(
     map: &Path,
     sources: &[PathBuf],
     projection_output: MapBuildProjectionOutput,
+    evidence_encoding: MapEvidenceEncoding,
+    section_compression: MapBuildSectionCompression,
     object_relative: &Path,
 ) -> Value {
     json!({
@@ -691,6 +816,8 @@ fn cache_manifest(
             "mapping_path": map.display().to_string(),
             "source_paths": sources.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
             "projection_output": projection_output.as_str(),
+            "evidence_encoding": evidence_encoding.as_str(),
+            "section_compression": section_compression.as_str(),
             "object_path": path_string(object_relative),
         },
         "status": "recorded",
@@ -762,7 +889,17 @@ pub(crate) fn verify_from_paths(map: &Path, sources: &[PathBuf]) -> Result<Value
     let inputs = read_source_inputs(sources)?;
     validate_source_inputs(&file, &inputs.states)?;
     let materialized = materialize_with_source_states(&file, &inputs.rows, &inputs.states)?;
-    let object_bytes = build_cove_o_from_materialized(&file, &materialized)?;
+    let evidence_encoding = MapEvidenceEncoding::Compact;
+    let section_compression = MapBuildSectionCompression::Zstd;
+    let object_output = build_cove_o_from_materialized_with_options(
+        &file,
+        &materialized,
+        evidence_encoding,
+        section_compression,
+    )?;
+    let object_bytes = object_output.bytes;
+    let compression_summary = object_output.compression_summary;
+    let evidence_summary = evidence_encoding_summary(&materialized, evidence_encoding)?;
     let (mapping_id, _mapping_version) = mapping_identity(&file).unwrap_or_else(|_| {
         (
             map.file_stem()
@@ -796,8 +933,12 @@ pub(crate) fn verify_from_paths(map: &Path, sources: &[PathBuf]) -> Result<Value
     let report = build_report(
         &materialized,
         MapBuildProjectionOutput::CoveT,
+        evidence_encoding,
+        section_compression,
         &object_relative,
         object_bytes.len(),
+        &evidence_summary,
+        &compression_summary,
         None,
         &index_artifacts,
         &projection_artifacts,

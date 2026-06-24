@@ -139,8 +139,15 @@
       "id": "customer360",
       "kind": "deterministic-customer360-data-science-showcase",
       "seed": 28,
-      "artifacts": ["customer360/crm.csv", "customer360/support.jsonl", "customer360/billing.parquet", "customer360/customers_360.jsonl", "customer360/events.jsonl", "customer360/events.cove", "customer360/customer360.covemap", "customer360/customer360_readback.covemap", "customer360/customers.cove", "customer360/customers_projection.cove", "customer360/evidence_projection.cove", "customer360/customers_projection.parquet", "customer360/evidence_projection.parquet", "customer360/customer360-manifest.json", "customer360/notebooks/customer360_analysis.py"],
+      "artifacts": ["customer360/crm.csv", "customer360/support.jsonl", "customer360/billing.parquet", "customer360/customers_360.jsonl", "customer360/events.jsonl", "customer360/events.cove", "customer360/customer360.covemap", "customer360/customer360_readback.covemap", "customer360/customers.cove", "customer360/customers_projection.cove", "customer360/evidence_projection.cove", "customer360/customers_projection.parquet", "customer360/evidence_projection.parquet", "customer360/map-build-bundle/map-build-manifest.json", "customer360/doctor-report.json", "customer360/proof-size-comparison.json", "customer360/customer360-manifest.json", "customer360/notebooks/customer360_analysis.py"],
       "purpose": "Customer 360 semantic archive, provenance, notebook, and benchmark workload"
+    },
+    {
+      "id": "proof-suite",
+      "kind": "deterministic-cove-o-proof-suite",
+      "seed": 29,
+      "artifacts": ["proof-suite/proof-suite-manifest.json", "proof-suite/customer360/map-build-bundle/map-build-manifest.json", "proof-suite/customer360/doctor-report.json", "proof-suite/customer360/proof-size-comparison.json", "proof-suite/claims/map-build-bundle/map-build-manifest.json", "proof-suite/claims/doctor-report.json", "proof-suite/claims/proof-size-comparison.json", "proof-suite/catalog/map-build-bundle/map-build-manifest.json", "proof-suite/catalog/doctor-report.json", "proof-suite/catalog/proof-size-comparison.json"],
+      "purpose": "reproducible proof scenarios comparing COVE-O bundles against overlapping source and Parquet baselines"
     }
   ],
   "query_groups": [
@@ -188,12 +195,30 @@
     "cove_map_build_tiny",
     "cove_map_build_medium",
     "cove_map_build_messy_multisource",
+    "cove_o_overlap_stress",
+    "cove_o_overlap_scale_1_table",
+    "cove_o_overlap_scale_2_tables",
+    "cove_o_overlap_scale_4_tables",
+    "cove_o_overlap_scale_8_tables",
+    "cove_o_overlap_scale_8_tables_large",
+    "cove_o_overlap_partial_0pct",
+    "cove_o_overlap_partial_25pct",
+    "cove_o_overlap_partial_50pct",
+    "cove_o_overlap_partial_75pct",
+    "cove_o_overlap_partial_100pct",
     "projection_covi_equality_valid",
     "projection_covi_in_valid",
     "projection_covi_range_valid",
     "projection_covi_missing_sidecar_fallback",
     "projection_covi_stale_sidecar_fallback",
-    "projection_covi_unsupported_predicate_fallback"
+    "projection_covi_unsupported_predicate_fallback",
+    "customer360_projection_covi_score_range_valid",
+    "customer360_projection_covi_status_eq_valid",
+    "customer360_projection_covi_tier_in_valid",
+    "customer360_projection_covi_compound_valid",
+    "proof_suite_customer360",
+    "proof_suite_claims",
+    "proof_suite_catalog"
   ],
   "required_report_fields": [
     "planning_ns",

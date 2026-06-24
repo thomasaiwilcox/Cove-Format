@@ -7541,6 +7541,7 @@ A COVE-MAP implementation that claims deterministic identity resolution MUST imp
 - If input row order can affect output, the mapping MUST declare a deterministic row ordering or reject replayability claims.
 - Do-not-merge constraints take precedence over auto-merge edges.
 - Identity-key assertions emitted for the same source row and the same row-semantics object output MAY declare co-reference. Co-referenced keys participate in the same identity equivalence graph only when their rule classes permit merge and no do-not-merge constraint applies.
+- Identity-equivalence indexes SHOULD NOT emit self-equivalence pairs where the left and right identity aliases are identical. The component/member list remains the authoritative compact representation for all contributing rows and keys.
 - Candidate matches MUST NOT participate in GOID selection.
 - A mapping MAY declare that unresolved identity conflicts reject the conversion, keep source-scoped objects separate, or emit conflict evidence. The default safe behaviour is rejection for canonical object output.
 
@@ -7852,6 +7853,10 @@ COVE-MAP SHOULD preserve evidence linking output objects, properties, associatio
 - Evidence entries MUST be deterministic for a given mapping run.
 - Evidence visibility MUST respect source governance/redaction policy.
 - If evidence cannot be retained because of privacy/security policy, the mapping SHOULD retain a redacted evidence stub with digest and policy reference where allowed.
+- `MAP_EVIDENCE_INDEX` defines the logical evidence table. Implementations MAY encode this section as either the expanded COVE-MAP JSON payload or a compact binary payload that is a deterministic, lossless encoding of the same fields.
+- Compact evidence encodings MUST preserve logical entry order, mapping identity, source row identity, output assertion/object references, observed source fingerprints, snapshot digests, and operation metadata. Readers that support the compact encoding MUST expose the same expanded logical evidence records as expanded JSON readback.
+- A compact evidence encoding MUST be self-identifying and integrity checked. Unknown, stale, corrupt, or unsupported compact evidence payloads MUST fail validation or fall back to a valid expanded representation; they MUST NOT silently change explain, projection, parity, or object readback results.
+- Build tools MAY default to compact evidence for generated COVE-O when evidence fan-out would otherwise dominate bundle size, but SHOULD provide an expanded or diagnostic output mode for auditability and interoperability.
 
 ### 70.13 Deterministic Function Registry
 
@@ -7907,6 +7912,8 @@ A COVE-MAP converter that targets object-and-association-based COVE SHOULD imple
 
 `cove map build` is the reference CLI orchestration command for this pipeline. It validates a reusable `.covemap` artifact, reads one or more declared source tables, materialises COVE-O object/association output, optionally materialises COVE-T projections, emits standard optional COVE-I acceleration sidecars when supported, and writes implementation reports plus a bundle manifest for adoption workflows. The `map-build-manifest.json` bundle manifest is not a normative COVM manifest. Implementations that need dataset publication semantics SHOULD emit a separate `.covm` artifact, for example through `cove map build --publish-covm` or `cove map publish --bundle-dir <dir> --out <dataset.covm>`. Generated COVE-I and COVM artifacts are optional companion artifacts: they MUST validate against the generated COVE snapshot before use, stale or corrupt artifacts MUST be ignored unless the caller explicitly requires them, and they MUST NOT change object readback, projection, parity, or validation results.
 
+Reference build tooling MAY use ordinary COVE section compression for generated COVE-O artifacts, including COVE-MAP metadata sections and temporal object sections, provided the file and section feature bits advertise the codec as required by Section 66. Such compression is a physical encoding choice only: it MUST NOT change logical object readback, projection readback, validation, parity, identity, evidence, or COVE-I sidecar semantics. Tooling SHOULD expose a compatibility option equivalent to `--section-compression none` when uncompressed sections are required by a downstream reader.
+
 Reference COVE-MAP tooling MAY place object-property, object-path, association-endpoint, evidence-lookup, and projection-fragment COVE-I roots in a command-owned `indexes/` directory. Query and projection engines MAY discover those roots by bundle convention or explicit sidecar path, but materialised COVE-O/COVE-T readback remains the semantic authority. Where projection descriptors do not expose stable object-property lineage, implementations SHOULD validate and report sidecar readiness while falling back to ordinary projection materialisation instead of guessing a pruning mapping.
 
 **Recommended tools:**
@@ -7914,6 +7921,11 @@ Reference COVE-MAP tooling MAY place object-property, object-path, association-e
 - `cove map preview`,
 - `cove map plan-keys`,
 - `cove map convert`,
+- `cove map build`,
+- `cove map publish`,
+- `cove map doctor`,
+- `cove map suggest`,
+- `cove map parity`,
 - `cove map explain`,
 - `cove map diff`,
 - `cove map project`,

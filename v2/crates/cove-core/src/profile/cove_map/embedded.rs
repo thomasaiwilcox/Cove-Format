@@ -5,10 +5,16 @@ use std::{
     fmt,
 };
 
+use crate::checksum;
 use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Value};
 
 use super::*;
+
+const COMPACT_EVIDENCE_MAGIC: &[u8; 8] = b"COVMEV1\0";
+const COMPACT_EVIDENCE_VERSION: u16 = 1;
+const COMPACT_EVIDENCE_HEADER_LEN: usize = 16;
+const NONE_INDEX: u32 = u32::MAX;
 
 impl EmbeddedMapSection {
     fn mapping_id(&self) -> &str {
@@ -910,6 +916,9 @@ impl MapEvidenceIndex {
         bytes: &[u8],
         requested_keys: &[String],
     ) -> Result<Self, CoveError> {
+        if is_compact_evidence_index_bytes(bytes) {
+            return parse_compact_evidence_index(bytes, requested_keys);
+        }
         let root = parse_root_for_section(SectionKind::MapEvidenceIndex, bytes)?;
         let object = as_object(&root)?;
         let (mapping_id, mapping_version) = parse_mapping_identity(object)?;
@@ -983,6 +992,306 @@ impl MapEvidenceIndex {
             mapping_version,
             entries,
         })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct CompactMember {
+    source_id: u32,
+    source_row_identity: u32,
+    rule_id: u32,
+    assertion_id: u32,
+    observed_schema_fingerprint: u32,
+    observed_snapshot_digest: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct CompactGroupKey {
+    output_object_id: u32,
+    operation_metadata: u32,
+}
+
+pub(super) fn is_compact_evidence_index_bytes(bytes: &[u8]) -> bool {
+    bytes.len() >= COMPACT_EVIDENCE_MAGIC.len()
+        && &bytes[..COMPACT_EVIDENCE_MAGIC.len()] == COMPACT_EVIDENCE_MAGIC
+}
+
+pub(super) fn compact_evidence_index_bytes(index: &MapEvidenceIndex) -> Result<Vec<u8>, CoveError> {
+    let mut strings = Vec::<String>::new();
+    let mut string_ids = BTreeMap::<String, u32>::new();
+    let mut intern = |value: &str| -> Result<u32, CoveError> {
+        if let Some(existing) = string_ids.get(value) {
+            return Ok(*existing);
+        }
+        let id = u32::try_from(strings.len()).map_err(|_| CoveError::MapEvidenceInvalid)?;
+        strings.push(value.to_string());
+        string_ids.insert(value.to_string(), id);
+        Ok(id)
+    };
+    let mapping_id = intern(&index.mapping_id)?;
+    let mapping_version = intern(&index.mapping_version)?;
+    let mut groups = Vec::<(CompactGroupKey, Vec<CompactMember>)>::new();
+    let mut group_ids = BTreeMap::<CompactGroupKey, u32>::new();
+    let mut order = Vec::<(u32, u32)>::with_capacity(index.entries.len());
+    for entry in &index.entries {
+        let metadata_json = serde_json::to_string(&entry.operation_metadata)
+            .map_err(|_| CoveError::MapEvidenceInvalid)?;
+        let key = CompactGroupKey {
+            output_object_id: intern(&entry.output_object_id)?,
+            operation_metadata: intern(&metadata_json)?,
+        };
+        let group_id = if let Some(existing) = group_ids.get(&key) {
+            *existing
+        } else {
+            let id = u32::try_from(groups.len()).map_err(|_| CoveError::MapEvidenceInvalid)?;
+            groups.push((key.clone(), Vec::new()));
+            group_ids.insert(key, id);
+            id
+        };
+        let member = CompactMember {
+            source_id: intern(&entry.source_id)?,
+            source_row_identity: intern(&entry.source_row_identity)?,
+            rule_id: intern(&entry.rule_id)?,
+            assertion_id: intern(&entry.assertion_id)?,
+            observed_schema_fingerprint: optional_string_index(
+                &mut intern,
+                entry.observed_schema_fingerprint.as_deref(),
+            )?,
+            observed_snapshot_digest: optional_string_index(
+                &mut intern,
+                entry.observed_snapshot_digest.as_deref(),
+            )?,
+        };
+        let members = &mut groups
+            .get_mut(usize::try_from(group_id).map_err(|_| CoveError::MapEvidenceInvalid)?)
+            .ok_or(CoveError::MapEvidenceInvalid)?
+            .1;
+        let member_id = u32::try_from(members.len()).map_err(|_| CoveError::MapEvidenceInvalid)?;
+        members.push(member);
+        order.push((group_id, member_id));
+    }
+
+    let mut body = Vec::new();
+    push_u32(&mut body, strings.len())?;
+    for value in &strings {
+        push_bytes(&mut body, value.as_bytes())?;
+    }
+    push_u32(&mut body, mapping_id)?;
+    push_u32(&mut body, mapping_version)?;
+    push_u32(&mut body, groups.len())?;
+    for (key, members) in &groups {
+        push_u32(&mut body, key.output_object_id)?;
+        push_u32(&mut body, key.operation_metadata)?;
+        push_u32(&mut body, members.len())?;
+        for member in members {
+            push_u32(&mut body, member.source_id)?;
+            push_u32(&mut body, member.source_row_identity)?;
+            push_u32(&mut body, member.rule_id)?;
+            push_u32(&mut body, member.assertion_id)?;
+            push_u32(&mut body, member.observed_schema_fingerprint)?;
+            push_u32(&mut body, member.observed_snapshot_digest)?;
+        }
+    }
+    push_u32(&mut body, order.len())?;
+    for (group_id, member_id) in &order {
+        push_u32(&mut body, *group_id)?;
+        push_u32(&mut body, *member_id)?;
+    }
+
+    let mut bytes = Vec::with_capacity(COMPACT_EVIDENCE_HEADER_LEN + body.len());
+    bytes.extend_from_slice(COMPACT_EVIDENCE_MAGIC);
+    bytes.extend_from_slice(&COMPACT_EVIDENCE_VERSION.to_le_bytes());
+    bytes.extend_from_slice(&0u16.to_le_bytes());
+    bytes.extend_from_slice(&checksum::crc32c(&body).to_le_bytes());
+    bytes.extend_from_slice(&body);
+    Ok(bytes)
+}
+
+fn optional_string_index(
+    intern: &mut impl FnMut(&str) -> Result<u32, CoveError>,
+    value: Option<&str>,
+) -> Result<u32, CoveError> {
+    value.map(intern).unwrap_or(Ok(NONE_INDEX))
+}
+
+fn parse_compact_evidence_index(
+    bytes: &[u8],
+    requested_keys: &[String],
+) -> Result<MapEvidenceIndex, CoveError> {
+    if bytes.len() < COMPACT_EVIDENCE_HEADER_LEN {
+        return Err(CoveError::MapEvidenceInvalid);
+    }
+    if &bytes[..COMPACT_EVIDENCE_MAGIC.len()] != COMPACT_EVIDENCE_MAGIC {
+        return Err(CoveError::MapEvidenceInvalid);
+    }
+    let version = u16::from_le_bytes([bytes[8], bytes[9]]);
+    if version != COMPACT_EVIDENCE_VERSION {
+        return Err(CoveError::MapEvidenceInvalid);
+    }
+    let expected_crc = u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
+    let body = &bytes[COMPACT_EVIDENCE_HEADER_LEN..];
+    if checksum::crc32c(body) != expected_crc {
+        return Err(CoveError::MapEvidenceInvalid);
+    }
+    let mut cursor = CompactCursor {
+        bytes: body,
+        pos: 0,
+    };
+    let string_count = cursor.read_u32_as_usize()?;
+    let mut strings = Vec::<String>::with_capacity(string_count);
+    for _ in 0..string_count {
+        let raw = cursor.read_len_bytes()?;
+        strings.push(
+            std::str::from_utf8(raw)
+                .map_err(|_| CoveError::MapEvidenceInvalid)?
+                .to_string(),
+        );
+    }
+    let mapping_id = string_at(&strings, cursor.read_u32()?)?.to_string();
+    let mapping_version = string_at(&strings, cursor.read_u32()?)?.to_string();
+    let group_count = cursor.read_u32_as_usize()?;
+    let mut groups = Vec::<(CompactGroupKey, Vec<CompactMember>)>::with_capacity(group_count);
+    for _ in 0..group_count {
+        let key = CompactGroupKey {
+            output_object_id: cursor.read_u32()?,
+            operation_metadata: cursor.read_u32()?,
+        };
+        string_at(&strings, key.output_object_id)?;
+        string_at(&strings, key.operation_metadata)?;
+        let member_count = cursor.read_u32_as_usize()?;
+        let mut members = Vec::with_capacity(member_count);
+        for _ in 0..member_count {
+            let member = CompactMember {
+                source_id: cursor.read_u32()?,
+                source_row_identity: cursor.read_u32()?,
+                rule_id: cursor.read_u32()?,
+                assertion_id: cursor.read_u32()?,
+                observed_schema_fingerprint: cursor.read_u32()?,
+                observed_snapshot_digest: cursor.read_u32()?,
+            };
+            string_at(&strings, member.source_id)?;
+            string_at(&strings, member.source_row_identity)?;
+            string_at(&strings, member.rule_id)?;
+            string_at(&strings, member.assertion_id)?;
+            optional_string_at(&strings, member.observed_schema_fingerprint)?;
+            optional_string_at(&strings, member.observed_snapshot_digest)?;
+            members.push(member);
+        }
+        groups.push((key, members));
+    }
+    let requested_keys = requested_keys
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let order_count = cursor.read_u32_as_usize()?;
+    let mut entries = Vec::with_capacity(order_count);
+    for _ in 0..order_count {
+        let group_id = cursor.read_u32_as_usize()?;
+        let member_id = cursor.read_u32_as_usize()?;
+        let (key, members) = groups.get(group_id).ok_or(CoveError::MapEvidenceInvalid)?;
+        let member = members
+            .get(member_id)
+            .ok_or(CoveError::MapEvidenceInvalid)?;
+        let metadata_json = string_at(&strings, key.operation_metadata)?;
+        let metadata: BTreeMap<String, Value> =
+            serde_json::from_str(metadata_json).map_err(|_| CoveError::MapEvidenceInvalid)?;
+        if metadata
+            .keys()
+            .any(|key| !is_evidence_operation_metadata_key(key))
+        {
+            return Err(CoveError::MapEvidenceInvalid);
+        }
+        let operation_metadata = metadata
+            .into_iter()
+            .filter(|(key, _)| requested_keys.is_empty() || requested_keys.contains(key.as_str()))
+            .collect();
+        entries.push(MapEvidenceEntry {
+            source_id: string_at(&strings, member.source_id)?.to_string(),
+            source_row_identity: string_at(&strings, member.source_row_identity)?.to_string(),
+            rule_id: string_at(&strings, member.rule_id)?.to_string(),
+            assertion_id: string_at(&strings, member.assertion_id)?.to_string(),
+            output_object_id: string_at(&strings, key.output_object_id)?.to_string(),
+            observed_schema_fingerprint: optional_string_at(
+                &strings,
+                member.observed_schema_fingerprint,
+            )?
+            .map(str::to_string),
+            observed_snapshot_digest: optional_string_at(
+                &strings,
+                member.observed_snapshot_digest,
+            )?
+            .map(str::to_string),
+            operation_metadata,
+        });
+    }
+    if cursor.pos != cursor.bytes.len() {
+        return Err(CoveError::MapEvidenceInvalid);
+    }
+    Ok(MapEvidenceIndex {
+        mapping_id,
+        mapping_version,
+        entries,
+    })
+}
+
+struct CompactCursor<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> CompactCursor<'a> {
+    fn read_u32(&mut self) -> Result<u32, CoveError> {
+        let end = self.pos.checked_add(4).ok_or(CoveError::ArithOverflow)?;
+        let bytes = self
+            .bytes
+            .get(self.pos..end)
+            .ok_or(CoveError::MapEvidenceInvalid)?;
+        self.pos = end;
+        Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
+    fn read_u32_as_usize(&mut self) -> Result<usize, CoveError> {
+        usize::try_from(self.read_u32()?).map_err(|_| CoveError::MapEvidenceInvalid)
+    }
+
+    fn read_len_bytes(&mut self) -> Result<&'a [u8], CoveError> {
+        let len = self.read_u32_as_usize()?;
+        let end = self.pos.checked_add(len).ok_or(CoveError::ArithOverflow)?;
+        let bytes = self
+            .bytes
+            .get(self.pos..end)
+            .ok_or(CoveError::MapEvidenceInvalid)?;
+        self.pos = end;
+        Ok(bytes)
+    }
+}
+
+fn push_u32(out: &mut Vec<u8>, value: impl TryInto<u32>) -> Result<(), CoveError> {
+    let value = value
+        .try_into()
+        .map_err(|_| CoveError::MapEvidenceInvalid)?;
+    out.extend_from_slice(&value.to_le_bytes());
+    Ok(())
+}
+
+fn push_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), CoveError> {
+    push_u32(out, bytes.len())?;
+    out.extend_from_slice(bytes);
+    Ok(())
+}
+
+fn string_at(strings: &[String], index: u32) -> Result<&str, CoveError> {
+    strings
+        .get(usize::try_from(index).map_err(|_| CoveError::MapEvidenceInvalid)?)
+        .map(String::as_str)
+        .ok_or(CoveError::MapEvidenceInvalid)
+}
+
+fn optional_string_at(strings: &[String], index: u32) -> Result<Option<&str>, CoveError> {
+    if index == NONE_INDEX {
+        Ok(None)
+    } else {
+        string_at(strings, index).map(Some)
     }
 }
 

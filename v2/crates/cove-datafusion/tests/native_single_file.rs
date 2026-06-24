@@ -642,6 +642,60 @@ async fn mapped_cove_o_end_to_end_builds_registers_and_queries_in_datafusion() {
 }
 
 #[tokio::test]
+async fn mapped_cove_o_projection_queries_zstd_compressed_map_build_object() {
+    let dir = make_temp_dir("mapped-zstd-map-build");
+    let bundle = dir.join("bundle");
+    let mapping_path = conformance_accept_path("cove_map_execution.covemap");
+    let people_csv = dir.join("people.csv");
+    let mut csv = String::from("person_id,person_name,team_id,team_name,valid_from,valid_to\n");
+    for index in 0..512 {
+        csv.push_str(&format!(
+            "p{index},person_{index:04},t{},Team {},2026-01-01,2026-12-31\n",
+            index % 16,
+            index % 16
+        ));
+    }
+    fs::write(&people_csv, csv).unwrap();
+    let mut options = cove_map::MapBuildOptions::new(bundle.clone());
+    options.projection_output = cove_map::MapBuildProjectionOutput::None;
+    let result = cove_map::build_from_paths(&mapping_path, &[people_csv], options).unwrap();
+    assert!(
+        result
+            .manifest
+            .pointer("/compression_summary/compressed_section_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            > 0
+    );
+    let object_rel = result
+        .manifest
+        .pointer("/artifacts/object/path")
+        .and_then(Value::as_str)
+        .unwrap();
+    let object_path = bundle.join(object_rel);
+
+    let ctx = SessionContext::new();
+    register_cove_o_projections(&ctx, &object_path, None, None).unwrap();
+    let batches = ctx
+        .sql("SELECT name, membership_count FROM people_projection WHERE name = 'person_0042'")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let expected = [
+        "+-------------+------------------+",
+        "| name        | membership_count |",
+        "+-------------+------------------+",
+        "| person_0042 | 1                |",
+        "+-------------+------------------+",
+    ];
+    assert_batches_eq!(expected, &batches);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
 async fn mapped_cove_o_showcase_spans_multiple_sources_and_projections_in_datafusion() {
     let showcase_dir = std::env::temp_dir().join(format!(
         "cove-datafusion-showcase-{}-{}",

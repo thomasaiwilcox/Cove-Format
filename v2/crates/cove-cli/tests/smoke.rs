@@ -2125,6 +2125,9 @@ fn customer360_showcase_command_generates_queryable_artifacts() {
         "evidence_projection.cove",
         "customers_projection.parquet",
         "evidence_projection.parquet",
+        "map-build-bundle/map-build-manifest.json",
+        "doctor-report.json",
+        "proof-size-comparison.json",
         "customer360-manifest.json",
         "notebooks/customer360_analysis.py",
     ] {
@@ -2140,6 +2143,8 @@ fn customer360_showcase_command_generates_queryable_artifacts() {
         manifest["pipeline"]["canonical_readback_source"],
         "customers_360.jsonl"
     );
+    assert_eq!(manifest["proof"]["doctor_status"], serde_json::json!("ok"));
+    assert_eq!(manifest["proof"]["parity_status"], serde_json::json!("ok"));
     assert!(manifest["recommended_queries"]
         .as_array()
         .unwrap()
@@ -2201,6 +2206,57 @@ fn customer360_showcase_command_generates_queryable_artifacts() {
         String::from_utf8_lossy(&joined.stderr)
     );
     assert!(String::from_utf8_lossy(&joined.stdout).contains("\"event_kind\""));
+}
+
+#[test]
+fn proof_suite_showcase_command_generates_verified_scenario() {
+    let out_dir = temp_file("proof-suite-generated");
+    let generated = run_cove(&[
+        "showcase",
+        "proof-suite",
+        "--scenario",
+        "claims",
+        "--profile",
+        "quick",
+        "--out",
+        out_dir.to_str().unwrap(),
+        "--force",
+        "--json",
+    ]);
+    assert!(
+        generated.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&generated.stdout),
+        String::from_utf8_lossy(&generated.stderr)
+    );
+    let manifest: serde_json::Value = serde_json::from_slice(&generated.stdout).unwrap();
+    assert_eq!(
+        manifest["format"],
+        serde_json::json!("cove-proof-suite-manifest-v1")
+    );
+    assert_eq!(
+        manifest["scenarios"][0]["scenario"],
+        serde_json::json!("claims")
+    );
+    assert_eq!(
+        manifest["scenarios"][0]["doctor_status"],
+        serde_json::json!("ok")
+    );
+    assert_eq!(
+        manifest["scenarios"][0]["parity_status"],
+        serde_json::json!("ok")
+    );
+    for name in [
+        "proof-suite-manifest.json",
+        "claims/claims.covemap",
+        "claims/map-build-bundle/map-build-manifest.json",
+        "claims/doctor-report.json",
+        "claims/proof-size-comparison.json",
+        "claims/parity/claims.v1.json",
+        "claims/proof-baselines/source-parquet/claims.parquet",
+    ] {
+        assert!(out_dir.join(name).exists(), "missing proof-suite {name}");
+    }
 }
 
 #[test]

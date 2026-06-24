@@ -27,7 +27,10 @@ use coveql::{
     PhysicalPlanOptions, PhysicalSidecarInputs, QueryArtifactMember, QuerySurfaceDiscovery,
     QuerySurfaceDiscoveryOptions, COVEQL_PROFILE_CONTRACT_VERSION,
 };
-use customer360::{generate_customer360, Customer360Options, Customer360Profile};
+use customer360::{
+    generate_customer360, generate_proof_suite, Customer360Options, Customer360Profile,
+    ProofSuiteOptions, ProofSuiteScenario,
+};
 use external_tables::{register_external_tables, ExternalTableSpec};
 use help::{print_usage, usage, HelpTopic};
 use output::{write_result, OutputFormat};
@@ -57,6 +60,13 @@ enum Command {
     ShowcaseCustomer360 {
         out_dir: PathBuf,
         profile: Customer360Profile,
+        force: bool,
+        json: bool,
+    },
+    ShowcaseProofSuite {
+        out_dir: PathBuf,
+        profile: Customer360Profile,
+        scenario: ProofSuiteScenario,
         force: bool,
         json: bool,
     },
@@ -172,6 +182,13 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<(), String> {
             force,
             json,
         } => run_showcase_customer360(&out_dir, profile, force, json),
+        Command::ShowcaseProofSuite {
+            out_dir,
+            profile,
+            scenario,
+            force,
+            json,
+        } => run_showcase_proof_suite(&out_dir, profile, scenario, force, json),
         Command::Query(command) => run_query(
             command.file.as_deref(),
             &command.query,
@@ -522,12 +539,19 @@ fn parse_showcase(mut args: Vec<String>) -> Result<Command, String> {
         return Ok(Command::Help(HelpTopic::Showcase));
     }
     let name = args.remove(0);
-    if name != "customer360" {
-        return Err(format!(
-            "unknown showcase '{name}'; expected customer360\n\n{}",
-            usage(HelpTopic::Showcase)
-        ));
+    if name == "customer360" {
+        return parse_showcase_customer360(args);
     }
+    if name == "proof-suite" {
+        return parse_showcase_proof_suite(args);
+    }
+    Err(format!(
+        "unknown showcase '{name}'; expected customer360 or proof-suite\n\n{}",
+        usage(HelpTopic::Showcase)
+    ))
+}
+
+fn parse_showcase_customer360(args: Vec<String>) -> Result<Command, String> {
     let mut out_dir = None;
     let mut profile = Customer360Profile::Quick;
     let mut force = false;
@@ -565,6 +589,57 @@ fn parse_showcase(mut args: Vec<String>) -> Result<Command, String> {
     Ok(Command::ShowcaseCustomer360 {
         out_dir,
         profile,
+        force,
+        json,
+    })
+}
+
+fn parse_showcase_proof_suite(args: Vec<String>) -> Result<Command, String> {
+    let mut out_dir = None;
+    let mut profile = Customer360Profile::Quick;
+    let mut scenario = ProofSuiteScenario::All;
+    let mut force = false;
+    let mut json = false;
+    let mut iter = args.into_iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--out" => {
+                out_dir =
+                    Some(PathBuf::from(iter.next().ok_or_else(|| {
+                        "--out requires a directory path".to_string()
+                    })?));
+            }
+            "--profile" => {
+                let value = iter.next().ok_or_else(|| {
+                    "--profile requires quick, standard, or publication".to_string()
+                })?;
+                profile = Customer360Profile::parse(&value)?;
+            }
+            "--scenario" => {
+                let value = iter.next().ok_or_else(|| {
+                    "--scenario requires customer360, claims, catalog, or all".to_string()
+                })?;
+                scenario = ProofSuiteScenario::parse(&value)?;
+            }
+            "--force" => force = true,
+            "--json" => json = true,
+            "-h" | "--help" => return Ok(Command::Help(HelpTopic::Showcase)),
+            arg if arg.starts_with("--") => {
+                return Err(format!("unknown proof-suite showcase option '{arg}'"))
+            }
+            _ => return Err("showcase proof-suite does not accept positional arguments".into()),
+        }
+    }
+    let out_dir = out_dir.ok_or_else(|| {
+        format!(
+            "--out is required for showcase proof-suite\n\n{}",
+            usage(HelpTopic::Showcase)
+        )
+    })?;
+    Ok(Command::ShowcaseProofSuite {
+        out_dir,
+        profile,
+        scenario,
         force,
         json,
     })
@@ -1033,6 +1108,10 @@ fn run_examples(json: bool) -> Result<(), String> {
             "cove showcase customer360 --profile quick --out examples/customer360 --force",
         ),
         (
+            "Generate the COVE-O proof suite",
+            "cove showcase proof-suite --scenario all --profile quick --out target/cove-proof-suite --force",
+        ),
+        (
             "Inspect canonical customer surfaces",
             "cove inspect --queries --performance examples/customer360/customers.cove",
         ),
@@ -1149,6 +1228,53 @@ fn run_showcase_customer360(
         println!(
             "  python3 {}/notebooks/customer360_analysis.py --input-dir {}",
             out_dir.display(),
+            out_dir.display()
+        );
+    }
+    Ok(())
+}
+
+fn run_showcase_proof_suite(
+    out_dir: &Path,
+    profile: Customer360Profile,
+    scenario: ProofSuiteScenario,
+    force: bool,
+    json: bool,
+) -> Result<(), String> {
+    let manifest = generate_proof_suite(&ProofSuiteOptions {
+        out_dir: out_dir.to_path_buf(),
+        profile,
+        scenario,
+        force,
+    })?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&manifest)
+                .map_err(|error| format!("cannot serialize proof-suite manifest: {error}"))?
+        );
+    } else {
+        println!(
+            "Generated COVE-O proof suite ({}, scenario {}) at {}",
+            profile.as_str(),
+            scenario.as_str(),
+            out_dir.display()
+        );
+        println!(
+            "Manifest: {}",
+            out_dir.join("proof-suite-manifest.json").display()
+        );
+        println!("Try next:");
+        println!(
+            "  cove map doctor --bundle-dir {}/customer360/map-build-bundle",
+            out_dir.display()
+        );
+        println!(
+            "  cove map doctor --bundle-dir {}/claims/map-build-bundle",
+            out_dir.display()
+        );
+        println!(
+            "  cove map doctor --bundle-dir {}/catalog/map-build-bundle",
             out_dir.display()
         );
     }

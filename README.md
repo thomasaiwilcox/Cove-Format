@@ -465,6 +465,9 @@ Important v2 paths:
   manifest, and capability matrix.
 - [`v2/docs/performance/datafusion-benchmark-report.md`](./v2/docs/performance/datafusion-benchmark-report.md):
   current local DataFusion benchmark methodology and results.
+- [`v2/docs/performance/cove-o-overlap-benchmark-results.md`](./v2/docs/performance/cove-o-overlap-benchmark-results.md):
+  current COVE-O overlap and scale results showing where mapped object storage
+  does and does not beat duplicated source-shaped Parquet bundles.
 
 ## Benchmark Snapshot
 
@@ -499,6 +502,15 @@ scan-heavy projection path and some OLAP grouping/top-customer full-query
 tracks. Planning overhead is visible in the full-query numbers. FileCode
 dictionary output is currently opt-in and should not be assumed to be faster
 than decoded output.
+
+The mapped COVE-O overlap benchmarks show a separate storage result. On the
+current CI-profile synthetic sweep, the COVE-O object becomes smaller as
+logical entity overlap rises; the full adoption bundle beats duplicated
+source-shaped Parquet only at high overlap. In the 8-table partial-overlap
+sweep, the full bundle is still larger at 75% overlap (`1.323x` Parquet) but
+smaller at 100% overlap (`0.530x` Parquet). See
+[`v2/docs/performance/cove-o-overlap-benchmark-results.md`](./v2/docs/performance/cove-o-overlap-benchmark-results.md)
+for the full table and caveats.
 
 ## Getting Started
 

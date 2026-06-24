@@ -52,6 +52,8 @@ pub(crate) enum Command {
         json: bool,
         object_name: Option<String>,
         projection_output: MapBuildProjectionOutput,
+        evidence_encoding: MapEvidenceEncoding,
+        section_compression: MapBuildSectionCompression,
         verify: bool,
         publish_covm: bool,
     },
@@ -199,6 +201,8 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<(), String> {
             json,
             object_name,
             projection_output,
+            evidence_encoding,
+            section_compression,
             verify,
             publish_covm,
         } => {
@@ -210,6 +214,8 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<(), String> {
                     force,
                     object_name,
                     projection_output,
+                    evidence_encoding,
+                    section_compression,
                     verify,
                     publish_covm,
                     reuse_cache: true,
@@ -389,6 +395,8 @@ pub(crate) fn parse_args(
                 json,
                 object_name,
                 projection_output,
+                evidence_encoding,
+                section_compression,
                 verify,
                 publish_covm,
                 positional,
@@ -409,6 +417,8 @@ pub(crate) fn parse_args(
                 json,
                 object_name,
                 projection_output,
+                evidence_encoding,
+                section_compression,
                 verify,
                 publish_covm,
             }
@@ -536,6 +546,8 @@ fn parse_build_args(
         bool,
         Option<String>,
         MapBuildProjectionOutput,
+        MapEvidenceEncoding,
+        MapBuildSectionCompression,
         bool,
         bool,
         Vec<PathBuf>,
@@ -547,6 +559,8 @@ fn parse_build_args(
     let mut json = false;
     let mut object_name = None;
     let mut projection_output = MapBuildProjectionOutput::CoveT;
+    let mut evidence_encoding = MapEvidenceEncoding::Compact;
+    let mut section_compression = MapBuildSectionCompression::Zstd;
     let mut verify = false;
     let mut publish_covm = false;
     let mut positional = Vec::new();
@@ -580,6 +594,29 @@ fn parse_build_args(
                     _ => return Err("--projection-output must be cove-t or none".into()),
                 };
             }
+            "--evidence-encoding" => {
+                let raw = args.next().ok_or_else(|| {
+                    "--evidence-encoding requires compact, expanded, or both".to_string()
+                })?;
+                evidence_encoding = match raw.as_str() {
+                    "compact" => MapEvidenceEncoding::Compact,
+                    "expanded" => MapEvidenceEncoding::Expanded,
+                    "both" => MapEvidenceEncoding::Both,
+                    _ => {
+                        return Err("--evidence-encoding must be compact, expanded, or both".into())
+                    }
+                };
+            }
+            "--section-compression" => {
+                let raw = args
+                    .next()
+                    .ok_or_else(|| "--section-compression requires zstd or none".to_string())?;
+                section_compression = match raw.as_str() {
+                    "zstd" => MapBuildSectionCompression::Zstd,
+                    "none" => MapBuildSectionCompression::None,
+                    _ => return Err("--section-compression must be zstd or none".into()),
+                };
+            }
             _ if arg.starts_with('-') => return Err(format!("unknown option {arg}")),
             _ => positional.push(PathBuf::from(arg)),
         }
@@ -591,6 +628,8 @@ fn parse_build_args(
         json,
         object_name,
         projection_output,
+        evidence_encoding,
+        section_compression,
         verify,
         publish_covm,
         positional,
