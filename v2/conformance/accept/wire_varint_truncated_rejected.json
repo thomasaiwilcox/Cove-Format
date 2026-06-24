@@ -1,7 +1,0 @@
-{
-  "input": [
-    128
-  ],
-  "op": "varint_decode_reject",
-  "reason": "continuation bit set but no following byte"
-}
