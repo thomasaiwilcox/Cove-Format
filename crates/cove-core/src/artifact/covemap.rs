@@ -653,7 +653,8 @@ impl CovemapFile {
                 | SectionKind::MapIdentityEquivalenceIndex
                 | SectionKind::MapEvidenceIndex
                 | SectionKind::MapConversionReport
-                | SectionKind::MapProjectionCatalog => {
+                | SectionKind::MapProjectionCatalog
+                | SectionKind::MapResolutionCatalog => {
                     map_sections.push(parse_embedded_section(section_kind, &section.payload)?);
                 }
                 _ => return Err(CoveError::MapInvalid),

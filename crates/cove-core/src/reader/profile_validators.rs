@@ -255,7 +255,8 @@ pub(super) fn validate_shared_semantics(
             | SectionKind::MapIdentityEquivalenceIndex
             | SectionKind::MapEvidenceIndex
             | SectionKind::MapConversionReport
-            | SectionKind::MapProjectionCatalog => {
+            | SectionKind::MapProjectionCatalog
+            | SectionKind::MapResolutionCatalog => {
                 if is_optional_advisory_section(kind)
                     && opts.optional_pushdown_policy == OptionalPushdownPolicy::FailOpen
                 {
@@ -670,6 +671,7 @@ pub(super) fn validate_cove_t_semantics_with_registered_page_scope(
             | SectionKind::MapEvidenceIndex
             | SectionKind::MapConversionReport
             | SectionKind::MapProjectionCatalog
+            | SectionKind::MapResolutionCatalog
             | SectionKind::VendorExtension => {}
         }
     }
@@ -2738,7 +2740,8 @@ pub(super) fn validate_cove_map_semantics(
             | SectionKind::MapIdentityEquivalenceIndex
             | SectionKind::MapEvidenceIndex
             | SectionKind::MapConversionReport
-            | SectionKind::MapProjectionCatalog => {
+            | SectionKind::MapProjectionCatalog
+            | SectionKind::MapResolutionCatalog => {
                 let payload = compression::section_payload(data, entry)?;
                 parse_embedded_section(kind, &payload).map(|section| {
                     map_sections.push(section);

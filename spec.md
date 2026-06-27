@@ -1104,8 +1104,38 @@ enum ProducerScopeKind {
 - COVE-I secondary index artifacts and COVE-CACHE coverage caches MUST be optional and snapshot-bound. Unsupported, stale, or corrupt index/cache metadata MUST be ignored for ordinary reads.
 - If `FEATURE_EXTENDED_FEATURE_SET` is set, readers MUST validate the extended feature set before accepting or rejecting unknown extended required features.
 
+### 11.1 COVE-O Delta Artifact Feature Bits
 
-### 11.1 Extended Feature Set
+COVE-O `.covedelta` artifacts use a local 64-bit delta feature namespace. These bits appear in `CoveDeltaPostscriptV1`, `CoveDeltaHeaderV1`, `CoveDeltaSectionDirectoryEntryV1`, `CovmDeltaChainExtensionV1`, and chain-summary entries. They are not global COVE header feature bits and MUST NOT be placed in `.cove` `required_features` or `optional_features`.
+
+| Bit | Name | Meaning |
+| ---: | --- | --- |
+| 0 | `DELTA_FEATURE_SPARSE_PATCH_ROWS` | Delta temporal rows use sparse property operations. |
+| 1 | `DELTA_FEATURE_OBJECT_TOMBSTONES` | Object tombstone records may appear. |
+| 2 | `DELTA_FEATURE_PROPERTY_TOMBSTONES` | Property tombstone operations may appear. |
+| 3 | `DELTA_FEATURE_ASSOCIATION_TOMBSTONES` | Association or link tombstone records may appear. |
+| 4 | `DELTA_FEATURE_CONTINUATION_ANCHORS` | Existing-object patches require logical continuation anchors. |
+| 5 | `DELTA_FEATURE_INLINE_DICTIONARY` | Delta-local dictionary values are inline. |
+| 6 | `DELTA_FEATURE_PARENT_DICTIONARY_ALIASES` | Delta-local dictionary entries may alias validated parent dictionaries. |
+| 7 | `DELTA_FEATURE_EXACT_TOUCHED_SET` | Touched-object summaries are exact and may be required for skipping. |
+| 8 | `DELTA_FEATURE_EXACT_TOMBSTONE_SET` | Tombstone summaries are exact and required for latest-state reads. |
+| 9 | `DELTA_FEATURE_CHECKPOINT_BASELINES` | Delta may carry checkpoint Baseline or Snapshot records. |
+| 10 | `DELTA_FEATURE_COVERAGE_PATCH` | Delta carries COVE-COVERAGE patch sections. |
+| 11 | `DELTA_FEATURE_INDEX_HINTS` | Delta references COVE-I or COVX index artifacts. |
+| 12 | `DELTA_FEATURE_MAP_EVIDENCE_PATCH` | Delta carries COVE-MAP evidence metadata. |
+| 13 | `DELTA_FEATURE_PROJECTION_PATCH` | Delta carries projection metadata or invalidation summaries. |
+| 14 | `DELTA_FEATURE_HISTORICAL_COMMIT_INSERT` | Delta may insert historical commit-order records. Deferred for the first profile. |
+
+**Rules:**
+- The first interoperable COVE-O delta profile requires bits 0, 1, 4, 5, 7, and 8 for ordinary sparse object-temporal reconstruction.
+- A reader that does not support a required delta feature bit MUST reject the selected snapshot or requested operation that needs the feature.
+- Unknown optional delta feature bits MAY be ignored, but readers MUST NOT use unknown optional metadata for pruning, reconstruction, trust validation, projection readback, or evidence replay.
+- Required feature bits in temporal segment semantics, sparse patch semantics, anchors, tombstones, exact touched sets, exact tombstone sets, or required chain summaries reject COVE-O object-temporal reads for the selected delta-bearing snapshot when unsupported.
+- Required feature bits in optional index, layout, coverage, projection, or evidence sections reject only operations that select those sections.
+- `DELTA_FEATURE_HISTORICAL_COMMIT_INSERT` MUST NOT be required by the first profile. Historical commit-order insertion requires a later required extension.
+
+
+### 11.2 Extended Feature Set
 
 The low 64-bit header feature words cover bootstrap features. COVE v2 also allows an `EXTENDED_FEATURE_SET` section for future feature banks.
 
@@ -1136,7 +1166,7 @@ struct ExtendedFeatureSetHeaderV2 {
 - The extended feature set MUST NOT be represented only in JSON metadata.
 - A writer SHOULD use the low feature word for commonly required bootstrap features and extended words for profile-specific, vendor, or future features.
 
-### 11.2 Feature Scope and Requiredness Model
+### 11.3 Feature Scope and Requiredness Model
 
 COVE v2 distinguishes the scope of requiredness. This avoids the failure mode where an ordinary table reader rejects a valid table scan because the file also contains required metadata for a different operation such as mapping replay, trust verification, Harbor mount, index-only answering, zero-copy export, or projection readback.
 
@@ -1182,7 +1212,7 @@ enum FeatureScope {
 - If a trust-chain, redaction, digest, COVE-I index-only answer, COVX kernel, COVE-L zero-copy map, COVE-R runtime adapter, or COVE-CACHE entry is requested by operation or policy, unsupported required features reject that operation only.
 - A writer that wants a file to be broadly readable SHOULD advertise optional profiles in header `optional_features`, then express their requiredness in section entries, profile matrices, or operation-specific bindings.
 
-### 11.2.1 Requiredness Validation Order
+### 11.3.1 Requiredness Validation Order
 
 A conforming reader SHOULD evaluate requiredness in this order:
 
@@ -1197,7 +1227,7 @@ A conforming reader SHOULD evaluate requiredness in this order:
 
 A reader MAY implement a stricter policy for safety, but such a policy MUST be reported as an implementation policy rather than a COVE wire-format requirement.
 
-### 11.2.2 Profile Capability Matrix
+### 11.3.2 Profile Capability Matrix
 
 `PROFILE_CAPABILITY_MATRIX` is a shared v2 section that scopes required and optional feature words to a profile, operation, section, or target-local reference. It is used when a file advertises optional profiles whose requiredness should not affect ordinary reads.
 
@@ -1232,7 +1262,7 @@ struct ProfileCapabilityEntryV2 {
 
 Entries MUST be sorted by `(profile, scope, operation_kind, global_feature_word_index, section_id, target_local_ref)` and duplicate keys are invalid. `operation_kind` MUST be `None` unless `scope = OperationRequired`. `global_feature_word_index` MUST be less than the `EXTENDED_FEATURE_SET.word_count` when an extended set is present.
 
-### 11.3 Section-Level Extended Feature Binding
+### 11.4 Section-Level Extended Feature Binding
 
 The low 64-bit feature words in `CoveSectionEntryV2` are sufficient for common bootstrap and section features. When section-, profile-, page-, or operation-scoped requiredness uses extended feature words, a `SECTION_FEATURE_BINDING` section provides the binary-authoritative binding. The binding section is not a way to make an unknown header-required feature safe; it applies only after header validation has succeeded.
 
@@ -1550,9 +1580,40 @@ struct CoveSectionEntryV2 {
 | 66 | MAP_EVIDENCE_INDEX | COVE-MAP | Source row, rule, digest, and output assertion evidence. |
 | 67 | MAP_CONVERSION_REPORT | COVE-MAP | Conversion diagnostics, conflicts, candidate matches, rejected rows, and fidelity report. |
 | 68 | MAP_PROJECTION_CATALOG | COVE-MAP | Object-and-association to table projection definitions and read-surface declarations. |
+| 69 | MAP_RESOLUTION_CATALOG | COVE-MAP | Resolver catalogs, normalisation pipelines, candidate rules, and reviewed resolution decisions. |
 | 255 | VENDOR_EXTENSION | shared | Reserved extension section. |
 
 MAP_* section payloads are COVE-MAP profile payloads whose standard schema is defined by Section 70. The authoritative reusable mapping definition normally lives in a `.covemap` artifact. MAP_* sections embedded in a `.cove` file are intended for mapping evidence, projection catalogs, conversion reports, identity-equivalence indexes, or embedded mapping snapshots tied to that file or dataset state; they MUST NOT silently override an explicitly referenced reusable mapping definition unless a required profile or extension defines that authority rule. A writer MUST NOT place MAP_* sections in an ordinary COVE file unless it advertises FEATURE_SEMANTIC_MAP and the payload conforms to the COVE-MAP v2 schema or to a registered required extension. General COVE readers MUST ignore optional MAP_* sections for ordinary COVE-T or COVE-O reads. COVE-MAP-aware tools MUST validate MAP_* payload schemas, source fingerprints, function registries, and evidence references before using them for conversion, replay, projection, or explanation.
+
+`.covedelta` artifacts use an artifact-local `section_kind` namespace in `CoveDeltaSectionDirectoryEntryV1`. These values are not global `.cove` section-kind IDs. A delta `section_id` is a unique section instance ID within the `.covedelta` artifact; `section_kind` identifies the local delta payload schema.
+
+| Delta kind | Name | Purpose |
+| ---: | --- | --- |
+| 0 | `DELTA_PARENT_REFS` | Digest-bound base, parent-delta, and sidecar references. |
+| 1 | `DELTA_CATALOG_PATCH` | Additive object, property, catalog, temporal-role, branch, or projection declarations. |
+| 2 | `DELTA_DICTIONARY_OVERLAY` | Delta-local dictionary entries and validated parent aliases. |
+| 3 | `DELTA_TEMPORAL_SEGMENT_INDEX` | Delta-local COVE-O temporal segment index. |
+| 4 | `DELTA_TEMPORAL_SEGMENT_DATA` | Delta-local COVE-O temporal segment payloads. |
+| 5 | `DELTA_CONTINUATION_ANCHORS` | Logical predecessor anchors for touched existing objects. |
+| 6 | `DELTA_TOUCHED_OBJECT_SET` | Conservative or exact changed object/property summary. |
+| 7 | `DELTA_TOMBSTONE_SET` | Conservative or exact tombstone summary. |
+| 8 | `DELTA_PROPERTY_OPS` | Sparse property operation streams when not embedded in temporal pages. |
+| 9 | `DELTA_EVIDENCE_PATCH` | Additional replay or explanation evidence metadata. |
+| 10 | `DELTA_PROJECTION_PATCH` | Projection metadata or invalidation summaries. |
+| 11 | `DELTA_COVERAGE_PATCH` | Delta-local COVE-COVERAGE providers and sets. |
+| 12 | `DELTA_INDEX_HINTS` | Optional references to delta-local COVE-I or COVX artifacts. |
+| 13 | `DELTA_LAYOUT_HINTS` | Optional byte-range and object-store planning hints. |
+| 14 | `DELTA_TRUST_CONTINUATION` | Trust-chain continuation and state-hash metadata. |
+| 15 | `DELTA_STRING_TABLE` | String and byte payload table for descriptors. |
+| 16 | `DELTA_BRANCH_IDENTITY_TABLE` | Canonical branch identity descriptors. |
+| 17 | `DELTA_SCOPE_TABLE` | Scope descriptors used by summaries and records. |
+| 18 | `DELTA_TEMPORAL_ROLE_SUMMARY_TABLE` | Temporal-role range summaries. |
+| 19 | `DELTA_TOUCHED_SUMMARY_TABLE` | Exact or conservative touched-object summaries. |
+| 20 | `DELTA_TOMBSTONE_SUMMARY_TABLE` | Exact or conservative tombstone summaries. |
+| 21 | `DELTA_STATE_HASH_TABLE` | Canonical state-hash descriptors and payload references. |
+| 255 | `DELTA_EXTENSION` | Required or optional extension payload. |
+
+Only the delta temporal segment sections plus metadata needed to validate them are required for a minimal object delta. Delta-local index, coverage, layout, evidence, and projection patches are optional unless selected by a required delta feature or by the requested operation.
 
 ---
 
@@ -5489,17 +5550,25 @@ semantics.
 ### 50.4 Append, Streaming, CDC, and Compaction Boundary
 
 **The accepted mutable-data pattern for COVE v2 is immutable-file publication:**
-- append by writing additional complete COVE files and publishing a new COVM state or external table snapshot,
+- append by writing additional complete COVE files, or by writing immutable COVE-O `.covedelta` artifacts and publishing a new COVM state or external table snapshot that selects the resulting base-plus-delta chain,
 - update/delete by external table-format overlays or by rewriting affected data into new COVE files,
+- update/delete for COVE-O by publishing selected `.covedelta` artifacts whose temporal records, tombstones, and summaries are part of the selected dataset snapshot,
 - compact by writing replacement COVE files and publishing a new manifest/catalog state,
 - ingest streams by buffering or micro-batching into temporary writer state, then finalising complete COVE files.
 
 **Rules:**
 - A .cove file MUST NOT be appended in place after finalisation.
+- A `.covedelta` file MUST NOT be appended in place after finalisation.
 - A partially written object MUST NOT be treated as a valid COVE file.
-- Patch, delta, CDC, or operation-log files MAY be represented as ordinary COVE-T data files when an external protocol defines their meaning, but COVE-Core/COVE-T readers MUST treat them as ordinary data unless that external protocol is explicitly in scope.
+- A partially written `.covedelta` artifact MUST NOT be treated as a valid selected delta.
+- Patch, delta, CDC, or operation-log files MAY be represented as ordinary COVE-T data files when an external protocol defines their meaning, but COVE-Core/COVE-T readers MUST treat them as ordinary data unless that external protocol is explicitly in scope. COVE-O `.covedelta` artifacts are a COVE-O temporal profile surface, not ordinary `.cove` files.
 - COVM readers MUST select one published dataset state. They MUST NOT merge multiple COVM generations as an implicit transaction log unless a separate protocol says to do so.
+- COVM or the governing external catalog is authoritative for selecting the base artifact and ordered `.covedelta` chain. Readers MUST NOT discover visible deltas by filename scanning, directory ordering, object-store listing, wall-clock time, or "latest file" heuristics.
+- A delta-bearing snapshot selected by COVM MUST be read as the selected base-plus-delta chain. A reader that cannot validate the required delta profile, chain digest, required summaries, or required features MUST fail closed for that selected snapshot rather than silently returning base-only object state.
+- A user or API MAY explicitly open the base `.cove` artifact directly. That direct-file read is not the same operation as reading the delta-bearing dataset snapshot.
+- Generic COVE-Core and COVE-T readers that do not claim COVE-O delta support MUST treat `.covedelta` artifacts as out of scope. Ordinary direct reads of finalised `.cove` files remain unaffected by unrelated `.covedelta` files.
 - Compaction MUST preserve logical table semantics according to the governing manifest or catalog; it MUST NOT mutate the replaced COVE files.
+- COVE-O delta compaction materialises a selected base-plus-delta snapshot into a new self-contained `.cove` file and publishes a new manifest/catalog state; it MUST NOT mutate the replaced base or delta artifacts.
 
 ---
 
@@ -6025,6 +6094,15 @@ COVE-O v2 files MUST be reconstruction self-contained.
 If a chain continues from outside the file, the writer MUST emit a Baseline or Snapshot anchor inside the file.
 Mandatory cross-file prev_ref is not supported in v2.
 
+A COVE-O delta-bearing dataset snapshot is self-contained at the selected snapshot level, not at the individual delta-artifact level. When COVM or an external catalog selects a base `.cove` plus ordered `.covedelta` chain, reconstruction MUST use only the selected base artifact, selected delta artifacts, selected sidecars, and digest-bound metadata for that snapshot.
+
+**Delta self-containment rules:**
+- Ordinary `.cove` files remain directly self-contained as described above.
+- `.covedelta` artifacts MUST NOT contain mandatory cross-file `prev_ref` row pointers. Existing-object patches use `DeltaContinuationAnchorV1` logical anchors instead.
+- The COVM delta-chain extension or equivalent external snapshot metadata is authoritative for the ordered parent chain. A delta header parent reference validates lineage, but it does not authorize discovery of additional deltas outside the selected snapshot.
+- A delta may inherit effective schema, object catalog, semantic-map, projection, visibility, or redaction metadata by validated fingerprint from its parent. If a required inherited surface cannot be validated, the selected snapshot is invalid for operations that need it.
+- A delta-aware reader MAY reconstruct only the objects and properties needed by a query, but it MUST behave as if applying the selected base and ordered deltas under the validation and visibility rules of this specification.
+
 ---
 
 ## 61. COVE-O Property Columns
@@ -6123,6 +6201,419 @@ Trust chains are optional and gated by FEATURE_TRUST_CHAIN.
 - property logical type,
 - canonical property value bytes,
 - previous trust hash where applicable.
+
+---
+
+### 63.1 COVE-O Delta Artifact Profile
+
+COVE-O delta artifacts are immutable `.covedelta` files selected by COVM or by an external catalog snapshot. They represent object-temporal changes after a self-contained base `.cove` snapshot without mutating the base file. The first interoperable profile is append-only in COVE-O commit order: historical commit-order insertion requires `DELTA_FEATURE_HISTORICAL_COMMIT_INSERT` and is deferred.
+
+#### 63.1.1 Binary Envelope
+
+A `.covedelta` artifact uses COVE-style tail discovery:
+
+```text
+[header bytes]
+[section payload bytes]
+[section directory bytes]
+[footer bytes]
+[postscript bytes]
+[postscript_version: u16]
+[postscript_len: u16]
+[magic: "CVD2"]
+```
+
+```rust
+struct CoveDeltaPostscriptV1 {
+    required_delta_features: u64,
+    optional_delta_features: u64,
+    file_len: u64,
+    footer_offset: u64,
+    footer_length: u64,
+    checksum: u32,
+}
+
+struct CoveDeltaFooterV1 {
+    header_offset: u64,
+    header_length: u64,
+    section_directory_offset: u64,
+    section_directory_length: u64,
+    section_count: u32,
+    parent_ref_count: u32,
+    footer_crc32c: u32,
+    checksum: u32,
+}
+
+struct CoveDeltaSectionDirectoryEntryV1 {
+    section_id: u32,
+    section_kind: u16,
+    flags: u16,
+    offset: u64,
+    length: u64,
+    uncompressed_length: u64,
+    item_count: u64,
+    compression: u8,
+    encryption: u8,             // 0=None in v1
+    alignment_log2: u8,
+    reserved0: u8,
+    required_delta_features: u64,
+    optional_delta_features: u64,
+    crc32c: u32,
+    checksum: u32,
+}
+```
+
+**Rules:**
+- Delta envelope fields use the same binary discipline as COVE v2 unless this section says otherwise: little-endian integers, explicit lengths and offsets, no native struct padding, and checksums computed with the checksum field treated as zero.
+- The final magic MUST be `CVD2`.
+- `postscript_len` locates `CoveDeltaPostscriptV1`; the postscript locates the footer; the footer locates the header and section directory.
+- Section offsets and lengths are relative to the start of the `.covedelta` artifact.
+- Readers MUST validate the postscript, footer, header, section directory, and every section needed by the requested operation before using those bytes.
+- `encryption` MUST be `0` in v1 unless a required extension defines an encrypted delta payload profile.
+- Unknown required delta features reject according to Section 11.1.
+
+#### 63.1.2 Delta Header
+
+```rust
+struct CoveDeltaHeaderV1 {
+    magic: [u8; 4],              // "CVD2"
+    version_major: u16,
+    version_minor: u16,
+    header_len: u16,
+    flags: u32,
+    required_delta_features: u64,
+    optional_delta_features: u64,
+
+    delta_artifact_id: [u8; 16],
+    dataset_id: [u8; 16],
+    snapshot_id: [u8; 16],
+    parent_snapshot_id: [u8; 16],
+
+    chain_ordinal: u32,
+    chain_depth: u32,
+    parent_ref_count: u32,
+    section_count: u32,
+
+    csn_min: u64,
+    csn_max: u64,
+    commit_time_range_start_us: i64,
+    commit_time_range_end_us: i64,
+
+    scope_kind: u16,             // valid when DELTA_FLAG_SINGLE_SCOPE is set
+    reserved0: u16,
+    scope_id: [u8; 16],          // zero when multi-scope
+
+    object_catalog_fingerprint_ref: u32,
+    schema_fingerprint_ref: u32,
+    semantic_map_fingerprint_ref: u32,
+    projection_fingerprint_ref: u32,
+
+    section_directory_offset: u64,
+    section_directory_length: u64,
+    parent_refs_offset: u64,
+    parent_refs_length: u64,
+
+    created_at_us: i64,
+    source_publish_range_start_us: i64,
+    source_publish_range_end_us: i64,
+    checksum: u32,
+}
+```
+
+Header flag `0x0000_0001` is `DELTA_FLAG_SINGLE_SCOPE`. Header flag `0x0000_0002` is `DELTA_FLAG_SOURCE_PUBLISH_RANGE_PRESENT`.
+
+**Rules:**
+- `magic` MUST be `CVD2`.
+- `chain_ordinal` MUST be dense within the selected snapshot chain.
+- `chain_depth` includes the current delta and MAY be used for read-amplification and retention policy limits.
+- `csn_min..=csn_max` MUST advance beyond the selected parent high-water mark for the same scope and branch identity in the initial append-only profile.
+- COVE-O `timestamp_us` remains commit/file-ordering time. Business, effective, source publication, or valid-time corrections MUST use declared temporal-role properties and summaries, not backdated commit timestamps.
+- If `DELTA_FLAG_SOURCE_PUBLISH_RANGE_PRESENT` is clear, `source_publish_range_start_us` and `source_publish_range_end_us` MUST be zero and ignored.
+- `source_publish_range_start_us/end_us` is operational metadata for producer publication, ingest, or update-batch ranges. It is not COVE-O commit time and not business valid time.
+- Fingerprint fields describe the effective metadata after applying this delta. A zero fingerprint reference means the surface is unchanged from the parent and inherited by validated parent reference.
+- If `DELTA_FLAG_SINGLE_SCOPE` is set, every temporal record, anchor, touched set, and tombstone summary in the delta belongs to `scope_kind/scope_id`. Otherwise those structures MUST carry explicit scope fields.
+
+#### 63.1.3 Parent References
+
+```rust
+struct DeltaParentRefV1 {
+    parent_ref: u32,
+    parent_kind: u8,            // base_cove, parent_delta, covi, covmap, other
+    flags: u32,
+
+    artifact_id: [u8; 16],
+    snapshot_id: [u8; 16],
+    file_len: u64,
+    footer_crc32c: u32,
+    digest_algorithm: u16,
+    digest_len: u16,
+    digest_ref: u32,
+    uri_ref: u32,
+
+    schema_fingerprint_ref: u32,
+    object_catalog_fingerprint_ref: u32,
+    semantic_map_fingerprint_ref: u32,
+    projection_fingerprint_ref: u32,
+
+    checksum: u32,
+}
+```
+
+Parent flag `0x0000_0001` is `DELTA_PARENT_REF_LINEAGE_PARENT`.
+
+**Rules:**
+- Exactly one parent reference in a `.covedelta` MUST be marked `DELTA_PARENT_REF_LINEAGE_PARENT`.
+- The lineage parent's `snapshot_id` MUST equal `CoveDeltaHeaderV1.parent_snapshot_id`.
+- Parent references MUST validate length, footer CRC, cryptographic digest, artifact ID, and snapshot ID before inherited metadata or value bytes are used.
+- `uri_ref` is advisory location metadata. It MUST NOT replace COVM or external catalog snapshot selection.
+- Merge DAG lineage is not part of v1. Multiple non-lineage parent refs may describe sidecars or mapping artifacts, but they do not define multiple lineage parents unless a later required extension does so.
+
+#### 63.1.4 Descriptor Tables
+
+Delta-local `*_ref` fields resolve through explicit descriptor tables, not through implicit offsets or ad hoc ordering. Unless a section says otherwise, descriptor refs are dense zero-based indexes into the matching descriptor table in the same artifact or validated COVM chain-summary payload.
+
+```rust
+struct DeltaScopeDescriptorV1 {
+    scope_ref: u32,
+    scope_kind: u16,
+    flags: u16,
+    scope_id: [u8; 16],
+    checksum: u32,
+}
+
+enum DeltaSummaryDescriptorKindV1 {
+    ExactSortedSet = 0,
+    ExactRangeSet = 1,
+    ConservativeRange = 2,
+    NoFalseNegativeBloom = 3,
+    PropertyBitmap = 4,
+    TemporalRoleRange = 5,
+    Extension = 255,
+}
+
+struct DeltaSummaryDescriptorV1 {
+    summary_ref: u32,
+    summary_kind: u8,
+    flags: u32,
+    payload_ref: u32,
+    item_count: u64,
+    checksum: u32,
+}
+
+enum DeltaStateHashKindV1 {
+    CoveObjectDeltaStateHashV1 = 0,
+    CoveOTrustHash = 1,
+    Extension = 255,
+}
+
+struct DeltaStateHashDescriptorV1 {
+    state_hash_ref: u32,
+    state_hash_kind: u8,
+    hash_algorithm: u16,
+    hash_len: u16,
+    hash_payload_ref: u32,
+    flags: u32,
+    checksum: u32,
+}
+```
+
+`branch_identity_ref` resolves through `DELTA_BRANCH_IDENTITY_TABLE`; `scope_summary_ref` resolves through `DELTA_SCOPE_TABLE` or a summary descriptor naming one or more scopes; `temporal_role_summary_ref`, `touched_summary_ref`, `tombstone_summary_ref`, and `predecessor_state_hash_ref` resolve through their named delta tables. Unsupported required descriptor kinds reject the operation that needs them.
+
+#### 63.1.5 Catalog Patches and Dictionary Overlays
+
+Catalog patches are inherited by fingerprint and MUST be additive. Allowed patch operations include new object types, new properties on existing object types, new association/link/evidence/projection object types, new temporal-role bindings, new branch aliases, and new projection definitions that depend only on declared object/property IDs.
+
+```text
+EffectiveCatalog(delta_n) =
+  ApplyAdditivePatch(EffectiveCatalog(parent), delta_n.catalog_patch)
+```
+
+Readers MUST reject duplicate object type IDs, duplicate property IDs within one object type, changed logical type or collation for an inherited property, changed association endpoint flags for an inherited property, or changed projection authority for an inherited projection. Catalog patches MUST NOT rename, remove, or reinterpret parent declarations. Breaking catalog changes require a new base `.cove` snapshot or a separate schema-generation branch.
+
+COVE FileCodes remain artifact-local. A delta may avoid duplicating value bytes by making local dictionary entries aliases to validated parent dictionary entries, but the first profile requires inline delta dictionary values for ordinary reconstruction.
+
+```rust
+enum DeltaDictionaryEntryKindV1 {
+    InlineValue = 0,
+    ParentDictionaryAlias = 1,
+    CanonicalHashHint = 2,
+}
+
+struct DeltaDictionaryEntryV1 {
+    local_dictionary_id: u32,
+    local_code: u32,
+    logical_type: u16,
+    collation_id: u16,
+    entry_kind: u8,
+    flags: u32,
+
+    inline_value_ref: u32,       // when InlineValue
+
+    parent_ref: u32,             // when ParentDictionaryAlias
+    parent_dictionary_id: u32,
+    parent_code: u32,
+    parent_dictionary_digest_ref: u32,
+
+    canonical_hash128: [u8; 16],
+    checksum: u32,
+}
+```
+
+**Dictionary rules:**
+- Delta encoded pages use delta-local FileCodes.
+- A local code may resolve to an inline value or to a validated parent alias.
+- Parent aliases are encoding optimizations, not cross-file code domains.
+- A parent alias is valid only if the parent artifact and parent dictionary digest match the selected snapshot and the alias includes logical type and collation context.
+- V1 parent aliases MUST resolve directly to a parent inline dictionary value or ordinary parent COVE dictionary value. Alias-to-alias recursion is prohibited unless a later required extension defines bounded recursive resolution.
+- `CanonicalHashHint` supports pruning or equality hints only. It is not sufficient to reconstruct a materialised output value unless canonical value bytes are recoverable from a validated parent or inline source.
+- A delta MUST NOT alias, hash, or expose equality hints for a parent value that is redacted or policy-protected in the selected snapshot unless the selected disclosure policy explicitly permits that equality leakage.
+
+#### 63.1.6 Branch Identity, Temporal Records, and Patch Operations
+
+Raw FileCodes cannot cross artifact boundaries. Delta metadata that names a branch MUST use canonical branch identity metadata.
+
+```rust
+struct DeltaBranchIdentityV1 {
+    branch_identity_ref: u32,
+    branch_identity_kind: u8,     // canonical_bytes, catalog_branch_id, hash
+    flags: u32,
+    branch_value_ref: u32,
+    branch_hash128: [u8; 16],
+    branch_catalog_fingerprint_ref: u32,
+    checksum: u32,
+}
+```
+
+Delta temporal pages may encode branch values in their local physical representation. Cross-artifact anchors, touched sets, tombstone sets, and summaries MUST use `branch_identity_ref`, not a raw FileCode.
+
+Delta records follow COVE-O temporal semantics. The first profile applies records in selected delta-chain order and COVE-O commit order. Within each delta, temporal rows MUST be sorted by the same ordering required for COVE-O temporal segment data. A delta whose records do not advance beyond the selected parent high-water mark for the same scope and branch identity is invalid unless `DELTA_FEATURE_HISTORICAL_COMMIT_INSERT` is required and supported.
+
+For each sparse patch row:
+
+```text
+record key:
+  scope_id, branch_identity, object_type_id, goid, record_id, timestamp_us, csn
+
+record body:
+  record_kind
+  changed_property_count
+  changed_property_ids
+  changed_property_ops
+  changed_property_value_refs
+```
+
+```rust
+enum DeltaPropertyOpV1 {
+    SetValue = 0,
+    SetNull = 1,
+    Clear = 2,
+    Tombstone = 3,
+    Redact = 4,
+}
+
+enum DeltaTombstoneKindV1 {
+    Object = 0,
+    Property = 1,
+    Association = 2,
+    Evidence = 3,
+    ProjectionRow = 4,
+}
+```
+
+Omitted property means unchanged. `SetValue` assigns a value from the delta-local encoded value stream. `SetNull` sets the property to null if allowed. `Clear` explicitly clears the property under the declared COVE-O policy. `Tombstone` tombstones an object, property, association, evidence assertion, or projection row according to `DeltaTombstoneKindV1`. `Redact` marks a present value inaccessible and MUST bind matching redaction metadata. The ordinary COVE null bitmap MUST NOT mean "unchanged" in a sparse patch row.
+
+#### 63.1.7 Continuation Anchors and State Hashes
+
+A continuation anchor identifies the logical parent object state a delta expects to extend. It is not a physical row pointer.
+
+```rust
+enum DeltaAnchorStrengthV1 {
+    KeyOnly = 0,
+    KeyAndRecordId = 1,
+    KeyRecordAndStateHash = 2,
+    KeyRecordStateAndTrustHash = 3,
+}
+
+struct DeltaContinuationAnchorV1 {
+    scope_kind: u16,
+    scope_id: [u8; 16],
+    object_type_id: u32,
+    branch_identity_ref: u32,
+    goid: [u8; 16],
+
+    parent_ref: u32,
+    predecessor_csn: u64,
+    predecessor_timestamp_us: i64,
+    predecessor_record_id: [u8; 16],
+
+    predecessor_state_hash_ref: u32,
+    predecessor_trust_hash_ref: u32,
+    anchor_strength: u8,
+    flags: u32,
+    checksum: u32,
+}
+```
+
+Anchors are required for the first patch or tombstone of an existing object in a delta unless the record is a full Baseline or Snapshot anchor. The first profile SHOULD require `KeyRecordAndStateHash` for patching existing objects. If the parent snapshot lacks a stored state hash, a reader MAY compute it from canonical logical state or reject when the selected operation requires anchor validation and recomputation is unsupported. Brand-new objects whose first delta record is a Baseline or Snapshot do not require a continuation anchor.
+
+`DeltaStateHashKindV1::CoveObjectDeltaStateHashV1` is the required state-hash input for MVP continuation anchors. The hash input is the canonical logical latest object state at the predecessor record and includes scope kind and ID, canonical branch identity, object type ID, GOID, predecessor record ID, predecessor CSN, predecessor commit timestamp, record kind and tombstone state, sorted property IDs present in logical state, each property's logical type/collation/null/clear/tombstone/redaction marker/canonical visible value bytes, redaction commitments, and hidden-value commitments only when the selected disclosure policy permits them to participate.
+
+The state hash excludes artifact-local FileCodes, dictionary IDs, physical page order, compression, section offsets, row ordinals, writer-local layout choices, advisory summaries, and indexes. Equivalent logical states with different FileCodes or layouts SHOULD produce the same state hash. Redacted values MUST NOT be hashed as hidden plaintext unless policy explicitly permits that disclosure.
+
+#### 63.1.8 Touched Sets, Tombstone Sets, and Reconstruction
+
+Every delta SHOULD include a compact summary of what it can affect:
+
+```rust
+struct DeltaTouchedObjectRangeV1 {
+    scope_kind: u16,
+    scope_id: [u8; 16],
+    object_type_id: u32,
+    branch_identity_ref: u32,
+    min_goid: [u8; 16],
+    max_goid: [u8; 16],
+    touched_count: u64,
+    property_bitmap_ref: u32,
+    object_set_ref: u32,
+    checksum: u32,
+}
+```
+
+Touched-set representations MAY include sorted GOIDs, GOID prefix ranges, bitmaps over a manifest-provided dense object ordinal map, or a no-false-negative probabilistic representation. A touched-object summary used for skipping MUST be conservative: it may over-include touched objects/properties but MUST NOT exclude any object/property affected by the delta. Tombstone summaries MUST carry the same scope, object type, and branch identity fields so latest-state readers never apply a tombstone across scopes or branches. The first profile requires exact touched-object and exact tombstone summaries for ordinary latest-state and point-lookup skipping.
+
+For a selected snapshot, object state reconstruction is logically:
+
+```text
+state = parent_state_at_cut(base, parent_deltas, query_cut)
+for delta in ordered_deltas_needed_by_cut:
+    validate delta parent and continuation anchors
+    apply records in COVE-O temporal order
+return state after visibility, redaction, branch, tombstone, and projection rules
+```
+
+A delta-aware planner SHOULD first validate the selected snapshot, delta-chain extension, and chain summary; use query root, object type, branch, temporal cut, selected properties, and predicates to choose candidate components; use the base temporal index, chain-summary entries, delta temporal indexes, touched sets, tombstone sets, temporal blooms, and COVE-I/COVX sidecars to prune; fetch only required delta headers or hot summary ranges; read the nearest required anchor plus later delta records for touched objects; apply sparse patches in CSN order into a dense in-memory state table keyed by `(scope_id, branch_identity, object_type_id, goid)`; and materialise only requested output fields.
+
+Pruning MUST be conservative. `as_of_csn` cuts before `delta.csn_min` may skip that delta. Commit-time cuts may use `commit_time_range_start_us/end_us` only when commit timestamp monotonicity validates. Source publication or ingest batch filters may use `source_publish_range_start_us/end_us` operationally, but not as object commit time or valid time. Valid-time or temporal-role cuts may skip a delta only through validated temporal-role summaries. Latest-state queries MUST check tombstone summaries before returning parent state. Optional coverage/index metadata may prune only under the COVE-COVERAGE/COVE-I proof rules.
+
+#### 63.1.9 Publication, Compaction, and Cross-Feature Ordering
+
+Writers publish deltas by finalizing the delta footer, postscript, checksums, digests, and trust data, then publishing the COVM or external catalog snapshot that references the complete delta and chain summary. Object-store writers MUST publish the COVM snapshot or external catalog commit last and MUST NOT infer visibility from partially uploaded or unreferenced objects.
+
+Compaction materialises a selected snapshot into a new self-contained `.cove` file:
+
+```text
+compact(base.cove, deltas...) -> compacted-base.cove
+```
+
+Compaction MUST preserve object state, history, branches, tombstones, trust hashes, evidence required by policy, and selected effective fingerprints; assign new file-local dictionaries and FileCodes; rebuild temporal indexes and requested sidecars; publish a new COVM or external-catalog state; and leave old base and delta artifacts immutable. Checkpoint deltas remain `.covedelta` artifacts carrying Baseline or Snapshot records for a declared object subset; they reduce read amplification but do not replace full compaction.
+
+COVE-MAP definitions are inherited by fingerprint unless mapping rules change. Resolver catalog support can materialise ordinary COVE-O snapshots without deltas, but resolver-specific delta evidence/projection patches depend on stable COVE-MAP resolver semantics. The core delta MVP MUST NOT require executing COVE-MAP resolver logic for ordinary object reconstruction; it only binds effective semantic-map fingerprints and reconstructs materialised COVE-O temporal records.
+
+**Implementation order requirements:**
+- COVE-MAP entity-resolution Phase 0 and Phase 1 SHOULD land before resolver-specific delta evidence/projection patches, so `MAP_RESOLUTION_CATALOG`, `resolver_digest`, `catalog_digest`, `pipeline_digest`, row-level resolver outcomes, and evidence metadata are stable.
+- The core COVE-O delta MVP MAY be implemented before resolver execution if it treats semantic-map fingerprints opaquely and does not claim support for `DELTA_FEATURE_MAP_EVIDENCE_PATCH`, `DELTA_EVIDENCE_PATCH`, or resolver-aware projection patches.
+- A delta that changes mapping rules, alias catalog content, resolver hit/miss policy, resolver digests, normalisation pipeline versions, reviewed decisions that contribute merge edges, candidate/review semantics, or projection behaviour MUST expose a new effective semantic-map or projection fingerprint.
+- Association, link, and evidence facts that affect ordinary COVE-O reconstruction MUST be materialised as COVE-O temporal records using declared object types and property flags. `DELTA_EVIDENCE_PATCH` and `DELTA_PROJECTION_PATCH` may provide replay, explanation, projection, or planning metadata, but MUST NOT be the only source of ordinary object truth unless a required extension defines that authority.
 
 ---
 
@@ -6998,6 +7489,7 @@ struct CovmFileEntryV2 {
 - COVE-I secondary index references, including root indexes and index validity,
 - COVE-COVERAGE provider references and coverage set summaries,
 - COVE-CACHE compatibility and invalidation hints when a runtime cache is permitted by policy,
+- COVE-O delta-chain extensions, ordered `.covedelta` artifact references, and digest-bound chain summaries,
 - object-store hints.
 **Rules:**
 - COVM MUST be ignored if stale.
@@ -7038,10 +7530,150 @@ COVM MAY reference COVE-MAP artifacts for lineage, planning, conversion replay, 
 - If a COVM mapping reference is stale, corrupt, or unsupported, readers MUST still be able to read the referenced COVE files. Only mapping replay/explanation operations fail or degrade.
 - A COVE-MAP converter SHOULD emit a COVM dataset manifest when it materialises more than one output COVE file or when source lineage must be preserved across a dataset.
 
+#### 69.4.1 COVM Delta-Chain Extension
+
+A COVM or equivalent external catalog snapshot selects a COVE-O base-plus-delta snapshot through a required delta-chain extension block.
+
+```rust
+struct CovmDeltaChainExtensionV1 {
+    delta_chain_profile_id: u32,
+    delta_chain_profile_version_major: u16,
+    delta_chain_profile_version_minor: u16,
+    required_delta_features: u64,
+    optional_delta_features: u64,
+
+    dataset_id: [u8; 16],
+    base_snapshot_id: [u8; 16],
+    result_snapshot_id: [u8; 16],
+
+    base_artifact_ref: u32,
+    ordered_delta_count: u32,
+    ordered_delta_artifact_refs_offset: u64,
+    ordered_delta_artifact_refs_length: u64,
+
+    chain_digest_algorithm: u16,
+    chain_digest_len: u16,
+    chain_digest_ref: u32,
+
+    chain_summary_kind: u8,       // inline, covm_section, external_ref
+    reserved0: u8,
+    chain_summary_ref: u32,
+    chain_summary_offset: u64,
+    chain_summary_length: u64,
+    chain_summary_crc32c: u32,
+    chain_summary_digest_algorithm: u16,
+    chain_summary_digest_len: u16,
+    chain_summary_digest_ref: u32,
+
+    effective_schema_fingerprint_ref: u32,
+    effective_object_catalog_fingerprint_ref: u32,
+    effective_projection_fingerprint_ref: u32,
+    effective_semantic_map_fingerprint_ref: u32,
+    effective_visibility_fingerprint_ref: u32,
+    effective_redaction_fingerprint_ref: u32,
+
+    csn_min: u64,
+    csn_max: u64,
+    created_at_us: i64,
+    checksum: u32,
+}
+```
+
+The chain digest is mandatory. It MUST bind the dataset ID; base artifact ID, length, footer CRC, digest, and base snapshot ID; ordered delta artifact IDs, lengths, footer CRCs, digests, and ordinals; result snapshot ID; required delta feature bits; and effective schema, object catalog, projection, semantic-map, visibility, and redaction fingerprints.
+
+**Rules:**
+- `ordered_delta_artifact_refs` is selected snapshot truth. A reader MUST NOT add newer deltas because they exist next to the selected files.
+- A reader that does not support `delta_chain_profile_id`, `delta_chain_profile_version_*`, or any required delta feature bit MUST reject the selected snapshot for object-temporal reads.
+- A reader MAY open the base `.cove` directly only when the user/request selects the base artifact rather than the delta-bearing dataset snapshot.
+- Snapshot-level COVE-I/COVX indexes, coverage providers, zero-copy/runtime hints, and COVE-CACHE entries MUST bind the exact `chain_digest`, not only the base file digest or latest timestamp.
+- A selected chain with a mismatched chain digest, missing delta, extra delta, reordered delta, mismatched effective fingerprint, or unsupported required feature is invalid.
+- `chain_summary_*` MUST identify a compact, checksum-validated summary sufficient to prune deltas before opening individual `.covedelta` objects for common COVE-O object-temporal reads.
+- CRC32C detects accidental transfer/storage corruption. The cryptographic `chain_summary_digest_*` fields bind summary bytes as selected snapshot metadata. A reader MUST NOT use an external or separately addressable chain summary for pruning unless its cryptographic digest validates.
+- Object-store-oriented COVM writers SHOULD place the chain summary in the same small COVM range as selected snapshot metadata or in one separately addressable summary object. A reader SHOULD NOT need one blob request per delta merely to discover that most deltas are irrelevant.
+
+The authoritative precedence for a delta-bearing COVM snapshot is: COVM delta-chain extension for selected snapshot identity; chain digest for ordered base-plus-delta chain; chain summary for pre-open pruning after its digest validates; delta postscript/footer for locating delta bytes; delta header for declared lineage, feature bits, effective metadata fingerprints, scope policy, and commit-time range; section directory entries for section byte ranges; and section payloads for their local reference spaces after checksum and required-feature validation. Any duplicated field that disagrees across authoritative surfaces MUST reject the selected snapshot or requested operation, except where the field is explicitly declared over-inclusive summary metadata.
+
+#### 69.4.2 COVM Delta Chain Summary
+
+The chain summary is the blob-cost control plane for a delta-bearing snapshot. It is selected and validated through `CovmDeltaChainExtensionV1`, then used to decide which delta artifacts must be opened for a requested object-temporal operation.
+
+```rust
+struct CovmDeltaChainSummaryV1 {
+    magic: [u8; 4],              // "CDS1"
+    version_major: u16,
+    version_minor: u16,
+    header_len: u16,
+    flags: u32,
+
+    dataset_id: [u8; 16],
+    result_snapshot_id: [u8; 16],
+    chain_digest_algorithm: u16,
+    chain_digest_len: u16,
+    chain_digest_ref: u32,
+
+    delta_summary_count: u32,
+    object_type_summary_count: u32,
+    branch_summary_count: u32,
+    temporal_role_summary_count: u32,
+
+    delta_summaries_offset: u64,
+    object_type_summaries_offset: u64,
+    branch_summaries_offset: u64,
+    temporal_role_summaries_offset: u64,
+    payload_offset: u64,
+    payload_length: u64,
+    checksum: u32,
+}
+
+struct DeltaChainSummaryEntryV1 {
+    chain_ordinal: u32,
+    delta_artifact_ref: u32,
+    delta_artifact_id: [u8; 16],
+
+    required_delta_features: u64,
+    optional_delta_features: u64,
+
+    csn_min: u64,
+    csn_max: u64,
+    commit_time_start_us: i64,
+    commit_time_end_us: i64,
+
+    artifact_created_at_us: i64,
+    first_published_at_us: i64,
+    selected_snapshot_published_at_us: i64,
+    time_field_presence_flags: u32,
+    time_summary_exactness_flags: u32,
+    source_publish_range_start_us: i64,
+    source_publish_range_end_us: i64,
+
+    scope_summary_ref: u32,
+    branch_summary_ref: u32,
+    object_type_summary_ref: u32,
+    goid_range_summary_ref: u32,
+    touched_summary_ref: u32,
+    tombstone_summary_ref: u32,
+    property_summary_ref: u32,
+    temporal_role_summary_ref: u32,
+
+    delta_header_range_offset: u64,
+    delta_header_range_length: u64,
+    hot_summary_range_offset: u64,
+    hot_summary_range_length: u64,
+    checksum: u32,
+}
+```
+
+**Rules:**
+- The summary MUST bind the same ordered `chain_digest` as the selected COVM delta-chain extension.
+- Summary entries MUST be dense and sorted by `chain_ordinal`.
+- Time fields MUST preserve the distinction between COVE-O commit time, source publication/ingest batch time, artifact creation time, selected snapshot publication time, and valid-time or other temporal-role summaries.
+- `time_field_presence_flags` declares which non-commit time fields are meaningful. Missing optional time fields MUST NOT be inferred from commit time.
+- `time_summary_exactness_flags` declares whether a summary is exact, conservative over-inclusive, or unavailable for each advertised time dimension. Unknown exactness values make that summary unusable for pruning.
+- Scope, branch, object type, GOID, touched, tombstone, property, and temporal-role summary references MUST resolve to validated summary descriptors. A corrupt or unsupported summary MUST NOT be used for pruning.
+- Chain-summary pruning may over-include deltas. It MUST NOT under-include any delta that could affect the selected object-temporal result.
+- Full delta-chain validation MUST prove that chain-summary entries agree with the referenced delta headers and payload summaries for every pruning claim the summary makes.
+
 ---
-
-
-
 
 ### 69.5 COVE-CACHE Runtime Coverage Cache
 
@@ -7093,6 +7725,7 @@ A COVE-CACHE entry MUST be invalidated when any of the following changes unless 
 - selected dataset snapshot;
 - COVM publication state;
 - referenced `.cove` file list, file length, footer CRC, or digest;
+- selected `.covedelta` chain, chain digest, chain summary digest, or effective delta-chain fingerprints;
 - schema fingerprint;
 - external delete or visibility overlay;
 - COVE-MAP mapping/projection version;
@@ -7258,6 +7891,7 @@ COVE-MAP v2 defines a standard logical payload schema for the `MAP_*` section ki
 | `MAP_EVIDENCE_INDEX` | Evidence records described by Section 70.12. |
 | `MAP_CONVERSION_REPORT` | Conversion diagnostics, rejected rows, unresolved conflicts, candidate matches, fidelity metrics, and policy outcomes described by Sections 70.8, 70.14, and 70.15. |
 | `MAP_PROJECTION_CATALOG` | Object/association projection declarations and expression records described by Section 70.10. |
+| `MAP_RESOLUTION_CATALOG` | Resolver catalogs, normalisation pipelines, candidate match rules, and reviewed decisions described by Section 70.5.1, with identity-planning integration in Sections 70.5 and 70.6. |
 
 **Common payload rules:**
 - A standard payload MUST identify `schema_id = "org.coveformat.covemap.v2"`, `section_id`, `mapping_id`, and `mapping_version`.
@@ -7268,6 +7902,58 @@ COVE-MAP v2 defines a standard logical payload schema for the `MAP_*` section ki
 - Logical values embedded in COVE-MAP payloads MUST use COVE canonical logical value semantics. Identity keys, hashes, and digests MUST be computed from canonical logical values or from the canonical tuple bytes defined in Section 70.5.
 - IDs used for sources, functions, rules, projections, object types, association types, semantic roles, and dimensions MUST be stable within the mapping version. A payload MUST NOT rely on source file order, map-object iteration order, locale defaults, or runtime-generated names for semantic identity.
 - A payload that omits a field marked as required by the relevant Section 70 rule is malformed. A payload that uses an undeclared function, source, identity rule, projection, object type, association type, semantic role, or extension namespace is malformed.
+
+#### 70.1.2 COVE-MAP Canonical JSON Digests
+
+Resolver catalogs and resolver evidence use COVE canonical JSON v1 for semantic digests.
+
+**Canonical JSON rules:**
+- The digest input is a UTF-8 JSON object payload.
+- Duplicate object keys MUST be rejected before digesting.
+- Object keys are sorted by bytewise UTF-8 member-name order.
+- Arrays preserve declared order unless the schema declares the array semantically unordered.
+- Insignificant whitespace is omitted.
+- Strings use deterministic JSON escaping.
+- Integers and decimal numbers use their parsed canonical JSON textual form.
+- Fields explicitly marked `non_semantic_metadata` are excluded from semantic digests.
+- All other metadata participates in the digest.
+
+**Resolver digest fields:**
+
+```text
+catalog_digest =
+  sha256(canonical-json(alias_catalog without catalog_digest fields))
+
+resolver_digest =
+  sha256(canonical-json({
+    resolver_id,
+    kind,
+    object_type,
+    authority,
+    confidence_class,
+    normalization_pipeline_id,
+    pipeline_digest,
+    on_hit,
+    on_miss,
+    miss_confidence_class,
+    ambiguous_policy,
+    catalog_digest
+  }))
+
+pipeline_digest =
+  sha256(canonical-json(normalisation pipeline, referenced table IDs, and
+  referenced table digests))
+```
+
+`catalog_digest` proves alias data. `resolver_digest` proves resolver behaviour, including pipeline digest, hit/miss policy, ambiguity policy, authority, and catalog digest. Evidence SHOULD carry `resolver_digest` when explaining or replaying resolver behaviour.
+
+**Digest ordering rules:**
+- Normalisation pipeline arrays preserve declared order because function order is semantic.
+- Alias catalog entries are sorted by `alias_entry_id` by default.
+- Aliases within an entry are sorted by normalised alias bytes, then raw alias bytes.
+- Candidate outputs are sorted by declared deterministic output order.
+- A resolver MAY declare `order_sensitive_catalog: true`; otherwise alias catalog order is not semantic.
+- A `resolver_digest` that names a `normalization_pipeline_id` but does not include the resolved `pipeline_digest` is invalid for deterministic replay.
 
 ### 70.2 Source Catalog
 
@@ -7470,7 +8156,9 @@ A join key tuple is computed per source row or source record. Cross-source match
 - null/missing policy,
 - duplicate/collision policy,
 - do-not-merge behaviour,
-- tie-breaker policy.
+- tie-breaker policy,
+- optional `allow_reviewed_equivalence` flag, default false,
+- optional resolver-backed `resolution` binding on each join-key component.
 
 **Canonical tuple construction:**
 
@@ -7487,6 +8175,99 @@ join_key_tuple_bytes =
 ```
 
 If hashed, the hash input MUST be the canonical tuple bytes. Implementations MUST NOT hash display strings, source bytes, FileCodes, or engine-local ExecutionCodes as a substitute.
+
+Existing non-resolver identity rules remain valid. Resolver-backed identity rules add an optional `resolution` object to a join-key component. A `MapIdentityRule` that supports reviewed equivalence includes `allow_reviewed_equivalence?: bool = false`. A `MapJoinKeyComponent` that supports resolver lookup includes:
+
+```text
+role_id, source_column, logical_type, canonicalization, null_policy, ordering,
+resolution?: MapResolutionBinding
+```
+
+The minimum standard `MapResolutionBinding` contains `resolver_id`. Required extensions MAY add fields, but a validator MUST reject unknown resolver-binding fields unless they are declared by a supported extension.
+
+**Resolver-backed join-key evaluation order:**
+
+```text
+raw source value
+  -> null policy check
+  -> resolver normalisation pipeline
+  -> resolver lookup or miss policy
+  -> resolved identity value
+  -> canonical COVE logical bytes for the join-key tuple
+```
+
+For resolver-backed join keys, `canonicalization` MUST be `identity` or `none`; the resolver owns normalisation. Non-resolver join keys keep the existing canonicalisation behaviour.
+
+**Standard resolver hit and miss policies:**
+- `on_hit: canonical_key` uses the alias entry's canonical key as the join-key value.
+- `on_hit: canonical_label` is invalid for identity keys because labels are not stable keys.
+- `on_miss: reject` fails conversion when no resolver match exists.
+- `on_miss: normalized_value` uses the normalised value directly and requires `miss_confidence_class` of `strong_deterministic` or `weak_deterministic`; it MUST NOT produce authoritative merge evidence.
+- `on_miss: candidate_only` emits candidate/resolution evidence and does not materialise an object row for that identity path.
+- `on_miss: source_scoped` produces a source-scoped key that does not merge across sources.
+
+#### 70.5.1 MAP_RESOLUTION_CATALOG
+
+`MAP_RESOLUTION_CATALOG` contains named normalisation pipelines, resolvers, candidate match rules, and reviewed decisions. It is the standard COVE-MAP surface for deterministic alias-based entity resolution and reviewed equivalence.
+
+**Resolver terminology:**
+- Observed value: raw source value before resolver normalisation.
+- Normalised value: observed value after the resolver's declared normalisation pipeline.
+- Canonical key: stable resolver output used for identity keys.
+- Canonical label: display value associated with a canonical key; not identity truth by itself.
+- Alias: observed or normalised value that maps to a canonical key.
+- Resolver: deterministic rule plus catalog and policies that maps observed values to canonical outcomes.
+- Candidate: non-authoritative possible match retained as evidence.
+- Reviewed equivalence: explicit reviewed same-object decision allowed only when the identity rule declares `allow_reviewed_equivalence`.
+- Do-not-merge decision: explicit negative decision that prevents or rejects conflicting merge plans.
+
+**Standard payload members:**
+- `normalization_pipelines`: ordered, versioned deterministic function pipelines.
+- `resolvers`: resolver declarations. The first standard resolver kind is `alias_catalog`.
+- `match_rules`: candidate-generation rules that emit evidence only.
+- `reviewed_decisions`: reviewed same-object or do-not-merge decisions.
+
+**Alias catalog resolver rules:**
+- `resolver_id` MUST be unique within the mapping.
+- `kind` MUST be `alias_catalog` unless a required extension declares another supported resolver kind.
+- The resolver MUST declare `object_type`, `authority`, `confidence_class`, `normalization_pipeline_id`, `on_hit`, `on_miss`, `ambiguous_policy`, `catalog_digest`, `pipeline_digest`, and `resolver_digest`.
+- `canonical_key` MUST be stable within the resolver catalog version. `canonical_label` MAY change only according to mapping governance and MUST NOT be used as an identity key.
+- Alias lookup uses normalised aliases produced by the resolver pipeline.
+- One normalised alias MUST NOT map to multiple canonical keys unless the resolver or alias entry explicitly marks it ambiguous and routes it to candidate-only evidence or rejection.
+- Ambiguous aliases MUST NOT auto-merge and MUST NOT fall through to `normalized_value` in a way that creates cross-source auto-merge.
+- Embedded or external resolver catalogs MUST be digest-pinned. A resolver that references unpinned live external state is not replayable.
+- Unsupported resolver kinds, unsupported resolver versions, or unsupported required normalisation functions reject before materialisation.
+
+Candidate match rules live in `MAP_RESOLUTION_CATALOG.match_rules`. They emit candidate evidence and review inputs, not GOID merge edges. Candidate scoring rules MUST declare source-aware inputs, blocking, normalisation pipeline, scoring kind, threshold, score scale, rounding, pair/cluster ordering, duplicate suppression, limits, and limit behaviour. `merge_behavior` MUST be `never`. Unsupported candidate rules MUST emit skipped-rule diagnostics or reject when the mapping requires them. Conformance fixtures SHOULD use `on_limit: fail_closed`.
+
+Reviewed decisions live in `MAP_RESOLUTION_CATALOG.reviewed_decisions`. They use typed identity references, not loose strings. Standard identity reference kinds are `identity_join_key`, `resolver_key`, `source_row`, `row_digest`, and `identity_alias` when it can be resolved to a typed form during validation. Durable `source_row` references SHOULD include source ID, source row identity, source snapshot digest, schema fingerprint, object type, and identity-rule context.
+
+**Reviewed decision rules:**
+- `same_object` decisions may form merge edges only when the identity rule declares `allow_reviewed_equivalence: true`.
+- `do_not_merge` decisions are hard constraints and MUST reject conflicting merge plans.
+- Reviewed decision validation MUST detect conflicts before materialisation.
+- Transitive closure MUST be deterministic.
+- Same-rule, same-resolver reviewed decisions MAY use the deterministic identity planner's anchor sort when all component keys share one identity rule.
+- Cross-rule or cross-resolver reviewed decisions MUST declare `canonical_anchor`.
+- A `canonical_anchor` MUST define object type, identity rule ID, role components, logical types, and resolved values used to build the canonical join-key tuple.
+- Changing the canonical anchor is a GOID-changing mapping edit and SHOULD be reported by validation, doctor, or explain tooling.
+
+**Effective merge authority:**
+
+| Resolver outcome | Effective merge authority |
+| --- | --- |
+| authoritative alias hit | `authoritative` |
+| strong resolver alias hit | `strong_deterministic` |
+| `on_miss: normalized_value` | declared `miss_confidence_class` only |
+| `on_miss: source_scoped` | `source_scoped` |
+| `on_miss: candidate_only` | `candidate_only` |
+| ambiguous alias with candidate policy | `candidate_only` |
+| ambiguous alias with reject policy | conversion error |
+| candidate match rule output | evidence only |
+
+A rule-level `authoritative` class MUST NOT escalate a weaker resolver outcome to authoritative. Row-level resolver outcome metadata SHOULD distinguish authoritative alias hits, strong deterministic hits, source-scoped misses, normalised-value misses, candidate-only misses, ambiguous aliases, reviewed same-object edges, do-not-merge constraints, and rejected rows.
+
+The following non-resolver example remains valid for baseline multi-column identity rules and for resolver-aware mappings that also contain ordinary deterministic join keys.
 
 **Example: Customer high-confidence match**
 
@@ -7527,14 +8308,16 @@ A COVE-MAP implementation that claims deterministic identity resolution MUST imp
 **Recommended abstract algorithm:**
 1. For each source row, compute source row identity and source evidence digest.
 2. Apply row semantics to produce identity-key, object, property, association, temporal, and evidence assertions.
-3. Compute every declared join key using declared canonicalisation functions and null policies.
-4. Partition keys by object type and identity rule scope.
-5. Add merge edges only for authoritative or strong deterministic keys whose `auto_merge` policy is true.
-6. Add candidate edges only as candidate-match assertions.
-7. Apply do-not-merge constraints before forming final equivalence sets.
-8. For each valid equivalence set, choose a canonical identity anchor using declared precedence: identity class, rule precedence, source priority, canonical key bytes, and source row identity tie-breakers.
-9. Generate the destination GOID from the canonical anchor or from a declared external authoritative key.
-10. Emit identity-equivalence and evidence records linking all contributing keys, source rows, and mapping rules.
+3. Compute every declared non-resolver join key using declared canonicalisation functions and null policies.
+4. For resolver-backed join-key components, apply the resolver evaluation order from Section 70.5, validate resolver/catalog/pipeline digests, and record row-level resolver outcomes.
+5. Partition keys by object type and identity rule scope.
+6. Add merge edges only for authoritative or strong deterministic keys whose `auto_merge` policy is true and whose resolver outcome permits that authority.
+7. Add reviewed same-object edges only when the target identity rule declares `allow_reviewed_equivalence: true` and the reviewed decision validates.
+8. Add candidate edges only as candidate-match assertions. Candidate edges MUST NOT participate in GOID selection.
+9. Apply do-not-merge constraints before forming final equivalence sets.
+10. For each valid equivalence set, choose a canonical identity anchor using declared precedence: identity class, rule precedence, source priority, canonical key bytes, source row identity tie-breakers, and any required reviewed-decision `canonical_anchor`.
+11. Generate the destination GOID from the canonical anchor or from a declared external authoritative key.
+12. Emit identity-equivalence and evidence records linking all contributing keys, source rows, resolver outcomes, reviewed decisions, and mapping rules.
 
 **Rules:**
 - The algorithm MUST produce the same equivalence sets and GOIDs for the same source data, source order declarations, mapping version, function versions, and conflict policy.
@@ -7543,6 +8326,9 @@ A COVE-MAP implementation that claims deterministic identity resolution MUST imp
 - Identity-key assertions emitted for the same source row and the same row-semantics object output MAY declare co-reference. Co-referenced keys participate in the same identity equivalence graph only when their rule classes permit merge and no do-not-merge constraint applies.
 - Identity-equivalence indexes SHOULD NOT emit self-equivalence pairs where the left and right identity aliases are identical. The component/member list remains the authoritative compact representation for all contributing rows and keys.
 - Candidate matches MUST NOT participate in GOID selection.
+- Resolver-backed candidate-only outcomes MUST remain evidence unless a later reviewed decision explicitly authorizes merge under an identity rule that allows reviewed equivalence.
+- A resolver-backed row that emits `source_scoped` identity MUST NOT merge across sources through that key.
+- Reviewed decisions that bridge identity-rule or resolver families MUST provide a `canonical_anchor`; missing anchors reject before GOID generation.
 - A mapping MAY declare that unresolved identity conflicts reject the conversion, keep source-scoped objects separate, or emit conflict evidence. The default safe behaviour is rejection for canonical object output.
 
 ### 70.7 GOID Generation for Mapped Objects
@@ -7637,10 +8423,15 @@ projection_expr =
   | function_call
   | aggregate_call
   | association_traversal
+  | identity_resolution_ref
   | conditional_expr
 
 path_ref =
   identifier("." identifier)*
+
+identity_resolution_ref =
+  "identity(" identity_rule_id ").resolution(" component_role_id ")."
+  ("canonical_key" | "canonical_label" | "normalized_value" | "raw_observed_value")
 
 association_traversal =
   "association(" association_type_ref ["," endpoint_role] ")" ["." path_ref]
@@ -7659,6 +8450,9 @@ conditional_expr =
 **Projection expression rules:**
 - `identifier`, `association_type_ref`, `endpoint_role`, `function_id`, and `predicate_ref` MUST resolve through the mapping artifact's source, object, association, function, predicate, or projection catalogs.
 - A path reference MUST resolve to exactly one declared object property, association property, endpoint role, evidence field, temporal role, or projection-local binding.
+- An `identity_resolution_ref` MUST identify one identity rule and one resolver-backed join-key role emitted for the current row or projection anchor.
+- Resolution expressions MUST fail closed when there is no resolver hit unless the projection or property binding declares an explicit fallback.
+- Raw observed labels SHOULD remain evidence even when canonical labels become object properties.
 - Function calls MUST reference declared deterministic functions from `MAP_FUNCTION_REGISTRY`.
 - Aggregate calls MUST declare their null policy, empty-set policy, cardinality policy, and temporal cut when those policies are not implied by the projection rule.
 - Association traversals MUST declare how zero, one, and many matching associations affect the output row: null, empty list, row explosion, aggregation, rejection, or deterministic first/last according to a declared ordering.
@@ -7758,7 +8552,7 @@ projections:
 - A projected table view MUST NOT change object identity, association identity, canonical property truth, tombstone semantics, or evidence lineage.
 - If a projected view is materialised as COVE-T, the COVE-T output SHOULD include lineage to the source COVE-O files, COVM dataset state where applicable, projection_id, projection_version, mapping/projection artifact digest, and temporal cut.
 - A projection catalog MAY include per-column optimizer lineage. For direct scalar object-property columns this MAY identify `source = "object_property"`, stable object type/property IDs, stable projection table/column IDs, the original expression, `transform = "identity"`, and `filter_pushdown = "projection_covi_prefilter"`. This lineage is a proof surface for optional acceleration only; it MUST NOT redefine projected values.
-- A COVE-I projection-column sidecar MAY index materialized projection row ordinals by projection table/column ID. Readers MAY use such sidecars to prefilter candidate projection rows only after validating the sidecar against the COVE-O snapshot and proving the pushed predicate matches the declared lineage. Readers MUST still apply the logical projection and residual predicate semantics to the candidate rows. Missing, stale, unsupported, ambiguous, or non-equivalent projection sidecars MUST fall back to materialized projection readback unless the caller explicitly requested strict accelerated execution.
+- A COVE-I projection-column sidecar MAY index materialised projection row ordinals by projection table/column ID. Readers MAY use such sidecars to prefilter candidate projection rows only after validating the sidecar against the COVE-O snapshot and proving the pushed predicate matches the declared lineage. Readers MUST still apply the logical projection and residual predicate semantics to the candidate rows. Missing, stale, unsupported, ambiguous, or non-equivalent projection sidecars MUST fall back to materialised projection readback unless the caller explicitly requested strict accelerated execution.
 
 
 ### 70.10.1 Semantic Dimensions and Object/Dimensional Coverage Maps
@@ -7849,10 +8643,54 @@ COVE-MAP SHOULD preserve evidence linking output objects, properties, associatio
 - output assertion ID,
 - output object GOID or association/link GOID where materialised.
 
+**Resolver and candidate evidence metadata keys:**
+
+```text
+resolution_kind
+resolver_id
+resolver_digest
+catalog_digest
+pipeline_digest
+normalization_pipeline_id
+raw_observed_value
+normalized_value
+resolved_identity_value
+canonical_key
+canonical_label
+alias_catalog_id
+alias_entry_id
+alias_hit
+alias_miss
+alias_ambiguous
+miss_policy
+candidate_match_id
+candidate_score
+left_source_id
+left_source_row_identity
+left_raw_observed_value
+left_normalized_value
+left_row_digest
+right_source_id
+right_source_row_identity
+right_raw_observed_value
+right_normalized_value
+right_row_digest
+blocking_key
+match_rule_id
+review_decision_id
+redacted_resolution_evidence
+```
+
+Authoritative alias-hit evidence SHOULD include source ID, source row identity, rule ID, assertion ID, output object ID, identity rule ID, object type, join-key SHA-256, resolver ID, resolver digest, normalisation pipeline ID, raw observed value, normalised value, canonical key, canonical label, alias catalog ID, alias entry ID, `resolution_kind = "alias_catalog"`, and `alias_hit = true`.
+
+Candidate evidence is pairwise or cluster-based. Candidate entries in `MAP_CONVERSION_REPORT.candidate_matches` and optional evidence metadata SHOULD include left/right source row references, raw values, normalised values, row digests, blocking key, match rule ID, and score. Candidate rows remain evidence only and do not enter GOID merge planning.
+
 **Rules:**
 - Evidence entries MUST be deterministic for a given mapping run.
 - Evidence visibility MUST respect source governance/redaction policy.
 - If evidence cannot be retained because of privacy/security policy, the mapping SHOULD retain a redacted evidence stub with digest and policy reference where allowed.
+- Redacted resolver evidence MAY omit raw values, but it MUST preserve enough digest, resolver-hit proof, or policy-approved commitment to support replay and explain for authorized readers.
+- Resolver evidence used for deterministic replay MUST carry `resolver_digest` or enough digest-pinned resolver/catalog/pipeline references to recompute the same value.
 - `MAP_EVIDENCE_INDEX` defines the logical evidence table. Implementations MAY encode this section as either the expanded COVE-MAP JSON payload or a compact binary payload that is a deterministic, lossless encoding of the same fields.
 - Compact evidence encodings MUST preserve logical entry order, mapping identity, source row identity, output assertion/object references, observed source fingerprints, snapshot digests, and operation metadata. Readers that support the compact encoding MUST expose the same expanded logical evidence records as expanded JSON readback.
 - A compact evidence encoding MUST be self-identifying and integrity checked. Unknown, stale, corrupt, or unsupported compact evidence payloads MUST fail validation or fall back to a valid expanded representation; they MUST NOT silently change explain, projection, parity, or object readback results.
@@ -7878,6 +8716,10 @@ COVE-MAP may reference deterministic functions for normalisation, canonicalisati
 - Functions used for identity MUST be declared and versioned.
 - Functions used for identity MUST NOT depend on undeclared locale defaults, mutable external services, random values, network calls, wall-clock time, or implementation-defined ordering.
 - A mapper MUST reject conversion if it cannot execute a required identity or property function exactly as declared.
+- Entity-resolution pipelines MAY use the recommended primitive functions `collapse_whitespace`, `strip_punctuation`, `strip_legal_suffix`, and `sort_tokens` when those functions are declared, versioned, and deterministic.
+- Legal suffix stripping MUST be table-driven when used for identity; the function declaration MUST include a stable `table_id` and suffix-table digest.
+- `strip_trading_words` and similar broad semantic removals SHOULD NOT be used for authoritative identity keys unless a curated alias catalog or reviewed decision promotes the result. Without that authority they SHOULD be candidate-only or weak-deterministic.
+- Recommended named pipelines such as `company_name_basic.v1` and `company_name_gb.v1` are conventions only; their behaviour is authoritative only when the mapping declares exact function versions and table digests.
 
 ### 70.14 Security, Governance, and Privacy
 
@@ -7888,6 +8730,9 @@ Semantic mapping can combine sources and reveal relationships not obvious in any
 - If mapped output combines sources with different sensitivity labels, the output MUST preserve the most restrictive applicable policy metadata, emit declared governance reconciliation metadata, or reject conversion.
 - Evidence indexes, identity-equivalence indexes, dictionaries, join-key digests, and conversion reports may leak sensitive information and must be governed like data.
 - Join keys derived from personal or regulated data SHOULD use digest/redaction policies that avoid exposing raw identity components to unauthorised readers.
+- Resolver catalogs, alias lists, candidate pairs, reviewed decisions, normalised values, and canonical keys may reveal sensitive relationships and MUST be governed at least as strictly as the source data they derive from.
+- Published artifacts MAY use redacted aliases, digest-pinned private resolver catalogs, or evidence policies that prove resolver hits without revealing protected aliases, provided replay/explain claims are scoped to authorized readers or digest verification.
+- Do-not-merge decisions may encode sensitive negative knowledge. Tools SHOULD expose governance metadata and redaction controls for reviewed decisions and candidate queues.
 - COVE-MAP is not an access-control system. Readers and platforms remain responsible for enforcing policy.
 
 ### 70.15 Conversion Tool Contract
@@ -7895,20 +8740,23 @@ Semantic mapping can combine sources and reveal relationships not obvious in any
 A COVE-MAP converter that targets object-and-association-based COVE SHOULD implement the following pipeline:
 
 1. Validate mapping artifact and deterministic function registry.
-2. Validate source snapshots, schema fingerprints, and source digests.
-3. Read source rows using declared source row identity and ordering.
-4. Apply source-local row semantics.
-5. Compute semantic join keys and source evidence digests.
-6. Resolve deterministic identity and produce GOIDs/equivalence sets.
-7. Apply property and association conflict rules.
-8. Produce semantic assertions and conversion diagnostics.
-9. Materialise COVE-O object records and link/association object records.
-10. Validate object-association readback semantics for the materialised output when association readback is claimed.
-11. Optionally materialise or register COVE-MAP projection rules for COVE-T/Arrow/SQL relational query engines.
-12. Emit evidence indexes and conversion report when auditability is claimed.
-13. Optionally emit COVE-I secondary-index sidecars for COVE-O object-property, object-path, association, projection-fragment, or semantic-dimension lookup when the sidecar can be validated against the generated object artifact.
-14. Emit COVM manifest references when a dataset has multiple output files or lineage artifacts.
-15. Validate the produced COVE outputs independently of the mapping artifact.
+2. Validate `MAP_RESOLUTION_CATALOG` when any identity rule, projection, evidence replay, or candidate/review surface references a resolver.
+3. Validate source snapshots, schema fingerprints, and source digests.
+4. Read source rows using declared source row identity and ordering.
+5. Apply source-local row semantics.
+6. Compute source evidence digests.
+7. Evaluate resolver-backed join-key components, including normalisation pipelines, alias lookup, miss policies, ambiguity policy, resolver/catalog/pipeline digest validation, and row-level resolver outcomes.
+8. Compute semantic join keys.
+9. Resolve deterministic identity, reviewed equivalence, do-not-merge constraints, and GOIDs/equivalence sets.
+10. Apply property and association conflict rules.
+11. Produce semantic assertions and conversion diagnostics.
+12. Materialise COVE-O object records and link/association object records.
+13. Validate object-association readback semantics for the materialised output when association readback is claimed.
+14. Optionally materialise or register COVE-MAP projection rules for COVE-T/Arrow/SQL relational query engines.
+15. Emit evidence indexes and conversion report when auditability is claimed.
+16. Optionally emit COVE-I secondary-index sidecars for COVE-O object-property, object-path, association, projection-fragment, or semantic-dimension lookup when the sidecar can be validated against the generated object artifact.
+17. Emit COVM manifest references when a dataset has multiple output files or lineage artifacts.
+18. Validate the produced COVE outputs independently of the mapping artifact.
 
 `cove map build` is the reference CLI orchestration command for this pipeline. It validates a reusable `.covemap` artifact, reads one or more declared source tables, materialises COVE-O object/association output, optionally materialises COVE-T projections, emits standard optional COVE-I acceleration sidecars when supported, and writes implementation reports plus a bundle manifest for adoption workflows. The `map-build-manifest.json` bundle manifest is not a normative COVM manifest. Implementations that need dataset publication semantics SHOULD emit a separate `.covm` artifact, for example through `cove map build --publish-covm` or `cove map publish --bundle-dir <dir> --out <dataset.covm>`. Generated COVE-I and COVM artifacts are optional companion artifacts: they MUST validate against the generated COVE snapshot before use, stale or corrupt artifacts MUST be ignored unless the caller explicitly requires them, and they MUST NOT change object readback, projection, parity, or validation results.
 
@@ -7942,7 +8790,12 @@ COVE-MAP v2 deliberately does not define:
 - mutable catalog transactions,
 - live database writes,
 - a mandatory Harbor dependency,
-- treating projected tables as more authoritative than the underlying object-association model.
+- treating projected tables as more authoritative than the underlying object-association model,
+- silently fuzzy auto-merge as canonical identity,
+- live external resolver lookup as required replay state,
+- LLM- or AI-produced matches as authoritative identity without declared deterministic review or alias authority,
+- assuming global name uniqueness across sources,
+- using candidate-match rules to create GOID merge edges.
 
 Future extensions may support candidate suggestions, interactive approval workflows, or external resolver integrations, but such features MUST NOT silently change deterministic object identity in a COVE-MAP output.
 
@@ -8243,6 +9096,45 @@ A COVE-MAP writer that claims object-conversion conformance MUST produce COVE-O 
 - prev_ref target kind matches,
 - reconstruction self-containment holds.
 
+**Delta-aware validation has two modes.**
+
+Snapshot-selection validation checks enough metadata to plan and execute a specific query without opening irrelevant deltas:
+- COVM delta-chain extension or equivalent external catalog snapshot;
+- ordered chain digest;
+- chain-summary CRC and cryptographic digest;
+- artifact references;
+- required and optional delta feature bits;
+- effective schema, object catalog, semantic-map, projection, visibility, and redaction fingerprints;
+- summary descriptors needed by the selected operation.
+
+Full delta-chain validation additionally opens every selected delta and proves that chain summaries, touched sets, tombstone sets, anchors, temporal indexes, and temporal rows agree with payloads. Conformance validators and release gates SHOULD provide full delta-chain validation.
+
+**Delta validation requirements:**
+- header magic, version, lengths, checksums, and section directory validate;
+- postscript/footer consistency and final `CVD2` magic validate;
+- parent refs match selected snapshot and digests;
+- exactly one parent ref is marked `DELTA_PARENT_REF_LINEAGE_PARENT` and its snapshot ID matches the header parent snapshot ID;
+- COVM delta-chain extension binds the exact ordered chain digest;
+- COVM chain summary exists, validates by CRC and cryptographic digest, and binds the same ordered chain digest;
+- chain summary entries are dense, ordered, and match referenced deltas;
+- chain summary time fields preserve commit time, source publication/ingest batch time, snapshot publication time, artifact creation time, and valid-time summary distinctions;
+- chain ordinals are dense and ordered;
+- artifact IDs are unique within the selected chain;
+- schema/catalog/projection fingerprints are inherited or patched validly;
+- catalog patches are additive;
+- temporal rows are sorted;
+- `csn` and commit timestamp monotonicity hold under the append-only profile;
+- `prev_ref` is file-local when present;
+- scope and branch identity are explicit or covered by a single-scope header invariant;
+- continuation anchors target valid logical parent state and meet required anchor strength;
+- dictionary aliases resolve through validated parent dictionary digests;
+- dictionary aliases do not expose redacted or policy-protected equality unless permitted;
+- touched sets do not under-include temporal records;
+- tombstone summaries cover all delta tombstones;
+- chain-summary pruning summaries do not under-include candidate deltas for the operations they claim to support in full delta-chain validation;
+- trust continuation hashes match when required;
+- required delta feature bits are supported for the requested operation.
+
 ### 73.6 COVE-CX Codec Validation
 
 A COVE-CX-aware validator MUST validate codec descriptors before using registered codec pages.
@@ -8302,6 +9194,7 @@ COVE-I artifacts and COVE-CACHE entries MUST be validated only when the requeste
 - sorted keys, duplicate chains, hash-collision policy, postings ordering, row-range coalescing, and row-ordinal bitmap bit order validate;
 - index-only capabilities declare exactness and overlay-awareness before answering exact queries;
 - cache entries match dataset snapshot, predicate form, semantic-map version, schema fingerprint, and sidecar versions;
+- when the selected snapshot is delta-bearing, COVE-I roots, COVX artifacts, coverage providers, and COVE-CACHE entries bind the selected `chain_digest` and effective fingerprints, not only the base file digest or timestamp;
 - stale or corrupt indexes/caches fail open to a wider conservative plan or full scan.
 
 ### 73.9 COVE-MAP Semantic Validation
@@ -8317,13 +9210,26 @@ A COVE-MAP-aware validator MUST validate the mapping artifact and any embedded m
 - no undeclared random, wall-clock, locale-default, network, or mutable external dependency,
 - identity rules reference existing object types and semantic roles,
 - multi-column join-key components have declared logical types, canonicalisation, null policy, and ordering,
+- resolver-backed join-key components reference an existing `MAP_RESOLUTION_CATALOG` resolver,
+- resolver-backed join-key components use `canonicalization = identity` or `none`,
+- resolver normalisation pipelines resolve to declared deterministic functions in order,
+- `catalog_digest`, `pipeline_digest`, and `resolver_digest` validate under Section 70.1.2 canonical JSON rules,
+- `resolver_digest` includes `pipeline_digest`,
+- external resolver catalogs, suffix tables, and reviewed-decision inputs are digest-pinned or rejected as not replayable,
+- alias catalogs do not map one normalised alias to multiple canonical keys unless ambiguity is declared and routed to candidate-only evidence or rejection,
+- unsupported resolver kinds reject before materialisation,
+- resolver miss policies are valid and cannot escalate to authoritative merge evidence,
 - auto-merge rules use authoritative or deterministic confidence classes only,
 - candidate rules do not alter canonical object identity,
+- candidate match rules declare deterministic blocking, scoring, rounding, ordering, duplicate suppression, limits, and `merge_behavior = never`,
 - do-not-merge constraints are checked before equivalence classes are materialised,
+- reviewed `same_object` decisions form merge edges only when the identity rule allows reviewed equivalence,
+- reviewed decisions use typed identity references and required canonical anchors,
+- reviewed decisions and do-not-merge decisions are conflict-checked before materialisation,
 - property conflict rules are declared for multi-source canonical properties,
 - association endpoints resolve to deterministic object identities,
 - output COVE-O object records satisfy COVE-O validation,
-- evidence entries refer to valid source IDs, source row identities or digests, mapping rule IDs, and output assertion IDs.
+- evidence entries refer to valid source IDs, source row identities or digests, mapping rule IDs, resolver IDs, resolver digests, reviewed decisions, and output assertion IDs.
 
 ---
 
@@ -8354,9 +9260,22 @@ A COVE-MAP-aware validator MUST validate the mapping artifact and any embedded m
 | COVM stale/corrupt | Ignore COVM |
 | COVE-MAP artifact stale/corrupt | Ignore for ordinary reads; reject mapping replay/explanation/conversion if required |
 | COVE-MAP identity conflict | Apply declared conflict behaviour; reject if no safe declared behaviour exists |
+| COVE-MAP resolver catalog missing or unsupported | Reject conversion, replay, explanation, or resolver-aware projection that requires it |
+| COVE-MAP resolver/catalog/pipeline digest mismatch | Reject resolver-aware operation |
+| COVE-MAP alias ambiguous under merge policy | Reject conversion unless resolver routes ambiguity to candidate-only evidence |
+| COVE-MAP reviewed decision conflict | Reject before materialisation |
 | COVE-COVERAGE corrupt/stale/unsupported | Ignore coverage artifact and use wider conservative plan or full scan unless operation requires it |
 | COVE-I stale/corrupt | Ignore index and scan unless operation explicitly requires the index |
 | COVE-CACHE stale/corrupt | Ignore cache and plan from validated metadata or full scan |
+| `.covedelta` malformed | Reject selected delta-bearing snapshot |
+| Unsupported required delta feature | Reject selected snapshot or requested operation that needs the feature |
+| Delta chain digest mismatch | Reject selected delta-bearing snapshot |
+| Missing/corrupt required delta chain summary | Reject selected delta-bearing snapshot |
+| Delta parent mismatch | Reject selected delta-bearing snapshot |
+| Delta continuation anchor invalid | Reject selected delta-bearing snapshot |
+| Delta state hash mismatch | Reject selected delta-bearing snapshot |
+| Delta touched/tombstone summary under-includes | Reject full validation; do not use summary for pruning |
+| Delta-bearing snapshot read by base-only path | Reject selected dataset snapshot rather than returning base-only state |
 | Index-only exactness unsupported | Do not answer from index; scan or reject if index-only was explicitly required |
 | Segment checksum mismatch | Reject segment; fail read unless explicit best-effort mode |
 | Page checksum mismatch | Reject page; fail read unless explicit best-effort mode |
@@ -8427,11 +9346,33 @@ Writers MUST publish COVE files by durable replace.
 | COVE_E_MAP_IDENTITY_CONFLICT | Declared identity rules produce an unresolved merge/do-not-merge conflict. |
 | COVE_E_MAP_SOURCE_STALE | Source snapshot, schema fingerprint, or source digest does not match the mapping run. |
 | COVE_E_MAP_EVIDENCE_INVALID | Mapping evidence references a missing source, rule, row, assertion, or output object. |
+| COVE_E_MAP_RESOLUTION_CATALOG_MISSING | Identity rule, projection, evidence replay, or candidate/review operation references a missing resolver catalog. |
+| COVE_E_MAP_RESOLVER_UNSUPPORTED | Resolver kind, version, required function, or required policy is unsupported. |
+| COVE_E_MAP_RESOLVER_DIGEST_MISMATCH | Embedded or external resolver digest does not match the declared digest. |
+| COVE_E_MAP_CATALOG_DIGEST_MISMATCH | Embedded or external alias catalog digest does not match the declared digest. |
+| COVE_E_MAP_PIPELINE_DIGEST_MISMATCH | Normalization pipeline or referenced table digest does not match the declared digest. |
+| COVE_E_MAP_ALIAS_AMBIGUOUS | One normalised alias maps to multiple canonical keys without a valid ambiguity policy. |
+| COVE_E_MAP_ALIAS_MISS | Alias lookup failed under `on_miss: reject`. |
+| COVE_E_MAP_REVIEW_DECISION_CONFLICT | Reviewed same-object or do-not-merge decisions conflict. |
+| COVE_E_MAP_DO_NOT_MERGE_VIOLATION | Merge plan violates a reviewed or declared do-not-merge constraint. |
+| COVE_E_MAP_CANONICAL_ANCHOR_REQUIRED | Reviewed equivalence requires an explicit canonical anchor. |
+| COVE_E_MAP_CANDIDATE_RULE_UNSUPPORTED | Candidate rule cannot be executed or validated deterministically. |
+| COVE_E_MAP_RESOLUTION_NOT_REPLAYABLE | Resolver references unpinned external state or mutable resolver inputs. |
 | COVE_E_BAD_COVERAGE | Coverage provider, predicate form, coverage set, proof strength, or coverage entry is invalid. |
 | COVE_E_COVERAGE_STALE | Coverage artifact does not match the selected snapshot, schema, semantic map, file digest, or visibility overlay. |
 | COVE_E_BAD_COVI | COVE-I secondary index artifact is malformed, stale, corrupt, or unsupported for the requested operation. |
 | COVE_E_INDEX_ONLY_UNSAFE | Requested metadata/index-only answer is not exact or not valid for the selected snapshot/overlay. |
 | COVE_E_CACHE_STALE | COVE-CACHE entry is stale, corrupt, approximate-may-under-include, or incompatible with the current runtime operation. |
+| COVE_E_BAD_COVEDELTA | `.covedelta` artifact is malformed, corrupt, or has invalid `CVD2` framing. |
+| COVE_E_DELTA_PROFILE_UNSUPPORTED | Delta-chain profile ID or version is unsupported. |
+| COVE_E_DELTA_REQUIRED_FEATURE_UNSUPPORTED | Required delta feature bit is unsupported for the requested operation. |
+| COVE_E_DELTA_CHAIN_DIGEST_MISMATCH | Selected base-plus-delta chain digest does not match COVM or catalog snapshot truth. |
+| COVE_E_DELTA_CHAIN_SUMMARY_INVALID | Delta chain summary is missing, malformed, corrupt, digest-mismatched, or unsupported when required. |
+| COVE_E_DELTA_PARENT_MISMATCH | Delta parent reference does not match selected parent snapshot, digest, artifact ID, or lineage rule. |
+| COVE_E_DELTA_ANCHOR_INVALID | Continuation anchor is missing, too weak, or does not validate against logical parent state. |
+| COVE_E_DELTA_STATE_HASH_MISMATCH | Continuation state hash or trust continuation hash does not match canonical logical state. |
+| COVE_E_DELTA_SUMMARY_UNDER_INCLUDES | Touched, tombstone, or chain summary omits an affected object, property, tombstone, or delta. |
+| COVE_E_DELTA_BASE_ONLY_SELECTED | Reader attempted to satisfy a selected delta-bearing snapshot by returning base-only state. |
 
 ---
 
@@ -8461,7 +9402,9 @@ Optional features are accelerators or metadata.
   - nested column support when projected,
   - trust-chain support when verification is requested,
   - engine profile required by requested output mode,
-  - COVE-MAP artifact required by requested mapping replay, source-to-object conversion, or mapping explanation operation.
+  - COVE-MAP artifact required by requested mapping replay, source-to-object conversion, or mapping explanation operation,
+  - COVE-MAP resolver catalog required by resolver-backed identity conversion, deterministic replay, or resolver-aware projection,
+  - COVE-O delta feature required by the selected delta-bearing snapshot operation.
 
 **Optional:**
   - bloom filters,
@@ -8472,7 +9415,8 @@ Optional features are accelerators or metadata.
   - COVX sidecars,
   - COVM manifests,
   - optional engine profile mappings,
-  - COVE-MAP mapping artifacts and evidence when ordinary table/object reading does not request mapping replay or explanation.
+  - COVE-MAP mapping artifacts and evidence when ordinary table/object reading does not request mapping replay or explanation,
+  - COVE-O delta evidence, projection, coverage, index, or layout hints when ordinary object reconstruction does not select those optional sections.
 
 ---
 
@@ -8526,6 +9470,15 @@ Conformance levels are cumulative implementation claims, not reductions in speci
 - validate prev_ref targets,
 - enforce reconstruction self-containment,
 - verify trust chains when requested and present.
+**A COVE-O delta-aware reader MUST additionally:**
+- select delta-bearing snapshots only through COVM or an equivalent external catalog snapshot,
+- validate `CovmDeltaChainExtensionV1`, ordered chain digest, and required chain summary before using deltas,
+- parse and validate `.covedelta` `CVD2` framing, header, footer, section directory, parent refs, and required sections,
+- reject unsupported required delta features for the selected operation,
+- validate continuation anchors and required state hashes before applying existing-object patches,
+- apply sparse patch rows, tombstones, redactions, and Baseline/Snapshot records according to COVE-O temporal semantics,
+- use touched sets, tombstone sets, chain summaries, coverage, and indexes only when they are conservative for the selected chain,
+- fail closed rather than returning base-only state for a selected delta-bearing snapshot.
 **A COVE-CX-aware reader MUST additionally:**
 - parse and validate codec extension descriptors when required,
 - reject unsupported required registered codecs without valid fallback,
@@ -8567,6 +9520,17 @@ Conformance levels are cumulative implementation claims, not reductions in speci
 - preserve evidence sufficient to explain source row -> object/property/association output when explanation is claimed,
 - reject or report unresolved identity/property conflicts according to declared policy,
 - never require Harbor for COVE-MAP conversion or COVE-O output.
+**A COVE-MAP resolver-aware tool MUST additionally:**
+- validate `MAP_RESOLUTION_CATALOG` payloads before resolver-backed conversion, replay, explanation, candidate generation, reviewed-decision handling, or resolver-aware projection,
+- implement COVE canonical JSON v1 digesting for `catalog_digest`, `pipeline_digest`, and `resolver_digest`,
+- require `resolver_digest` to include `pipeline_digest`,
+- support the standard `alias_catalog` resolver kind before claiming resolver MVP support,
+- enforce resolver hit/miss policies and ambiguity policy without escalating resolver outcomes,
+- keep candidate match rules evidence-only with `merge_behavior = never`,
+- validate reviewed same-object and do-not-merge decisions before materialisation,
+- require canonical anchors for cross-rule or cross-resolver reviewed equivalences,
+- preserve resolver evidence metadata sufficient for replay/explain according to governance policy,
+- reject unpinned live external resolver state for deterministic replay.
 **A conforming writer MUST:**
 - never emit engine execution codes as authoritative logical data,
 - write FileCodes densely into the file dictionary,
@@ -8612,9 +9576,10 @@ A public interoperability release of COVE SHOULD NOT claim broad v2 readiness wi
 - Parquet-to-COVE conversion cost,
 - COVE file-size overhead,
 - COVX/COVM acceleration impact,
+- COVE-O delta-chain read amplification, chain-summary pruning, checkpoint delta benefit, and compaction cost,
 - ExecutionCode remap overhead,
 - Harbor EngineCode remap overhead,
-- COVE-MAP source-to-object conversion cost and identity-resolution cost when COVE-MAP tooling is claimed,
+- COVE-MAP source-to-object conversion cost, resolver-catalog lookup cost, candidate-generation cost, and identity-resolution cost when COVE-MAP tooling is claimed,
 - registered codec decode and predicate-kernel cost,
 - fallback payload overhead,
 - layout-plan and scan-split planning overhead,
@@ -8668,6 +9633,8 @@ Negative vectors SHOULD name the expected error class rather than depending on e
 - security/privacy boundary cases including redaction, omitted sensitive indexes, and approximate/private statistics,
 - streaming-writer finalisation and partially written file rejection,
 - COVE-MAP source catalog validation, deterministic function registry validation, multi-column join-key canonicalisation, candidate-vs-canonical identity separation, do-not-merge enforcement, source evidence traceability, object-and-association-based COVE-O output validation, association readback validation, and projection-rule validation,
+- COVE-MAP resolver vectors: valid authoritative alias hit, `on_miss: reject`, `on_miss: candidate_only`, `on_miss: source_scoped`, ambiguous alias rejection, ambiguous alias candidate-only routing, alias-entry reorder preserving `catalog_digest`, changed suffix table changing `pipeline_digest` and `resolver_digest`, resolver digest missing `pipeline_digest` rejection, candidate rule `merge_behavior` rejection, candidate limit fail-closed behaviour, reviewed same-object allowed only with `allow_reviewed_equivalence`, do-not-merge violation rejection, canonical anchor required for cross-rule/cross-resolver review, redacted alias evidence proving a resolver hit without raw alias exposure, and resolver expression fail-closed behaviour,
+- COVE-O delta vectors: non-delta-aware COVM reader rejects a delta-bearing snapshot, direct base `.cove` open still succeeds, minimal base plus one delta with one new object, sparse property patch, `SetValue`/`SetNull`/`Clear`/`Redact`/`Tombstone`/omitted-unchanged property semantics, object tombstone hiding parent latest state, association/link update, evidence addition with inherited COVE-MAP fingerprint, additive object catalog patch, invalid parent digest rejection, wrong `parent_snapshot_id` rejection, multiple or missing lineage parent refs rejection, chain reorder rejection by chain digest, missing/corrupt required chain summary rejection, wrong chain-summary digest rejection, source publication range not altering `as_of_csn` or valid-time semantics, multi-scope GOID collision isolation, raw parent FileCode branch key rejection as cross-artifact branch identity, duplicate record ID rejection, missing or weak continuation anchor rejection, state-hash mismatch rejection, touched-set under-inclusion rejection, tombstone-summary under-inclusion rejection, corrupt optional delta-local index fallback, `as_of_csn` cuts before/inside/after delta range, and valid-time pruning only through validated temporal-role summaries,
 - COVE-COVERAGE provider validation, predicate normal-form validation, interval predicate canonicalisation, conservative coverage proof validation, coverage/tightness metric reporting, and stale coverage rejection,
 - COVE-I secondary index root validation, value-to-fragment lookup, path/dimensional-bucket lookup, exact index-only count/min/max/existence vectors, approximate answer rejection for exact queries, and stale index rejection,
 - COVE-CACHE predicate containment, snapshot-bound cache reuse, invalidation triggers, and full-scan fallback,

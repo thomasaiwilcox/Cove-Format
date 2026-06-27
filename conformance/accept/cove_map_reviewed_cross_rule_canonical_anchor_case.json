@@ -1,0 +1,57 @@
+{
+  "expect_cove_o_valid": true,
+  "expected_conversion": {
+    "candidate_match_count": 0,
+    "object_count": 2
+  },
+  "expected_conversion_summary": {
+    "assertion_count": 1,
+    "evidence_entry_count": 2,
+    "identity_equivalence_index": {
+      "components": [
+        {
+          "canonical_anchor": "person_by_id:64a9eb5d68f182b76b97d427b8e9d0286fc717e8fa98c2cfbdf11e7f0b9c0122",
+          "equivalence_id": "Person:4f695975c271fdbffa780c2e2e5540d9",
+          "goid": "4f695975c271fdbffa780c2e2e5540d9",
+          "members": [
+            {
+              "identity_alias": "person_by_email:f2f232c95f83c2a145949c0f8a229d322644d56a9a24e4581a9bd555e69342f2",
+              "identity_rule_id": "person_by_email",
+              "join_key_sha256": "f2f232c95f83c2a145949c0f8a229d322644d56a9a24e4581a9bd555e69342f2",
+              "object_type": "Person",
+              "row_digest": "ec4afd3328a1f4bad569c06f3250d43d9c45ff2505025cad95b1c50764034349",
+              "row_index": 0,
+              "row_rule_id": "person_email_row",
+              "source_id": "reviewed_cross_rule",
+              "source_row_identity": "reviewed_cross_rule:0"
+            },
+            {
+              "identity_alias": "person_by_id:64a9eb5d68f182b76b97d427b8e9d0286fc717e8fa98c2cfbdf11e7f0b9c0122",
+              "identity_rule_id": "person_by_id",
+              "join_key_sha256": "64a9eb5d68f182b76b97d427b8e9d0286fc717e8fa98c2cfbdf11e7f0b9c0122",
+              "object_type": "Person",
+              "row_digest": "ec4afd3328a1f4bad569c06f3250d43d9c45ff2505025cad95b1c50764034349",
+              "row_index": 0,
+              "row_rule_id": "person_id_row",
+              "source_id": "reviewed_cross_rule",
+              "source_row_identity": "reviewed_cross_rule:0"
+            }
+          ]
+        }
+      ],
+      "equivalences": [
+        {
+          "left_identity": "person_by_email:f2f232c95f83c2a145949c0f8a229d322644d56a9a24e4581a9bd555e69342f2",
+          "right_identity": "person_by_id:64a9eb5d68f182b76b97d427b8e9d0286fc717e8fa98c2cfbdf11e7f0b9c0122"
+        }
+      ],
+      "mapping_id": "reviewed-cross-rule-map",
+      "mapping_version": "2026.06"
+    },
+    "materialized_row_count": 2
+  },
+  "mapping": "accept/cove_map_reviewed_cross_rule_canonical_anchor.covemap",
+  "sources": [
+    "accept/reviewed_cross_rule.csv"
+  ]
+}

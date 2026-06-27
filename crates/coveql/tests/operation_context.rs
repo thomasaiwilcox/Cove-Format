@@ -11,7 +11,10 @@ use std::{
     sync::Arc,
 };
 
-use arrow_array::{Array, BooleanArray, Int64Array, StringArray};
+use arrow_array::{
+    types::UInt32Type, Array, BooleanArray, DictionaryArray, FixedSizeBinaryArray, Int64Array,
+    StringArray,
+};
 use arrow_schema::DataType;
 use cove_core::{
     artifact::covm::{CovmFile, CovmFileEntryV1, CovmHeaderV1, CovmPostscriptV1},
@@ -3860,6 +3863,182 @@ fn object_file_with_numcode_records(values: &[i64]) -> Vec<u8> {
     panic!("could not build aligned retained NumCode object fixture");
 }
 
+fn object_file_with_nullable_numcode_records(values: &[Option<i64>]) -> Vec<u8> {
+    for payload_padding in 0..8 {
+        let bytes = object_file_with_nullable_numcode_records_with_padding(values, payload_padding);
+        if retained_metric_values_are_aligned(&bytes) {
+            return bytes;
+        }
+    }
+    panic!("could not build aligned retained nullable NumCode object fixture");
+}
+
+fn object_file_with_plain_fixed_uuid_records(values: &[[u8; 16]]) -> Vec<u8> {
+    let catalog = ObjectTypeCatalog {
+        flags: 0,
+        types: vec![ObjectTypeEntryV1 {
+            object_type_id: 1,
+            type_name: "UuidFixedThing".into(),
+            flags: OBJECT_TYPE_FLAG_ENTITY_OBJECT,
+            properties: vec![PropertyEntryV1 {
+                property_id: 4,
+                property_name: "uid".into(),
+                logical_type: CoveLogicalType::Uuid,
+                physical_kind: CovePhysicalKind::FixedBytes,
+                nullable: false,
+                collation_id: 0,
+                flags: 0,
+            }],
+        }],
+    };
+    let rows = values
+        .iter()
+        .enumerate()
+        .map(|(index, _)| TemporalRowEntryV1 {
+            timestamp_us: 10 + index as i64,
+            csn: 1 + index as u64,
+            branch_key: 0,
+            goid: [index as u8; 16],
+            record_id: [index as u8 + 112; 16],
+            record_kind: RecordKind::Baseline,
+            prev_ref: None,
+        })
+        .collect::<Vec<_>>();
+    let segment = temporal_segment_with_plain_fixed_uuid_property(&rows, values);
+    let index = TemporalSegmentIndex {
+        flags: 0,
+        entries: vec![temporal_segment_entry_for_rows(
+            7,
+            &rows,
+            segment.len() as u64,
+        )],
+    };
+
+    let mut writer = MinimalCoveWriter::new();
+    writer.primary_profile = PrimaryProfile::ObjectTemporal as u8;
+    writer.required_features = FEATURE_OBJECT_PROFILE;
+    writer.sections.push(SectionPayload {
+        section_kind: SectionKind::ObjectTypeCatalog as u16,
+        profile: PrimaryProfile::ObjectTemporal as u8,
+        flags: 0,
+        item_count: 1,
+        row_count: 0,
+        compression: CompressionCodec::None as u8,
+        alignment_log2: 0,
+        required_features: FEATURE_OBJECT_PROFILE,
+        optional_features: 0,
+        data: catalog.serialize().unwrap(),
+    });
+    writer.sections.push(SectionPayload {
+        section_kind: SectionKind::TemporalSegmentIndex as u16,
+        profile: PrimaryProfile::ObjectTemporal as u8,
+        flags: 0,
+        item_count: 1,
+        row_count: rows.len() as u64,
+        compression: CompressionCodec::None as u8,
+        alignment_log2: 0,
+        required_features: FEATURE_OBJECT_PROFILE,
+        optional_features: 0,
+        data: index.serialize().unwrap(),
+    });
+    writer.sections.push(SectionPayload {
+        section_kind: SectionKind::TemporalSegmentData as u16,
+        profile: PrimaryProfile::ObjectTemporal as u8,
+        flags: 0,
+        item_count: 1,
+        row_count: rows.len() as u64,
+        compression: CompressionCodec::None as u8,
+        alignment_log2: 0,
+        required_features: FEATURE_OBJECT_PROFILE,
+        optional_features: 0,
+        data: segment,
+    });
+    writer.write().unwrap()
+}
+
+fn object_file_with_nullable_plain_fixed_uuid_records(values: &[Option<[u8; 16]>]) -> Vec<u8> {
+    let catalog = ObjectTypeCatalog {
+        flags: 0,
+        types: vec![ObjectTypeEntryV1 {
+            object_type_id: 1,
+            type_name: "UuidFixedThing".into(),
+            flags: OBJECT_TYPE_FLAG_ENTITY_OBJECT,
+            properties: vec![PropertyEntryV1 {
+                property_id: 4,
+                property_name: "uid".into(),
+                logical_type: CoveLogicalType::Uuid,
+                physical_kind: CovePhysicalKind::FixedBytes,
+                nullable: true,
+                collation_id: 0,
+                flags: 0,
+            }],
+        }],
+    };
+    let rows = values
+        .iter()
+        .enumerate()
+        .map(|(index, _)| TemporalRowEntryV1 {
+            timestamp_us: 10 + index as i64,
+            csn: 1 + index as u64,
+            branch_key: 0,
+            goid: [index as u8; 16],
+            record_id: [index as u8 + 112; 16],
+            record_kind: RecordKind::Baseline,
+            prev_ref: None,
+        })
+        .collect::<Vec<_>>();
+    let segment = temporal_segment_with_nullable_plain_fixed_uuid_property(&rows, values);
+    let index = TemporalSegmentIndex {
+        flags: 0,
+        entries: vec![temporal_segment_entry_for_rows(
+            7,
+            &rows,
+            segment.len() as u64,
+        )],
+    };
+
+    let mut writer = MinimalCoveWriter::new();
+    writer.primary_profile = PrimaryProfile::ObjectTemporal as u8;
+    writer.required_features = FEATURE_OBJECT_PROFILE;
+    writer.sections.push(SectionPayload {
+        section_kind: SectionKind::ObjectTypeCatalog as u16,
+        profile: PrimaryProfile::ObjectTemporal as u8,
+        flags: 0,
+        item_count: 1,
+        row_count: 0,
+        compression: CompressionCodec::None as u8,
+        alignment_log2: 0,
+        required_features: FEATURE_OBJECT_PROFILE,
+        optional_features: 0,
+        data: catalog.serialize().unwrap(),
+    });
+    writer.sections.push(SectionPayload {
+        section_kind: SectionKind::TemporalSegmentIndex as u16,
+        profile: PrimaryProfile::ObjectTemporal as u8,
+        flags: 0,
+        item_count: 1,
+        row_count: rows.len() as u64,
+        compression: CompressionCodec::None as u8,
+        alignment_log2: 0,
+        required_features: FEATURE_OBJECT_PROFILE,
+        optional_features: 0,
+        data: index.serialize().unwrap(),
+    });
+    writer.sections.push(SectionPayload {
+        section_kind: SectionKind::TemporalSegmentData as u16,
+        profile: PrimaryProfile::ObjectTemporal as u8,
+        flags: 0,
+        item_count: 1,
+        row_count: rows.len() as u64,
+        compression: CompressionCodec::None as u8,
+        alignment_log2: 0,
+        required_features: FEATURE_OBJECT_PROFILE,
+        optional_features: 0,
+        data: segment,
+    });
+    writer.write().unwrap()
+}
+
 fn object_file_with_numcode_records_with_padding(
     values: &[i64],
     payload_padding: usize,
@@ -3946,6 +4125,92 @@ fn object_file_with_numcode_records_with_padding(
     writer.write().unwrap()
 }
 
+fn object_file_with_nullable_numcode_records_with_padding(
+    values: &[Option<i64>],
+    payload_padding: usize,
+) -> Vec<u8> {
+    let catalog = ObjectTypeCatalog {
+        flags: 0,
+        types: vec![ObjectTypeEntryV1 {
+            object_type_id: 1,
+            type_name: "MetricThing".into(),
+            flags: OBJECT_TYPE_FLAG_ENTITY_OBJECT,
+            properties: vec![PropertyEntryV1 {
+                property_id: 3,
+                property_name: "metric".into(),
+                logical_type: CoveLogicalType::Int64,
+                physical_kind: CovePhysicalKind::NumCode,
+                nullable: true,
+                collation_id: 0,
+                flags: 0,
+            }],
+        }],
+    };
+    let rows = values
+        .iter()
+        .enumerate()
+        .map(|(index, _)| TemporalRowEntryV1 {
+            timestamp_us: 10 + index as i64,
+            csn: 1 + index as u64,
+            branch_key: 0,
+            goid: [index as u8; 16],
+            record_id: [index as u8 + 96; 16],
+            record_kind: RecordKind::Baseline,
+            prev_ref: None,
+        })
+        .collect::<Vec<_>>();
+    let segment = temporal_segment_with_nullable_numcode_property(&rows, values, payload_padding);
+    let index = TemporalSegmentIndex {
+        flags: 0,
+        entries: vec![temporal_segment_entry_for_rows(
+            7,
+            &rows,
+            segment.len() as u64,
+        )],
+    };
+
+    let mut writer = MinimalCoveWriter::new();
+    writer.primary_profile = PrimaryProfile::ObjectTemporal as u8;
+    writer.required_features = FEATURE_OBJECT_PROFILE;
+    writer.sections.push(SectionPayload {
+        section_kind: SectionKind::ObjectTypeCatalog as u16,
+        profile: PrimaryProfile::ObjectTemporal as u8,
+        flags: 0,
+        item_count: 1,
+        row_count: 0,
+        compression: CompressionCodec::None as u8,
+        alignment_log2: 0,
+        required_features: FEATURE_OBJECT_PROFILE,
+        optional_features: 0,
+        data: catalog.serialize().unwrap(),
+    });
+    writer.sections.push(SectionPayload {
+        section_kind: SectionKind::TemporalSegmentIndex as u16,
+        profile: PrimaryProfile::ObjectTemporal as u8,
+        flags: 0,
+        item_count: 1,
+        row_count: rows.len() as u64,
+        compression: CompressionCodec::None as u8,
+        alignment_log2: 0,
+        required_features: FEATURE_OBJECT_PROFILE,
+        optional_features: 0,
+        data: index.serialize().unwrap(),
+    });
+    writer.sections.push(SectionPayload {
+        section_kind: SectionKind::TemporalSegmentData as u16,
+        profile: PrimaryProfile::ObjectTemporal as u8,
+        flags: 0,
+        item_count: 1,
+        row_count: rows.len() as u64,
+        compression: CompressionCodec::None as u8,
+        alignment_log2: 0,
+        required_features: FEATURE_OBJECT_PROFILE,
+        optional_features: 0,
+        data: segment,
+    });
+    writer.write().unwrap()
+}
+
 fn retained_metric_values_are_aligned(bytes: &[u8]) -> bool {
     let retained = read_retained_object_temporal_segments(
         RetainedBytes::from_vec(bytes.to_vec()),
@@ -3964,6 +4229,179 @@ fn retained_metric_values_are_aligned(bytes: &[u8]) -> bool {
 }
 
 fn metric_zero_copy_map() -> Vec<u8> {
+    metric_zero_copy_map_with_null_polarity(ZeroCopyNullBitmapPolarityV2::NoNullBitmap)
+}
+
+fn nullable_metric_zero_copy_map() -> Vec<u8> {
+    metric_zero_copy_map_with_null_polarity(ZeroCopyNullBitmapPolarityV2::OneMeansNull)
+}
+
+fn uid_fixed_bytes_zero_copy_map() -> Vec<u8> {
+    uid_fixed_bytes_zero_copy_map_with_null_polarity(ZeroCopyNullBitmapPolarityV2::NoNullBitmap)
+}
+
+fn nullable_uid_fixed_bytes_zero_copy_map() -> Vec<u8> {
+    uid_fixed_bytes_zero_copy_map_with_null_polarity(ZeroCopyNullBitmapPolarityV2::OneMeansNull)
+}
+
+fn active_bool_zero_copy_map() -> Vec<u8> {
+    ZeroCopyBufferMapV2 {
+        header: ZeroCopyBufferMapHeaderV2 {
+            map_count: 1,
+            target_count: 1,
+            flags: 0,
+            checksum: 0,
+        },
+        targets: vec![ZeroCopyTargetV2 {
+            target_id: 1,
+            namespace: "org.apache.arrow".into(),
+            target_name: "arrow".into(),
+            version_major: 1,
+            version_minor: 0,
+            flags: 0,
+        }],
+        entries: vec![ZeroCopyBufferMapEntryV2 {
+            target_id: 1,
+            table_id: 1,
+            column_id: 1,
+            segment_id: 7,
+            morsel_id: 0,
+            page_ref: 1,
+            buffer_id: 0,
+            buffer_kind: PageBufferKind::Values as u16,
+            logical_type: CoveLogicalType::Bool as u16,
+            physical_kind: CovePhysicalKind::Boolean as u8,
+            source_endianness: 0,
+            required_alignment_log2: 0,
+            null_bitmap_polarity: ZeroCopyNullBitmapPolarityV2::NoNullBitmap,
+            source_offset_width_bits: 0,
+            target_offset_width_bits: 0,
+            dictionary_key_width_bits: 0,
+            dictionary_semantics: ZeroCopyDictionarySemanticsV2::NoDictionary,
+            lifetime_scope: ZeroCopyLifetimeScopeV2::ReaderSession,
+            nested_layout_kind: ZeroCopyNestedLayoutKindV2::NotNested,
+            compression_required_none: 1,
+            target_buffer_role: ZeroCopyTargetBufferRoleV2::Values,
+            source_buffer_role: ZeroCopySourceBufferRoleV2::CoveValues,
+            target_type_ref: u32::MAX,
+            dictionary_values_ref: u32::MAX,
+            child_layout_ref: u32::MAX,
+            owner_lifetime_ref: u32::MAX,
+            flags: 0,
+            checksum: 0,
+        }],
+    }
+    .serialize()
+    .unwrap()
+}
+
+fn name_filecode_zero_copy_map() -> Vec<u8> {
+    ZeroCopyBufferMapV2 {
+        header: ZeroCopyBufferMapHeaderV2 {
+            map_count: 1,
+            target_count: 1,
+            flags: 0,
+            checksum: 0,
+        },
+        targets: vec![ZeroCopyTargetV2 {
+            target_id: 1,
+            namespace: "org.apache.arrow".into(),
+            target_name: "arrow".into(),
+            version_major: 1,
+            version_minor: 0,
+            flags: 0,
+        }],
+        entries: vec![ZeroCopyBufferMapEntryV2 {
+            target_id: 1,
+            table_id: 1,
+            column_id: 2,
+            segment_id: 7,
+            morsel_id: 0,
+            page_ref: 1,
+            buffer_id: 0,
+            buffer_kind: PageBufferKind::Values as u16,
+            logical_type: CoveLogicalType::Utf8 as u16,
+            physical_kind: CovePhysicalKind::FileCode as u8,
+            source_endianness: 0,
+            required_alignment_log2: 0,
+            null_bitmap_polarity: ZeroCopyNullBitmapPolarityV2::NoNullBitmap,
+            source_offset_width_bits: 0,
+            target_offset_width_bits: 0,
+            dictionary_key_width_bits: 32,
+            dictionary_semantics: ZeroCopyDictionarySemanticsV2::FileCodeDictionary,
+            lifetime_scope: ZeroCopyLifetimeScopeV2::ReaderSession,
+            nested_layout_kind: ZeroCopyNestedLayoutKindV2::NotNested,
+            compression_required_none: 1,
+            target_buffer_role: ZeroCopyTargetBufferRoleV2::Values,
+            source_buffer_role: ZeroCopySourceBufferRoleV2::CoveValues,
+            target_type_ref: u32::MAX,
+            dictionary_values_ref: u32::MAX,
+            child_layout_ref: u32::MAX,
+            owner_lifetime_ref: u32::MAX,
+            flags: 0,
+            checksum: 0,
+        }],
+    }
+    .serialize()
+    .unwrap()
+}
+
+fn uid_fixed_bytes_zero_copy_map_with_null_polarity(
+    null_bitmap_polarity: ZeroCopyNullBitmapPolarityV2,
+) -> Vec<u8> {
+    ZeroCopyBufferMapV2 {
+        header: ZeroCopyBufferMapHeaderV2 {
+            map_count: 1,
+            target_count: 1,
+            flags: 0,
+            checksum: 0,
+        },
+        targets: vec![ZeroCopyTargetV2 {
+            target_id: 1,
+            namespace: "org.apache.arrow".into(),
+            target_name: "arrow".into(),
+            version_major: 1,
+            version_minor: 0,
+            flags: 0,
+        }],
+        entries: vec![ZeroCopyBufferMapEntryV2 {
+            target_id: 1,
+            table_id: 1,
+            column_id: 4,
+            segment_id: 7,
+            morsel_id: 0,
+            page_ref: 1,
+            buffer_id: 0,
+            buffer_kind: PageBufferKind::Values as u16,
+            logical_type: CoveLogicalType::Uuid as u16,
+            physical_kind: CovePhysicalKind::FixedBytes as u8,
+            source_endianness: 0,
+            required_alignment_log2: 0,
+            null_bitmap_polarity,
+            source_offset_width_bits: 0,
+            target_offset_width_bits: 0,
+            dictionary_key_width_bits: 0,
+            dictionary_semantics: ZeroCopyDictionarySemanticsV2::NoDictionary,
+            lifetime_scope: ZeroCopyLifetimeScopeV2::ReaderSession,
+            nested_layout_kind: ZeroCopyNestedLayoutKindV2::NotNested,
+            compression_required_none: 1,
+            target_buffer_role: ZeroCopyTargetBufferRoleV2::Values,
+            source_buffer_role: ZeroCopySourceBufferRoleV2::CoveValues,
+            target_type_ref: u32::MAX,
+            dictionary_values_ref: u32::MAX,
+            child_layout_ref: u32::MAX,
+            owner_lifetime_ref: u32::MAX,
+            flags: 0,
+            checksum: 0,
+        }],
+    }
+    .serialize()
+    .unwrap()
+}
+
+fn metric_zero_copy_map_with_null_polarity(
+    null_bitmap_polarity: ZeroCopyNullBitmapPolarityV2,
+) -> Vec<u8> {
     ZeroCopyBufferMapV2 {
         header: ZeroCopyBufferMapHeaderV2 {
             map_count: 1,
@@ -3992,7 +4430,7 @@ fn metric_zero_copy_map() -> Vec<u8> {
             physical_kind: CovePhysicalKind::NumCode as u8,
             source_endianness: 0,
             required_alignment_log2: 3,
-            null_bitmap_polarity: ZeroCopyNullBitmapPolarityV2::NoNullBitmap,
+            null_bitmap_polarity,
             source_offset_width_bits: 0,
             target_offset_width_bits: 0,
             dictionary_key_width_bits: 0,
@@ -5075,11 +5513,293 @@ fn temporal_segment_with_numcode_property(
     bytes
 }
 
+fn temporal_segment_with_nullable_numcode_property(
+    rows: &[TemporalRowEntryV1],
+    values: &[Option<i64>],
+    payload_padding: usize,
+) -> Vec<u8> {
+    assert_eq!(rows.len(), values.len());
+    let row_directory_offset = TEMPORAL_SEGMENT_HEADER_LEN as u64;
+    let row_bytes = (rows.len() * TEMPORAL_ROW_ENTRY_LEN) as u64;
+    let row_end = row_directory_offset + row_bytes;
+    let column_directory_offset = row_end;
+    let page_index_offset = column_directory_offset + TABLE_COLUMN_DIRECTORY_ENTRY_LEN as u64;
+    let page_index_length = cove_core::page::COLUMN_PAGE_INDEX_ENTRY_LEN as u64;
+    let data_offset = page_index_offset + page_index_length;
+    let mut null_bitmap = vec![0u8; rows.len().div_ceil(8)];
+    let mut null_count = 0u32;
+    let value_bytes = values
+        .iter()
+        .enumerate()
+        .flat_map(|(index, value)| {
+            if value.is_none() {
+                null_count += 1;
+                null_bitmap[index / 8] |= 1 << (index % 8);
+            }
+            (value.unwrap_or(0) as u64).to_le_bytes()
+        })
+        .collect::<Vec<_>>();
+    let payload = aligned_numcode_page_payload_with_nulls(
+        rows.len() as u32,
+        (null_count > 0).then_some(null_bitmap),
+        value_bytes,
+        payload_padding,
+    );
+    let header = TemporalSegmentHeaderV1 {
+        segment_id: 7,
+        object_type_id: 1,
+        time_range_start_us: rows.first().map(|row| row.timestamp_us).unwrap_or(0),
+        time_range_end_us: rows.last().map(|row| row.timestamp_us).unwrap_or(0),
+        csn_min: rows.first().map(|row| row.csn).unwrap_or(0),
+        csn_max: rows.last().map(|row| row.csn).unwrap_or(0),
+        row_count: rows.len() as u32,
+        morsel_count: u32::from(!rows.is_empty()),
+        morsel_row_count: if rows.is_empty() {
+            0
+        } else {
+            rows.len() as u32
+        },
+        column_count: 1,
+        row_directory_offset,
+        column_directory_offset,
+        page_index_offset,
+        data_offset,
+        flags: 0,
+        checksum: 0,
+    };
+    let directory = TableColumnDirectoryEntryV1 {
+        column_id: 3,
+        logical_type: CoveLogicalType::Int64,
+        physical_kind: CovePhysicalKind::NumCode,
+        flags: 0,
+        page_index_offset,
+        page_index_length,
+        data_offset,
+        data_length: payload.len() as u64,
+        stats_ref: u32::MAX,
+        domain_ref: u32::MAX,
+        checksum: 0,
+    };
+    let page = ColumnPageIndexEntryV1 {
+        column_id: 3,
+        morsel_id: 0,
+        row_count: rows.len() as u32,
+        non_null_count: rows.len() as u32 - null_count,
+        null_count,
+        encoding_root: CoveEncodingKind::NumCode as u32,
+        page_offset: data_offset,
+        page_length: payload.len() as u64,
+        uncompressed_length: payload.len() as u64,
+        stats_ref: u32::MAX,
+        flags: 0,
+        checksum: checksum::crc32c(&payload),
+    };
+
+    let mut bytes = header.serialize().to_vec();
+    for row in rows {
+        bytes.extend_from_slice(&row.serialize());
+    }
+    bytes.extend_from_slice(&directory.serialize());
+    bytes.extend_from_slice(&page.serialize());
+    bytes.extend_from_slice(&payload);
+    bytes
+}
+
+fn temporal_segment_with_plain_fixed_uuid_property(
+    rows: &[TemporalRowEntryV1],
+    values: &[[u8; 16]],
+) -> Vec<u8> {
+    assert_eq!(rows.len(), values.len());
+    let row_directory_offset = TEMPORAL_SEGMENT_HEADER_LEN as u64;
+    let row_bytes = (rows.len() * TEMPORAL_ROW_ENTRY_LEN) as u64;
+    let row_end = row_directory_offset + row_bytes;
+    let column_directory_offset = row_end;
+    let page_index_offset = column_directory_offset + TABLE_COLUMN_DIRECTORY_ENTRY_LEN as u64;
+    let page_index_length = cove_core::page::COLUMN_PAGE_INDEX_ENTRY_LEN as u64;
+    let data_offset = page_index_offset + page_index_length;
+    let value_bytes = values
+        .iter()
+        .flat_map(|value| value.iter().copied())
+        .collect::<Vec<_>>();
+    let payload = ColumnPagePayloadV1::build_single_node(
+        rows.len() as u32,
+        CoveEncodingKind::PlainFixed,
+        CoveLogicalType::Uuid,
+        CovePhysicalKind::FixedBytes,
+        None,
+        value_bytes,
+    )
+    .unwrap();
+    let header = TemporalSegmentHeaderV1 {
+        segment_id: 7,
+        object_type_id: 1,
+        time_range_start_us: rows.first().map(|row| row.timestamp_us).unwrap_or(0),
+        time_range_end_us: rows.last().map(|row| row.timestamp_us).unwrap_or(0),
+        csn_min: rows.first().map(|row| row.csn).unwrap_or(0),
+        csn_max: rows.last().map(|row| row.csn).unwrap_or(0),
+        row_count: rows.len() as u32,
+        morsel_count: u32::from(!rows.is_empty()),
+        morsel_row_count: if rows.is_empty() {
+            0
+        } else {
+            rows.len() as u32
+        },
+        column_count: 1,
+        row_directory_offset,
+        column_directory_offset,
+        page_index_offset,
+        data_offset,
+        flags: 0,
+        checksum: 0,
+    };
+    let directory = TableColumnDirectoryEntryV1 {
+        column_id: 4,
+        logical_type: CoveLogicalType::Uuid,
+        physical_kind: CovePhysicalKind::FixedBytes,
+        flags: 0,
+        page_index_offset,
+        page_index_length,
+        data_offset,
+        data_length: payload.len() as u64,
+        stats_ref: u32::MAX,
+        domain_ref: u32::MAX,
+        checksum: 0,
+    };
+    let page = ColumnPageIndexEntryV1 {
+        column_id: 4,
+        morsel_id: 0,
+        row_count: rows.len() as u32,
+        non_null_count: rows.len() as u32,
+        null_count: 0,
+        encoding_root: CoveEncodingKind::PlainFixed as u32,
+        page_offset: data_offset,
+        page_length: payload.len() as u64,
+        uncompressed_length: payload.len() as u64,
+        stats_ref: u32::MAX,
+        flags: 0,
+        checksum: checksum::crc32c(&payload),
+    };
+
+    let mut bytes = header.serialize().to_vec();
+    for row in rows {
+        bytes.extend_from_slice(&row.serialize());
+    }
+    bytes.extend_from_slice(&directory.serialize());
+    bytes.extend_from_slice(&page.serialize());
+    bytes.extend_from_slice(&payload);
+    bytes
+}
+
+fn temporal_segment_with_nullable_plain_fixed_uuid_property(
+    rows: &[TemporalRowEntryV1],
+    values: &[Option<[u8; 16]>],
+) -> Vec<u8> {
+    assert_eq!(rows.len(), values.len());
+    let row_directory_offset = TEMPORAL_SEGMENT_HEADER_LEN as u64;
+    let row_bytes = (rows.len() * TEMPORAL_ROW_ENTRY_LEN) as u64;
+    let row_end = row_directory_offset + row_bytes;
+    let column_directory_offset = row_end;
+    let page_index_offset = column_directory_offset + TABLE_COLUMN_DIRECTORY_ENTRY_LEN as u64;
+    let page_index_length = cove_core::page::COLUMN_PAGE_INDEX_ENTRY_LEN as u64;
+    let data_offset = page_index_offset + page_index_length;
+    let mut null_bitmap = vec![0u8; rows.len().div_ceil(8)];
+    let mut null_count = 0u32;
+    let value_bytes = values
+        .iter()
+        .enumerate()
+        .flat_map(|(index, value)| {
+            if value.is_none() {
+                null_count += 1;
+                null_bitmap[index / 8] |= 1 << (index % 8);
+            }
+            value.unwrap_or([0; 16])
+        })
+        .collect::<Vec<_>>();
+    let payload = ColumnPagePayloadV1::build_single_node(
+        rows.len() as u32,
+        CoveEncodingKind::PlainFixed,
+        CoveLogicalType::Uuid,
+        CovePhysicalKind::FixedBytes,
+        (null_count > 0).then_some(null_bitmap),
+        value_bytes,
+    )
+    .unwrap();
+    let header = TemporalSegmentHeaderV1 {
+        segment_id: 7,
+        object_type_id: 1,
+        time_range_start_us: rows.first().map(|row| row.timestamp_us).unwrap_or(0),
+        time_range_end_us: rows.last().map(|row| row.timestamp_us).unwrap_or(0),
+        csn_min: rows.first().map(|row| row.csn).unwrap_or(0),
+        csn_max: rows.last().map(|row| row.csn).unwrap_or(0),
+        row_count: rows.len() as u32,
+        morsel_count: u32::from(!rows.is_empty()),
+        morsel_row_count: if rows.is_empty() {
+            0
+        } else {
+            rows.len() as u32
+        },
+        column_count: 1,
+        row_directory_offset,
+        column_directory_offset,
+        page_index_offset,
+        data_offset,
+        flags: 0,
+        checksum: 0,
+    };
+    let directory = TableColumnDirectoryEntryV1 {
+        column_id: 4,
+        logical_type: CoveLogicalType::Uuid,
+        physical_kind: CovePhysicalKind::FixedBytes,
+        flags: 0,
+        page_index_offset,
+        page_index_length,
+        data_offset,
+        data_length: payload.len() as u64,
+        stats_ref: u32::MAX,
+        domain_ref: u32::MAX,
+        checksum: 0,
+    };
+    let page = ColumnPageIndexEntryV1 {
+        column_id: 4,
+        morsel_id: 0,
+        row_count: rows.len() as u32,
+        non_null_count: rows.len() as u32 - null_count,
+        null_count,
+        encoding_root: CoveEncodingKind::PlainFixed as u32,
+        page_offset: data_offset,
+        page_length: payload.len() as u64,
+        uncompressed_length: payload.len() as u64,
+        stats_ref: u32::MAX,
+        flags: 0,
+        checksum: checksum::crc32c(&payload),
+    };
+
+    let mut bytes = header.serialize().to_vec();
+    for row in rows {
+        bytes.extend_from_slice(&row.serialize());
+    }
+    bytes.extend_from_slice(&directory.serialize());
+    bytes.extend_from_slice(&page.serialize());
+    bytes.extend_from_slice(&payload);
+    bytes
+}
+
 fn aligned_numcode_page_payload(row_count: u32, value_bytes: Vec<u8>, padding: usize) -> Vec<u8> {
-    let values_offset = COLUMN_PAGE_PAYLOAD_HEADER_LEN
+    aligned_numcode_page_payload_with_nulls(row_count, None, value_bytes, padding)
+}
+
+fn aligned_numcode_page_payload_with_nulls(
+    row_count: u32,
+    null_bitmap: Option<Vec<u8>>,
+    value_bytes: Vec<u8>,
+    padding: usize,
+) -> Vec<u8> {
+    let buffer_count = 1 + usize::from(null_bitmap.is_some());
+    let buffers_offset = COLUMN_PAGE_PAYLOAD_HEADER_LEN
         + COVE_ENCODING_NODE_LEN
-        + PAGE_BUFFER_DESCRIPTOR_LEN
-        + padding;
+        + buffer_count * PAGE_BUFFER_DESCRIPTOR_LEN;
+    let null_offset = buffers_offset;
+    let values_offset = null_offset + null_bitmap.as_ref().map_or(0, Vec::len) + padding;
     let header = ColumnPagePayloadHeaderV1 {
         magic: COLUMN_PAGE_PAYLOAD_MAGIC,
         version_major: COLUMN_PAGE_PAYLOAD_VERSION_MAJOR,
@@ -5087,13 +5807,11 @@ fn aligned_numcode_page_payload(row_count: u32, value_bytes: Vec<u8>, padding: u
         flags: 0,
         root_node_id: 0,
         node_count: 1,
-        buffer_count: 1,
+        buffer_count: buffer_count as u16,
         row_count,
         nodes_offset: COLUMN_PAGE_PAYLOAD_HEADER_LEN as u32,
         buffer_directory_offset: (COLUMN_PAGE_PAYLOAD_HEADER_LEN + COVE_ENCODING_NODE_LEN) as u32,
-        buffers_offset: (COLUMN_PAGE_PAYLOAD_HEADER_LEN
-            + COVE_ENCODING_NODE_LEN
-            + PAGE_BUFFER_DESCRIPTOR_LEN) as u32,
+        buffers_offset: buffers_offset as u32,
         reserved: 0,
     };
     let node = CoveEncodingNodeV1 {
@@ -5104,25 +5822,42 @@ fn aligned_numcode_page_payload(row_count: u32, value_bytes: Vec<u8>, padding: u
         flags: 0,
         logical_len: row_count,
         child_count: 0,
-        buffer_count: 1,
+        buffer_count: buffer_count as u16,
         params_offset: 0,
         params_length: 0,
         stats_id: u32::MAX,
         reserved: 0,
     };
-    let descriptor = PageBufferDescriptorV1 {
-        buffer_id: 0,
+    let mut descriptors = Vec::with_capacity(buffer_count);
+    if let Some(null_bitmap) = &null_bitmap {
+        descriptors.push(PageBufferDescriptorV1 {
+            buffer_id: 0,
+            kind: PageBufferKind::NullBitmap,
+            flags: 0,
+            offset: null_offset as u64,
+            length: null_bitmap.len() as u64,
+            checksum: checksum::crc32c(null_bitmap),
+            reserved: 0,
+        });
+    }
+    descriptors.push(PageBufferDescriptorV1 {
+        buffer_id: descriptors.len() as u16,
         kind: PageBufferKind::Values,
         flags: 0,
         offset: values_offset as u64,
         length: value_bytes.len() as u64,
         checksum: checksum::crc32c(&value_bytes),
         reserved: 0,
-    };
+    });
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&header.serialize());
     bytes.extend_from_slice(&node.serialize());
-    bytes.extend_from_slice(&descriptor.serialize());
+    for descriptor in descriptors {
+        bytes.extend_from_slice(&descriptor.serialize());
+    }
+    if let Some(null_bitmap) = &null_bitmap {
+        bytes.extend_from_slice(null_bitmap);
+    }
     bytes.extend(std::iter::repeat(0).take(padding));
     bytes.extend_from_slice(&value_bytes);
     bytes
@@ -5515,6 +6250,9 @@ fn object_property_index_only_covi_with_target(
             semantic_map_fingerprint_ref: u32::MAX,
             external_visibility_ref: u32::MAX,
             data_checksum_root_ref: u32::MAX,
+            delta_chain_digest_algorithm: DigestAlgorithm::None as u16,
+            delta_chain_digest_len: 0,
+            delta_chain_digest_offset: 0,
             valid_from_us: 0,
             valid_until_us: i64::MAX,
             flags: 0,
@@ -5794,6 +6532,9 @@ fn object_property_bool_lookup_covi(
             semantic_map_fingerprint_ref: u32::MAX,
             external_visibility_ref: u32::MAX,
             data_checksum_root_ref: u32::MAX,
+            delta_chain_digest_algorithm: DigestAlgorithm::None as u16,
+            delta_chain_digest_len: 0,
+            delta_chain_digest_offset: 0,
             valid_from_us: 0,
             valid_until_us: i64::MAX,
             flags: 0,
@@ -16089,6 +16830,14 @@ fn kernel_temporal_history_direct_projection_executes_with_exact_native_authorit
         kernel.kernel_report.decision.safe_details["residual_verification"],
         json!(false)
     );
+    assert_eq!(
+        kernel.kernel_report.decision.safe_details["kernel_surface_source"],
+        json!("temporal_segment_direct")
+    );
+    assert_eq!(
+        kernel.kernel_report.decision.safe_details["materialized_surface_role"],
+        json!("reconstruction_oracle_and_fallback")
+    );
     assert!(kernel.executed.diagnostics.iter().any(|diagnostic| {
         diagnostic.code == "W_KERNEL_NATIVE_DIRECT_PROJECTION_EXECUTED"
             && diagnostic.safe_details["root_kind"] == json!("object")
@@ -17095,6 +17844,353 @@ fn retained_physical_zero_copy_arrow_uses_cove_l_object_page_owner() {
 }
 
 #[test]
+fn retained_physical_zero_copy_arrow_reuses_numcode_values_with_null_bitmap() {
+    let bytes = Arc::new(object_file_with_nullable_numcode_records(&[
+        Some(10),
+        None,
+        Some(30),
+    ]));
+    let retained = read_retained_object_temporal_segments(
+        RetainedBytes::from_arc(Arc::clone(&bytes)),
+        validation_options(),
+    )
+    .unwrap();
+    let retained_payload = retained.segments[0].property_columns[0].pages[0]
+        .payload
+        .as_ref()
+        .unwrap();
+    let expected_values_ptr = retained_payload
+        .buffer_bytes(PageBufferKind::Values)
+        .unwrap()
+        .unwrap()
+        .as_ptr();
+
+    let mut resolve_options = ResolveOptions {
+        output_mode: Some(CoveQlOutputMode::ArrowRecordBatch {
+            zero_copy_requested: true,
+        }),
+        ..ResolveOptions::default()
+    };
+    resolve_options.security.zero_copy_permission = true;
+    resolve_options.security.metadata_disclosure_policy = MetadataDisclosurePolicy::AllowProtected;
+    let kernel = parse_resolve_plan_build_physical_and_execute_query_retained(
+        CoveQlRetainedInput::from_arc(Arc::clone(&bytes)),
+        "MetricThing.select(metric)",
+        ParseOptions::default(),
+        resolve_options,
+        PlanOptions::default(),
+        PhysicalPlanOptions {
+            allow_zero_copy_output: true,
+            sidecars: PhysicalSidecarInputs {
+                zero_copy_buffer_map_bytes: Some(nullable_metric_zero_copy_map()),
+                ..PhysicalSidecarInputs::default()
+            },
+            ..PhysicalPlanOptions::default()
+        },
+        ExecutionOptions::default(),
+        KernelExecutionOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+
+    assert!(kernel
+        .executed
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "W_ZERO_COPY_ARROW_EXECUTED"));
+    assert!(!kernel
+        .executed
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "W_ZERO_COPY_MATERIALIZED_FALLBACK"));
+    let CoveQlExecutionResult::ArrowRecordBatches(batches) = &kernel.executed.result else {
+        panic!("expected Arrow batches");
+    };
+    let values = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(values.value(0), 10);
+    assert!(values.is_null(1));
+    assert_eq!(values.value(2), 30);
+    assert_eq!(values.to_data().buffers()[0].as_ptr(), expected_values_ptr);
+}
+
+#[test]
+fn retained_physical_zero_copy_arrow_reuses_fixed_bytes_values() {
+    let first = [1u8; 16];
+    let second = [2u8; 16];
+    let bytes = Arc::new(object_file_with_plain_fixed_uuid_records(&[first, second]));
+    let retained = read_retained_object_temporal_segments(
+        RetainedBytes::from_arc(Arc::clone(&bytes)),
+        validation_options(),
+    )
+    .unwrap();
+    let retained_payload = retained.segments[0].property_columns[0].pages[0]
+        .payload
+        .as_ref()
+        .unwrap();
+    let expected_values_ptr = retained_payload
+        .buffer_bytes(PageBufferKind::Values)
+        .unwrap()
+        .unwrap()
+        .as_ptr();
+
+    let mut resolve_options = ResolveOptions {
+        output_mode: Some(CoveQlOutputMode::ArrowRecordBatch {
+            zero_copy_requested: true,
+        }),
+        ..ResolveOptions::default()
+    };
+    resolve_options.security.zero_copy_permission = true;
+    resolve_options.security.metadata_disclosure_policy = MetadataDisclosurePolicy::AllowProtected;
+    let kernel = parse_resolve_plan_build_physical_and_execute_query_retained(
+        CoveQlRetainedInput::from_arc(Arc::clone(&bytes)),
+        "UuidFixedThing.select(uid)",
+        ParseOptions::default(),
+        resolve_options,
+        PlanOptions::default(),
+        PhysicalPlanOptions {
+            allow_zero_copy_output: true,
+            sidecars: PhysicalSidecarInputs {
+                zero_copy_buffer_map_bytes: Some(uid_fixed_bytes_zero_copy_map()),
+                ..PhysicalSidecarInputs::default()
+            },
+            ..PhysicalPlanOptions::default()
+        },
+        ExecutionOptions::default(),
+        KernelExecutionOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+
+    assert!(kernel
+        .executed
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "W_ZERO_COPY_ARROW_EXECUTED"));
+    let CoveQlExecutionResult::ArrowRecordBatches(batches) = &kernel.executed.result else {
+        panic!("expected Arrow batches");
+    };
+    let values = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<FixedSizeBinaryArray>()
+        .unwrap();
+    assert_eq!(values.value(0), first);
+    assert_eq!(values.value(1), second);
+    assert_eq!(values.to_data().buffers()[0].as_ptr(), expected_values_ptr);
+}
+
+#[test]
+fn retained_physical_zero_copy_arrow_reuses_nullable_fixed_bytes_values() {
+    let first = [1u8; 16];
+    let third = [3u8; 16];
+    let bytes = Arc::new(object_file_with_nullable_plain_fixed_uuid_records(&[
+        Some(first),
+        None,
+        Some(third),
+    ]));
+    let retained = read_retained_object_temporal_segments(
+        RetainedBytes::from_arc(Arc::clone(&bytes)),
+        validation_options(),
+    )
+    .unwrap();
+    let retained_payload = retained.segments[0].property_columns[0].pages[0]
+        .payload
+        .as_ref()
+        .unwrap();
+    let expected_values_ptr = retained_payload
+        .buffer_bytes(PageBufferKind::Values)
+        .unwrap()
+        .unwrap()
+        .as_ptr();
+
+    let mut resolve_options = ResolveOptions {
+        output_mode: Some(CoveQlOutputMode::ArrowRecordBatch {
+            zero_copy_requested: true,
+        }),
+        ..ResolveOptions::default()
+    };
+    resolve_options.security.zero_copy_permission = true;
+    resolve_options.security.metadata_disclosure_policy = MetadataDisclosurePolicy::AllowProtected;
+    let kernel = parse_resolve_plan_build_physical_and_execute_query_retained(
+        CoveQlRetainedInput::from_arc(Arc::clone(&bytes)),
+        "UuidFixedThing.select(uid)",
+        ParseOptions::default(),
+        resolve_options,
+        PlanOptions::default(),
+        PhysicalPlanOptions {
+            allow_zero_copy_output: true,
+            sidecars: PhysicalSidecarInputs {
+                zero_copy_buffer_map_bytes: Some(nullable_uid_fixed_bytes_zero_copy_map()),
+                ..PhysicalSidecarInputs::default()
+            },
+            ..PhysicalPlanOptions::default()
+        },
+        ExecutionOptions::default(),
+        KernelExecutionOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+
+    assert!(kernel
+        .executed
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "W_ZERO_COPY_ARROW_EXECUTED"));
+    let CoveQlExecutionResult::ArrowRecordBatches(batches) = &kernel.executed.result else {
+        panic!("expected Arrow batches");
+    };
+    let values = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<FixedSizeBinaryArray>()
+        .unwrap();
+    assert_eq!(values.value(0), first);
+    assert!(values.is_null(1));
+    assert_eq!(values.value(2), third);
+    assert_eq!(values.to_data().buffers()[0].as_ptr(), expected_values_ptr);
+}
+
+#[test]
+fn retained_physical_zero_copy_arrow_exports_bool_page_without_materialized_fallback() {
+    let bytes = Arc::new(object_file_with_bool_records(&[true, false, true]));
+    let retained = read_retained_object_temporal_segments(
+        RetainedBytes::from_arc(Arc::clone(&bytes)),
+        validation_options(),
+    )
+    .unwrap();
+    let retained_payload = retained.segments[0].property_columns[0].pages[0]
+        .payload
+        .as_ref()
+        .unwrap();
+    let cove_values_ptr = retained_payload
+        .buffer_bytes(PageBufferKind::Values)
+        .unwrap()
+        .unwrap()
+        .as_ptr();
+
+    let mut resolve_options = ResolveOptions {
+        output_mode: Some(CoveQlOutputMode::ArrowRecordBatch {
+            zero_copy_requested: true,
+        }),
+        ..ResolveOptions::default()
+    };
+    resolve_options.security.zero_copy_permission = true;
+    resolve_options.security.metadata_disclosure_policy = MetadataDisclosurePolicy::AllowProtected;
+    let kernel = parse_resolve_plan_build_physical_and_execute_query_retained(
+        CoveQlRetainedInput::from_arc(Arc::clone(&bytes)),
+        "Thing.select(active)",
+        ParseOptions::default(),
+        resolve_options,
+        PlanOptions::default(),
+        PhysicalPlanOptions {
+            allow_zero_copy_output: true,
+            sidecars: PhysicalSidecarInputs {
+                zero_copy_buffer_map_bytes: Some(active_bool_zero_copy_map()),
+                ..PhysicalSidecarInputs::default()
+            },
+            ..PhysicalPlanOptions::default()
+        },
+        ExecutionOptions::default(),
+        KernelExecutionOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+
+    assert!(kernel
+        .executed
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "W_ZERO_COPY_ARROW_EXECUTED"));
+    assert!(!kernel
+        .executed
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "W_ZERO_COPY_MATERIALIZED_FALLBACK"));
+    let CoveQlExecutionResult::ArrowRecordBatches(batches) = &kernel.executed.result else {
+        panic!("expected Arrow batches");
+    };
+    let values = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .unwrap();
+    assert!(values.value(0));
+    assert!(!values.value(1));
+    assert!(values.value(2));
+    assert_ne!(values.to_data().buffers()[0].as_ptr(), cove_values_ptr);
+}
+
+#[test]
+fn retained_physical_zero_copy_arrow_exports_filecode_dictionary_page() {
+    let (bytes, _) = object_file_with_filecode_records(&["red", "blue", "red"]);
+    let bytes = Arc::new(bytes);
+
+    let mut resolve_options = ResolveOptions {
+        output_mode: Some(CoveQlOutputMode::ArrowRecordBatch {
+            zero_copy_requested: true,
+        }),
+        ..ResolveOptions::default()
+    };
+    resolve_options.security.zero_copy_permission = true;
+    resolve_options.security.metadata_disclosure_policy = MetadataDisclosurePolicy::AllowProtected;
+    let kernel = parse_resolve_plan_build_physical_and_execute_query_retained(
+        CoveQlRetainedInput::from_arc(Arc::clone(&bytes)),
+        "Person.select(name)",
+        ParseOptions::default(),
+        resolve_options,
+        PlanOptions::default(),
+        PhysicalPlanOptions {
+            allow_zero_copy_output: true,
+            sidecars: PhysicalSidecarInputs {
+                zero_copy_buffer_map_bytes: Some(name_filecode_zero_copy_map()),
+                ..PhysicalSidecarInputs::default()
+            },
+            ..PhysicalPlanOptions::default()
+        },
+        ExecutionOptions::default(),
+        KernelExecutionOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+
+    assert!(kernel
+        .executed
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "W_ZERO_COPY_ARROW_EXECUTED"));
+    assert!(!kernel
+        .executed
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "W_ZERO_COPY_MATERIALIZED_FALLBACK"));
+    let CoveQlExecutionResult::ArrowRecordBatches(batches) = &kernel.executed.result else {
+        panic!("expected Arrow batches");
+    };
+    let values = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<DictionaryArray<UInt32Type>>()
+        .unwrap();
+    let dictionary = values
+        .values()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let decoded = (0..values.len())
+        .map(|row| dictionary.value(values.keys().value(row) as usize))
+        .collect::<Vec<_>>();
+    assert_eq!(decoded, vec!["red", "blue", "red"]);
+    assert_eq!(
+        batches[0].schema().field(0).data_type(),
+        &DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8))
+    );
+}
+
+#[test]
 fn kernel_compare_mode_matches_materialized_object_json_rows() {
     let bytes = include_bytes!("../../../conformance/accept/cove_o_temporal_valid.cove");
     let kernel = parse_resolve_plan_build_physical_and_execute_query(
@@ -17187,6 +18283,1287 @@ fn kernel_compare_mode_matches_materialized_object_json_rows() {
             .as_array()
             .is_some_and(|boundaries| boundaries.is_empty())
     );
+}
+
+#[test]
+fn kernel_native_scalar_bool_page_lane_prefilter_matches_materialized() {
+    let bytes = object_file_with_bool_records(&[true, false, true]);
+    let query = "Thing.where(active == true).select(active)";
+    let kernel = parse_resolve_plan_build_physical_and_execute_query(
+        &bytes,
+        query,
+        ParseOptions::default(),
+        protected_json_resolve_options(),
+        PlanOptions::default(),
+        PhysicalPlanOptions::default(),
+        ExecutionOptions::default(),
+        KernelExecutionOptions {
+            mode: KernelExecutionMode::CompareWithMaterialized,
+            ..KernelExecutionOptions::default()
+        },
+        validation_options(),
+    )
+    .unwrap();
+    let materialized = parse_resolve_plan_and_execute_query(
+        &bytes,
+        query,
+        ParseOptions::default(),
+        protected_json_resolve_options(),
+        PlanOptions::default(),
+        ExecutionOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        kernel.executed.output_fingerprint,
+        materialized.output_fingerprint
+    );
+    let diagnostic = kernel
+        .executed
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == "W_NATIVE_SCALAR_LITERAL_PRUNE_EXECUTED")
+        .expect("native scalar prune diagnostic is present");
+    assert_eq!(diagnostic.safe_details["predicate_count"], json!(1));
+    assert_eq!(diagnostic.safe_details["page_count"], json!(1));
+    assert_eq!(diagnostic.safe_details["matched_rows"], json!(2));
+    assert_eq!(
+        diagnostic.safe_details["residual_verification"],
+        json!(false)
+    );
+    assert_eq!(diagnostic.safe_details["predicate_kernels"], json!(1));
+    let predicate_dispatch_total = diagnostic.safe_details["predicate_kernel_scalar"]
+        .as_u64()
+        .unwrap()
+        + diagnostic.safe_details["predicate_kernel_avx2"]
+            .as_u64()
+            .unwrap()
+        + diagnostic.safe_details["predicate_kernel_neon"]
+            .as_u64()
+            .unwrap();
+    assert_eq!(predicate_dispatch_total, 1);
+    let decision = kernel
+        .kernel_report
+        .decisions
+        .iter()
+        .find(|decision| {
+            decision
+                .reason
+                .contains("native scalar page-lane predicate")
+        })
+        .expect("native scalar prune decision is present");
+    assert!(
+        decision
+            .reason
+            .contains("native scalar page-lane predicate")
+            && decision.safe_details["matched_rows"] == json!(2)
+            && decision.safe_details["residual_verification"] == json!(false)
+            && decision.safe_details["predicate_kernels"] == json!(1)
+    );
+    assert_eq!(kernel.kernel_report.counters.rows_after_bitmap, 2);
+    assert_eq!(kernel.kernel_report.counters.residual_rows_checked, 0);
+}
+
+#[test]
+fn kernel_native_scalar_varbytes_page_lane_prefilter_matches_materialized() {
+    let bytes = object_file_with_nullable_name_records(&[Some("Ada"), None, Some("Bob")]);
+    let query = r#"Person.where(name == "Ada").select(name)"#;
+    let kernel = parse_resolve_plan_build_physical_and_execute_query(
+        &bytes,
+        query,
+        ParseOptions::default(),
+        protected_json_resolve_options(),
+        PlanOptions::default(),
+        PhysicalPlanOptions::default(),
+        ExecutionOptions::default(),
+        KernelExecutionOptions {
+            mode: KernelExecutionMode::CompareWithMaterialized,
+            ..KernelExecutionOptions::default()
+        },
+        validation_options(),
+    )
+    .unwrap();
+    let materialized = parse_resolve_plan_and_execute_query(
+        &bytes,
+        query,
+        ParseOptions::default(),
+        protected_json_resolve_options(),
+        PlanOptions::default(),
+        ExecutionOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        kernel.executed.output_fingerprint,
+        materialized.output_fingerprint
+    );
+    assert!(kernel.executed.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "W_NATIVE_SCALAR_LITERAL_PRUNE_EXECUTED"
+            && diagnostic.safe_details["predicate_count"] == json!(1)
+            && diagnostic.safe_details["page_count"] == json!(1)
+            && diagnostic.safe_details["matched_rows"] == json!(1)
+            && diagnostic.safe_details["residual_verification"] == json!(false)
+    }));
+    assert_eq!(kernel.kernel_report.counters.rows_after_bitmap, 1);
+}
+
+#[test]
+fn kernel_native_scalar_varbytes_in_page_lane_prefilter_matches_materialized() {
+    let bytes = object_file_with_nullable_name_records(&[Some("Ada"), None, Some("Bob")]);
+    let query = r#"Person.where(name in ["Ada", "Bob"]).select(name)"#;
+    let kernel = parse_resolve_plan_build_physical_and_execute_query(
+        &bytes,
+        query,
+        ParseOptions::default(),
+        protected_json_resolve_options(),
+        PlanOptions::default(),
+        PhysicalPlanOptions::default(),
+        ExecutionOptions::default(),
+        KernelExecutionOptions {
+            mode: KernelExecutionMode::CompareWithMaterialized,
+            ..KernelExecutionOptions::default()
+        },
+        validation_options(),
+    )
+    .unwrap();
+    let materialized = parse_resolve_plan_and_execute_query(
+        &bytes,
+        query,
+        ParseOptions::default(),
+        protected_json_resolve_options(),
+        PlanOptions::default(),
+        ExecutionOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        kernel.executed.output_fingerprint,
+        materialized.output_fingerprint
+    );
+    assert!(kernel.executed.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "W_NATIVE_SCALAR_LITERAL_PRUNE_EXECUTED"
+            && diagnostic.safe_details["predicate_count"] == json!(1)
+            && diagnostic.safe_details["page_count"] == json!(1)
+            && diagnostic.safe_details["matched_rows"] == json!(2)
+            && diagnostic.safe_details["predicate_order"] == json!(["varbytes_in"])
+            && diagnostic.safe_details["residual_verification"] == json!(false)
+    }));
+    assert_eq!(kernel.kernel_report.counters.rows_after_bitmap, 2);
+    assert_eq!(kernel.kernel_report.counters.residual_rows_checked, 0);
+}
+
+#[test]
+fn kernel_native_scalar_varbytes_not_in_page_lane_prefilter_matches_materialized() {
+    let bytes = object_file_with_nullable_name_records(&[Some("Ada"), None, Some("Bob")]);
+    let query = r#"Person.where(!(name in ["Ada"])).select(name)"#;
+    let kernel = parse_resolve_plan_build_physical_and_execute_query(
+        &bytes,
+        query,
+        ParseOptions::default(),
+        protected_json_resolve_options(),
+        PlanOptions::default(),
+        PhysicalPlanOptions::default(),
+        ExecutionOptions::default(),
+        KernelExecutionOptions {
+            mode: KernelExecutionMode::CompareWithMaterialized,
+            ..KernelExecutionOptions::default()
+        },
+        validation_options(),
+    )
+    .unwrap();
+    let materialized = parse_resolve_plan_and_execute_query(
+        &bytes,
+        query,
+        ParseOptions::default(),
+        protected_json_resolve_options(),
+        PlanOptions::default(),
+        ExecutionOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        kernel.executed.output_fingerprint,
+        materialized.output_fingerprint
+    );
+    let CoveQlExecutionResult::JsonRows(rows) = kernel.executed.result else {
+        panic!("expected JSON rows");
+    };
+    assert_eq!(rows, vec![json!({"name": "Bob"})]);
+    assert!(kernel.executed.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "W_NATIVE_SCALAR_LITERAL_PRUNE_EXECUTED"
+            && diagnostic.safe_details["predicate_count"] == json!(1)
+            && diagnostic.safe_details["page_count"] == json!(1)
+            && diagnostic.safe_details["matched_rows"] == json!(1)
+            && diagnostic.safe_details["predicate_order"] == json!(["varbytes_not_in"])
+            && diagnostic.safe_details["residual_verification"] == json!(false)
+    }));
+    assert_eq!(kernel.kernel_report.counters.rows_after_bitmap, 1);
+    assert_eq!(kernel.kernel_report.counters.residual_rows_checked, 0);
+}
+
+#[test]
+fn kernel_native_scalar_varbytes_not_equal_page_lane_prefilter_matches_materialized() {
+    let bytes = object_file_with_nullable_name_records(&[Some("Ada"), None, Some("Bob")]);
+    let query = r#"Person.where(name != "Ada").select(name)"#;
+    let kernel = parse_resolve_plan_build_physical_and_execute_query(
+        &bytes,
+        query,
+        ParseOptions::default(),
+        protected_json_resolve_options(),
+        PlanOptions::default(),
+        PhysicalPlanOptions::default(),
+        ExecutionOptions::default(),
+        KernelExecutionOptions {
+            mode: KernelExecutionMode::CompareWithMaterialized,
+            ..KernelExecutionOptions::default()
+        },
+        validation_options(),
+    )
+    .unwrap();
+    let materialized = parse_resolve_plan_and_execute_query(
+        &bytes,
+        query,
+        ParseOptions::default(),
+        protected_json_resolve_options(),
+        PlanOptions::default(),
+        ExecutionOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        kernel.executed.output_fingerprint,
+        materialized.output_fingerprint
+    );
+    let CoveQlExecutionResult::JsonRows(rows) = kernel.executed.result else {
+        panic!("expected JSON rows");
+    };
+    assert_eq!(rows, vec![json!({"name": "Bob"})]);
+    assert!(kernel.executed.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "W_NATIVE_SCALAR_LITERAL_PRUNE_EXECUTED"
+            && diagnostic.safe_details["predicate_count"] == json!(1)
+            && diagnostic.safe_details["page_count"] == json!(1)
+            && diagnostic.safe_details["matched_rows"] == json!(1)
+            && diagnostic.safe_details["predicate_order"] == json!(["varbytes_not_in"])
+            && diagnostic.safe_details["residual_verification"] == json!(false)
+    }));
+    assert_eq!(kernel.kernel_report.counters.rows_after_bitmap, 1);
+    assert_eq!(kernel.kernel_report.counters.residual_rows_checked, 0);
+}
+
+#[test]
+fn kernel_native_scalar_null_page_lane_prefilter_matches_materialized() {
+    let bytes = object_file_with_nullable_name_records(&[Some("Ada"), None, Some("Bob")]);
+    let query = "Person.where(name.isNull()).select(name)";
+    let kernel = parse_resolve_plan_build_physical_and_execute_query(
+        &bytes,
+        query,
+        ParseOptions::default(),
+        protected_json_resolve_options(),
+        PlanOptions::default(),
+        PhysicalPlanOptions::default(),
+        ExecutionOptions::default(),
+        KernelExecutionOptions {
+            mode: KernelExecutionMode::CompareWithMaterialized,
+            ..KernelExecutionOptions::default()
+        },
+        validation_options(),
+    )
+    .unwrap();
+    let materialized = parse_resolve_plan_and_execute_query(
+        &bytes,
+        query,
+        ParseOptions::default(),
+        protected_json_resolve_options(),
+        PlanOptions::default(),
+        ExecutionOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        kernel.executed.output_fingerprint,
+        materialized.output_fingerprint
+    );
+    assert!(kernel.executed.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "W_NATIVE_SCALAR_LITERAL_PRUNE_EXECUTED"
+            && diagnostic.safe_details["predicate_count"] == json!(1)
+            && diagnostic.safe_details["page_count"] == json!(1)
+            && diagnostic.safe_details["matched_rows"] == json!(1)
+            && diagnostic.safe_details["residual_verification"] == json!(false)
+    }));
+    assert_eq!(kernel.kernel_report.counters.rows_after_bitmap, 1);
+}
+
+#[test]
+fn kernel_native_scalar_numcode_page_lane_prefilter_matches_materialized() {
+    let bytes = object_file_with_numcode_records(&[5, 10, 20, 30]);
+    let query = "MetricThing.where(metric >= 10).select(metric)";
+    let kernel = parse_resolve_plan_build_physical_and_execute_query(
+        &bytes,
+        query,
+        ParseOptions::default(),
+        protected_json_resolve_options(),
+        PlanOptions::default(),
+        PhysicalPlanOptions::default(),
+        ExecutionOptions::default(),
+        KernelExecutionOptions {
+            mode: KernelExecutionMode::CompareWithMaterialized,
+            ..KernelExecutionOptions::default()
+        },
+        validation_options(),
+    )
+    .unwrap();
+    let materialized = parse_resolve_plan_and_execute_query(
+        &bytes,
+        query,
+        ParseOptions::default(),
+        protected_json_resolve_options(),
+        PlanOptions::default(),
+        ExecutionOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        kernel.executed.output_fingerprint,
+        materialized.output_fingerprint
+    );
+    assert!(kernel.executed.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "W_NATIVE_SCALAR_LITERAL_PRUNE_EXECUTED"
+            && diagnostic.safe_details["predicate_count"] == json!(1)
+            && diagnostic.safe_details["page_count"] == json!(1)
+            && diagnostic.safe_details["matched_rows"] == json!(3)
+            && diagnostic.safe_details["residual_verification"] == json!(false)
+    }));
+    assert_eq!(kernel.kernel_report.counters.rows_after_bitmap, 3);
+}
+
+#[test]
+fn kernel_native_scalar_numcode_in_page_lane_prefilter_matches_materialized() {
+    let bytes = object_file_with_numcode_records(&[5, 10, 20, 30]);
+    let query = "MetricThing.where(metric in [5, 20]).select(metric)";
+    let kernel = parse_resolve_plan_build_physical_and_execute_query(
+        &bytes,
+        query,
+        ParseOptions::default(),
+        protected_json_resolve_options(),
+        PlanOptions::default(),
+        PhysicalPlanOptions::default(),
+        ExecutionOptions::default(),
+        KernelExecutionOptions {
+            mode: KernelExecutionMode::CompareWithMaterialized,
+            ..KernelExecutionOptions::default()
+        },
+        validation_options(),
+    )
+    .unwrap();
+    let materialized = parse_resolve_plan_and_execute_query(
+        &bytes,
+        query,
+        ParseOptions::default(),
+        protected_json_resolve_options(),
+        PlanOptions::default(),
+        ExecutionOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        kernel.executed.output_fingerprint,
+        materialized.output_fingerprint
+    );
+    let CoveQlExecutionResult::JsonRows(rows) = kernel.executed.result else {
+        panic!("expected JSON rows");
+    };
+    assert_eq!(rows, vec![json!({"metric": 5}), json!({"metric": 20})]);
+    assert!(kernel.executed.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "W_NATIVE_SCALAR_LITERAL_PRUNE_EXECUTED"
+            && diagnostic.safe_details["predicate_count"] == json!(1)
+            && diagnostic.safe_details["page_count"] == json!(1)
+            && diagnostic.safe_details["matched_rows"] == json!(2)
+            && diagnostic.safe_details["predicate_order"] == json!(["numcode_in"])
+            && diagnostic.safe_details["residual_verification"] == json!(false)
+    }));
+    assert_eq!(kernel.kernel_report.counters.rows_after_bitmap, 2);
+}
+
+#[test]
+fn kernel_native_scalar_numcode_not_in_page_lane_prefilter_matches_materialized() {
+    let bytes = object_file_with_numcode_records(&[5, 10, 20, 30]);
+    let query = "MetricThing.where(!(metric in [5, 20])).select(metric)";
+    let kernel = parse_resolve_plan_build_physical_and_execute_query(
+        &bytes,
+        query,
+        ParseOptions::default(),
+        protected_json_resolve_options(),
+        PlanOptions::default(),
+        PhysicalPlanOptions::default(),
+        ExecutionOptions::default(),
+        KernelExecutionOptions {
+            mode: KernelExecutionMode::CompareWithMaterialized,
+            ..KernelExecutionOptions::default()
+        },
+        validation_options(),
+    )
+    .unwrap();
+    let materialized = parse_resolve_plan_and_execute_query(
+        &bytes,
+        query,
+        ParseOptions::default(),
+        protected_json_resolve_options(),
+        PlanOptions::default(),
+        ExecutionOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        kernel.executed.output_fingerprint,
+        materialized.output_fingerprint
+    );
+    let CoveQlExecutionResult::JsonRows(rows) = kernel.executed.result else {
+        panic!("expected JSON rows");
+    };
+    assert_eq!(rows, vec![json!({"metric": 10}), json!({"metric": 30})]);
+    assert!(kernel.executed.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "W_NATIVE_SCALAR_LITERAL_PRUNE_EXECUTED"
+            && diagnostic.safe_details["predicate_count"] == json!(1)
+            && diagnostic.safe_details["page_count"] == json!(1)
+            && diagnostic.safe_details["matched_rows"] == json!(2)
+            && diagnostic.safe_details["predicate_order"] == json!(["numcode_not_in"])
+            && diagnostic.safe_details["residual_verification"] == json!(false)
+    }));
+    assert_eq!(kernel.kernel_report.counters.rows_after_bitmap, 2);
+    assert_eq!(kernel.kernel_report.counters.residual_rows_checked, 0);
+}
+
+#[test]
+fn kernel_native_scalar_numcode_not_equal_page_lane_prefilter_matches_materialized() {
+    let bytes = object_file_with_numcode_records(&[5, 10, 20, 30]);
+    let query = "MetricThing.where(metric != 20).select(metric)";
+    let kernel = parse_resolve_plan_build_physical_and_execute_query(
+        &bytes,
+        query,
+        ParseOptions::default(),
+        protected_json_resolve_options(),
+        PlanOptions::default(),
+        PhysicalPlanOptions::default(),
+        ExecutionOptions::default(),
+        KernelExecutionOptions {
+            mode: KernelExecutionMode::CompareWithMaterialized,
+            ..KernelExecutionOptions::default()
+        },
+        validation_options(),
+    )
+    .unwrap();
+    let materialized = parse_resolve_plan_and_execute_query(
+        &bytes,
+        query,
+        ParseOptions::default(),
+        protected_json_resolve_options(),
+        PlanOptions::default(),
+        ExecutionOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        kernel.executed.output_fingerprint,
+        materialized.output_fingerprint
+    );
+    let CoveQlExecutionResult::JsonRows(rows) = kernel.executed.result else {
+        panic!("expected JSON rows");
+    };
+    assert_eq!(
+        rows,
+        vec![
+            json!({"metric": 5}),
+            json!({"metric": 10}),
+            json!({"metric": 30})
+        ]
+    );
+    assert!(kernel.executed.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "W_NATIVE_SCALAR_LITERAL_PRUNE_EXECUTED"
+            && diagnostic.safe_details["predicate_count"] == json!(1)
+            && diagnostic.safe_details["page_count"] == json!(1)
+            && diagnostic.safe_details["matched_rows"] == json!(3)
+            && diagnostic.safe_details["predicate_order"] == json!(["numcode_not_in"])
+            && diagnostic.safe_details["residual_verification"] == json!(false)
+    }));
+    assert_eq!(kernel.kernel_report.counters.rows_after_bitmap, 3);
+    assert_eq!(kernel.kernel_report.counters.residual_rows_checked, 0);
+}
+
+#[test]
+fn kernel_native_scalar_negated_numcode_range_uses_inverted_page_lane_prefilter() {
+    let bytes = object_file_with_numcode_records(&[5, 10, 20, 30]);
+    let query = "MetricThing.where(!(metric >= 10)).select(metric)";
+    let kernel = parse_resolve_plan_build_physical_and_execute_query(
+        &bytes,
+        query,
+        ParseOptions::default(),
+        protected_json_resolve_options(),
+        PlanOptions::default(),
+        PhysicalPlanOptions::default(),
+        ExecutionOptions::default(),
+        KernelExecutionOptions {
+            mode: KernelExecutionMode::CompareWithMaterialized,
+            ..KernelExecutionOptions::default()
+        },
+        validation_options(),
+    )
+    .unwrap();
+    let materialized = parse_resolve_plan_and_execute_query(
+        &bytes,
+        query,
+        ParseOptions::default(),
+        protected_json_resolve_options(),
+        PlanOptions::default(),
+        ExecutionOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        kernel.executed.output_fingerprint,
+        materialized.output_fingerprint
+    );
+    let CoveQlExecutionResult::JsonRows(rows) = kernel.executed.result else {
+        panic!("expected JSON rows");
+    };
+    assert_eq!(rows, vec![json!({"metric": 5})]);
+    assert!(kernel.executed.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "W_NATIVE_SCALAR_LITERAL_PRUNE_EXECUTED"
+            && diagnostic.safe_details["predicate_count"] == json!(1)
+            && diagnostic.safe_details["page_count"] == json!(1)
+            && diagnostic.safe_details["matched_rows"] == json!(1)
+            && diagnostic.safe_details["predicate_order"] == json!(["numcode"])
+            && diagnostic.safe_details["residual_verification"] == json!(false)
+    }));
+    assert_eq!(kernel.kernel_report.counters.rows_after_bitmap, 1);
+    assert_eq!(kernel.kernel_report.counters.residual_rows_checked, 0);
+}
+
+#[test]
+fn kernel_native_scalar_same_path_numeric_or_uses_numcode_in_prefilter() {
+    let bytes = object_file_with_numcode_records(&[5, 10, 20, 30]);
+    let query = "MetricThing.where(metric == 5 || metric == 20).select(metric)";
+    let kernel = parse_resolve_plan_build_physical_and_execute_query(
+        &bytes,
+        query,
+        ParseOptions::default(),
+        protected_json_resolve_options(),
+        PlanOptions::default(),
+        PhysicalPlanOptions::default(),
+        ExecutionOptions::default(),
+        KernelExecutionOptions {
+            mode: KernelExecutionMode::CompareWithMaterialized,
+            ..KernelExecutionOptions::default()
+        },
+        validation_options(),
+    )
+    .unwrap();
+    let materialized = parse_resolve_plan_and_execute_query(
+        &bytes,
+        query,
+        ParseOptions::default(),
+        protected_json_resolve_options(),
+        PlanOptions::default(),
+        ExecutionOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        kernel.executed.output_fingerprint,
+        materialized.output_fingerprint
+    );
+    assert!(kernel.executed.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "W_NATIVE_SCALAR_LITERAL_PRUNE_EXECUTED"
+            && diagnostic.safe_details["predicate_count"] == json!(1)
+            && diagnostic.safe_details["page_count"] == json!(1)
+            && diagnostic.safe_details["matched_rows"] == json!(2)
+            && diagnostic.safe_details["predicate_order"] == json!(["numcode_in"])
+            && diagnostic.safe_details["residual_verification"] == json!(false)
+    }));
+    assert_eq!(kernel.kernel_report.counters.rows_after_bitmap, 2);
+}
+
+#[test]
+fn kernel_native_scalar_csn_row_directory_prefilter_matches_materialized() {
+    let bytes = object_file_with_bool_records(&[true, false, true]);
+    let query = "Thing.where(csn >= 2).select(active)";
+    let kernel = parse_resolve_plan_build_physical_and_execute_query(
+        &bytes,
+        query,
+        ParseOptions::default(),
+        protected_json_resolve_options(),
+        PlanOptions::default(),
+        PhysicalPlanOptions::default(),
+        ExecutionOptions::default(),
+        KernelExecutionOptions {
+            mode: KernelExecutionMode::CompareWithMaterialized,
+            ..KernelExecutionOptions::default()
+        },
+        validation_options(),
+    )
+    .unwrap();
+    let materialized = parse_resolve_plan_and_execute_query(
+        &bytes,
+        query,
+        ParseOptions::default(),
+        protected_json_resolve_options(),
+        PlanOptions::default(),
+        ExecutionOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        kernel.executed.output_fingerprint,
+        materialized.output_fingerprint
+    );
+    assert!(kernel.executed.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "W_NATIVE_SCALAR_LITERAL_PRUNE_EXECUTED"
+            && diagnostic.safe_details["predicate_count"] == json!(1)
+            && diagnostic.safe_details["page_count"] == json!(1)
+            && diagnostic.safe_details["matched_rows"] == json!(2)
+            && diagnostic.safe_details["residual_verification"] == json!(false)
+    }));
+    assert!(kernel.kernel_report.decisions.iter().any(|decision| {
+        decision
+            .reason
+            .contains("native scalar page-lane predicate")
+            && decision.safe_details["matched_rows"] == json!(2)
+            && decision.safe_details["residual_verification"] == json!(false)
+    }));
+    assert_eq!(kernel.kernel_report.counters.rows_after_bitmap, 2);
+}
+
+#[test]
+fn kernel_native_scalar_branch_row_directory_prefilter_matches_materialized() {
+    let bytes = object_file_with_bool_records_on_branches(&[true, false, true], &[0, 7, 7]);
+    let query = "Thing.where(branch_key == 7).select(active)";
+    let kernel = parse_resolve_plan_build_physical_and_execute_query(
+        &bytes,
+        query,
+        ParseOptions::default(),
+        protected_json_resolve_options(),
+        PlanOptions::default(),
+        PhysicalPlanOptions::default(),
+        ExecutionOptions::default(),
+        KernelExecutionOptions {
+            mode: KernelExecutionMode::CompareWithMaterialized,
+            ..KernelExecutionOptions::default()
+        },
+        validation_options(),
+    )
+    .unwrap();
+    let materialized = parse_resolve_plan_and_execute_query(
+        &bytes,
+        query,
+        ParseOptions::default(),
+        protected_json_resolve_options(),
+        PlanOptions::default(),
+        ExecutionOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        kernel.executed.output_fingerprint,
+        materialized.output_fingerprint
+    );
+    assert!(kernel.executed.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "W_NATIVE_SCALAR_LITERAL_PRUNE_EXECUTED"
+            && diagnostic.safe_details["predicate_count"] == json!(1)
+            && diagnostic.safe_details["page_count"] == json!(1)
+            && diagnostic.safe_details["matched_rows"] == json!(2)
+            && diagnostic.safe_details["predicate_order"] == json!(["system_numeric"])
+            && diagnostic.safe_details["residual_verification"] == json!(false)
+    }));
+    assert_eq!(kernel.kernel_report.counters.rows_after_bitmap, 2);
+}
+
+#[test]
+fn kernel_native_scalar_timestamp_row_directory_prefilter_matches_materialized() {
+    let bytes = object_file_with_bool_records(&[true, false, true]);
+    let query = "Thing.where(timestamp_us >= 11).select(active)";
+    let kernel = parse_resolve_plan_build_physical_and_execute_query(
+        &bytes,
+        query,
+        ParseOptions::default(),
+        protected_json_resolve_options(),
+        PlanOptions::default(),
+        PhysicalPlanOptions::default(),
+        ExecutionOptions::default(),
+        KernelExecutionOptions {
+            mode: KernelExecutionMode::CompareWithMaterialized,
+            ..KernelExecutionOptions::default()
+        },
+        validation_options(),
+    )
+    .unwrap();
+    let materialized = parse_resolve_plan_and_execute_query(
+        &bytes,
+        query,
+        ParseOptions::default(),
+        protected_json_resolve_options(),
+        PlanOptions::default(),
+        ExecutionOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        kernel.executed.output_fingerprint,
+        materialized.output_fingerprint
+    );
+    assert!(kernel.executed.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "W_NATIVE_SCALAR_LITERAL_PRUNE_EXECUTED"
+            && diagnostic.safe_details["predicate_count"] == json!(1)
+            && diagnostic.safe_details["page_count"] == json!(1)
+            && diagnostic.safe_details["matched_rows"] == json!(2)
+            && diagnostic.safe_details["predicate_order"] == json!(["system_numeric"])
+            && diagnostic.safe_details["residual_verification"] == json!(false)
+    }));
+    assert_eq!(kernel.kernel_report.counters.rows_after_bitmap, 2);
+}
+
+#[test]
+fn kernel_native_scalar_predicates_are_cost_ordered_before_bitmap_intersection() {
+    let bytes = object_file_with_bool_records(&[true, false, true]);
+    let query = "Thing.where(active == true && csn >= 2).select(active)";
+    let kernel = parse_resolve_plan_build_physical_and_execute_query(
+        &bytes,
+        query,
+        ParseOptions::default(),
+        protected_json_resolve_options(),
+        PlanOptions::default(),
+        PhysicalPlanOptions::default(),
+        ExecutionOptions::default(),
+        KernelExecutionOptions {
+            mode: KernelExecutionMode::CompareWithMaterialized,
+            ..KernelExecutionOptions::default()
+        },
+        validation_options(),
+    )
+    .unwrap();
+    let materialized = parse_resolve_plan_and_execute_query(
+        &bytes,
+        query,
+        ParseOptions::default(),
+        protected_json_resolve_options(),
+        PlanOptions::default(),
+        ExecutionOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        kernel.executed.output_fingerprint,
+        materialized.output_fingerprint
+    );
+    assert!(kernel.executed.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "W_NATIVE_SCALAR_LITERAL_PRUNE_EXECUTED"
+            && diagnostic.safe_details["predicate_count"] == json!(2)
+            && diagnostic.safe_details["page_count"] == json!(2)
+            && diagnostic.safe_details["matched_rows"] == json!(1)
+            && diagnostic.safe_details["predicate_order"] == json!(["system_numeric", "bool_eq"])
+            && diagnostic.safe_details["bitmap_intersections"] == json!(1)
+            && diagnostic.safe_details["residual_verification"] == json!(false)
+    }));
+    assert!(kernel.kernel_report.decisions.iter().any(|decision| {
+        decision
+            .reason
+            .contains("native scalar page-lane predicate")
+            && decision.safe_details["predicate_order"] == json!(["system_numeric", "bool_eq"])
+            && decision.safe_details["matched_rows"] == json!(1)
+            && decision.safe_details["residual_verification"] == json!(false)
+    }));
+    assert_eq!(kernel.kernel_report.counters.rows_after_bitmap, 1);
+}
+
+#[test]
+fn kernel_native_scalar_predicates_short_circuit_after_empty_ordered_bitmap() {
+    let bytes = object_file_with_bool_records(&[true, false, true]);
+    let query = "Thing.where(active == true && csn > 99).select(active)";
+    let kernel = parse_resolve_plan_build_physical_and_execute_query(
+        &bytes,
+        query,
+        ParseOptions::default(),
+        protected_json_resolve_options(),
+        PlanOptions::default(),
+        PhysicalPlanOptions::default(),
+        ExecutionOptions::default(),
+        KernelExecutionOptions {
+            mode: KernelExecutionMode::CompareWithMaterialized,
+            ..KernelExecutionOptions::default()
+        },
+        validation_options(),
+    )
+    .unwrap();
+    let materialized = parse_resolve_plan_and_execute_query(
+        &bytes,
+        query,
+        ParseOptions::default(),
+        protected_json_resolve_options(),
+        PlanOptions::default(),
+        ExecutionOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        kernel.executed.output_fingerprint,
+        materialized.output_fingerprint
+    );
+    assert!(kernel.executed.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "W_NATIVE_SCALAR_LITERAL_PRUNE_EXECUTED"
+            && diagnostic.safe_details["predicate_count"] == json!(2)
+            && diagnostic.safe_details["executed_predicate_count"] == json!(1)
+            && diagnostic.safe_details["page_count"] == json!(1)
+            && diagnostic.safe_details["matched_rows"] == json!(0)
+            && diagnostic.safe_details["predicate_order"] == json!(["system_numeric", "bool_eq"])
+            && diagnostic.safe_details["bitmap_intersections"] == json!(0)
+            && diagnostic.safe_details["short_circuited"] == json!(true)
+            && diagnostic.safe_details["residual_verification"] == json!(false)
+    }));
+    assert!(kernel.kernel_report.decisions.iter().any(|decision| {
+        decision
+            .reason
+            .contains("native scalar page-lane predicate")
+            && decision.safe_details["executed_predicate_count"] == json!(1)
+            && decision.safe_details["short_circuited"] == json!(true)
+            && decision.safe_details["matched_rows"] == json!(0)
+            && decision.safe_details["residual_verification"] == json!(false)
+    }));
+    assert_eq!(kernel.kernel_report.counters.rows_after_bitmap, 0);
+}
+
+#[test]
+fn kernel_native_scalar_goid_row_directory_prefilter_matches_materialized_without_pushdown() {
+    let bytes = object_file_with_bool_records(&[true, false, true]);
+    let query = r#"Thing.where(goid == uuid"00000000-0000-0000-0000-000000000000").select(active)"#;
+    let execution_options = ExecutionOptions {
+        pushdown: PushdownOptions {
+            enabled: false,
+            ..PushdownOptions::default()
+        },
+        ..ExecutionOptions::default()
+    };
+    let kernel = parse_resolve_plan_build_physical_and_execute_query(
+        &bytes,
+        query,
+        ParseOptions::default(),
+        protected_json_resolve_options(),
+        PlanOptions::default(),
+        PhysicalPlanOptions::default(),
+        execution_options.clone(),
+        KernelExecutionOptions {
+            mode: KernelExecutionMode::CompareWithMaterialized,
+            ..KernelExecutionOptions::default()
+        },
+        validation_options(),
+    )
+    .unwrap();
+    let materialized = parse_resolve_plan_and_execute_query(
+        &bytes,
+        query,
+        ParseOptions::default(),
+        protected_json_resolve_options(),
+        PlanOptions::default(),
+        execution_options,
+        validation_options(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        kernel.executed.output_fingerprint,
+        materialized.output_fingerprint
+    );
+    assert!(kernel.executed.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "W_NATIVE_SCALAR_LITERAL_PRUNE_EXECUTED"
+            && diagnostic.safe_details["predicate_count"] == json!(1)
+            && diagnostic.safe_details["page_count"] == json!(1)
+            && diagnostic.safe_details["matched_rows"] == json!(1)
+            && diagnostic.safe_details["residual_verification"] == json!(false)
+    }));
+    assert_eq!(kernel.kernel_report.counters.rows_after_bitmap, 1);
+}
+
+#[test]
+fn kernel_native_scalar_fixed_bytes_page_lane_prefilter_matches_materialized() {
+    let first = [1u8; 16];
+    let second = [2u8; 16];
+    let bytes = object_file_with_plain_fixed_uuid_records(&[first, second, first]);
+    let query =
+        r#"UuidFixedThing.where(uid == uuid"01010101-0101-0101-0101-010101010101").select(uid)"#;
+    let kernel = parse_resolve_plan_build_physical_and_execute_query(
+        &bytes,
+        query,
+        ParseOptions::default(),
+        protected_json_resolve_options(),
+        PlanOptions::default(),
+        PhysicalPlanOptions::default(),
+        ExecutionOptions::default(),
+        KernelExecutionOptions {
+            mode: KernelExecutionMode::CompareWithMaterialized,
+            ..KernelExecutionOptions::default()
+        },
+        validation_options(),
+    )
+    .unwrap();
+    let materialized = parse_resolve_plan_and_execute_query(
+        &bytes,
+        query,
+        ParseOptions::default(),
+        protected_json_resolve_options(),
+        PlanOptions::default(),
+        ExecutionOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        kernel.executed.output_fingerprint,
+        materialized.output_fingerprint
+    );
+    assert!(kernel.executed.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "W_NATIVE_SCALAR_LITERAL_PRUNE_EXECUTED"
+            && diagnostic.safe_details["predicate_count"] == json!(1)
+            && diagnostic.safe_details["page_count"] == json!(1)
+            && diagnostic.safe_details["matched_rows"] == json!(2)
+            && diagnostic.safe_details["residual_verification"] == json!(false)
+    }));
+    assert!(kernel.kernel_report.decisions.iter().any(|decision| {
+        decision
+            .reason
+            .contains("native scalar page-lane predicate")
+            && decision.safe_details["matched_rows"] == json!(2)
+            && decision.safe_details["residual_verification"] == json!(false)
+    }));
+    assert_eq!(kernel.kernel_report.counters.rows_after_bitmap, 2);
+}
+
+#[test]
+fn retained_kernel_native_scalar_numcode_page_lane_prefilter_uses_retained_buffers() {
+    let bytes = object_file_with_numcode_records(&[5, 10, 20, 30]);
+    let query = "MetricThing.where(metric >= 10).select(metric)";
+    let kernel = parse_resolve_plan_build_physical_and_execute_query_retained(
+        CoveQlRetainedInput::from_arc(Arc::new(bytes.clone())),
+        query,
+        ParseOptions::default(),
+        protected_json_resolve_options(),
+        PlanOptions::default(),
+        PhysicalPlanOptions::default(),
+        ExecutionOptions::default(),
+        KernelExecutionOptions {
+            mode: KernelExecutionMode::CompareWithMaterialized,
+            ..KernelExecutionOptions::default()
+        },
+        validation_options(),
+    )
+    .unwrap();
+    let materialized = parse_resolve_plan_and_execute_query(
+        &bytes,
+        query,
+        ParseOptions::default(),
+        protected_json_resolve_options(),
+        PlanOptions::default(),
+        ExecutionOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        kernel.executed.output_fingerprint,
+        materialized.output_fingerprint
+    );
+    assert!(kernel.executed.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "W_NATIVE_SCALAR_LITERAL_PRUNE_EXECUTED"
+            && diagnostic.safe_details["predicate_count"] == json!(1)
+            && diagnostic.safe_details["page_count"] == json!(1)
+            && diagnostic.safe_details["matched_rows"] == json!(3)
+            && diagnostic.safe_details["retained_page_buffers"] == json!(true)
+    }));
+    assert!(kernel.kernel_report.decisions.iter().any(|decision| {
+        decision
+            .reason
+            .contains("native scalar page-lane predicate")
+            && decision.safe_details["retained_page_buffers"] == json!(true)
+            && decision.safe_details["matched_rows"] == json!(3)
+    }));
+    assert_eq!(kernel.kernel_report.counters.rows_after_bitmap, 3);
+}
+
+#[test]
+fn retained_kernel_native_scalar_csn_row_directory_prefilter_uses_retained_buffers() {
+    let bytes = object_file_with_bool_records(&[true, false, true]);
+    let query = "Thing.where(csn >= 2).select(active)";
+    let kernel = parse_resolve_plan_build_physical_and_execute_query_retained(
+        CoveQlRetainedInput::from_arc(Arc::new(bytes.clone())),
+        query,
+        ParseOptions::default(),
+        protected_json_resolve_options(),
+        PlanOptions::default(),
+        PhysicalPlanOptions::default(),
+        ExecutionOptions::default(),
+        KernelExecutionOptions {
+            mode: KernelExecutionMode::CompareWithMaterialized,
+            ..KernelExecutionOptions::default()
+        },
+        validation_options(),
+    )
+    .unwrap();
+    let materialized = parse_resolve_plan_and_execute_query(
+        &bytes,
+        query,
+        ParseOptions::default(),
+        protected_json_resolve_options(),
+        PlanOptions::default(),
+        ExecutionOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        kernel.executed.output_fingerprint,
+        materialized.output_fingerprint
+    );
+    assert!(kernel.executed.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "W_NATIVE_SCALAR_LITERAL_PRUNE_EXECUTED"
+            && diagnostic.safe_details["predicate_count"] == json!(1)
+            && diagnostic.safe_details["page_count"] == json!(1)
+            && diagnostic.safe_details["matched_rows"] == json!(2)
+            && diagnostic.safe_details["retained_page_buffers"] == json!(true)
+    }));
+    assert!(kernel.kernel_report.decisions.iter().any(|decision| {
+        decision
+            .reason
+            .contains("native scalar page-lane predicate")
+            && decision.safe_details["retained_page_buffers"] == json!(true)
+            && decision.safe_details["matched_rows"] == json!(2)
+    }));
+    assert_eq!(kernel.kernel_report.counters.rows_after_bitmap, 2);
+}
+
+#[test]
+fn kernel_native_scalar_fixed_bytes_in_page_lane_prefilter_matches_materialized() {
+    let first = [1u8; 16];
+    let second = [2u8; 16];
+    let bytes = object_file_with_plain_fixed_uuid_records(&[first, second, first]);
+    let query = r#"UuidFixedThing.where(uid in [uuid"01010101-0101-0101-0101-010101010101", uuid"02020202-0202-0202-0202-020202020202"]).select(uid)"#;
+    let kernel = parse_resolve_plan_build_physical_and_execute_query(
+        &bytes,
+        query,
+        ParseOptions::default(),
+        protected_json_resolve_options(),
+        PlanOptions::default(),
+        PhysicalPlanOptions::default(),
+        ExecutionOptions::default(),
+        KernelExecutionOptions {
+            mode: KernelExecutionMode::CompareWithMaterialized,
+            ..KernelExecutionOptions::default()
+        },
+        validation_options(),
+    )
+    .unwrap();
+    let materialized = parse_resolve_plan_and_execute_query(
+        &bytes,
+        query,
+        ParseOptions::default(),
+        protected_json_resolve_options(),
+        PlanOptions::default(),
+        ExecutionOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        kernel.executed.output_fingerprint,
+        materialized.output_fingerprint
+    );
+    assert!(kernel.executed.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "W_NATIVE_SCALAR_LITERAL_PRUNE_EXECUTED"
+            && diagnostic.safe_details["predicate_count"] == json!(1)
+            && diagnostic.safe_details["page_count"] == json!(1)
+            && diagnostic.safe_details["matched_rows"] == json!(3)
+            && diagnostic.safe_details["predicate_order"] == json!(["fixed_bytes_in"])
+            && diagnostic.safe_details["residual_verification"] == json!(false)
+    }));
+    assert_eq!(kernel.kernel_report.counters.rows_after_bitmap, 3);
+    assert_eq!(kernel.kernel_report.counters.residual_rows_checked, 0);
+}
+
+#[test]
+fn kernel_native_scalar_fixed_bytes_not_in_page_lane_prefilter_matches_materialized() {
+    let first = [1u8; 16];
+    let second = [2u8; 16];
+    let bytes = object_file_with_plain_fixed_uuid_records(&[first, second, first]);
+    let query = r#"UuidFixedThing.where(!(uid in [uuid"01010101-0101-0101-0101-010101010101"])).select(uid)"#;
+    let kernel = parse_resolve_plan_build_physical_and_execute_query(
+        &bytes,
+        query,
+        ParseOptions::default(),
+        protected_json_resolve_options(),
+        PlanOptions::default(),
+        PhysicalPlanOptions::default(),
+        ExecutionOptions::default(),
+        KernelExecutionOptions {
+            mode: KernelExecutionMode::CompareWithMaterialized,
+            ..KernelExecutionOptions::default()
+        },
+        validation_options(),
+    )
+    .unwrap();
+    let materialized = parse_resolve_plan_and_execute_query(
+        &bytes,
+        query,
+        ParseOptions::default(),
+        protected_json_resolve_options(),
+        PlanOptions::default(),
+        ExecutionOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        kernel.executed.output_fingerprint,
+        materialized.output_fingerprint
+    );
+    let CoveQlExecutionResult::JsonRows(rows) = kernel.executed.result else {
+        panic!("expected JSON rows");
+    };
+    assert_eq!(
+        rows,
+        vec![json!({"uid": "02020202020202020202020202020202"})]
+    );
+    assert!(kernel.executed.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "W_NATIVE_SCALAR_LITERAL_PRUNE_EXECUTED"
+            && diagnostic.safe_details["predicate_count"] == json!(1)
+            && diagnostic.safe_details["page_count"] == json!(1)
+            && diagnostic.safe_details["matched_rows"] == json!(1)
+            && diagnostic.safe_details["predicate_order"] == json!(["fixed_bytes_not_in"])
+            && diagnostic.safe_details["residual_verification"] == json!(false)
+    }));
+    assert_eq!(kernel.kernel_report.counters.rows_after_bitmap, 1);
+    assert_eq!(kernel.kernel_report.counters.residual_rows_checked, 0);
+}
+
+#[test]
+fn kernel_native_scalar_fixed_bytes_not_equal_page_lane_prefilter_matches_materialized() {
+    let first = [1u8; 16];
+    let second = [2u8; 16];
+    let bytes = object_file_with_plain_fixed_uuid_records(&[first, second, first]);
+    let query =
+        r#"UuidFixedThing.where(uid != uuid"01010101-0101-0101-0101-010101010101").select(uid)"#;
+    let kernel = parse_resolve_plan_build_physical_and_execute_query(
+        &bytes,
+        query,
+        ParseOptions::default(),
+        protected_json_resolve_options(),
+        PlanOptions::default(),
+        PhysicalPlanOptions::default(),
+        ExecutionOptions::default(),
+        KernelExecutionOptions {
+            mode: KernelExecutionMode::CompareWithMaterialized,
+            ..KernelExecutionOptions::default()
+        },
+        validation_options(),
+    )
+    .unwrap();
+    let materialized = parse_resolve_plan_and_execute_query(
+        &bytes,
+        query,
+        ParseOptions::default(),
+        protected_json_resolve_options(),
+        PlanOptions::default(),
+        ExecutionOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        kernel.executed.output_fingerprint,
+        materialized.output_fingerprint
+    );
+    let CoveQlExecutionResult::JsonRows(rows) = kernel.executed.result else {
+        panic!("expected JSON rows");
+    };
+    assert_eq!(
+        rows,
+        vec![json!({"uid": "02020202020202020202020202020202"})]
+    );
+    assert!(kernel.executed.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "W_NATIVE_SCALAR_LITERAL_PRUNE_EXECUTED"
+            && diagnostic.safe_details["predicate_count"] == json!(1)
+            && diagnostic.safe_details["page_count"] == json!(1)
+            && diagnostic.safe_details["matched_rows"] == json!(1)
+            && diagnostic.safe_details["predicate_order"] == json!(["fixed_bytes_not_in"])
+            && diagnostic.safe_details["residual_verification"] == json!(false)
+    }));
+    assert_eq!(kernel.kernel_report.counters.rows_after_bitmap, 1);
+    assert_eq!(kernel.kernel_report.counters.residual_rows_checked, 0);
+}
+
+#[test]
+fn retained_kernel_native_scalar_fixed_bytes_page_lane_prefilter_uses_retained_buffers() {
+    let first = [1u8; 16];
+    let second = [2u8; 16];
+    let bytes = object_file_with_plain_fixed_uuid_records(&[first, second, first]);
+    let query =
+        r#"UuidFixedThing.where(uid == uuid"01010101-0101-0101-0101-010101010101").select(uid)"#;
+    let kernel = parse_resolve_plan_build_physical_and_execute_query_retained(
+        CoveQlRetainedInput::from_arc(Arc::new(bytes.clone())),
+        query,
+        ParseOptions::default(),
+        protected_json_resolve_options(),
+        PlanOptions::default(),
+        PhysicalPlanOptions::default(),
+        ExecutionOptions::default(),
+        KernelExecutionOptions {
+            mode: KernelExecutionMode::CompareWithMaterialized,
+            ..KernelExecutionOptions::default()
+        },
+        validation_options(),
+    )
+    .unwrap();
+    let materialized = parse_resolve_plan_and_execute_query(
+        &bytes,
+        query,
+        ParseOptions::default(),
+        protected_json_resolve_options(),
+        PlanOptions::default(),
+        ExecutionOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        kernel.executed.output_fingerprint,
+        materialized.output_fingerprint
+    );
+    assert!(kernel.executed.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "W_NATIVE_SCALAR_LITERAL_PRUNE_EXECUTED"
+            && diagnostic.safe_details["predicate_count"] == json!(1)
+            && diagnostic.safe_details["page_count"] == json!(1)
+            && diagnostic.safe_details["matched_rows"] == json!(2)
+            && diagnostic.safe_details["retained_page_buffers"] == json!(true)
+    }));
+    assert!(kernel.kernel_report.decisions.iter().any(|decision| {
+        decision
+            .reason
+            .contains("native scalar page-lane predicate")
+            && decision.safe_details["retained_page_buffers"] == json!(true)
+            && decision.safe_details["matched_rows"] == json!(2)
+    }));
+    assert_eq!(kernel.kernel_report.counters.rows_after_bitmap, 2);
 }
 
 #[test]
@@ -17302,12 +19679,13 @@ fn kernel_single_file_filecode_equality_executes_with_exact_native_authority() {
             && diagnostic.safe_details["predicate_count"] == json!(1)
             && diagnostic.safe_details["matched_rows"] == json!(2)
             && diagnostic.safe_details["dataset_file_count"] == json!(1)
+            && diagnostic.safe_details["residual_verification"] == json!(false)
     }));
     assert!(kernel.kernel_report.decisions.iter().any(|decision| {
         decision
             .reason
             .contains("single-file FileCode literal predicate")
-            && decision.safe_details["residual_verification"] == json!(true)
+            && decision.safe_details["residual_verification"] == json!(false)
             && decision.safe_details["bridge_required"] == json!(false)
     }));
 }
@@ -17731,6 +20109,235 @@ fn kernel_auto_in_list_matches_materialized_output_without_compare_mode() {
         kernel.kernel_report.decision.safe_details["residual_verification"],
         json!(false)
     );
+}
+
+#[test]
+fn kernel_native_scalar_bool_in_single_value_uses_bool_lane() {
+    let bytes = object_file_with_bool_records(&[true, false, true]);
+    let query = "Thing.where(active in [true]).select(active)";
+    let kernel = parse_resolve_plan_build_physical_and_execute_query(
+        &bytes,
+        query,
+        ParseOptions::default(),
+        protected_json_resolve_options(),
+        PlanOptions::default(),
+        PhysicalPlanOptions::default(),
+        ExecutionOptions::default(),
+        KernelExecutionOptions {
+            mode: KernelExecutionMode::CompareWithMaterialized,
+            ..KernelExecutionOptions::default()
+        },
+        validation_options(),
+    )
+    .unwrap();
+    let materialized = parse_resolve_plan_and_execute_query(
+        &bytes,
+        query,
+        ParseOptions::default(),
+        protected_json_resolve_options(),
+        PlanOptions::default(),
+        ExecutionOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        kernel.executed.output_fingerprint,
+        materialized.output_fingerprint
+    );
+    assert!(kernel.executed.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "W_NATIVE_SCALAR_LITERAL_PRUNE_EXECUTED"
+            && diagnostic.safe_details["matched_rows"] == json!(2)
+            && diagnostic.safe_details["predicate_order"] == json!(["bool_eq"])
+            && diagnostic.safe_details["residual_verification"] == json!(false)
+    }));
+    assert_eq!(kernel.kernel_report.counters.rows_after_bitmap, 2);
+    assert_eq!(kernel.kernel_report.counters.residual_rows_checked, 0);
+}
+
+#[test]
+fn kernel_native_scalar_bool_not_in_single_value_uses_bool_lane() {
+    let bytes = object_file_with_bool_records(&[true, false, true]);
+    let query = "Thing.where(!(active in [true])).select(active)";
+    let kernel = parse_resolve_plan_build_physical_and_execute_query(
+        &bytes,
+        query,
+        ParseOptions::default(),
+        protected_json_resolve_options(),
+        PlanOptions::default(),
+        PhysicalPlanOptions::default(),
+        ExecutionOptions::default(),
+        KernelExecutionOptions {
+            mode: KernelExecutionMode::CompareWithMaterialized,
+            ..KernelExecutionOptions::default()
+        },
+        validation_options(),
+    )
+    .unwrap();
+    let materialized = parse_resolve_plan_and_execute_query(
+        &bytes,
+        query,
+        ParseOptions::default(),
+        protected_json_resolve_options(),
+        PlanOptions::default(),
+        ExecutionOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        kernel.executed.output_fingerprint,
+        materialized.output_fingerprint
+    );
+    let CoveQlExecutionResult::JsonRows(rows) = kernel.executed.result else {
+        panic!("expected JSON rows");
+    };
+    assert_eq!(rows, vec![json!({"active": false})]);
+    assert!(kernel.executed.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "W_NATIVE_SCALAR_LITERAL_PRUNE_EXECUTED"
+            && diagnostic.safe_details["matched_rows"] == json!(1)
+            && diagnostic.safe_details["predicate_order"] == json!(["bool_eq"])
+            && diagnostic.safe_details["residual_verification"] == json!(false)
+    }));
+    assert_eq!(kernel.kernel_report.counters.rows_after_bitmap, 1);
+    assert_eq!(kernel.kernel_report.counters.residual_rows_checked, 0);
+}
+
+#[test]
+fn kernel_native_scalar_bool_not_equal_uses_bool_lane() {
+    let bytes = object_file_with_bool_records(&[true, false, true]);
+    let query = "Thing.where(active != true).select(active)";
+    let kernel = parse_resolve_plan_build_physical_and_execute_query(
+        &bytes,
+        query,
+        ParseOptions::default(),
+        protected_json_resolve_options(),
+        PlanOptions::default(),
+        PhysicalPlanOptions::default(),
+        ExecutionOptions::default(),
+        KernelExecutionOptions {
+            mode: KernelExecutionMode::CompareWithMaterialized,
+            ..KernelExecutionOptions::default()
+        },
+        validation_options(),
+    )
+    .unwrap();
+    let materialized = parse_resolve_plan_and_execute_query(
+        &bytes,
+        query,
+        ParseOptions::default(),
+        protected_json_resolve_options(),
+        PlanOptions::default(),
+        ExecutionOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        kernel.executed.output_fingerprint,
+        materialized.output_fingerprint
+    );
+    let CoveQlExecutionResult::JsonRows(rows) = kernel.executed.result else {
+        panic!("expected JSON rows");
+    };
+    assert_eq!(rows, vec![json!({"active": false})]);
+    assert!(kernel.executed.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "W_NATIVE_SCALAR_LITERAL_PRUNE_EXECUTED"
+            && diagnostic.safe_details["matched_rows"] == json!(1)
+            && diagnostic.safe_details["predicate_order"] == json!(["bool_eq"])
+            && diagnostic.safe_details["residual_verification"] == json!(false)
+    }));
+    assert_eq!(kernel.kernel_report.counters.rows_after_bitmap, 1);
+    assert_eq!(kernel.kernel_report.counters.residual_rows_checked, 0);
+}
+
+#[test]
+fn kernel_native_scalar_bool_in_all_values_uses_validity_lane() {
+    let bytes = object_file_with_nullable_bool_records(&[Some(true), None, Some(false)]);
+    let query = "Thing.where(active in [true, false]).select(active)";
+    let kernel = parse_resolve_plan_build_physical_and_execute_query(
+        &bytes,
+        query,
+        ParseOptions::default(),
+        protected_json_resolve_options(),
+        PlanOptions::default(),
+        PhysicalPlanOptions::default(),
+        ExecutionOptions::default(),
+        KernelExecutionOptions {
+            mode: KernelExecutionMode::CompareWithMaterialized,
+            ..KernelExecutionOptions::default()
+        },
+        validation_options(),
+    )
+    .unwrap();
+    let materialized = parse_resolve_plan_and_execute_query(
+        &bytes,
+        query,
+        ParseOptions::default(),
+        protected_json_resolve_options(),
+        PlanOptions::default(),
+        ExecutionOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        kernel.executed.output_fingerprint,
+        materialized.output_fingerprint
+    );
+    assert!(kernel.executed.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "W_NATIVE_SCALAR_LITERAL_PRUNE_EXECUTED"
+            && diagnostic.safe_details["matched_rows"] == json!(2)
+            && diagnostic.safe_details["predicate_order"] == json!(["null_check"])
+            && diagnostic.safe_details["residual_verification"] == json!(false)
+    }));
+    assert_eq!(kernel.kernel_report.counters.rows_after_bitmap, 2);
+    assert_eq!(kernel.kernel_report.counters.residual_rows_checked, 0);
+}
+
+#[test]
+fn kernel_not_in_list_with_null_literal_keeps_residual_three_valued_logic() {
+    let bytes = object_file_with_bool_records(&[true, false]);
+    let query = "Thing.where(!(active in [true, null])).select(active)";
+    let kernel = parse_resolve_plan_build_physical_and_execute_query(
+        &bytes,
+        query,
+        ParseOptions::default(),
+        protected_json_resolve_options(),
+        PlanOptions::default(),
+        PhysicalPlanOptions::default(),
+        ExecutionOptions::default(),
+        KernelExecutionOptions {
+            mode: KernelExecutionMode::CompareWithMaterialized,
+            ..KernelExecutionOptions::default()
+        },
+        validation_options(),
+    )
+    .unwrap();
+    let materialized = parse_resolve_plan_and_execute_query(
+        &bytes,
+        query,
+        ParseOptions::default(),
+        protected_json_resolve_options(),
+        PlanOptions::default(),
+        ExecutionOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        kernel.executed.output_fingerprint,
+        materialized.output_fingerprint
+    );
+    let CoveQlExecutionResult::JsonRows(rows) = kernel.executed.result else {
+        panic!("expected JSON rows");
+    };
+    assert!(rows.is_empty());
+    assert!(!kernel
+        .executed
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "W_NATIVE_SCALAR_LITERAL_PRUNE_EXECUTED"));
 }
 
 #[test]
@@ -19001,11 +21608,10 @@ fn execution_code_filecode_prune_matches_materialized_kernel_output() {
         .diagnostics
         .iter()
         .any(|diagnostic| diagnostic.code == "W_EXECUTION_CODE_REMAP_EXECUTED"));
-    assert!(kernel
-        .kernel_report
-        .decisions
-        .iter()
-        .any(|decision| decision.reason.contains("execution-code remap was used")));
+    assert!(kernel.kernel_report.decisions.iter().any(|decision| {
+        decision.reason.contains("execution-code remap was used")
+            && decision.safe_details["residual_verification"] == json!(false)
+    }));
 }
 
 #[test]
@@ -19082,6 +21688,10 @@ fn execution_code_filecode_bool_prune_matches_materialized_kernel_output() {
         execution_domains_debug,
         kernel.executed.diagnostics
     );
+    assert!(kernel.executed.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "W_EXECUTION_CODE_REMAP_EXECUTED"
+            && diagnostic.safe_details["residual_verification"] == json!(false)
+    }));
 }
 
 #[test]
@@ -19330,10 +21940,12 @@ fn execution_code_filecode_or_prune_matches_materialized_kernel_output() {
         diagnostic.code == "W_EXECUTION_CODE_REMAP_EXECUTED"
             && diagnostic.safe_details["predicate_count"] == json!(1)
             && diagnostic.safe_details["matched_rows"] == json!(3)
+            && diagnostic.safe_details["residual_verification"] == json!(false)
     }));
     assert!(kernel.kernel_report.decisions.iter().any(|decision| {
         decision.reason.contains("execution-code remap was used")
             && decision.safe_details["matched_rows"] == json!(3)
+            && decision.safe_details["residual_verification"] == json!(false)
     }));
 }
 
@@ -19786,25 +22398,34 @@ fn kernel_force_mode_executes_direct_aggregates_with_exact_native_contract() {
         object_file_with_nullable_bool_records(&[Some(true), None, Some(false), Some(true)]);
     let mut resolve_options = json_resolve_options();
     resolve_options.security.aggregate_disclosure_policy = AggregateDisclosurePolicy::AllowExact;
-    for (query, expected, aggregate, counted_path) in [
-        ("Thing.select(n: count(*))", json!({"n": 4}), "count", None),
+    for (query, expected, aggregate, counted_path, strategy) in [
+        (
+            "Thing.select(n: count(*))",
+            json!({"n": 4}),
+            "count",
+            None,
+            "row_count",
+        ),
         (
             "Thing.select(n: count(active))",
             json!({"n": 3}),
             "count",
             Some("active"),
+            "single_pass_value_ref",
         ),
         (
             "Thing.select(e: exists(active))",
             json!({"e": true}),
             "exists",
             Some("active"),
+            "single_pass_value_ref",
         ),
         (
             "Thing.select(d: distinct_count(active))",
             json!({"d": 2}),
             "distinct_count",
             Some("active"),
+            "single_pass_value_ref",
         ),
     ] {
         let kernel = parse_resolve_plan_build_physical_and_execute_query(
@@ -19869,6 +22490,12 @@ fn kernel_force_mode_executes_direct_aggregates_with_exact_native_contract() {
                 && diagnostic.safe_details["aggregate"] == json!(aggregate)
                 && diagnostic.safe_details["counted_path"]
                     == counted_path.map_or(serde_json::Value::Null, |path| json!(path))
+                && diagnostic.safe_details["aggregate_strategy"] == json!(strategy)
+        }));
+        assert!(kernel.kernel_report.decisions.iter().any(|decision| {
+            decision.reason.contains("native direct aggregate")
+                && decision.safe_details["aggregate"] == json!(aggregate)
+                && decision.safe_details["aggregate_strategy"] == json!(strategy)
         }));
     }
 }
@@ -20014,6 +22641,7 @@ fn kernel_force_mode_executes_min_max_numcode_aggregates_with_exact_native_contr
             diagnostic.code == "W_KERNEL_NATIVE_DIRECT_AGGREGATE_EXECUTED"
                 && diagnostic.safe_details["aggregate"] == json!(aggregate)
                 && diagnostic.safe_details["counted_path"] == json!("metric")
+                && diagnostic.safe_details["aggregate_strategy"] == json!("single_pass_typed_order")
         }));
     }
 }
@@ -20088,6 +22716,8 @@ fn kernel_force_mode_executes_sum_avg_numcode_aggregates_with_exact_native_contr
             diagnostic.code == "W_KERNEL_NATIVE_DIRECT_AGGREGATE_EXECUTED"
                 && diagnostic.safe_details["aggregate"] == json!(aggregate)
                 && diagnostic.safe_details["counted_path"] == json!("metric")
+                && diagnostic.safe_details["aggregate_strategy"]
+                    == json!("single_pass_typed_numeric")
         }));
     }
 }
@@ -20313,7 +22943,74 @@ fn kernel_force_mode_executes_bool_group_count_with_exact_native_contract() {
         .executed
         .diagnostics
         .iter()
-        .any(|diagnostic| diagnostic.code == "W_KERNEL_NATIVE_BOOL_GROUP_COUNT_EXECUTED"));
+        .any(
+            |diagnostic| diagnostic.code == "W_KERNEL_NATIVE_BOOL_GROUP_COUNT_EXECUTED"
+                && diagnostic.safe_details["group_strategy"] == json!("dense_bool_star")
+                && diagnostic.safe_details["aggregate_strategy"] == json!("row_count")
+        ));
+    assert!(kernel.kernel_report.decisions.iter().any(|decision| {
+        decision.reason.contains("native direct grouped aggregate")
+            && decision.safe_details["group_strategy"] == json!("dense_bool_star")
+            && decision.safe_details["aggregate_strategy"] == json!("row_count")
+    }));
+}
+
+#[test]
+fn kernel_force_mode_dense_bool_group_count_preserves_null_group_order() {
+    let bytes =
+        object_file_with_nullable_bool_records(&[Some(false), None, Some(true), Some(true)]);
+    let query = "Thing.groupBy(active).select(active, n: count(*))";
+    let mut resolve_options = json_resolve_options();
+    resolve_options.security.aggregate_disclosure_policy = AggregateDisclosurePolicy::AllowExact;
+    let kernel = parse_resolve_plan_build_physical_and_execute_query(
+        &bytes,
+        query,
+        ParseOptions::default(),
+        resolve_options.clone(),
+        PlanOptions::default(),
+        PhysicalPlanOptions::default(),
+        ExecutionOptions::default(),
+        KernelExecutionOptions {
+            mode: KernelExecutionMode::ForceKernel,
+            ..KernelExecutionOptions::default()
+        },
+        validation_options(),
+    )
+    .unwrap();
+    let materialized = parse_resolve_plan_and_execute_query(
+        &bytes,
+        query,
+        ParseOptions::default(),
+        resolve_options,
+        PlanOptions::default(),
+        ExecutionOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        kernel.executed.output_fingerprint,
+        materialized.output_fingerprint
+    );
+    let CoveQlExecutionResult::JsonRows(rows) = kernel.executed.result else {
+        panic!("expected JSON rows");
+    };
+    assert_eq!(
+        rows,
+        vec![
+            json!({"active": false, "n": 1}),
+            json!({"active": null, "n": 1}),
+            json!({"active": true, "n": 2})
+        ]
+    );
+    assert!(kernel.executed.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "W_KERNEL_NATIVE_BOOL_GROUP_COUNT_EXECUTED"
+            && diagnostic.safe_details["group_strategy"] == json!("dense_bool_star")
+            && diagnostic.safe_details["aggregate_strategy"] == json!("row_count")
+            && diagnostic.safe_details["group_count"] == json!(3)
+            && diagnostic.safe_details["rows_counted"] == json!(4)
+            && diagnostic.safe_details["values_seen"] == json!(4)
+    }));
 }
 
 #[test]
@@ -20390,6 +23087,8 @@ fn kernel_force_mode_executes_numcode_group_count_with_exact_native_contract() {
             && diagnostic.safe_details["aggregate"] == json!("count")
             && diagnostic.safe_details["group_property"] == json!("metric")
             && diagnostic.safe_details["logical_type"] == json!("int64")
+            && diagnostic.safe_details["group_strategy"] == json!("row_index_single_pass")
+            && diagnostic.safe_details["aggregate_strategy"] == json!("row_count")
     }));
 }
 
@@ -20398,7 +23097,7 @@ fn kernel_force_mode_executes_single_file_filecode_grouped_aggregates_with_exact
     let (bytes, _) = object_file_with_filecode_records(&["red", "blue", "red", "green"]);
     let mut resolve_options = json_resolve_options();
     resolve_options.security.aggregate_disclosure_policy = AggregateDisclosurePolicy::AllowExact;
-    for (query, expected_rows, aggregate, representation_class) in [
+    for (query, expected_rows, aggregate, representation_class, aggregate_strategy) in [
         (
             "Person.groupBy(name).select(name, n: count(*))",
             vec![
@@ -20408,6 +23107,7 @@ fn kernel_force_mode_executes_single_file_filecode_grouped_aggregates_with_exact
             ],
             "count",
             "code_pure",
+            "row_count",
         ),
         (
             "Person.groupBy(name).select(name, d: distinct_count(name))",
@@ -20418,6 +23118,7 @@ fn kernel_force_mode_executes_single_file_filecode_grouped_aggregates_with_exact
             ],
             "distinct_count",
             "code_pure",
+            "single_pass_value_ref",
         ),
         (
             "Person.groupBy(name).select(name, e: exists(name))",
@@ -20428,6 +23129,7 @@ fn kernel_force_mode_executes_single_file_filecode_grouped_aggregates_with_exact
             ],
             "exists",
             "code_pure",
+            "single_pass_value_ref",
         ),
     ] {
         let kernel = parse_resolve_plan_build_physical_and_execute_query(
@@ -20491,6 +23193,8 @@ fn kernel_force_mode_executes_single_file_filecode_grouped_aggregates_with_exact
                 && diagnostic.safe_details["aggregate"] == json!(aggregate)
                 && diagnostic.safe_details["group_property"] == json!("name")
                 && diagnostic.safe_details["logical_type"] == json!("utf8")
+                && diagnostic.safe_details["group_strategy"] == json!("row_index_single_pass")
+                && diagnostic.safe_details["aggregate_strategy"] == json!(aggregate_strategy)
         }));
     }
 }
@@ -20500,7 +23204,7 @@ fn kernel_force_mode_executes_grouped_numcode_direct_aggregates_with_exact_nativ
     let bytes = object_file_with_numcode_records(&[20, 5, 20, 10]);
     let mut resolve_options = json_resolve_options();
     resolve_options.security.aggregate_disclosure_policy = AggregateDisclosurePolicy::AllowExact;
-    for (query, expected_rows, aggregate, representation_class) in [
+    for (query, expected_rows, aggregate, representation_class, aggregate_strategy) in [
         (
             "MetricThing.groupBy(metric).select(metric, n: count(metric))",
             vec![
@@ -20510,6 +23214,7 @@ fn kernel_force_mode_executes_grouped_numcode_direct_aggregates_with_exact_nativ
             ],
             "count",
             "code_pure",
+            "single_pass_value_ref",
         ),
         (
             "MetricThing.groupBy(metric).select(metric, e: exists(metric))",
@@ -20520,6 +23225,7 @@ fn kernel_force_mode_executes_grouped_numcode_direct_aggregates_with_exact_nativ
             ],
             "exists",
             "code_pure",
+            "single_pass_value_ref",
         ),
         (
             "MetricThing.groupBy(metric).select(metric, d: distinct_count(metric))",
@@ -20530,6 +23236,7 @@ fn kernel_force_mode_executes_grouped_numcode_direct_aggregates_with_exact_nativ
             ],
             "distinct_count",
             "typed_numeric_coded",
+            "single_pass_value_ref",
         ),
         (
             "MetricThing.groupBy(metric).select(metric, m: min(metric))",
@@ -20540,6 +23247,7 @@ fn kernel_force_mode_executes_grouped_numcode_direct_aggregates_with_exact_nativ
             ],
             "min",
             "typed_numeric_coded",
+            "single_pass_typed_order",
         ),
         (
             "MetricThing.groupBy(metric).select(metric, m: max(metric))",
@@ -20550,6 +23258,7 @@ fn kernel_force_mode_executes_grouped_numcode_direct_aggregates_with_exact_nativ
             ],
             "max",
             "typed_numeric_coded",
+            "single_pass_typed_order",
         ),
         (
             "MetricThing.groupBy(metric).select(metric, s: sum(metric))",
@@ -20560,6 +23269,7 @@ fn kernel_force_mode_executes_grouped_numcode_direct_aggregates_with_exact_nativ
             ],
             "sum",
             "typed_numeric_coded",
+            "single_pass_typed_numeric",
         ),
         (
             "MetricThing.groupBy(metric).select(metric, a: avg(metric))",
@@ -20570,6 +23280,7 @@ fn kernel_force_mode_executes_grouped_numcode_direct_aggregates_with_exact_nativ
             ],
             "avg",
             "typed_numeric_coded",
+            "single_pass_typed_numeric",
         ),
     ] {
         let kernel = parse_resolve_plan_build_physical_and_execute_query(
@@ -20626,6 +23337,8 @@ fn kernel_force_mode_executes_grouped_numcode_direct_aggregates_with_exact_nativ
                 && diagnostic.safe_details["aggregate"] == json!(aggregate)
                 && diagnostic.safe_details["group_property"] == json!("metric")
                 && diagnostic.safe_details["logical_type"] == json!("int64")
+                && diagnostic.safe_details["group_strategy"] == json!("row_index_single_pass")
+                && diagnostic.safe_details["aggregate_strategy"] == json!(aggregate_strategy)
         }));
     }
 }

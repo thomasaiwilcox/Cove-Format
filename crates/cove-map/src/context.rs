@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use cove_core::{
     artifact::covemap::CovemapFile,
     profile::cove_map::{
-        EmbeddedMapSection, MapIdentityRule, MapIdentityRuleCatalog, MapRowSemanticRule,
-        MapRowSemanticsCatalog, MapSourceEntry,
+        EmbeddedMapSection, MapIdentityRule, MapIdentityRuleCatalog, MapResolutionCatalog,
+        MapRowSemanticRule, MapRowSemanticsCatalog, MapSourceEntry,
     },
 };
 
@@ -17,6 +17,7 @@ pub(crate) struct MappingContext {
     pub(crate) governance_reconciliation_policy: String,
     pub(crate) row_rules: Vec<MapRowSemanticRule>,
     pub(crate) do_not_merge: Vec<(String, String)>,
+    pub(crate) resolution_catalog: Option<MapResolutionCatalog>,
 }
 
 pub(crate) fn mapping_context(file: &CovemapFile) -> Result<MappingContext, String> {
@@ -27,6 +28,7 @@ pub(crate) fn mapping_context(file: &CovemapFile) -> Result<MappingContext, Stri
     let mut governance_reconciliation_policy = "emit_effective_policy".to_string();
     let mut row_rules = Vec::new();
     let mut do_not_merge = Vec::new();
+    let mut resolution_catalog = None;
     for section in crate::embedded_sections(file)? {
         match section {
             EmbeddedMapSection::SourceCatalog(catalog) => {
@@ -75,6 +77,12 @@ pub(crate) fn mapping_context(file: &CovemapFile) -> Result<MappingContext, Stri
             EmbeddedMapSection::RowSemanticsCatalog(MapRowSemanticsCatalog { rules, .. }) => {
                 row_rules.extend(rules);
             }
+            EmbeddedMapSection::ResolutionCatalog(catalog) => {
+                if resolution_catalog.is_some() {
+                    return Err("duplicate resolution catalog".into());
+                }
+                resolution_catalog = Some(catalog);
+            }
             _ => {}
         }
     }
@@ -89,5 +97,6 @@ pub(crate) fn mapping_context(file: &CovemapFile) -> Result<MappingContext, Stri
         governance_reconciliation_policy,
         row_rules,
         do_not_merge,
+        resolution_catalog,
     })
 }

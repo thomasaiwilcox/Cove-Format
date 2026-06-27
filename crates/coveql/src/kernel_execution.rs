@@ -14,10 +14,22 @@ use cove_core::{
         mount_cove_file, ExecutionCodeRequest, ExecutionCodeResolver, ExecutionCodeValue,
         MountOptions, OutputRepresentation,
     },
+    native::{
+        compact_selection_bitmap, filter_bool_eq, filter_fixed_bytes_eq, filter_fixed_bytes_in,
+        filter_local_u16_membership, filter_local_u32_membership, filter_local_u8_membership,
+        filter_numcode_le_in_typed, filter_numcode_le_not_in_typed, filter_numcode_le_typed,
+        filter_u32_le_in_sorted, filter_u32_le_not_in_sorted, filter_validity, filter_varbytes_eq,
+        filter_varbytes_in, filter_varbytes_prefix, local_membership_u8, native_numcode_matches,
+        native_object_temporal_batch_from_retained_segment,
+        native_object_temporal_batch_from_segment, valid_rows_except, KernelStats, LaneRef,
+        NativeCodeDomain, NativeKernelDispatch, NativeNumericLiteral, NativeNumericPredicateOp,
+        NativeObjectTemporalBatch, ValidityRef,
+    },
     page_payload::PageBufferKind,
     profile::cove_o::{
-        read_object_kernel_surface_from_bytes_with_options, CoveObjectKernelReadOptions,
-        CoveObjectKernelSurface, CoveObjectReadWithPushdownOptions, TemporalSegmentData,
+        read_object_kernel_surface_from_bytes_with_options, read_retained_object_temporal_segments,
+        CoveObjectKernelReadOptions, CoveObjectKernelSurface, CoveObjectReadWithPushdownOptions,
+        RetainedTemporalSegmentData, TemporalSegmentData,
     },
     reader::ValidationOptions,
     validity::ValidityBitmap,
@@ -73,7 +85,7 @@ use crate::{
         native_temporal_direct_projection_shape, native_typed_order_path, native_typed_order_shape,
         row_root_predicate_is_direct_safe, CodedRepresentationClass, KernelShape,
     },
-    kernel_predicate::{select_rows_with_base, SelectionBitmap},
+    kernel_predicate::{select_rows_with_base, KernelLiteral, KernelPredicate, SelectionBitmap},
     kernel_reconstruct::reconstruct_selected_object_states,
     materialized::{
         hex, ExecutionRow, MaterializedAssociationRow, MaterializedEvidenceRow,
@@ -85,7 +97,7 @@ use crate::{
     ExecutionOptions, ExecutionRowCounts, ManifestDatasetMember, MetadataDisclosurePolicy,
     ParseOptions, PhysicalPlanOptions, PhysicalPlannedQuery, PlanOptions, ResolveOptions,
     ResolvedExpr, ResolvedLiteral, ResolvedLiteralValue, ResolvedPath, ResolvedPredicate,
-    ResolvedRoot, TemporalMode, VisibilityPolicy,
+    ResolvedRoot, ResolvedSystemField, TemporalMode, VisibilityPolicy,
 };
 
 #[derive(Debug, Clone)]
@@ -198,6 +210,16 @@ pub fn parse_resolve_plan_build_physical_and_execute_query_retained(
 
 pub fn execute_physical_planned_query(
     bytes: &[u8],
+    physical: PhysicalPlannedQuery,
+    execution_options: ExecutionOptions,
+    kernel_options: KernelExecutionOptions,
+) -> Result<KernelExecutedQuery, BuildExecutionError> {
+    execute_physical_planned_query_inner(bytes, None, physical, execution_options, kernel_options)
+}
+
+fn execute_physical_planned_query_inner(
+    bytes: &[u8],
+    retained_input: Option<&CoveQlRetainedInput>,
     physical: PhysicalPlannedQuery,
     execution_options: ExecutionOptions,
     kernel_options: KernelExecutionOptions,
@@ -341,6 +363,7 @@ pub fn execute_physical_planned_query(
             };
             let (mut executed, mut kernel_report) = execute_kernel_object(
                 bytes,
+                retained_input,
                 &physical,
                 &execution_options,
                 &kernel_options,
@@ -399,6 +422,7 @@ pub fn execute_physical_planned_query(
             })?;
             let (executed, kernel_report) = execute_kernel_object(
                 bytes,
+                retained_input,
                 &physical,
                 &execution_options,
                 &kernel_options,
@@ -473,8 +497,9 @@ pub fn execute_physical_planned_query_retained(
         }
     }
 
-    execute_physical_planned_query(
+    execute_physical_planned_query_inner(
         input.as_slice(),
+        Some(&input),
         physical,
         execution_options,
         kernel_options,
@@ -947,6 +972,8 @@ fn try_manifest_native_result(
                 "group_count": report.group_count,
                 "rows_counted": report.rows_counted,
                 "values_seen": report.values_seen,
+                "group_strategy": report.group_strategy,
+                "aggregate_strategy": report.aggregate_strategy,
             }),
         }));
     }
@@ -1019,6 +1046,7 @@ fn try_manifest_native_result(
                 "counted_path": report.counted_path,
                 "rows_counted": report.rows_counted,
                 "values_seen": report.values_seen,
+                "aggregate_strategy": report.aggregate_strategy,
             }),
         }));
     }
@@ -1160,7 +1188,16 @@ fn manifest_kernel_row_source(
                 &shape.predicates,
                 None,
             );
-            let selection_vector = selection.to_selection_vector();
+            let (selection_vector, _compaction_stats) =
+                compact_selection_bitmap(&selection, NativeKernelDispatch::Auto).map_err(
+                    |error| {
+                        exec_error(
+                            "E_MANIFEST_KERNEL_SELECTION_COMPACT",
+                            format!("manifest native selection-vector compaction failed: {error}"),
+                            json!({ "source": member.scope.source }),
+                        )
+                    },
+                )?;
             let reconstruction = reconstruction_options(&member_plan)?;
             let retained_dependency_type_ids = member_plan
                 .dependencies
@@ -1492,6 +1529,109 @@ struct FileCodeLiteralPrune {
 }
 
 #[derive(Debug, Clone)]
+struct NativeScalarPredicatePrune {
+    bitmap: SelectionBitmap,
+    predicate_count: usize,
+    executed_predicate_count: usize,
+    page_count: usize,
+    matched_rows: usize,
+    predicate_order: Vec<&'static str>,
+    predicate_dispatch: NativeKernelDispatchCounts,
+    bitmap_dispatch: NativeBitmapDispatchCounts,
+    retained_page_buffers: bool,
+    short_circuited: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct NativeKernelDispatchCounts {
+    kernels: usize,
+    scalar: usize,
+    avx2: usize,
+    neon: usize,
+}
+
+impl NativeKernelDispatchCounts {
+    fn record(&mut self, dispatch: NativeKernelDispatch) {
+        self.kernels += 1;
+        match dispatch {
+            NativeKernelDispatch::Scalar | NativeKernelDispatch::Auto => self.scalar += 1,
+            NativeKernelDispatch::Avx2 => self.avx2 += 1,
+            NativeKernelDispatch::Neon => self.neon += 1,
+        }
+    }
+
+    fn merge(&mut self, other: NativeKernelDispatchCounts) {
+        self.kernels += other.kernels;
+        self.scalar += other.scalar;
+        self.avx2 += other.avx2;
+        self.neon += other.neon;
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct NativeBitmapDispatchCounts {
+    intersections: usize,
+    scalar: usize,
+    avx2: usize,
+    neon: usize,
+}
+
+impl NativeBitmapDispatchCounts {
+    fn record(&mut self, dispatch: NativeKernelDispatch) {
+        self.intersections += 1;
+        match dispatch {
+            NativeKernelDispatch::Scalar | NativeKernelDispatch::Auto => self.scalar += 1,
+            NativeKernelDispatch::Avx2 => self.avx2 += 1,
+            NativeKernelDispatch::Neon => self.neon += 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct NativeScalarBitmapScan {
+    bitmap: SelectionBitmap,
+    page_count: usize,
+    predicate_dispatch: NativeKernelDispatchCounts,
+}
+
+#[derive(Debug, Clone)]
+struct NativeScalarBatchScan {
+    page_count: usize,
+    predicate_dispatch: NativeKernelDispatchCounts,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SurfaceRowLookup {
+    segments: Vec<SurfaceRowLookupSegment>,
+}
+
+#[derive(Debug, Clone)]
+struct SurfaceRowLookupSegment {
+    segment_id: u32,
+    rows: Vec<Option<usize>>,
+}
+
+impl SurfaceRowLookup {
+    fn from_segment_rows(segment_rows: BTreeMap<u32, Vec<Option<usize>>>) -> Self {
+        Self {
+            segments: segment_rows
+                .into_iter()
+                .map(|(segment_id, rows)| SurfaceRowLookupSegment { segment_id, rows })
+                .collect(),
+        }
+    }
+
+    fn get(&self, segment_id: u32, row_index: u32) -> Option<usize> {
+        let segment = self
+            .segments
+            .binary_search_by_key(&segment_id, |segment| segment.segment_id)
+            .ok()
+            .and_then(|index| self.segments.get(index))?;
+        segment.rows.get(row_index as usize).and_then(|row| *row)
+    }
+}
+
+#[derive(Debug, Clone)]
 struct ExecutionCodePredicateRequest {
     object_type_id: u32,
     property_id: u32,
@@ -1510,6 +1650,98 @@ struct ExecutionCodeLiteralKey {
 enum ExecutionCodeMatchMode {
     Include,
     Exclude,
+}
+
+#[derive(Debug, Clone)]
+enum NativeScalarPredicateRequest {
+    SystemNumeric {
+        object_type_id: u32,
+        field: NativeSystemNumericField,
+        op: NativeNumericPredicateOp,
+        literal: NativeNumericLiteral,
+    },
+    SystemGoidEq {
+        object_type_id: u32,
+        value: [u8; 16],
+    },
+    NullCheck {
+        object_type_id: u32,
+        property_id: u32,
+        want_valid: bool,
+    },
+    BoolEq {
+        object_type_id: u32,
+        property_id: u32,
+        value: bool,
+    },
+    FixedBytesEq {
+        object_type_id: u32,
+        property_id: u32,
+        logical_type: CoveLogicalType,
+        value: Vec<u8>,
+    },
+    FixedBytesIn {
+        object_type_id: u32,
+        property_id: u32,
+        logical_type: CoveLogicalType,
+        values: Vec<u8>,
+    },
+    FixedBytesNotIn {
+        object_type_id: u32,
+        property_id: u32,
+        logical_type: CoveLogicalType,
+        values: Vec<u8>,
+    },
+    VarBytesEq {
+        object_type_id: u32,
+        property_id: u32,
+        logical_type: CoveLogicalType,
+        value: Vec<u8>,
+    },
+    VarBytesIn {
+        object_type_id: u32,
+        property_id: u32,
+        logical_type: CoveLogicalType,
+        values: Vec<Vec<u8>>,
+    },
+    VarBytesNotIn {
+        object_type_id: u32,
+        property_id: u32,
+        logical_type: CoveLogicalType,
+        values: Vec<Vec<u8>>,
+    },
+    VarBytesPrefix {
+        object_type_id: u32,
+        property_id: u32,
+        logical_type: CoveLogicalType,
+        prefix: Vec<u8>,
+    },
+    NumCode {
+        object_type_id: u32,
+        property_id: u32,
+        logical_type: CoveLogicalType,
+        op: NativeNumericPredicateOp,
+        literal: NativeNumericLiteral,
+    },
+    NumCodeIn {
+        object_type_id: u32,
+        property_id: u32,
+        logical_type: CoveLogicalType,
+        literals: Vec<NativeNumericLiteral>,
+    },
+    NumCodeNotIn {
+        object_type_id: u32,
+        property_id: u32,
+        logical_type: CoveLogicalType,
+        literals: Vec<NativeNumericLiteral>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeSystemNumericField {
+    BranchKey,
+    Csn,
+    TimestampUs,
 }
 
 impl ExecutionCodeMatchMode {
@@ -1533,6 +1765,8 @@ struct NativeBoolGroupCountReport {
     group_count: usize,
     rows_counted: usize,
     values_seen: usize,
+    group_strategy: &'static str,
+    aggregate_strategy: &'static str,
 }
 
 #[derive(Debug, Clone)]
@@ -1541,6 +1775,7 @@ struct NativeDirectAggregateReport {
     counted_path: Option<String>,
     rows_counted: usize,
     values_seen: usize,
+    aggregate_strategy: &'static str,
 }
 
 #[derive(Debug, Clone)]
@@ -1830,7 +2065,7 @@ fn try_covi_row_range_prune(
             lookup_count += 1;
             row_range_count += candidates.row_ranges.len();
             if let Some(existing) = &mut combined {
-                existing.intersect_with(&bitmap);
+                let _ = existing.intersect_with_dispatch(&bitmap, NativeKernelDispatch::Auto);
             } else {
                 combined = Some(bitmap);
             }
@@ -2028,9 +2263,12 @@ fn try_execution_code_filecode_prune(
             &target_codes,
             execution_map,
         )?;
+        if page_count == 0 {
+            return Ok(None);
+        }
         total_pages += page_count;
         if let Some(existing) = &mut combined {
-            existing.intersect_with(&bitmap);
+            let _ = existing.intersect_with_dispatch(&bitmap, NativeKernelDispatch::Auto);
         } else {
             combined = Some(bitmap);
         }
@@ -2142,9 +2380,12 @@ fn try_file_code_literal_prune(
             request,
             &target_codes,
         )?;
+        if page_count == 0 {
+            return Ok(None);
+        }
         total_pages += page_count;
         if let Some(existing) = &mut combined {
-            existing.intersect_with(&bitmap);
+            let _ = existing.intersect_with_dispatch(&bitmap, NativeKernelDispatch::Auto);
         } else {
             combined = Some(bitmap);
         }
@@ -2158,6 +2399,1706 @@ fn try_file_code_literal_prune(
         predicate_count: requests.len(),
         page_count: total_pages,
     }))
+}
+
+fn try_native_scalar_predicate_prune(
+    bytes: &[u8],
+    retained_input: Option<&CoveQlRetainedInput>,
+    physical: &PhysicalPlannedQuery,
+    surface: &CoveObjectKernelSurface,
+    root_object_type_id: u32,
+    predicates: &[KernelPredicate],
+) -> Result<Option<NativeScalarPredicatePrune>, BuildExecutionError> {
+    let planned = &physical.planned;
+    let security = &planned.resolved.operation_context.security;
+    if planned.resolved.operation_context.dataset.files.len() > 1
+        || security.metadata_disclosure_policy != MetadataDisclosurePolicy::AllowProtected
+        || matches!(
+            security.visibility_policy,
+            VisibilityPolicy::ExternalOverlay(_)
+        )
+        || planned
+            .resolved
+            .operation_context
+            .tombstone
+            .include_tombstones
+        || planned.resolved.temporal.role_binding.is_some()
+        || planned.resolved.method_chain.history.is_some()
+        || planned.resolved.method_chain.changes.is_some()
+        || matches!(
+            planned.resolved.output_mode,
+            crate::CoveQlOutputMode::DataFusionTableProvider | crate::CoveQlOutputMode::ExplainJson
+        )
+    {
+        return Ok(None);
+    }
+    let ResolvedRoot::Object(root) = &planned.resolved.root else {
+        return Ok(None);
+    };
+    if root.object_type_id != root_object_type_id {
+        return Ok(None);
+    }
+
+    let mut requests = predicates
+        .iter()
+        .filter_map(|predicate| native_scalar_request_for_predicate(predicate, root_object_type_id))
+        .collect::<Vec<_>>();
+    if requests.is_empty() {
+        return Ok(None);
+    }
+    order_native_scalar_requests_by_cost(&mut requests);
+
+    let loaded_rows = surface_row_lookup_for_object(surface, root_object_type_id);
+
+    if let Some(input) = retained_input {
+        match read_retained_object_temporal_segments(
+            input.retained_bytes(),
+            ValidationOptions {
+                semantic: true,
+                verify_digests: false,
+                allow_unknown_optional_extensions: true,
+                ..ValidationOptions::default()
+            },
+        ) {
+            Ok(retained) => {
+                return native_scalar_prune_from_retained_segments(
+                    &retained.segments,
+                    surface,
+                    &loaded_rows,
+                    &requests,
+                );
+            }
+            Err(CoveError::UnsupportedEncoding(_)) => {}
+            Err(_) => {}
+        }
+    }
+
+    let segments = temporal_segments_from_bytes_with_context(
+        bytes,
+        "E_NATIVE_SCALAR_LITERAL_PRUNE",
+        "native scalar literal prune",
+    )?;
+    native_scalar_prune_from_segments(&segments, surface, &loaded_rows, &requests)
+}
+
+fn native_scalar_request_for_predicate(
+    predicate: &KernelPredicate,
+    root_object_type_id: u32,
+) -> Option<NativeScalarPredicateRequest> {
+    match predicate {
+        KernelPredicate::BoolPath { path } => {
+            native_bool_eq_request(path, true, root_object_type_id)
+        }
+        KernelPredicate::Not(inner) => match inner.as_ref() {
+            KernelPredicate::BoolPath { path } => {
+                native_bool_eq_request(path, false, root_object_type_id)
+            }
+            KernelPredicate::InList { path, literals } => {
+                native_not_in_list_request(path, literals, root_object_type_id)
+            }
+            KernelPredicate::ComparePathLiteral { path, op, literal } => {
+                native_negated_compare_request(path, *op, literal, root_object_type_id)
+            }
+            _ => None,
+        },
+        KernelPredicate::NullCheck { path, negated } => {
+            native_null_check_request(path, *negated, root_object_type_id)
+        }
+        KernelPredicate::ComparePathLiteral { path, op, literal }
+            if matches!(
+                op,
+                AstCompareOp::Eq
+                    | AstCompareOp::Ne
+                    | AstCompareOp::Lt
+                    | AstCompareOp::Le
+                    | AstCompareOp::Gt
+                    | AstCompareOp::Ge
+            ) =>
+        {
+            native_compare_request(path, *op, literal, root_object_type_id)
+        }
+        KernelPredicate::InList { path, literals } => {
+            native_in_list_request(path, literals, root_object_type_id)
+        }
+        KernelPredicate::Or(parts) => native_or_request(parts, root_object_type_id),
+        KernelPredicate::StartsWithPathLiteral { path, prefix } => {
+            let (object_type_id, property_id, logical_type) =
+                native_object_property_path(path, root_object_type_id)?;
+            if !matches!(logical_type, CoveLogicalType::Utf8)
+                || path.physical_kind.as_str() != "var_bytes"
+            {
+                return None;
+            }
+            Some(NativeScalarPredicateRequest::VarBytesPrefix {
+                object_type_id,
+                property_id,
+                logical_type,
+                prefix: prefix.as_bytes().to_vec(),
+            })
+        }
+        _ => None,
+    }
+}
+
+fn native_or_request(
+    parts: &[KernelPredicate],
+    root_object_type_id: u32,
+) -> Option<NativeScalarPredicateRequest> {
+    let mut path: Option<&ResolvedPath> = None;
+    let mut literals = Vec::with_capacity(parts.len());
+    for part in parts {
+        let KernelPredicate::ComparePathLiteral {
+            path: part_path,
+            op,
+            literal,
+        } = part
+        else {
+            return None;
+        };
+        if *op != AstCompareOp::Eq {
+            return None;
+        }
+        if path.is_some_and(|path| !same_native_path(path, part_path)) {
+            return None;
+        }
+        path = Some(part_path);
+        literals.push(literal.clone());
+    }
+    native_in_list_request(path?, &literals, root_object_type_id)
+}
+
+fn native_negated_compare_request(
+    path: &ResolvedPath,
+    op: AstCompareOp,
+    literal: &KernelLiteral,
+    root_object_type_id: u32,
+) -> Option<NativeScalarPredicateRequest> {
+    let inverted = match op {
+        AstCompareOp::Eq => return native_not_equal_request(path, literal, root_object_type_id),
+        AstCompareOp::Ne => AstCompareOp::Eq,
+        AstCompareOp::Lt => AstCompareOp::Ge,
+        AstCompareOp::Le => AstCompareOp::Gt,
+        AstCompareOp::Gt => AstCompareOp::Le,
+        AstCompareOp::Ge => AstCompareOp::Lt,
+    };
+    native_compare_request(path, inverted, literal, root_object_type_id)
+}
+
+fn native_in_list_request(
+    path: &ResolvedPath,
+    literals: &[KernelLiteral],
+    root_object_type_id: u32,
+) -> Option<NativeScalarPredicateRequest> {
+    let (object_type_id, property_id, logical_type) =
+        native_object_property_path(path, root_object_type_id)?;
+    match path.physical_kind.as_str() {
+        "boolean" if logical_type == CoveLogicalType::Bool => {
+            let (has_true, has_false) = native_bool_literals_for_kernel(literals)?;
+            match (has_true, has_false) {
+                (true, true) => Some(NativeScalarPredicateRequest::NullCheck {
+                    object_type_id,
+                    property_id,
+                    want_valid: true,
+                }),
+                (true, false) => Some(NativeScalarPredicateRequest::BoolEq {
+                    object_type_id,
+                    property_id,
+                    value: true,
+                }),
+                (false, true) => Some(NativeScalarPredicateRequest::BoolEq {
+                    object_type_id,
+                    property_id,
+                    value: false,
+                }),
+                (false, false) => None,
+            }
+        }
+        "num_code" => {
+            let literals = literals
+                .iter()
+                .map(native_numeric_literal_for_kernel)
+                .collect::<Option<Vec<_>>>()?;
+            (!literals.is_empty()).then_some(NativeScalarPredicateRequest::NumCodeIn {
+                object_type_id,
+                property_id,
+                logical_type,
+                literals,
+            })
+        }
+        "fixed_bytes" => {
+            let values = literals
+                .iter()
+                .map(|literal| native_fixed_bytes_literal_for_kernel(logical_type, literal))
+                .collect::<Option<Vec<_>>>()?
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+            (!values.is_empty()).then_some(NativeScalarPredicateRequest::FixedBytesIn {
+                object_type_id,
+                property_id,
+                logical_type,
+                values,
+            })
+        }
+        "var_bytes" => {
+            let values = literals
+                .iter()
+                .map(|literal| native_varbytes_literal_for_kernel(logical_type, literal))
+                .collect::<Option<Vec<_>>>()?;
+            (!values.is_empty()).then_some(NativeScalarPredicateRequest::VarBytesIn {
+                object_type_id,
+                property_id,
+                logical_type,
+                values,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn native_not_equal_request(
+    path: &ResolvedPath,
+    literal: &KernelLiteral,
+    root_object_type_id: u32,
+) -> Option<NativeScalarPredicateRequest> {
+    let (object_type_id, property_id, logical_type) =
+        native_object_property_path(path, root_object_type_id)?;
+    match (path.physical_kind.as_str(), logical_type, literal) {
+        ("boolean", CoveLogicalType::Bool, KernelLiteral::Bool(value)) => {
+            Some(NativeScalarPredicateRequest::BoolEq {
+                object_type_id,
+                property_id,
+                value: !*value,
+            })
+        }
+        ("num_code", _, _) => {
+            let literal = native_numeric_literal_for_kernel(literal)?;
+            Some(NativeScalarPredicateRequest::NumCodeNotIn {
+                object_type_id,
+                property_id,
+                logical_type,
+                literals: vec![literal],
+            })
+        }
+        ("fixed_bytes", CoveLogicalType::Uuid, KernelLiteral::String(_)) => {
+            let value = native_fixed_bytes_literal_for_kernel(logical_type, literal)?;
+            Some(NativeScalarPredicateRequest::FixedBytesNotIn {
+                object_type_id,
+                property_id,
+                logical_type,
+                values: value,
+            })
+        }
+        ("var_bytes", CoveLogicalType::Utf8, KernelLiteral::String(_)) => {
+            let value = native_varbytes_literal_for_kernel(logical_type, literal)?;
+            Some(NativeScalarPredicateRequest::VarBytesNotIn {
+                object_type_id,
+                property_id,
+                logical_type,
+                values: vec![value],
+            })
+        }
+        _ => None,
+    }
+}
+
+fn native_not_in_list_request(
+    path: &ResolvedPath,
+    literals: &[KernelLiteral],
+    root_object_type_id: u32,
+) -> Option<NativeScalarPredicateRequest> {
+    if literals
+        .iter()
+        .any(|literal| matches!(literal, KernelLiteral::Null))
+    {
+        return None;
+    }
+    let (object_type_id, property_id, logical_type) =
+        native_object_property_path(path, root_object_type_id)?;
+    match path.physical_kind.as_str() {
+        "boolean" if logical_type == CoveLogicalType::Bool => {
+            let (has_true, has_false) = native_bool_literals_for_kernel(literals)?;
+            match (has_true, has_false) {
+                (true, false) => Some(NativeScalarPredicateRequest::BoolEq {
+                    object_type_id,
+                    property_id,
+                    value: false,
+                }),
+                (false, true) => Some(NativeScalarPredicateRequest::BoolEq {
+                    object_type_id,
+                    property_id,
+                    value: true,
+                }),
+                _ => None,
+            }
+        }
+        "num_code" => {
+            let literals = literals
+                .iter()
+                .map(native_numeric_literal_for_kernel)
+                .collect::<Option<Vec<_>>>()?;
+            (!literals.is_empty()).then_some(NativeScalarPredicateRequest::NumCodeNotIn {
+                object_type_id,
+                property_id,
+                logical_type,
+                literals,
+            })
+        }
+        "fixed_bytes" => {
+            let values = literals
+                .iter()
+                .map(|literal| native_fixed_bytes_literal_for_kernel(logical_type, literal))
+                .collect::<Option<Vec<_>>>()?
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+            (!values.is_empty()).then_some(NativeScalarPredicateRequest::FixedBytesNotIn {
+                object_type_id,
+                property_id,
+                logical_type,
+                values,
+            })
+        }
+        "var_bytes" => {
+            let values = literals
+                .iter()
+                .map(|literal| native_varbytes_literal_for_kernel(logical_type, literal))
+                .collect::<Option<Vec<_>>>()?;
+            (!values.is_empty()).then_some(NativeScalarPredicateRequest::VarBytesNotIn {
+                object_type_id,
+                property_id,
+                logical_type,
+                values,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn same_native_path(left: &ResolvedPath, right: &ResolvedPath) -> bool {
+    left.root_kind == right.root_kind
+        && left.object_type_id == right.object_type_id
+        && left.property_id == right.property_id
+        && left.system_field == right.system_field
+        && left.logical_type == right.logical_type
+        && left.physical_kind == right.physical_kind
+}
+
+fn native_bool_literals_for_kernel(literals: &[KernelLiteral]) -> Option<(bool, bool)> {
+    let mut has_true = false;
+    let mut has_false = false;
+    for literal in literals {
+        match literal {
+            KernelLiteral::Bool(true) => has_true = true,
+            KernelLiteral::Bool(false) => has_false = true,
+            KernelLiteral::Null => {}
+            _ => return None,
+        }
+    }
+    Some((has_true, has_false))
+}
+
+fn native_compare_request(
+    path: &ResolvedPath,
+    op: AstCompareOp,
+    literal: &KernelLiteral,
+    root_object_type_id: u32,
+) -> Option<NativeScalarPredicateRequest> {
+    if op == AstCompareOp::Ne {
+        return native_not_equal_request(path, literal, root_object_type_id);
+    }
+    if let Some(request) = native_system_compare_request(path, op, literal, root_object_type_id) {
+        return Some(request);
+    }
+    let (object_type_id, property_id, logical_type) =
+        native_object_property_path(path, root_object_type_id)?;
+    if path.physical_kind.as_str() == "num_code" {
+        let op = native_numeric_op_for_ast(op)?;
+        let literal = native_numeric_literal_for_kernel(literal)?;
+        return Some(NativeScalarPredicateRequest::NumCode {
+            object_type_id,
+            property_id,
+            logical_type,
+            op,
+            literal,
+        });
+    }
+    if op != AstCompareOp::Eq {
+        return None;
+    }
+    match (path.physical_kind.as_str(), logical_type, literal) {
+        ("boolean", CoveLogicalType::Bool, KernelLiteral::Bool(value)) => {
+            Some(NativeScalarPredicateRequest::BoolEq {
+                object_type_id,
+                property_id,
+                value: *value,
+            })
+        }
+        ("fixed_bytes", CoveLogicalType::Uuid, KernelLiteral::String(value)) => {
+            let value = decode_compact_hex_bytes(value).filter(|value| value.len() == 16)?;
+            Some(NativeScalarPredicateRequest::FixedBytesEq {
+                object_type_id,
+                property_id,
+                logical_type,
+                value,
+            })
+        }
+        ("var_bytes", CoveLogicalType::Utf8, KernelLiteral::String(value)) => {
+            Some(NativeScalarPredicateRequest::VarBytesEq {
+                object_type_id,
+                property_id,
+                logical_type,
+                value: value.as_bytes().to_vec(),
+            })
+        }
+        _ => None,
+    }
+}
+
+fn native_system_compare_request(
+    path: &ResolvedPath,
+    op: AstCompareOp,
+    literal: &KernelLiteral,
+    root_object_type_id: u32,
+) -> Option<NativeScalarPredicateRequest> {
+    if !matches!(path.root_kind, crate::ResolvedPathRootKind::Object)
+        || path.object_type_id != Some(root_object_type_id)
+    {
+        return None;
+    }
+    match path.system_field.as_ref()? {
+        ResolvedSystemField::BranchKey => Some(NativeScalarPredicateRequest::SystemNumeric {
+            object_type_id: root_object_type_id,
+            field: NativeSystemNumericField::BranchKey,
+            op: native_numeric_op_for_ast(op)?,
+            literal: native_numeric_literal_for_kernel(literal)?,
+        }),
+        ResolvedSystemField::Csn => Some(NativeScalarPredicateRequest::SystemNumeric {
+            object_type_id: root_object_type_id,
+            field: NativeSystemNumericField::Csn,
+            op: native_numeric_op_for_ast(op)?,
+            literal: native_numeric_literal_for_kernel(literal)?,
+        }),
+        ResolvedSystemField::TimestampUs => Some(NativeScalarPredicateRequest::SystemNumeric {
+            object_type_id: root_object_type_id,
+            field: NativeSystemNumericField::TimestampUs,
+            op: native_numeric_op_for_ast(op)?,
+            literal: native_numeric_literal_for_kernel(literal)?,
+        }),
+        ResolvedSystemField::Goid if op == AstCompareOp::Eq => {
+            let KernelLiteral::String(value) = literal else {
+                return None;
+            };
+            let value: [u8; 16] = decode_compact_hex_bytes(value)?.try_into().ok()?;
+            Some(NativeScalarPredicateRequest::SystemGoidEq {
+                object_type_id: root_object_type_id,
+                value,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn native_numeric_op_for_ast(op: AstCompareOp) -> Option<NativeNumericPredicateOp> {
+    match op {
+        AstCompareOp::Eq => Some(NativeNumericPredicateOp::Eq),
+        AstCompareOp::Lt => Some(NativeNumericPredicateOp::Lt),
+        AstCompareOp::Le => Some(NativeNumericPredicateOp::LtEq),
+        AstCompareOp::Gt => Some(NativeNumericPredicateOp::Gt),
+        AstCompareOp::Ge => Some(NativeNumericPredicateOp::GtEq),
+        AstCompareOp::Ne => None,
+    }
+}
+
+fn native_numeric_literal_for_kernel(literal: &KernelLiteral) -> Option<NativeNumericLiteral> {
+    match literal {
+        KernelLiteral::I64(value) => Some(NativeNumericLiteral::Int64(*value)),
+        KernelLiteral::U64(value) => Some(NativeNumericLiteral::UInt64(*value)),
+        KernelLiteral::F64(value) => Some(NativeNumericLiteral::Float64(*value)),
+        _ => None,
+    }
+}
+
+fn native_fixed_bytes_literal_for_kernel(
+    logical_type: CoveLogicalType,
+    literal: &KernelLiteral,
+) -> Option<Vec<u8>> {
+    match (logical_type, literal) {
+        (CoveLogicalType::Uuid, KernelLiteral::String(value)) => {
+            decode_compact_hex_bytes(value).filter(|value| value.len() == 16)
+        }
+        _ => None,
+    }
+}
+
+fn native_varbytes_literal_for_kernel(
+    logical_type: CoveLogicalType,
+    literal: &KernelLiteral,
+) -> Option<Vec<u8>> {
+    match (logical_type, literal) {
+        (CoveLogicalType::Utf8, KernelLiteral::String(value)) => Some(value.as_bytes().to_vec()),
+        _ => None,
+    }
+}
+
+fn native_bool_eq_request(
+    path: &ResolvedPath,
+    value: bool,
+    root_object_type_id: u32,
+) -> Option<NativeScalarPredicateRequest> {
+    let (object_type_id, property_id, logical_type) =
+        native_object_property_path(path, root_object_type_id)?;
+    (path.physical_kind.as_str() == "boolean" && logical_type == CoveLogicalType::Bool).then_some(
+        NativeScalarPredicateRequest::BoolEq {
+            object_type_id,
+            property_id,
+            value,
+        },
+    )
+}
+
+fn native_null_check_request(
+    path: &ResolvedPath,
+    want_valid: bool,
+    root_object_type_id: u32,
+) -> Option<NativeScalarPredicateRequest> {
+    let (object_type_id, property_id, _) = native_object_property_path(path, root_object_type_id)?;
+    Some(NativeScalarPredicateRequest::NullCheck {
+        object_type_id,
+        property_id,
+        want_valid,
+    })
+}
+
+fn native_object_property_path(
+    path: &ResolvedPath,
+    root_object_type_id: u32,
+) -> Option<(u32, u32, CoveLogicalType)> {
+    if !matches!(path.root_kind, crate::ResolvedPathRootKind::Object)
+        || path.system_field.is_some()
+        || path.object_type_id != Some(root_object_type_id)
+    {
+        return None;
+    }
+    let object_type_id = path.object_type_id?;
+    let property_id = path.property_id?;
+    let logical_type = logical_type_to_cove(path.logical_type.as_str())?;
+    Some((object_type_id, property_id, logical_type))
+}
+
+fn native_scalar_prune_from_segments(
+    segments: &[TemporalSegmentData],
+    surface: &CoveObjectKernelSurface,
+    loaded_rows: &SurfaceRowLookup,
+    requests: &[NativeScalarPredicateRequest],
+) -> Result<Option<NativeScalarPredicatePrune>, BuildExecutionError> {
+    let mut combined: Option<SelectionBitmap> = None;
+    let mut bitmap_dispatch = NativeBitmapDispatchCounts::default();
+    let mut predicate_dispatch = NativeKernelDispatchCounts::default();
+    let mut total_pages = 0usize;
+    let mut executed_predicate_count = 0usize;
+    let mut short_circuited = false;
+    for request in requests {
+        if combined.as_ref().is_some_and(SelectionBitmap::all_zero) {
+            short_circuited = true;
+            break;
+        }
+        let Some(scan) = native_scalar_bitmap_for_request(segments, surface, loaded_rows, request)?
+        else {
+            return Ok(None);
+        };
+        executed_predicate_count += 1;
+        total_pages += scan.page_count;
+        predicate_dispatch.merge(scan.predicate_dispatch);
+        if let Some(existing) = &mut combined {
+            let dispatch =
+                existing.intersect_with_dispatch(&scan.bitmap, NativeKernelDispatch::Auto);
+            bitmap_dispatch.record(dispatch);
+        } else {
+            combined = Some(scan.bitmap);
+        }
+    }
+    Ok(combined.map(|bitmap| NativeScalarPredicatePrune {
+        matched_rows: bitmap.count_ones(),
+        bitmap,
+        predicate_count: requests.len(),
+        executed_predicate_count,
+        page_count: total_pages,
+        predicate_order: requests
+            .iter()
+            .map(NativeScalarPredicateRequest::kind_name)
+            .collect(),
+        predicate_dispatch,
+        bitmap_dispatch,
+        retained_page_buffers: false,
+        short_circuited,
+    }))
+}
+
+fn native_scalar_prune_from_retained_segments(
+    segments: &[RetainedTemporalSegmentData],
+    surface: &CoveObjectKernelSurface,
+    loaded_rows: &SurfaceRowLookup,
+    requests: &[NativeScalarPredicateRequest],
+) -> Result<Option<NativeScalarPredicatePrune>, BuildExecutionError> {
+    let mut combined: Option<SelectionBitmap> = None;
+    let mut bitmap_dispatch = NativeBitmapDispatchCounts::default();
+    let mut predicate_dispatch = NativeKernelDispatchCounts::default();
+    let mut total_pages = 0usize;
+    let mut executed_predicate_count = 0usize;
+    let mut short_circuited = false;
+    for request in requests {
+        if combined.as_ref().is_some_and(SelectionBitmap::all_zero) {
+            short_circuited = true;
+            break;
+        }
+        let Some(scan) =
+            native_scalar_bitmap_for_retained_request(segments, surface, loaded_rows, request)?
+        else {
+            return Ok(None);
+        };
+        executed_predicate_count += 1;
+        total_pages += scan.page_count;
+        predicate_dispatch.merge(scan.predicate_dispatch);
+        if let Some(existing) = &mut combined {
+            let dispatch =
+                existing.intersect_with_dispatch(&scan.bitmap, NativeKernelDispatch::Auto);
+            bitmap_dispatch.record(dispatch);
+        } else {
+            combined = Some(scan.bitmap);
+        }
+    }
+    Ok(combined.map(|bitmap| NativeScalarPredicatePrune {
+        matched_rows: bitmap.count_ones(),
+        bitmap,
+        predicate_count: requests.len(),
+        executed_predicate_count,
+        page_count: total_pages,
+        predicate_order: requests
+            .iter()
+            .map(NativeScalarPredicateRequest::kind_name)
+            .collect(),
+        predicate_dispatch,
+        bitmap_dispatch,
+        retained_page_buffers: true,
+        short_circuited,
+    }))
+}
+
+fn native_scalar_bitmap_for_request(
+    segments: &[TemporalSegmentData],
+    surface: &CoveObjectKernelSurface,
+    loaded_rows: &SurfaceRowLookup,
+    request: &NativeScalarPredicateRequest,
+) -> Result<Option<NativeScalarBitmapScan>, BuildExecutionError> {
+    let mut bitmap = SelectionBitmap::none(surface.system.len());
+    let mut page_count = 0usize;
+    let mut predicate_dispatch = NativeKernelDispatchCounts::default();
+    for segment in segments {
+        if segment.header.object_type_id != request.object_type_id() {
+            continue;
+        }
+        let batch = native_object_temporal_batch_from_segment(
+            segment,
+            NativeCodeDomain {
+                object_type_id: Some(segment.header.object_type_id),
+                ..NativeCodeDomain::default()
+            },
+        )
+        .map_err(|error| {
+            exec_error(
+                "E_NATIVE_SCALAR_LITERAL_PRUNE",
+                format!("native scalar literal prune page binding failed: {error}"),
+                json!({ "segment_id": segment.header.segment_id }),
+            )
+        })?;
+        let Some(batch_scan) =
+            native_scalar_bitmap_for_batch(&mut bitmap, loaded_rows, request, &batch)?
+        else {
+            return Ok(None);
+        };
+        page_count += batch_scan.page_count;
+        predicate_dispatch.merge(batch_scan.predicate_dispatch);
+    }
+    Ok(Some(NativeScalarBitmapScan {
+        bitmap,
+        page_count,
+        predicate_dispatch,
+    }))
+}
+
+fn native_scalar_bitmap_for_retained_request(
+    segments: &[RetainedTemporalSegmentData],
+    surface: &CoveObjectKernelSurface,
+    loaded_rows: &SurfaceRowLookup,
+    request: &NativeScalarPredicateRequest,
+) -> Result<Option<NativeScalarBitmapScan>, BuildExecutionError> {
+    let mut bitmap = SelectionBitmap::none(surface.system.len());
+    let mut page_count = 0usize;
+    let mut predicate_dispatch = NativeKernelDispatchCounts::default();
+    for segment in segments {
+        if segment.header.object_type_id != request.object_type_id() {
+            continue;
+        }
+        let batch = native_object_temporal_batch_from_retained_segment(
+            segment,
+            NativeCodeDomain {
+                object_type_id: Some(segment.header.object_type_id),
+                ..NativeCodeDomain::default()
+            },
+        )
+        .map_err(|error| {
+            exec_error(
+                "E_NATIVE_SCALAR_LITERAL_PRUNE",
+                format!("retained native scalar literal prune page binding failed: {error}"),
+                json!({ "segment_id": segment.header.segment_id }),
+            )
+        })?;
+        let Some(batch_scan) =
+            native_scalar_bitmap_for_batch(&mut bitmap, loaded_rows, request, &batch)?
+        else {
+            return Ok(None);
+        };
+        page_count += batch_scan.page_count;
+        predicate_dispatch.merge(batch_scan.predicate_dispatch);
+    }
+    Ok(Some(NativeScalarBitmapScan {
+        bitmap,
+        page_count,
+        predicate_dispatch,
+    }))
+}
+
+fn native_selection_from_kernel(
+    result: Result<(SelectionBitmap, KernelStats), CoveError>,
+) -> Result<(SelectionBitmap, NativeKernelDispatch), CoveError> {
+    result.map(|(selected, stats)| (selected, stats.dispatch))
+}
+
+fn native_selection_from_bitmap(
+    selected: SelectionBitmap,
+) -> (SelectionBitmap, NativeKernelDispatch) {
+    (selected, NativeKernelDispatch::Scalar)
+}
+
+fn native_scalar_bitmap_for_batch(
+    bitmap: &mut SelectionBitmap,
+    loaded_rows: &SurfaceRowLookup,
+    request: &NativeScalarPredicateRequest,
+    batch: &NativeObjectTemporalBatch<'_>,
+) -> Result<Option<NativeScalarBatchScan>, BuildExecutionError> {
+    if let Some(scanned_units) =
+        native_scalar_bitmap_for_system_batch(bitmap, loaded_rows, request, batch)?
+    {
+        return Ok(Some(scanned_units));
+    }
+    let mut page_count = 0usize;
+    let mut predicate_dispatch = NativeKernelDispatchCounts::default();
+    for page in &batch.property_pages {
+        if page.property_id != request.property_id() {
+            continue;
+        }
+        page_count += 1;
+        let (selected, dispatch) = match (request, &page.lane) {
+            (NativeScalarPredicateRequest::NullCheck { want_valid, .. }, lane) => {
+                native_validity_selection_for_lane(lane, page.row_count, *want_valid).ok_or(
+                    CoveError::UnsupportedEncoding(
+                        "native null check requires a validity-backed lane".into(),
+                    ),
+                )
+            }
+            (
+                NativeScalarPredicateRequest::BoolEq { value, .. },
+                LaneRef::Bool {
+                    values,
+                    row_count,
+                    validity,
+                    ..
+                },
+            ) => native_selection_from_kernel(filter_bool_eq(
+                values, *row_count, *validity, *value, None,
+            )),
+            (
+                NativeScalarPredicateRequest::BoolEq { value, .. },
+                LaneRef::LocalCodeU8 {
+                    values,
+                    validity,
+                    local_to_global,
+                    logical_type,
+                    physical_kind,
+                    ..
+                },
+            ) if *logical_type == CoveLogicalType::Bool
+                && *physical_kind == CovePhysicalKind::Boolean =>
+            {
+                Ok(local_u8_selection_for_targets(
+                    values,
+                    *validity,
+                    local_to_global,
+                    &[u64::from(u8::from(*value))],
+                    true,
+                ))
+            }
+            (
+                NativeScalarPredicateRequest::BoolEq { value, .. },
+                LaneRef::LocalCodeU16 {
+                    values,
+                    validity,
+                    local_to_global,
+                    logical_type,
+                    physical_kind,
+                    ..
+                },
+            ) if *logical_type == CoveLogicalType::Bool
+                && *physical_kind == CovePhysicalKind::Boolean =>
+            {
+                Ok(local_u16_selection_for_targets(
+                    values,
+                    *validity,
+                    local_to_global,
+                    &[u64::from(u8::from(*value))],
+                    true,
+                ))
+            }
+            (
+                NativeScalarPredicateRequest::BoolEq { value, .. },
+                LaneRef::LocalCodeU32 {
+                    values,
+                    validity,
+                    local_to_global,
+                    logical_type,
+                    physical_kind,
+                    ..
+                },
+            ) if *logical_type == CoveLogicalType::Bool
+                && *physical_kind == CovePhysicalKind::Boolean =>
+            {
+                Ok(local_u32_selection_for_targets(
+                    values,
+                    *validity,
+                    local_to_global,
+                    &[u64::from(u8::from(*value))],
+                    true,
+                ))
+            }
+            (
+                NativeScalarPredicateRequest::FixedBytesEq {
+                    logical_type,
+                    value,
+                    ..
+                },
+                LaneRef::FixedBytes {
+                    values,
+                    width,
+                    row_count,
+                    validity,
+                    logical_type: lane_logical_type,
+                    ..
+                },
+            ) if lane_logical_type == logical_type => native_selection_from_kernel(
+                filter_fixed_bytes_eq(values, *row_count, *width, *validity, value, None),
+            ),
+            (
+                NativeScalarPredicateRequest::FixedBytesIn {
+                    logical_type,
+                    values: needles,
+                    ..
+                },
+                LaneRef::FixedBytes {
+                    values,
+                    width,
+                    row_count,
+                    validity,
+                    logical_type: lane_logical_type,
+                    ..
+                },
+            ) if lane_logical_type == logical_type => native_selection_from_kernel(
+                filter_fixed_bytes_in(values, *row_count, *width, *validity, needles, None),
+            ),
+            (
+                NativeScalarPredicateRequest::FixedBytesNotIn {
+                    logical_type,
+                    values: needles,
+                    ..
+                },
+                LaneRef::FixedBytes {
+                    values,
+                    width,
+                    row_count,
+                    validity,
+                    logical_type: lane_logical_type,
+                    ..
+                },
+            ) if lane_logical_type == logical_type => filter_fixed_bytes_in(
+                values, *row_count, *width, *validity, needles, None,
+            )
+            .map(|(matched, stats)| {
+                (
+                    valid_rows_except(*row_count, *validity, &matched),
+                    stats.dispatch,
+                )
+            }),
+            (
+                NativeScalarPredicateRequest::VarBytesEq {
+                    logical_type,
+                    value,
+                    ..
+                },
+                LaneRef::VarBytes {
+                    row_offsets,
+                    values,
+                    validity,
+                    logical_type: lane_logical_type,
+                    ..
+                },
+            ) if lane_logical_type == logical_type => native_selection_from_kernel(
+                filter_varbytes_eq(row_offsets, values, *validity, value, None),
+            ),
+            (
+                NativeScalarPredicateRequest::VarBytesIn {
+                    logical_type,
+                    values: needles,
+                    ..
+                },
+                LaneRef::VarBytes {
+                    row_offsets,
+                    values,
+                    validity,
+                    logical_type: lane_logical_type,
+                    ..
+                },
+            ) if lane_logical_type == logical_type => {
+                let needles = needles.iter().map(Vec::as_slice).collect::<Vec<_>>();
+                native_selection_from_kernel(filter_varbytes_in(
+                    row_offsets,
+                    values,
+                    *validity,
+                    &needles,
+                    None,
+                ))
+            }
+            (
+                NativeScalarPredicateRequest::VarBytesNotIn {
+                    logical_type,
+                    values: needles,
+                    ..
+                },
+                LaneRef::VarBytes {
+                    row_offsets,
+                    values,
+                    validity,
+                    logical_type: lane_logical_type,
+                    ..
+                },
+            ) if lane_logical_type == logical_type => {
+                let needles = needles.iter().map(Vec::as_slice).collect::<Vec<_>>();
+                filter_varbytes_in(row_offsets, values, *validity, &needles, None).map(
+                    |(matched, stats)| {
+                        (
+                            valid_rows_except(row_offsets.len(), *validity, &matched),
+                            stats.dispatch,
+                        )
+                    },
+                )
+            }
+            (
+                NativeScalarPredicateRequest::VarBytesPrefix {
+                    logical_type,
+                    prefix,
+                    ..
+                },
+                LaneRef::VarBytes {
+                    row_offsets,
+                    values,
+                    validity,
+                    logical_type: lane_logical_type,
+                    ..
+                },
+            ) if lane_logical_type == logical_type => native_selection_from_kernel(
+                filter_varbytes_prefix(row_offsets, values, *validity, prefix, None),
+            ),
+            (
+                NativeScalarPredicateRequest::NumCode {
+                    logical_type,
+                    op,
+                    literal,
+                    ..
+                },
+                LaneRef::NumCodeU64LeBytes {
+                    bytes,
+                    row_count,
+                    validity,
+                    logical_type: lane_logical_type,
+                    ..
+                },
+            ) if lane_logical_type == logical_type => {
+                native_selection_from_kernel(filter_numcode_le_typed(
+                    bytes,
+                    *row_count,
+                    *validity,
+                    *logical_type,
+                    *op,
+                    *literal,
+                    None,
+                ))
+            }
+            (
+                NativeScalarPredicateRequest::NumCodeIn {
+                    logical_type,
+                    literals,
+                    ..
+                },
+                LaneRef::NumCodeU64LeBytes {
+                    bytes,
+                    row_count,
+                    validity,
+                    logical_type: lane_logical_type,
+                    ..
+                },
+            ) if lane_logical_type == logical_type => {
+                native_selection_from_kernel(filter_numcode_le_in_typed(
+                    bytes,
+                    *row_count,
+                    *validity,
+                    *logical_type,
+                    literals,
+                    None,
+                ))
+            }
+            (
+                NativeScalarPredicateRequest::NumCodeNotIn {
+                    logical_type,
+                    literals,
+                    ..
+                },
+                LaneRef::NumCodeU64LeBytes {
+                    bytes,
+                    row_count,
+                    validity,
+                    logical_type: lane_logical_type,
+                    ..
+                },
+            ) if lane_logical_type == logical_type => {
+                native_selection_from_kernel(filter_numcode_le_not_in_typed(
+                    bytes,
+                    *row_count,
+                    *validity,
+                    *logical_type,
+                    literals,
+                    None,
+                ))
+            }
+            (
+                NativeScalarPredicateRequest::NumCode {
+                    logical_type,
+                    op,
+                    literal,
+                    ..
+                },
+                LaneRef::LocalCodeU8 {
+                    values,
+                    validity,
+                    local_to_global,
+                    logical_type: lane_logical_type,
+                    physical_kind,
+                    ..
+                },
+            ) if lane_logical_type == logical_type
+                && *physical_kind == CovePhysicalKind::NumCode =>
+            {
+                local_numcode_membership(local_to_global, *logical_type, *op, *literal).map(
+                    |membership| {
+                        let (selected, stats) =
+                            filter_local_u8_membership(values, *validity, &membership, None);
+                        (selected, stats.dispatch)
+                    },
+                )
+            }
+            (
+                NativeScalarPredicateRequest::NumCode {
+                    logical_type,
+                    op,
+                    literal,
+                    ..
+                },
+                LaneRef::LocalCodeU16 {
+                    values,
+                    validity,
+                    local_to_global,
+                    logical_type: lane_logical_type,
+                    physical_kind,
+                    ..
+                },
+            ) if lane_logical_type == logical_type
+                && *physical_kind == CovePhysicalKind::NumCode =>
+            {
+                local_numcode_membership(local_to_global, *logical_type, *op, *literal).map(
+                    |membership| {
+                        let (selected, stats) =
+                            filter_local_u16_membership(values, *validity, &membership, None);
+                        (selected, stats.dispatch)
+                    },
+                )
+            }
+            (
+                NativeScalarPredicateRequest::NumCode {
+                    logical_type,
+                    op,
+                    literal,
+                    ..
+                },
+                LaneRef::LocalCodeU32 {
+                    values,
+                    validity,
+                    local_to_global,
+                    logical_type: lane_logical_type,
+                    physical_kind,
+                    ..
+                },
+            ) if lane_logical_type == logical_type
+                && *physical_kind == CovePhysicalKind::NumCode =>
+            {
+                local_numcode_membership(local_to_global, *logical_type, *op, *literal).map(
+                    |membership| {
+                        let (selected, stats) =
+                            filter_local_u32_membership(values, *validity, &membership, None);
+                        (selected, stats.dispatch)
+                    },
+                )
+            }
+            (
+                NativeScalarPredicateRequest::NumCodeIn {
+                    logical_type,
+                    literals,
+                    ..
+                },
+                LaneRef::LocalCodeU8 {
+                    values,
+                    validity,
+                    local_to_global,
+                    logical_type: lane_logical_type,
+                    physical_kind,
+                    ..
+                },
+            ) if lane_logical_type == logical_type
+                && *physical_kind == CovePhysicalKind::NumCode =>
+            {
+                local_numcode_in_membership(local_to_global, *logical_type, literals).map(
+                    |membership| {
+                        let (selected, stats) =
+                            filter_local_u8_membership(values, *validity, &membership, None);
+                        (selected, stats.dispatch)
+                    },
+                )
+            }
+            (
+                NativeScalarPredicateRequest::NumCodeNotIn {
+                    logical_type,
+                    literals,
+                    ..
+                },
+                LaneRef::LocalCodeU8 {
+                    values,
+                    validity,
+                    local_to_global,
+                    logical_type: lane_logical_type,
+                    physical_kind,
+                    ..
+                },
+            ) if lane_logical_type == logical_type
+                && *physical_kind == CovePhysicalKind::NumCode =>
+            {
+                local_numcode_in_membership(local_to_global, *logical_type, literals).map(
+                    |membership| {
+                        let (matched, stats) =
+                            filter_local_u8_membership(values, *validity, &membership, None);
+                        (
+                            valid_rows_except(values.len(), *validity, &matched),
+                            stats.dispatch,
+                        )
+                    },
+                )
+            }
+            (
+                NativeScalarPredicateRequest::NumCodeIn {
+                    logical_type,
+                    literals,
+                    ..
+                },
+                LaneRef::LocalCodeU16 {
+                    values,
+                    validity,
+                    local_to_global,
+                    logical_type: lane_logical_type,
+                    physical_kind,
+                    ..
+                },
+            ) if lane_logical_type == logical_type
+                && *physical_kind == CovePhysicalKind::NumCode =>
+            {
+                local_numcode_in_membership(local_to_global, *logical_type, literals).map(
+                    |membership| {
+                        let (selected, stats) =
+                            filter_local_u16_membership(values, *validity, &membership, None);
+                        (selected, stats.dispatch)
+                    },
+                )
+            }
+            (
+                NativeScalarPredicateRequest::NumCodeNotIn {
+                    logical_type,
+                    literals,
+                    ..
+                },
+                LaneRef::LocalCodeU16 {
+                    values,
+                    validity,
+                    local_to_global,
+                    logical_type: lane_logical_type,
+                    physical_kind,
+                    ..
+                },
+            ) if lane_logical_type == logical_type
+                && *physical_kind == CovePhysicalKind::NumCode =>
+            {
+                local_numcode_in_membership(local_to_global, *logical_type, literals).map(
+                    |membership| {
+                        let (matched, stats) =
+                            filter_local_u16_membership(values, *validity, &membership, None);
+                        (
+                            valid_rows_except(values.len(), *validity, &matched),
+                            stats.dispatch,
+                        )
+                    },
+                )
+            }
+            (
+                NativeScalarPredicateRequest::NumCodeIn {
+                    logical_type,
+                    literals,
+                    ..
+                },
+                LaneRef::LocalCodeU32 {
+                    values,
+                    validity,
+                    local_to_global,
+                    logical_type: lane_logical_type,
+                    physical_kind,
+                    ..
+                },
+            ) if lane_logical_type == logical_type
+                && *physical_kind == CovePhysicalKind::NumCode =>
+            {
+                local_numcode_in_membership(local_to_global, *logical_type, literals).map(
+                    |membership| {
+                        let (selected, stats) =
+                            filter_local_u32_membership(values, *validity, &membership, None);
+                        (selected, stats.dispatch)
+                    },
+                )
+            }
+            (
+                NativeScalarPredicateRequest::NumCodeNotIn {
+                    logical_type,
+                    literals,
+                    ..
+                },
+                LaneRef::LocalCodeU32 {
+                    values,
+                    validity,
+                    local_to_global,
+                    logical_type: lane_logical_type,
+                    physical_kind,
+                    ..
+                },
+            ) if lane_logical_type == logical_type
+                && *physical_kind == CovePhysicalKind::NumCode =>
+            {
+                local_numcode_in_membership(local_to_global, *logical_type, literals).map(
+                    |membership| {
+                        let (matched, stats) =
+                            filter_local_u32_membership(values, *validity, &membership, None);
+                        (
+                            valid_rows_except(values.len(), *validity, &matched),
+                            stats.dispatch,
+                        )
+                    },
+                )
+            }
+            (
+                _,
+                LaneRef::DecodeBoundary {
+                    reason: "all-null elided page",
+                    ..
+                },
+            ) => Ok(native_selection_from_bitmap(SelectionBitmap::none(
+                page.row_count,
+            ))),
+            _ => return Ok(None),
+        }
+        .map_err(|error| {
+            exec_error(
+                "E_NATIVE_SCALAR_LITERAL_PRUNE",
+                format!("native scalar literal prune page scan failed: {error}"),
+                json!({ "segment_id": batch.segment_id }),
+            )
+        })?;
+        predicate_dispatch.record(dispatch);
+
+        for local_row in selected.to_selection_vector().rows() {
+            set_native_scalar_prune_surface_row(
+                bitmap,
+                loaded_rows,
+                batch.segment_id,
+                page.row_start,
+                *local_row as usize,
+            )?;
+        }
+    }
+    if page_count == 0 {
+        return Ok(None);
+    }
+    Ok(Some(NativeScalarBatchScan {
+        page_count,
+        predicate_dispatch,
+    }))
+}
+
+fn native_scalar_bitmap_for_system_batch(
+    bitmap: &mut SelectionBitmap,
+    loaded_rows: &SurfaceRowLookup,
+    request: &NativeScalarPredicateRequest,
+    batch: &NativeObjectTemporalBatch<'_>,
+) -> Result<Option<NativeScalarBatchScan>, BuildExecutionError> {
+    if !matches!(
+        request,
+        NativeScalarPredicateRequest::SystemNumeric { .. }
+            | NativeScalarPredicateRequest::SystemGoidEq { .. }
+    ) {
+        return Ok(None);
+    }
+    for (row_index, row) in batch.rows.iter().enumerate() {
+        let matched = match request {
+            NativeScalarPredicateRequest::SystemNumeric {
+                field, op, literal, ..
+            } => native_system_numeric_row_matches(row, *field, *op, *literal)?,
+            NativeScalarPredicateRequest::SystemGoidEq { value, .. } => row.goid == *value,
+            _ => unreachable!(),
+        };
+        if matched {
+            set_native_scalar_prune_surface_row(
+                bitmap,
+                loaded_rows,
+                batch.segment_id,
+                0,
+                row_index,
+            )?;
+        }
+    }
+    let mut predicate_dispatch = NativeKernelDispatchCounts::default();
+    predicate_dispatch.record(NativeKernelDispatch::Scalar);
+    Ok(Some(NativeScalarBatchScan {
+        page_count: 1,
+        predicate_dispatch,
+    }))
+}
+
+fn native_system_numeric_row_matches(
+    row: &cove_core::profile::cove_o::TemporalRowEntryV1,
+    field: NativeSystemNumericField,
+    op: NativeNumericPredicateOp,
+    literal: NativeNumericLiteral,
+) -> Result<bool, BuildExecutionError> {
+    let (logical_type, raw_value) = match field {
+        NativeSystemNumericField::BranchKey => (CoveLogicalType::UInt64, row.branch_key),
+        NativeSystemNumericField::Csn => (CoveLogicalType::UInt64, row.csn),
+        NativeSystemNumericField::TimestampUs => {
+            (CoveLogicalType::TimestampMicros, row.timestamp_us as u64)
+        }
+    };
+    native_numcode_matches(logical_type, raw_value, op, literal).map_err(|error| {
+        exec_error(
+            "E_NATIVE_SCALAR_LITERAL_PRUNE",
+            format!("native system row predicate failed: {error}"),
+            json!({ "logical_type": format!("{logical_type:?}") }),
+        )
+    })
+}
+
+fn local_numcode_membership(
+    local_to_global: &[u64],
+    logical_type: CoveLogicalType,
+    op: NativeNumericPredicateOp,
+    literal: NativeNumericLiteral,
+) -> Result<Vec<bool>, CoveError> {
+    local_to_global
+        .iter()
+        .copied()
+        .map(|value| native_numcode_matches(logical_type, value, op, literal))
+        .collect()
+}
+
+fn local_numcode_in_membership(
+    local_to_global: &[u64],
+    logical_type: CoveLogicalType,
+    literals: &[NativeNumericLiteral],
+) -> Result<Vec<bool>, CoveError> {
+    local_to_global
+        .iter()
+        .copied()
+        .map(|value| {
+            for literal in literals {
+                if native_numcode_matches(
+                    logical_type,
+                    value,
+                    NativeNumericPredicateOp::Eq,
+                    *literal,
+                )? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        })
+        .collect()
+}
+
+fn local_u8_selection_for_targets(
+    values: &[u8],
+    validity: ValidityRef<'_>,
+    local_to_global: &[u64],
+    target_codes: &[u64],
+    include: bool,
+) -> (SelectionBitmap, NativeKernelDispatch) {
+    let membership = local_membership_u8(local_to_global, target_codes);
+    let (matched, stats) = filter_local_u8_membership(values, validity, &membership, None);
+    let selected = if include {
+        matched
+    } else {
+        valid_rows_except(values.len(), validity, &matched)
+    };
+    (selected, stats.dispatch)
+}
+
+fn local_u16_selection_for_targets(
+    values: &[u16],
+    validity: ValidityRef<'_>,
+    local_to_global: &[u64],
+    target_codes: &[u64],
+    include: bool,
+) -> (SelectionBitmap, NativeKernelDispatch) {
+    let membership = local_membership_u8(local_to_global, target_codes);
+    let (matched, stats) = filter_local_u16_membership(values, validity, &membership, None);
+    let selected = if include {
+        matched
+    } else {
+        valid_rows_except(values.len(), validity, &matched)
+    };
+    (selected, stats.dispatch)
+}
+
+fn local_u32_selection_for_targets(
+    values: &[u32],
+    validity: ValidityRef<'_>,
+    local_to_global: &[u64],
+    target_codes: &[u64],
+    include: bool,
+) -> (SelectionBitmap, NativeKernelDispatch) {
+    let membership = local_membership_u8(local_to_global, target_codes);
+    let (matched, stats) = filter_local_u32_membership(values, validity, &membership, None);
+    let selected = if include {
+        matched
+    } else {
+        valid_rows_except(values.len(), validity, &matched)
+    };
+    (selected, stats.dispatch)
+}
+
+fn native_validity_selection_for_lane(
+    lane: &LaneRef<'_>,
+    page_row_count: usize,
+    want_valid: bool,
+) -> Option<(SelectionBitmap, NativeKernelDispatch)> {
+    if lane.row_count() != page_row_count {
+        return None;
+    }
+    let validity = lane.validity()?;
+    let (selected, stats) = filter_validity(page_row_count, validity, want_valid, None);
+    Some((selected, stats.dispatch))
+}
+
+impl NativeScalarPredicateRequest {
+    fn kind_name(&self) -> &'static str {
+        match self {
+            Self::SystemNumeric { .. } => "system_numeric",
+            Self::SystemGoidEq { .. } => "system_goid_eq",
+            Self::NullCheck { .. } => "null_check",
+            Self::BoolEq { .. } => "bool_eq",
+            Self::FixedBytesEq { .. } => "fixed_bytes_eq",
+            Self::FixedBytesIn { .. } => "fixed_bytes_in",
+            Self::FixedBytesNotIn { .. } => "fixed_bytes_not_in",
+            Self::VarBytesEq { .. } => "varbytes_eq",
+            Self::VarBytesIn { .. } => "varbytes_in",
+            Self::VarBytesNotIn { .. } => "varbytes_not_in",
+            Self::VarBytesPrefix { .. } => "varbytes_prefix",
+            Self::NumCode { .. } => "numcode",
+            Self::NumCodeIn { .. } => "numcode_in",
+            Self::NumCodeNotIn { .. } => "numcode_not_in",
+        }
+    }
+
+    fn object_type_id(&self) -> u32 {
+        match self {
+            Self::SystemNumeric { object_type_id, .. }
+            | Self::SystemGoidEq { object_type_id, .. }
+            | Self::NullCheck { object_type_id, .. }
+            | Self::BoolEq { object_type_id, .. }
+            | Self::FixedBytesEq { object_type_id, .. }
+            | Self::FixedBytesIn { object_type_id, .. }
+            | Self::FixedBytesNotIn { object_type_id, .. }
+            | Self::VarBytesEq { object_type_id, .. }
+            | Self::VarBytesIn { object_type_id, .. }
+            | Self::VarBytesNotIn { object_type_id, .. }
+            | Self::VarBytesPrefix { object_type_id, .. }
+            | Self::NumCode { object_type_id, .. }
+            | Self::NumCodeIn { object_type_id, .. }
+            | Self::NumCodeNotIn { object_type_id, .. } => *object_type_id,
+        }
+    }
+
+    fn property_id(&self) -> u32 {
+        match self {
+            Self::NullCheck { property_id, .. }
+            | Self::BoolEq { property_id, .. }
+            | Self::FixedBytesEq { property_id, .. }
+            | Self::FixedBytesIn { property_id, .. }
+            | Self::FixedBytesNotIn { property_id, .. }
+            | Self::VarBytesEq { property_id, .. }
+            | Self::VarBytesIn { property_id, .. }
+            | Self::VarBytesNotIn { property_id, .. }
+            | Self::VarBytesPrefix { property_id, .. }
+            | Self::NumCode { property_id, .. }
+            | Self::NumCodeIn { property_id, .. }
+            | Self::NumCodeNotIn { property_id, .. } => *property_id,
+            Self::SystemNumeric { .. } | Self::SystemGoidEq { .. } => {
+                unreachable!("system native scalar predicates do not have property ids")
+            }
+        }
+    }
+}
+
+fn native_scalar_prune_covers_all_kernel_predicates(
+    prune: &NativeScalarPredicatePrune,
+    predicates: &[KernelPredicate],
+) -> bool {
+    native_scalar_prune_covers_kernel_predicate_count(prune, predicates.len())
+}
+
+fn native_scalar_prune_covers_kernel_predicate_count(
+    prune: &NativeScalarPredicatePrune,
+    predicate_count: usize,
+) -> bool {
+    predicate_count > 0
+        && prune.page_count > 0
+        && prune.predicate_count == predicate_count
+        && (prune.executed_predicate_count == prune.predicate_count || prune.short_circuited)
+}
+
+fn code_prune_covers_kernel_predicate_count(
+    prune_predicate_count: usize,
+    prune_page_count: usize,
+    predicate_count: usize,
+) -> bool {
+    predicate_count > 0 && prune_page_count > 0 && prune_predicate_count == predicate_count
+}
+
+fn order_native_scalar_requests_by_cost(requests: &mut [NativeScalarPredicateRequest]) -> bool {
+    let mut indexed = requests.iter().cloned().enumerate().collect::<Vec<_>>();
+    indexed.sort_by_key(|(index, request)| (native_scalar_request_cost_key(request), *index));
+    let reordered = indexed
+        .iter()
+        .enumerate()
+        .any(|(slot, (original, _))| slot != *original);
+    for (slot, (_, request)) in requests.iter_mut().zip(indexed) {
+        *slot = request;
+    }
+    reordered
+}
+
+fn native_scalar_request_cost_key(request: &NativeScalarPredicateRequest) -> (u8, u8) {
+    match request {
+        NativeScalarPredicateRequest::SystemNumeric { .. } => (0, 0),
+        NativeScalarPredicateRequest::SystemGoidEq { .. } => (0, 1),
+        NativeScalarPredicateRequest::NullCheck { .. } => (1, 0),
+        NativeScalarPredicateRequest::BoolEq { .. } => (2, 0),
+        NativeScalarPredicateRequest::NumCode { .. } => (3, 0),
+        NativeScalarPredicateRequest::NumCodeIn { .. } => (3, 1),
+        NativeScalarPredicateRequest::NumCodeNotIn { .. } => (3, 2),
+        NativeScalarPredicateRequest::FixedBytesEq { .. } => (4, 0),
+        NativeScalarPredicateRequest::FixedBytesIn { .. } => (4, 1),
+        NativeScalarPredicateRequest::FixedBytesNotIn { .. } => (4, 2),
+        NativeScalarPredicateRequest::VarBytesEq { .. } => (5, 0),
+        NativeScalarPredicateRequest::VarBytesIn { .. } => (5, 1),
+        NativeScalarPredicateRequest::VarBytesNotIn { .. } => (5, 2),
+        NativeScalarPredicateRequest::VarBytesPrefix { .. } => (5, 3),
+    }
+}
+
+fn surface_row_lookup_for_object(
+    surface: &CoveObjectKernelSurface,
+    root_object_type_id: u32,
+) -> SurfaceRowLookup {
+    let mut segment_rows = BTreeMap::<u32, Vec<Option<usize>>>::new();
+    for row in 0..surface.system.len() {
+        if surface.system.object_type_ids[row] == root_object_type_id {
+            let segment_id = surface.system.segment_ids[row];
+            let row_index = surface.system.row_indices[row] as usize;
+            let rows = segment_rows.entry(segment_id).or_default();
+            if rows.len() <= row_index {
+                rows.resize(row_index + 1, None);
+            }
+            rows[row_index] = Some(row);
+        }
+    }
+    SurfaceRowLookup::from_segment_rows(segment_rows)
+}
+
+fn set_native_scalar_prune_surface_row(
+    bitmap: &mut SelectionBitmap,
+    loaded_rows: &SurfaceRowLookup,
+    segment_id: u32,
+    page_row_start: usize,
+    local_row: usize,
+) -> Result<(), BuildExecutionError> {
+    let row_index = page_row_start.checked_add(local_row).ok_or_else(|| {
+        exec_error(
+            "E_NATIVE_SCALAR_LITERAL_PRUNE",
+            "native scalar literal prune page row offset overflowed",
+            json!({}),
+        )
+    })?;
+    let row_index = u32::try_from(row_index).map_err(|_| {
+        exec_error(
+            "E_NATIVE_SCALAR_LITERAL_PRUNE",
+            "native scalar literal prune page row index exceeded u32",
+            json!({}),
+        )
+    })?;
+    if let Some(surface_row) = loaded_rows.get(segment_id, row_index) {
+        bitmap.set(surface_row);
+    }
+    Ok(())
+}
+
+fn decode_compact_hex_bytes(value: &str) -> Option<Vec<u8>> {
+    if value.len() % 2 != 0 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(value.len() / 2);
+    for chunk in value.as_bytes().chunks_exact(2) {
+        let text = std::str::from_utf8(chunk).ok()?;
+        out.push(u8::from_str_radix(text, 16).ok()?);
+    }
+    Some(out)
 }
 
 fn execution_code_predicate_requests(
@@ -2517,18 +4458,7 @@ fn execution_code_bitmap_for_request(
     execution_map: &cove_core::mount::ExecutionCodeMap,
 ) -> Result<(SelectionBitmap, usize), BuildExecutionError> {
     let mut bitmap = SelectionBitmap::none(surface.system.len());
-    let mut loaded_rows = BTreeMap::new();
-    for row in 0..surface.system.len() {
-        if surface.system.object_type_ids[row] == root_object_type_id {
-            loaded_rows.insert(
-                (
-                    surface.system.segment_ids[row],
-                    surface.system.row_indices[row],
-                ),
-                row,
-            );
-        }
-    }
+    let loaded_rows = surface_row_lookup_for_object(surface, root_object_type_id);
     let mut page_count = 0usize;
     for segment in temporal_segments_from_bytes(bytes)? {
         if segment.header.object_type_id != request.object_type_id {
@@ -2609,8 +4539,9 @@ fn execution_code_bitmap_for_request(
                     None,
                 );
                 for local_row in 0..page.index_entry.row_count {
-                    let row_key = (segment.header.segment_id, page_row_start + local_row);
-                    let Some(surface_row) = loaded_rows.get(&row_key).copied() else {
+                    let Some(surface_row) =
+                        loaded_rows.get(segment.header.segment_id, page_row_start + local_row)
+                    else {
                         continue;
                     };
                     let value = array.decode_row(u64::from(local_row)).map_err(|error| {
@@ -2647,19 +4578,16 @@ fn file_code_bitmap_for_request(
     target_codes: &BTreeSet<u32>,
 ) -> Result<(SelectionBitmap, usize), BuildExecutionError> {
     let mut bitmap = SelectionBitmap::none(surface.system.len());
-    let mut loaded_rows = BTreeMap::new();
-    for row in 0..surface.system.len() {
-        if surface.system.object_type_ids[row] == root_object_type_id {
-            loaded_rows.insert(
-                (
-                    surface.system.segment_ids[row],
-                    surface.system.row_indices[row],
-                ),
-                row,
-            );
-        }
-    }
+    let loaded_rows = surface_row_lookup_for_object(surface, root_object_type_id);
     let mut page_count = 0usize;
+    let target_codes_vec = target_codes.iter().copied().collect::<Vec<_>>();
+    let target_codes_u64 = target_codes
+        .iter()
+        .copied()
+        .map(u64::from)
+        .collect::<Vec<_>>();
+    let request_logical_type = logical_type_for_execution_code_request(&request.logical_type)
+        .unwrap_or(CoveLogicalType::Utf8);
     for segment in temporal_segments_from_bytes_with_context(
         bytes,
         "E_FILE_CODE_LITERAL_PRUNE",
@@ -2668,112 +4596,224 @@ fn file_code_bitmap_for_request(
         if segment.header.object_type_id != request.object_type_id {
             continue;
         }
-        for column in &segment.property_columns {
-            if column.directory.column_id != request.property_id
-                || Some(column.directory.logical_type)
-                    != logical_type_for_execution_code_request(&request.logical_type)
-                || column.directory.physical_kind != CovePhysicalKind::FileCode
-            {
+        let batch =
+            native_object_temporal_batch_from_segment(&segment, NativeCodeDomain::default())
+                .map_err(|error| {
+                    exec_error(
+                "E_FILE_CODE_LITERAL_PRUNE",
+                format!("single-file FileCode literal prune native page binding failed: {error}"),
+                json!({ "segment_id": segment.header.segment_id }),
+            )
+                })?;
+        for page in &batch.property_pages {
+            if page.property_id != request.property_id {
                 continue;
             }
-            for page in &column.pages {
-                page_count += 1;
-                let page_row_start = page
-                    .index_entry
-                    .morsel_id
-                    .checked_mul(segment.header.morsel_row_count)
-                    .ok_or_else(|| {
-                        exec_error(
-                            "E_FILE_CODE_LITERAL_PRUNE",
-                            "single-file FileCode literal prune page row offset overflowed",
-                            json!({}),
-                        )
-                    })?;
-                let Some(payload) = &page.payload else {
-                    if page.index_entry.null_count == page.index_entry.row_count {
+            match &page.lane {
+                LaneRef::FileCodeU32LeBytes {
+                    bytes,
+                    row_count,
+                    validity,
+                    logical_type,
+                    ..
+                } if *logical_type == request_logical_type => {
+                    page_count += 1;
+                    match request.match_mode {
+                        ExecutionCodeMatchMode::Include => {
+                            let (selected, _) = filter_u32_le_in_sorted(
+                                bytes,
+                                *row_count,
+                                *validity,
+                                &target_codes_vec,
+                                None,
+                            )
+                            .map_err(|error| {
+                                exec_error(
+                                    "E_FILE_CODE_LITERAL_PRUNE",
+                                    format!(
+                                        "single-file FileCode literal prune native page scan failed: {error}"
+                                    ),
+                                    json!({ "segment_id": segment.header.segment_id }),
+                                )
+                            })?;
+                            for local_row in selected.to_selection_vector().rows() {
+                                set_file_code_prune_surface_row(
+                                    &mut bitmap,
+                                    &loaded_rows,
+                                    batch.segment_id,
+                                    page.row_start,
+                                    *local_row as usize,
+                                )?;
+                            }
+                        }
+                        ExecutionCodeMatchMode::Exclude => {
+                            let (selected, _) = filter_u32_le_not_in_sorted(
+                                bytes,
+                                *row_count,
+                                *validity,
+                                &target_codes_vec,
+                                None,
+                            )
+                            .map_err(|error| {
+                                exec_error(
+                                    "E_FILE_CODE_LITERAL_PRUNE",
+                                    format!(
+                                        "single-file FileCode literal prune native page scan failed: {error}"
+                                    ),
+                                    json!({ "segment_id": segment.header.segment_id }),
+                                )
+                            })?;
+                            for local_row in selected.to_selection_vector().rows() {
+                                set_file_code_prune_surface_row(
+                                    &mut bitmap,
+                                    &loaded_rows,
+                                    batch.segment_id,
+                                    page.row_start,
+                                    *local_row as usize,
+                                )?;
+                            }
+                        }
+                    }
+                }
+                LaneRef::LocalCodeU8 {
+                    values,
+                    validity,
+                    local_to_global,
+                    logical_type,
+                    physical_kind,
+                    ..
+                } if *logical_type == request_logical_type
+                    && *physical_kind == CovePhysicalKind::FileCode =>
+                {
+                    page_count += 1;
+                    let selected = local_u8_selection_for_targets(
+                        values,
+                        *validity,
+                        local_to_global,
+                        &target_codes_u64,
+                        request.match_mode == ExecutionCodeMatchMode::Include,
+                    )
+                    .0;
+                    for local_row in selected.to_selection_vector().rows() {
+                        set_file_code_prune_surface_row(
+                            &mut bitmap,
+                            &loaded_rows,
+                            batch.segment_id,
+                            page.row_start,
+                            *local_row as usize,
+                        )?;
+                    }
+                }
+                LaneRef::LocalCodeU16 {
+                    values,
+                    validity,
+                    local_to_global,
+                    logical_type,
+                    physical_kind,
+                    ..
+                } if *logical_type == request_logical_type
+                    && *physical_kind == CovePhysicalKind::FileCode =>
+                {
+                    page_count += 1;
+                    let selected = local_u16_selection_for_targets(
+                        values,
+                        *validity,
+                        local_to_global,
+                        &target_codes_u64,
+                        request.match_mode == ExecutionCodeMatchMode::Include,
+                    )
+                    .0;
+                    for local_row in selected.to_selection_vector().rows() {
+                        set_file_code_prune_surface_row(
+                            &mut bitmap,
+                            &loaded_rows,
+                            batch.segment_id,
+                            page.row_start,
+                            *local_row as usize,
+                        )?;
+                    }
+                }
+                LaneRef::LocalCodeU32 {
+                    values,
+                    validity,
+                    local_to_global,
+                    logical_type,
+                    physical_kind,
+                    ..
+                } if *logical_type == request_logical_type
+                    && *physical_kind == CovePhysicalKind::FileCode =>
+                {
+                    page_count += 1;
+                    let selected = local_u32_selection_for_targets(
+                        values,
+                        *validity,
+                        local_to_global,
+                        &target_codes_u64,
+                        request.match_mode == ExecutionCodeMatchMode::Include,
+                    )
+                    .0;
+                    for local_row in selected.to_selection_vector().rows() {
+                        set_file_code_prune_surface_row(
+                            &mut bitmap,
+                            &loaded_rows,
+                            batch.segment_id,
+                            page.row_start,
+                            *local_row as usize,
+                        )?;
+                    }
+                }
+                LaneRef::DecodeBoundary {
+                    logical_type,
+                    physical_kind,
+                    reason,
+                    ..
+                } if *logical_type == request_logical_type
+                    && *physical_kind == CovePhysicalKind::FileCode =>
+                {
+                    page_count += 1;
+                    if *reason == "all-null elided page" {
                         continue;
                     }
                     return Err(exec_error(
                         "E_FILE_CODE_LITERAL_PRUNE",
-                        "single-file FileCode literal prune cannot execute over non-null payload-elided pages",
+                        format!(
+                            "single-file FileCode literal prune cannot execute over decode-boundary page: {reason}"
+                        ),
                         json!({ "segment_id": segment.header.segment_id }),
                     ));
-                };
-                let root = payload.root_node().map_err(|error| {
-                    exec_error(
-                        "E_FILE_CODE_LITERAL_PRUNE",
-                        format!(
-                            "single-file FileCode literal prune page root could not be read: {error}"
-                        ),
-                        json!({}),
-                    )
-                })?;
-                let null_bitmap =
-                    payload
-                        .buffer_bytes(PageBufferKind::NullBitmap)
-                        .map_err(|error| {
-                            exec_error(
-                                "E_FILE_CODE_LITERAL_PRUNE",
-                                format!(
-                                    "single-file FileCode literal prune null bitmap could not be read: {error}"
-                                ),
-                                json!({}),
-                            )
-                        })?;
-                let validity = null_bitmap
-                    .map(|bytes| ValidityBitmap::new(bytes, u64::from(page.index_entry.row_count)));
-                let value_bytes = payload
-                    .buffer_bytes(PageBufferKind::Values)
-                    .map_err(|error| {
-                        exec_error(
-                            "E_FILE_CODE_LITERAL_PRUNE",
-                            format!(
-                                "single-file FileCode literal prune values buffer could not be read: {error}"
-                            ),
-                            json!({}),
-                        )
-                    })?
-                    .unwrap_or(&[]);
-                let array = EncodedArray::new(
-                    logical_type_for_execution_code_request(&request.logical_type)
-                        .unwrap_or(CoveLogicalType::Utf8),
-                    CovePhysicalKind::FileCode,
-                    u64::from(page.index_entry.row_count),
-                    root.encoding_kind,
-                    validity,
-                    value_bytes,
-                    None,
-                );
-                for local_row in 0..page.index_entry.row_count {
-                    let row_key = (segment.header.segment_id, page_row_start + local_row);
-                    let Some(surface_row) = loaded_rows.get(&row_key).copied() else {
-                        continue;
-                    };
-                    let value = array.decode_row(u64::from(local_row)).map_err(|error| {
-                        exec_error(
-                            "E_FILE_CODE_LITERAL_PRUNE",
-                            format!(
-                                "single-file FileCode literal prune page decode failed: {error}"
-                            ),
-                            json!({}),
-                        )
-                    })?;
-                    let CoveArrayValue::FileCode(file_code) = value else {
-                        continue;
-                    };
-                    let contains = target_codes.contains(&file_code);
-                    if matches!(
-                        (request.match_mode, contains),
-                        (ExecutionCodeMatchMode::Include, true)
-                            | (ExecutionCodeMatchMode::Exclude, false)
-                    ) {
-                        bitmap.set(surface_row);
-                    }
                 }
+                _ => {}
             }
         }
     }
     Ok((bitmap, page_count))
+}
+
+fn set_file_code_prune_surface_row(
+    bitmap: &mut SelectionBitmap,
+    loaded_rows: &SurfaceRowLookup,
+    segment_id: u32,
+    page_row_start: usize,
+    local_row: usize,
+) -> Result<(), BuildExecutionError> {
+    let row_index = page_row_start.checked_add(local_row).ok_or_else(|| {
+        exec_error(
+            "E_FILE_CODE_LITERAL_PRUNE",
+            "single-file FileCode literal prune page row offset overflowed",
+            json!({}),
+        )
+    })?;
+    let row_index = u32::try_from(row_index).map_err(|_| {
+        exec_error(
+            "E_FILE_CODE_LITERAL_PRUNE",
+            "single-file FileCode literal prune page row index exceeded u32",
+            json!({}),
+        )
+    })?;
+    if let Some(surface_row) = loaded_rows.get(segment_id, row_index) {
+        bitmap.set(surface_row);
+    }
+    Ok(())
 }
 
 fn logical_type_for_execution_code_request(logical_type: &str) -> Option<CoveLogicalType> {
@@ -3834,6 +5874,11 @@ fn try_native_bool_group_count_result(
     let Some(select) = &planned.resolved.method_chain.select else {
         return Ok(None);
     };
+    if let Some(result) = try_native_dense_bool_group_star_aggregate_result(
+        rows, group_path, select, planned, options, started,
+    )? {
+        return Ok(Some(result));
+    }
     let mut groups = BTreeMap::<String, (Value, Vec<usize>)>::new();
     for (row_index, row) in rows.iter().enumerate() {
         let ExecutionRow::Object(row) = row else {
@@ -3871,6 +5916,7 @@ fn try_native_bool_group_count_result(
     }
     let mut json_rows = Vec::with_capacity(groups.len());
     let mut aggregate_name = "count";
+    let mut aggregate_strategy = "none";
     let mut values_seen = 0usize;
     for (_key, (group_value, row_indices)) in groups {
         let mut object = serde_json::Map::new();
@@ -3884,16 +5930,16 @@ fn try_native_bool_group_count_result(
                     name, arg, star, ..
                 } => {
                     aggregate_name = aggregate_operator_name(*name);
-                    let (aggregate_value, group_values_seen) =
-                        native_grouped_direct_aggregate_value(
-                            *name,
-                            *star,
-                            arg.as_deref(),
-                            &row_indices,
-                            rows,
-                        )?;
-                    values_seen += group_values_seen;
-                    object.insert(key, aggregate_value);
+                    let aggregate_eval = native_grouped_direct_aggregate_eval(
+                        *name,
+                        *star,
+                        arg.as_deref(),
+                        &row_indices,
+                        rows,
+                    )?;
+                    aggregate_strategy = aggregate_eval.strategy;
+                    values_seen += aggregate_eval.values_seen;
+                    object.insert(key, aggregate_eval.value);
                 }
                 _ => return Ok(None),
             }
@@ -3913,6 +5959,118 @@ fn try_native_bool_group_count_result(
             group_count,
             rows_counted: rows.len(),
             values_seen,
+            group_strategy: "row_index_single_pass",
+            aggregate_strategy,
+        },
+    )))
+}
+
+fn try_native_dense_bool_group_star_aggregate_result(
+    rows: &[ExecutionRow],
+    group_path: &ResolvedPath,
+    select: &[crate::ResolvedSelectItem],
+    planned: &crate::PlannedQuery,
+    options: &ExecutionOptions,
+    started: Instant,
+) -> Result<
+    Option<(
+        CoveQlExecutionResult,
+        ExecutionRowCounts,
+        NativeBoolGroupCountReport,
+    )>,
+    BuildExecutionError,
+> {
+    if !matches!(group_path.logical_type.as_str(), "bool" | "boolean") {
+        return Ok(None);
+    }
+    let Some(aggregate_name) = select.iter().find_map(|item| match &item.expr {
+        ResolvedExpr::AggregateCall {
+            name,
+            star: true,
+            arg: None,
+            ..
+        } if matches!(name, AstAggregateName::Count | AstAggregateName::Exists) => Some(*name),
+        _ => None,
+    }) else {
+        return Ok(None);
+    };
+
+    let mut false_count = 0usize;
+    let mut null_count = 0usize;
+    let mut true_count = 0usize;
+    for row in rows {
+        let ExecutionRow::Object(row) = row else {
+            return Ok(None);
+        };
+        if object_path_is_redacted(row, group_path) {
+            return Ok(None);
+        }
+        match row.value_for_path(group_path) {
+            Value::Bool(false) => false_count += 1,
+            Value::Bool(true) => true_count += 1,
+            Value::Null => null_count += 1,
+            value => return Err(exec_error(
+                "E_KERNEL_AGGREGATE",
+                "native dense bool group aggregate received a value outside its proven typed lane",
+                json!({
+                    "group_property": group_path.display_name,
+                    "logical_type": group_path.logical_type,
+                    "value": value,
+                }),
+            )),
+        }
+    }
+
+    let mut json_rows = Vec::with_capacity(3);
+    for (group_value, group_rows) in [
+        (Value::Bool(false), false_count),
+        (Value::Null, null_count),
+        (Value::Bool(true), true_count),
+    ] {
+        if group_rows == 0 {
+            continue;
+        }
+        let mut object = serde_json::Map::new();
+        for item in select {
+            let key = native_bool_group_count_output_name(&item.expr, item.alias.as_deref());
+            match &item.expr {
+                ResolvedExpr::Path(_) => {
+                    object.insert(key, group_value.clone());
+                }
+                ResolvedExpr::AggregateCall {
+                    name,
+                    star: true,
+                    arg: None,
+                    ..
+                } if *name == aggregate_name => {
+                    let value = match aggregate_name {
+                        AstAggregateName::Count => json!(group_rows as u64),
+                        AstAggregateName::Exists => Value::Bool(group_rows > 0),
+                        _ => unreachable!("dense bool group star aggregate was prefiltered"),
+                    };
+                    object.insert(key, value);
+                }
+                _ => return Ok(None),
+            }
+        }
+        json_rows.push(Value::Object(object));
+    }
+
+    let group_count = json_rows.len();
+    let (result, row_counts) =
+        finish_json_rows(json_rows, rows.len(), rows.len(), planned, options, started)?;
+    Ok(Some((
+        result,
+        row_counts,
+        NativeBoolGroupCountReport {
+            aggregate: aggregate_operator_name(aggregate_name),
+            group_property: group_path.display_name.clone(),
+            group_logical_type: group_path.logical_type.clone(),
+            group_count,
+            rows_counted: rows.len(),
+            values_seen: rows.len(),
+            group_strategy: "dense_bool_star",
+            aggregate_strategy: "row_count",
         },
     )))
 }
@@ -4080,13 +6238,13 @@ fn native_direct_group_count_value_is_supported(value: &Value, path: &ResolvedPa
     }
 }
 
-fn native_grouped_direct_aggregate_value(
+fn native_grouped_direct_aggregate_eval(
     aggregate: AstAggregateName,
     star: bool,
     arg: Option<&ResolvedExpr>,
     row_indices: &[usize],
     rows: &[ExecutionRow],
-) -> Result<(Value, usize), BuildExecutionError> {
+) -> Result<NativeDirectAggregateEval, BuildExecutionError> {
     if star {
         let value = match aggregate {
             AstAggregateName::Count => json!(row_indices.len() as u64),
@@ -4099,7 +6257,11 @@ fn native_grouped_direct_aggregate_value(
                 ))
             }
         };
-        return Ok((value, row_indices.len()));
+        return Ok(NativeDirectAggregateEval {
+            value,
+            values_seen: row_indices.len(),
+            strategy: "row_count",
+        });
     }
     let Some(ResolvedExpr::Path(path)) = arg else {
         return Err(exec_error(
@@ -4108,12 +6270,35 @@ fn native_grouped_direct_aggregate_value(
             json!({ "aggregate": aggregate_operator_name(aggregate) }),
         ));
     };
-    let values = native_direct_aggregate_path_values_for_indices(path, rows, row_indices)?;
-    let values_seen = values.iter().filter(|value| !value.is_null()).count();
-    Ok((
-        native_direct_aggregate_value_for_path_values(aggregate, path, &values)?,
-        values_seen,
-    ))
+    let mut state = NativeDirectAggregateState::new();
+    for row_index in row_indices {
+        let Some(row) = rows.get(*row_index) else {
+            return Err(exec_error(
+                "E_KERNEL_AGGREGATE",
+                "native grouped aggregate row index was outside the reconstructed row set",
+                json!({ "row_index": row_index }),
+            ));
+        };
+        let ExecutionRow::Object(row) = row else {
+            return Err(exec_error(
+                "E_KERNEL_AGGREGATE",
+                "native grouped aggregate expected object rows",
+                json!({}),
+            ));
+        };
+        if object_path_is_redacted(row, path) {
+            return Err(exec_error(
+                "E_KERNEL_AGGREGATE",
+                "native grouped aggregate cannot evaluate a redacted path",
+                json!({ "path": path.display_name }),
+            ));
+        }
+        let Some(value) = object_property_value_for_path(row, path) else {
+            continue;
+        };
+        state.accumulate_value(aggregate, path, value)?;
+    }
+    state.finish(aggregate)
 }
 
 fn try_native_direct_aggregate_result(
@@ -4145,22 +6330,11 @@ fn try_native_direct_aggregate_result(
         return Ok(None);
     };
     let counted_path = native_direct_aggregate_path(planned);
-    if let Some(path) = counted_path {
-        for row in rows {
-            let ExecutionRow::Object(row) = row else {
-                return Ok(None);
-            };
-            if object_path_is_redacted(row, path) {
-                return Ok(None);
-            }
-        }
-    }
-    let aggregate_value = native_direct_aggregate_value(aggregate, *star, counted_path, rows)?;
-    let values_seen = native_direct_aggregate_values_seen(*star, counted_path, rows)?;
+    let aggregate_eval = native_direct_aggregate_eval(aggregate, *star, counted_path, rows)?;
     let mut object = serde_json::Map::new();
     object.insert(
         native_bool_group_count_output_name(&item.expr, item.alias.as_deref()),
-        aggregate_value,
+        aggregate_eval.value,
     );
     let (result, row_counts) = finish_json_rows(
         vec![Value::Object(object)],
@@ -4177,7 +6351,8 @@ fn try_native_direct_aggregate_result(
             aggregate: aggregate_operator_name(aggregate),
             counted_path: counted_path.map(|path| path.display_name.clone()),
             rows_counted: rows.len(),
-            values_seen,
+            values_seen: aggregate_eval.values_seen,
+            aggregate_strategy: aggregate_eval.strategy,
         },
     )))
 }
@@ -4891,57 +7066,54 @@ fn native_helper_aggregate_value_for_indices(
     }
 }
 
-fn native_direct_aggregate_value(
-    aggregate: AstAggregateName,
-    star: bool,
-    path: Option<&ResolvedPath>,
-    rows: &[ExecutionRow],
-) -> Result<Value, BuildExecutionError> {
-    if star {
-        return Ok(match aggregate {
-            AstAggregateName::Count => json!(rows.len() as u64),
-            AstAggregateName::Exists => Value::Bool(!rows.is_empty()),
-            _ => {
-                return Err(exec_error(
-                    "E_KERNEL_AGGREGATE",
-                    "native direct aggregate received an unsupported star aggregate",
-                    json!({ "aggregate": aggregate_operator_name(aggregate) }),
-                ))
-            }
-        });
-    }
-    let Some(path) = path else {
-        return Err(exec_error(
-            "E_KERNEL_AGGREGATE",
-            "native direct aggregate requires a direct path argument",
-            json!({ "aggregate": aggregate_operator_name(aggregate) }),
-        ));
-    };
-    let values = native_direct_aggregate_path_values(path, rows)?;
-    native_direct_aggregate_value_for_path_values(aggregate, path, &values)
+#[derive(Debug)]
+struct NativeDirectAggregateEval {
+    value: Value,
+    values_seen: usize,
+    strategy: &'static str,
 }
 
-fn native_direct_aggregate_value_for_path_values(
-    aggregate: AstAggregateName,
-    path: &ResolvedPath,
-    values: &[Value],
-) -> Result<Value, BuildExecutionError> {
-    Ok(match aggregate {
-        AstAggregateName::Count => {
-            json!(values.iter().filter(|value| !value.is_null()).count() as u64)
+#[derive(Debug)]
+struct NativeDirectAggregateState<'a> {
+    values_seen: usize,
+    distinct: BTreeSet<String>,
+    selected: Option<&'a Value>,
+    exact_sum: Option<ExactDecimal>,
+    float_sum: f64,
+    saw_float: bool,
+}
+
+impl<'a> NativeDirectAggregateState<'a> {
+    fn new() -> Self {
+        Self {
+            values_seen: 0,
+            distinct: BTreeSet::new(),
+            selected: None,
+            exact_sum: None,
+            float_sum: 0.0,
+            saw_float: false,
         }
-        AstAggregateName::Exists => Value::Bool(values.iter().any(|value| !value.is_null())),
-        AstAggregateName::DistinctCount => {
-            let mut distinct = BTreeSet::new();
-            for value in values.iter().filter(|value| !value.is_null()) {
-                distinct.insert(logical_value_key(value, Some(path.logical_type.as_str())));
+    }
+
+    fn accumulate_value(
+        &mut self,
+        aggregate: AstAggregateName,
+        path: &ResolvedPath,
+        value: &'a Value,
+    ) -> Result<(), BuildExecutionError> {
+        if value.is_null() {
+            return Ok(());
+        }
+        self.values_seen += 1;
+
+        match aggregate {
+            AstAggregateName::Count | AstAggregateName::Exists => {}
+            AstAggregateName::DistinctCount => {
+                self.distinct
+                    .insert(logical_value_key(value, Some(path.logical_type.as_str())));
             }
-            json!(distinct.len() as u64)
-        }
-        AstAggregateName::Min | AstAggregateName::Max => {
-            let mut selected: Option<Value> = None;
-            for value in values.iter().filter(|value| !value.is_null()) {
-                let replace = match &selected {
+            AstAggregateName::Min | AstAggregateName::Max => {
+                let replace = match self.selected {
                     None => true,
                     Some(current) => {
                         value_ordering_typed(
@@ -4965,59 +7137,141 @@ fn native_direct_aggregate_value_for_path_values(
                     }
                 };
                 if replace {
-                    selected = Some(value.clone());
+                    self.selected = Some(value);
                 }
             }
-            selected.unwrap_or(Value::Null)
+            AstAggregateName::Sum | AstAggregateName::Avg => {
+                accumulate_native_direct_numeric_value(
+                    aggregate,
+                    path,
+                    value,
+                    &mut self.exact_sum,
+                    &mut self.float_sum,
+                    &mut self.saw_float,
+                )?;
+            }
         }
-        AstAggregateName::Sum | AstAggregateName::Avg => {
-            native_direct_numeric_aggregate_value(aggregate, path, &values)?
-        }
-    })
+        Ok(())
+    }
+
+    fn finish(
+        self,
+        aggregate: AstAggregateName,
+    ) -> Result<NativeDirectAggregateEval, BuildExecutionError> {
+        let value = match aggregate {
+            AstAggregateName::Count => json!(self.values_seen as u64),
+            AstAggregateName::Exists => Value::Bool(self.values_seen > 0),
+            AstAggregateName::DistinctCount => json!(self.distinct.len() as u64),
+            AstAggregateName::Min | AstAggregateName::Max => {
+                self.selected.cloned().unwrap_or(Value::Null)
+            }
+            AstAggregateName::Sum | AstAggregateName::Avg => {
+                finish_native_direct_numeric_aggregate(
+                    aggregate,
+                    self.exact_sum,
+                    self.float_sum,
+                    self.saw_float,
+                    self.values_seen,
+                )?
+            }
+        };
+        let strategy = match aggregate {
+            AstAggregateName::Sum | AstAggregateName::Avg => "single_pass_typed_numeric",
+            AstAggregateName::Min | AstAggregateName::Max => "single_pass_typed_order",
+            AstAggregateName::Count
+            | AstAggregateName::Exists
+            | AstAggregateName::DistinctCount => "single_pass_value_ref",
+        };
+        Ok(NativeDirectAggregateEval {
+            value,
+            values_seen: self.values_seen,
+            strategy,
+        })
+    }
 }
 
-fn native_direct_numeric_aggregate_value(
+fn native_direct_aggregate_eval(
     aggregate: AstAggregateName,
-    path: &ResolvedPath,
-    values: &[Value],
-) -> Result<Value, BuildExecutionError> {
-    let mut exact_sum: Option<ExactDecimal> = None;
-    let mut float_sum = 0.0f64;
-    let mut saw_float = false;
-    let mut count = 0usize;
-    for value in values.iter().filter(|value| !value.is_null()) {
-        let numeric_is_float = matches!(path.logical_type.as_str(), "float32" | "float64")
-            || value
-                .as_number()
-                .is_some_and(|number| number.as_i64().is_none() && number.as_u64().is_none());
-        if numeric_is_float {
-            let Some(number) = value.as_f64() else {
+    star: bool,
+    path: Option<&ResolvedPath>,
+    rows: &[ExecutionRow],
+) -> Result<NativeDirectAggregateEval, BuildExecutionError> {
+    if star {
+        let value = match aggregate {
+            AstAggregateName::Count => json!(rows.len() as u64),
+            AstAggregateName::Exists => Value::Bool(!rows.is_empty()),
+            _ => {
                 return Err(exec_error(
                     "E_KERNEL_AGGREGATE",
-                    "native sum/avg aggregate requires numeric materialized values",
-                    json!({
-                        "aggregate": aggregate_operator_name(aggregate),
-                        "logical_type": path.logical_type,
-                    }),
-                ));
-            };
-            saw_float = true;
-            float_sum += number;
-        } else if let Some(decimal) = parse_decimal_value(value) {
-            exact_sum = Some(match exact_sum {
-                Some(sum) => sum.checked_add(decimal).ok_or_else(|| {
-                    exec_error(
-                        "E_KERNEL_AGGREGATE",
-                        "native sum/avg aggregate overflowed decimal accumulator",
-                        json!({
-                            "aggregate": aggregate_operator_name(aggregate),
-                            "logical_type": path.logical_type,
-                        }),
-                    )
-                })?,
-                None => decimal,
-            });
-        } else {
+                    "native direct aggregate received an unsupported star aggregate",
+                    json!({ "aggregate": aggregate_operator_name(aggregate) }),
+                ))
+            }
+        };
+        return Ok(NativeDirectAggregateEval {
+            value,
+            values_seen: rows.len(),
+            strategy: "row_count",
+        });
+    }
+
+    let Some(path) = path else {
+        return Err(exec_error(
+            "E_KERNEL_AGGREGATE",
+            "native direct aggregate requires a direct path argument",
+            json!({ "aggregate": aggregate_operator_name(aggregate) }),
+        ));
+    };
+
+    let mut state = NativeDirectAggregateState::new();
+    for row in rows {
+        let ExecutionRow::Object(row) = row else {
+            return Err(exec_error(
+                "E_KERNEL_AGGREGATE",
+                "native direct aggregate expected object rows",
+                json!({}),
+            ));
+        };
+        if object_path_is_redacted(row, path) {
+            return Err(exec_error(
+                "E_KERNEL_AGGREGATE",
+                "native direct aggregate cannot evaluate a redacted path",
+                json!({ "path": path.display_name }),
+            ));
+        }
+        let Some(value) = object_property_value_for_path(row, path) else {
+            continue;
+        };
+        state.accumulate_value(aggregate, path, value)?;
+    }
+    state.finish(aggregate)
+}
+
+fn object_property_value_for_path<'a>(
+    row: &'a MaterializedObjectRow,
+    path: &ResolvedPath,
+) -> Option<&'a Value> {
+    let property_id = path.property_id?;
+    if let Some(name) = row.property_ids.get(&property_id) {
+        return row.properties.get(name);
+    }
+    row.properties.get(&path.display_name)
+}
+
+fn accumulate_native_direct_numeric_value(
+    aggregate: AstAggregateName,
+    path: &ResolvedPath,
+    value: &Value,
+    exact_sum: &mut Option<ExactDecimal>,
+    float_sum: &mut f64,
+    saw_float: &mut bool,
+) -> Result<(), BuildExecutionError> {
+    let numeric_is_float = matches!(path.logical_type.as_str(), "float32" | "float64")
+        || value
+            .as_number()
+            .is_some_and(|number| number.as_i64().is_none() && number.as_u64().is_none());
+    if numeric_is_float {
+        let Some(number) = value.as_f64() else {
             return Err(exec_error(
                 "E_KERNEL_AGGREGATE",
                 "native sum/avg aggregate requires numeric materialized values",
@@ -5026,9 +7280,44 @@ fn native_direct_numeric_aggregate_value(
                     "logical_type": path.logical_type,
                 }),
             ));
-        }
-        count += 1;
+        };
+        *saw_float = true;
+        *float_sum += number;
+        return Ok(());
     }
+    let Some(decimal) = parse_decimal_value(value) else {
+        return Err(exec_error(
+            "E_KERNEL_AGGREGATE",
+            "native sum/avg aggregate requires numeric materialized values",
+            json!({
+                "aggregate": aggregate_operator_name(aggregate),
+                "logical_type": path.logical_type,
+            }),
+        ));
+    };
+    *exact_sum = Some(match exact_sum.take() {
+        Some(sum) => sum.checked_add(decimal).ok_or_else(|| {
+            exec_error(
+                "E_KERNEL_AGGREGATE",
+                "native sum/avg aggregate overflowed decimal accumulator",
+                json!({
+                    "aggregate": aggregate_operator_name(aggregate),
+                    "logical_type": path.logical_type,
+                }),
+            )
+        })?,
+        None => decimal,
+    });
+    Ok(())
+}
+
+fn finish_native_direct_numeric_aggregate(
+    aggregate: AstAggregateName,
+    exact_sum: Option<ExactDecimal>,
+    float_sum: f64,
+    saw_float: bool,
+    count: usize,
+) -> Result<Value, BuildExecutionError> {
     if count == 0 {
         return Ok(Value::Null);
     }
@@ -5069,81 +7358,6 @@ fn native_direct_numeric_aggregate_value(
             json!({ "aggregate": aggregate_operator_name(aggregate) }),
         )),
     }
-}
-
-fn native_direct_aggregate_values_seen(
-    star: bool,
-    path: Option<&ResolvedPath>,
-    rows: &[ExecutionRow],
-) -> Result<usize, BuildExecutionError> {
-    if star {
-        return Ok(rows.len());
-    }
-    let Some(path) = path else {
-        return Ok(0);
-    };
-    Ok(native_direct_aggregate_path_values(path, rows)?
-        .iter()
-        .filter(|value| !value.is_null())
-        .count())
-}
-
-fn native_direct_aggregate_path_values(
-    path: &ResolvedPath,
-    rows: &[ExecutionRow],
-) -> Result<Vec<Value>, BuildExecutionError> {
-    let mut values = Vec::with_capacity(rows.len());
-    for row in rows {
-        let ExecutionRow::Object(row) = row else {
-            return Err(exec_error(
-                "E_KERNEL_AGGREGATE",
-                "native direct aggregate expected object rows",
-                json!({}),
-            ));
-        };
-        if object_path_is_redacted(row, path) {
-            return Err(exec_error(
-                "E_KERNEL_AGGREGATE",
-                "native direct aggregate cannot evaluate a redacted path",
-                json!({ "path": path.display_name }),
-            ));
-        }
-        values.push(row.value_for_path(path));
-    }
-    Ok(values)
-}
-
-fn native_direct_aggregate_path_values_for_indices(
-    path: &ResolvedPath,
-    rows: &[ExecutionRow],
-    row_indices: &[usize],
-) -> Result<Vec<Value>, BuildExecutionError> {
-    let mut values = Vec::with_capacity(row_indices.len());
-    for row_index in row_indices {
-        let Some(row) = rows.get(*row_index) else {
-            return Err(exec_error(
-                "E_KERNEL_AGGREGATE",
-                "native grouped aggregate row index was outside the reconstructed row set",
-                json!({ "row_index": row_index }),
-            ));
-        };
-        let ExecutionRow::Object(row) = row else {
-            return Err(exec_error(
-                "E_KERNEL_AGGREGATE",
-                "native grouped aggregate expected object rows",
-                json!({}),
-            ));
-        };
-        if object_path_is_redacted(row, path) {
-            return Err(exec_error(
-                "E_KERNEL_AGGREGATE",
-                "native grouped aggregate cannot evaluate a redacted path",
-                json!({ "path": path.display_name }),
-            ));
-        }
-        values.push(row.value_for_path(path));
-    }
-    Ok(values)
 }
 
 fn try_native_typed_order_result(
@@ -5563,6 +7777,7 @@ fn expr_contains_helper_exists(expr: &ResolvedExpr) -> bool {
 
 fn execute_kernel_object(
     bytes: &[u8],
+    retained_input: Option<&CoveQlRetainedInput>,
     physical: &PhysicalPlannedQuery,
     options: &ExecutionOptions,
     kernel_options: &KernelExecutionOptions,
@@ -5773,6 +7988,28 @@ fn execute_kernel_object(
     } else {
         None
     };
+    let native_scalar_prune = try_native_scalar_predicate_prune(
+        bytes,
+        retained_input,
+        physical,
+        &read.kernel_surface,
+        shape.public.root_object_type_id,
+        &shape.predicates,
+    )?;
+    let execution_code_predicates_exact = execution_code_prune.as_ref().is_some_and(|prune| {
+        code_prune_covers_kernel_predicate_count(
+            prune.predicate_count,
+            prune.page_count,
+            shape.predicates.len(),
+        )
+    });
+    let file_code_predicates_exact = file_code_prune.as_ref().is_some_and(|prune| {
+        code_prune_covers_kernel_predicate_count(
+            prune.predicate_count,
+            prune.page_count,
+            shape.predicates.len(),
+        )
+    });
     if let Some(prune) = &coverage_prune {
         diagnostics.push(exec_warning(
             "W_COVERAGE_ROW_RANGE_PRUNE_EXECUTED",
@@ -5804,6 +8041,7 @@ fn execute_kernel_object(
                 "predicate_count": prune.predicate_count,
                 "page_count": prune.page_count,
                 "matched_rows": prune.matched_rows,
+                "residual_verification": !execution_code_predicates_exact,
             }),
         ));
     }
@@ -5816,39 +8054,89 @@ fn execute_kernel_object(
                 "page_count": prune.page_count,
                 "matched_rows": prune.matched_rows,
                 "dataset_file_count": planned.resolved.operation_context.dataset.files.len(),
+                "residual_verification": !file_code_predicates_exact,
+            }),
+        ));
+    }
+    let native_scalar_predicates_exact = native_scalar_prune.as_ref().is_some_and(|prune| {
+        native_scalar_prune_covers_all_kernel_predicates(prune, &shape.predicates)
+    });
+    if let Some(prune) = &native_scalar_prune {
+        diagnostics.push(exec_warning(
+            "W_NATIVE_SCALAR_LITERAL_PRUNE_EXECUTED",
+            "native scalar page lanes narrowed kernel candidate rows before final predicate evaluation",
+            json!({
+                "predicate_count": prune.predicate_count,
+                "executed_predicate_count": prune.executed_predicate_count,
+                "page_count": prune.page_count,
+                "matched_rows": prune.matched_rows,
+                "predicate_order": prune.predicate_order.clone(),
+                "short_circuited": prune.short_circuited,
+                "residual_verification": !native_scalar_predicates_exact,
+                "predicate_kernels": prune.predicate_dispatch.kernels,
+                "predicate_kernel_scalar": prune.predicate_dispatch.scalar,
+                "predicate_kernel_avx2": prune.predicate_dispatch.avx2,
+                "predicate_kernel_neon": prune.predicate_dispatch.neon,
+                "bitmap_intersections": prune.bitmap_dispatch.intersections,
+                "bitmap_intersection_scalar": prune.bitmap_dispatch.scalar,
+                "bitmap_intersection_avx2": prune.bitmap_dispatch.avx2,
+                "bitmap_intersection_neon": prune.bitmap_dispatch.neon,
+                "retained_page_buffers": prune.retained_page_buffers,
             }),
         ));
     }
     let mut base_selection = coverage_prune.as_ref().map(|prune| prune.bitmap.clone());
     if let Some(prune) = &covi_prune {
         if let Some(base) = &mut base_selection {
-            base.intersect_with(&prune.bitmap);
+            let _ = base.intersect_with_dispatch(&prune.bitmap, NativeKernelDispatch::Auto);
         } else {
             base_selection = Some(prune.bitmap.clone());
         }
     }
     if let Some(prune) = &file_code_prune {
         if let Some(base) = &mut base_selection {
-            base.intersect_with(&prune.bitmap);
+            let _ = base.intersect_with_dispatch(&prune.bitmap, NativeKernelDispatch::Auto);
         } else {
             base_selection = Some(prune.bitmap.clone());
         }
     }
     if let Some(prune) = &execution_code_prune {
         if let Some(base) = &mut base_selection {
-            base.intersect_with(&prune.bitmap);
+            let _ = base.intersect_with_dispatch(&prune.bitmap, NativeKernelDispatch::Auto);
+        } else {
+            base_selection = Some(prune.bitmap.clone());
+        }
+    }
+    if let Some(prune) = &native_scalar_prune {
+        if let Some(base) = &mut base_selection {
+            let _ = base.intersect_with_dispatch(&prune.bitmap, NativeKernelDispatch::Auto);
         } else {
             base_selection = Some(prune.bitmap.clone());
         }
     }
 
+    let selection_predicates = if native_scalar_predicates_exact
+        || execution_code_predicates_exact
+        || file_code_predicates_exact
+    {
+        &[][..]
+    } else {
+        shape.predicates.as_slice()
+    };
     let selection = select_rows_with_base(
         &read.kernel_surface,
         shape.public.root_object_type_id,
-        &shape.predicates,
+        selection_predicates,
         base_selection,
     );
-    let selection_vector = selection.to_selection_vector();
+    let (selection_vector, selection_compaction_stats) =
+        compact_selection_bitmap(&selection, NativeKernelDispatch::Auto).map_err(|error| {
+            exec_error(
+                "E_KERNEL_SELECTION_COMPACT",
+                format!("native selection-vector compaction failed: {error}"),
+                json!({}),
+            )
+        })?;
     let native_role_bound_projection = native_role_bound_direct_projection_shape(planned);
     let reconstruction = reconstruction_options(planned)?;
     let retained_dependency_type_ids = planned
@@ -6180,6 +8468,8 @@ fn execute_kernel_object(
                 "group_count": report.group_count,
                 "rows_counted": report.rows_counted,
                 "values_seen": report.values_seen,
+                "group_strategy": report.group_strategy,
+                "aggregate_strategy": report.aggregate_strategy,
             }),
         ));
         (
@@ -6249,6 +8539,7 @@ fn execute_kernel_object(
                 "counted_path": report.counted_path,
                 "rows_counted": report.rows_counted,
                 "values_seen": report.values_seen,
+                "aggregate_strategy": report.aggregate_strategy,
             }),
         ));
         (
@@ -6300,6 +8591,13 @@ fn execute_kernel_object(
     };
     enforce_result_budgets(&result, &row_counts, planned, options, started)?;
     let output_fingerprint = result_fingerprint(&result)?;
+    let residual_verification_required = native_root_scan_report.is_none()
+        && native_direct_projection_report.is_none()
+        && native_bool_group_count_report.is_none()
+        && native_grouped_helper_aggregate_report.is_none()
+        && native_helper_aggregate_report.is_none()
+        && native_direct_aggregate_report.is_none()
+        && native_typed_order_report.is_none();
 
     let mut counters = KernelCounters {
         rows_scanned: read.kernel_surface.system.len(),
@@ -6308,7 +8606,11 @@ fn execute_kernel_object(
         candidate_object_keys,
         retained_record_chain_rows,
         reconstructed_states: states.len(),
-        residual_rows_checked: row_counts.input_rows,
+        residual_rows_checked: if residual_verification_required {
+            row_counts.input_rows
+        } else {
+            0
+        },
         output_rows: row_counts.output_rows,
         bitmap_words: selection.word_count(),
         selection_vector_len: selection_vector.len(),
@@ -6318,9 +8620,13 @@ fn execute_kernel_object(
                 .map_or(0, |prune| prune.matched_rows)
             + file_code_prune
                 .as_ref()
+                .map_or(0, |prune| prune.matched_rows)
+            + native_scalar_prune
+                .as_ref()
                 .map_or(0, |prune| prune.matched_rows),
         typed_predicate_rows: shape.predicates.len() * read.kernel_surface.system.len(),
-        bytes_touched_estimate: read.kernel_surface.system.len() * std::mem::size_of::<u64>() * 5,
+        bytes_touched_estimate: read.kernel_surface.system.len() * std::mem::size_of::<u64>() * 5
+            + selection_compaction_stats.bytes_touched_estimate,
         scratch_high_water_bytes: selection.word_count() * std::mem::size_of::<u64>()
             + selection_vector.len() * std::mem::size_of::<u32>(),
         ..KernelCounters::default()
@@ -6341,13 +8647,9 @@ fn execute_kernel_object(
     let mut kernel_report = KernelExecutionReport::applied(kernel_options.mode, counters);
     kernel_report.decision.safe_details = json!({
         "kernel_shape": runtime_kernel_shape,
-        "residual_verification": native_root_scan_report.is_none()
-            && native_direct_projection_report.is_none()
-            && native_bool_group_count_report.is_none()
-            && native_grouped_helper_aggregate_report.is_none()
-            && native_helper_aggregate_report.is_none()
-            && native_direct_aggregate_report.is_none()
-            && native_typed_order_report.is_none(),
+        "kernel_surface_source": "temporal_segment_direct",
+        "materialized_surface_role": "reconstruction_oracle_and_fallback",
+        "residual_verification": residual_verification_required,
     });
     if let Some(report) = &native_root_scan_report {
         kernel_report.optimization_authority = OptimizationAuthorityReport::authoritative(
@@ -6397,6 +8699,8 @@ fn execute_kernel_object(
                 "group_count": report.group_count,
                 "rows_counted": report.rows_counted,
                 "values_seen": report.values_seen,
+                "group_strategy": report.group_strategy,
+                "aggregate_strategy": report.aggregate_strategy,
                 "residual_verification": false,
                 "row_grain": "reconstructed_visible_object_states",
             }),
@@ -6454,6 +8758,7 @@ fn execute_kernel_object(
                 "counted_path": report.counted_path,
                 "rows_counted": report.rows_counted,
                 "values_seen": report.values_seen,
+                "aggregate_strategy": report.aggregate_strategy,
                 "residual_verification": false,
                 "row_grain": "reconstructed_visible_object_states",
             }),
@@ -6515,7 +8820,7 @@ fn execute_kernel_object(
                 "predicate_count": prune.predicate_count,
                 "page_count": prune.page_count,
                 "matched_rows": prune.matched_rows,
-                "residual_verification": true,
+                "residual_verification": !execution_code_predicates_exact,
             }),
             false,
         ));
@@ -6529,8 +8834,30 @@ fn execute_kernel_object(
                 "page_count": prune.page_count,
                 "matched_rows": prune.matched_rows,
                 "dataset_file_count": planned.resolved.operation_context.dataset.files.len(),
-                "residual_verification": true,
+                "residual_verification": !file_code_predicates_exact,
                 "bridge_required": false,
+                "row_grain": "single_file_object_records",
+            }),
+            false,
+        ));
+    }
+    if let Some(prune) = &native_scalar_prune {
+        kernel_report.decisions.push(KernelDecision::new(
+            KernelDecisionKind::Applied,
+            "native scalar page-lane predicate was used as a kernel prefilter",
+            json!({
+                "predicate_count": prune.predicate_count,
+                "executed_predicate_count": prune.executed_predicate_count,
+                "page_count": prune.page_count,
+                "matched_rows": prune.matched_rows,
+                "predicate_order": prune.predicate_order.clone(),
+                "short_circuited": prune.short_circuited,
+                "residual_verification": !native_scalar_predicates_exact,
+                "predicate_kernels": prune.predicate_dispatch.kernels,
+                "predicate_kernel_scalar": prune.predicate_dispatch.scalar,
+                "predicate_kernel_avx2": prune.predicate_dispatch.avx2,
+                "predicate_kernel_neon": prune.predicate_dispatch.neon,
+                "retained_page_buffers": prune.retained_page_buffers,
                 "row_grain": "single_file_object_records",
             }),
             false,
@@ -6653,5 +8980,37 @@ mod tests {
         wire::append_u64_leb128(&mut bad_utf8, 2);
         bad_utf8.extend_from_slice(&[0xff, 0xff]);
         assert!(decode_index_only_min_max_value("utf8", &bad_utf8).is_err());
+    }
+
+    #[test]
+    fn native_scalar_exact_predicate_proof_requires_pages_or_empty_short_circuit() {
+        let mut prune = NativeScalarPredicatePrune {
+            bitmap: SelectionBitmap::none(0),
+            predicate_count: 1,
+            executed_predicate_count: 1,
+            page_count: 0,
+            matched_rows: 0,
+            predicate_order: vec!["bool_eq"],
+            predicate_dispatch: NativeKernelDispatchCounts::default(),
+            bitmap_dispatch: NativeBitmapDispatchCounts::default(),
+            retained_page_buffers: false,
+            short_circuited: false,
+        };
+
+        assert!(!native_scalar_prune_covers_kernel_predicate_count(
+            &prune, 1
+        ));
+
+        prune.page_count = 1;
+        assert!(native_scalar_prune_covers_kernel_predicate_count(&prune, 1));
+
+        prune.predicate_count = 2;
+        prune.executed_predicate_count = 1;
+        prune.short_circuited = true;
+        assert!(native_scalar_prune_covers_kernel_predicate_count(&prune, 2));
+
+        assert!(!code_prune_covers_kernel_predicate_count(1, 0, 1));
+        assert!(!code_prune_covers_kernel_predicate_count(1, 1, 2));
+        assert!(code_prune_covers_kernel_predicate_count(2, 1, 2));
     }
 }

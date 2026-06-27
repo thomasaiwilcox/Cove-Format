@@ -2,7 +2,7 @@ use cove_cache::{CoverageCacheUseContextV2, CoverageCacheV2, ABSENT_REF};
 use cove_core::{
     codec::CodecExtensionDescriptorV2,
     compression,
-    constants::{DigestAlgorithm, SectionKind, FEATURE_CODEC_EXTENSION_REGISTRY},
+    constants::{CovePhysicalKind, DigestAlgorithm, SectionKind, FEATURE_CODEC_EXTENSION_REGISTRY},
     digest::compute_digest,
     footer::CoveFooter,
     mount::{mount_cove_file, MountOptions, OutputRepresentation},
@@ -29,7 +29,7 @@ use serde_json::json;
 use crate::{
     physical_predicate::{default_execution_code_domain, PhysicalExecutionCodeDomainDescriptor},
     physical_sidecars::{PhysicalSidecarInputs, PhysicalSidecarValidation},
-    CoveQlOutputMode, PlannedQuery,
+    CoveQlOutputMode, PlannedQuery, ResolvedExpr, ResolvedRoot,
 };
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -595,6 +595,8 @@ fn validate_zero_copy_map_for_file(
     } else {
         let (catalog, segments) = object_zero_copy_authority_for_file(bytes, &mounted.footer)
             .map_err(|error| error.to_string())?;
+        let expected_dictionary_semantics =
+            object_zero_copy_dictionary_semantics_for_plan(planned, &catalog)?;
         let compatibility = ZeroCopyCompatibilityContext {
             active_visibility_overlay: matches!(
                 planned
@@ -605,7 +607,7 @@ fn validate_zero_copy_map_for_file(
                 crate::VisibilityPolicy::ExternalOverlay(_)
             ),
             accepts_cove_null_bitmap_polarity: true,
-            expected_dictionary_semantics: ZeroCopyDictionarySemanticsV2::NoDictionary,
+            expected_dictionary_semantics,
             expected_nested_layout_kind: ZeroCopyNestedLayoutKindV2::NotNested,
             required_lifetime_scope: ZeroCopyLifetimeScopeV2::ReaderSession,
         };
@@ -618,6 +620,52 @@ fn validate_zero_copy_map_for_file(
         .map_err(|error| error.to_string())?;
     }
     Ok((target_count, entry_count))
+}
+
+fn object_zero_copy_dictionary_semantics_for_plan(
+    planned: &PlannedQuery,
+    catalog: &ObjectTypeCatalog,
+) -> Result<ZeroCopyDictionarySemanticsV2, String> {
+    let ResolvedRoot::Object(root) = &planned.resolved.root else {
+        return Ok(ZeroCopyDictionarySemanticsV2::NoDictionary);
+    };
+    let object_type = catalog
+        .types
+        .iter()
+        .find(|object_type| object_type.object_type_id == root.object_type_id)
+        .ok_or_else(|| "zero-copy COVE-O validation found no root object type".to_string())?;
+    let select = planned
+        .resolved
+        .method_chain
+        .select
+        .as_ref()
+        .ok_or_else(|| "zero-copy COVE-O validation requires a direct select".to_string())?;
+    let mut selected_semantics = None;
+    for item in select {
+        let ResolvedExpr::Path(path) = &item.expr else {
+            return Err("zero-copy COVE-O validation supports direct path selections only".into());
+        };
+        let property_id = path.property_id.ok_or_else(|| {
+            "zero-copy COVE-O validation does not support system fields".to_string()
+        })?;
+        let property = object_type
+            .properties
+            .iter()
+            .find(|property| property.property_id == property_id)
+            .ok_or_else(|| {
+                format!("zero-copy COVE-O validation found no selected property: {property_id}")
+            })?;
+        let semantics = if property.physical_kind == CovePhysicalKind::FileCode {
+            ZeroCopyDictionarySemanticsV2::FileCodeDictionary
+        } else {
+            ZeroCopyDictionarySemanticsV2::NoDictionary
+        };
+        if selected_semantics.is_some_and(|selected| selected != semantics) {
+            return Err("zero-copy COVE-O validation does not support mixed FileCode dictionary and non-dictionary selections".into());
+        }
+        selected_semantics = Some(semantics);
+    }
+    Ok(selected_semantics.unwrap_or(ZeroCopyDictionarySemanticsV2::NoDictionary))
 }
 
 fn zero_copy_table_for_map<'a>(

@@ -17,6 +17,7 @@ use crate::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LowerOperator {
     Eq,
+    NotEq,
     Lt,
     LtEq,
     Gt,
@@ -57,6 +58,13 @@ pub enum LowerExpr {
         expr: Box<LowerExpr>,
         list: Vec<LowerExpr>,
         negated: bool,
+    },
+    Like {
+        expr: Box<LowerExpr>,
+        pattern: Box<LowerExpr>,
+        negated: bool,
+        case_insensitive: bool,
+        escape_char: Option<char>,
     },
     Unsupported(String),
 }
@@ -126,6 +134,30 @@ fn lower_filters_into(
             );
         }
         LowerExpr::Or(children) => {
+            if let Some(filter) =
+                classify_same_column_numeric_equality_or(state, children, display.to_string())
+            {
+                lowering.filters.push(filter);
+                return;
+            }
+            if let Some(filter) =
+                classify_same_column_filecode_equality_or(state, children, display.to_string())
+            {
+                lowering.filters.push(filter);
+                return;
+            }
+            if let Some(filter) =
+                classify_same_column_fixed_bytes_equality_or(state, children, display.to_string())
+            {
+                lowering.filters.push(filter);
+                return;
+            }
+            if let Some(filter) =
+                classify_same_column_varbytes_equality_or(state, children, display.to_string())
+            {
+                lowering.filters.push(filter);
+                return;
+            }
             let mut exprs = Vec::with_capacity(children.len());
             let mut predicate_columns = Vec::new();
             for child in children {
@@ -200,6 +232,26 @@ fn lower_atom_filter(state: &DatasetState, expr: &LowerExpr, display: String) ->
             list,
             negated,
         } if !negated => classify_in_list_filter(state, expr, list, display),
+        LowerExpr::InList {
+            expr,
+            list,
+            negated,
+        } => classify_not_in_list_filter(state, expr, list, *negated, display),
+        LowerExpr::Like {
+            expr,
+            pattern,
+            negated,
+            case_insensitive,
+            escape_char,
+        } => classify_like_filter(
+            state,
+            expr,
+            pattern,
+            *negated,
+            *case_insensitive,
+            *escape_char,
+            display,
+        ),
         _ => FilterPlan::unsupported(display),
     };
     promote_filter_exactness(state, &mut filter);
@@ -253,6 +305,110 @@ fn classify_in_list_filter(
         return FilterPlan::unsupported(display);
     };
     let column = &state.table().columns[column_index];
+    match column.physical {
+        CovePhysicalKind::FileCode => {
+            let mut canonical_values = Vec::with_capacity(list.len());
+            let mut canonical_keys = Vec::with_capacity(list.len());
+            for item in list {
+                let LowerExpr::Literal(literal) = item else {
+                    return FilterPlan::unsupported(display);
+                };
+                match file_code_canonical_literal(column.logical, literal) {
+                    Ok(Some(canonical)) => {
+                        canonical_values.push(canonical.payload);
+                        canonical_keys.push(canonical.key);
+                    }
+                    Ok(None) => {}
+                    Err(_) => return FilterPlan::unsupported(display),
+                }
+            }
+            FilterPlan::pruning_file_code_in_with_canonical_keys(
+                column_index,
+                Vec::new(),
+                canonical_values,
+                canonical_keys,
+                display,
+            )
+        }
+        CovePhysicalKind::NumCode => {
+            let mut literals = Vec::with_capacity(list.len());
+            for item in list {
+                let LowerExpr::Literal(literal) = item else {
+                    return FilterPlan::unsupported(display);
+                };
+                let Some(literal) = numeric_literal(literal) else {
+                    return FilterPlan::unsupported(display);
+                };
+                literals.push(literal);
+            }
+            FilterPlan::pruning_numeric_in(column_index, literals, display)
+        }
+        CovePhysicalKind::FixedBytes => {
+            let mut literals = Vec::with_capacity(list.len());
+            for item in list {
+                let LowerExpr::Literal(literal) = item else {
+                    return FilterPlan::unsupported(display);
+                };
+                let Some(literal) = fixed_bytes_literal(column.logical, literal) else {
+                    return FilterPlan::unsupported(display);
+                };
+                literals.push(literal);
+            }
+            if literals.is_empty() {
+                return FilterPlan::unsupported(display);
+            }
+            FilterPlan::pruning_fixed_bytes_in(column_index, literals, display)
+        }
+        CovePhysicalKind::VarBytes if column.logical == CoveLogicalType::Utf8 => {
+            let mut literals = Vec::with_capacity(list.len());
+            for item in list {
+                let LowerExpr::Literal(LowerLiteral::Utf8(value)) = item else {
+                    return FilterPlan::unsupported(display);
+                };
+                literals.push(value.as_bytes().to_vec());
+            }
+            if literals.is_empty() {
+                return FilterPlan::unsupported(display);
+            }
+            FilterPlan::pruning_varbytes_in(column_index, literals, display)
+        }
+        _ => FilterPlan::unsupported(display),
+    }
+}
+
+fn classify_not_in_list_filter(
+    state: &DatasetState,
+    expr: &LowerExpr,
+    list: &[LowerExpr],
+    negated: bool,
+    display: String,
+) -> FilterPlan {
+    if !negated {
+        return FilterPlan::unsupported(display);
+    }
+    let Some(column_index) = top_level_column_index(state, expr) else {
+        return FilterPlan::unsupported(display);
+    };
+    let column = &state.table().columns[column_index];
+    if column.physical == CovePhysicalKind::NumCode {
+        if !non_float_numeric_complement_supported(column.logical) {
+            return FilterPlan::unsupported(display);
+        }
+        let mut literals = Vec::with_capacity(list.len());
+        for item in list {
+            let LowerExpr::Literal(literal) = item else {
+                return FilterPlan::unsupported(display);
+            };
+            let Some(literal) = numeric_literal(literal) else {
+                return FilterPlan::unsupported(display);
+            };
+            literals.push(literal);
+        }
+        if literals.is_empty() {
+            return FilterPlan::unsupported(display);
+        }
+        return FilterPlan::pruning_numeric_not_in(column_index, literals, display);
+    }
     if column.physical != CovePhysicalKind::FileCode {
         return FilterPlan::unsupported(display);
     }
@@ -267,17 +423,239 @@ fn classify_in_list_filter(
                 canonical_values.push(canonical.payload);
                 canonical_keys.push(canonical.key);
             }
-            Ok(None) => {}
-            Err(_) => return FilterPlan::unsupported(display),
+            Ok(None) | Err(_) => return FilterPlan::unsupported(display),
         }
     }
-    FilterPlan::pruning_file_code_in_with_canonical_keys(
+    if canonical_values.is_empty() {
+        return FilterPlan::unsupported(display);
+    }
+    FilterPlan::pruning_file_code_not_in_with_canonical_keys(
         column_index,
         Vec::new(),
         canonical_values,
         canonical_keys,
         display,
     )
+}
+
+fn classify_like_filter(
+    state: &DatasetState,
+    expr: &LowerExpr,
+    pattern: &LowerExpr,
+    negated: bool,
+    case_insensitive: bool,
+    escape_char: Option<char>,
+    display: String,
+) -> FilterPlan {
+    if negated || case_insensitive {
+        return FilterPlan::unsupported(display);
+    }
+    let Some(column_index) = top_level_column_index(state, expr) else {
+        return FilterPlan::unsupported(display);
+    };
+    let column = &state.table().columns[column_index];
+    if column.physical != CovePhysicalKind::VarBytes || column.logical != CoveLogicalType::Utf8 {
+        return FilterPlan::unsupported(display);
+    }
+    let LowerExpr::Literal(LowerLiteral::Utf8(pattern)) = pattern else {
+        return FilterPlan::unsupported(display);
+    };
+    match exact_like_literal(pattern, escape_char) {
+        Some(LikeLiteral::Exact(literal)) => {
+            FilterPlan::pruning_varbytes_eq(column_index, literal, display)
+        }
+        Some(LikeLiteral::Prefix(prefix)) => {
+            FilterPlan::pruning_varbytes_prefix(column_index, prefix, display)
+        }
+        None => FilterPlan::unsupported(display),
+    }
+}
+
+enum LikeLiteral {
+    Exact(Vec<u8>),
+    Prefix(Vec<u8>),
+}
+
+fn exact_like_literal(pattern: &str, escape_char: Option<char>) -> Option<LikeLiteral> {
+    let escape = escape_char.unwrap_or('\\');
+    let mut literal = String::new();
+    let mut chars = pattern.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == escape {
+            literal.push(chars.next()?);
+            continue;
+        }
+        if ch == '%' {
+            return chars
+                .peek()
+                .is_none()
+                .then(|| LikeLiteral::Prefix(literal.into_bytes()));
+        }
+        if ch == '_' {
+            return None;
+        }
+        literal.push(ch);
+    }
+    Some(LikeLiteral::Exact(literal.into_bytes()))
+}
+
+fn classify_same_column_numeric_equality_or(
+    state: &DatasetState,
+    children: &[LowerExpr],
+    display: String,
+) -> Option<FilterPlan> {
+    if children.is_empty() {
+        return None;
+    }
+    let mut column_index = None;
+    let mut literals = Vec::with_capacity(children.len());
+    for child in children {
+        let LowerExpr::Binary { left, op, right } = child else {
+            return None;
+        };
+        if *op != LowerOperator::Eq {
+            return None;
+        }
+        let (index, literal, _) = column_literal_binary(state, left, *op, right)
+            .or_else(|| column_literal_binary(state, right, *op, left))?;
+        let column = &state.table().columns[index];
+        if column.physical != CovePhysicalKind::NumCode {
+            return None;
+        }
+        if column_index
+            .replace(index)
+            .is_some_and(|existing| existing != index)
+        {
+            return None;
+        }
+        literals.push(numeric_literal(&literal)?);
+    }
+    let mut filter = FilterPlan::pruning_numeric_in(column_index?, literals, display);
+    promote_filter_exactness(state, &mut filter);
+    Some(filter)
+}
+
+fn classify_same_column_filecode_equality_or(
+    state: &DatasetState,
+    children: &[LowerExpr],
+    display: String,
+) -> Option<FilterPlan> {
+    if children.is_empty() {
+        return None;
+    }
+    let mut column_index = None;
+    let mut canonical_values = Vec::with_capacity(children.len());
+    let mut canonical_keys = Vec::with_capacity(children.len());
+    for child in children {
+        let LowerExpr::Binary { left, op, right } = child else {
+            return None;
+        };
+        if *op != LowerOperator::Eq {
+            return None;
+        }
+        let (index, literal, _) = column_literal_binary(state, left, *op, right)
+            .or_else(|| column_literal_binary(state, right, *op, left))?;
+        let column = &state.table().columns[index];
+        if column.physical != CovePhysicalKind::FileCode {
+            return None;
+        }
+        if column_index
+            .replace(index)
+            .is_some_and(|existing| existing != index)
+        {
+            return None;
+        }
+        let canonical = file_code_canonical_literal(column.logical, &literal)
+            .ok()
+            .flatten()?;
+        canonical_values.push(canonical.payload);
+        canonical_keys.push(canonical.key);
+    }
+    let mut filter = FilterPlan::pruning_file_code_in_with_canonical_keys(
+        column_index?,
+        Vec::new(),
+        canonical_values,
+        canonical_keys,
+        display,
+    );
+    promote_filter_exactness(state, &mut filter);
+    Some(filter)
+}
+
+fn classify_same_column_fixed_bytes_equality_or(
+    state: &DatasetState,
+    children: &[LowerExpr],
+    display: String,
+) -> Option<FilterPlan> {
+    if children.is_empty() {
+        return None;
+    }
+    let mut column_index = None;
+    let mut literals = Vec::with_capacity(children.len());
+    for child in children {
+        let LowerExpr::Binary { left, op, right } = child else {
+            return None;
+        };
+        if *op != LowerOperator::Eq {
+            return None;
+        }
+        let (index, literal, _) = column_literal_binary(state, left, *op, right)
+            .or_else(|| column_literal_binary(state, right, *op, left))?;
+        let column = &state.table().columns[index];
+        if column.physical != CovePhysicalKind::FixedBytes {
+            return None;
+        }
+        if column_index
+            .replace(index)
+            .is_some_and(|existing| existing != index)
+        {
+            return None;
+        }
+        literals.push(fixed_bytes_literal(column.logical, &literal)?);
+    }
+    let mut filter = FilterPlan::pruning_fixed_bytes_in(column_index?, literals, display);
+    promote_filter_exactness(state, &mut filter);
+    Some(filter)
+}
+
+fn classify_same_column_varbytes_equality_or(
+    state: &DatasetState,
+    children: &[LowerExpr],
+    display: String,
+) -> Option<FilterPlan> {
+    if children.is_empty() {
+        return None;
+    }
+    let mut column_index = None;
+    let mut literals = Vec::with_capacity(children.len());
+    for child in children {
+        let LowerExpr::Binary { left, op, right } = child else {
+            return None;
+        };
+        if *op != LowerOperator::Eq {
+            return None;
+        }
+        let (index, literal, _) = column_literal_binary(state, left, *op, right)
+            .or_else(|| column_literal_binary(state, right, *op, left))?;
+        let column = &state.table().columns[index];
+        if column.physical != CovePhysicalKind::VarBytes || column.logical != CoveLogicalType::Utf8
+        {
+            return None;
+        }
+        if column_index
+            .replace(index)
+            .is_some_and(|existing| existing != index)
+        {
+            return None;
+        }
+        let LowerLiteral::Utf8(value) = literal else {
+            return None;
+        };
+        literals.push(value.into_bytes());
+    }
+    let mut filter = FilterPlan::pruning_varbytes_in(column_index?, literals, display);
+    promote_filter_exactness(state, &mut filter);
+    Some(filter)
 }
 
 fn classify_column_literal(
@@ -293,7 +671,14 @@ fn classify_column_literal(
             let Some(literal) = numeric_literal(literal) else {
                 return FilterPlan::unsupported(display);
             };
-            FilterPlan::pruning_numeric(column_index, numeric_op(op), literal, display)
+            if op == LowerOperator::NotEq {
+                if !non_float_numeric_complement_supported(column.logical) {
+                    return FilterPlan::unsupported(display);
+                }
+                FilterPlan::pruning_numeric_not_in(column_index, vec![literal], display)
+            } else {
+                FilterPlan::pruning_numeric(column_index, numeric_op(op), literal, display)
+            }
         }
         CovePhysicalKind::FileCode if op == LowerOperator::Eq => {
             match file_code_canonical_literal(column.logical, literal) {
@@ -313,6 +698,18 @@ fn classify_column_literal(
                 Err(_) => FilterPlan::unsupported(display),
             }
         }
+        CovePhysicalKind::FileCode if op == LowerOperator::NotEq => {
+            match file_code_canonical_literal(column.logical, literal) {
+                Ok(Some(canonical)) => FilterPlan::pruning_file_code_not_in_with_canonical_keys(
+                    column_index,
+                    Vec::new(),
+                    vec![canonical.payload],
+                    vec![canonical.key],
+                    display,
+                ),
+                Ok(None) | Err(_) => FilterPlan::unsupported(display),
+            }
+        }
         CovePhysicalKind::VarBytes
             if op == LowerOperator::Eq && column.logical == CoveLogicalType::Utf8 =>
         {
@@ -320,6 +717,12 @@ fn classify_column_literal(
                 return FilterPlan::unsupported(display);
             };
             FilterPlan::pruning_varbytes_eq(column_index, value.as_bytes().to_vec(), display)
+        }
+        CovePhysicalKind::FixedBytes if op == LowerOperator::Eq => {
+            let Some(value) = fixed_bytes_literal(column.logical, literal) else {
+                return FilterPlan::unsupported(display);
+            };
+            FilterPlan::pruning_fixed_bytes_eq(column_index, value, display)
         }
         _ => FilterPlan::unsupported(display),
     }
@@ -559,6 +962,7 @@ fn numeric_literal(literal: &LowerLiteral) -> Option<PredicateLiteral> {
 fn numeric_op(op: LowerOperator) -> NumericPredicateOp {
     match op {
         LowerOperator::Eq => NumericPredicateOp::Eq,
+        LowerOperator::NotEq => unreachable!("numeric not-equal remains residual"),
         LowerOperator::Lt => NumericPredicateOp::Lt,
         LowerOperator::LtEq => NumericPredicateOp::LtEq,
         LowerOperator::Gt => NumericPredicateOp::Gt,
@@ -566,9 +970,32 @@ fn numeric_op(op: LowerOperator) -> NumericPredicateOp {
     }
 }
 
+fn fixed_bytes_literal(logical: CoveLogicalType, literal: &LowerLiteral) -> Option<Vec<u8>> {
+    let expected = cove_core::array::logical_type_fixed_width(logical)?;
+    let value = match (logical, literal) {
+        (CoveLogicalType::Uuid, LowerLiteral::Utf8(value)) => {
+            parse_uuid_literal(value).ok().map(|value| value.to_vec())?
+        }
+        (CoveLogicalType::Uuid, LowerLiteral::Binary(value)) if value.len() == expected => {
+            value.clone()
+        }
+        (CoveLogicalType::Decimal128, LowerLiteral::Int128(value)) => value.to_le_bytes().to_vec(),
+        (CoveLogicalType::Decimal128, LowerLiteral::Binary(value)) if value.len() == expected => {
+            value.clone()
+        }
+        _ => return None,
+    };
+    (value.len() == expected).then_some(value)
+}
+
+fn non_float_numeric_complement_supported(logical: CoveLogicalType) -> bool {
+    !matches!(logical, CoveLogicalType::Float32 | CoveLogicalType::Float64)
+}
+
 fn flip_op(op: LowerOperator) -> LowerOperator {
     match op {
         LowerOperator::Eq => LowerOperator::Eq,
+        LowerOperator::NotEq => LowerOperator::NotEq,
         LowerOperator::Lt => LowerOperator::Gt,
         LowerOperator::LtEq => LowerOperator::GtEq,
         LowerOperator::Gt => LowerOperator::Lt,

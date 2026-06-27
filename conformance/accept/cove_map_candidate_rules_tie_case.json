@@ -1,0 +1,69 @@
+{
+  "expected_candidates": {
+    "candidate_match_count": 3,
+    "diagnostic_count": 0,
+    "match_order": [
+      {
+        "left": {
+          "normalized_value": "alpha beta",
+          "row_index": 0,
+          "source_id": "company_candidates_tie"
+        },
+        "match": {
+          "blocking_key": "alph",
+          "candidate_score": 333333,
+          "match_rule_id": "company_name_similarity",
+          "merge_behavior": "never",
+          "score_scale": 1000000
+        },
+        "right": {
+          "normalized_value": "alpha delta",
+          "row_index": 2,
+          "source_id": "company_candidates_tie"
+        }
+      },
+      {
+        "left": {
+          "normalized_value": "alpha beta",
+          "row_index": 0,
+          "source_id": "company_candidates_tie"
+        },
+        "match": {
+          "blocking_key": "alph",
+          "candidate_score": 333333,
+          "match_rule_id": "company_name_similarity",
+          "merge_behavior": "never",
+          "score_scale": 1000000
+        },
+        "right": {
+          "normalized_value": "alpha gamma",
+          "row_index": 1,
+          "source_id": "company_candidates_tie"
+        }
+      },
+      {
+        "left": {
+          "normalized_value": "alpha gamma",
+          "row_index": 1,
+          "source_id": "company_candidates_tie"
+        },
+        "match": {
+          "blocking_key": "alph",
+          "candidate_score": 333333,
+          "match_rule_id": "company_name_similarity",
+          "merge_behavior": "never",
+          "score_scale": 1000000
+        },
+        "right": {
+          "normalized_value": "alpha delta",
+          "row_index": 2,
+          "source_id": "company_candidates_tie"
+        }
+      }
+    ]
+  },
+  "mapping": "accept/cove_map_candidate_rules_tie.covemap",
+  "sources": [
+    "accept/company_candidates_tie.csv"
+  ]
+}

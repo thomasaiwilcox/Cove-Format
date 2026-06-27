@@ -1,0 +1,11 @@
+{
+  "expected_replay": {
+    "ok": true,
+    "resolver_catalog_digest_count": 1,
+    "reviewed_decision_count": 0
+  },
+  "mapping": "accept/cove_map_resolution_alias.covemap",
+  "sources": [
+    "accept/company_aliases.csv"
+  ]
+}

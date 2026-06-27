@@ -6,7 +6,7 @@ use datafusion::{
     common::ScalarValue,
     logical_expr::Operator,
     physical_expr::expressions::{
-        BinaryExpr, Column, InListExpr, IsNotNullExpr, IsNullExpr, Literal,
+        BinaryExpr, Column, InListExpr, IsNotNullExpr, IsNullExpr, LikeExpr, Literal,
     },
     physical_expr_common::physical_expr::PhysicalExpr,
 };
@@ -110,12 +110,22 @@ fn lower_expr(expr: &dyn PhysicalExpr) -> Option<LowerExpr> {
             negated: in_list.negated(),
         });
     }
+    if let Some(like) = expr.as_any().downcast_ref::<LikeExpr>() {
+        return Some(LowerExpr::Like {
+            expr: Box::new(lower_expr(like.expr().as_ref())?),
+            pattern: Box::new(lower_expr(like.pattern().as_ref())?),
+            negated: like.negated(),
+            case_insensitive: like.case_insensitive(),
+            escape_char: Some('\\'),
+        });
+    }
     None
 }
 
 fn lower_operator(op: &Operator) -> Option<LowerOperator> {
     match op {
         Operator::Eq => Some(LowerOperator::Eq),
+        Operator::NotEq => Some(LowerOperator::NotEq),
         Operator::Lt => Some(LowerOperator::Lt),
         Operator::LtEq => Some(LowerOperator::LtEq),
         Operator::Gt => Some(LowerOperator::Gt),

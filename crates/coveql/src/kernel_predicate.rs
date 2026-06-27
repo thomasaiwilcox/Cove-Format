@@ -12,91 +12,7 @@ use crate::{
     ResolvedPredicate, ResolvedSystemField,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SelectionBitmap {
-    words: Vec<u64>,
-    len: usize,
-}
-
-impl SelectionBitmap {
-    pub(crate) fn all(len: usize) -> Self {
-        let words_len = len.div_ceil(64);
-        let mut words = vec![u64::MAX; words_len];
-        if let Some(last) = words.last_mut() {
-            let used = len % 64;
-            if used != 0 {
-                *last &= (1u64 << used) - 1;
-            }
-        }
-        Self { words, len }
-    }
-
-    pub(crate) fn none(len: usize) -> Self {
-        Self {
-            words: vec![0; len.div_ceil(64)],
-            len,
-        }
-    }
-
-    pub(crate) fn set(&mut self, row: usize) {
-        if row < self.len {
-            self.words[row / 64] |= 1u64 << (row % 64);
-        }
-    }
-
-    pub(crate) fn clear(&mut self, row: usize) {
-        if row < self.len {
-            self.words[row / 64] &= !(1u64 << (row % 64));
-        }
-    }
-
-    pub(crate) fn contains(&self, row: usize) -> bool {
-        row < self.len && (self.words[row / 64] & (1u64 << (row % 64))) != 0
-    }
-
-    pub(crate) fn count_ones(&self) -> usize {
-        self.words
-            .iter()
-            .map(|word| word.count_ones() as usize)
-            .sum()
-    }
-
-    pub(crate) fn word_count(&self) -> usize {
-        self.words.len()
-    }
-
-    pub(crate) fn intersect_with(&mut self, other: &SelectionBitmap) {
-        debug_assert_eq!(self.len, other.len);
-        for (left, right) in self.words.iter_mut().zip(&other.words) {
-            *left &= *right;
-        }
-    }
-
-    pub(crate) fn to_selection_vector(&self) -> SelectionVector {
-        let mut rows = Vec::with_capacity(self.count_ones());
-        for row in 0..self.len {
-            if self.contains(row) {
-                rows.push(row as u32);
-            }
-        }
-        SelectionVector { rows }
-    }
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct SelectionVector {
-    rows: Vec<u32>,
-}
-
-impl SelectionVector {
-    pub(crate) fn len(&self) -> usize {
-        self.rows.len()
-    }
-
-    pub(crate) fn rows(&self) -> &[u32] {
-        &self.rows
-    }
-}
+pub(crate) use cove_core::native::{SelectionBitmap, SelectionVector};
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum KernelPredicate {
@@ -169,11 +85,10 @@ pub(crate) fn select_rows_with_base(
     base: Option<SelectionBitmap>,
 ) -> SelectionBitmap {
     let mut bitmap = base.unwrap_or_else(|| SelectionBitmap::all(surface.system.len()));
-    for row in 0..surface.system.len() {
-        if surface.system.object_type_ids[row] != object_type_id {
-            bitmap.clear(row);
-        }
-    }
+    let row_count = surface.system.len();
+    bitmap.retain_set_bits(|row| {
+        row < row_count && surface.system.object_type_ids[row] == object_type_id
+    });
     for predicate in predicates {
         apply_predicate(surface, predicate, &mut bitmap);
     }
@@ -185,14 +100,10 @@ fn apply_predicate(
     predicate: &KernelPredicate,
     bitmap: &mut SelectionBitmap,
 ) {
-    for row in 0..surface.system.len() {
-        if !bitmap.contains(row) {
-            continue;
-        }
-        if eval_predicate_truth(surface, row, predicate) != KernelTruth::True {
-            bitmap.clear(row);
-        }
-    }
+    let row_count = surface.system.len();
+    bitmap.retain_set_bits(|row| {
+        row < row_count && eval_predicate_truth(surface, row, predicate) == KernelTruth::True
+    });
 }
 
 fn eval_predicate_truth(
@@ -1125,6 +1036,10 @@ fn path_is_kernel_safe(path: &ResolvedPath, op: AstCompareOp) -> bool {
                 op,
                 AstCompareOp::Lt | AstCompareOp::Le | AstCompareOp::Gt | AstCompareOp::Ge
             ) && path_has_utf8_ordering_collation_contract(path));
+    }
+    if path.physical_kind == "fixed_bytes" {
+        return matches!(path.logical_type.as_str(), "uuid")
+            && matches!(op, AstCompareOp::Eq | AstCompareOp::Ne);
     }
     matches!(
         path.logical_type.as_str(),

@@ -2,7 +2,7 @@
 
 use datafusion::{
     common::ScalarValue,
-    logical_expr::{Expr, Operator},
+    logical_expr::{Expr, Like, Operator},
 };
 
 use crate::{
@@ -59,6 +59,19 @@ fn lower_expr(expr: &Expr) -> LowerExpr {
             list: in_list.list.iter().map(lower_expr).collect(),
             negated: in_list.negated,
         },
+        Expr::Like(Like {
+            negated,
+            expr,
+            pattern,
+            escape_char,
+            case_insensitive,
+        }) => LowerExpr::Like {
+            expr: Box::new(lower_expr(expr)),
+            pattern: Box::new(lower_expr(pattern)),
+            negated: *negated,
+            case_insensitive: *case_insensitive,
+            escape_char: *escape_char,
+        },
         Expr::Between(between) if !between.negated => LowerExpr::Between {
             expr: Box::new(lower_expr(&between.expr)),
             low: Box::new(lower_expr(&between.low)),
@@ -78,6 +91,7 @@ enum LowerBinaryOperator {
 fn lower_operator(op: Operator) -> Option<LowerBinaryOperator> {
     match op {
         Operator::Eq => Some(LowerBinaryOperator::Predicate(LowerOperator::Eq)),
+        Operator::NotEq => Some(LowerBinaryOperator::Predicate(LowerOperator::NotEq)),
         Operator::Lt => Some(LowerBinaryOperator::Predicate(LowerOperator::Lt)),
         Operator::LtEq => Some(LowerBinaryOperator::Predicate(LowerOperator::LtEq)),
         Operator::Gt => Some(LowerBinaryOperator::Predicate(LowerOperator::Gt)),

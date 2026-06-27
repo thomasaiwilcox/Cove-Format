@@ -1,4 +1,5 @@
 use arrow_array::RecordBatch;
+use cove_core::native::{KernelStats, NativeKernelDispatch};
 
 use super::*;
 
@@ -69,6 +70,54 @@ pub struct DecodeStats {
     pub range_plan_mixed: usize,
     pub range_plan_dense: usize,
     pub kernel_fallbacks: usize,
+    pub native_bitmap_intersections: usize,
+    pub native_bitmap_intersection_scalar: usize,
+    pub native_bitmap_intersection_avx2: usize,
+    pub native_bitmap_intersection_neon: usize,
+    pub native_table_batches: usize,
+    pub native_table_pages: usize,
+    pub native_table_decode_boundaries: usize,
+    pub native_lane_predicates: usize,
+    pub native_lane_predicate_rows_seen: usize,
+    pub native_lane_predicate_rows_matched: usize,
+    pub native_lane_predicate_bytes_touched: usize,
+    pub native_lane_predicate_dispatch_scalar: usize,
+    pub native_lane_predicate_dispatch_avx2: usize,
+    pub native_lane_predicate_dispatch_neon: usize,
+    pub native_aggregate_kernels: usize,
+    pub native_aggregate_rows_seen: usize,
+    pub native_aggregate_rows_matched: usize,
+    pub native_aggregate_bytes_touched: usize,
+    pub native_aggregate_dispatch_scalar: usize,
+    pub native_aggregate_dispatch_avx2: usize,
+    pub native_aggregate_dispatch_neon: usize,
+    pub native_group_kernels: usize,
+    pub native_group_rows_seen: usize,
+    pub native_group_rows_matched: usize,
+    pub native_group_bytes_touched: usize,
+    pub native_group_dispatch_scalar: usize,
+    pub native_group_dispatch_avx2: usize,
+    pub native_group_dispatch_neon: usize,
+    pub native_count_scans: usize,
+    pub native_count_rows_seen: usize,
+    pub native_count_rows_matched: usize,
+    pub native_sort_kernels: usize,
+    pub native_sort_rows_seen: usize,
+    pub native_sort_rows_matched: usize,
+    pub native_sort_bytes_touched: usize,
+    pub native_sort_dispatch_scalar: usize,
+    pub native_sort_dispatch_avx2: usize,
+    pub native_sort_dispatch_neon: usize,
+    pub native_join_kernels: usize,
+    pub native_join_rows_seen: usize,
+    pub native_join_rows_matched: usize,
+    pub native_join_bytes_touched: usize,
+    pub native_join_dispatch_scalar: usize,
+    pub native_join_dispatch_avx2: usize,
+    pub native_join_dispatch_neon: usize,
+    pub native_projection_batches: usize,
+    pub native_projection_pages: usize,
+    pub native_projection_decode_boundaries: usize,
     pub arrow_export_direct_varbytes_rows: usize,
     pub arrow_export_direct_varbytes_bytes: usize,
     pub arrow_export_direct_numcode_rows: usize,
@@ -189,6 +238,54 @@ impl DecodeStats {
         self.range_plan_mixed += other.range_plan_mixed;
         self.range_plan_dense += other.range_plan_dense;
         self.kernel_fallbacks += other.kernel_fallbacks;
+        self.native_bitmap_intersections += other.native_bitmap_intersections;
+        self.native_bitmap_intersection_scalar += other.native_bitmap_intersection_scalar;
+        self.native_bitmap_intersection_avx2 += other.native_bitmap_intersection_avx2;
+        self.native_bitmap_intersection_neon += other.native_bitmap_intersection_neon;
+        self.native_table_batches += other.native_table_batches;
+        self.native_table_pages += other.native_table_pages;
+        self.native_table_decode_boundaries += other.native_table_decode_boundaries;
+        self.native_lane_predicates += other.native_lane_predicates;
+        self.native_lane_predicate_rows_seen += other.native_lane_predicate_rows_seen;
+        self.native_lane_predicate_rows_matched += other.native_lane_predicate_rows_matched;
+        self.native_lane_predicate_bytes_touched += other.native_lane_predicate_bytes_touched;
+        self.native_lane_predicate_dispatch_scalar += other.native_lane_predicate_dispatch_scalar;
+        self.native_lane_predicate_dispatch_avx2 += other.native_lane_predicate_dispatch_avx2;
+        self.native_lane_predicate_dispatch_neon += other.native_lane_predicate_dispatch_neon;
+        self.native_aggregate_kernels += other.native_aggregate_kernels;
+        self.native_aggregate_rows_seen += other.native_aggregate_rows_seen;
+        self.native_aggregate_rows_matched += other.native_aggregate_rows_matched;
+        self.native_aggregate_bytes_touched += other.native_aggregate_bytes_touched;
+        self.native_aggregate_dispatch_scalar += other.native_aggregate_dispatch_scalar;
+        self.native_aggregate_dispatch_avx2 += other.native_aggregate_dispatch_avx2;
+        self.native_aggregate_dispatch_neon += other.native_aggregate_dispatch_neon;
+        self.native_group_kernels += other.native_group_kernels;
+        self.native_group_rows_seen += other.native_group_rows_seen;
+        self.native_group_rows_matched += other.native_group_rows_matched;
+        self.native_group_bytes_touched += other.native_group_bytes_touched;
+        self.native_group_dispatch_scalar += other.native_group_dispatch_scalar;
+        self.native_group_dispatch_avx2 += other.native_group_dispatch_avx2;
+        self.native_group_dispatch_neon += other.native_group_dispatch_neon;
+        self.native_count_scans += other.native_count_scans;
+        self.native_count_rows_seen += other.native_count_rows_seen;
+        self.native_count_rows_matched += other.native_count_rows_matched;
+        self.native_sort_kernels += other.native_sort_kernels;
+        self.native_sort_rows_seen += other.native_sort_rows_seen;
+        self.native_sort_rows_matched += other.native_sort_rows_matched;
+        self.native_sort_bytes_touched += other.native_sort_bytes_touched;
+        self.native_sort_dispatch_scalar += other.native_sort_dispatch_scalar;
+        self.native_sort_dispatch_avx2 += other.native_sort_dispatch_avx2;
+        self.native_sort_dispatch_neon += other.native_sort_dispatch_neon;
+        self.native_join_kernels += other.native_join_kernels;
+        self.native_join_rows_seen += other.native_join_rows_seen;
+        self.native_join_rows_matched += other.native_join_rows_matched;
+        self.native_join_bytes_touched += other.native_join_bytes_touched;
+        self.native_join_dispatch_scalar += other.native_join_dispatch_scalar;
+        self.native_join_dispatch_avx2 += other.native_join_dispatch_avx2;
+        self.native_join_dispatch_neon += other.native_join_dispatch_neon;
+        self.native_projection_batches += other.native_projection_batches;
+        self.native_projection_pages += other.native_projection_pages;
+        self.native_projection_decode_boundaries += other.native_projection_decode_boundaries;
         self.arrow_export_direct_varbytes_rows += other.arrow_export_direct_varbytes_rows;
         self.arrow_export_direct_varbytes_bytes += other.arrow_export_direct_varbytes_bytes;
         self.arrow_export_direct_numcode_rows += other.arrow_export_direct_numcode_rows;
@@ -228,6 +325,116 @@ impl DecodeStats {
         self.utf8_proof_hits += other.utf8_proof_hits;
         self.utf8_proof_misses += other.utf8_proof_misses;
         self.utf8_proofs_earned += other.utf8_proofs_earned;
+    }
+
+    pub(crate) fn record_native_bitmap_dispatch(&mut self, dispatch: NativeKernelDispatch) {
+        self.native_bitmap_intersections += 1;
+        match dispatch {
+            NativeKernelDispatch::Scalar | NativeKernelDispatch::Auto => {
+                self.native_bitmap_intersection_scalar += 1;
+            }
+            NativeKernelDispatch::Avx2 => {
+                self.native_bitmap_intersection_avx2 += 1;
+            }
+            NativeKernelDispatch::Neon => {
+                self.native_bitmap_intersection_neon += 1;
+            }
+        }
+    }
+
+    pub(crate) fn record_native_lane_kernel(&mut self, stats: KernelStats) {
+        self.native_lane_predicate_rows_seen += stats.rows_seen;
+        self.native_lane_predicate_rows_matched += stats.rows_matched;
+        self.native_lane_predicate_bytes_touched += stats.bytes_touched_estimate;
+        match stats.dispatch {
+            NativeKernelDispatch::Scalar | NativeKernelDispatch::Auto => {
+                self.native_lane_predicate_dispatch_scalar += 1;
+            }
+            NativeKernelDispatch::Avx2 => {
+                self.native_lane_predicate_dispatch_avx2 += 1;
+            }
+            NativeKernelDispatch::Neon => {
+                self.native_lane_predicate_dispatch_neon += 1;
+            }
+        }
+    }
+
+    pub(crate) fn record_native_aggregate_kernel(&mut self, stats: KernelStats) {
+        self.native_aggregate_kernels += 1;
+        self.native_aggregate_rows_seen += stats.rows_seen;
+        self.native_aggregate_rows_matched += stats.rows_matched;
+        self.native_aggregate_bytes_touched += stats.bytes_touched_estimate;
+        match stats.dispatch {
+            NativeKernelDispatch::Scalar | NativeKernelDispatch::Auto => {
+                self.native_aggregate_dispatch_scalar += 1;
+            }
+            NativeKernelDispatch::Avx2 => {
+                self.native_aggregate_dispatch_avx2 += 1;
+            }
+            NativeKernelDispatch::Neon => {
+                self.native_aggregate_dispatch_neon += 1;
+            }
+        }
+    }
+
+    pub(crate) fn record_native_group_kernel(&mut self, stats: KernelStats) {
+        self.native_group_kernels += 1;
+        self.native_group_rows_seen += stats.rows_seen;
+        self.native_group_rows_matched += stats.rows_matched;
+        self.native_group_bytes_touched += stats.bytes_touched_estimate;
+        match stats.dispatch {
+            NativeKernelDispatch::Scalar | NativeKernelDispatch::Auto => {
+                self.native_group_dispatch_scalar += 1;
+            }
+            NativeKernelDispatch::Avx2 => {
+                self.native_group_dispatch_avx2 += 1;
+            }
+            NativeKernelDispatch::Neon => {
+                self.native_group_dispatch_neon += 1;
+            }
+        }
+    }
+
+    pub(crate) fn record_native_count_scan(&mut self, rows_seen: usize, rows_matched: usize) {
+        self.native_count_scans += 1;
+        self.native_count_rows_seen += rows_seen;
+        self.native_count_rows_matched += rows_matched;
+    }
+
+    pub(crate) fn record_native_sort_kernel(&mut self, stats: KernelStats) {
+        self.native_sort_kernels += 1;
+        self.native_sort_rows_seen += stats.rows_seen;
+        self.native_sort_rows_matched += stats.rows_matched;
+        self.native_sort_bytes_touched += stats.bytes_touched_estimate;
+        match stats.dispatch {
+            NativeKernelDispatch::Scalar | NativeKernelDispatch::Auto => {
+                self.native_sort_dispatch_scalar += 1;
+            }
+            NativeKernelDispatch::Avx2 => {
+                self.native_sort_dispatch_avx2 += 1;
+            }
+            NativeKernelDispatch::Neon => {
+                self.native_sort_dispatch_neon += 1;
+            }
+        }
+    }
+
+    pub(crate) fn record_native_join_kernel(&mut self, stats: KernelStats) {
+        self.native_join_kernels += 1;
+        self.native_join_rows_seen += stats.rows_seen;
+        self.native_join_rows_matched += stats.rows_matched;
+        self.native_join_bytes_touched += stats.bytes_touched_estimate;
+        match stats.dispatch {
+            NativeKernelDispatch::Scalar | NativeKernelDispatch::Auto => {
+                self.native_join_dispatch_scalar += 1;
+            }
+            NativeKernelDispatch::Avx2 => {
+                self.native_join_dispatch_avx2 += 1;
+            }
+            NativeKernelDispatch::Neon => {
+                self.native_join_dispatch_neon += 1;
+            }
+        }
     }
 }
 

@@ -1,17 +1,13 @@
 use super::*;
 
+pub(crate) type SelectionMask = cove_core::native::SelectionBitmap;
+
 #[derive(Debug, Default)]
 pub(crate) struct DecodeScratch {
     pub(crate) selected_mask: SelectionMask,
     pub(crate) filter_mask: SelectionMask,
     pub(crate) selected_rows: Vec<u32>,
     pub(crate) selection: Selection,
-}
-
-#[derive(Debug, Default, Clone)]
-pub(crate) struct SelectionMask {
-    pub(crate) words: Vec<u64>,
-    pub(crate) len: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -36,7 +32,12 @@ impl Selection {
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.len() == 0
+        match self {
+            Self::None => true,
+            Self::AllRows { len } => *len == 0,
+            Self::Bitset(mask) => mask.all_zero(),
+            Self::RowIndices(rows) => rows.is_empty(),
+        }
     }
 
     pub(crate) fn from_mask(mask: &SelectionMask, rows: &mut Vec<u32>) -> Result<Self, CoveError> {
@@ -44,11 +45,15 @@ impl Selection {
         if selected == 0 {
             return Ok(Self::None);
         }
-        if selected == mask.len {
-            return Ok(Self::AllRows { len: mask.len });
+        if selected == mask.len() {
+            return Ok(Self::AllRows { len: mask.len() });
         }
-        if selected * 5 <= mask.len {
-            mask.write_selected_rows(rows)?;
+        if selected * 5 <= mask.len() {
+            let _ = cove_core::native::compact_selection_bitmap_into(
+                mask,
+                rows,
+                cove_core::native::NativeKernelDispatch::Auto,
+            )?;
             return Ok(Self::RowIndices(rows.clone()));
         }
         Ok(Self::Bitset(mask.clone()))
@@ -110,82 +115,36 @@ impl Selection {
     }
 }
 
-impl SelectionMask {
-    pub(crate) fn clone_from_mask(&mut self, other: &Self) {
-        self.len = other.len;
-        self.words.clone_from(&other.words);
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bitset_selection_empty_checks_words_without_changing_len_semantics() {
+        let mut mask = SelectionMask::none(130);
+        let selection = Selection::Bitset(mask.clone());
+        assert!(selection.is_empty());
+        assert_eq!(selection.len(), 0);
+
+        mask.set(129);
+        let selection = Selection::Bitset(mask);
+        assert!(!selection.is_empty());
+        assert_eq!(selection.len(), 1);
     }
 
-    pub(crate) fn fill_all(&mut self, len: usize) {
-        self.len = len;
-        let word_len = len.div_ceil(64);
-        self.words.clear();
-        self.words.resize(word_len, u64::MAX);
-        self.mask_tail();
-    }
+    #[test]
+    fn sparse_mask_selection_compacts_with_shared_native_kernel() {
+        let mut mask = SelectionMask::none(128);
+        mask.set(2);
+        mask.set(65);
+        let mut rows = vec![99];
 
-    pub(crate) fn fill_none(&mut self, len: usize) {
-        self.len = len;
-        let word_len = len.div_ceil(64);
-        self.words.clear();
-        self.words.resize(word_len, 0);
-    }
+        let selection = Selection::from_mask(&mask, &mut rows).unwrap();
 
-    pub(crate) fn set(&mut self, index: usize) {
-        debug_assert!(index < self.len);
-        self.words[index / 64] |= 1u64 << (index % 64);
-    }
-
-    pub(crate) fn clear_bit(&mut self, index: usize) {
-        debug_assert!(index < self.len);
-        self.words[index / 64] &= !(1u64 << (index % 64));
-    }
-
-    pub(crate) fn and_inplace(&mut self, other: &Self) {
-        debug_assert_eq!(self.len, other.len);
-        for (left, right) in self.words.iter_mut().zip(other.words.iter()) {
-            *left &= *right;
-        }
-    }
-
-    pub(crate) fn all_zero(&self) -> bool {
-        self.words.iter().all(|word| *word == 0)
-    }
-
-    pub(crate) fn count_ones(&self) -> usize {
-        self.words
-            .iter()
-            .map(|word| word.count_ones() as usize)
-            .sum()
-    }
-
-    pub(crate) fn write_selected_rows(&self, rows: &mut Vec<u32>) -> Result<(), CoveError> {
-        rows.clear();
-        rows.reserve(self.count_ones());
-        for (word_index, word) in self.words.iter().copied().enumerate() {
-            let mut remaining = word;
-            while remaining != 0 {
-                let bit = remaining.trailing_zeros() as usize;
-                let index = word_index
-                    .checked_mul(64)
-                    .and_then(|base| base.checked_add(bit))
-                    .ok_or_else(|| CoveError::ArithOverflow)?;
-                if index < self.len {
-                    rows.push(u32::try_from(index).map_err(|_| CoveError::ArithOverflow)?);
-                }
-                remaining &= remaining - 1;
-            }
-        }
-        Ok(())
-    }
-
-    fn mask_tail(&mut self) {
-        let tail_bits = self.len % 64;
-        if tail_bits == 0 {
-            return;
-        }
-        if let Some(last) = self.words.last_mut() {
-            *last &= (1u64 << tail_bits) - 1;
-        }
+        assert!(matches!(selection, Selection::RowIndices(_)));
+        assert_eq!(rows, vec![2, 65]);
+        let mut written = Vec::new();
+        selection.write_rows(&mut written).unwrap();
+        assert_eq!(written, vec![2, 65]);
     }
 }

@@ -47,6 +47,7 @@ pub struct CoviValidationContextV2 {
     pub schema_fingerprint_ref: Option<u32>,
     pub semantic_map_fingerprint_ref: Option<u32>,
     pub external_visibility_ref: Option<u32>,
+    pub delta_chain_digest: Option<CoviFileDigestV2>,
     pub row_range_scopes: Vec<CoviRowRangeScopeV2>,
     pub now_us: Option<i64>,
     pub allow_file_code_keys: bool,
@@ -65,6 +66,7 @@ impl CoviValidationContextV2 {
             schema_fingerprint_ref: None,
             semantic_map_fingerprint_ref: None,
             external_visibility_ref: None,
+            delta_chain_digest: None,
             row_range_scopes: Vec::new(),
             now_us: None,
             allow_file_code_keys: false,
@@ -94,6 +96,11 @@ impl CoviValidationContextV2 {
 
     pub fn with_external_visibility_ref(mut self, external_visibility_ref: u32) -> Self {
         self.external_visibility_ref = Some(external_visibility_ref);
+        self
+    }
+
+    pub fn with_delta_chain_digest(mut self, algorithm: DigestAlgorithm, bytes: Vec<u8>) -> Self {
+        self.delta_chain_digest = Some(CoviFileDigestV2 { algorithm, bytes });
         self
     }
 
@@ -650,8 +657,22 @@ impl ValidatedCoviArtifactV2 {
             .iter()
             .map(|entry| (entry.snapshot_validity_ref, entry.clone()))
             .collect::<BTreeMap<_, _>>();
+        let string_table = if context.delta_chain_digest.is_some() {
+            let Some(bytes) = artifact_bytes else {
+                return Err(CoveError::BadCovi);
+            };
+            if artifact.header.string_table_section_ref == ABSENT_U32 {
+                return Err(CoveError::BadCovi);
+            }
+            Some(
+                artifact
+                    .section_payload_from_bytes(bytes, artifact.header.string_table_section_ref)?,
+            )
+        } else {
+            None
+        };
         for entry in snapshot_validity.values() {
-            validate_snapshot(entry, &context)?;
+            validate_snapshot(entry, &context, string_table.as_deref())?;
         }
 
         let mut roots = BTreeMap::new();
@@ -1452,6 +1473,7 @@ fn validate_referenced_file<'a>(
 fn validate_snapshot(
     snapshot: &CoviSnapshotValidityV2,
     context: &CoviValidationContextV2,
+    string_table: Option<&[u8]>,
 ) -> Result<(), CoveError> {
     if let Some(dataset_id) = context.dataset_id {
         if snapshot.dataset_id != dataset_id {
@@ -1481,6 +1503,41 @@ fn validate_snapshot(
         }
         None => {
             if snapshot.external_visibility_ref != ABSENT_U32 {
+                return Err(CoveError::BadCovi);
+            }
+        }
+    }
+    let declared_chain_algorithm = DigestAlgorithm::from_u16(snapshot.delta_chain_digest_algorithm)
+        .ok_or(CoveError::BadCovi)?;
+    match &context.delta_chain_digest {
+        Some(expected) => {
+            if declared_chain_algorithm == DigestAlgorithm::None {
+                return Err(CoveError::BadCovi);
+            }
+            if declared_chain_algorithm != expected.algorithm {
+                return Err(CoveError::DigestMismatch);
+            }
+            if usize::from(snapshot.delta_chain_digest_len) != expected.bytes.len() {
+                return Err(CoveError::DigestMismatch);
+            }
+            let string_table = string_table.ok_or(CoveError::BadCovi)?;
+            let start = usize::try_from(snapshot.delta_chain_digest_offset)
+                .map_err(|_| CoveError::OffsetRange)?;
+            let end = start
+                .checked_add(usize::from(snapshot.delta_chain_digest_len))
+                .ok_or(CoveError::ArithOverflow)?;
+            if end > string_table.len() {
+                return Err(CoveError::OffsetRange);
+            }
+            if &string_table[start..end] != expected.bytes.as_slice() {
+                return Err(CoveError::DigestMismatch);
+            }
+        }
+        None => {
+            if declared_chain_algorithm != DigestAlgorithm::None
+                || snapshot.delta_chain_digest_len != 0
+                || snapshot.delta_chain_digest_offset != 0
+            {
                 return Err(CoveError::BadCovi);
             }
         }
@@ -3156,6 +3213,9 @@ mod tests {
             semantic_map_fingerprint_ref: ABSENT_U32,
             external_visibility_ref,
             data_checksum_root_ref: ABSENT_U32,
+            delta_chain_digest_algorithm: DigestAlgorithm::None as u16,
+            delta_chain_digest_len: 0,
+            delta_chain_digest_offset: 0,
             valid_from_us: 0,
             valid_until_us: 100,
             flags: 0,
@@ -3502,16 +3562,16 @@ mod tests {
         let snapshot = snapshot_with_external_visibility(7);
         let context = CoviValidationContextV2::for_file([3; 16], 64, 0x1234);
         assert!(matches!(
-            validate_snapshot(&snapshot, &context),
+            validate_snapshot(&snapshot, &context, None),
             Err(CoveError::BadCovi)
         ));
 
         let matching_context = context.clone().with_external_visibility_ref(7);
-        validate_snapshot(&snapshot, &matching_context).unwrap();
+        validate_snapshot(&snapshot, &matching_context, None).unwrap();
 
         let mismatched_context = context.with_external_visibility_ref(8);
         assert!(matches!(
-            validate_snapshot(&snapshot, &mismatched_context),
+            validate_snapshot(&snapshot, &mismatched_context, None),
             Err(CoveError::BadCovi)
         ));
     }
@@ -3520,7 +3580,33 @@ mod tests {
     fn snapshot_validation_accepts_absent_overlay_without_context_overlay() {
         let snapshot = snapshot_with_external_visibility(ABSENT_U32);
         let context = CoviValidationContextV2::for_file([3; 16], 64, 0x1234);
-        validate_snapshot(&snapshot, &context).unwrap();
+        validate_snapshot(&snapshot, &context, None).unwrap();
+    }
+
+    #[test]
+    fn snapshot_validation_binds_delta_chain_digest() {
+        let mut snapshot = snapshot_with_external_visibility(ABSENT_U32);
+        snapshot.delta_chain_digest_algorithm = DigestAlgorithm::Sha256 as u16;
+        snapshot.delta_chain_digest_len = 32;
+        snapshot.delta_chain_digest_offset = 4;
+        let mut string_table = vec![0, 1, 2, 3];
+        string_table.extend_from_slice(&[0xAA; 32]);
+        let matching_context = CoviValidationContextV2::for_file([3; 16], 64, 0x1234)
+            .with_delta_chain_digest(DigestAlgorithm::Sha256, vec![0xAA; 32]);
+        validate_snapshot(&snapshot, &matching_context, Some(&string_table)).unwrap();
+
+        let mismatched_context = CoviValidationContextV2::for_file([3; 16], 64, 0x1234)
+            .with_delta_chain_digest(DigestAlgorithm::Sha256, vec![0xBB; 32]);
+        assert!(matches!(
+            validate_snapshot(&snapshot, &mismatched_context, Some(&string_table)),
+            Err(CoveError::DigestMismatch)
+        ));
+
+        let base_only_context = CoviValidationContextV2::for_file([3; 16], 64, 0x1234);
+        assert!(matches!(
+            validate_snapshot(&snapshot, &base_only_context, None),
+            Err(CoveError::BadCovi)
+        ));
     }
 
     #[test]

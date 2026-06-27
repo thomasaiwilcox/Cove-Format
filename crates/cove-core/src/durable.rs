@@ -132,6 +132,34 @@ where
     Ok(tmp)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableDeltaManifestPublish {
+    pub delta_temp_path: PathBuf,
+    pub manifest_temp_path: PathBuf,
+}
+
+/// Publish an immutable delta artifact first, then publish the manifest that
+/// makes that delta visible.
+///
+/// If manifest publication fails after the delta has been durably written, the
+/// caller may leave the delta as an unreferenced immutable artifact. The
+/// manifest/COVM path is the visibility point and is always attempted last.
+pub fn durable_publish_delta_then_manifest(
+    delta_path: &Path,
+    delta_bytes: &[u8],
+    manifest_path: &Path,
+    manifest_bytes: &[u8],
+) -> Result<DurableDeltaManifestPublish, CoveError> {
+    let mut backend = StdDurableReplaceBackend;
+    durable_publish_delta_then_manifest_with_backend(
+        &mut backend,
+        delta_path,
+        delta_bytes,
+        manifest_path,
+        manifest_bytes,
+    )
+}
+
 trait DurableReplaceBackend {
     fn write_new_file(&mut self, path: &Path, bytes: &[u8]) -> Result<(), CoveError>;
     fn sync_file(&mut self, path: &Path) -> Result<(), CoveError>;
@@ -218,6 +246,26 @@ fn durable_replace_with_backend<B: DurableReplaceBackend>(
     Ok(tmp)
 }
 
+fn durable_publish_delta_then_manifest_with_backend<B: DurableReplaceBackend>(
+    backend: &mut B,
+    delta_path: &Path,
+    delta_bytes: &[u8],
+    manifest_path: &Path,
+    manifest_bytes: &[u8],
+) -> Result<DurableDeltaManifestPublish, CoveError> {
+    if delta_path == manifest_path {
+        return Err(CoveError::BadSection(
+            "delta artifact and manifest publish paths must differ".into(),
+        ));
+    }
+    let delta_temp_path = durable_replace_with_backend(backend, delta_path, delta_bytes)?;
+    let manifest_temp_path = durable_replace_with_backend(backend, manifest_path, manifest_bytes)?;
+    Ok(DurableDeltaManifestPublish {
+        delta_temp_path,
+        manifest_temp_path,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -234,6 +282,13 @@ mod tests {
     struct FailingBackend {
         inner: StdDurableReplaceBackend,
         fail_at: Option<FailStep>,
+    }
+
+    struct OrderedPublishBackend {
+        inner: StdDurableReplaceBackend,
+        rename_calls: usize,
+        fail_rename_call: Option<usize>,
+        rename_targets: Vec<PathBuf>,
     }
 
     impl DurableReplaceBackend for FailingBackend {
@@ -269,6 +324,33 @@ mod tests {
             if self.fail_at == Some(FailStep::SyncParentDir) {
                 return Err(std::io::Error::other("injected parent sync failure").into());
             }
+            self.inner.sync_parent_dir(final_path)
+        }
+    }
+
+    impl DurableReplaceBackend for OrderedPublishBackend {
+        fn write_new_file(&mut self, path: &Path, bytes: &[u8]) -> Result<(), CoveError> {
+            self.inner.write_new_file(path, bytes)
+        }
+
+        fn sync_file(&mut self, path: &Path) -> Result<(), CoveError> {
+            self.inner.sync_file(path)
+        }
+
+        fn rename(&mut self, from: &Path, to: &Path) -> Result<(), CoveError> {
+            self.rename_calls += 1;
+            self.rename_targets.push(to.to_path_buf());
+            if self.fail_rename_call == Some(self.rename_calls) {
+                return Err(std::io::Error::other("injected ordered rename failure").into());
+            }
+            self.inner.rename(from, to)
+        }
+
+        fn remove_file(&mut self, path: &Path) -> Result<(), CoveError> {
+            self.inner.remove_file(path)
+        }
+
+        fn sync_parent_dir(&mut self, final_path: &Path) -> Result<(), CoveError> {
             self.inner.sync_parent_dir(final_path)
         }
     }
@@ -346,6 +428,71 @@ mod tests {
             temp_siblings_for(&target).is_empty(),
             "no durable temp siblings should remain"
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn durable_publish_delta_then_manifest_publishes_manifest_last() {
+        let dir = test_dir("delta-manifest-success");
+        let delta = dir.join("delta.covedelta");
+        let manifest = dir.join("manifest.covm");
+        std::fs::write(&manifest, b"old-manifest").unwrap();
+
+        let result =
+            durable_publish_delta_then_manifest(&delta, b"delta-bytes", &manifest, b"manifest-v2")
+                .unwrap();
+
+        assert_eq!(std::fs::read(&delta).unwrap(), b"delta-bytes");
+        assert_eq!(std::fs::read(&manifest).unwrap(), b"manifest-v2");
+        assert!(!result.delta_temp_path.exists());
+        assert!(!result.manifest_temp_path.exists());
+        assert!(temp_siblings_for(&delta).is_empty());
+        assert!(temp_siblings_for(&manifest).is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn durable_publish_delta_then_manifest_keeps_old_manifest_when_manifest_rename_fails() {
+        let dir = test_dir("delta-manifest-rename-fail");
+        let delta = dir.join("delta.covedelta");
+        let manifest = dir.join("manifest.covm");
+        std::fs::write(&manifest, b"old-manifest").unwrap();
+        let mut backend = OrderedPublishBackend {
+            inner: StdDurableReplaceBackend,
+            rename_calls: 0,
+            fail_rename_call: Some(2),
+            rename_targets: Vec::new(),
+        };
+
+        assert!(durable_publish_delta_then_manifest_with_backend(
+            &mut backend,
+            &delta,
+            b"delta-bytes",
+            &manifest,
+            b"manifest-v2",
+        )
+        .is_err());
+
+        assert_eq!(
+            backend.rename_targets,
+            vec![delta.clone(), manifest.clone()]
+        );
+        assert_eq!(std::fs::read(&delta).unwrap(), b"delta-bytes");
+        assert_eq!(std::fs::read(&manifest).unwrap(), b"old-manifest");
+        assert!(temp_siblings_for(&delta).is_empty());
+        assert!(temp_siblings_for(&manifest).is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn durable_publish_delta_then_manifest_rejects_same_path() {
+        let dir = test_dir("delta-manifest-same-path");
+        let path = dir.join("manifest.covm");
+        assert!(matches!(
+            durable_publish_delta_then_manifest(&path, b"delta", &path, b"manifest"),
+            Err(CoveError::BadSection(message))
+                if message.contains("must differ")
+        ));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

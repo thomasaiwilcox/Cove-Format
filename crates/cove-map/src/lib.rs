@@ -15,7 +15,10 @@ use cove_core::{
     page::{ColumnPageIndexEntryV1, COLUMN_PAGE_INDEX_ENTRY_LEN},
     page_payload::ColumnPagePayloadV1,
     profile::{
-        cove_map::{MapIdentityRule, MapPropertyBinding, MapRowSemanticRule, SourceOperationKind},
+        cove_map::{
+            MapAliasEntry, MapIdentityRule, MapJoinKeyComponent, MapNormalizationPipeline,
+            MapPropertyBinding, MapResolver, MapRowSemanticRule, SourceOperationKind,
+        },
         cove_o::{
             temporal_row_trust_payload, CoveRecordRefV1, ObjectTypeCatalog, ObjectTypeEntryV1,
             PropertyEntryV1, RecordKind, TemporalRowEntryV1, TemporalSegmentData,
@@ -35,8 +38,10 @@ use cove_core::{
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
+mod alias_import;
 mod api;
 mod build;
+mod candidates;
 mod cli;
 mod context;
 mod emit;
@@ -44,6 +49,8 @@ mod identity;
 mod input;
 mod parity;
 mod project;
+mod replay;
+mod review;
 mod sections;
 mod suggest;
 mod support;
@@ -53,16 +60,16 @@ mod verify;
 #[cfg(test)]
 use crate::cli::{parse_args, Command, OutputFormat};
 pub use api::{
-    conversion_report_from_paths, conversion_summary_from_paths, cove_o_from_paths,
-    projected_output_from_cove_o_bytes, projected_output_from_cove_o_path,
+    candidate_matches_from_paths, conversion_report_from_paths, conversion_summary_from_paths,
+    cove_o_from_paths, projected_output_from_cove_o_bytes, projected_output_from_cove_o_path,
     projected_output_from_paths, projected_record_batch_from_cove_o_bytes,
     projected_record_batches_from_cove_o_bytes,
     projected_record_batches_from_cove_o_bytes_with_catalog, projected_rows_from_cove_o_path,
     projected_rows_from_paths, projection_arrow_schema, projection_catalog_from_cove_o_bytes,
     projection_covi_filter_plan, projection_descriptors_from_cove_o_path,
-    projection_read_requirements_for_catalog, ProjectionColumnDescriptor,
-    ProjectionColumnLineageDescriptor, ProjectionCoviFilterDiagnostic, ProjectionCoviFilterLookup,
-    ProjectionCoviFilterPlan, ProjectionDescriptor,
+    projection_read_requirements_for_catalog, verify_replay_report_from_paths,
+    ProjectionColumnDescriptor, ProjectionColumnLineageDescriptor, ProjectionCoviFilterDiagnostic,
+    ProjectionCoviFilterLookup, ProjectionCoviFilterPlan, ProjectionDescriptor,
 };
 pub(crate) use api::{parse_map, plan_keys, preview};
 use build::verify_from_paths;
@@ -70,6 +77,7 @@ pub use build::{
     build_from_paths, publish_covm_from_bundle, MapBuildOptions, MapBuildProjectionOutput,
     MapBuildResult, MapBuildSectionCompression, MapEvidenceEncoding,
 };
+pub(crate) use candidates::candidate_matches;
 pub(crate) use context::{mapping_context, MappingContext};
 #[cfg(test)]
 use emit::build_cove_o;
@@ -90,6 +98,8 @@ pub use project::{
     ProjectionBatchOptions, ProjectionCandidateRows, ProjectionFilter, ProjectionFilterLiteral,
     ProjectionFilterOp, ProjectionFormat, ProjectionReadRequirements,
 };
+pub(crate) use replay::verify_replay_report;
+pub(crate) use review::review_worklist_from_candidate_matches;
 pub(crate) use sections::{embedded_sections, mapping_identity, section_kind};
 #[cfg(test)]
 use std::path::PathBuf;
@@ -138,6 +148,44 @@ struct MaterializedModel {
     evidence_entries: Vec<Value>,
     evidence_index: Value,
     conversion_report: Value,
+}
+
+#[derive(Debug, Clone)]
+struct ReviewedDecisionReplayBinding {
+    count: usize,
+    digest: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct JoinKeyEvaluation {
+    pub(crate) tuple: Vec<u8>,
+    pub(crate) materializes_identity: bool,
+    pub(crate) effective_confidence_class: Option<String>,
+    pub(crate) resolution_metadata: Vec<ResolutionMetadata>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ResolutionMetadata {
+    pub(crate) role_id: String,
+    pub(crate) resolution_kind: String,
+    pub(crate) resolver_id: String,
+    pub(crate) resolver_digest: String,
+    pub(crate) catalog_digest: String,
+    pub(crate) pipeline_digest: String,
+    pub(crate) normalization_pipeline_id: String,
+    pub(crate) evidence_policy: String,
+    pub(crate) redacted_resolution_evidence: bool,
+    pub(crate) raw_observed_value: String,
+    pub(crate) normalized_value: String,
+    pub(crate) resolved_identity_value: Option<String>,
+    pub(crate) canonical_key: Option<String>,
+    pub(crate) canonical_label: Option<String>,
+    pub(crate) alias_catalog_id: Option<String>,
+    pub(crate) alias_entry_id: Option<String>,
+    pub(crate) alias_hit: bool,
+    pub(crate) alias_miss: bool,
+    pub(crate) alias_ambiguous: bool,
+    pub(crate) miss_policy: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -192,24 +240,27 @@ fn materialize_with_source_states(
             )
         })
         .collect::<BTreeMap<_, _>>();
-    let planned_by_join = planned
-        .iter()
-        .map(|identity| {
-            (
-                (
-                    identity.identity_rule_id.clone(),
-                    identity.join_key_sha256.clone(),
-                ),
-                identity,
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
+    let mut planned_by_join = BTreeMap::<(String, String), Vec<&PlannedIdentity>>::new();
+    for identity in planned {
+        planned_by_join
+            .entry((
+                identity.identity_rule_id.clone(),
+                identity.join_key_sha256.clone(),
+            ))
+            .or_default()
+            .push(identity);
+    }
     let row_rules = context
         .row_rules
         .iter()
         .map(|rule| (rule.rule_id.clone(), rule))
         .collect::<BTreeMap<_, _>>();
     let (mapping_id, mapping_version) = mapping_identity(file)?;
+    let candidate_rule_output = candidate_matches(file, rows)?;
+    let candidate_rule_matches = candidate_rule_output["candidate_matches"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     let mut object_rows = Vec::new();
     let mut assertions = Vec::new();
     let mut evidence_entries = Vec::new();
@@ -239,6 +290,14 @@ fn materialize_with_source_states(
             add_operation_metadata(&mut evidence, row_rule, None);
         }
         evidence_entries.push(evidence);
+    }
+    for candidate in &candidate_rule_matches {
+        let candidate_id = candidate
+            .get("candidate_match_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "candidate rule output missing candidate_match_id".to_string())?;
+        push_unique_assertion(&mut assertions, candidate_id, candidate_id);
+        evidence_entries.push(candidate_rule_evidence_entry(candidate)?);
     }
 
     for identity in planned {
@@ -319,6 +378,7 @@ fn materialize_with_source_states(
             row.record_id,
         )
     });
+    let reviewed_decision_replay = reviewed_decision_replay_binding(file)?;
     let conversion_report = json!({
         "mapping_id": mapping_id,
         "mapping_version": mapping_version,
@@ -328,7 +388,14 @@ fn materialize_with_source_states(
         "object_count": object_rows.iter().filter(|row| !row.object_type.starts_with("Association:")).count(),
         "association_count": object_rows.iter().filter(|row| row.object_type.starts_with("Association:")).count(),
         "property_value_count": object_rows.iter().map(|row| row.properties.len()).sum::<usize>(),
-        "candidate_match_count": identity_plan.candidates.len(),
+        "candidate_match_count": identity_plan.candidates.len() + candidate_rule_matches.len(),
+        "resolver_hit_count": evidence_bool_count(&evidence_entries, "alias_hit"),
+        "resolver_miss_count": evidence_bool_count(&evidence_entries, "alias_miss"),
+        "ambiguous_alias_count": evidence_bool_count(&evidence_entries, "alias_ambiguous"),
+        "resolver_catalog_digests": resolver_catalog_digests(&evidence_entries),
+        "reviewed_decision_count": reviewed_decision_replay.count,
+        "reviewed_decision_catalog_digest": reviewed_decision_replay.digest,
+        "resolver_goid_impact": resolver_goid_impact(&evidence_entries),
         "candidate_matches": identity_plan.candidates.iter().map(|candidate| {
             json!({
                 "candidate_match_id": candidate_match_id(candidate),
@@ -339,7 +406,7 @@ fn materialize_with_source_states(
                 "object_type": candidate.object_type,
                 "join_key_sha256": candidate.join_key_sha256,
             })
-        }).collect::<Vec<_>>(),
+        }).chain(candidate_rule_matches.iter().map(candidate_rule_report_entry)).collect::<Vec<_>>(),
         "generated_artifacts": ["cove-o", "map-assertion-log", "map-identity-equivalence-index", "map-evidence-index"],
         "unsupported": [],
         "operation_counts": operation_counts(&evidence_entries),
@@ -380,6 +447,67 @@ fn push_unique_assertion(assertions: &mut Vec<Value>, assertion_id: &str, output
         "assertion_id": assertion_id,
         "output_object_id": output_object_id,
     }));
+}
+
+fn candidate_rule_report_entry(candidate: &Value) -> Value {
+    let left = candidate.get("left").and_then(Value::as_object);
+    let right = candidate.get("right").and_then(Value::as_object);
+    json!({
+        "candidate_match_id": candidate.get("candidate_match_id").cloned().unwrap_or(Value::Null),
+        "match_rule_id": candidate.get("match_rule_id").cloned().unwrap_or(Value::Null),
+        "object_type": candidate.get("object_type").cloned().unwrap_or(Value::Null),
+        "candidate_score": candidate.get("candidate_score").cloned().unwrap_or(Value::Null),
+        "score_scale": candidate.get("score_scale").cloned().unwrap_or(Value::Null),
+        "blocking_key": candidate.get("blocking_key").cloned().unwrap_or(Value::Null),
+        "left_source_id": nested_candidate_value(left, "source_id"),
+        "left_source_row_identity": nested_candidate_value(left, "source_row_identity"),
+        "left_raw_observed_value": nested_candidate_value(left, "raw_value"),
+        "left_normalized_value": nested_candidate_value(left, "normalized_value"),
+        "left_row_digest": nested_candidate_value(left, "row_digest"),
+        "right_source_id": nested_candidate_value(right, "source_id"),
+        "right_source_row_identity": nested_candidate_value(right, "source_row_identity"),
+        "right_raw_observed_value": nested_candidate_value(right, "raw_value"),
+        "right_normalized_value": nested_candidate_value(right, "normalized_value"),
+        "right_row_digest": nested_candidate_value(right, "row_digest"),
+    })
+}
+
+fn candidate_rule_evidence_entry(candidate: &Value) -> Result<Value, String> {
+    let left = candidate
+        .get("left")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "candidate rule output missing left member".to_string())?;
+    let report = candidate_rule_report_entry(candidate);
+    Ok(json!({
+        "source_id": nested_candidate_value(Some(left), "source_id"),
+        "source_row_identity": nested_candidate_value(Some(left), "source_row_identity"),
+        "rule_id": candidate.get("match_rule_id").cloned().unwrap_or(Value::Null),
+        "assertion_id": candidate.get("candidate_match_id").cloned().unwrap_or(Value::Null),
+        "output_object_id": candidate.get("candidate_match_id").cloned().unwrap_or(Value::Null),
+        "candidate": true,
+        "candidate_match_id": report["candidate_match_id"].clone(),
+        "candidate_score": report["candidate_score"].clone(),
+        "match_rule_id": report["match_rule_id"].clone(),
+        "object_type": report["object_type"].clone(),
+        "blocking_key": report["blocking_key"].clone(),
+        "left_source_id": report["left_source_id"].clone(),
+        "left_source_row_identity": report["left_source_row_identity"].clone(),
+        "left_raw_observed_value": report["left_raw_observed_value"].clone(),
+        "left_normalized_value": report["left_normalized_value"].clone(),
+        "left_row_digest": report["left_row_digest"].clone(),
+        "right_source_id": report["right_source_id"].clone(),
+        "right_source_row_identity": report["right_source_row_identity"].clone(),
+        "right_raw_observed_value": report["right_raw_observed_value"].clone(),
+        "right_normalized_value": report["right_normalized_value"].clone(),
+        "right_row_digest": report["right_row_digest"].clone(),
+    }))
+}
+
+fn nested_candidate_value(object: Option<&Map<String, Value>>, key: &str) -> Value {
+    object
+        .and_then(|object| object.get(key))
+        .cloned()
+        .unwrap_or(Value::Null)
 }
 
 fn conversion_report_sources(rows: &[SourceRow], source_states: &[ObservedSourceState]) -> Value {
@@ -450,6 +578,147 @@ fn operation_counts(evidence_entries: &[Value]) -> Value {
         }
     }
     json!(counts)
+}
+
+fn evidence_bool_count(evidence_entries: &[Value], key: &str) -> usize {
+    evidence_entries
+        .iter()
+        .filter(|entry| entry.get(key).and_then(Value::as_bool) == Some(true))
+        .count()
+}
+
+fn reviewed_decision_replay_binding(
+    file: &CovemapFile,
+) -> Result<ReviewedDecisionReplayBinding, String> {
+    let decisions = match file
+        .sections
+        .iter()
+        .find(|section| section.entry.section_id == SectionKind::MapResolutionCatalog as u32)
+    {
+        Some(section) => {
+            let payload: Value = serde_json::from_slice(&section.payload)
+                .map_err(|err| format!("invalid MAP_RESOLUTION_CATALOG JSON: {err}"))?;
+            payload
+                .get("reviewed_decisions")
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    "MAP_RESOLUTION_CATALOG missing reviewed_decisions array".to_string()
+                })?
+                .clone()
+        }
+        None => Vec::new(),
+    };
+    let count = decisions.len();
+    let digest = alias_import::digest_json(&json!({
+        "reviewed_decisions": decisions
+    }))?;
+    Ok(ReviewedDecisionReplayBinding { count, digest })
+}
+
+fn resolver_catalog_digests(evidence_entries: &[Value]) -> Value {
+    let digests = evidence_entries
+        .iter()
+        .filter_map(|entry| {
+            Some((
+                entry.get("resolver_id")?.as_str()?.to_string(),
+                entry
+                    .get("normalization_pipeline_id")?
+                    .as_str()?
+                    .to_string(),
+                entry.get("resolver_digest")?.as_str()?.to_string(),
+                entry.get("catalog_digest")?.as_str()?.to_string(),
+                entry.get("pipeline_digest")?.as_str()?.to_string(),
+            ))
+        })
+        .collect::<BTreeSet<_>>();
+    Value::Array(
+        digests
+            .into_iter()
+            .map(
+                |(
+                    resolver_id,
+                    normalization_pipeline_id,
+                    resolver_digest,
+                    catalog_digest,
+                    pipeline_digest,
+                )| {
+                    json!({
+                        "resolver_id": resolver_id,
+                        "normalization_pipeline_id": normalization_pipeline_id,
+                        "resolver_digest": resolver_digest,
+                        "catalog_digest": catalog_digest,
+                        "pipeline_digest": pipeline_digest,
+                    })
+                },
+            )
+            .collect(),
+    )
+}
+
+fn resolver_goid_impact(evidence_entries: &[Value]) -> Value {
+    let mut impacted =
+        BTreeMap::<(String, String, String, String, String), BTreeSet<String>>::new();
+    for entry in evidence_entries {
+        let Some(resolver_id) = entry.get("resolver_id").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(normalization_pipeline_id) = entry
+            .get("normalization_pipeline_id")
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        let Some(resolver_digest) = entry.get("resolver_digest").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(catalog_digest) = entry.get("catalog_digest").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(pipeline_digest) = entry.get("pipeline_digest").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(output_object_id) = entry.get("output_object_id").and_then(Value::as_str) else {
+            continue;
+        };
+        impacted
+            .entry((
+                resolver_id.to_string(),
+                normalization_pipeline_id.to_string(),
+                resolver_digest.to_string(),
+                catalog_digest.to_string(),
+                pipeline_digest.to_string(),
+            ))
+            .or_default()
+            .insert(output_object_id.to_string());
+    }
+    Value::Array(
+        impacted
+            .into_iter()
+            .map(
+                |(
+                    (
+                        resolver_id,
+                        normalization_pipeline_id,
+                        resolver_digest,
+                        catalog_digest,
+                        pipeline_digest,
+                    ),
+                    affected_goids,
+                )| {
+                    let affected_goids = affected_goids.into_iter().collect::<Vec<_>>();
+                    json!({
+                        "resolver_id": resolver_id,
+                        "normalization_pipeline_id": normalization_pipeline_id,
+                        "resolver_digest": resolver_digest,
+                        "catalog_digest": catalog_digest,
+                        "pipeline_digest": pipeline_digest,
+                        "affected_goid_count": affected_goids.len(),
+                        "affected_goids": affected_goids,
+                    })
+                },
+            )
+            .collect(),
+    )
 }
 
 fn operation_effect(kind: SourceOperationKind) -> &'static str {
@@ -823,7 +1092,7 @@ fn materialize_associations(
     context: &MappingContext,
     planned: &[PlannedIdentity],
     planned_by_key: &BTreeMap<(String, usize, String), &PlannedIdentity>,
-    planned_by_join: &BTreeMap<(String, String), &PlannedIdentity>,
+    planned_by_join: &BTreeMap<(String, String), Vec<&PlannedIdentity>>,
     source_rows: &BTreeMap<(String, usize), &SourceRow>,
     type_ids: &BTreeMap<String, u32>,
     properties_by_type: &BTreeMap<u32, BTreeMap<u32, PropertyEntryV1>>,
@@ -911,7 +1180,10 @@ fn materialize_associations(
                 &source_endpoint.goid,
                 &target.goid,
             );
-            let assertion_id = format!("{}:{}", binding.assertion_id, identity.row_digest);
+            let assertion_id = format!(
+                "{}:{}:{}",
+                binding.assertion_id, identity.source_row_identity, identity.row_digest
+            );
             let source_evidence_id = format!("{}:{}", identity.source_id, identity.row_index);
             let Some(valid_from) = association_validity_value(
                 source_row,
@@ -1021,7 +1293,7 @@ fn resolve_association_endpoint<'a>(
     context: &MappingContext,
     type_ids: &BTreeMap<String, u32>,
     planned_by_key: &BTreeMap<(String, usize, String), &'a PlannedIdentity>,
-    planned_by_join: &BTreeMap<(String, String), &'a PlannedIdentity>,
+    planned_by_join: &BTreeMap<(String, String), Vec<&'a PlannedIdentity>>,
 ) -> Result<Option<&'a PlannedIdentity>, String> {
     let expression = expression.trim();
     if expression == "source.goid" {
@@ -1056,9 +1328,26 @@ fn resolve_association_endpoint<'a>(
     let object_type_id = *type_ids
         .get(&rule.object_type)
         .ok_or_else(|| format!("unknown object type '{}'", rule.object_type))?;
-    let tuple = join_key_tuple_from_rule(rule, source_row, object_type_id)?;
-    let digest = sha256_hex(&tuple);
-    Ok(planned_by_join.get(&(rule_id.to_string(), digest)).copied())
+    let evaluation =
+        join_key_tuple_from_rule_with_context(rule, source_row, object_type_id, Some(context))?;
+    if !evaluation.materializes_identity {
+        return Ok(None);
+    }
+    let digest = sha256_hex(&evaluation.tuple);
+    let Some(matches) = planned_by_join.get(&(rule_id.to_string(), digest.clone())) else {
+        return Ok(None);
+    };
+    let distinct_goids = matches
+        .iter()
+        .map(|identity| identity.goid)
+        .collect::<BTreeSet<_>>();
+    if distinct_goids.len() == 1 {
+        return Ok(matches.first().copied());
+    }
+    Err(format!(
+        "association endpoint identity rule '{rule_id}' join key '{digest}' is ambiguous across {} GOIDs",
+        distinct_goids.len()
+    ))
 }
 
 fn row_rule_materializes_object(row_rule: &MapRowSemanticRule) -> Result<bool, String> {
@@ -2302,6 +2591,7 @@ fn map_passthrough_sections(
                     | SectionKind::MapIdentityRuleCatalog
                     | SectionKind::MapRowSemanticsCatalog
                     | SectionKind::MapProjectionCatalog
+                    | SectionKind::MapResolutionCatalog
             )
             .then(|| {
                 let data = if kind == SectionKind::MapProjectionCatalog {
@@ -2364,12 +2654,16 @@ fn join_key_tuple(
     out
 }
 
-fn join_key_tuple_from_rule(
+pub(crate) fn join_key_tuple_from_rule_with_context(
     rule: &MapIdentityRule,
     row: &SourceRow,
     object_type_id: u32,
-) -> Result<Vec<u8>, String> {
+    context: Option<&MappingContext>,
+) -> Result<JoinKeyEvaluation, String> {
     let mut encoded_values = Vec::<Option<Vec<u8>>>::with_capacity(rule.join_keys.len());
+    let mut resolution_metadata = Vec::new();
+    let mut materializes_identity = true;
+    let mut effective_confidence_class = None::<String>;
     for component in &rule.join_keys {
         let raw_value = row.values.get(&component.source_column);
         if raw_value.is_none() || matches!(raw_value, Some(Value::Null)) {
@@ -2385,11 +2679,35 @@ fn join_key_tuple_from_rule(
             encoded_values.push(None);
             continue;
         }
-        let value = apply_canonicalization(
-            raw_value.unwrap(),
-            &component.canonicalization,
-            &rule.function_ids,
-        )?;
+        let value = if component.resolution.is_some() {
+            let Some(context) = context else {
+                return Err(format!(
+                    "identity rule '{}' uses resolver-backed join key '{}' without resolution context",
+                    rule.rule_id, component.role_id
+                ));
+            };
+            let resolved = resolve_join_key_component(
+                component,
+                raw_value.unwrap(),
+                &rule.object_type,
+                context,
+            )?;
+            materializes_identity &= resolved.materializes_identity;
+            if let Some(class) = &resolved.effective_confidence_class {
+                effective_confidence_class = Some(match effective_confidence_class.take() {
+                    Some(existing) => most_restrictive_confidence(&existing, class).to_string(),
+                    None => class.clone(),
+                });
+            }
+            resolution_metadata.push(resolved.metadata);
+            Value::String(resolved.identity_value)
+        } else {
+            apply_canonicalization(
+                raw_value.unwrap(),
+                &component.canonicalization,
+                &rule.function_ids,
+            )?
+        };
         encoded_values.push(Some(canonical_component_bytes(
             &component.logical_type,
             &value,
@@ -2405,7 +2723,377 @@ fn join_key_tuple_from_rule(
             value: bytes.as_deref(),
         })
         .collect::<Vec<_>>();
-    Ok(join_key_tuple(object_type_id, &rule.rule_id, &components))
+    Ok(JoinKeyEvaluation {
+        tuple: join_key_tuple(object_type_id, &rule.rule_id, &components),
+        materializes_identity,
+        effective_confidence_class,
+        resolution_metadata,
+    })
+}
+
+struct ResolvedJoinKeyComponent {
+    identity_value: String,
+    materializes_identity: bool,
+    effective_confidence_class: Option<String>,
+    metadata: ResolutionMetadata,
+}
+
+fn resolve_join_key_component(
+    component: &MapJoinKeyComponent,
+    raw_value: &Value,
+    object_type: &str,
+    context: &MappingContext,
+) -> Result<ResolvedJoinKeyComponent, String> {
+    let binding = component
+        .resolution
+        .as_ref()
+        .ok_or_else(|| "missing resolution binding".to_string())?;
+    let catalog = context
+        .resolution_catalog
+        .as_ref()
+        .ok_or_else(|| "MAP_RESOLUTION_CATALOG_MISSING: resolver-backed identity rule has no resolution catalog".to_string())?;
+    let resolver = catalog
+        .resolvers
+        .iter()
+        .find(|resolver| resolver.resolver_id == binding.resolver_id)
+        .ok_or_else(|| {
+            format!(
+                "MAP_RESOLUTION_CATALOG_MISSING: identity rule references missing resolver '{}'",
+                binding.resolver_id
+            )
+        })?;
+    if resolver.kind != "alias_catalog" {
+        return Err(format!(
+            "MAP_RESOLVER_UNSUPPORTED: unsupported resolver kind '{}'",
+            resolver.kind
+        ));
+    }
+    if resolver.object_type != object_type {
+        return Err(format!(
+            "MAP_RESOLUTION_CATALOG_MISMATCH: resolver '{}' targets object type '{}' but identity rule targets '{}'",
+            resolver.resolver_id, resolver.object_type, object_type
+        ));
+    }
+    let pipeline = catalog
+        .normalization_pipelines
+        .iter()
+        .find(|pipeline| pipeline.pipeline_id == resolver.normalization_pipeline_id)
+        .ok_or_else(|| {
+            format!(
+                "MAP_PIPELINE_DIGEST_MISMATCH: resolver '{}' references missing pipeline '{}'",
+                resolver.resolver_id, resolver.normalization_pipeline_id
+            )
+        })?;
+    let raw_observed_value = string_arg(raw_value, "resolver alias lookup")?.to_string();
+    let normalized_value = apply_resolution_pipeline(&raw_observed_value, pipeline)?;
+    let alias_catalog = resolver.alias_catalog.as_ref().ok_or_else(|| {
+        format!(
+            "MAP_RESOLVER_UNSUPPORTED: resolver '{}' has no alias catalog",
+            resolver.resolver_id
+        )
+    })?;
+    let mut hits = Vec::<&MapAliasEntry>::new();
+    for entry in &alias_catalog.entries {
+        for alias in &entry.aliases {
+            if apply_resolution_pipeline(alias, pipeline)? == normalized_value {
+                hits.push(entry);
+                break;
+            }
+        }
+    }
+    hits.sort_by_key(|entry| entry.alias_entry_id.clone());
+    hits.dedup_by_key(|entry| entry.alias_entry_id.clone());
+
+    if hits.is_empty() {
+        return resolve_alias_miss(component, resolver, &raw_observed_value, &normalized_value);
+    }
+
+    let canonical_keys = hits
+        .iter()
+        .map(|entry| entry.canonical_key.as_str())
+        .collect::<BTreeSet<_>>();
+    let ambiguous = canonical_keys.len() > 1 || hits.iter().any(|entry| entry.ambiguous);
+    if ambiguous {
+        if resolver.ambiguous_policy == "candidate_only" {
+            return Ok(ResolvedJoinKeyComponent {
+                identity_value: normalized_value.clone(),
+                materializes_identity: false,
+                effective_confidence_class: Some("candidate_only".to_string()),
+                metadata: resolution_metadata_base(
+                    component,
+                    resolver,
+                    &raw_observed_value,
+                    &normalized_value,
+                    Some(normalized_value.clone()),
+                )
+                .with_alias_ambiguous(alias_catalog.alias_catalog_id.clone()),
+            });
+        }
+        let display_value = resolver_error_observed_value(resolver, &normalized_value);
+        return Err(format!(
+            "MAP_ALIAS_AMBIGUOUS: normalized alias '{}' matched multiple canonical keys for resolver '{}'",
+            display_value, resolver.resolver_id
+        ));
+    }
+
+    let entry = hits[0];
+    Ok(ResolvedJoinKeyComponent {
+        identity_value: entry.canonical_key.clone(),
+        materializes_identity: true,
+        effective_confidence_class: Some(resolver.confidence_class.clone()),
+        metadata: resolution_metadata_base(
+            component,
+            resolver,
+            &raw_observed_value,
+            &normalized_value,
+            Some(entry.canonical_key.clone()),
+        )
+        .with_alias_hit(
+            entry.canonical_key.clone(),
+            entry.canonical_label.clone(),
+            alias_catalog.alias_catalog_id.clone(),
+            entry.alias_entry_id.clone(),
+        ),
+    })
+}
+
+fn resolve_alias_miss(
+    component: &MapJoinKeyComponent,
+    resolver: &MapResolver,
+    raw_observed_value: &str,
+    normalized_value: &str,
+) -> Result<ResolvedJoinKeyComponent, String> {
+    match resolver.on_miss.as_str() {
+        "reject" => {
+            let display_value = resolver_error_observed_value(resolver, raw_observed_value);
+            Err(format!(
+                "MAP_ALIAS_MISS: resolver '{}' did not match '{}'",
+                resolver.resolver_id, display_value
+            ))
+        }
+        "candidate_only" => Ok(ResolvedJoinKeyComponent {
+            identity_value: normalized_value.to_string(),
+            materializes_identity: false,
+            effective_confidence_class: Some("candidate_only".to_string()),
+            metadata: resolution_metadata_base(
+                component,
+                resolver,
+                raw_observed_value,
+                normalized_value,
+                Some(normalized_value.to_string()),
+            )
+            .with_alias_miss(),
+        }),
+        "source_scoped" => Ok(ResolvedJoinKeyComponent {
+            identity_value: normalized_value.to_string(),
+            materializes_identity: true,
+            effective_confidence_class: Some("source_scoped".to_string()),
+            metadata: resolution_metadata_base(
+                component,
+                resolver,
+                raw_observed_value,
+                normalized_value,
+                Some(normalized_value.to_string()),
+            )
+            .with_alias_miss(),
+        }),
+        "normalized_value" => {
+            let class = resolver.miss_confidence_class.clone().ok_or_else(|| {
+                format!(
+                    "MAP_RESOLUTION_NOT_REPLAYABLE: resolver '{}' missing miss_confidence_class",
+                    resolver.resolver_id
+                )
+            })?;
+            Ok(ResolvedJoinKeyComponent {
+                identity_value: normalized_value.to_string(),
+                materializes_identity: true,
+                effective_confidence_class: Some(class),
+                metadata: resolution_metadata_base(
+                    component,
+                    resolver,
+                    raw_observed_value,
+                    normalized_value,
+                    Some(normalized_value.to_string()),
+                )
+                .with_alias_miss(),
+            })
+        }
+        other => Err(format!(
+            "MAP_RESOLVER_UNSUPPORTED: unsupported resolver miss policy '{other}'"
+        )),
+    }
+}
+
+fn resolver_error_observed_value(resolver: &MapResolver, observed_value: &str) -> String {
+    if resolver.evidence_policy == "redact_raw" {
+        "<redacted>".to_string()
+    } else {
+        observed_value.to_string()
+    }
+}
+
+fn resolution_metadata_base(
+    component: &MapJoinKeyComponent,
+    resolver: &MapResolver,
+    raw_observed_value: &str,
+    normalized_value: &str,
+    resolved_identity_value: Option<String>,
+) -> ResolutionMetadata {
+    ResolutionMetadata {
+        role_id: component.role_id.clone(),
+        resolution_kind: resolver.kind.clone(),
+        resolver_id: resolver.resolver_id.clone(),
+        resolver_digest: resolver.resolver_digest.clone(),
+        catalog_digest: resolver.catalog_digest.clone(),
+        pipeline_digest: resolver.pipeline_digest.clone(),
+        normalization_pipeline_id: resolver.normalization_pipeline_id.clone(),
+        evidence_policy: resolver.evidence_policy.clone(),
+        redacted_resolution_evidence: resolver.evidence_policy == "redact_raw",
+        raw_observed_value: raw_observed_value.to_string(),
+        normalized_value: normalized_value.to_string(),
+        resolved_identity_value,
+        canonical_key: None,
+        canonical_label: None,
+        alias_catalog_id: None,
+        alias_entry_id: None,
+        alias_hit: false,
+        alias_miss: false,
+        alias_ambiguous: false,
+        miss_policy: Some(resolver.on_miss.clone()),
+    }
+}
+
+impl ResolutionMetadata {
+    fn with_alias_hit(
+        mut self,
+        canonical_key: String,
+        canonical_label: String,
+        alias_catalog_id: String,
+        alias_entry_id: String,
+    ) -> Self {
+        self.canonical_key = Some(canonical_key);
+        self.canonical_label = Some(canonical_label);
+        self.alias_catalog_id = Some(alias_catalog_id);
+        self.alias_entry_id = Some(alias_entry_id);
+        self.alias_hit = true;
+        self.miss_policy = None;
+        self
+    }
+
+    fn with_alias_miss(mut self) -> Self {
+        self.alias_miss = true;
+        self
+    }
+
+    fn with_alias_ambiguous(mut self, alias_catalog_id: String) -> Self {
+        self.alias_catalog_id = Some(alias_catalog_id);
+        self.alias_ambiguous = true;
+        self
+    }
+}
+
+fn apply_resolution_pipeline(
+    raw: &str,
+    pipeline: &MapNormalizationPipeline,
+) -> Result<String, String> {
+    let mut value = raw.to_string();
+    for function in &pipeline.functions {
+        value = match function.function_id.as_str() {
+            "identity" => value,
+            "trim" => value.trim().to_string(),
+            "unicode_nfkc" => {
+                let normalizer = icu_normalizer::ComposingNormalizerBorrowed::new_nfkc();
+                normalizer.normalize(&value).into_owned()
+            }
+            "unicode_casefold" => {
+                let case_mapper = icu_casemap::CaseMapper::new();
+                case_mapper.fold_string(&value).into_owned()
+            }
+            "strip_punctuation" => value
+                .chars()
+                .filter(|ch| !ch.is_ascii_punctuation())
+                .collect::<String>(),
+            "collapse_whitespace" => value.split_whitespace().collect::<Vec<_>>().join(" "),
+            "strip_legal_suffix" => strip_legal_suffix(&value, pipeline, function.table_id.as_deref())?,
+            "sort_tokens" => {
+                let mut tokens = value.split_whitespace().collect::<Vec<_>>();
+                tokens.sort_unstable();
+                tokens.join(" ")
+            }
+            other => {
+                return Err(format!(
+                    "MAP_RESOLVER_UNSUPPORTED: normalization function '{other}' is not implemented by resolver execution"
+                ))
+            }
+        };
+    }
+    Ok(value)
+}
+
+fn strip_legal_suffix(
+    value: &str,
+    pipeline: &MapNormalizationPipeline,
+    table_id: Option<&str>,
+) -> Result<String, String> {
+    let table_id = table_id.ok_or_else(|| {
+        format!(
+            "MAP_RESOLUTION_NOT_REPLAYABLE: strip_legal_suffix in pipeline '{}' has no table_id",
+            pipeline.pipeline_id
+        )
+    })?;
+    let table = pipeline
+        .tables
+        .iter()
+        .find(|table| table.table_id == table_id)
+        .ok_or_else(|| {
+            format!(
+                "MAP_RESOLUTION_NOT_REPLAYABLE: strip_legal_suffix references missing table '{table_id}'"
+            )
+        })?;
+    let mut text = value.trim().to_string();
+    loop {
+        let mut changed = false;
+        for suffix in &table.values {
+            let suffix = suffix.trim();
+            if suffix.is_empty() {
+                continue;
+            }
+            if text == suffix {
+                return Ok(text);
+            }
+            let Some(prefix) = text.strip_suffix(suffix) else {
+                continue;
+            };
+            if prefix.is_empty() || !prefix.chars().next_back().is_some_and(char::is_whitespace) {
+                continue;
+            }
+            text = prefix.trim_end().to_string();
+            changed = true;
+            break;
+        }
+        if !changed {
+            return Ok(text);
+        }
+    }
+}
+
+fn most_restrictive_confidence(left: &str, right: &str) -> String {
+    if identity_confidence_rank(left) >= identity_confidence_rank(right) {
+        left.to_string()
+    } else {
+        right.to_string()
+    }
+}
+
+fn identity_confidence_rank(class: &str) -> u8 {
+    match class {
+        "authoritative" | "reviewed_authoritative" => 0,
+        "strong_deterministic" => 1,
+        "source_scoped" => 2,
+        "weak_deterministic" => 3,
+        "candidate_only" | "candidate" => 4,
+        _ => 5,
+    }
 }
 
 fn apply_canonicalization(
@@ -2696,6 +3384,461 @@ mod tests {
         }
     }
 
+    fn resolution_catalog_section(mapping_id: &str, mapping_version: &str) -> CovemapSection {
+        company_resolution_catalog_section_with_policy(
+            mapping_id,
+            mapping_version,
+            "candidate_only",
+            None,
+            "retain_raw",
+        )
+    }
+
+    fn redacted_resolution_catalog_section(
+        mapping_id: &str,
+        mapping_version: &str,
+    ) -> CovemapSection {
+        company_resolution_catalog_section_with_policy(
+            mapping_id,
+            mapping_version,
+            "candidate_only",
+            None,
+            "redact_raw",
+        )
+    }
+
+    fn company_resolution_catalog_section_with_miss_policy(
+        mapping_id: &str,
+        mapping_version: &str,
+        on_miss: &str,
+        miss_confidence_class: Option<&str>,
+    ) -> CovemapSection {
+        company_resolution_catalog_section_with_policy(
+            mapping_id,
+            mapping_version,
+            on_miss,
+            miss_confidence_class,
+            "retain_raw",
+        )
+    }
+
+    fn normalized_miss_resolution_catalog_section(
+        mapping_id: &str,
+        mapping_version: &str,
+    ) -> CovemapSection {
+        company_resolution_catalog_section_with_miss_policy(
+            mapping_id,
+            mapping_version,
+            "normalized_value",
+            Some("weak_deterministic"),
+        )
+    }
+
+    fn company_resolution_catalog_section_with_policy(
+        mapping_id: &str,
+        mapping_version: &str,
+        on_miss: &str,
+        miss_confidence_class: Option<&str>,
+        evidence_policy: &str,
+    ) -> CovemapSection {
+        let pipeline_digest_input = json!({
+            "pipeline_id": "company_name.v1",
+            "functions": [
+                {"function_id": "unicode_nfkc", "version": "1"},
+                {"function_id": "unicode_casefold", "version": "1"},
+                {"function_id": "trim", "version": "1"},
+                {"function_id": "collapse_whitespace", "version": "1"}
+            ],
+            "tables": []
+        });
+        let pipeline_digest = test_sha256_digest(&test_canonical_json(&pipeline_digest_input));
+        let alias_catalog_digest_input = json!({
+            "alias_catalog_id": "company_aliases",
+            "entries": [{
+                "alias_entry_id": "company:tesco",
+                "canonical_key": "uk-company:tesco",
+                "canonical_label": "Tesco",
+                "aliases": ["Tesco", "Tesco PLC", "tesco supermarket"]
+            }]
+        });
+        let catalog_digest = test_sha256_digest(&test_canonical_json(&alias_catalog_digest_input));
+        let resolver_digest_input = json!({
+            "resolver_id": "uk_company_name_resolver",
+            "kind": "alias_catalog",
+            "object_type": "Company",
+            "authority": "curated",
+            "confidence_class": "authoritative",
+            "normalization_pipeline_id": "company_name.v1",
+            "pipeline_digest": pipeline_digest,
+            "on_hit": "canonical_key",
+            "on_miss": on_miss,
+            "miss_confidence_class": miss_confidence_class,
+            "ambiguous_policy": "reject_auto_merge",
+            "catalog_digest": catalog_digest,
+            "evidence_policy": evidence_policy,
+        });
+        let resolver_digest = test_sha256_digest(&test_canonical_json(&resolver_digest_input));
+        let mut payload = json!({
+            "mapping_id": mapping_id,
+            "mapping_version": mapping_version,
+            "normalization_pipelines": [{
+                "pipeline_id": "company_name.v1",
+                "functions": [
+                    {"function_id": "unicode_nfkc", "version": "1"},
+                    {"function_id": "unicode_casefold", "version": "1"},
+                    {"function_id": "trim", "version": "1"},
+                    {"function_id": "collapse_whitespace", "version": "1"}
+                ],
+                "tables": []
+            }],
+            "resolvers": [{
+                "resolver_id": "uk_company_name_resolver",
+                "kind": "alias_catalog",
+                "object_type": "Company",
+                "authority": "curated",
+                "confidence_class": "authoritative",
+                "normalization_pipeline_id": "company_name.v1",
+                "on_hit": "canonical_key",
+                "on_miss": on_miss,
+                "miss_confidence_class": miss_confidence_class,
+                "ambiguous_policy": "reject_auto_merge",
+                "catalog_digest": catalog_digest,
+                "pipeline_digest": pipeline_digest,
+                "resolver_digest": resolver_digest,
+                "evidence_policy": evidence_policy,
+                "alias_catalog": {
+                    "alias_catalog_id": "company_aliases",
+                    "entries": [{
+                        "alias_entry_id": "company:tesco",
+                        "canonical_key": "uk-company:tesco",
+                        "canonical_label": "Tesco",
+                        "aliases": ["tesco supermarket", "Tesco PLC", "Tesco"]
+                    }]
+                }
+            }],
+            "match_rules": [],
+            "reviewed_decisions": []
+        });
+        if miss_confidence_class.is_none() {
+            payload["resolvers"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("miss_confidence_class");
+        }
+        test_section(SectionKind::MapResolutionCatalog, payload)
+    }
+
+    fn team_resolution_catalog_section(mapping_id: &str, mapping_version: &str) -> CovemapSection {
+        let pipeline_digest_input = json!({
+            "pipeline_id": "team_name.v1",
+            "functions": [
+                {"function_id": "unicode_nfkc", "version": "1"},
+                {"function_id": "unicode_casefold", "version": "1"},
+                {"function_id": "trim", "version": "1"},
+                {"function_id": "collapse_whitespace", "version": "1"}
+            ],
+            "tables": []
+        });
+        let pipeline_digest = test_sha256_digest(&test_canonical_json(&pipeline_digest_input));
+        let alias_catalog_digest_input = json!({
+            "alias_catalog_id": "team_aliases",
+            "entries": [{
+                "alias_entry_id": "team:alpha",
+                "canonical_key": "team:alpha",
+                "canonical_label": "Alpha Team",
+                "aliases": ["Alpha Team Ltd", "Team Alpha", "alpha team"]
+            }]
+        });
+        let catalog_digest = test_sha256_digest(&test_canonical_json(&alias_catalog_digest_input));
+        let resolver_digest_input = json!({
+            "resolver_id": "team_name_resolver",
+            "kind": "alias_catalog",
+            "object_type": "Team",
+            "authority": "curated",
+            "confidence_class": "authoritative",
+            "normalization_pipeline_id": "team_name.v1",
+            "pipeline_digest": pipeline_digest,
+            "on_hit": "canonical_key",
+            "on_miss": "reject",
+            "miss_confidence_class": null,
+            "ambiguous_policy": "reject_auto_merge",
+            "catalog_digest": catalog_digest,
+            "evidence_policy": "retain_raw",
+        });
+        let resolver_digest = test_sha256_digest(&test_canonical_json(&resolver_digest_input));
+        test_section(
+            SectionKind::MapResolutionCatalog,
+            json!({
+                "mapping_id": mapping_id,
+                "mapping_version": mapping_version,
+                "normalization_pipelines": [{
+                    "pipeline_id": "team_name.v1",
+                    "functions": [
+                        {"function_id": "unicode_nfkc", "version": "1"},
+                        {"function_id": "unicode_casefold", "version": "1"},
+                        {"function_id": "trim", "version": "1"},
+                        {"function_id": "collapse_whitespace", "version": "1"}
+                    ],
+                    "tables": []
+                }],
+                "resolvers": [{
+                    "resolver_id": "team_name_resolver",
+                    "kind": "alias_catalog",
+                    "object_type": "Team",
+                    "authority": "curated",
+                    "confidence_class": "authoritative",
+                    "normalization_pipeline_id": "team_name.v1",
+                    "on_hit": "canonical_key",
+                    "on_miss": "reject",
+                    "ambiguous_policy": "reject_auto_merge",
+                    "catalog_digest": catalog_digest,
+                    "pipeline_digest": pipeline_digest,
+                    "resolver_digest": resolver_digest,
+                    "alias_catalog": {
+                        "alias_catalog_id": "team_aliases",
+                        "entries": [{
+                            "alias_entry_id": "team:alpha",
+                            "canonical_key": "team:alpha",
+                            "canonical_label": "Alpha Team",
+                            "aliases": ["Team Alpha", "Alpha Team Ltd", "alpha team"]
+                        }]
+                    }
+                }],
+                "match_rules": [],
+                "reviewed_decisions": []
+            }),
+        )
+    }
+
+    fn ambiguous_company_resolution_catalog_section(
+        mapping_id: &str,
+        mapping_version: &str,
+        ambiguous_policy: &str,
+    ) -> CovemapSection {
+        ambiguous_company_resolution_catalog_section_with_policy(
+            mapping_id,
+            mapping_version,
+            ambiguous_policy,
+            "retain_raw",
+        )
+    }
+
+    fn ambiguous_company_resolution_catalog_section_with_policy(
+        mapping_id: &str,
+        mapping_version: &str,
+        ambiguous_policy: &str,
+        evidence_policy: &str,
+    ) -> CovemapSection {
+        let pipeline_digest_input = json!({
+            "pipeline_id": "company_name.v1",
+            "functions": [
+                {"function_id": "unicode_nfkc", "version": "1"},
+                {"function_id": "unicode_casefold", "version": "1"},
+                {"function_id": "trim", "version": "1"},
+                {"function_id": "collapse_whitespace", "version": "1"}
+            ],
+            "tables": []
+        });
+        let pipeline_digest = test_sha256_digest(&test_canonical_json(&pipeline_digest_input));
+        let alias_catalog_digest_input = json!({
+            "alias_catalog_id": "company_aliases",
+            "entries": [{
+                "alias_entry_id": "company:tesco",
+                "canonical_key": "uk-company:tesco",
+                "canonical_label": "Tesco",
+                "aliases": ["Tesco", "Tesco PLC", "tesco supermarket"],
+                "ambiguous": true
+            }]
+        });
+        let catalog_digest = test_sha256_digest(&test_canonical_json(&alias_catalog_digest_input));
+        let resolver_digest_input = json!({
+            "resolver_id": "uk_company_name_resolver",
+            "kind": "alias_catalog",
+            "object_type": "Company",
+            "authority": "curated",
+            "confidence_class": "authoritative",
+            "normalization_pipeline_id": "company_name.v1",
+            "pipeline_digest": pipeline_digest,
+            "on_hit": "canonical_key",
+            "on_miss": "candidate_only",
+            "miss_confidence_class": null,
+            "ambiguous_policy": ambiguous_policy,
+            "catalog_digest": catalog_digest,
+            "evidence_policy": evidence_policy,
+        });
+        let resolver_digest = test_sha256_digest(&test_canonical_json(&resolver_digest_input));
+        test_section(
+            SectionKind::MapResolutionCatalog,
+            json!({
+                "mapping_id": mapping_id,
+                "mapping_version": mapping_version,
+                "normalization_pipelines": [{
+                    "pipeline_id": "company_name.v1",
+                    "functions": [
+                        {"function_id": "unicode_nfkc", "version": "1"},
+                        {"function_id": "unicode_casefold", "version": "1"},
+                        {"function_id": "trim", "version": "1"},
+                        {"function_id": "collapse_whitespace", "version": "1"}
+                    ],
+                    "tables": []
+                }],
+                "resolvers": [{
+                    "resolver_id": "uk_company_name_resolver",
+                    "kind": "alias_catalog",
+                    "object_type": "Company",
+                    "authority": "curated",
+                    "confidence_class": "authoritative",
+                    "normalization_pipeline_id": "company_name.v1",
+                    "on_hit": "canonical_key",
+                    "on_miss": "candidate_only",
+                    "ambiguous_policy": ambiguous_policy,
+                    "catalog_digest": catalog_digest,
+                    "pipeline_digest": pipeline_digest,
+                    "resolver_digest": resolver_digest,
+                    "evidence_policy": evidence_policy,
+                    "alias_catalog": {
+                        "alias_catalog_id": "company_aliases",
+                        "entries": [{
+                            "alias_entry_id": "company:tesco",
+                            "canonical_key": "uk-company:tesco",
+                            "canonical_label": "Tesco",
+                            "aliases": ["tesco supermarket", "Tesco PLC", "Tesco"],
+                            "ambiguous": true
+                        }]
+                    }
+                }],
+                "match_rules": [],
+                "reviewed_decisions": []
+            }),
+        )
+    }
+
+    fn company_resolution_map() -> CovemapFile {
+        test_covemap(vec![
+            test_section(
+                SectionKind::MapSourceCatalog,
+                json!({
+                    "mapping_id": "company-map",
+                    "mapping_version": "test/v1",
+                    "sources": [{
+                        "source_id": "suppliers",
+                        "row_identity_rules": ["company_by_resolved_name"]
+                    }]
+                }),
+            ),
+            test_section(
+                SectionKind::MapFunctionRegistry,
+                json!({
+                    "mapping_id": "company-map",
+                    "mapping_version": "test/v1",
+                    "functions": [
+                        {"function_id": "identity", "version": "1", "deterministic": true, "dependency": "pure"},
+                        {"function_id": "unicode_nfkc", "version": "1", "deterministic": true, "dependency": "pure"},
+                        {"function_id": "unicode_casefold", "version": "1", "deterministic": true, "dependency": "pure"},
+                        {"function_id": "trim", "version": "1", "deterministic": true, "dependency": "pure"},
+                        {"function_id": "collapse_whitespace", "version": "1", "deterministic": true, "dependency": "pure"}
+                    ]
+                }),
+            ),
+            test_section(
+                SectionKind::MapIdentityRuleCatalog,
+                json!({
+                    "mapping_id": "company-map",
+                    "mapping_version": "test/v1",
+                    "identity_rules": [{
+                        "rule_id": "company_by_resolved_name",
+                        "object_type": "Company",
+                        "semantic_role": "subject",
+                        "confidence_class": "authoritative",
+                        "auto_merge": true,
+                        "candidate_only": false,
+                        "property_conflicts_declared": true,
+                        "function_ids": ["identity"],
+                        "join_keys": [{
+                            "role_id": "company",
+                            "source_column": "company_name",
+                            "logical_type": "utf8",
+                            "canonicalization": "identity",
+                            "null_policy": "reject",
+                            "ordering": "declared",
+                            "resolution": {
+                                "resolver_id": "uk_company_name_resolver"
+                            }
+                        }]
+                    }],
+                    "do_not_merge": []
+                }),
+            ),
+            test_section(
+                SectionKind::MapRowSemanticsCatalog,
+                json!({
+                    "mapping_id": "company-map",
+                    "mapping_version": "test/v1",
+                    "rules": [{
+                        "rule_id": "supplier_company",
+                        "source_id": "suppliers",
+                        "identity_rule_id": "company_by_resolved_name",
+                        "row_semantics_kind": "Object",
+                        "assertion_kinds": ["object", "evidence"],
+                        "function_ids": ["identity"],
+                        "output_assertion_ids": [],
+                        "association_endpoints": []
+                    }]
+                }),
+            ),
+            resolution_catalog_section("company-map", "test/v1"),
+        ])
+    }
+
+    fn test_sha256_digest(bytes: &[u8]) -> String {
+        format!("sha256:{}", sha256_hex(bytes))
+    }
+
+    fn test_canonical_json(value: &Value) -> Vec<u8> {
+        let mut out = Vec::new();
+        write_test_canonical_json(value, &mut out);
+        out
+    }
+
+    fn write_test_canonical_json(value: &Value, out: &mut Vec<u8>) {
+        match value {
+            Value::Null => out.extend_from_slice(b"null"),
+            Value::Bool(true) => out.extend_from_slice(b"true"),
+            Value::Bool(false) => out.extend_from_slice(b"false"),
+            Value::Number(number) => out.extend_from_slice(number.to_string().as_bytes()),
+            Value::String(value) => {
+                out.extend_from_slice(serde_json::to_string(value).unwrap().as_bytes());
+            }
+            Value::Array(values) => {
+                out.push(b'[');
+                for (index, value) in values.iter().enumerate() {
+                    if index > 0 {
+                        out.push(b',');
+                    }
+                    write_test_canonical_json(value, out);
+                }
+                out.push(b']');
+            }
+            Value::Object(object) => {
+                out.push(b'{');
+                let mut keys = object
+                    .keys()
+                    .filter(|key| key.as_str() != "non_semantic_metadata")
+                    .collect::<Vec<_>>();
+                keys.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+                for (index, key) in keys.iter().enumerate() {
+                    if index > 0 {
+                        out.push(b',');
+                    }
+                    out.extend_from_slice(serde_json::to_string(key).unwrap().as_bytes());
+                    out.push(b':');
+                    write_test_canonical_json(object.get(*key).unwrap(), out);
+                }
+                out.push(b'}');
+            }
+        }
+    }
+
     fn people_batch() -> RecordBatch {
         RecordBatch::try_from_iter(vec![
             (
@@ -2821,6 +3964,211 @@ mod tests {
                             "rule_id": "support_person",
                             "source_id": "support",
                             "identity_rule_id": "person_by_id",
+                            "row_semantics_kind": "Object",
+                            "assertion_kinds": ["object", "evidence"],
+                            "function_ids": ["identity"],
+                            "output_assertion_ids": [],
+                            "association_endpoints": []
+                        }
+                    ]
+                }),
+            ),
+        ])
+    }
+
+    fn reviewed_decisions_section(
+        mapping_id: &str,
+        mapping_version: &str,
+        decisions: Vec<Value>,
+    ) -> CovemapSection {
+        test_section(
+            SectionKind::MapResolutionCatalog,
+            json!({
+                "mapping_id": mapping_id,
+                "mapping_version": mapping_version,
+                "normalization_pipelines": [],
+                "resolvers": [],
+                "match_rules": [],
+                "reviewed_decisions": decisions
+            }),
+        )
+    }
+
+    fn add_reviewed_decisions(file: &mut CovemapFile, decisions: Vec<Value>) {
+        file.sections.push(reviewed_decisions_section(
+            "people-map",
+            "test/v1",
+            decisions,
+        ));
+    }
+
+    fn set_person_reviewed_equivalence(file: &mut CovemapFile, allowed: bool) {
+        mutate_section_payload(file, 2, |payload| {
+            payload["identity_rules"][0]["allow_reviewed_equivalence"] = json!(allowed);
+        });
+    }
+
+    fn identity_alias_ref(object_type: &str, identity_alias: &str) -> Value {
+        json!({
+            "kind": "identity_alias",
+            "object_type": object_type,
+            "identity_alias": identity_alias
+        })
+    }
+
+    fn reviewed_same_object_decision(left: Value, right: Value, anchor: Option<Value>) -> Value {
+        let mut decision = json!({
+            "decision_id": "review:same-object",
+            "decision": "same_object",
+            "confidence_class": "reviewed_authoritative",
+            "reviewed_by": "mapping-author",
+            "reviewed_at": "2026-06-25T00:00:00Z",
+            "left": left,
+            "right": right
+        });
+        if let Some(anchor) = anchor {
+            decision["canonical_anchor"] = anchor;
+        }
+        decision
+    }
+
+    fn reviewed_do_not_merge_decision(left: Value, right: Value) -> Value {
+        json!({
+            "decision_id": "review:do-not-merge",
+            "decision": "do_not_merge",
+            "confidence_class": "reviewed_authoritative",
+            "reviewed_by": "mapping-author",
+            "reviewed_at": "2026-06-25T00:00:00Z",
+            "left": left,
+            "right": right
+        })
+    }
+
+    fn reviewed_rows(ids: &[(&str, &str)]) -> Vec<SourceRow> {
+        ids.iter()
+            .map(|(source_id, id)| SourceRow {
+                source_id: (*source_id).into(),
+                row_index: 0,
+                values: BTreeMap::from([("id".into(), json!(*id))]),
+            })
+            .collect()
+    }
+
+    fn three_source_identity_map() -> CovemapFile {
+        let mut file = two_source_identity_map(Vec::new());
+        mutate_section_payload(&mut file, 0, |payload| {
+            payload["sources"].as_array_mut().unwrap().push(json!({
+                "source_id": "ops",
+                "row_identity_rules": ["person_by_id"]
+            }));
+        });
+        mutate_section_payload(&mut file, 3, |payload| {
+            payload["rules"].as_array_mut().unwrap().push(json!({
+                "rule_id": "ops_person",
+                "source_id": "ops",
+                "identity_rule_id": "person_by_id",
+                "row_semantics_kind": "Object",
+                "assertion_kinds": ["object", "evidence"],
+                "function_ids": ["identity"],
+                "output_assertion_ids": [],
+                "association_endpoints": []
+            }));
+        });
+        file
+    }
+
+    fn cross_rule_reviewed_identity_map() -> CovemapFile {
+        test_covemap(vec![
+            test_section(
+                SectionKind::MapSourceCatalog,
+                json!({
+                    "mapping_id": "people-map",
+                    "mapping_version": "test/v1",
+                    "sources": [{
+                        "source_id": "people",
+                        "row_identity_rules": ["person_by_id", "person_by_email"]
+                    }]
+                }),
+            ),
+            test_section(
+                SectionKind::MapFunctionRegistry,
+                json!({
+                    "mapping_id": "people-map",
+                    "mapping_version": "test/v1",
+                    "functions": [{
+                        "function_id": "identity",
+                        "version": "1",
+                        "deterministic": true,
+                        "dependency": "pure"
+                    }]
+                }),
+            ),
+            test_section(
+                SectionKind::MapIdentityRuleCatalog,
+                json!({
+                    "mapping_id": "people-map",
+                    "mapping_version": "test/v1",
+                    "identity_rules": [
+                        {
+                            "rule_id": "person_by_id",
+                            "object_type": "Person",
+                            "semantic_role": "subject",
+                            "confidence_class": "authoritative",
+                            "candidate_only": false,
+                            "property_conflicts_declared": true,
+                            "allow_reviewed_equivalence": true,
+                            "function_ids": ["identity"],
+                            "join_keys": [{
+                                "role_id": "person_id",
+                                "source_column": "id",
+                                "logical_type": "utf8",
+                                "canonicalization": "identity",
+                                "null_policy": "reject",
+                                "ordering": "declared"
+                            }]
+                        },
+                        {
+                            "rule_id": "person_by_email",
+                            "object_type": "Person",
+                            "semantic_role": "subject",
+                            "confidence_class": "authoritative",
+                            "candidate_only": false,
+                            "property_conflicts_declared": true,
+                            "allow_reviewed_equivalence": true,
+                            "function_ids": ["identity"],
+                            "join_keys": [{
+                                "role_id": "email",
+                                "source_column": "email",
+                                "logical_type": "utf8",
+                                "canonicalization": "identity",
+                                "null_policy": "reject",
+                                "ordering": "declared"
+                            }]
+                        }
+                    ],
+                    "do_not_merge": []
+                }),
+            ),
+            test_section(
+                SectionKind::MapRowSemanticsCatalog,
+                json!({
+                    "mapping_id": "people-map",
+                    "mapping_version": "test/v1",
+                    "rules": [
+                        {
+                            "rule_id": "person_id_row",
+                            "source_id": "people",
+                            "identity_rule_id": "person_by_id",
+                            "row_semantics_kind": "Object",
+                            "assertion_kinds": ["object", "evidence"],
+                            "function_ids": ["identity"],
+                            "output_assertion_ids": [],
+                            "association_endpoints": []
+                        },
+                        {
+                            "rule_id": "person_email_row",
+                            "source_id": "people",
+                            "identity_rule_id": "person_by_email",
                             "row_semantics_kind": "Object",
                             "assertion_kinds": ["object", "evidence"],
                             "function_ids": ["identity"],
@@ -3357,6 +4705,269 @@ mod tests {
         ])
     }
 
+    fn alias_backed_association_map() -> CovemapFile {
+        test_covemap(vec![
+            test_section(
+                SectionKind::MapSourceCatalog,
+                json!({
+                    "mapping_id": "people-map",
+                    "mapping_version": "test/v1",
+                    "sources": [
+                        {
+                            "source_id": "memberships",
+                            "row_identity_rules": ["person_by_id"]
+                        },
+                        {
+                            "source_id": "teams",
+                            "row_identity_rules": ["team_by_name"]
+                        }
+                    ]
+                }),
+            ),
+            test_section(
+                SectionKind::MapFunctionRegistry,
+                json!({
+                    "mapping_id": "people-map",
+                    "mapping_version": "test/v1",
+                    "functions": [
+                        {"function_id": "identity", "version": "1", "deterministic": true, "dependency": "pure"},
+                        {"function_id": "unicode_nfkc", "version": "1", "deterministic": true, "dependency": "pure"},
+                        {"function_id": "unicode_casefold", "version": "1", "deterministic": true, "dependency": "pure"},
+                        {"function_id": "trim", "version": "1", "deterministic": true, "dependency": "pure"},
+                        {"function_id": "collapse_whitespace", "version": "1", "deterministic": true, "dependency": "pure"}
+                    ]
+                }),
+            ),
+            test_section(
+                SectionKind::MapIdentityRuleCatalog,
+                json!({
+                    "mapping_id": "people-map",
+                    "mapping_version": "test/v1",
+                    "identity_rules": [
+                        {
+                            "rule_id": "person_by_id",
+                            "object_type": "Person",
+                            "semantic_role": "subject",
+                            "confidence_class": "authoritative",
+                            "candidate_only": false,
+                            "property_conflicts_declared": true,
+                            "function_ids": ["identity"],
+                            "join_keys": [{
+                                "role_id": "person_id",
+                                "source_column": "person_id",
+                                "logical_type": "utf8",
+                                "canonicalization": "identity",
+                                "null_policy": "reject",
+                                "ordering": "declared"
+                            }]
+                        },
+                        {
+                            "rule_id": "team_by_name",
+                            "object_type": "Team",
+                            "semantic_role": "organization",
+                            "confidence_class": "authoritative",
+                            "candidate_only": false,
+                            "property_conflicts_declared": true,
+                            "function_ids": ["identity"],
+                            "join_keys": [{
+                                "role_id": "team",
+                                "source_column": "team_name",
+                                "logical_type": "utf8",
+                                "canonicalization": "identity",
+                                "null_policy": "reject",
+                                "ordering": "declared",
+                                "resolution": {
+                                    "resolver_id": "team_name_resolver"
+                                }
+                            }]
+                        }
+                    ],
+                    "do_not_merge": []
+                }),
+            ),
+            test_section(
+                SectionKind::MapRowSemanticsCatalog,
+                json!({
+                    "mapping_id": "people-map",
+                    "mapping_version": "test/v1",
+                    "rules": [
+                        {
+                            "rule_id": "membership_row",
+                            "source_id": "memberships",
+                            "identity_rule_id": "person_by_id",
+                            "row_semantics_kind": "Object",
+                            "assertion_kinds": ["object", "association", "evidence"],
+                            "function_ids": ["identity"],
+                            "output_assertion_ids": [],
+                            "association_endpoints": [],
+                            "association_bindings": [{
+                                "assertion_id": "member_of_assertion",
+                                "association_type": "member_of",
+                                "source_identity_rule_id": "person_by_id",
+                                "source_endpoint_expression": "source.goid",
+                                "target_identity_rule_id": "team_by_name",
+                                "target_endpoint_expression": "identity(team_by_name)",
+                                "source_role": "member",
+                                "target_role": "team",
+                                "valid_from_expression": "source.valid_from",
+                                "valid_to_expression": "source.valid_to",
+                                "cardinality_policy": "many_to_one",
+                                "missing_policy": "reject"
+                            }]
+                        },
+                        {
+                            "rule_id": "team_row",
+                            "source_id": "teams",
+                            "identity_rule_id": "team_by_name",
+                            "row_semantics_kind": "Object",
+                            "assertion_kinds": ["object", "evidence"],
+                            "function_ids": ["identity"],
+                            "output_assertion_ids": [],
+                            "association_endpoints": []
+                        }
+                    ]
+                }),
+            ),
+            team_resolution_catalog_section("people-map", "test/v1"),
+        ])
+    }
+
+    fn source_scoped_ambiguous_association_map() -> CovemapFile {
+        test_covemap(vec![
+            test_section(
+                SectionKind::MapSourceCatalog,
+                json!({
+                    "mapping_id": "people-map",
+                    "mapping_version": "test/v1",
+                    "sources": [
+                        {
+                            "source_id": "memberships",
+                            "row_identity_rules": ["person_by_id"]
+                        },
+                        {
+                            "source_id": "teams_a",
+                            "row_identity_rules": ["team_by_id"]
+                        },
+                        {
+                            "source_id": "teams_b",
+                            "row_identity_rules": ["team_by_id"]
+                        }
+                    ]
+                }),
+            ),
+            test_section(
+                SectionKind::MapFunctionRegistry,
+                json!({
+                    "mapping_id": "people-map",
+                    "mapping_version": "test/v1",
+                    "functions": [{
+                        "function_id": "identity",
+                        "version": "1",
+                        "deterministic": true,
+                        "dependency": "pure"
+                    }]
+                }),
+            ),
+            test_section(
+                SectionKind::MapIdentityRuleCatalog,
+                json!({
+                    "mapping_id": "people-map",
+                    "mapping_version": "test/v1",
+                    "identity_rules": [
+                        {
+                            "rule_id": "person_by_id",
+                            "object_type": "Person",
+                            "semantic_role": "subject",
+                            "confidence_class": "authoritative",
+                            "candidate_only": false,
+                            "property_conflicts_declared": true,
+                            "function_ids": ["identity"],
+                            "join_keys": [{
+                                "role_id": "person_id",
+                                "source_column": "person_id",
+                                "logical_type": "utf8",
+                                "canonicalization": "identity",
+                                "null_policy": "reject",
+                                "ordering": "declared"
+                            }]
+                        },
+                        {
+                            "rule_id": "team_by_id",
+                            "object_type": "Team",
+                            "semantic_role": "organization",
+                            "confidence_class": "source_scoped",
+                            "candidate_only": false,
+                            "property_conflicts_declared": true,
+                            "function_ids": ["identity"],
+                            "join_keys": [{
+                                "role_id": "team_id",
+                                "source_column": "team_id",
+                                "logical_type": "utf8",
+                                "canonicalization": "identity",
+                                "null_policy": "reject",
+                                "ordering": "declared"
+                            }]
+                        }
+                    ],
+                    "do_not_merge": []
+                }),
+            ),
+            test_section(
+                SectionKind::MapRowSemanticsCatalog,
+                json!({
+                    "mapping_id": "people-map",
+                    "mapping_version": "test/v1",
+                    "rules": [
+                        {
+                            "rule_id": "membership_row",
+                            "source_id": "memberships",
+                            "identity_rule_id": "person_by_id",
+                            "row_semantics_kind": "Object",
+                            "assertion_kinds": ["object", "association", "evidence"],
+                            "function_ids": ["identity"],
+                            "output_assertion_ids": [],
+                            "association_endpoints": [],
+                            "association_bindings": [{
+                                "assertion_id": "member_of_assertion",
+                                "association_type": "member_of",
+                                "source_identity_rule_id": "person_by_id",
+                                "source_endpoint_expression": "source.goid",
+                                "target_identity_rule_id": "team_by_id",
+                                "target_endpoint_expression": "identity(team_by_id)",
+                                "source_role": "member",
+                                "target_role": "team",
+                                "valid_from_expression": "source.valid_from",
+                                "valid_to_expression": "source.valid_to",
+                                "cardinality_policy": "many_to_one",
+                                "missing_policy": "reject"
+                            }]
+                        },
+                        {
+                            "rule_id": "team_a_row",
+                            "source_id": "teams_a",
+                            "identity_rule_id": "team_by_id",
+                            "row_semantics_kind": "Object",
+                            "assertion_kinds": ["object", "evidence"],
+                            "function_ids": ["identity"],
+                            "output_assertion_ids": [],
+                            "association_endpoints": []
+                        },
+                        {
+                            "rule_id": "team_b_row",
+                            "source_id": "teams_b",
+                            "identity_rule_id": "team_by_id",
+                            "row_semantics_kind": "Object",
+                            "assertion_kinds": ["object", "evidence"],
+                            "function_ids": ["identity"],
+                            "output_assertion_ids": [],
+                            "association_endpoints": []
+                        }
+                    ]
+                }),
+            ),
+        ])
+    }
+
     fn governance_map(policy: &str) -> CovemapFile {
         let mut file = two_source_identity_map(Vec::new());
         file.sections[0] = test_section(
@@ -3553,6 +5164,107 @@ mod tests {
                 output: PathBuf::from("dataset.covm"),
                 force: true,
                 json: true,
+            }
+        );
+        assert_eq!(
+            parse_args([
+                "candidates".to_string(),
+                "--out".to_string(),
+                "candidates.json".to_string(),
+                "mapping.covemap".to_string(),
+                "suppliers.csv".to_string(),
+            ])
+            .unwrap()
+            .unwrap(),
+            Command::Candidates {
+                map: PathBuf::from("mapping.covemap"),
+                sources: vec![PathBuf::from("suppliers.csv")],
+                output: Some(PathBuf::from("candidates.json")),
+            }
+        );
+        assert_eq!(
+            parse_args([
+                "review".to_string(),
+                "--out".to_string(),
+                "reviewed.json".to_string(),
+                "candidates.json".to_string(),
+            ])
+            .unwrap()
+            .unwrap(),
+            Command::Review {
+                candidates: PathBuf::from("candidates.json"),
+                output: Some(PathBuf::from("reviewed.json")),
+            }
+        );
+        assert_eq!(
+            parse_args([
+                "review".to_string(),
+                "import".to_string(),
+                "mapping.covemap".to_string(),
+                "reviewed.json".to_string(),
+                "--out".to_string(),
+                "mapping-reviewed.covemap".to_string(),
+                "--replace".to_string(),
+            ])
+            .unwrap()
+            .unwrap(),
+            Command::ReviewImport {
+                map: PathBuf::from("mapping.covemap"),
+                review: PathBuf::from("reviewed.json"),
+                output: PathBuf::from("mapping-reviewed.covemap"),
+                replace: true,
+            }
+        );
+        assert_eq!(
+            parse_args([
+                "review".to_string(),
+                "export".to_string(),
+                "mapping-reviewed.covemap".to_string(),
+                "--out".to_string(),
+                "reviewed-export.json".to_string(),
+            ])
+            .unwrap()
+            .unwrap(),
+            Command::ReviewExport {
+                map: PathBuf::from("mapping-reviewed.covemap"),
+                output: Some(PathBuf::from("reviewed-export.json")),
+            }
+        );
+        assert_eq!(
+            parse_args([
+                "aliases".to_string(),
+                "import".to_string(),
+                "mapping.covemap".to_string(),
+                "aliases.csv".to_string(),
+                "--catalog-id".to_string(),
+                "company_aliases".to_string(),
+                "--resolver-id".to_string(),
+                "uk_company_name_resolver".to_string(),
+                "--out".to_string(),
+                "mapping-with-aliases.covemap".to_string(),
+            ])
+            .unwrap()
+            .unwrap(),
+            Command::AliasesImport {
+                map: PathBuf::from("mapping.covemap"),
+                aliases: PathBuf::from("aliases.csv"),
+                catalog_id: "company_aliases".into(),
+                resolver_id: "uk_company_name_resolver".into(),
+                output: PathBuf::from("mapping-with-aliases.covemap"),
+            }
+        );
+        assert_eq!(
+            parse_args([
+                "replay".to_string(),
+                "verify".to_string(),
+                "mapping.covemap".to_string(),
+                "conversion-report.json".to_string(),
+            ])
+            .unwrap()
+            .unwrap(),
+            Command::ReplayVerify {
+                map: PathBuf::from("mapping.covemap"),
+                report: PathBuf::from("conversion-report.json"),
             }
         );
     }
@@ -3787,6 +5499,724 @@ mod tests {
     }
 
     #[test]
+    fn alias_catalog_resolver_merges_alias_hits_and_emits_evidence() {
+        let file = company_resolution_map();
+        file.validate_map_sections().unwrap();
+        let rows = ["Tesco", "Tesco PLC", "tesco supermarket"]
+            .into_iter()
+            .enumerate()
+            .map(|(row_index, company_name)| SourceRow {
+                source_id: "suppliers".into(),
+                row_index,
+                values: BTreeMap::from([("company_name".into(), json!(company_name))]),
+            })
+            .collect::<Vec<_>>();
+
+        let planned = plan_identities(&file, &rows).unwrap();
+        assert_eq!(planned.candidates.len(), 0);
+        let goids = planned
+            .canonical
+            .iter()
+            .map(|identity| identity.goid)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(goids.len(), 1);
+        assert!(planned.canonical.iter().all(|identity| {
+            identity.resolution_metadata[0].canonical_key.as_deref() == Some("uk-company:tesco")
+                && identity.resolution_metadata[0].alias_hit
+        }));
+
+        let materialized = materialize_with_source_states(&file, &rows, &[]).unwrap();
+        assert_eq!(materialized.rows.len(), 3);
+        assert_eq!(
+            materialized.conversion_report["candidate_match_count"],
+            json!(0)
+        );
+        assert_eq!(
+            materialized.conversion_report["resolver_hit_count"],
+            json!(3)
+        );
+        assert_eq!(
+            materialized.conversion_report["resolver_miss_count"],
+            json!(0)
+        );
+        let impact = materialized.conversion_report["resolver_goid_impact"]
+            .as_array()
+            .unwrap();
+        assert_eq!(impact.len(), 1);
+        assert_eq!(
+            impact[0]["normalization_pipeline_id"],
+            json!("company_name.v1")
+        );
+        assert_eq!(impact[0]["affected_goid_count"], json!(1));
+        assert_eq!(impact[0]["affected_goids"].as_array().unwrap().len(), 1);
+        assert!(materialized.evidence_entries.iter().all(|entry| {
+            entry["resolver_id"] == json!("uk_company_name_resolver")
+                && entry["canonical_key"] == json!("uk-company:tesco")
+                && entry["canonical_label"] == json!("Tesco")
+                && entry["alias_hit"] == json!(true)
+        }));
+    }
+
+    #[test]
+    fn resolver_backed_identity_rule_rejects_object_type_mismatch_at_runtime() {
+        let mut file = company_resolution_map();
+        mutate_section_payload(&mut file, 2, |payload| {
+            payload["identity_rules"][0]["object_type"] = json!("Person");
+        });
+        let rows = vec![SourceRow {
+            source_id: "suppliers".into(),
+            row_index: 0,
+            values: BTreeMap::from([("company_name".into(), json!("Tesco PLC"))]),
+        }];
+
+        let err = plan_identities(&file, &rows).unwrap_err();
+        assert!(err.contains("resolver 'uk_company_name_resolver' targets object type 'Company'"));
+    }
+
+    #[test]
+    fn replay_verify_accepts_current_report_and_rejects_stale_resolver() {
+        let file = company_resolution_map();
+        let rows = ["Tesco", "Tesco PLC"]
+            .into_iter()
+            .enumerate()
+            .map(|(row_index, company_name)| SourceRow {
+                source_id: "suppliers".into(),
+                row_index,
+                values: BTreeMap::from([("company_name".into(), json!(company_name))]),
+            })
+            .collect::<Vec<_>>();
+        let materialized = materialize_with_source_states(&file, &rows, &[]).unwrap();
+
+        let report = verify_replay_report(&file, &materialized.conversion_report).unwrap();
+        assert_eq!(report["ok"], json!(true));
+        assert_eq!(report["resolver_catalog_digest_count"], json!(1));
+
+        let mut stale = materialized.conversion_report.clone();
+        stale["resolver_catalog_digests"][0]["resolver_digest"] =
+            json!("sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        let err = verify_replay_report(&file, &stale).unwrap_err();
+        assert!(err.contains("MAP_REPLAY_STALE_RESOLVER"));
+    }
+
+    #[test]
+    fn replay_verify_rejects_stale_source_binding() {
+        let state = ObservedSourceState {
+            source_id: "crm".into(),
+            source_kind: "csv".into(),
+            schema_fingerprint: "cove-map-schema-v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            snapshot_digest: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+        };
+        let mut file = two_source_identity_map(Vec::new());
+        file.sections[0] = test_section(
+            SectionKind::MapSourceCatalog,
+            json!({
+                "mapping_id": "people-map",
+                "mapping_version": "test/v1",
+                "sources": [
+                    {
+                        "source_id": "crm",
+                        "row_identity_rules": ["person_by_id"],
+                        "schema_fingerprint": state.schema_fingerprint.clone(),
+                        "snapshot_digest": state.snapshot_digest.clone(),
+                        "replay_claimed": true
+                    },
+                    {"source_id": "support", "row_identity_rules": ["person_by_id"]}
+                ]
+            }),
+        );
+        let rows = vec![SourceRow {
+            source_id: "crm".into(),
+            row_index: 0,
+            values: BTreeMap::from([("id".into(), json!("1"))]),
+        }];
+        let materialized =
+            materialize_with_source_states(&file, &rows, std::slice::from_ref(&state)).unwrap();
+        verify_replay_report(&file, &materialized.conversion_report).unwrap();
+
+        let mut stale = materialized.conversion_report.clone();
+        stale["sources"][0]["snapshot_digest"] =
+            json!("sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        let err = verify_replay_report(&file, &stale).unwrap_err();
+        assert!(err.contains("MAP_REPLAY_SOURCE_STALE"));
+    }
+
+    #[test]
+    fn aliases_import_updates_catalog_digests_and_runtime_lookup() {
+        let file = company_resolution_map();
+        let csv = br#"canonical_key,canonical_label,alias,authority,confidence_class,metadata_json
+uk-company:acme,Acme,Acme Ltd,curated,authoritative,{"source":"manual"}
+uk-company:acme,Acme,ACME LIMITED,curated,authoritative,
+"#;
+        let options = alias_import::AliasImportOptions {
+            catalog_id: "company_aliases".into(),
+            resolver_id: "uk_company_name_resolver".into(),
+        };
+        let (updated, report) =
+            alias_import::import_aliases_from_csv_bytes(&file, csv, &options).unwrap();
+        assert_eq!(report["alias_entry_count"], json!(1));
+        assert_eq!(report["alias_count"], json!(2));
+        assert!(report["catalog_digest"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:"));
+        assert!(report["resolver_digest"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:"));
+        updated.validate_map_sections().unwrap();
+        let serialized = updated.serialize().unwrap();
+        CovemapFile::parse_validated(&serialized).unwrap();
+
+        let rows = ["Acme Ltd", "ACME LIMITED"]
+            .into_iter()
+            .enumerate()
+            .map(|(row_index, company_name)| SourceRow {
+                source_id: "suppliers".into(),
+                row_index,
+                values: BTreeMap::from([("company_name".into(), json!(company_name))]),
+            })
+            .collect::<Vec<_>>();
+        let planned = plan_identities(&updated, &rows).unwrap();
+        let goids = planned
+            .canonical
+            .iter()
+            .map(|identity| identity.goid)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(goids.len(), 1);
+        assert!(planned.canonical.iter().all(|identity| {
+            identity.resolution_metadata[0].canonical_key.as_deref() == Some("uk-company:acme")
+                && identity.resolution_metadata[0].alias_hit
+        }));
+    }
+
+    #[test]
+    fn redacted_resolver_evidence_omits_raw_alias_but_preserves_hit_proof() {
+        let mut file = company_resolution_map();
+        *file.sections.last_mut().unwrap() =
+            redacted_resolution_catalog_section("company-map", "test/v1");
+        file.validate_map_sections().unwrap();
+        let rows = vec![SourceRow {
+            source_id: "suppliers".into(),
+            row_index: 0,
+            values: BTreeMap::from([("company_name".into(), json!("Tesco PLC"))]),
+        }];
+
+        let materialized = materialize_with_source_states(&file, &rows, &[]).unwrap();
+        let entry = materialized
+            .evidence_entries
+            .iter()
+            .find(|entry| entry["alias_hit"] == json!(true))
+            .unwrap();
+        assert_eq!(entry["evidence_policy"], json!("redact_raw"));
+        assert_eq!(entry["redacted_resolution_evidence"], json!(true));
+        assert_eq!(entry["redacted"], json!(true));
+        assert_eq!(entry["redaction_scope"], json!("resolver_evidence"));
+        assert!(entry.get("raw_observed_value").is_none());
+        assert!(entry.get("normalized_value").is_none());
+        assert_eq!(entry["canonical_key"], json!("uk-company:tesco"));
+        assert!(entry["resolver_digest"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:"));
+        assert!(entry["catalog_digest"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:"));
+        assert!(entry["pipeline_digest"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:"));
+    }
+
+    #[test]
+    fn alias_catalog_candidate_only_miss_emits_candidate_without_goid() {
+        let file = company_resolution_map();
+        file.validate_map_sections().unwrap();
+        let rows = vec![SourceRow {
+            source_id: "suppliers".into(),
+            row_index: 0,
+            values: BTreeMap::from([("company_name".into(), json!("Unknown Stores"))]),
+        }];
+
+        let planned = plan_identities(&file, &rows).unwrap();
+        assert!(planned.canonical.is_empty());
+        assert_eq!(planned.candidates.len(), 1);
+        assert_eq!(
+            planned.candidates[0].resolution_metadata[0].normalized_value,
+            "unknown stores"
+        );
+        assert!(planned.candidates[0].resolution_metadata[0].alias_miss);
+
+        let materialized = materialize_with_source_states(&file, &rows, &[]).unwrap();
+        assert!(materialized.rows.is_empty());
+        assert_eq!(
+            materialized.conversion_report["resolver_hit_count"],
+            json!(0)
+        );
+        assert_eq!(
+            materialized.conversion_report["resolver_miss_count"],
+            json!(1)
+        );
+        assert_eq!(
+            materialized.conversion_report["candidate_match_count"],
+            json!(1)
+        );
+        assert_eq!(materialized.evidence_entries.len(), 1);
+        assert_eq!(materialized.evidence_entries[0]["candidate"], json!(true));
+        assert_eq!(materialized.evidence_entries[0]["alias_miss"], json!(true));
+        assert_eq!(
+            materialized.evidence_entries[0]["miss_policy"],
+            json!("candidate_only")
+        );
+    }
+
+    #[test]
+    fn redacted_alias_miss_error_omits_raw_alias_value() {
+        let mut file = company_resolution_map();
+        *file.sections.last_mut().unwrap() = company_resolution_catalog_section_with_policy(
+            "company-map",
+            "test/v1",
+            "reject",
+            None,
+            "redact_raw",
+        );
+        file.validate_map_sections().unwrap();
+        let rows = vec![SourceRow {
+            source_id: "suppliers".into(),
+            row_index: 0,
+            values: BTreeMap::from([("company_name".into(), json!("Protected Unknown Stores"))]),
+        }];
+
+        let err = materialize_with_source_states(&file, &rows, &[]).unwrap_err();
+        assert!(err.contains("MAP_ALIAS_MISS"));
+        assert!(err.contains("<redacted>"));
+        assert!(!err.contains("Protected Unknown Stores"));
+        assert!(!err.contains("protected unknown stores"));
+    }
+
+    #[test]
+    fn alias_catalog_ambiguous_hit_rejects_auto_merge_by_default() {
+        let mut file = company_resolution_map();
+        *file.sections.last_mut().unwrap() = ambiguous_company_resolution_catalog_section(
+            "company-map",
+            "test/v1",
+            "reject_auto_merge",
+        );
+        file.validate_map_sections().unwrap();
+        let rows = vec![SourceRow {
+            source_id: "suppliers".into(),
+            row_index: 0,
+            values: BTreeMap::from([("company_name".into(), json!("Tesco"))]),
+        }];
+
+        let err = materialize_with_source_states(&file, &rows, &[]).unwrap_err();
+        assert!(err.contains("MAP_ALIAS_AMBIGUOUS"));
+    }
+
+    #[test]
+    fn redacted_ambiguous_alias_error_omits_normalized_alias_value() {
+        let mut file = company_resolution_map();
+        *file.sections.last_mut().unwrap() =
+            ambiguous_company_resolution_catalog_section_with_policy(
+                "company-map",
+                "test/v1",
+                "reject_auto_merge",
+                "redact_raw",
+            );
+        file.validate_map_sections().unwrap();
+        let rows = vec![SourceRow {
+            source_id: "suppliers".into(),
+            row_index: 0,
+            values: BTreeMap::from([("company_name".into(), json!("Tesco"))]),
+        }];
+
+        let err = materialize_with_source_states(&file, &rows, &[]).unwrap_err();
+        assert!(err.contains("MAP_ALIAS_AMBIGUOUS"));
+        assert!(err.contains("<redacted>"));
+        assert!(!err.contains("Tesco"));
+        assert!(!err.contains("tesco"));
+    }
+
+    #[test]
+    fn alias_catalog_ambiguous_hit_can_route_to_candidate_only() {
+        let mut file = company_resolution_map();
+        *file.sections.last_mut().unwrap() = ambiguous_company_resolution_catalog_section(
+            "company-map",
+            "test/v1",
+            "candidate_only",
+        );
+        file.validate_map_sections().unwrap();
+        let rows = vec![SourceRow {
+            source_id: "suppliers".into(),
+            row_index: 0,
+            values: BTreeMap::from([("company_name".into(), json!("Tesco"))]),
+        }];
+
+        let planned = plan_identities(&file, &rows).unwrap();
+        assert!(planned.canonical.is_empty());
+        assert_eq!(planned.candidates.len(), 1);
+        assert!(planned.candidates[0].resolution_metadata[0].alias_ambiguous);
+
+        let materialized = materialize_with_source_states(&file, &rows, &[]).unwrap();
+        assert!(materialized.rows.is_empty());
+        assert_eq!(
+            materialized.conversion_report["ambiguous_alias_count"],
+            json!(1)
+        );
+        assert_eq!(materialized.evidence_entries[0]["candidate"], json!(true));
+        assert_eq!(
+            materialized.evidence_entries[0]["alias_ambiguous"],
+            json!(true)
+        );
+    }
+
+    #[test]
+    fn resolution_property_expressions_project_from_identity_evidence() {
+        let mut file = company_resolution_map();
+        file.sections.push(test_section(
+            SectionKind::MapProjectionCatalog,
+            json!({
+                "mapping_id": "company-map",
+                "mapping_version": "test/v1",
+                "projections": [{
+                    "projection_id": "company_resolution_projection",
+                    "output_table": "company_resolution",
+                    "row_grain": "one_row_per_object",
+                    "anchor": {"object_type": "Company"},
+                    "temporal_mode": {"as_of": "latest_committed"},
+                    "multi_value_policy": "reject",
+                    "columns": [
+                        {"name": "canonical_key", "value": "identity(company_by_resolved_name).resolution(company).canonical_key"},
+                        {"name": "canonical_label", "value": "identity(company_by_resolved_name).resolution(company).canonical_label"},
+                        {"name": "normalized_value", "value": "identity(company_by_resolved_name).resolution(company).normalized_value"},
+                        {"name": "raw_observed_value", "value": "identity(company_by_resolved_name).resolution(company).raw_observed_value"}
+                    ],
+                    "output_modes": ["json"]
+                }]
+            }),
+        ));
+        let rows = vec![SourceRow {
+            source_id: "suppliers".into(),
+            row_index: 0,
+            values: BTreeMap::from([("company_name".into(), json!("Tesco PLC"))]),
+        }];
+
+        let projected = project_rows(&file, &rows).unwrap();
+        let projected_row = &projected["rows"][0];
+        assert_eq!(projected_row["canonical_key"], json!("uk-company:tesco"));
+        assert_eq!(projected_row["canonical_label"], json!("Tesco"));
+        assert_eq!(projected_row["normalized_value"], json!("tesco plc"));
+        assert_eq!(projected_row["raw_observed_value"], json!("Tesco PLC"));
+
+        let bytes = build_cove_o(&file, &rows).unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "cove-map-resolution-projection-test-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let object_path = dir.join("company.cove");
+        fs::write(&object_path, bytes).unwrap();
+        let persisted_projected = project_cove_o_path(&object_path, None).unwrap();
+        assert_eq!(persisted_projected["rows"], projected["rows"]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn resolution_property_expressions_select_declared_role() {
+        let mut file = company_resolution_map();
+        mutate_section_payload(&mut file, 2, |payload| {
+            payload["identity_rules"][0]["join_keys"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({
+                    "role_id": "parent_company",
+                    "source_column": "parent_company_name",
+                    "logical_type": "utf8",
+                    "canonicalization": "identity",
+                    "null_policy": "reject",
+                    "ordering": "declared",
+                    "resolution": {
+                        "resolver_id": "uk_company_name_resolver"
+                    }
+                }));
+        });
+        file.sections.push(test_section(
+            SectionKind::MapProjectionCatalog,
+            json!({
+                "mapping_id": "company-map",
+                "mapping_version": "test/v1",
+                "projections": [{
+                    "projection_id": "company_resolution_projection",
+                    "output_table": "company_resolution",
+                    "row_grain": "one_row_per_object",
+                    "anchor": {"object_type": "Company"},
+                    "temporal_mode": {"as_of": "latest_committed"},
+                    "multi_value_policy": "reject",
+                    "columns": [
+                        {"name": "company_raw", "value": "identity(company_by_resolved_name).resolution(company).raw_observed_value"},
+                        {"name": "parent_raw", "value": "identity(company_by_resolved_name).resolution(parent_company).raw_observed_value"}
+                    ],
+                    "output_modes": ["json"]
+                }]
+            }),
+        ));
+        let rows = vec![SourceRow {
+            source_id: "suppliers".into(),
+            row_index: 0,
+            values: BTreeMap::from([
+                ("company_name".into(), json!("Tesco")),
+                ("parent_company_name".into(), json!("Tesco PLC")),
+            ]),
+        }];
+
+        let materialized = materialize_with_source_states(&file, &rows, &[]).unwrap();
+        assert_eq!(
+            materialized.evidence_entries[0]["resolution_metadata"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+
+        let projected = project_rows(&file, &rows).unwrap();
+        let projected_row = &projected["rows"][0];
+        assert_eq!(projected_row["company_raw"], json!("Tesco"));
+        assert_eq!(projected_row["parent_raw"], json!("Tesco PLC"));
+    }
+
+    #[test]
+    fn resolution_property_expressions_fail_closed_without_resolver_hit() {
+        let mut file = company_resolution_map();
+        *file.sections.last_mut().unwrap() =
+            normalized_miss_resolution_catalog_section("company-map", "test/v1");
+        file.sections.push(test_section(
+            SectionKind::MapProjectionCatalog,
+            json!({
+                "mapping_id": "company-map",
+                "mapping_version": "test/v1",
+                "projections": [{
+                    "projection_id": "company_resolution_projection",
+                    "output_table": "company_resolution",
+                    "row_grain": "one_row_per_object",
+                    "anchor": {"object_type": "Company"},
+                    "temporal_mode": {"as_of": "latest_committed"},
+                    "multi_value_policy": "reject",
+                    "columns": [
+                        {"name": "canonical_key", "value": "identity(company_by_resolved_name).resolution(company).canonical_key"}
+                    ],
+                    "output_modes": ["json"]
+                }]
+            }),
+        ));
+        let rows = vec![SourceRow {
+            source_id: "suppliers".into(),
+            row_index: 0,
+            values: BTreeMap::from([("company_name".into(), json!("Unknown Stores"))]),
+        }];
+
+        let materialized = materialize_with_source_states(&file, &rows, &[]).unwrap();
+        assert_eq!(materialized.rows.len(), 1);
+        assert_eq!(materialized.evidence_entries[0]["alias_miss"], json!(true));
+        assert!(materialized.evidence_entries[0]["alias_hit"].is_null());
+
+        let err = project_rows(&file, &rows).unwrap_err();
+        assert!(err.contains("found no resolver hit"));
+    }
+
+    fn add_company_candidate_match_rule(file: &mut CovemapFile, max_pairs_per_block: u64) {
+        mutate_section_payload(file, 4, |payload| {
+            payload["match_rules"].as_array_mut().unwrap().push(json!({
+                "match_rule_id": "company_name_similarity",
+                "object_type": "Company",
+                "inputs": [{
+                    "source_id": "suppliers",
+                    "column": "company_name"
+                }],
+                "blocking": {
+                    "kind": "normalized_prefix",
+                    "length": 4
+                },
+                "normalization_pipeline_id": "company_name.v1",
+                "scoring": {
+                    "kind": "token_jaccard",
+                    "candidate_threshold": 0.3,
+                    "merge_behavior": "never",
+                    "score_scale": 1000000,
+                    "rounding": "floor"
+                },
+                "limits": {
+                    "max_pairs_per_block": max_pairs_per_block,
+                    "max_pairs_total": 100,
+                    "on_limit": "fail_closed"
+                },
+                "output": {
+                    "assertion_kinds": ["candidate_match", "evidence"]
+                }
+            }));
+        });
+    }
+
+    #[test]
+    fn candidate_match_rule_emits_stable_token_jaccard_json() {
+        let mut file = company_resolution_map();
+        add_company_candidate_match_rule(&mut file, 10);
+        file.validate_map_sections().unwrap();
+        let rows = vec![
+            SourceRow {
+                source_id: "suppliers".into(),
+                row_index: 0,
+                values: BTreeMap::from([("company_name".into(), json!("Tesco PLC"))]),
+            },
+            SourceRow {
+                source_id: "suppliers".into(),
+                row_index: 1,
+                values: BTreeMap::from([("company_name".into(), json!("Tesco supermarket"))]),
+            },
+        ];
+
+        let candidates = candidate_matches(&file, &rows).unwrap();
+        let matches = candidates["candidate_matches"].as_array().unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(
+            matches[0]["match_rule_id"],
+            json!("company_name_similarity")
+        );
+        assert_eq!(matches[0]["candidate_score"], json!(333333));
+        assert_eq!(matches[0]["score_scale"], json!(1000000));
+        assert_eq!(matches[0]["blocking_key"], json!("tesc"));
+        assert_eq!(matches[0]["merge_behavior"], json!("never"));
+        assert_eq!(matches[0]["left"]["normalized_value"], json!("tesco plc"));
+        assert_eq!(
+            matches[0]["right"]["normalized_value"],
+            json!("tesco supermarket")
+        );
+
+        let materialized = materialize_with_source_states(&file, &rows, &[]).unwrap();
+        assert_eq!(materialized.rows.len(), 2);
+        assert_eq!(
+            materialized.conversion_report["candidate_match_count"],
+            json!(1)
+        );
+        assert_eq!(
+            materialized.conversion_report["candidate_matches"][0]["match_rule_id"],
+            json!("company_name_similarity")
+        );
+        assert!(materialized.evidence_entries.iter().any(|entry| {
+            entry["candidate_match_id"] == matches[0]["candidate_match_id"]
+                && entry["match_rule_id"] == json!("company_name_similarity")
+                && entry["candidate_score"] == json!(333333)
+                && entry["left_normalized_value"] == json!("tesco plc")
+                && entry["right_normalized_value"] == json!("tesco supermarket")
+        }));
+    }
+
+    #[test]
+    fn review_worklist_from_candidate_matches_emits_decision_templates() {
+        let mut file = company_resolution_map();
+        add_company_candidate_match_rule(&mut file, 10);
+        let rows = vec![
+            SourceRow {
+                source_id: "suppliers".into(),
+                row_index: 0,
+                values: BTreeMap::from([("company_name".into(), json!("Tesco PLC"))]),
+            },
+            SourceRow {
+                source_id: "suppliers".into(),
+                row_index: 1,
+                values: BTreeMap::from([("company_name".into(), json!("Tesco supermarket"))]),
+            },
+        ];
+
+        let candidates = candidate_matches(&file, &rows).unwrap();
+        let review = review_worklist_from_candidate_matches(&candidates).unwrap();
+        assert_eq!(
+            review["schema_id"],
+            json!("org.coveformat.covemap.review-worklist.v1")
+        );
+        assert_eq!(review["candidate_match_count"], json!(1));
+        assert_eq!(
+            review["review_items"][0]["same_object_decision_template"]["left"]["kind"],
+            json!("row_digest")
+        );
+        assert_eq!(
+            review["review_items"][0]["same_object_decision_template"]["left"]["source_id"],
+            json!("suppliers")
+        );
+        assert_eq!(
+            review["review_items"][0]["same_object_decision_template"]["left"]
+                ["source_row_identity"],
+            json!("suppliers:0")
+        );
+        assert_eq!(
+            review["review_items"][0]["do_not_merge_decision_template"]["decision"],
+            json!("do_not_merge")
+        );
+        assert_eq!(
+            review["review_items"][0]["left"]["normalized_value"],
+            json!("tesco plc")
+        );
+    }
+
+    #[test]
+    fn candidate_match_rule_limits_fail_closed() {
+        let mut file = company_resolution_map();
+        add_company_candidate_match_rule(&mut file, 0);
+        let rows = vec![
+            SourceRow {
+                source_id: "suppliers".into(),
+                row_index: 0,
+                values: BTreeMap::from([("company_name".into(), json!("Tesco PLC"))]),
+            },
+            SourceRow {
+                source_id: "suppliers".into(),
+                row_index: 1,
+                values: BTreeMap::from([("company_name".into(), json!("Tesco supermarket"))]),
+            },
+        ];
+
+        let err = candidate_matches(&file, &rows).unwrap_err();
+        assert!(err.contains("max_pairs_per_block"));
+    }
+
+    #[test]
+    fn explain_includes_resolution_metadata_from_evidence_index() {
+        let mut file = company_resolution_map();
+        let rows = vec![SourceRow {
+            source_id: "suppliers".into(),
+            row_index: 0,
+            values: BTreeMap::from([("company_name".into(), json!("Tesco PLC"))]),
+        }];
+        let materialized = materialize_with_source_states(&file, &rows, &[]).unwrap();
+        file.sections.push(test_section(
+            SectionKind::MapEvidenceIndex,
+            materialized.evidence_index.clone(),
+        ));
+
+        let goid = hex_encode(&materialized.rows[0].goid);
+        let explained = explain(&file, &goid).unwrap();
+        assert_eq!(
+            explained["operation_metadata"]["identity_rule_id"],
+            json!("company_by_resolved_name")
+        );
+        assert_eq!(
+            explained["resolution"]["resolver_id"],
+            json!("uk_company_name_resolver")
+        );
+        assert_eq!(
+            explained["resolution"]["resolution_role_id"],
+            json!("company")
+        );
+        assert_eq!(
+            explained["resolution"]["raw_observed_value"],
+            json!("Tesco PLC")
+        );
+        assert_eq!(
+            explained["resolution"]["canonical_key"],
+            json!("uk-company:tesco")
+        );
+    }
+
+    #[test]
     fn candidate_identity_rules_emit_evidence_without_goids() {
         let mut file = two_source_identity_map(Vec::new());
         file.sections[2] = test_section(
@@ -3896,6 +6326,535 @@ mod tests {
             },
         ];
         assert!(plan_identities(&file, &rows).is_err());
+    }
+
+    #[test]
+    fn reviewed_same_object_merges_only_when_identity_rule_allows_it() {
+        let rows = reviewed_rows(&[("crm", "1"), ("support", "2")]);
+        let mut file = two_source_identity_map(Vec::new());
+        set_person_reviewed_equivalence(&mut file, true);
+        add_reviewed_decisions(
+            &mut file,
+            vec![reviewed_same_object_decision(
+                identity_alias_ref("Person", "crm:0"),
+                identity_alias_ref("Person", "support:0"),
+                None,
+            )],
+        );
+
+        let planned = plan_identities(&file, &rows).unwrap();
+        let goids = planned
+            .canonical
+            .iter()
+            .map(|identity| identity.goid)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(goids.len(), 1);
+
+        let mut disallowed = two_source_identity_map(Vec::new());
+        add_reviewed_decisions(
+            &mut disallowed,
+            vec![reviewed_same_object_decision(
+                identity_alias_ref("Person", "crm:0"),
+                identity_alias_ref("Person", "support:0"),
+                None,
+            )],
+        );
+        let err = plan_identities(&disallowed, &rows).unwrap_err();
+        assert!(err.contains("does not allow reviewed equivalence"));
+    }
+
+    #[test]
+    fn reviewed_row_digest_reference_rejects_ambiguous_matches() {
+        let rows = reviewed_rows(&[("crm", "1"), ("support", "1")]);
+        let mut file = two_source_identity_map(Vec::new());
+        set_person_reviewed_equivalence(&mut file, true);
+        let reference = json!({
+            "kind": "row_digest",
+            "object_type": "Person",
+            "row_digest": row_digest(&rows[0])
+        });
+        add_reviewed_decisions(
+            &mut file,
+            vec![reviewed_same_object_decision(
+                reference.clone(),
+                reference,
+                None,
+            )],
+        );
+
+        let err = plan_identities(&file, &rows).unwrap_err();
+        assert!(err.contains("row_digest reference matched"));
+    }
+
+    #[test]
+    fn review_import_creates_resolution_catalog_and_merges_decisions() {
+        let rows = reviewed_rows(&[("crm", "1"), ("support", "2")]);
+        let mut file = two_source_identity_map(Vec::new());
+        set_person_reviewed_equivalence(&mut file, true);
+        let decision = reviewed_same_object_decision(
+            identity_alias_ref("Person", "crm:0"),
+            identity_alias_ref("Person", "support:0"),
+            None,
+        );
+        let review = serde_json::to_vec(&json!({
+            "schema_id": "org.coveformat.covemap.review-worklist.v1",
+            "mapping_id": "people-map",
+            "mapping_version": "test/v1",
+            "reviewed_decisions": [decision.clone()]
+        }))
+        .unwrap();
+
+        let (updated, report) = review::import_reviewed_decisions_from_bytes(
+            &file,
+            &review,
+            &review::ReviewImportOptions { replace: false },
+        )
+        .unwrap();
+        assert_eq!(report["existing_reviewed_decision_count"], json!(0));
+        assert_eq!(report["imported_reviewed_decision_count"], json!(1));
+        assert_eq!(report["reviewed_decision_count"], json!(1));
+        updated.validate_map_sections().unwrap();
+        let serialized = updated.serialize().unwrap();
+        CovemapFile::parse_validated(&serialized).unwrap();
+        let exported = review::export_reviewed_decisions(&updated).unwrap();
+        assert_eq!(
+            exported["schema_id"],
+            json!("org.coveformat.covemap.review-worklist.v1")
+        );
+        assert_eq!(exported["mapping_id"], json!("people-map"));
+        assert_eq!(exported["mapping_version"], json!("test/v1"));
+        assert_eq!(exported["reviewed_decision_count"], json!(1));
+        assert_eq!(exported["reviewed_decisions"], json!([decision]));
+
+        let planned = plan_identities(&updated, &rows).unwrap();
+        let goids = planned
+            .canonical
+            .iter()
+            .map(|identity| identity.goid)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(goids.len(), 1);
+    }
+
+    #[test]
+    fn reviewed_decision_catalog_digest_binds_conversion_report() {
+        let rows = reviewed_rows(&[("crm", "1"), ("support", "2")]);
+        let decision = reviewed_same_object_decision(
+            identity_alias_ref("Person", "crm:0"),
+            identity_alias_ref("Person", "support:0"),
+            None,
+        );
+
+        let mut file = two_source_identity_map(Vec::new());
+        set_person_reviewed_equivalence(&mut file, true);
+        add_reviewed_decisions(&mut file, vec![decision.clone()]);
+        let materialized = materialize_with_source_states(&file, &rows, &[]).unwrap();
+        assert_eq!(
+            materialized.conversion_report["reviewed_decision_count"],
+            json!(1)
+        );
+        let original_digest = materialized.conversion_report["reviewed_decision_catalog_digest"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(original_digest.starts_with("sha256:"));
+
+        let mut changed_decision = decision;
+        changed_decision["reason"] = json!("manual adjudication update");
+        let mut changed = two_source_identity_map(Vec::new());
+        set_person_reviewed_equivalence(&mut changed, true);
+        add_reviewed_decisions(&mut changed, vec![changed_decision]);
+        let changed_materialized = materialize_with_source_states(&changed, &rows, &[]).unwrap();
+        assert_eq!(
+            changed_materialized.conversion_report["reviewed_decision_count"],
+            json!(1)
+        );
+        assert_ne!(
+            original_digest,
+            changed_materialized.conversion_report["reviewed_decision_catalog_digest"]
+                .as_str()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn replay_verify_rejects_stale_reviewed_decision_digest() {
+        let rows = reviewed_rows(&[("crm", "1"), ("support", "2")]);
+        let decision = reviewed_same_object_decision(
+            identity_alias_ref("Person", "crm:0"),
+            identity_alias_ref("Person", "support:0"),
+            None,
+        );
+        let mut file = two_source_identity_map(Vec::new());
+        set_person_reviewed_equivalence(&mut file, true);
+        add_reviewed_decisions(&mut file, vec![decision.clone()]);
+        let materialized = materialize_with_source_states(&file, &rows, &[]).unwrap();
+        verify_replay_report(&file, &materialized.conversion_report).unwrap();
+
+        let mut changed_decision = decision;
+        changed_decision["reason"] = json!("post-run adjudication changed");
+        let mut changed = two_source_identity_map(Vec::new());
+        set_person_reviewed_equivalence(&mut changed, true);
+        add_reviewed_decisions(&mut changed, vec![changed_decision]);
+        let err = verify_replay_report(&changed, &materialized.conversion_report).unwrap_err();
+        assert!(err.contains("MAP_REPLAY_STALE_REVIEW"));
+    }
+
+    #[test]
+    fn reviewed_do_not_merge_rejects_conflicting_reviewed_merge() {
+        let rows = reviewed_rows(&[("crm", "1"), ("support", "2")]);
+        let mut file = two_source_identity_map(Vec::new());
+        set_person_reviewed_equivalence(&mut file, true);
+        let left = identity_alias_ref("Person", "crm:0");
+        let right = identity_alias_ref("Person", "support:0");
+        add_reviewed_decisions(
+            &mut file,
+            vec![
+                reviewed_same_object_decision(left.clone(), right.clone(), None),
+                reviewed_do_not_merge_decision(left, right),
+            ],
+        );
+
+        let err = plan_identities(&file, &rows).unwrap_err();
+        assert!(err.contains("reviewed do-not-merge"));
+    }
+
+    #[test]
+    fn reviewed_same_object_transitive_closure_is_deterministic() {
+        let rows = reviewed_rows(&[("crm", "1"), ("support", "2"), ("ops", "3")]);
+        let mut file = three_source_identity_map();
+        set_person_reviewed_equivalence(&mut file, true);
+        let mut crm_support = reviewed_same_object_decision(
+            identity_alias_ref("Person", "crm:0"),
+            identity_alias_ref("Person", "support:0"),
+            None,
+        );
+        crm_support["decision_id"] = json!("review:crm-support");
+        let mut support_ops = reviewed_same_object_decision(
+            identity_alias_ref("Person", "support:0"),
+            identity_alias_ref("Person", "ops:0"),
+            None,
+        );
+        support_ops["decision_id"] = json!("review:support-ops");
+        add_reviewed_decisions(&mut file, vec![crm_support, support_ops]);
+
+        let first = plan_identities(&file, &rows).unwrap();
+        let second = plan_identities(&file, &rows).unwrap();
+        let first_goids = first
+            .canonical
+            .iter()
+            .map(|identity| identity.goid)
+            .collect::<BTreeSet<_>>();
+        let second_goids = second
+            .canonical
+            .iter()
+            .map(|identity| identity.goid)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(first_goids.len(), 1);
+        assert_eq!(first_goids, second_goids);
+    }
+
+    #[test]
+    fn reviewed_source_row_references_bind_snapshot_and_schema() {
+        let rows = reviewed_rows(&[("crm", "1"), ("support", "2")]);
+        let crm_snapshot =
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+        let support_snapshot =
+            "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+        let mut file = two_source_identity_map(Vec::new());
+        set_person_reviewed_equivalence(&mut file, true);
+        mutate_section_payload(&mut file, 0, |payload| {
+            payload["sources"][0]["snapshot_digest"] = json!(crm_snapshot);
+            payload["sources"][1]["snapshot_digest"] = json!(support_snapshot);
+        });
+        let left = json!({
+            "kind": "source_row",
+            "object_type": "Person",
+            "identity_rule_id": "person_by_id",
+            "source_id": "crm",
+            "source_row_identity": "crm:0",
+            "source_snapshot_digest": crm_snapshot,
+            "schema_fingerprint": schema_fingerprint(&rows[0])
+        });
+        let right = json!({
+            "kind": "source_row",
+            "object_type": "Person",
+            "identity_rule_id": "person_by_id",
+            "source_id": "support",
+            "source_row_identity": "support:0",
+            "source_snapshot_digest": support_snapshot,
+            "schema_fingerprint": schema_fingerprint(&rows[1])
+        });
+        add_reviewed_decisions(
+            &mut file,
+            vec![reviewed_same_object_decision(
+                left.clone(),
+                right.clone(),
+                None,
+            )],
+        );
+        let planned = plan_identities(&file, &rows).unwrap();
+        let goids = planned
+            .canonical
+            .iter()
+            .map(|identity| identity.goid)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(goids.len(), 1);
+
+        let mut wrong_digest = two_source_identity_map(Vec::new());
+        set_person_reviewed_equivalence(&mut wrong_digest, true);
+        mutate_section_payload(&mut wrong_digest, 0, |payload| {
+            payload["sources"][0]["snapshot_digest"] = json!(crm_snapshot);
+            payload["sources"][1]["snapshot_digest"] = json!(support_snapshot);
+        });
+        let mut wrong_right = right;
+        wrong_right["source_snapshot_digest"] =
+            json!("sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        add_reviewed_decisions(
+            &mut wrong_digest,
+            vec![reviewed_same_object_decision(left, wrong_right, None)],
+        );
+        let err = plan_identities(&wrong_digest, &rows).unwrap_err();
+        assert!(err.contains("did not match"));
+    }
+
+    #[test]
+    fn cross_rule_reviewed_same_object_requires_and_uses_canonical_anchor() {
+        let rows = vec![SourceRow {
+            source_id: "people".into(),
+            row_index: 0,
+            values: BTreeMap::from([
+                ("id".into(), json!("1")),
+                ("email".into(), json!("ada@example.test")),
+            ]),
+        }];
+        let base = cross_rule_reviewed_identity_map();
+        let planned = plan_identities(&base, &rows).unwrap();
+        assert_eq!(planned.canonical.len(), 2);
+        let person_by_id = planned
+            .canonical
+            .iter()
+            .find(|identity| identity.identity_rule_id == "person_by_id")
+            .unwrap();
+        let person_by_email = planned
+            .canonical
+            .iter()
+            .find(|identity| identity.identity_rule_id == "person_by_email")
+            .unwrap();
+        let left = json!({
+            "kind": "identity_join_key",
+            "object_type": "Person",
+            "identity_rule_id": "person_by_id",
+            "join_key_sha256": person_by_id.join_key_sha256
+        });
+        let right = json!({
+            "kind": "identity_join_key",
+            "object_type": "Person",
+            "identity_rule_id": "person_by_email",
+            "join_key_sha256": person_by_email.join_key_sha256
+        });
+
+        let mut missing_anchor = base.clone();
+        add_reviewed_decisions(
+            &mut missing_anchor,
+            vec![reviewed_same_object_decision(
+                left.clone(),
+                right.clone(),
+                None,
+            )],
+        );
+        let err = plan_identities(&missing_anchor, &rows).unwrap_err();
+        assert!(err.contains("requires canonical_anchor"));
+
+        let mut wrong_shape = base.clone();
+        add_reviewed_decisions(
+            &mut wrong_shape,
+            vec![reviewed_same_object_decision(
+                left.clone(),
+                right.clone(),
+                Some(json!({
+                    "kind": "resolved_join_key",
+                    "object_type": "Person",
+                    "identity_rule_id": "person_by_id",
+                    "components": [{
+                        "role_id": "email",
+                        "logical_type": "utf8",
+                        "resolved_value": "ada@example.test"
+                    }]
+                })),
+            )],
+        );
+        let err = plan_identities(&wrong_shape, &rows).unwrap_err();
+        assert!(err.contains("join key shape"));
+
+        let mut anchored = base;
+        add_reviewed_decisions(
+            &mut anchored,
+            vec![reviewed_same_object_decision(
+                left,
+                right,
+                Some(json!({
+                    "kind": "resolved_join_key",
+                    "object_type": "Person",
+                    "identity_rule_id": "person_by_id",
+                    "components": [{
+                        "role_id": "person_id",
+                        "logical_type": "utf8",
+                        "resolved_value": "1"
+                    }]
+                })),
+            )],
+        );
+        let planned = plan_identities(&anchored, &rows).unwrap();
+        let goids = planned
+            .canonical
+            .iter()
+            .map(|identity| identity.goid)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(goids.len(), 1);
+        assert!(planned
+            .canonical
+            .iter()
+            .all(|identity| identity.canonical_anchor.starts_with("person_by_id:")));
+    }
+
+    #[test]
+    fn reviewed_same_object_rejects_cross_object_type_components() {
+        let rows = vec![SourceRow {
+            source_id: "people".into(),
+            row_index: 0,
+            values: BTreeMap::from([
+                ("id".into(), json!("1")),
+                ("email".into(), json!("ada@example.test")),
+            ]),
+        }];
+        let mut base = cross_rule_reviewed_identity_map();
+        mutate_section_payload(&mut base, 2, |payload| {
+            payload["identity_rules"][1]["object_type"] = json!("Company");
+        });
+        let planned = plan_identities(&base, &rows).unwrap();
+        let person_by_id = planned
+            .canonical
+            .iter()
+            .find(|identity| identity.identity_rule_id == "person_by_id")
+            .unwrap();
+        let company_by_email = planned
+            .canonical
+            .iter()
+            .find(|identity| identity.identity_rule_id == "person_by_email")
+            .unwrap();
+        assert_eq!(person_by_id.object_type, "Person");
+        assert_eq!(company_by_email.object_type, "Company");
+
+        let mut reviewed = base;
+        add_reviewed_decisions(
+            &mut reviewed,
+            vec![reviewed_same_object_decision(
+                json!({
+                    "kind": "identity_join_key",
+                    "object_type": "Person",
+                    "identity_rule_id": "person_by_id",
+                    "join_key_sha256": person_by_id.join_key_sha256
+                }),
+                json!({
+                    "kind": "identity_join_key",
+                    "object_type": "Company",
+                    "identity_rule_id": "person_by_email",
+                    "join_key_sha256": company_by_email.join_key_sha256
+                }),
+                Some(json!({
+                    "kind": "resolved_join_key",
+                    "object_type": "Person",
+                    "identity_rule_id": "person_by_id",
+                    "components": [{
+                        "role_id": "person_id",
+                        "logical_type": "utf8",
+                        "resolved_value": "1"
+                    }]
+                })),
+            )],
+        );
+
+        let err = plan_identities(&reviewed, &rows).unwrap_err();
+        assert!(err.contains("crosses object types"));
+    }
+
+    #[test]
+    fn reviewed_same_object_rejects_canonical_anchor_object_type_mismatch() {
+        let rows = vec![SourceRow {
+            source_id: "people".into(),
+            row_index: 0,
+            values: BTreeMap::from([
+                ("id".into(), json!("1")),
+                ("email".into(), json!("ada@example.test")),
+            ]),
+        }];
+        let mut base = cross_rule_reviewed_identity_map();
+        mutate_section_payload(&mut base, 2, |payload| {
+            payload["identity_rules"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({
+                    "rule_id": "company_by_id",
+                    "object_type": "Company",
+                    "semantic_role": "subject",
+                    "confidence_class": "authoritative",
+                    "candidate_only": false,
+                    "property_conflicts_declared": true,
+                    "allow_reviewed_equivalence": true,
+                    "function_ids": ["identity"],
+                    "join_keys": [{
+                        "role_id": "company_id",
+                        "source_column": "id",
+                        "logical_type": "utf8",
+                        "canonicalization": "identity",
+                        "null_policy": "reject",
+                        "ordering": "declared"
+                    }]
+                }));
+        });
+        let planned = plan_identities(&base, &rows).unwrap();
+        let person_by_id = planned
+            .canonical
+            .iter()
+            .find(|identity| identity.identity_rule_id == "person_by_id")
+            .unwrap();
+        let person_by_email = planned
+            .canonical
+            .iter()
+            .find(|identity| identity.identity_rule_id == "person_by_email")
+            .unwrap();
+
+        let mut reviewed = base;
+        add_reviewed_decisions(
+            &mut reviewed,
+            vec![reviewed_same_object_decision(
+                json!({
+                    "kind": "identity_join_key",
+                    "object_type": "Person",
+                    "identity_rule_id": "person_by_id",
+                    "join_key_sha256": person_by_id.join_key_sha256
+                }),
+                json!({
+                    "kind": "identity_join_key",
+                    "object_type": "Person",
+                    "identity_rule_id": "person_by_email",
+                    "join_key_sha256": person_by_email.join_key_sha256
+                }),
+                Some(json!({
+                    "kind": "resolved_join_key",
+                    "object_type": "Company",
+                    "identity_rule_id": "company_by_id",
+                    "components": [{
+                        "role_id": "company_id",
+                        "logical_type": "utf8",
+                        "resolved_value": "1"
+                    }]
+                })),
+            )],
+        );
+
+        let err = plan_identities(&reviewed, &rows).unwrap_err();
+        assert!(err.contains("canonical anchor object type"));
     }
 
     #[test]
@@ -4115,6 +7074,80 @@ mod tests {
             property_by_name(association, "cardinality_policy"),
             json!("many_to_one")
         );
+    }
+
+    #[test]
+    fn association_endpoint_resolution_uses_alias_backed_target_identity() {
+        let file = alias_backed_association_map();
+        let rows = vec![
+            SourceRow {
+                source_id: "memberships".into(),
+                row_index: 0,
+                values: BTreeMap::from([
+                    ("person_id".into(), json!("p1")),
+                    ("team_name".into(), json!("Alpha Team Ltd")),
+                    ("valid_from".into(), json!("2026-01-01")),
+                    ("valid_to".into(), json!("2026-12-31")),
+                ]),
+            },
+            SourceRow {
+                source_id: "teams".into(),
+                row_index: 0,
+                values: BTreeMap::from([("team_name".into(), json!("Team Alpha"))]),
+            },
+        ];
+        let materialized = materialize_with_source_states(&file, &rows, &[]).unwrap();
+        let team = materialized
+            .rows
+            .iter()
+            .find(|row| row.object_type == "Team")
+            .unwrap();
+        let association = materialized
+            .rows
+            .iter()
+            .find(|row| row.object_type == "Association:member_of")
+            .unwrap();
+
+        assert_eq!(
+            property_by_name(association, "target_goid"),
+            json!(hex_encode(&team.goid))
+        );
+        assert!(materialized.evidence_entries.iter().any(|entry| {
+            entry["source_id"] == json!("teams")
+                && entry["rule_id"] == json!("team_row")
+                && entry["alias_hit"] == json!(true)
+                && entry["canonical_key"] == json!("team:alpha")
+        }));
+    }
+
+    #[test]
+    fn association_endpoint_rejects_source_scoped_join_key_ambiguity() {
+        let file = source_scoped_ambiguous_association_map();
+        let rows = vec![
+            SourceRow {
+                source_id: "memberships".into(),
+                row_index: 0,
+                values: BTreeMap::from([
+                    ("person_id".into(), json!("p1")),
+                    ("team_id".into(), json!("team-1")),
+                    ("valid_from".into(), json!("2026-01-01")),
+                    ("valid_to".into(), json!("2026-12-31")),
+                ]),
+            },
+            SourceRow {
+                source_id: "teams_a".into(),
+                row_index: 0,
+                values: BTreeMap::from([("team_id".into(), json!("team-1"))]),
+            },
+            SourceRow {
+                source_id: "teams_b".into(),
+                row_index: 0,
+                values: BTreeMap::from([("team_id".into(), json!("team-1"))]),
+            },
+        ];
+
+        let err = materialize_with_source_states(&file, &rows, &[]).unwrap_err();
+        assert!(err.contains("ambiguous across 2 GOIDs"));
     }
 
     #[test]

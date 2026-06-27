@@ -27,6 +27,9 @@ pub const MAGIC_COVM: [u8; 4] = *b"CVM2";
 /// Magic bytes at the end of a COVE-MAP v2 reusable mapping artifact (`b"CMP2"`).
 pub const MAGIC_COVEMAP: [u8; 4] = *b"CMP2";
 
+/// Magic bytes at the end of a COVE-O delta artifact (`b"CVD2"`).
+pub const MAGIC_COVEDELTA: [u8; 4] = *b"CVD2";
+
 /// Magic bytes at the end of a COVE-I v2 secondary-index artifact (`b"CVI2"`).
 pub const MAGIC_COVI: [u8; 4] = *b"CVI2";
 
@@ -328,6 +331,7 @@ pub enum SectionKind {
     MapEvidenceIndex = 66,
     MapConversionReport = 67,
     MapProjectionCatalog = 68,
+    MapResolutionCatalog = 69,
 
     // Vendor extension (shared)
     VendorExtension = 255,
@@ -394,6 +398,7 @@ impl SectionKind {
             66 => Some(Self::MapEvidenceIndex),
             67 => Some(Self::MapConversionReport),
             68 => Some(Self::MapProjectionCatalog),
+            69 => Some(Self::MapResolutionCatalog),
             255 => Some(Self::VendorExtension),
             _ => None,
         }
@@ -984,6 +989,10 @@ mod tests {
         assert_eq!(
             SectionKind::from_u16(68),
             Some(SectionKind::MapProjectionCatalog)
+        );
+        assert_eq!(
+            SectionKind::from_u16(69),
+            Some(SectionKind::MapResolutionCatalog)
         );
         assert_eq!(
             SectionKind::from_u16(255),

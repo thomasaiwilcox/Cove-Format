@@ -121,6 +121,23 @@ impl ObjectTypeCatalog {
         }
         Ok(())
     }
+
+    pub fn apply_additive_patch(&mut self, patch: &ObjectTypeCatalog) -> Result<(), CoveError> {
+        patch.validate()?;
+        for patch_type in &patch.types {
+            match self
+                .types
+                .iter_mut()
+                .find(|ty| ty.object_type_id == patch_type.object_type_id)
+            {
+                Some(existing_type) => {
+                    existing_type.apply_additive_patch(patch_type)?;
+                }
+                None => self.types.push(patch_type.clone()),
+            }
+        }
+        self.validate()
+    }
 }
 
 impl ObjectTypeEntryV1 {
@@ -167,6 +184,30 @@ impl ObjectTypeEntryV1 {
             out.extend_from_slice(&prop.serialize()?);
         }
         Ok(out)
+    }
+
+    fn apply_additive_patch(&mut self, patch: &ObjectTypeEntryV1) -> Result<(), CoveError> {
+        if self.type_name != patch.type_name || self.flags != patch.flags {
+            return Err(CoveError::BadSchema(
+                "object catalog patch cannot rename or reinterpret an existing object type".into(),
+            ));
+        }
+        for patch_property in &patch.properties {
+            match self
+                .properties
+                .iter()
+                .find(|property| property.property_id == patch_property.property_id)
+            {
+                Some(existing_property) if existing_property != patch_property => {
+                    return Err(CoveError::BadSchema(
+                        "object catalog patch cannot reinterpret an existing property".into(),
+                    ));
+                }
+                Some(_) => {}
+                None => self.properties.push(patch_property.clone()),
+            }
+        }
+        Ok(())
     }
 }
 
@@ -260,4 +301,83 @@ fn write_str(out: &mut Vec<u8>, s: &str, what: &str) -> Result<(), CoveError> {
     out.extend_from_slice(&len.to_le_bytes());
     out.extend_from_slice(s.as_bytes());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn property(property_id: u32, name: &str, logical_type: CoveLogicalType) -> PropertyEntryV1 {
+        PropertyEntryV1 {
+            property_id,
+            property_name: name.into(),
+            logical_type,
+            physical_kind: match logical_type {
+                CoveLogicalType::Bool => CovePhysicalKind::Boolean,
+                CoveLogicalType::Utf8 => CovePhysicalKind::VarBytes,
+                _ => CovePhysicalKind::VarBytes,
+            },
+            nullable: false,
+            collation_id: 0,
+            flags: 0,
+        }
+    }
+
+    fn object_type(properties: Vec<PropertyEntryV1>) -> ObjectTypeEntryV1 {
+        ObjectTypeEntryV1 {
+            object_type_id: 7,
+            type_name: "Thing".into(),
+            flags: OBJECT_TYPE_FLAG_ENTITY_OBJECT,
+            properties,
+        }
+    }
+
+    #[test]
+    fn additive_catalog_patch_adds_new_property() {
+        let mut catalog = ObjectTypeCatalog {
+            flags: 0,
+            types: vec![object_type(vec![property(
+                1,
+                "active",
+                CoveLogicalType::Bool,
+            )])],
+        };
+        let patch = ObjectTypeCatalog {
+            flags: 0,
+            types: vec![object_type(vec![property(
+                2,
+                "name",
+                CoveLogicalType::Utf8,
+            )])],
+        };
+
+        catalog.apply_additive_patch(&patch).unwrap();
+        assert_eq!(catalog.types[0].properties.len(), 2);
+        assert_eq!(catalog.types[0].properties[1].property_name, "name");
+    }
+
+    #[test]
+    fn additive_catalog_patch_rejects_property_reinterpretation() {
+        let mut catalog = ObjectTypeCatalog {
+            flags: 0,
+            types: vec![object_type(vec![property(
+                1,
+                "active",
+                CoveLogicalType::Bool,
+            )])],
+        };
+        let patch = ObjectTypeCatalog {
+            flags: 0,
+            types: vec![object_type(vec![property(
+                1,
+                "active",
+                CoveLogicalType::Utf8,
+            )])],
+        };
+
+        assert!(matches!(
+            catalog.apply_additive_patch(&patch),
+            Err(CoveError::BadSchema(_))
+        ));
+    }
 }

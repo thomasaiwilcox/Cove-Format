@@ -363,6 +363,10 @@ impl LocalCodebookPayload {
             .collect()
     }
 
+    pub fn decode_local_indexes(&self) -> Result<Vec<u32>, CoveError> {
+        self.indexes.decode_local_indexes()
+    }
+
     pub fn decode_file_codes(&self) -> Result<Vec<u32>, CoveError> {
         let LocalCodebookValues::FileCode(values) = &self.values else {
             return Err(CoveError::UnsupportedEncoding(

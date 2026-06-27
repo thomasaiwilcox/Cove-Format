@@ -1,0 +1,8 @@
+{
+  "expected_error_contains": "MAP_REPLAY_STALE_REVIEW",
+  "mapping": "accept/cove_map_resolution_alias.covemap",
+  "mutate_report": "reviewed_decision_digest",
+  "sources": [
+    "accept/company_aliases.csv"
+  ]
+}

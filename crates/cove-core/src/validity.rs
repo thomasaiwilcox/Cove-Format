@@ -48,6 +48,11 @@ impl<'a> ValidityBitmap<'a> {
         self.row_count
     }
 
+    /// Returns the borrowed packed bitmap bytes.
+    pub fn bytes(&self) -> &'a [u8] {
+        self.bytes
+    }
+
     /// Returns `true` if the row at `row` is **null**, `false` if it is
     /// **non-null**.
     ///

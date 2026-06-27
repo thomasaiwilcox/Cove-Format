@@ -2329,20 +2329,23 @@ fn try_direct_primitive_array(
         {
             DataType::Int64 => {
                 if let Some(values) = retained_numcode_i64_values(array, data_owner)? {
-                    return Ok(Some(Arc::new(Int64Array::new(values, None)) as ArrayRef));
+                    let nulls = retained_array_nulls(array)?;
+                    return Ok(Some(Arc::new(Int64Array::new(values, nulls)) as ArrayRef));
                 }
                 Ok(Some(Arc::new(numcode_i64_array(array)?) as ArrayRef))
             }
             DataType::UInt64 => {
                 if let Some(values) = retained_numcode_u64_values(array, data_owner)? {
-                    return Ok(Some(Arc::new(UInt64Array::new(values, None)) as ArrayRef));
+                    let nulls = retained_array_nulls(array)?;
+                    return Ok(Some(Arc::new(UInt64Array::new(values, nulls)) as ArrayRef));
                 }
                 Ok(Some(Arc::new(numcode_u64_array(array)?) as ArrayRef))
             }
             DataType::Timestamp(TimeUnit::Microsecond, None) => {
                 if let Some(values) = retained_numcode_i64_values(array, data_owner)? {
+                    let nulls = retained_array_nulls(array)?;
                     return Ok(Some(
-                        Arc::new(TimestampMicrosecondArray::new(values, None)) as ArrayRef
+                        Arc::new(TimestampMicrosecondArray::new(values, nulls)) as ArrayRef,
                     ));
                 }
                 Ok(Some(
@@ -2351,8 +2354,9 @@ fn try_direct_primitive_array(
             }
             DataType::Timestamp(TimeUnit::Nanosecond, None) => {
                 if let Some(values) = retained_numcode_i64_values(array, data_owner)? {
+                    let nulls = retained_array_nulls(array)?;
                     return Ok(Some(
-                        Arc::new(TimestampNanosecondArray::new(values, None)) as ArrayRef
+                        Arc::new(TimestampNanosecondArray::new(values, nulls)) as ArrayRef
                     ));
                 }
                 Ok(Some(
@@ -2413,7 +2417,7 @@ fn try_direct_plain_fixed_array(
     array: &EncodedArray<'_>,
     selection: ArrowRowSelection<'_>,
     data_type: &DataType,
-    _data_owner: Option<&ArrowBufferOwner>,
+    data_owner: Option<&ArrowBufferOwner>,
 ) -> Result<Option<ArrayRef>, CoveError> {
     if array.encoding != CoveEncodingKind::PlainFixed {
         return Ok(None);
@@ -2534,6 +2538,16 @@ fn try_direct_plain_fixed_array(
             Ok(Some(Arc::new(array) as ArrayRef))
         }
         DataType::FixedSizeBinary(size) => {
+            validate_fixed_size_binary_width(*size, width)?;
+            if let Some(values) =
+                retained_plain_fixed_binary_buffer(array, selection, data, width, data_owner)?
+            {
+                let nulls = retained_array_nulls(array)?;
+                let array = FixedSizeBinaryArray::try_new(*size, values, nulls).map_err(|err| {
+                    CoveError::BadSection(format!("Arrow FixedSizeBinary: {err}"))
+                })?;
+                return Ok(Some(Arc::new(array) as ArrayRef));
+            }
             let (values, nulls) = collect_plain_fixed_bytes(array, selection, data, width)?;
             let array = FixedSizeBinaryArray::try_new(*size, Buffer::from_vec(values), nulls)
                 .map_err(|err| CoveError::BadSection(format!("Arrow FixedSizeBinary: {err}")))?;
@@ -2541,6 +2555,48 @@ fn try_direct_plain_fixed_array(
         }
         _ => Ok(None),
     }
+}
+
+fn validate_fixed_size_binary_width(size: i32, width: usize) -> Result<(), CoveError> {
+    let size = usize::try_from(size).map_err(|_| CoveError::PageCorrupt)?;
+    if size != width {
+        return Err(CoveError::PageCorrupt);
+    }
+    Ok(())
+}
+
+fn retained_plain_fixed_binary_buffer(
+    array: &EncodedArray<'_>,
+    selection: ArrowRowSelection<'_>,
+    data: &[u8],
+    width: usize,
+    data_owner: Option<&ArrowBufferOwner>,
+) -> Result<Option<Buffer>, CoveError> {
+    let Some(owner) = data_owner else {
+        return Ok(None);
+    };
+    if !selection.is_all_rows(array.row_count)? {
+        return Ok(None);
+    }
+    let row_count = usize::try_from(array.row_count).map_err(|_| CoveError::ArithOverflow)?;
+    let byte_len = row_count
+        .checked_mul(width)
+        .ok_or(CoveError::ArithOverflow)?;
+    if byte_len == 0 {
+        return Ok(Some(Buffer::from_vec(Vec::<u8>::new())));
+    }
+    if data.len() < byte_len {
+        return Err(CoveError::OffsetRange);
+    }
+    let Some(ptr) = NonNull::new(data.as_ptr() as *mut u8) else {
+        return Err(CoveError::BufferTooShort);
+    };
+    // INVARIANT: `data_owner` owns the immutable retained COVE page allocation
+    // containing `data`; Arrow clones that owner into the custom allocation, so
+    // the byte-addressed fixed-size values buffer stays live for the array.
+    Ok(Some(unsafe {
+        Buffer::from_custom_allocation(ptr, byte_len, Arc::clone(owner))
+    }))
 }
 
 fn plain_fixed_native_array<T, F>(
@@ -3204,7 +3260,7 @@ fn retained_numcode_u64_values(
     let Some(owner) = data_owner else {
         return Ok(None);
     };
-    if !cfg!(target_endian = "little") || array_has_nulls(array)? {
+    if !cfg!(target_endian = "little") {
         return Ok(None);
     }
     let row_count = usize::try_from(array.row_count).map_err(|_| CoveError::ArithOverflow)?;
@@ -3219,7 +3275,7 @@ fn retained_numcode_i64_values(
     let Some(owner) = data_owner else {
         return Ok(None);
     };
-    if !cfg!(target_endian = "little") || array_has_nulls(array)? {
+    if !cfg!(target_endian = "little") {
         return Ok(None);
     }
     let row_count = usize::try_from(array.row_count).map_err(|_| CoveError::ArithOverflow)?;
@@ -3228,6 +3284,11 @@ fn retained_numcode_i64_values(
         checked_numcode_i64(read_numcode_u64(data, row))?;
     }
     retained_numcode_scalar_buffer::<i64>(data, row_count, owner)
+}
+
+fn retained_array_nulls(array: &EncodedArray<'_>) -> Result<Option<NullBuffer>, CoveError> {
+    let row_count = usize::try_from(array.row_count).map_err(|_| CoveError::ArithOverflow)?;
+    arrow_null_buffer(array.validity, row_count)
 }
 
 fn retained_numcode_scalar_buffer<T: ArrowNativeType>(
@@ -3255,7 +3316,7 @@ fn retained_numcode_scalar_buffer<T: ArrowNativeType>(
     // page data. The `owner` is cloned into Arrow's custom allocation so the
     // backing bytes outlive every array using this buffer.
     // SAFETY: `data` was proven valid for `byte_len` bytes, the pointer is
-    // non-null and aligned for `T`, and only little-endian no-null NumCode
+    // non-null and aligned for `T`, and only little-endian fixed-width NumCode
     // payloads reach this helper.
     let buffer = unsafe { Buffer::from_custom_allocation(ptr, byte_len, Arc::clone(owner)) };
     Ok(Some(ScalarBuffer::new(buffer, 0, row_count)))
@@ -4664,6 +4725,82 @@ mod tests {
         if (owner.as_ptr() as usize).is_multiple_of(std::mem::align_of::<u64>()) {
             assert_eq!(uints.to_data().buffers()[0].as_ptr(), owner.as_ptr());
         }
+    }
+
+    #[test]
+    fn retained_numcode_int64_array_with_nulls_keeps_backing_owner() {
+        let mut values = Vec::new();
+        values.extend_from_slice(&10u64.to_le_bytes());
+        values.extend_from_slice(&99u64.to_le_bytes());
+        values.extend_from_slice(&30u64.to_le_bytes());
+        let owner = Arc::new(values);
+        let mut validity = ValidityBitmapBuilder::new(3).unwrap();
+        validity.set_null(1).unwrap();
+        let validity_bytes = validity.into_bytes();
+        let bitmap = crate::validity::ValidityBitmap::new(&validity_bytes, 3);
+        let cove = EncodedArray::new(
+            CoveLogicalType::Int64,
+            CovePhysicalKind::NumCode,
+            3,
+            CoveEncodingKind::NumCode,
+            Some(bitmap),
+            owner.as_slice(),
+            None,
+        );
+        let buffer_owner = arrow_buffer_owner(Arc::clone(&owner));
+
+        let result = encoded_array_to_arrow_with_options_and_owner(
+            &cove,
+            ArrowExportOptions::default(),
+            Some(&buffer_owner),
+        )
+        .unwrap();
+        let ints = result.value.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(ints.value(0), 10);
+        assert!(ints.is_null(1));
+        assert_eq!(ints.value(2), 30);
+        if (owner.as_ptr() as usize).is_multiple_of(std::mem::align_of::<i64>()) {
+            assert_eq!(ints.to_data().buffers()[0].as_ptr(), owner.as_ptr());
+        }
+    }
+
+    #[test]
+    fn retained_plain_fixed_uuid_array_with_nulls_keeps_backing_owner() {
+        let mut values = Vec::new();
+        values.extend_from_slice(&[1u8; 16]);
+        values.extend_from_slice(&[99u8; 16]);
+        values.extend_from_slice(&[3u8; 16]);
+        let owner = Arc::new(values);
+        let mut validity = ValidityBitmapBuilder::new(3).unwrap();
+        validity.set_null(1).unwrap();
+        let validity_bytes = validity.into_bytes();
+        let bitmap = crate::validity::ValidityBitmap::new(&validity_bytes, 3);
+        let cove = EncodedArray::new(
+            CoveLogicalType::Uuid,
+            CovePhysicalKind::FixedBytes,
+            3,
+            CoveEncodingKind::PlainFixed,
+            Some(bitmap),
+            owner.as_slice(),
+            None,
+        );
+        let buffer_owner = arrow_buffer_owner(Arc::clone(&owner));
+
+        let result = encoded_array_to_arrow_with_options_and_owner(
+            &cove,
+            ArrowExportOptions::default(),
+            Some(&buffer_owner),
+        )
+        .unwrap();
+        let uuids = result
+            .value
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .unwrap();
+        assert_eq!(uuids.value(0), &[1u8; 16]);
+        assert!(uuids.is_null(1));
+        assert_eq!(uuids.value(2), &[3u8; 16]);
+        assert_eq!(uuids.to_data().buffers()[0].as_ptr(), owner.as_ptr());
     }
 
     #[test]

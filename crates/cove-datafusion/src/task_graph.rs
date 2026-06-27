@@ -369,6 +369,24 @@ fn lookup_keys_for_plan(
             }
             Some((*column_index, LookupKeyKind::NumCode, keys))
         }
+        CovePredicate::NumericIn {
+            column_index,
+            literals,
+        } => {
+            let column = state.table().columns.get(*column_index)?;
+            let mut keys = Vec::new();
+            for literal in literals {
+                for key in numeric_lookup_keys(column.logical, *literal) {
+                    if !keys.contains(&key) {
+                        keys.push(key);
+                    }
+                }
+            }
+            if keys.is_empty() {
+                return None;
+            }
+            Some((*column_index, LookupKeyKind::NumCode, keys))
+        }
         _ => None,
     }
 }

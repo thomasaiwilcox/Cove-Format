@@ -32,18 +32,21 @@ pub use object_catalog::{
     PROPERTY_FLAG_EVIDENCE_REF, PROPERTY_FLAG_MAPPING_RULE_REF,
 };
 pub use readback::{
-    read_object_kernel_surface_from_bytes_with_options, read_object_surface_from_bytes,
+    read_object_kernel_surface_from_bytes_with_options,
+    read_object_surface_from_base_and_delta_files,
+    read_object_surface_from_base_and_delta_files_with_options, read_object_surface_from_bytes,
     read_object_surface_from_bytes_with_options,
     read_object_surface_from_bytes_with_pushdown_options, read_retained_object_temporal_segments,
-    reconstruct_object_states, CoveAssociationMetadata, CoveObjectAssociationEndpointCandidate,
-    CoveObjectKernelPropertyLane, CoveObjectKernelPropertyValues, CoveObjectKernelReadOptions,
-    CoveObjectKernelReadResult, CoveObjectKernelSurface, CoveObjectKernelSystemLanes,
-    CoveObjectPropertyPredicateCandidate, CoveObjectPropertyPredicateLiteral,
-    CoveObjectPropertyPredicateOp, CoveObjectPropertyValue, CoveObjectReadOptions,
-    CoveObjectReadPushdownDecision, CoveObjectReadPushdownOptions, CoveObjectReadPushdownReport,
-    CoveObjectReadResult, CoveObjectReadWithPushdownOptions, CoveObjectReconstructionOptions,
-    CoveObjectRecord, CoveObjectRedactionReadPolicy, CoveObjectRetainedTemporalReadResult,
-    CoveObjectState, CoveObjectSurface, CoveObjectTemporalCut, CoveObjectTombstoneStatus,
+    reconstruct_object_states, reconstruct_object_states_from_base_and_delta_files,
+    CoveAssociationMetadata, CoveObjectAssociationEndpointCandidate, CoveObjectKernelPropertyLane,
+    CoveObjectKernelPropertyValues, CoveObjectKernelReadOptions, CoveObjectKernelReadResult,
+    CoveObjectKernelSurface, CoveObjectKernelSystemLanes, CoveObjectPropertyPredicateCandidate,
+    CoveObjectPropertyPredicateLiteral, CoveObjectPropertyPredicateOp, CoveObjectPropertyValue,
+    CoveObjectReadOptions, CoveObjectReadPushdownDecision, CoveObjectReadPushdownOptions,
+    CoveObjectReadPushdownReport, CoveObjectReadResult, CoveObjectReadWithPushdownOptions,
+    CoveObjectReconstructionOptions, CoveObjectRecord, CoveObjectRedactionReadPolicy,
+    CoveObjectRetainedTemporalReadResult, CoveObjectState, CoveObjectSurface,
+    CoveObjectTemporalCut, CoveObjectTombstoneStatus,
 };
 pub(crate) use segment::{
     validate_temporal_property_page_elision_features, validate_temporal_property_stats_only_page,
@@ -61,6 +64,7 @@ pub use trust::{temporal_row_trust_payload, TrustDictionary, TrustManifest, Trus
 mod tests {
     use super::*;
     use crate::{
+        canonical::CanonicalValue,
         checksum,
         constants::{
             CoveEncodingKind, CoveLogicalType, CovePhysicalKind, FEATURE_OBJECT_PROFILE,
@@ -74,6 +78,27 @@ mod tests {
         segment::{TableColumnDirectoryEntryV1, TABLE_COLUMN_DIRECTORY_ENTRY_LEN},
         trust_chain, CoveError,
     };
+
+    #[derive(Debug)]
+    struct TestTrustDictionary {
+        entries: Vec<(crate::constants::ValueTag, Vec<u8>)>,
+    }
+
+    impl TrustDictionary for TestTrustDictionary {
+        fn len(&self) -> u32 {
+            self.entries.len() as u32
+        }
+
+        fn canonical_entry(
+            &self,
+            file_code: u32,
+        ) -> Result<(crate::constants::ValueTag, Vec<u8>), CoveError> {
+            self.entries
+                .get(file_code as usize)
+                .cloned()
+                .ok_or(CoveError::BadFileCode)
+        }
+    }
 
     fn k(t: i64, csn: u64) -> TemporalRowKey {
         TemporalRowKey {
@@ -450,6 +475,90 @@ mod tests {
         bytes
     }
 
+    fn temporal_segment_with_filecode_property(
+        rows: &[TemporalRowEntryV1],
+        codes: &[u32],
+    ) -> Vec<u8> {
+        let row_directory_offset = TEMPORAL_SEGMENT_HEADER_LEN as u64;
+        let row_bytes = (rows.len() * TEMPORAL_ROW_ENTRY_LEN) as u64;
+        let row_end = row_directory_offset + row_bytes;
+        let column_directory_offset = row_end;
+        let page_index_offset = column_directory_offset + TABLE_COLUMN_DIRECTORY_ENTRY_LEN as u64;
+        let page_index_length = crate::page::COLUMN_PAGE_INDEX_ENTRY_LEN as u64;
+        let data_offset = page_index_offset + page_index_length;
+        let mut value_bytes = Vec::with_capacity(codes.len() * 4);
+        for code in codes {
+            value_bytes.extend_from_slice(&code.to_le_bytes());
+        }
+        let payload = ColumnPagePayloadV1::build_single_node(
+            rows.len() as u32,
+            CoveEncodingKind::FileCode,
+            CoveLogicalType::Utf8,
+            CovePhysicalKind::FileCode,
+            None,
+            value_bytes,
+        )
+        .unwrap();
+        let header = TemporalSegmentHeaderV1 {
+            segment_id: 7,
+            object_type_id: 1,
+            time_range_start_us: rows.first().map(|row| row.timestamp_us).unwrap_or(0),
+            time_range_end_us: rows.last().map(|row| row.timestamp_us).unwrap_or(0),
+            csn_min: rows.first().map(|row| row.csn).unwrap_or(0),
+            csn_max: rows.last().map(|row| row.csn).unwrap_or(0),
+            row_count: rows.len() as u32,
+            morsel_count: u32::from(!rows.is_empty()),
+            morsel_row_count: if rows.is_empty() {
+                0
+            } else {
+                rows.len() as u32
+            },
+            column_count: 1,
+            row_directory_offset,
+            column_directory_offset,
+            page_index_offset,
+            data_offset,
+            flags: 0,
+            checksum: 0,
+        };
+        let directory = TableColumnDirectoryEntryV1 {
+            column_id: 1,
+            logical_type: CoveLogicalType::Utf8,
+            physical_kind: CovePhysicalKind::FileCode,
+            flags: 0,
+            page_index_offset,
+            page_index_length,
+            data_offset,
+            data_length: payload.len() as u64,
+            stats_ref: u32::MAX,
+            domain_ref: u32::MAX,
+            checksum: 0,
+        };
+        let page = ColumnPageIndexEntryV1 {
+            column_id: 1,
+            morsel_id: 0,
+            row_count: rows.len() as u32,
+            non_null_count: rows.len() as u32,
+            null_count: 0,
+            encoding_root: CoveEncodingKind::FileCode as u32,
+            page_offset: data_offset,
+            page_length: payload.len() as u64,
+            uncompressed_length: payload.len() as u64,
+            stats_ref: u32::MAX,
+            flags: 0,
+            checksum: checksum::crc32c(&payload),
+        };
+
+        let mut bytes = header.serialize().to_vec();
+        for row in rows {
+            bytes.extend_from_slice(&row.serialize());
+        }
+        bytes.extend_from_slice(&directory.serialize());
+        bytes.extend_from_slice(&page.serialize());
+        bytes.extend_from_slice(&payload);
+        bytes
+    }
+
     #[test]
     fn temporal_segment_data_roundtrip_validates() {
         let bytes = temporal_segment_bytes(&[temporal_row(10, 1), temporal_row(20, 2)]);
@@ -645,6 +754,51 @@ mod tests {
             manifest.verify_against(&[tampered]),
             Err(CoveError::DigestMismatch)
         );
+    }
+
+    #[cfg(feature = "digest-sha2")]
+    #[test]
+    fn trust_manifest_hashes_filecode_properties_by_canonical_value() {
+        let rows = [temporal_row(10, 1)];
+        let alpha = CanonicalValue::Utf8("alpha").encode().unwrap();
+        let beta = CanonicalValue::Utf8("beta").encode().unwrap();
+        let base_dictionary = TestTrustDictionary {
+            entries: vec![
+                (crate::constants::ValueTag::Utf8, alpha.clone()),
+                (crate::constants::ValueTag::Utf8, beta.clone()),
+            ],
+        };
+        let compacted_dictionary = TestTrustDictionary {
+            entries: vec![
+                (crate::constants::ValueTag::Utf8, beta),
+                (crate::constants::ValueTag::Utf8, alpha),
+            ],
+        };
+        let base_segment =
+            TemporalSegmentData::parse(&temporal_segment_with_filecode_property(&rows, &[0]))
+                .unwrap();
+        let compacted_segment =
+            TemporalSegmentData::parse(&temporal_segment_with_filecode_property(&rows, &[1]))
+                .unwrap();
+
+        let base_payload =
+            temporal_row_trust_payload(&base_segment, 0, Some(&base_dictionary), &[]).unwrap();
+        let compacted_payload =
+            temporal_row_trust_payload(&compacted_segment, 0, Some(&compacted_dictionary), &[])
+                .unwrap();
+        assert_eq!(base_payload, compacted_payload);
+
+        let expected_hash = trust_chain::chain(&[0; 32], &base_payload).unwrap();
+        let manifest = TrustManifest {
+            entries: vec![TrustManifestEntryV1 {
+                segment_id: 7,
+                row_index: 0,
+                expected_hash,
+            }],
+        };
+        assert!(manifest
+            .verify_against_with_dictionary(&[compacted_segment], Some(&compacted_dictionary), &[])
+            .is_ok());
     }
 
     #[test]

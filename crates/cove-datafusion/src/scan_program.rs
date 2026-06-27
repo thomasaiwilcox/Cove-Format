@@ -7,6 +7,10 @@
 use cove_core::{
     constants::{CoveLogicalType, CovePhysicalKind},
     index::lookup::LookupKeyKind,
+    native::{
+        NativeDecodeKernel, NativePredicateCost, NativePredicateExactness, NativeScanOp,
+        NativeScanProgram,
+    },
 };
 
 use crate::{
@@ -14,81 +18,11 @@ use crate::{
     planner::{CoveFilterUse, CovePredicate, FilterPlan, NumericPredicateOp},
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PredicateExactness {
-    PruningOnly,
-    FullRowPredicateExact,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DecodeKernel {
-    NullBitmap,
-    DirectFileCode,
-    PreparedFileCode,
-    PreparedNumCode,
-    PreparedVarBytes,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum PredicateCost {
-    NullBitmap,
-    NumericCode,
-    FileCode,
-    VarBytes,
-    ResidualOrUnsupported,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ScanOp {
-    Null {
-        column_index: usize,
-        column_id: u32,
-        exactness: PredicateExactness,
-        kernel: DecodeKernel,
-    },
-    Numeric {
-        column_index: usize,
-        column_id: u32,
-        exactness: PredicateExactness,
-        kernel: DecodeKernel,
-    },
-    FileCodeIn {
-        column_index: usize,
-        column_id: u32,
-        exactness: PredicateExactness,
-        kernel: DecodeKernel,
-        literal_count: usize,
-    },
-    VarBytesEq {
-        column_index: usize,
-        column_id: u32,
-        exactness: PredicateExactness,
-        kernel: DecodeKernel,
-        literal_len: usize,
-    },
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct CoveScanProgram {
-    pub ops: Vec<ScanOp>,
-    pub exact_filters: usize,
-    pub inexact_filters: usize,
-    pub lookup_rowref_eligible: bool,
-    pub predicate_ordered: bool,
-}
-
-impl CoveScanProgram {
-    pub fn display_summary(&self) -> String {
-        format!(
-            "ops={}, exact_filters={}, inexact_filters={}, lookup_rowref_eligible={}, predicate_ordered={}",
-            self.ops.len(),
-            self.exact_filters,
-            self.inexact_filters,
-            self.lookup_rowref_eligible,
-            self.predicate_ordered
-        )
-    }
-}
+pub type PredicateExactness = NativePredicateExactness;
+pub type DecodeKernel = NativeDecodeKernel;
+pub type PredicateCost = NativePredicateCost;
+pub type ScanOp = NativeScanOp;
+pub type CoveScanProgram = NativeScanProgram;
 
 /// Promote a lowered filter only when Cove can evaluate the full row predicate
 /// itself. Unsupported or advisory-only predicates stay pruning-only so
@@ -140,6 +74,20 @@ pub fn compile_scan_program(state: &DatasetState, filters: &[FilterPlan]) -> Cov
                 exactness,
                 kernel,
             },
+            CovePredicate::NumericIn { literals, .. } => ScanOp::NumericIn {
+                column_index,
+                column_id: column.column_id,
+                exactness,
+                kernel,
+                literal_count: literals.len(),
+            },
+            CovePredicate::NumericNotIn { literals, .. } => ScanOp::NumericNotIn {
+                column_index,
+                column_id: column.column_id,
+                exactness,
+                kernel,
+                literal_count: literals.len(),
+            },
             CovePredicate::FileCodeIn {
                 file_codes,
                 canonical_values,
@@ -155,12 +103,56 @@ pub fn compile_scan_program(state: &DatasetState, filters: &[FilterPlan]) -> Cov
                     .max(canonical_values.len())
                     .max(canonical_keys.len()),
             },
+            CovePredicate::FileCodeNotIn {
+                file_codes,
+                canonical_values,
+                canonical_keys,
+                ..
+            } => ScanOp::FileCodeNotIn {
+                column_index,
+                column_id: column.column_id,
+                exactness,
+                kernel,
+                literal_count: file_codes
+                    .len()
+                    .max(canonical_values.len())
+                    .max(canonical_keys.len()),
+            },
+            CovePredicate::FixedBytesEq { literal, .. } => ScanOp::FixedBytesEq {
+                column_index,
+                column_id: column.column_id,
+                exactness,
+                kernel,
+                literal_len: literal.len(),
+            },
+            CovePredicate::FixedBytesIn { literals, .. } => ScanOp::FixedBytesIn {
+                column_index,
+                column_id: column.column_id,
+                exactness,
+                kernel,
+                literal_count: literals.len(),
+                literal_len: literals.first().map_or(0, Vec::len),
+            },
             CovePredicate::VarBytesEq { literal, .. } => ScanOp::VarBytesEq {
                 column_index,
                 column_id: column.column_id,
                 exactness,
                 kernel,
                 literal_len: literal.len(),
+            },
+            CovePredicate::VarBytesIn { literals, .. } => ScanOp::VarBytesIn {
+                column_index,
+                column_id: column.column_id,
+                exactness,
+                kernel,
+                literal_count: literals.len(),
+            },
+            CovePredicate::VarBytesPrefix { prefix, .. } => ScanOp::VarBytesPrefix {
+                column_index,
+                column_id: column.column_id,
+                exactness,
+                kernel,
+                literal_len: prefix.len(),
             },
         };
         program.ops.push(op);
@@ -185,9 +177,22 @@ pub fn predicate_cost(filter: &FilterPlan) -> PredicateCost {
     }
     match filter.predicate {
         Some(CovePredicate::Null { .. }) => PredicateCost::NullBitmap,
-        Some(CovePredicate::Numeric { .. }) => PredicateCost::NumericCode,
-        Some(CovePredicate::FileCodeIn { .. }) => PredicateCost::FileCode,
-        Some(CovePredicate::VarBytesEq { .. }) => PredicateCost::VarBytes,
+        Some(
+            CovePredicate::Numeric { .. }
+            | CovePredicate::NumericIn { .. }
+            | CovePredicate::NumericNotIn { .. },
+        ) => PredicateCost::NumericCode,
+        Some(CovePredicate::FileCodeIn { .. } | CovePredicate::FileCodeNotIn { .. }) => {
+            PredicateCost::FileCode
+        }
+        Some(CovePredicate::FixedBytesEq { .. } | CovePredicate::FixedBytesIn { .. }) => {
+            PredicateCost::VarBytes
+        }
+        Some(
+            CovePredicate::VarBytesEq { .. }
+            | CovePredicate::VarBytesIn { .. }
+            | CovePredicate::VarBytesPrefix { .. },
+        ) => PredicateCost::VarBytes,
         None => PredicateCost::ResidualOrUnsupported,
     }
 }
@@ -205,7 +210,13 @@ fn filter_exactness(state: &DatasetState, filter: &FilterPlan) -> PredicateExact
         return PredicateExactness::PruningOnly;
     };
     match predicate {
-        CovePredicate::Null { .. } => PredicateExactness::PruningOnly,
+        CovePredicate::Null { column_index, .. } => {
+            if state.table().columns.get(*column_index).is_some() {
+                PredicateExactness::FullRowPredicateExact
+            } else {
+                PredicateExactness::PruningOnly
+            }
+        }
         CovePredicate::Numeric { column_index, .. } => {
             let Some(column) = state.table().columns.get(*column_index) else {
                 return PredicateExactness::PruningOnly;
@@ -216,7 +227,34 @@ fn filter_exactness(state: &DatasetState, filter: &FilterPlan) -> PredicateExact
                 PredicateExactness::PruningOnly
             }
         }
+        CovePredicate::NumericIn { column_index, .. } => {
+            let Some(column) = state.table().columns.get(*column_index) else {
+                return PredicateExactness::PruningOnly;
+            };
+            if column.physical == CovePhysicalKind::NumCode {
+                PredicateExactness::FullRowPredicateExact
+            } else {
+                PredicateExactness::PruningOnly
+            }
+        }
+        CovePredicate::NumericNotIn { column_index, .. } => {
+            let Some(column) = state.table().columns.get(*column_index) else {
+                return PredicateExactness::PruningOnly;
+            };
+            if column.physical == CovePhysicalKind::NumCode
+                && non_float_numeric_complement_supported(column.logical)
+            {
+                PredicateExactness::FullRowPredicateExact
+            } else {
+                PredicateExactness::PruningOnly
+            }
+        }
         CovePredicate::FileCodeIn {
+            column_index,
+            canonical_values,
+            ..
+        }
+        | CovePredicate::FileCodeNotIn {
             column_index,
             canonical_values,
             ..
@@ -240,7 +278,31 @@ fn filter_exactness(state: &DatasetState, filter: &FilterPlan) -> PredicateExact
             }
             PredicateExactness::FullRowPredicateExact
         }
-        CovePredicate::VarBytesEq { column_index, .. } => {
+        CovePredicate::FixedBytesEq { column_index, .. }
+        | CovePredicate::FixedBytesIn { column_index, .. } => {
+            let Some(column) = state.table().columns.get(*column_index) else {
+                return PredicateExactness::PruningOnly;
+            };
+            if column.physical == CovePhysicalKind::FixedBytes {
+                PredicateExactness::FullRowPredicateExact
+            } else {
+                PredicateExactness::PruningOnly
+            }
+        }
+        CovePredicate::VarBytesEq { column_index, .. }
+        | CovePredicate::VarBytesIn { column_index, .. } => {
+            let Some(column) = state.table().columns.get(*column_index) else {
+                return PredicateExactness::PruningOnly;
+            };
+            if column.physical == CovePhysicalKind::VarBytes
+                && column.logical == CoveLogicalType::Utf8
+            {
+                PredicateExactness::FullRowPredicateExact
+            } else {
+                PredicateExactness::PruningOnly
+            }
+        }
+        CovePredicate::VarBytesPrefix { column_index, .. } => {
             let Some(column) = state.table().columns.get(*column_index) else {
                 return PredicateExactness::PruningOnly;
             };
@@ -266,7 +328,8 @@ fn lookup_rowref_eligible(state: &DatasetState, filters: &[FilterPlan]) -> bool 
                     CovePredicate::Numeric {
                         op: NumericPredicateOp::Eq,
                         ..
-                    } | CovePredicate::FileCodeIn { .. }
+                    } | CovePredicate::NumericIn { .. }
+                        | CovePredicate::FileCodeIn { .. }
                 )
             )
         })
@@ -293,6 +356,17 @@ fn lookup_rowref_eligible(state: &DatasetState, filters: &[FilterPlan]) -> bool 
         {
             (*column_index, LookupKeyKind::NumCode)
         }
+        CovePredicate::NumericIn {
+            column_index,
+            literals,
+        } if state
+            .table()
+            .columns
+            .get(*column_index)
+            .is_some_and(|column| !numeric_in_lookup_keys(column.logical, literals).is_empty()) =>
+        {
+            (*column_index, LookupKeyKind::NumCode)
+        }
         _ => return false,
     };
     let Some(column) = state.table().columns.get(column_index) else {
@@ -308,9 +382,18 @@ fn lookup_rowref_eligible(state: &DatasetState, filters: &[FilterPlan]) -> bool 
 fn predicate_kernel(predicate: &CovePredicate) -> DecodeKernel {
     match predicate {
         CovePredicate::Null { .. } => DecodeKernel::NullBitmap,
-        CovePredicate::Numeric { .. } => DecodeKernel::PreparedNumCode,
-        CovePredicate::FileCodeIn { .. } => DecodeKernel::PreparedFileCode,
-        CovePredicate::VarBytesEq { .. } => DecodeKernel::PreparedVarBytes,
+        CovePredicate::Numeric { .. }
+        | CovePredicate::NumericIn { .. }
+        | CovePredicate::NumericNotIn { .. } => DecodeKernel::PreparedNumCode,
+        CovePredicate::FileCodeIn { .. } | CovePredicate::FileCodeNotIn { .. } => {
+            DecodeKernel::PreparedFileCode
+        }
+        CovePredicate::FixedBytesEq { .. } | CovePredicate::FixedBytesIn { .. } => {
+            DecodeKernel::PreparedFixedBytes
+        }
+        CovePredicate::VarBytesEq { .. }
+        | CovePredicate::VarBytesIn { .. }
+        | CovePredicate::VarBytesPrefix { .. } => DecodeKernel::PreparedVarBytes,
     }
 }
 
@@ -318,9 +401,35 @@ fn predicate_column_index(predicate: &CovePredicate) -> Option<usize> {
     match predicate {
         CovePredicate::Null { column_index, .. }
         | CovePredicate::Numeric { column_index, .. }
+        | CovePredicate::NumericIn { column_index, .. }
+        | CovePredicate::NumericNotIn { column_index, .. }
         | CovePredicate::FileCodeIn { column_index, .. }
+        | CovePredicate::FileCodeNotIn { column_index, .. }
+        | CovePredicate::FixedBytesEq { column_index, .. }
+        | CovePredicate::FixedBytesIn { column_index, .. }
+        | CovePredicate::VarBytesPrefix { column_index, .. }
+        | CovePredicate::VarBytesIn { column_index, .. }
         | CovePredicate::VarBytesEq { column_index, .. } => Some(*column_index),
     }
+}
+
+fn non_float_numeric_complement_supported(logical: CoveLogicalType) -> bool {
+    !matches!(logical, CoveLogicalType::Float32 | CoveLogicalType::Float64)
+}
+
+fn numeric_in_lookup_keys(
+    logical: CoveLogicalType,
+    literals: &[crate::planner::PredicateLiteral],
+) -> Vec<u64> {
+    let mut keys = Vec::new();
+    for literal in literals {
+        for key in crate::decode::numeric_lookup_keys(logical, *literal) {
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+    }
+    keys
 }
 
 #[cfg(test)]
@@ -379,5 +488,27 @@ mod tests {
         assert!(!order_filters_by_cost(&mut filters));
         assert_eq!(filters[0].display, "b > 10");
         assert_eq!(filters[1].display, "a = 1");
+    }
+
+    #[test]
+    fn scan_program_contract_is_shared_with_cove_core_native() {
+        let op = ScanOp::Null {
+            column_index: 1,
+            column_id: 9,
+            exactness: PredicateExactness::FullRowPredicateExact,
+            kernel: DecodeKernel::NullBitmap,
+        };
+        let native_op: cove_core::native::NativeScanOp = op.clone();
+        assert_eq!(native_op, op);
+
+        let program = CoveScanProgram {
+            ops: vec![op],
+            exact_filters: 1,
+            inexact_filters: 0,
+            lookup_rowref_eligible: false,
+            predicate_ordered: true,
+        };
+        let native_program: cove_core::native::NativeScanProgram = program.clone();
+        assert_eq!(native_program, program);
     }
 }

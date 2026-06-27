@@ -1,0 +1,34 @@
+{
+  "expected_conversion": {
+    "ambiguous_alias_count": 1,
+    "candidate_match_count": 1,
+    "object_count": 0,
+    "resolver_hit_count": 0,
+    "resolver_miss_count": 0,
+    "row_count": 1,
+    "source_count": 1
+  },
+  "expected_conversion_summary": {
+    "assertion_count": 1,
+    "evidence_entry_count": 1,
+    "materialized_row_count": 0
+  },
+  "expected_evidence_entries": [
+    {
+      "contains": {
+        "alias_ambiguous": true,
+        "alias_catalog_id": "company_aliases",
+        "candidate": true
+      },
+      "present": [
+        "resolver_digest",
+        "catalog_digest",
+        "pipeline_digest"
+      ]
+    }
+  ],
+  "mapping": "accept/cove_map_resolution_alias_normalized_collision_candidate.covemap",
+  "sources": [
+    "accept/company_alias_normalized_collision_candidate.csv"
+  ]
+}

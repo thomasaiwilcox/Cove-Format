@@ -1,0 +1,5 @@
+{
+  "case_id": "delta-manifest-order",
+  "manifest_payload": "durable-covm-candidate",
+  "payload": "durable-covedelta-candidate"
+}
