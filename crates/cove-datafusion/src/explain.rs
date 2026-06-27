@@ -872,8 +872,15 @@ fn residual_report(plan: &ScanPlan) -> Value {
         .map(|op| match op {
             crate::scan_program::ScanOp::Null { exactness, .. }
             | crate::scan_program::ScanOp::Numeric { exactness, .. }
+            | crate::scan_program::ScanOp::NumericIn { exactness, .. }
+            | crate::scan_program::ScanOp::NumericNotIn { exactness, .. }
             | crate::scan_program::ScanOp::FileCodeIn { exactness, .. }
-            | crate::scan_program::ScanOp::VarBytesEq { exactness, .. } => *exactness,
+            | crate::scan_program::ScanOp::FileCodeNotIn { exactness, .. }
+            | crate::scan_program::ScanOp::FixedBytesEq { exactness, .. }
+            | crate::scan_program::ScanOp::FixedBytesIn { exactness, .. }
+            | crate::scan_program::ScanOp::VarBytesEq { exactness, .. }
+            | crate::scan_program::ScanOp::VarBytesIn { exactness, .. }
+            | crate::scan_program::ScanOp::VarBytesPrefix { exactness, .. } => *exactness,
         })
         .collect::<Vec<_>>();
     json!({
@@ -975,30 +982,161 @@ fn synthetic_report_morsels(
 }
 
 fn decode_stats_json(stats: DecodeStats) -> Value {
-    json!({
-        "metadata_bytes_read": stats.metadata_bytes_read,
-        "data_bytes_read": stats.data_bytes_read,
-        "range_requests": stats.range_requests,
-        "original_range_requests": stats.original_range_requests,
-        "coalesced_range_requests": stats.coalesced_range_requests,
-        "range_bytes_requested": stats.range_bytes_requested,
-        "range_bytes_used": stats.range_bytes_used,
-        "pages_decoded": stats.pages_decoded,
-        "rows_selected": stats.rows_selected,
-        "rows_materialized": stats.rows_materialized,
-        "morsels_considered": stats.morsels_considered,
-        "morsels_pruned": stats.morsels_pruned,
-        "scan_tasks": stats.scan_tasks,
-        "scan_partitions": stats.scan_partitions,
-        "residual_rows": stats.residual_rows,
-        "exact_predicates": stats.exact_predicates,
-        "residual_predicates": stats.residual_predicates,
-        "zero_copy_compatible_buffers": stats.zero_copy_compatible_buffers,
-        "zero_copy_materialized_buffers": stats.zero_copy_materialized_buffers,
-        "lookup_index_hits": stats.lookup_index_hits,
-        "lookup_index_misses": stats.lookup_index_misses,
-        "index_fallbacks": stats.index_fallbacks,
-    })
+    let mut out = serde_json::Map::new();
+    macro_rules! insert_stat {
+        ($name:literal, $value:expr) => {
+            out.insert($name.into(), json!($value));
+        };
+    }
+    insert_stat!("metadata_bytes_read", stats.metadata_bytes_read);
+    insert_stat!("data_bytes_read", stats.data_bytes_read);
+    insert_stat!("range_requests", stats.range_requests);
+    insert_stat!("original_range_requests", stats.original_range_requests);
+    insert_stat!("coalesced_range_requests", stats.coalesced_range_requests);
+    insert_stat!("range_bytes_requested", stats.range_bytes_requested);
+    insert_stat!("range_bytes_used", stats.range_bytes_used);
+    insert_stat!("pages_decoded", stats.pages_decoded);
+    insert_stat!("rows_selected", stats.rows_selected);
+    insert_stat!("rows_materialized", stats.rows_materialized);
+    insert_stat!("morsels_considered", stats.morsels_considered);
+    insert_stat!("morsels_pruned", stats.morsels_pruned);
+    insert_stat!("scan_tasks", stats.scan_tasks);
+    insert_stat!("scan_partitions", stats.scan_partitions);
+    insert_stat!("residual_rows", stats.residual_rows);
+    insert_stat!("exact_predicates", stats.exact_predicates);
+    insert_stat!("residual_predicates", stats.residual_predicates);
+    insert_stat!(
+        "zero_copy_compatible_buffers",
+        stats.zero_copy_compatible_buffers
+    );
+    insert_stat!(
+        "zero_copy_materialized_buffers",
+        stats.zero_copy_materialized_buffers
+    );
+    insert_stat!("lookup_index_hits", stats.lookup_index_hits);
+    insert_stat!("lookup_index_misses", stats.lookup_index_misses);
+    insert_stat!("index_fallbacks", stats.index_fallbacks);
+    insert_stat!(
+        "native_bitmap_intersections",
+        stats.native_bitmap_intersections
+    );
+    insert_stat!(
+        "native_bitmap_intersection_scalar",
+        stats.native_bitmap_intersection_scalar
+    );
+    insert_stat!(
+        "native_bitmap_intersection_avx2",
+        stats.native_bitmap_intersection_avx2
+    );
+    insert_stat!(
+        "native_bitmap_intersection_neon",
+        stats.native_bitmap_intersection_neon
+    );
+    insert_stat!("native_table_batches", stats.native_table_batches);
+    insert_stat!("native_table_pages", stats.native_table_pages);
+    insert_stat!(
+        "native_table_decode_boundaries",
+        stats.native_table_decode_boundaries
+    );
+    insert_stat!("native_lane_predicates", stats.native_lane_predicates);
+    insert_stat!(
+        "native_lane_predicate_rows_seen",
+        stats.native_lane_predicate_rows_seen
+    );
+    insert_stat!(
+        "native_lane_predicate_rows_matched",
+        stats.native_lane_predicate_rows_matched
+    );
+    insert_stat!(
+        "native_lane_predicate_bytes_touched",
+        stats.native_lane_predicate_bytes_touched
+    );
+    insert_stat!(
+        "native_lane_predicate_dispatch_scalar",
+        stats.native_lane_predicate_dispatch_scalar
+    );
+    insert_stat!(
+        "native_lane_predicate_dispatch_avx2",
+        stats.native_lane_predicate_dispatch_avx2
+    );
+    insert_stat!(
+        "native_lane_predicate_dispatch_neon",
+        stats.native_lane_predicate_dispatch_neon
+    );
+    insert_stat!("native_aggregate_kernels", stats.native_aggregate_kernels);
+    insert_stat!(
+        "native_aggregate_rows_seen",
+        stats.native_aggregate_rows_seen
+    );
+    insert_stat!(
+        "native_aggregate_rows_matched",
+        stats.native_aggregate_rows_matched
+    );
+    insert_stat!(
+        "native_aggregate_bytes_touched",
+        stats.native_aggregate_bytes_touched
+    );
+    insert_stat!(
+        "native_aggregate_dispatch_scalar",
+        stats.native_aggregate_dispatch_scalar
+    );
+    insert_stat!(
+        "native_aggregate_dispatch_avx2",
+        stats.native_aggregate_dispatch_avx2
+    );
+    insert_stat!(
+        "native_aggregate_dispatch_neon",
+        stats.native_aggregate_dispatch_neon
+    );
+    insert_stat!("native_group_kernels", stats.native_group_kernels);
+    insert_stat!("native_group_rows_seen", stats.native_group_rows_seen);
+    insert_stat!("native_group_rows_matched", stats.native_group_rows_matched);
+    insert_stat!(
+        "native_group_bytes_touched",
+        stats.native_group_bytes_touched
+    );
+    insert_stat!(
+        "native_group_dispatch_scalar",
+        stats.native_group_dispatch_scalar
+    );
+    insert_stat!(
+        "native_group_dispatch_avx2",
+        stats.native_group_dispatch_avx2
+    );
+    insert_stat!(
+        "native_group_dispatch_neon",
+        stats.native_group_dispatch_neon
+    );
+    insert_stat!("native_count_scans", stats.native_count_scans);
+    insert_stat!("native_count_rows_seen", stats.native_count_rows_seen);
+    insert_stat!("native_count_rows_matched", stats.native_count_rows_matched);
+    insert_stat!("native_sort_kernels", stats.native_sort_kernels);
+    insert_stat!("native_sort_rows_seen", stats.native_sort_rows_seen);
+    insert_stat!("native_sort_rows_matched", stats.native_sort_rows_matched);
+    insert_stat!("native_sort_bytes_touched", stats.native_sort_bytes_touched);
+    insert_stat!(
+        "native_sort_dispatch_scalar",
+        stats.native_sort_dispatch_scalar
+    );
+    insert_stat!("native_sort_dispatch_avx2", stats.native_sort_dispatch_avx2);
+    insert_stat!("native_sort_dispatch_neon", stats.native_sort_dispatch_neon);
+    insert_stat!("native_join_kernels", stats.native_join_kernels);
+    insert_stat!("native_join_rows_seen", stats.native_join_rows_seen);
+    insert_stat!("native_join_rows_matched", stats.native_join_rows_matched);
+    insert_stat!("native_join_bytes_touched", stats.native_join_bytes_touched);
+    insert_stat!(
+        "native_join_dispatch_scalar",
+        stats.native_join_dispatch_scalar
+    );
+    insert_stat!("native_join_dispatch_avx2", stats.native_join_dispatch_avx2);
+    insert_stat!("native_join_dispatch_neon", stats.native_join_dispatch_neon);
+    insert_stat!("native_projection_batches", stats.native_projection_batches);
+    insert_stat!("native_projection_pages", stats.native_projection_pages);
+    insert_stat!(
+        "native_projection_decode_boundaries",
+        stats.native_projection_decode_boundaries
+    );
+    Value::Object(out)
 }
 
 impl Default for CoalescedRangeStats {
@@ -1066,6 +1204,134 @@ mod tests {
             reject_residual_required(&plan),
             Err(CoveError::UnsupportedEncoding(_))
         ));
+    }
+
+    #[test]
+    fn decode_stats_json_reports_native_lane_kernel_counters() {
+        let stats = DecodeStats {
+            native_lane_predicates: 2,
+            native_lane_predicate_rows_seen: 128,
+            native_lane_predicate_rows_matched: 9,
+            native_lane_predicate_bytes_touched: 1024,
+            native_lane_predicate_dispatch_scalar: 1,
+            native_lane_predicate_dispatch_avx2: 0,
+            native_lane_predicate_dispatch_neon: 1,
+            ..DecodeStats::default()
+        };
+
+        let value = decode_stats_json(stats);
+
+        assert_eq!(value["native_lane_predicates"], 2);
+        assert_eq!(value["native_lane_predicate_rows_seen"], 128);
+        assert_eq!(value["native_lane_predicate_rows_matched"], 9);
+        assert_eq!(value["native_lane_predicate_bytes_touched"], 1024);
+        assert_eq!(value["native_lane_predicate_dispatch_scalar"], 1);
+        assert_eq!(value["native_lane_predicate_dispatch_avx2"], 0);
+        assert_eq!(value["native_lane_predicate_dispatch_neon"], 1);
+    }
+
+    #[test]
+    fn decode_stats_json_reports_native_aggregate_kernel_counters() {
+        let stats = DecodeStats {
+            native_aggregate_kernels: 3,
+            native_aggregate_rows_seen: 192,
+            native_aggregate_rows_matched: 120,
+            native_aggregate_bytes_touched: 1536,
+            native_aggregate_dispatch_scalar: 3,
+            ..DecodeStats::default()
+        };
+
+        let value = decode_stats_json(stats);
+
+        assert_eq!(value["native_aggregate_kernels"], 3);
+        assert_eq!(value["native_aggregate_rows_seen"], 192);
+        assert_eq!(value["native_aggregate_rows_matched"], 120);
+        assert_eq!(value["native_aggregate_bytes_touched"], 1536);
+        assert_eq!(value["native_aggregate_dispatch_scalar"], 3);
+        assert_eq!(value["native_aggregate_dispatch_avx2"], 0);
+        assert_eq!(value["native_aggregate_dispatch_neon"], 0);
+    }
+
+    #[test]
+    fn decode_stats_json_reports_native_group_kernel_counters() {
+        let stats = DecodeStats {
+            native_group_kernels: 2,
+            native_group_rows_seen: 64,
+            native_group_rows_matched: 61,
+            native_group_bytes_touched: 512,
+            native_group_dispatch_scalar: 2,
+            ..DecodeStats::default()
+        };
+
+        let value = decode_stats_json(stats);
+
+        assert_eq!(value["native_group_kernels"], 2);
+        assert_eq!(value["native_group_rows_seen"], 64);
+        assert_eq!(value["native_group_rows_matched"], 61);
+        assert_eq!(value["native_group_bytes_touched"], 512);
+        assert_eq!(value["native_group_dispatch_scalar"], 2);
+        assert_eq!(value["native_group_dispatch_avx2"], 0);
+        assert_eq!(value["native_group_dispatch_neon"], 0);
+    }
+
+    #[test]
+    fn decode_stats_json_reports_native_count_counters() {
+        let stats = DecodeStats {
+            native_count_scans: 4,
+            native_count_rows_seen: 256,
+            native_count_rows_matched: 99,
+            ..DecodeStats::default()
+        };
+
+        let value = decode_stats_json(stats);
+
+        assert_eq!(value["native_count_scans"], 4);
+        assert_eq!(value["native_count_rows_seen"], 256);
+        assert_eq!(value["native_count_rows_matched"], 99);
+    }
+
+    #[test]
+    fn decode_stats_json_reports_native_sort_kernel_counters() {
+        let stats = DecodeStats {
+            native_sort_kernels: 2,
+            native_sort_rows_seen: 128,
+            native_sort_rows_matched: 7,
+            native_sort_bytes_touched: 1024,
+            native_sort_dispatch_scalar: 2,
+            ..DecodeStats::default()
+        };
+
+        let value = decode_stats_json(stats);
+
+        assert_eq!(value["native_sort_kernels"], 2);
+        assert_eq!(value["native_sort_rows_seen"], 128);
+        assert_eq!(value["native_sort_rows_matched"], 7);
+        assert_eq!(value["native_sort_bytes_touched"], 1024);
+        assert_eq!(value["native_sort_dispatch_scalar"], 2);
+        assert_eq!(value["native_sort_dispatch_avx2"], 0);
+        assert_eq!(value["native_sort_dispatch_neon"], 0);
+    }
+
+    #[test]
+    fn decode_stats_json_reports_native_join_kernel_counters() {
+        let stats = DecodeStats {
+            native_join_kernels: 2,
+            native_join_rows_seen: 96,
+            native_join_rows_matched: 90,
+            native_join_bytes_touched: 768,
+            native_join_dispatch_scalar: 2,
+            ..DecodeStats::default()
+        };
+
+        let value = decode_stats_json(stats);
+
+        assert_eq!(value["native_join_kernels"], 2);
+        assert_eq!(value["native_join_rows_seen"], 96);
+        assert_eq!(value["native_join_rows_matched"], 90);
+        assert_eq!(value["native_join_bytes_touched"], 768);
+        assert_eq!(value["native_join_dispatch_scalar"], 2);
+        assert_eq!(value["native_join_dispatch_avx2"], 0);
+        assert_eq!(value["native_join_dispatch_neon"], 0);
     }
 
     #[test]

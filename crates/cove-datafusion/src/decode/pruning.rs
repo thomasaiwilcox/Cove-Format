@@ -1,13 +1,42 @@
 use super::materialize::{
     encoded_array_for_page, materialize_page_payload, materialize_page_payload_from_wire,
 };
-use super::morsels::SegmentMetadata;
+use super::morsels::{PreparedSegmentColumn, SegmentMetadata};
 use super::predicates::{
     lookup_selection_for_morsel, plan_has_row_predicate, predicate_column_index,
-    predicate_is_index_covered, try_apply_predicate_to_selection,
-    try_apply_raw_predicate_to_selection,
+    predicate_is_index_covered, try_apply_native_lane_predicate_to_selection,
+    try_apply_predicate_to_selection, try_apply_raw_predicate_to_selection,
 };
 use super::*;
+use cove_core::native::{native_lane_from_column_page_payload, LaneRef, NativeCodeDomain};
+
+fn try_apply_native_table_page_predicate_to_selection(
+    predicate: &CovePredicate,
+    segment_ref: &TableSegmentIndexEntryV1,
+    segment_column: &PreparedSegmentColumn,
+    page: &ColumnPageIndexEntryV1,
+    payload: &RetainedColumnPagePayloadV1,
+    selected: &mut SelectionMask,
+    stats: &mut DecodeStats,
+) -> Result<Option<()>, CoveError> {
+    let mut domain = NativeCodeDomain::default();
+    domain.table_id = Some(segment_ref.table_id);
+    let lane =
+        native_lane_from_column_page_payload(segment_column.directory(), page, payload, domain)?;
+    stats.native_table_batches += 1;
+    stats.native_table_pages += 1;
+    if matches!(&lane, LaneRef::DecodeBoundary { .. }) {
+        stats.native_table_decode_boundaries += 1;
+    }
+    let applied = try_apply_native_lane_predicate_to_selection(predicate, &lane, selected)?;
+    if let Some(kernel_stats) = applied {
+        stats.native_lane_predicates += 1;
+        stats.record_native_lane_kernel(kernel_stats);
+        Ok(Some(()))
+    } else {
+        Ok(None)
+    }
+}
 
 fn apply_overlay_to_rows(
     state: &DatasetState,
@@ -218,15 +247,15 @@ pub(super) fn selected_rows_for_morsel(
         let Some(predicate) = &filter.predicate else {
             continue;
         };
-        if matches!(predicate, CovePredicate::Null { .. }) {
-            continue;
-        }
         if skip_index_predicates && predicate_is_index_covered(state, predicate) {
             continue;
         }
         if matches!(
             predicate,
             CovePredicate::FileCodeIn { file_codes, .. } if file_codes.is_empty()
+        ) || matches!(
+            predicate,
+            CovePredicate::NumericIn { literals, .. } if literals.is_empty()
         ) {
             scratch.selection = Selection::None;
             return Ok(());
@@ -275,27 +304,43 @@ pub(super) fn selected_rows_for_morsel(
             .data_bytes_read
             .checked_add(usize::try_from(page.page_length).map_err(|_| CoveError::OffsetRange)?)
             .ok_or_else(|| CoveError::ArithOverflow)?;
-        let dictionary = if matches!(predicate, CovePredicate::FileCodeIn { .. }) {
-            None
-        } else {
-            state.mounted().dictionary.as_ref()
-        };
-        let array = encoded_array_for_page(&payload, page, dictionary)?;
-        let applied = match try_apply_raw_predicate_to_selection(
+        let applied = match try_apply_native_table_page_predicate_to_selection(
             predicate,
-            &array,
+            segment_ref,
+            segment_column,
+            page,
+            &payload,
             &mut scratch.selected_mask,
-            &mut scratch.filter_mask,
+            stats,
         )? {
             Some(()) => true,
             None => {
-                let prepared = array.prepare()?;
-                try_apply_predicate_to_selection(
+                let dictionary = if matches!(
                     predicate,
-                    &prepared,
+                    CovePredicate::FileCodeIn { .. } | CovePredicate::FileCodeNotIn { .. }
+                ) {
+                    None
+                } else {
+                    state.mounted().dictionary.as_ref()
+                };
+                let array = encoded_array_for_page(&payload, page, dictionary)?;
+                match try_apply_raw_predicate_to_selection(
+                    predicate,
+                    &array,
                     &mut scratch.selected_mask,
                     &mut scratch.filter_mask,
-                )?
+                )? {
+                    Some(()) => true,
+                    None => {
+                        let prepared = array.prepare()?;
+                        try_apply_predicate_to_selection(
+                            predicate,
+                            &prepared,
+                            &mut scratch.selected_mask,
+                            &mut scratch.filter_mask,
+                        )?
+                    }
+                }
             }
         };
         if !applied {
@@ -399,15 +444,15 @@ pub(super) async fn selected_rows_for_morsel_metadata<R: CoveRangeReader + ?Size
         let Some(predicate) = &filter.predicate else {
             continue;
         };
-        if matches!(predicate, CovePredicate::Null { .. }) {
-            continue;
-        }
         if skip_index_predicates && predicate_is_index_covered(state, predicate) {
             continue;
         }
         if matches!(
             predicate,
             CovePredicate::FileCodeIn { file_codes, .. } if file_codes.is_empty()
+        ) || matches!(
+            predicate,
+            CovePredicate::NumericIn { literals, .. } if literals.is_empty()
         ) {
             scratch.selection = Selection::None;
             return Ok(());
@@ -454,27 +499,43 @@ pub(super) async fn selected_rows_for_morsel_metadata<R: CoveRangeReader + ?Size
             }
             Err(error) => return Err(error),
         };
-        let dictionary = if matches!(predicate, CovePredicate::FileCodeIn { .. }) {
-            None
-        } else {
-            state.mounted().dictionary.as_ref()
-        };
-        let array = encoded_array_for_page(&payload, page, dictionary)?;
-        let applied = match try_apply_raw_predicate_to_selection(
+        let applied = match try_apply_native_table_page_predicate_to_selection(
             predicate,
-            &array,
+            segment_ref,
+            segment_column,
+            page,
+            &payload,
             &mut scratch.selected_mask,
-            &mut scratch.filter_mask,
+            stats,
         )? {
             Some(()) => true,
             None => {
-                let prepared = array.prepare()?;
-                try_apply_predicate_to_selection(
+                let dictionary = if matches!(
                     predicate,
-                    &prepared,
+                    CovePredicate::FileCodeIn { .. } | CovePredicate::FileCodeNotIn { .. }
+                ) {
+                    None
+                } else {
+                    state.mounted().dictionary.as_ref()
+                };
+                let array = encoded_array_for_page(&payload, page, dictionary)?;
+                match try_apply_raw_predicate_to_selection(
+                    predicate,
+                    &array,
                     &mut scratch.selected_mask,
                     &mut scratch.filter_mask,
-                )?
+                )? {
+                    Some(()) => true,
+                    None => {
+                        let prepared = array.prepare()?;
+                        try_apply_predicate_to_selection(
+                            predicate,
+                            &prepared,
+                            &mut scratch.selected_mask,
+                            &mut scratch.filter_mask,
+                        )?
+                    }
+                }
             }
         };
         if !applied {
@@ -553,7 +614,7 @@ pub(super) fn should_prune_morsel(
     stats: &mut DecodeStats,
 ) -> Result<bool, CoveError> {
     for filter in &plan.filters {
-        if filter.use_kind != CoveFilterUse::PruningOnly {
+        if filter.use_kind == CoveFilterUse::Unsupported {
             continue;
         }
         let Some(CovePredicate::Null { column_index, kind }) = filter.predicate.as_ref() else {
@@ -582,7 +643,7 @@ pub(super) fn should_prune_morsel_metadata(
     stats: &mut DecodeStats,
 ) -> Result<bool, CoveError> {
     for filter in &plan.filters {
-        if filter.use_kind != CoveFilterUse::PruningOnly {
+        if filter.use_kind == CoveFilterUse::Unsupported {
             continue;
         }
         let Some(CovePredicate::Null { column_index, kind }) = filter.predicate.as_ref() else {

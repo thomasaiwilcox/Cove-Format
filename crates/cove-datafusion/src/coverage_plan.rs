@@ -300,6 +300,17 @@ impl PredicateFormMatch {
                     && self.literal.as_deref()
                         == canonical_numeric_literal(self.logical, *literal).as_deref()
             }
+            CovePredicate::NumericIn {
+                column_index,
+                literals,
+            } => {
+                self.column_index == *column_index
+                    && self.op == CoverageAtomOp::Eq
+                    && literals.len() == 1
+                    && self.literal.as_deref()
+                        == canonical_numeric_literal(self.logical, literals[0]).as_deref()
+            }
+            CovePredicate::NumericNotIn { .. } => false,
             CovePredicate::FileCodeIn {
                 column_index,
                 canonical_values,
@@ -310,6 +321,9 @@ impl PredicateFormMatch {
                     && canonical_values.len() == 1
                     && self.literal.as_deref() == Some(canonical_values[0].as_slice())
             }
+            CovePredicate::FileCodeNotIn { .. } => false,
+            CovePredicate::FixedBytesEq { .. } | CovePredicate::FixedBytesIn { .. } => false,
+            CovePredicate::VarBytesIn { .. } | CovePredicate::VarBytesPrefix { .. } => false,
             CovePredicate::VarBytesEq {
                 column_index,
                 literal,

@@ -161,6 +161,9 @@ fn filters_need_execution_codes(filters: &[FilterPlan]) -> bool {
             Some(CovePredicate::FileCodeIn {
                 ref canonical_values,
                 ..
+            } | CovePredicate::FileCodeNotIn {
+                ref canonical_values,
+                ..
             }) if !canonical_values.is_empty()
         )
     })

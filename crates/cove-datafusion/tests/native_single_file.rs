@@ -36,6 +36,10 @@ use cove_core::{
     },
     dictionary::{FileDictionary, FileDictionaryHeaderV1, FileDictionaryIndexEntryV1},
     domain::ColumnDomain,
+    encoding::{
+        bit_packed::BitPackedPayload,
+        local_codebook::{LocalCodebookPayload, LocalCodebookValues, LocalIndexPayload},
+    },
     feature_binding::{FeatureScopeV2, OperationKindV2},
     feature_scope::{
         cove_column_page_target_ref, ExtendedFeatureSetHeaderV2, ExtendedFeatureSetV2,
@@ -107,11 +111,15 @@ use cove_datafusion::{
         bootstrap_local_file_async, bootstrap_range_reader_with_options, CoveMetadataCache,
     },
     dataset_state::embedded_coverage_snapshot_validity_ref,
-    decode::{decode_local_dataset_scan_tasks, decode_scan},
+    decode::{
+        decode_local_dataset_scan_tasks, decode_scan, native_bool_group_count_scan,
+        native_bool_i64_group_aggregate_scan, native_filecode_group_count_scan,
+        native_filecode_i64_group_aggregate_scan, native_i64_i64_group_aggregate_scan,
+    },
     expr_lowering::{lower_filter, LowerExpr, LowerLiteral, LowerOperator},
     overlay::{CoveOverlaySnapshot, OverlayFile, OverlayFileIdentity, RowRange, RowVisibility},
     planner::{
-        plan_scan, CovePredicate, FilterPlan, NullPredicateKind, NumericPredicateOp,
+        plan_scan, CoveFilterUse, CovePredicate, FilterPlan, NullPredicateKind, NumericPredicateOp,
         PredicateLiteral,
     },
     range_reader::{coalesced_range_count, MemoryRangeReader, RangeCoalescingOptions},
@@ -150,7 +158,9 @@ use datafusion::{
     assert_batches_eq,
     catalog::TableProvider,
     common::{stats::Precision, Column, ScalarValue},
-    logical_expr::{Between, BinaryExpr, Expr, Operator, TableProviderFilterPushDown},
+    logical_expr::{
+        expr::InList, Between, BinaryExpr, Expr, Like, Operator, TableProviderFilterPushDown,
+    },
     physical_plan::{execution_plan::collect as collect_physical_plan, ExecutionPlan},
     prelude::SessionContext,
 };
@@ -175,7 +185,6 @@ async fn collect_sql_with_cove_metric(
     (batches, execution_plan_metric_sum(&plan, metric_name))
 }
 
-#[cfg(feature = "covi")]
 async fn collect_sql_with_cove_metrics(
     ctx: &SessionContext,
     sql: &str,
@@ -207,6 +216,192 @@ fn execution_plan_metric_sum(plan: &Arc<dyn ExecutionPlan>, metric_name: &str) -
         .into_iter()
         .map(|child| execution_plan_metric_sum(child, metric_name))
         .sum::<usize>()
+}
+
+fn assert_typed_i64_native_contract(explain_text: &str) {
+    assert!(
+        explain_text.contains("representation=typed_numeric_i64"),
+        "{explain_text}"
+    );
+    assert!(
+        explain_text.contains("semantic_domain=cove.datafusion.native.i64"),
+        "{explain_text}"
+    );
+    assert!(
+        explain_text.contains("kernel=shared_cove_core"),
+        "{explain_text}"
+    );
+    assert!(
+        explain_text.contains("null_policy=validity-bitmap")
+            || explain_text.contains("null_policy=validity-bitmap-nulls-never-match"),
+        "{explain_text}"
+    );
+    assert!(
+        explain_text.contains("decode_boundary=none"),
+        "{explain_text}"
+    );
+    assert!(explain_text.contains("fallback=none"), "{explain_text}");
+}
+
+fn assert_bool_native_contract(explain_text: &str) {
+    assert!(
+        explain_text.contains("representation=boolean_dense"),
+        "{explain_text}"
+    );
+    assert!(
+        explain_text.contains("semantic_domain=cove.datafusion.native.bool"),
+        "{explain_text}"
+    );
+    assert!(
+        explain_text.contains("kernel=shared_cove_core"),
+        "{explain_text}"
+    );
+    assert!(
+        explain_text.contains("null_policy=validity-bitmap"),
+        "{explain_text}"
+    );
+    assert!(
+        explain_text.contains("decode_boundary=none"),
+        "{explain_text}"
+    );
+    assert!(
+        explain_text.contains("fallback=page-decode-boundary"),
+        "{explain_text}"
+    );
+}
+
+fn assert_bool_i64_group_aggregate_native_contract(explain_text: &str) {
+    assert!(
+        explain_text.contains("representation=group_key:boolean_dense,value:typed_numeric_i64"),
+        "{explain_text}"
+    );
+    assert!(
+        explain_text.contains(
+            "semantic_domain=key:cove.datafusion.native.bool,value:cove.datafusion.native.i64"
+        ),
+        "{explain_text}"
+    );
+    assert!(
+        explain_text.contains("kernel=shared_cove_core"),
+        "{explain_text}"
+    );
+    assert!(
+        explain_text.contains("null_policy=validity-bitmap"),
+        "{explain_text}"
+    );
+    assert!(
+        explain_text.contains("decode_boundary=none"),
+        "{explain_text}"
+    );
+    assert!(
+        explain_text.contains("fallback=page-decode-boundary"),
+        "{explain_text}"
+    );
+}
+
+fn assert_i64_i64_group_aggregate_native_contract(explain_text: &str) {
+    assert!(
+        explain_text.contains("representation=group_key:typed_numeric_i64,value:typed_numeric_i64"),
+        "{explain_text}"
+    );
+    assert!(
+        explain_text.contains(
+            "semantic_domain=key:cove.datafusion.native.i64,value:cove.datafusion.native.i64"
+        ),
+        "{explain_text}"
+    );
+    assert!(
+        explain_text.contains("kernel=shared_cove_core"),
+        "{explain_text}"
+    );
+    assert!(
+        explain_text.contains("null_policy=validity-bitmap"),
+        "{explain_text}"
+    );
+    assert!(
+        explain_text.contains("decode_boundary=none"),
+        "{explain_text}"
+    );
+    assert!(
+        explain_text.contains("fallback=page-decode-boundary"),
+        "{explain_text}"
+    );
+}
+
+fn assert_filecode_i64_group_aggregate_native_contract(explain_text: &str) {
+    assert!(
+        explain_text.contains("representation=group_key:filecode_utf8,value:typed_numeric_i64"),
+        "{explain_text}"
+    );
+    assert!(
+        explain_text.contains(
+            "semantic_domain=key:file-local-dictionary-to-canonical-utf8,value:cove.datafusion.native.i64"
+        ),
+        "{explain_text}"
+    );
+    assert!(
+        explain_text.contains("kernel=shared_cove_core"),
+        "{explain_text}"
+    );
+    assert!(
+        explain_text.contains("null_policy=validity-bitmap"),
+        "{explain_text}"
+    );
+    assert!(
+        explain_text.contains("decode_boundary=group-label-output"),
+        "{explain_text}"
+    );
+    assert!(
+        explain_text.contains("fallback=page-decode-boundary"),
+        "{explain_text}"
+    );
+}
+
+fn assert_filecode_join_native_contract(explain_text: &str) {
+    assert!(
+        explain_text.contains("representation=filecode_utf8_execution_code_u32"),
+        "{explain_text}"
+    );
+    assert!(
+        explain_text.contains("semantic_domain=file-local-dictionary-to-canonical-utf8"),
+        "{explain_text}"
+    );
+    assert!(
+        explain_text.contains("kernel=shared_cove_core"),
+        "{explain_text}"
+    );
+    assert!(
+        explain_text.contains("null_policy=validity-bitmap-nulls-never-match"),
+        "{explain_text}"
+    );
+    assert!(
+        explain_text.contains("decode_boundary=join-key-canonicalization"),
+        "{explain_text}"
+    );
+    assert!(
+        explain_text.contains("fallback=page-decode-boundary"),
+        "{explain_text}"
+    );
+}
+
+fn assert_rowset_count_native_contract(explain_text: &str) {
+    assert!(
+        explain_text.contains("representation=rowset_count"),
+        "{explain_text}"
+    );
+    assert!(
+        explain_text.contains("semantic_domain=none"),
+        "{explain_text}"
+    );
+    assert!(
+        explain_text.contains("kernel=shared_cove_core"),
+        "{explain_text}"
+    );
+    assert!(
+        explain_text.contains("decode_boundary=none"),
+        "{explain_text}"
+    );
+    assert!(explain_text.contains("fallback=none"), "{explain_text}");
 }
 
 #[tokio::test]
@@ -1040,11 +1235,11 @@ async fn native_materialization_mode_selection_is_explained() {
         .await
         .unwrap();
     let explain_text = pretty_format_batches(&explain).unwrap().to_string();
-    assert!(explain_text.contains("topn_hint=Some"), "{explain_text}");
     assert!(
-        explain_text.contains("materialization_mode=streaming"),
+        explain_text.contains("CoveNativeI64OrderExec"),
         "{explain_text}"
     );
+    assert!(!explain_text.contains("CoveExec"), "{explain_text}");
 
     fs::remove_file(path).unwrap();
 }
@@ -1873,6 +2068,279 @@ async fn compatibility_dictionary_output_is_option_aware() {
 }
 
 #[tokio::test]
+async fn filtered_filecode_group_count_uses_native_group_exec_across_swapped_dictionaries() {
+    let dir = make_temp_dir("native_filecode_group_swapped");
+    let first = dir.join("part1.cove");
+    let second = dir.join("part2.cove");
+    fs::write(&first, dictionary_items_file(sample_dictionary())).unwrap();
+    fs::write(&second, dictionary_items_file(swapped_dictionary())).unwrap();
+    let first_state = cove_table_from_path(&first).unwrap();
+    let second_state = cove_table_from_path(&second).unwrap();
+    let snapshot = CoveOverlaySnapshot {
+        snapshot_id: "native-filecode-group-swapped".into(),
+        files: vec![
+            OverlayFile {
+                uri: first.display().to_string().into(),
+                expected_identity: Some(identity_for_state(first_state.state())),
+                visibility: RowVisibility::All,
+            },
+            OverlayFile {
+                uri: second.display().to_string().into(),
+                expected_identity: Some(identity_for_state(second_state.state())),
+                visibility: RowVisibility::All,
+            },
+        ],
+    };
+    let ctx = SessionContext::new();
+    register_cove_overlay_snapshot(&ctx, "items", snapshot, CoveTableOptions::default()).unwrap();
+
+    let (batches, metrics) = collect_sql_with_cove_metrics(
+        &ctx,
+        "SELECT name, COUNT(*) AS n FROM items WHERE name = 'red' GROUP BY name ORDER BY name",
+        &[
+            "cove_native_lane_predicates",
+            "cove_native_group_kernels",
+            "cove_native_group_rows_matched",
+            "cove_rows_materialized",
+        ],
+    )
+    .await;
+    let expected = [
+        "+------+---+",
+        "| name | n |",
+        "+------+---+",
+        "| red  | 2 |",
+        "+------+---+",
+    ];
+    assert_batches_eq!(expected, &batches);
+    assert!(metrics[0] >= 2, "{metrics:?}");
+    assert!(metrics[1] >= 2, "{metrics:?}");
+    assert_eq!(metrics[2], 2, "{metrics:?}");
+    assert_eq!(metrics[3], 0, "{metrics:?}");
+
+    let explain = ctx
+        .sql("EXPLAIN SELECT name, COUNT(*) AS n FROM items WHERE name = 'red' GROUP BY name")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let explain_text = pretty_format_batches(&explain).unwrap().to_string();
+    assert!(
+        explain_text.contains("CoveNativeGroupCountExec"),
+        "{explain_text}"
+    );
+    assert!(explain_text.contains("representation=filecode_utf8"));
+    assert!(!explain_text.contains("CoveMetadataExec"), "{explain_text}");
+    assert!(!explain_text.contains("CoveExec"), "{explain_text}");
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn filtered_filecode_distinct_uses_native_group_exec_across_swapped_dictionaries() {
+    let dir = make_temp_dir("native_filecode_distinct_swapped");
+    let first = dir.join("part1.cove");
+    let second = dir.join("part2.cove");
+    fs::write(&first, dictionary_items_file(sample_dictionary())).unwrap();
+    fs::write(&second, dictionary_items_file(swapped_dictionary())).unwrap();
+    let first_state = cove_table_from_path(&first).unwrap();
+    let second_state = cove_table_from_path(&second).unwrap();
+    let snapshot = CoveOverlaySnapshot {
+        snapshot_id: "native-filecode-distinct-swapped".into(),
+        files: vec![
+            OverlayFile {
+                uri: first.display().to_string().into(),
+                expected_identity: Some(identity_for_state(first_state.state())),
+                visibility: RowVisibility::All,
+            },
+            OverlayFile {
+                uri: second.display().to_string().into(),
+                expected_identity: Some(identity_for_state(second_state.state())),
+                visibility: RowVisibility::All,
+            },
+        ],
+    };
+    let ctx = SessionContext::new();
+    register_cove_overlay_snapshot(&ctx, "items", snapshot, CoveTableOptions::default()).unwrap();
+
+    for sql in [
+        "SELECT name FROM items WHERE name = 'red' GROUP BY name ORDER BY name",
+        "SELECT DISTINCT name FROM items WHERE name = 'red' ORDER BY name",
+    ] {
+        let (batches, metrics) = collect_sql_with_cove_metrics(
+            &ctx,
+            sql,
+            &[
+                "cove_native_lane_predicates",
+                "cove_native_group_kernels",
+                "cove_native_group_rows_matched",
+                "cove_rows_materialized",
+            ],
+        )
+        .await;
+        let expected = ["+------+", "| name |", "+------+", "| red  |", "+------+"];
+        assert_batches_eq!(expected, &batches);
+        assert!(metrics[0] >= 2, "{sql}: {metrics:?}");
+        assert!(metrics[1] >= 2, "{sql}: {metrics:?}");
+        assert_eq!(metrics[2], 2, "{sql}: {metrics:?}");
+        assert_eq!(metrics[3], 0, "{sql}: {metrics:?}");
+
+        let explain = ctx
+            .sql(&format!("EXPLAIN {sql}"))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let explain_text = pretty_format_batches(&explain).unwrap().to_string();
+        assert!(
+            explain_text.contains("CoveNativeGroupDistinctExec"),
+            "{explain_text}"
+        );
+        assert!(explain_text.contains("representation=filecode_utf8"));
+        assert!(!explain_text.contains("CoveMetadataExec"), "{explain_text}");
+        assert!(!explain_text.contains("CoveExec"), "{explain_text}");
+    }
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn filecode_i64_group_aggregates_use_native_exec_across_swapped_dictionaries() {
+    let dir = make_temp_dir("native_filecode_i64_group_aggs_swapped");
+    let first = dir.join("part1.cove");
+    let second = dir.join("part2.cove");
+    fs::write(
+        &first,
+        scored_dictionary_items_file(sample_dictionary(), [10, 20]),
+    )
+    .unwrap();
+    fs::write(
+        &second,
+        scored_dictionary_items_file(swapped_dictionary(), [30, 40]),
+    )
+    .unwrap();
+    let first_state = cove_table_from_path(&first).unwrap();
+    let second_state = cove_table_from_path(&second).unwrap();
+    let snapshot = CoveOverlaySnapshot {
+        snapshot_id: "native-filecode-i64-group-aggs-swapped".into(),
+        files: vec![
+            OverlayFile {
+                uri: first.display().to_string().into(),
+                expected_identity: Some(identity_for_state(first_state.state())),
+                visibility: RowVisibility::All,
+            },
+            OverlayFile {
+                uri: second.display().to_string().into(),
+                expected_identity: Some(identity_for_state(second_state.state())),
+                visibility: RowVisibility::All,
+            },
+        ],
+    };
+    let ctx = SessionContext::new();
+    register_cove_overlay_snapshot(&ctx, "items", snapshot, CoveTableOptions::default()).unwrap();
+
+    let sql =
+        "SELECT name, SUM(score) AS total, MIN(score) AS lo, MAX(score) AS hi, COUNT(score) AS c \
+               FROM items GROUP BY name ORDER BY name";
+    let (batches, metrics) = collect_sql_with_cove_metrics(
+        &ctx,
+        sql,
+        &[
+            "cove_native_aggregate_kernels",
+            "cove_native_aggregate_rows_matched",
+            "cove_rows_materialized",
+        ],
+    )
+    .await;
+    let expected = [
+        "+------+-------+----+----+---+",
+        "| name | total | lo | hi | c |",
+        "+------+-------+----+----+---+",
+        "| blue | 50    | 20 | 30 | 2 |",
+        "| red  | 50    | 10 | 40 | 2 |",
+        "+------+-------+----+----+---+",
+    ];
+    assert_batches_eq!(expected, &batches);
+    assert!(metrics[0] >= 2, "{metrics:?}");
+    assert_eq!(metrics[1], 4, "{metrics:?}");
+    assert_eq!(metrics[2], 0, "{metrics:?}");
+
+    let explain = ctx
+        .sql(
+            "EXPLAIN SELECT name, SUM(score) AS total, MIN(score) AS lo, MAX(score) AS hi, \
+             COUNT(score) AS c FROM items GROUP BY name",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let explain_text = pretty_format_batches(&explain).unwrap().to_string();
+    assert!(
+        explain_text.contains("CoveNativeFileCodeI64GroupAggregateExec"),
+        "{explain_text}"
+    );
+    assert_filecode_i64_group_aggregate_native_contract(&explain_text);
+    assert!(!explain_text.contains("CoveExec"), "{explain_text}");
+    assert!(!explain_text.contains("CoveMetadataExec"), "{explain_text}");
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn filecode_i64_group_aggregates_use_native_exec_over_local_codebook() {
+    let path = write_temp_cove(
+        "local_codebook_filecode_i64_group_aggs",
+        local_codebook_scored_dictionary_items_file(),
+    );
+    let ctx = SessionContext::new();
+    register_cove_file(&ctx, "items", &path).unwrap();
+
+    let (batches, metrics) = collect_sql_with_cove_metrics(
+        &ctx,
+        "SELECT name, SUM(score) AS total, COUNT(score) AS c \
+         FROM items GROUP BY name ORDER BY name",
+        &[
+            "cove_native_aggregate_kernels",
+            "cove_native_aggregate_rows_matched",
+            "cove_rows_materialized",
+        ],
+    )
+    .await;
+    let expected = [
+        "+------+-------+---+",
+        "| name | total | c |",
+        "+------+-------+---+",
+        "| blue | 60    | 2 |",
+        "| red  | 40    | 2 |",
+        "+------+-------+---+",
+    ];
+    assert_batches_eq!(expected, &batches);
+    assert!(metrics[0] >= 1, "{metrics:?}");
+    assert_eq!(metrics[1], 4, "{metrics:?}");
+    assert_eq!(metrics[2], 0, "{metrics:?}");
+
+    let explain = ctx
+        .sql(
+            "EXPLAIN SELECT name, SUM(score) AS total, COUNT(score) AS c \
+             FROM items GROUP BY name",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let explain_text = pretty_format_batches(&explain).unwrap().to_string();
+    assert!(
+        explain_text.contains("CoveNativeFileCodeI64GroupAggregateExec"),
+        "{explain_text}"
+    );
+    assert_filecode_i64_group_aggregate_native_contract(&explain_text);
+    assert!(!explain_text.contains("CoveExec"), "{explain_text}");
+    assert!(!explain_text.contains("CoveMetadataExec"), "{explain_text}");
+    fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
 async fn select_projected_column_returns_only_projection() {
     let path = write_temp_cove("events_projection", primitive_events_file());
     let ctx = SessionContext::new();
@@ -2319,7 +2787,7 @@ async fn between_filter_uses_inclusive_lower_and_upper_bounds() {
 }
 
 #[test]
-fn filter_pushdown_classifies_supported_numeric_exact_and_null_inexact() {
+fn filter_pushdown_classifies_supported_numeric_and_null_exact() {
     let path = write_temp_cove("nullable_classification", nullable_events_file());
     let provider = cove_table_from_path(&path).unwrap();
     let nullable_col = Expr::Column(Column::from_name("maybe"));
@@ -2338,8 +2806,8 @@ fn filter_pushdown_classifies_supported_numeric_exact_and_null_inexact() {
     assert_eq!(
         support,
         vec![
-            TableProviderFilterPushDown::Inexact,
-            TableProviderFilterPushDown::Inexact,
+            TableProviderFilterPushDown::Exact,
+            TableProviderFilterPushDown::Exact,
             TableProviderFilterPushDown::Exact
         ]
     );
@@ -2365,6 +2833,44 @@ fn filter_pushdown_classifies_between_as_two_exact_bounds() {
 }
 
 #[test]
+fn filter_pushdown_classifies_numeric_in_as_exact() {
+    let path = write_temp_cove("numeric_in_classification", primitive_events_file());
+    let provider = cove_table_from_path(&path).unwrap();
+    let in_list = Expr::InList(InList::new(
+        Box::new(Expr::Column(Column::from_name("id"))),
+        vec![
+            Expr::Literal(ScalarValue::Int64(Some(1)), None),
+            Expr::Literal(ScalarValue::Int64(Some(3)), None),
+        ],
+        false,
+    ));
+
+    let support = provider.supports_filters_pushdown(&[&in_list]).unwrap();
+
+    assert_eq!(support, vec![TableProviderFilterPushDown::Exact]);
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn filter_pushdown_classifies_fixed_bytes_equality_exact() {
+    let path = write_temp_cove("fixed_bytes_classification", fixed_uuid_events_file());
+    let provider = cove_table_from_path(&path).unwrap();
+    let equality = Expr::BinaryExpr(BinaryExpr::new(
+        Box::new(Expr::Column(Column::from_name("uid"))),
+        Operator::Eq,
+        Box::new(Expr::Literal(
+            ScalarValue::Utf8(Some("00000000-0000-0000-0000-000000000002".into())),
+            None,
+        )),
+    ));
+
+    let support = provider.supports_filters_pushdown(&[&equality]).unwrap();
+
+    assert_eq!(support, vec![TableProviderFilterPushDown::Exact]);
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn filter_pushdown_classifies_varbytes_equality_exact() {
     let path = write_temp_cove("varbytes_classification", primitive_events_file());
     let provider = cove_table_from_path(&path).unwrap();
@@ -2381,6 +2887,39 @@ fn filter_pushdown_classifies_varbytes_equality_exact() {
 
     let support = provider
         .supports_filters_pushdown(&[&varbytes_equality, &varbytes_range])
+        .unwrap();
+
+    assert_eq!(
+        support,
+        vec![
+            TableProviderFilterPushDown::Exact,
+            TableProviderFilterPushDown::Unsupported
+        ]
+    );
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn filter_pushdown_classifies_varbytes_prefix_like_exact() {
+    let path = write_temp_cove("varbytes_prefix_classification", primitive_events_file());
+    let provider = cove_table_from_path(&path).unwrap();
+    let like = Expr::Like(Like::new(
+        false,
+        Box::new(Expr::Column(Column::from_name("name"))),
+        Box::new(Expr::Literal(ScalarValue::Utf8(Some("ga%".into())), None)),
+        None,
+        false,
+    ));
+    let wildcard = Expr::Like(Like::new(
+        false,
+        Box::new(Expr::Column(Column::from_name("name"))),
+        Box::new(Expr::Literal(ScalarValue::Utf8(Some("g_m%".into())), None)),
+        None,
+        false,
+    ));
+
+    let support = provider
+        .supports_filters_pushdown(&[&like, &wildcard])
         .unwrap();
 
     assert_eq!(
@@ -2565,8 +3104,14 @@ fn null_pruning_uses_page_indexes_without_materializing_predicate_columns() {
 
     assert_eq!(decoded.stats.predicate_pages_checked, 3);
     assert_eq!(decoded.stats.morsels_pruned, 1);
-    assert_eq!(decoded.stats.pages_decoded, 2);
+    assert_eq!(decoded.stats.exact_predicates, 1);
+    assert_eq!(decoded.stats.residual_predicates, 0);
+    assert!(decoded.stats.native_lane_predicates >= 1);
+    assert_eq!(decoded.stats.native_table_decode_boundaries, 0);
+    assert_eq!(decoded.stats.pages_decoded, 4);
     assert!(decoded.batches.iter().all(|batch| batch.num_columns() == 1));
+    let expected = ["+----+", "| id |", "+----+", "| 2  |", "| 3  |", "+----+"];
+    assert_batches_eq!(expected, &decoded.batches);
 }
 
 #[test]
@@ -2594,7 +3139,461 @@ fn numeric_row_selection_late_materializes_projected_columns() {
     assert_batches_eq!(expected, &decoded.batches);
     assert_eq!(decoded.stats.rows_selected, 1);
     assert_eq!(decoded.stats.rows_materialized, 1);
+    assert!(decoded.stats.native_table_batches >= 1);
+    assert!(decoded.stats.native_lane_predicates >= 1);
+    assert!(
+        decoded.stats.native_lane_predicate_dispatch_scalar
+            + decoded.stats.native_lane_predicate_dispatch_avx2
+            + decoded.stats.native_lane_predicate_dispatch_neon
+            >= 1
+    );
+    assert_eq!(decoded.stats.native_table_decode_boundaries, 0);
+    assert!(decoded.stats.native_projection_batches >= 1);
+    assert!(decoded.stats.native_projection_pages >= 1);
+    assert_eq!(decoded.stats.native_projection_decode_boundaries, 0);
     assert!(decoded.stats.pages_decoded < full.stats.pages_decoded);
+}
+
+#[test]
+fn numeric_in_row_selection_uses_native_numcode_kernel() {
+    let state = bootstrap_bytes("events", primitive_events_file()).unwrap();
+    let full = decode_scan(&state, &plan_scan(&state, None, Vec::new()).unwrap()).unwrap();
+    let projection = vec![1];
+    let filter = lower_filter(
+        &state,
+        &LowerExpr::InList {
+            expr: Box::new(LowerExpr::Column("id".into())),
+            list: vec![
+                LowerExpr::Literal(LowerLiteral::Int64(1)),
+                LowerExpr::Literal(LowerLiteral::Int64(3)),
+            ],
+            negated: false,
+        },
+        "id IN (1, 3)",
+    );
+    match filter.predicate.as_ref() {
+        Some(CovePredicate::NumericIn { literals, .. }) => {
+            assert_eq!(literals.len(), 2);
+        }
+        other => panic!("expected numeric IN predicate, got {other:?}"),
+    }
+    let plan = plan_scan(&state, Some(&projection), vec![filter]).unwrap();
+
+    let decoded = decode_scan(&state, &plan).unwrap();
+
+    let expected = [
+        "+-------+",
+        "| name  |",
+        "+-------+",
+        "| alpha |",
+        "| gamma |",
+        "+-------+",
+    ];
+    assert_batches_eq!(expected, &decoded.batches);
+    assert_eq!(decoded.stats.rows_selected, 2);
+    assert_eq!(decoded.stats.rows_materialized, 2);
+    assert_eq!(decoded.stats.residual_predicates, 0);
+    assert_eq!(decoded.stats.exact_predicates, 1);
+    assert!(decoded.stats.native_lane_predicates >= 1);
+    assert!(decoded.stats.native_lane_predicate_rows_seen >= decoded.stats.rows_selected);
+    assert!(decoded.stats.native_lane_predicate_rows_matched >= decoded.stats.rows_selected);
+    assert!(decoded.stats.native_lane_predicate_bytes_touched > 0);
+    assert!(
+        decoded.stats.native_lane_predicate_dispatch_scalar
+            + decoded.stats.native_lane_predicate_dispatch_avx2
+            + decoded.stats.native_lane_predicate_dispatch_neon
+            >= 1
+    );
+    assert_eq!(decoded.stats.native_table_decode_boundaries, 0);
+    assert!(decoded.stats.pages_decoded < full.stats.pages_decoded);
+}
+
+#[test]
+fn numeric_not_equal_row_selection_uses_native_numcode_complement_kernel() {
+    let state = bootstrap_bytes("events", primitive_events_file()).unwrap();
+    let full = decode_scan(&state, &plan_scan(&state, None, Vec::new()).unwrap()).unwrap();
+    let projection = vec![1];
+    let filter = lower_filter(
+        &state,
+        &LowerExpr::Binary {
+            left: Box::new(LowerExpr::Column("id".into())),
+            op: LowerOperator::NotEq,
+            right: Box::new(LowerExpr::Literal(LowerLiteral::Int64(2))),
+        },
+        "id != 2",
+    );
+    match filter.predicate.as_ref() {
+        Some(CovePredicate::NumericNotIn { literals, .. }) => {
+            assert_eq!(literals.len(), 1);
+        }
+        other => panic!("expected numeric NOT IN predicate, got {other:?}"),
+    }
+    let plan = plan_scan(&state, Some(&projection), vec![filter]).unwrap();
+
+    let decoded = decode_scan(&state, &plan).unwrap();
+
+    let expected = [
+        "+-------+",
+        "| name  |",
+        "+-------+",
+        "| alpha |",
+        "| gamma |",
+        "+-------+",
+    ];
+    assert_batches_eq!(expected, &decoded.batches);
+    assert_eq!(decoded.stats.rows_selected, 2);
+    assert_eq!(decoded.stats.rows_materialized, 2);
+    assert_eq!(decoded.stats.residual_predicates, 0);
+    assert_eq!(decoded.stats.exact_predicates, 1);
+    assert!(decoded.stats.native_lane_predicates >= 1);
+    assert!(decoded.stats.pages_decoded < full.stats.pages_decoded);
+}
+
+#[test]
+fn numeric_not_in_row_selection_uses_native_numcode_complement_kernel() {
+    let state = bootstrap_bytes("events", primitive_events_file()).unwrap();
+    let projection = vec![1];
+    let filter = lower_filter(
+        &state,
+        &LowerExpr::InList {
+            expr: Box::new(LowerExpr::Column("id".into())),
+            list: vec![
+                LowerExpr::Literal(LowerLiteral::Int64(1)),
+                LowerExpr::Literal(LowerLiteral::Int64(3)),
+            ],
+            negated: true,
+        },
+        "id NOT IN (1, 3)",
+    );
+    match filter.predicate.as_ref() {
+        Some(CovePredicate::NumericNotIn { literals, .. }) => {
+            assert_eq!(literals.len(), 2);
+        }
+        other => panic!("expected numeric NOT IN predicate, got {other:?}"),
+    }
+    let plan = plan_scan(&state, Some(&projection), vec![filter]).unwrap();
+
+    let decoded = decode_scan(&state, &plan).unwrap();
+
+    let expected = ["+------+", "| name |", "+------+", "| beta |", "+------+"];
+    assert_batches_eq!(expected, &decoded.batches);
+    assert_eq!(decoded.stats.rows_selected, 1);
+    assert_eq!(decoded.stats.residual_predicates, 0);
+    assert_eq!(decoded.stats.exact_predicates, 1);
+    assert!(decoded.stats.native_lane_predicates >= 1);
+}
+
+#[tokio::test]
+async fn numeric_not_in_filter_is_pushed_down_exactly() {
+    let path = write_temp_cove("events_numeric_not_in_filter", primitive_events_file());
+    let ctx = SessionContext::new();
+    register_cove_file(&ctx, "events", &path).unwrap();
+
+    let batches = ctx
+        .sql("SELECT name FROM events WHERE id NOT IN (1, 3)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let expected = ["+------+", "| name |", "+------+", "| beta |", "+------+"];
+    assert_batches_eq!(expected, &batches);
+
+    let explain = ctx
+        .sql("EXPLAIN SELECT name FROM events WHERE id NOT IN (1, 3)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let explain_text = pretty_format_batches(&explain).unwrap().to_string();
+    assert!(explain_text.contains("CoveExec"), "{explain_text}");
+    assert!(!explain_text.contains("FilterExec"), "{explain_text}");
+    assert!(explain_text.contains("exact_filters=2"), "{explain_text}");
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn empty_numeric_in_selects_no_rows_without_page_decode() {
+    let state = bootstrap_bytes("events", primitive_events_file()).unwrap();
+    let projection = vec![1];
+    let filter = FilterPlan::pruning_numeric_in(0, Vec::new(), "id IN ()");
+    let plan = plan_scan(&state, Some(&projection), vec![filter]).unwrap();
+
+    let decoded = decode_scan(&state, &plan).unwrap();
+
+    assert!(decoded.batches.is_empty());
+    assert_eq!(decoded.stats.rows_selected, 0);
+    assert_eq!(decoded.stats.rows_materialized, 0);
+    assert_eq!(decoded.stats.pages_decoded, 0);
+}
+
+#[tokio::test]
+async fn numeric_in_filter_is_pushed_down_exactly() {
+    let path = write_temp_cove("events_numeric_in_filter", primitive_events_file());
+    let ctx = SessionContext::new();
+    register_cove_file(&ctx, "events", &path).unwrap();
+
+    let batches = ctx
+        .sql("SELECT name FROM events WHERE id IN (1, 3) ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let expected = [
+        "+-------+",
+        "| name  |",
+        "+-------+",
+        "| alpha |",
+        "| gamma |",
+        "+-------+",
+    ];
+    assert_batches_eq!(expected, &batches);
+
+    let explain = ctx
+        .sql("EXPLAIN SELECT name FROM events WHERE id IN (1, 3)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let explain_text = pretty_format_batches(&explain).unwrap().to_string();
+    assert!(explain_text.contains("CoveExec"), "{explain_text}");
+    assert!(!explain_text.contains("FilterExec"), "{explain_text}");
+    assert!(explain_text.contains("exact_filters=1"), "{explain_text}");
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn fixed_bytes_equality_late_materializes_projected_columns() {
+    let state = bootstrap_bytes("events", fixed_uuid_events_file()).unwrap();
+    let full = decode_scan(&state, &plan_scan(&state, None, Vec::new()).unwrap()).unwrap();
+    let projection = vec![2];
+    let filter = lower_filter(
+        &state,
+        &LowerExpr::Binary {
+            left: Box::new(LowerExpr::Column("uid".into())),
+            op: LowerOperator::Eq,
+            right: Box::new(LowerExpr::Literal(LowerLiteral::Utf8(
+                "00000000-0000-0000-0000-000000000002".into(),
+            ))),
+        },
+        "uid = '00000000-0000-0000-0000-000000000002'",
+    );
+    match filter.predicate.as_ref() {
+        Some(CovePredicate::FixedBytesEq { literal, .. }) => {
+            assert_eq!(literal.as_slice(), &uuid_bytes(2));
+        }
+        other => panic!("expected FixedBytes predicate, got {other:?}"),
+    }
+    let plan = plan_scan(&state, Some(&projection), vec![filter]).unwrap();
+
+    let decoded = decode_scan(&state, &plan).unwrap();
+
+    let expected = [
+        "+---------+",
+        "| payload |",
+        "+---------+",
+        "| beta    |",
+        "+---------+",
+    ];
+    assert_batches_eq!(expected, &decoded.batches);
+    assert_eq!(decoded.stats.rows_selected, 1);
+    assert_eq!(decoded.stats.rows_materialized, 1);
+    assert_eq!(decoded.stats.residual_predicates, 0);
+    assert_eq!(decoded.stats.exact_predicates, 1);
+    assert!(decoded.stats.native_lane_predicates >= 1);
+    assert_eq!(decoded.stats.native_table_decode_boundaries, 0);
+    assert!(decoded.stats.pages_decoded < full.stats.pages_decoded);
+}
+
+#[test]
+fn fixed_bytes_in_late_materializes_projected_columns() {
+    let state = bootstrap_bytes("events", fixed_uuid_events_file()).unwrap();
+    let full = decode_scan(&state, &plan_scan(&state, None, Vec::new()).unwrap()).unwrap();
+    let projection = vec![2];
+    let filter = lower_filter(
+        &state,
+        &LowerExpr::InList {
+            expr: Box::new(LowerExpr::Column("uid".into())),
+            list: vec![
+                LowerExpr::Literal(LowerLiteral::Utf8(
+                    "00000000-0000-0000-0000-000000000001".into(),
+                )),
+                LowerExpr::Literal(LowerLiteral::Utf8(
+                    "00000000-0000-0000-0000-000000000003".into(),
+                )),
+            ],
+            negated: false,
+        },
+        "uid IN ('00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000003')",
+    );
+    match filter.predicate.as_ref() {
+        Some(CovePredicate::FixedBytesIn { literals, .. }) => {
+            assert_eq!(literals, &vec![uuid_bytes(1), uuid_bytes(3)]);
+        }
+        other => panic!("expected FixedBytes IN predicate, got {other:?}"),
+    }
+    let plan = plan_scan(&state, Some(&projection), vec![filter]).unwrap();
+
+    let decoded = decode_scan(&state, &plan).unwrap();
+
+    let expected = [
+        "+---------+",
+        "| payload |",
+        "+---------+",
+        "| alpha   |",
+        "| gamma   |",
+        "+---------+",
+    ];
+    assert_batches_eq!(expected, &decoded.batches);
+    assert_eq!(decoded.stats.rows_selected, 2);
+    assert_eq!(decoded.stats.rows_materialized, 2);
+    assert_eq!(decoded.stats.residual_predicates, 0);
+    assert_eq!(decoded.stats.exact_predicates, 1);
+    assert!(decoded.stats.native_lane_predicates >= 1);
+    assert_eq!(decoded.stats.native_table_decode_boundaries, 0);
+    assert!(decoded.stats.pages_decoded < full.stats.pages_decoded);
+}
+
+#[test]
+fn fixed_bytes_same_column_or_lowers_to_native_in() {
+    let state = bootstrap_bytes("events", fixed_uuid_events_file()).unwrap();
+    let projection = vec![2];
+    let filter = lower_filter(
+        &state,
+        &LowerExpr::Or(vec![
+            LowerExpr::Binary {
+                left: Box::new(LowerExpr::Column("uid".into())),
+                op: LowerOperator::Eq,
+                right: Box::new(LowerExpr::Literal(LowerLiteral::Utf8(
+                    "00000000-0000-0000-0000-000000000001".into(),
+                ))),
+            },
+            LowerExpr::Binary {
+                left: Box::new(LowerExpr::Column("uid".into())),
+                op: LowerOperator::Eq,
+                right: Box::new(LowerExpr::Literal(LowerLiteral::Utf8(
+                    "00000000-0000-0000-0000-000000000003".into(),
+                ))),
+            },
+        ]),
+        "uid = '00000000-0000-0000-0000-000000000001' OR uid = '00000000-0000-0000-0000-000000000003'",
+    );
+    match filter.predicate.as_ref() {
+        Some(CovePredicate::FixedBytesIn { literals, .. }) => {
+            assert_eq!(literals, &vec![uuid_bytes(1), uuid_bytes(3)]);
+        }
+        other => panic!("expected FixedBytes IN predicate, got {other:?}"),
+    }
+    let plan = plan_scan(&state, Some(&projection), vec![filter]).unwrap();
+
+    let decoded = decode_scan(&state, &plan).unwrap();
+
+    let expected = [
+        "+---------+",
+        "| payload |",
+        "+---------+",
+        "| alpha   |",
+        "| gamma   |",
+        "+---------+",
+    ];
+    assert_batches_eq!(expected, &decoded.batches);
+    assert_eq!(decoded.stats.rows_selected, 2);
+    assert_eq!(decoded.stats.residual_predicates, 0);
+    assert_eq!(decoded.stats.exact_predicates, 1);
+}
+
+#[test]
+fn filter_pushdown_classifies_fixed_bytes_in_exact() {
+    let path = write_temp_cove("fixed_bytes_in_classification", fixed_uuid_events_file());
+    let provider = cove_table_from_path(&path).unwrap();
+    let in_list = Expr::InList(InList::new(
+        Box::new(Expr::Column(Column::from_name("uid"))),
+        vec![
+            Expr::Literal(
+                ScalarValue::Utf8(Some("00000000-0000-0000-0000-000000000001".into())),
+                None,
+            ),
+            Expr::Literal(
+                ScalarValue::Utf8(Some("00000000-0000-0000-0000-000000000003".into())),
+                None,
+            ),
+        ],
+        false,
+    ));
+
+    let support = provider.supports_filters_pushdown(&[&in_list]).unwrap();
+
+    assert_eq!(support, vec![TableProviderFilterPushDown::Exact]);
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn varbytes_prefix_late_materializes_projected_columns() {
+    let state = bootstrap_bytes("events", primitive_events_file()).unwrap();
+    let full = decode_scan(&state, &plan_scan(&state, None, Vec::new()).unwrap()).unwrap();
+    let projection = vec![0];
+    let filter = lower_filter(
+        &state,
+        &LowerExpr::Like {
+            expr: Box::new(LowerExpr::Column("name".into())),
+            pattern: Box::new(LowerExpr::Literal(LowerLiteral::Utf8("ga%".into()))),
+            negated: false,
+            case_insensitive: false,
+            escape_char: None,
+        },
+        "name LIKE 'ga%'",
+    );
+    assert!(matches!(
+        filter.predicate,
+        Some(CovePredicate::VarBytesPrefix { .. })
+    ));
+    let plan = plan_scan(&state, Some(&projection), vec![filter]).unwrap();
+
+    let decoded = decode_scan(&state, &plan).unwrap();
+
+    let expected = ["+----+", "| id |", "+----+", "| 3  |", "+----+"];
+    assert_batches_eq!(expected, &decoded.batches);
+    assert_eq!(decoded.stats.rows_selected, 1);
+    assert_eq!(decoded.stats.rows_materialized, 1);
+    assert_eq!(decoded.stats.residual_predicates, 0);
+    assert_eq!(decoded.stats.exact_predicates, 1);
+    assert!(decoded.stats.native_lane_predicates >= 1);
+    assert_eq!(decoded.stats.native_table_decode_boundaries, 0);
+    assert!(decoded.stats.pages_decoded < full.stats.pages_decoded);
+}
+
+#[tokio::test]
+async fn varbytes_prefix_like_filter_is_pushed_down_exactly() {
+    let path = write_temp_cove("events_varbytes_prefix_filter", primitive_events_file());
+    let ctx = SessionContext::new();
+    register_cove_file(&ctx, "events", &path).unwrap();
+
+    let batches = ctx
+        .sql("SELECT id FROM events WHERE name LIKE 'ga%'")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let expected = ["+----+", "| id |", "+----+", "| 3  |", "+----+"];
+    assert_batches_eq!(expected, &batches);
+
+    let explain = ctx
+        .sql("EXPLAIN SELECT id FROM events WHERE name LIKE 'ga%'")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let explain_text = pretty_format_batches(&explain).unwrap().to_string();
+    assert!(explain_text.contains("CoveExec"), "{explain_text}");
+    assert!(!explain_text.contains("FilterExec"), "{explain_text}");
+    assert!(explain_text.contains("exact_filters=1"), "{explain_text}");
+    fs::remove_file(path).unwrap();
 }
 
 #[test]
@@ -2625,7 +3624,89 @@ fn varbytes_equality_late_materializes_projected_columns() {
     assert_eq!(decoded.stats.rows_materialized, 1);
     assert_eq!(decoded.stats.residual_predicates, 0);
     assert_eq!(decoded.stats.exact_predicates, 1);
+    assert!(decoded.stats.native_table_batches >= 1);
+    assert!(decoded.stats.native_lane_predicates >= 1);
+    assert_eq!(decoded.stats.native_table_decode_boundaries, 0);
+    assert!(decoded.stats.native_projection_batches >= 1);
+    assert!(decoded.stats.native_projection_pages >= 1);
+    assert_eq!(decoded.stats.native_projection_decode_boundaries, 0);
     assert!(decoded.stats.pages_decoded < full.stats.pages_decoded);
+}
+
+#[test]
+fn varbytes_in_late_materializes_projected_columns() {
+    let state = bootstrap_bytes("events", primitive_events_file()).unwrap();
+    let full = decode_scan(&state, &plan_scan(&state, None, Vec::new()).unwrap()).unwrap();
+    let projection = vec![0];
+    let filter = lower_filter(
+        &state,
+        &LowerExpr::InList {
+            expr: Box::new(LowerExpr::Column("name".into())),
+            list: vec![
+                LowerExpr::Literal(LowerLiteral::Utf8("alpha".into())),
+                LowerExpr::Literal(LowerLiteral::Utf8("gamma".into())),
+            ],
+            negated: false,
+        },
+        "name IN ('alpha', 'gamma')",
+    );
+    match filter.predicate.as_ref() {
+        Some(CovePredicate::VarBytesIn { literals, .. }) => {
+            assert_eq!(literals, &vec![b"alpha".to_vec(), b"gamma".to_vec()]);
+        }
+        other => panic!("expected VarBytes IN predicate, got {other:?}"),
+    }
+    let plan = plan_scan(&state, Some(&projection), vec![filter]).unwrap();
+
+    let decoded = decode_scan(&state, &plan).unwrap();
+
+    let expected = ["+----+", "| id |", "+----+", "| 1  |", "| 3  |", "+----+"];
+    assert_batches_eq!(expected, &decoded.batches);
+    assert_eq!(decoded.stats.rows_selected, 2);
+    assert_eq!(decoded.stats.rows_materialized, 2);
+    assert_eq!(decoded.stats.residual_predicates, 0);
+    assert_eq!(decoded.stats.exact_predicates, 1);
+    assert!(decoded.stats.native_table_batches >= 1);
+    assert!(decoded.stats.native_lane_predicates >= 1);
+    assert_eq!(decoded.stats.native_table_decode_boundaries, 0);
+    assert!(decoded.stats.pages_decoded < full.stats.pages_decoded);
+}
+
+#[test]
+fn varbytes_same_column_or_lowers_to_native_in() {
+    let state = bootstrap_bytes("events", primitive_events_file()).unwrap();
+    let projection = vec![0];
+    let filter = lower_filter(
+        &state,
+        &LowerExpr::Or(vec![
+            LowerExpr::Binary {
+                left: Box::new(LowerExpr::Column("name".into())),
+                op: LowerOperator::Eq,
+                right: Box::new(LowerExpr::Literal(LowerLiteral::Utf8("alpha".into()))),
+            },
+            LowerExpr::Binary {
+                left: Box::new(LowerExpr::Column("name".into())),
+                op: LowerOperator::Eq,
+                right: Box::new(LowerExpr::Literal(LowerLiteral::Utf8("gamma".into()))),
+            },
+        ]),
+        "name = 'alpha' OR name = 'gamma'",
+    );
+    match filter.predicate.as_ref() {
+        Some(CovePredicate::VarBytesIn { literals, .. }) => {
+            assert_eq!(literals, &vec![b"alpha".to_vec(), b"gamma".to_vec()]);
+        }
+        other => panic!("expected VarBytes IN predicate, got {other:?}"),
+    }
+    let plan = plan_scan(&state, Some(&projection), vec![filter]).unwrap();
+
+    let decoded = decode_scan(&state, &plan).unwrap();
+
+    let expected = ["+----+", "| id |", "+----+", "| 1  |", "| 3  |", "+----+"];
+    assert_batches_eq!(expected, &decoded.batches);
+    assert_eq!(decoded.stats.rows_selected, 2);
+    assert_eq!(decoded.stats.residual_predicates, 0);
+    assert_eq!(decoded.stats.exact_predicates, 1);
 }
 
 #[tokio::test]
@@ -2646,6 +3727,36 @@ async fn varbytes_equality_filter_is_pushed_down_exactly() {
 
     let explain = ctx
         .sql("EXPLAIN SELECT id FROM events WHERE name = 'beta'")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let explain_text = pretty_format_batches(&explain).unwrap().to_string();
+    assert!(explain_text.contains("CoveExec"), "{explain_text}");
+    assert!(!explain_text.contains("FilterExec"), "{explain_text}");
+    assert!(explain_text.contains("exact_filters=1"), "{explain_text}");
+    fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn varbytes_in_filter_is_pushed_down_exactly() {
+    let path = write_temp_cove("events_varbytes_in_filter", primitive_events_file());
+    let ctx = SessionContext::new();
+    register_cove_file(&ctx, "events", &path).unwrap();
+
+    let batches = ctx
+        .sql("SELECT id FROM events WHERE name IN ('alpha', 'gamma')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let expected = ["+----+", "| id |", "+----+", "| 1  |", "| 3  |", "+----+"];
+    assert_batches_eq!(expected, &batches);
+
+    let explain = ctx
+        .sql("EXPLAIN SELECT id FROM events WHERE name IN ('alpha', 'gamma')")
         .await
         .unwrap()
         .collect()
@@ -2711,6 +3822,359 @@ fn direct_decode_resolves_canonical_filecode_filters_for_single_file_state() {
     assert_batches_eq!(expected, &decoded.batches);
     assert_eq!(decoded.stats.lookup_index_hits, 1);
     assert_eq!(decoded.stats.index_rows_selected, 1);
+}
+
+#[test]
+fn filecode_same_column_or_lowers_to_native_in() {
+    let state = bootstrap_bytes("items", dictionary_items_file_with_lookup_index()).unwrap();
+    let projection = vec![1];
+    let filter = lower_filter(
+        &state,
+        &LowerExpr::Or(vec![
+            LowerExpr::Binary {
+                left: Box::new(LowerExpr::Column("name".into())),
+                op: LowerOperator::Eq,
+                right: Box::new(LowerExpr::Literal(LowerLiteral::Utf8("red".into()))),
+            },
+            LowerExpr::Binary {
+                left: Box::new(LowerExpr::Column("name".into())),
+                op: LowerOperator::Eq,
+                right: Box::new(LowerExpr::Literal(LowerLiteral::Utf8("blue".into()))),
+            },
+        ]),
+        "name = 'red' OR name = 'blue'",
+    );
+    match filter.predicate.as_ref() {
+        Some(CovePredicate::FileCodeIn {
+            file_codes,
+            canonical_values,
+            ..
+        }) => {
+            assert!(file_codes.is_empty());
+            assert_eq!(canonical_values.len(), 2);
+        }
+        other => panic!("expected FileCode IN predicate, got {other:?}"),
+    }
+    let plan = plan_scan(&state, Some(&projection), vec![filter]).unwrap();
+
+    let decoded = decode_scan(&state, &plan).unwrap();
+
+    let expected = [
+        "+---------+",
+        "| payload |",
+        "+---------+",
+        "| first   |",
+        "| second  |",
+        "+---------+",
+    ];
+    assert_batches_eq!(expected, &decoded.batches);
+    assert_eq!(decoded.stats.rows_selected, 2);
+    assert_eq!(decoded.stats.residual_predicates, 0);
+    assert_eq!(decoded.stats.exact_predicates, 1);
+}
+
+#[test]
+fn native_filecode_group_count_scan_groups_codes_then_decodes_labels() {
+    let state = bootstrap_bytes("items", dictionary_items_file(sample_dictionary())).unwrap();
+    let filter = lower_filter(
+        &state,
+        &LowerExpr::Binary {
+            left: Box::new(LowerExpr::Column("name".into())),
+            op: LowerOperator::Eq,
+            right: Box::new(LowerExpr::Literal(LowerLiteral::Utf8("red".into()))),
+        },
+        "name = 'red'",
+    );
+    let projection = Vec::new();
+    let plan = plan_scan(&state, Some(&projection), vec![filter]).unwrap();
+
+    let scanned = native_filecode_group_count_scan(&state, 0, &plan).unwrap();
+
+    assert_eq!(scanned.groups.counts.get(&canonical_utf8("red")), Some(&1));
+    assert_eq!(scanned.groups.counts.get(&canonical_utf8("blue")), None);
+    assert_eq!(scanned.groups.null_count, 0);
+    assert_eq!(scanned.groups.rows_grouped, 1);
+    assert!(scanned.stats.native_group_kernels >= 1);
+    assert_eq!(scanned.stats.native_group_rows_matched, 1);
+    assert_eq!(scanned.stats.rows_materialized, 0);
+}
+
+#[test]
+fn native_filecode_i64_group_aggregate_scan_merges_by_canonical_label() {
+    let state = bootstrap_bytes(
+        "items",
+        scored_dictionary_items_file(sample_dictionary(), [10, 20]),
+    )
+    .unwrap();
+    let projection = Vec::new();
+    let plan = plan_scan(&state, Some(&projection), Vec::new()).unwrap();
+
+    let scanned = native_filecode_i64_group_aggregate_scan(&state, 0, 1, &plan).unwrap();
+
+    let red = scanned.groups.groups.get(&canonical_utf8("red")).unwrap();
+    let blue = scanned.groups.groups.get(&canonical_utf8("blue")).unwrap();
+    assert_eq!(red.row_count, 1);
+    assert_eq!(red.aggregate.sum, 10);
+    assert_eq!(blue.row_count, 1);
+    assert_eq!(blue.aggregate.sum, 20);
+    assert_eq!(scanned.groups.null_row_count, 0);
+    assert!(scanned.stats.native_aggregate_kernels >= 1);
+    assert_eq!(scanned.stats.native_aggregate_rows_matched, 2);
+    assert_eq!(scanned.stats.rows_materialized, 0);
+}
+
+#[test]
+fn native_filecode_i64_group_aggregate_scan_merges_local_codebook_by_canonical_label() {
+    let state = bootstrap_bytes("items", local_codebook_scored_dictionary_items_file()).unwrap();
+    let projection = Vec::new();
+    let plan = plan_scan(&state, Some(&projection), Vec::new()).unwrap();
+
+    let scanned = native_filecode_i64_group_aggregate_scan(&state, 0, 1, &plan).unwrap();
+
+    let red = scanned.groups.groups.get(&canonical_utf8("red")).unwrap();
+    let blue = scanned.groups.groups.get(&canonical_utf8("blue")).unwrap();
+    assert_eq!(red.row_count, 2);
+    assert_eq!(red.aggregate.sum, 40);
+    assert_eq!(blue.row_count, 2);
+    assert_eq!(blue.aggregate.sum, 60);
+    assert_eq!(scanned.groups.null_row_count, 0);
+    assert!(scanned.stats.native_aggregate_kernels >= 1);
+    assert_eq!(scanned.stats.native_aggregate_rows_matched, 4);
+    assert_eq!(scanned.stats.rows_materialized, 0);
+}
+
+#[test]
+fn native_i64_i64_group_aggregate_scan_merges_numeric_groups() {
+    let state = bootstrap_bytes("scores", numeric_scores_file()).unwrap();
+    let projection = Vec::new();
+    let plan = plan_scan(
+        &state,
+        Some(&projection),
+        vec![FilterPlan::pruning_numeric(
+            1,
+            NumericPredicateOp::GtEq,
+            PredicateLiteral::Int64(20),
+            "score >= 20",
+        )],
+    )
+    .unwrap();
+
+    let scanned = native_i64_i64_group_aggregate_scan(&state, 0, 1, &plan).unwrap();
+
+    let one = scanned.groups.aggregates.get(&1).unwrap();
+    let two = scanned.groups.aggregates.get(&2).unwrap();
+    assert_eq!(scanned.groups.row_counts.get(&1), Some(&2));
+    assert_eq!(one.count, 2);
+    assert_eq!(one.sum, 80);
+    assert_eq!(one.min, Some(30));
+    assert_eq!(one.max, Some(50));
+    assert_eq!(scanned.groups.row_counts.get(&2), Some(&2));
+    assert_eq!(two.count, 2);
+    assert_eq!(two.sum, 60);
+    assert_eq!(two.min, Some(20));
+    assert_eq!(two.max, Some(40));
+    assert_eq!(scanned.groups.null_row_count, 0);
+    assert!(scanned.stats.native_lane_predicates >= 1);
+    assert!(scanned.stats.native_aggregate_kernels >= 1);
+    assert_eq!(scanned.stats.native_aggregate_rows_matched, 4);
+    assert_eq!(scanned.stats.rows_materialized, 0);
+}
+
+#[test]
+fn native_bool_group_count_scan_groups_plain_bool_lane() {
+    let state = bootstrap_bytes("events", primitive_events_file()).unwrap();
+    let projection = Vec::new();
+    let plan = plan_scan(
+        &state,
+        Some(&projection),
+        vec![FilterPlan::pruning_numeric(
+            0,
+            NumericPredicateOp::GtEq,
+            PredicateLiteral::Int64(2),
+            "id >= 2",
+        )],
+    )
+    .unwrap();
+
+    let scanned = native_bool_group_count_scan(&state, 2, &plan).unwrap();
+
+    assert_eq!(scanned.groups.counts, vec![1, 1]);
+    assert_eq!(scanned.groups.null_count, 0);
+    assert_eq!(scanned.groups.rows_grouped, 2);
+    assert!(scanned.stats.native_lane_predicates >= 1);
+    assert!(scanned.stats.native_group_kernels >= 1);
+    assert_eq!(scanned.stats.native_group_rows_matched, 2);
+    assert_eq!(scanned.stats.rows_materialized, 0);
+}
+
+#[test]
+fn native_bool_i64_group_aggregate_scan_uses_dense_bool_groups() {
+    let state = bootstrap_bytes("events", primitive_events_file()).unwrap();
+    let projection = Vec::new();
+    let plan = plan_scan(
+        &state,
+        Some(&projection),
+        vec![FilterPlan::pruning_numeric(
+            0,
+            NumericPredicateOp::GtEq,
+            PredicateLiteral::Int64(2),
+            "id >= 2",
+        )],
+    )
+    .unwrap();
+
+    let scanned = native_bool_i64_group_aggregate_scan(&state, 2, 0, &plan).unwrap();
+
+    assert_eq!(scanned.groups.row_counts, vec![1, 1]);
+    assert_eq!(scanned.groups.aggregates[0].count, 1);
+    assert_eq!(scanned.groups.aggregates[0].sum, 2);
+    assert_eq!(scanned.groups.aggregates[1].count, 1);
+    assert_eq!(scanned.groups.aggregates[1].sum, 3);
+    assert_eq!(scanned.groups.null_row_count, 0);
+    assert!(scanned.stats.native_lane_predicates >= 1);
+    assert!(scanned.stats.native_aggregate_kernels >= 1);
+    assert_eq!(scanned.stats.native_aggregate_rows_matched, 2);
+    assert_eq!(scanned.stats.rows_materialized, 0);
+}
+
+#[tokio::test]
+async fn filecode_same_column_or_filter_is_pushed_down_exactly() {
+    let path = write_temp_cove(
+        "items_filecode_or_filter",
+        dictionary_items_file_with_lookup_index(),
+    );
+    let ctx = SessionContext::new();
+    register_cove_file(&ctx, "items", &path).unwrap();
+
+    let batches = ctx
+        .sql("SELECT payload FROM items WHERE name = 'red' OR name = 'blue'")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let expected = [
+        "+---------+",
+        "| payload |",
+        "+---------+",
+        "| first   |",
+        "| second  |",
+        "+---------+",
+    ];
+    assert_batches_eq!(expected, &batches);
+
+    let explain = ctx
+        .sql("EXPLAIN SELECT payload FROM items WHERE name = 'red' OR name = 'blue'")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let explain_text = pretty_format_batches(&explain).unwrap().to_string();
+    assert!(explain_text.contains("CoveExec"), "{explain_text}");
+    assert!(!explain_text.contains("FilterExec"), "{explain_text}");
+    assert!(explain_text.contains("exact_filters=1"), "{explain_text}");
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn filecode_not_in_uses_native_complement_kernel() {
+    let state = bootstrap_bytes("items", dictionary_items_file_with_lookup_index()).unwrap();
+    let projection = vec![1];
+    let filter = lower_filter(
+        &state,
+        &LowerExpr::InList {
+            expr: Box::new(LowerExpr::Column("name".into())),
+            list: vec![LowerExpr::Literal(LowerLiteral::Utf8("red".into()))],
+            negated: true,
+        },
+        "name NOT IN ('red')",
+    );
+    match filter.predicate.as_ref() {
+        Some(CovePredicate::FileCodeNotIn {
+            file_codes,
+            canonical_values,
+            ..
+        }) => {
+            assert!(file_codes.is_empty());
+            assert_eq!(canonical_values.len(), 1);
+        }
+        other => panic!("expected FileCode NOT IN predicate, got {other:?}"),
+    }
+    let plan = plan_scan(&state, Some(&projection), vec![filter]).unwrap();
+
+    let decoded = decode_scan(&state, &plan).unwrap();
+
+    let expected = [
+        "+---------+",
+        "| payload |",
+        "+---------+",
+        "| second  |",
+        "+---------+",
+    ];
+    assert_batches_eq!(expected, &decoded.batches);
+    assert_eq!(decoded.stats.rows_selected, 1);
+    assert_eq!(decoded.stats.rows_materialized, 1);
+    assert_eq!(decoded.stats.residual_predicates, 0);
+    assert_eq!(decoded.stats.exact_predicates, 1);
+    assert_eq!(decoded.stats.lookup_index_hits, 0);
+    assert!(decoded.stats.native_lane_predicates >= 1);
+}
+
+#[test]
+fn filecode_not_in_with_null_literal_remains_residual() {
+    let state = bootstrap_bytes("items", dictionary_items_file_with_lookup_index()).unwrap();
+    let filter = lower_filter(
+        &state,
+        &LowerExpr::InList {
+            expr: Box::new(LowerExpr::Column("name".into())),
+            list: vec![LowerExpr::Literal(LowerLiteral::Null)],
+            negated: true,
+        },
+        "name NOT IN (NULL)",
+    );
+
+    assert_eq!(filter.use_kind, CoveFilterUse::Unsupported);
+    assert!(filter.predicate.is_none());
+}
+
+#[tokio::test]
+async fn filecode_not_in_filter_is_pushed_down_exactly() {
+    let path = write_temp_cove(
+        "items_filecode_not_in_filter",
+        dictionary_items_file_with_lookup_index(),
+    );
+    let ctx = SessionContext::new();
+    register_cove_file(&ctx, "items", &path).unwrap();
+
+    let batches = ctx
+        .sql("SELECT payload FROM items WHERE name NOT IN ('red')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let expected = [
+        "+---------+",
+        "| payload |",
+        "+---------+",
+        "| second  |",
+        "+---------+",
+    ];
+    assert_batches_eq!(expected, &batches);
+
+    let explain = ctx
+        .sql("EXPLAIN SELECT payload FROM items WHERE name NOT IN ('red')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let explain_text = pretty_format_batches(&explain).unwrap().to_string();
+    assert!(explain_text.contains("CoveExec"), "{explain_text}");
+    assert!(!explain_text.contains("FilterExec"), "{explain_text}");
+    assert!(explain_text.contains("exact_filters=1"), "{explain_text}");
+    fs::remove_file(path).unwrap();
 }
 
 #[test]
@@ -3085,6 +4549,639 @@ async fn generated_covi_sum_avg_answers_feed_datafusion_metadata_path() {
     fs::remove_file(covi_path).unwrap();
 }
 
+#[tokio::test]
+async fn native_i64_scalar_aggregates_use_native_aggregate_exec() {
+    let path = write_temp_cove("native_i64_aggregates", primitive_events_file());
+    let ctx = SessionContext::new();
+    register_cove_file(&ctx, "events", &path).unwrap();
+
+    let (batches, metrics) = collect_sql_with_cove_metrics(
+        &ctx,
+        "SELECT SUM(id) AS total, AVG(id) AS mean, MIN(id) AS lo, MAX(id) AS hi FROM events",
+        &[
+            "cove_native_aggregate_kernels",
+            "cove_native_aggregate_rows_matched",
+            "cove_rows_materialized",
+        ],
+    )
+    .await;
+    let expected = [
+        "+-------+------+----+----+",
+        "| total | mean | lo | hi |",
+        "+-------+------+----+----+",
+        "| 6     | 2.0  | 1  | 3  |",
+        "+-------+------+----+----+",
+    ];
+    assert_batches_eq!(expected, &batches);
+    assert!(metrics[0] >= 1, "{metrics:?}");
+    assert!(metrics[1] >= 3, "{metrics:?}");
+    assert_eq!(metrics[2], 0, "{metrics:?}");
+
+    let explain = ctx
+        .sql("EXPLAIN SELECT SUM(id), AVG(id), MIN(id), MAX(id) FROM events")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let explain_text = pretty_format_batches(&explain).unwrap().to_string();
+    assert!(
+        explain_text.contains("CoveNativeAggregateExec"),
+        "{explain_text}"
+    );
+    assert_typed_i64_native_contract(&explain_text);
+    assert!(!explain_text.contains("CoveExec"), "{explain_text}");
+    assert!(!explain_text.contains("CoveMetadataExec"), "{explain_text}");
+    fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn native_i64_group_count_uses_native_group_exec() {
+    let path = write_temp_cove("native_i64_group_count", primitive_events_file());
+    let ctx = SessionContext::new();
+    register_cove_file(&ctx, "events", &path).unwrap();
+
+    let (batches, metrics) = collect_sql_with_cove_metrics(
+        &ctx,
+        "SELECT id, COUNT(*) AS n FROM events GROUP BY id ORDER BY id",
+        &[
+            "cove_native_group_kernels",
+            "cove_native_group_rows_matched",
+            "cove_rows_materialized",
+        ],
+    )
+    .await;
+    let expected = [
+        "+----+---+",
+        "| id | n |",
+        "+----+---+",
+        "| 1  | 1 |",
+        "| 2  | 1 |",
+        "| 3  | 1 |",
+        "+----+---+",
+    ];
+    assert_batches_eq!(expected, &batches);
+    assert!(metrics[0] >= 1, "{metrics:?}");
+    assert!(metrics[1] >= 3, "{metrics:?}");
+    assert_eq!(metrics[2], 0, "{metrics:?}");
+
+    let explain = ctx
+        .sql("EXPLAIN SELECT id, COUNT(*) AS n FROM events GROUP BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let explain_text = pretty_format_batches(&explain).unwrap().to_string();
+    assert!(
+        explain_text.contains("CoveNativeGroupCountExec"),
+        "{explain_text}"
+    );
+    assert_typed_i64_native_contract(&explain_text);
+    assert!(!explain_text.contains("CoveExec"), "{explain_text}");
+    assert!(!explain_text.contains("CoveMetadataExec"), "{explain_text}");
+    fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn native_bool_group_count_uses_native_group_exec() {
+    let path = write_temp_cove("native_bool_group_count", primitive_events_file());
+    let ctx = SessionContext::new();
+    register_cove_file(&ctx, "events", &path).unwrap();
+
+    let (batches, metrics) = collect_sql_with_cove_metrics(
+        &ctx,
+        "SELECT active, COUNT(*) AS n FROM events GROUP BY active ORDER BY active",
+        &[
+            "cove_native_group_kernels",
+            "cove_native_group_rows_matched",
+            "cove_rows_materialized",
+        ],
+    )
+    .await;
+    let expected = [
+        "+--------+---+",
+        "| active | n |",
+        "+--------+---+",
+        "| false  | 1 |",
+        "| true   | 2 |",
+        "+--------+---+",
+    ];
+    assert_batches_eq!(expected, &batches);
+    assert!(metrics[0] >= 1, "{metrics:?}");
+    assert_eq!(metrics[1], 3, "{metrics:?}");
+    assert_eq!(metrics[2], 0, "{metrics:?}");
+
+    let explain = ctx
+        .sql("EXPLAIN SELECT active, COUNT(*) AS n FROM events GROUP BY active")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let explain_text = pretty_format_batches(&explain).unwrap().to_string();
+    assert!(
+        explain_text.contains("CoveNativeGroupCountExec"),
+        "{explain_text}"
+    );
+    assert_bool_native_contract(&explain_text);
+    assert!(!explain_text.contains("CoveExec"), "{explain_text}");
+    assert!(!explain_text.contains("CoveMetadataExec"), "{explain_text}");
+    fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn filtered_native_bool_i64_group_aggregates_use_native_exec() {
+    let path = write_temp_cove(
+        "filtered_native_bool_i64_group_aggs",
+        primitive_events_file(),
+    );
+    let ctx = SessionContext::new();
+    register_cove_file(&ctx, "events", &path).unwrap();
+
+    let sql = "SELECT active, SUM(id) AS total, AVG(id) AS mean, MIN(id) AS lo, MAX(id) AS hi, COUNT(id) AS c \
+               FROM events WHERE id >= 2 GROUP BY active ORDER BY active";
+    let (batches, metrics) = collect_sql_with_cove_metrics(
+        &ctx,
+        sql,
+        &[
+            "cove_native_lane_predicates",
+            "cove_native_aggregate_kernels",
+            "cove_native_aggregate_rows_matched",
+            "cove_rows_materialized",
+        ],
+    )
+    .await;
+    let expected = [
+        "+--------+-------+------+----+----+---+",
+        "| active | total | mean | lo | hi | c |",
+        "+--------+-------+------+----+----+---+",
+        "| false  | 2     | 2.0  | 2  | 2  | 1 |",
+        "| true   | 3     | 3.0  | 3  | 3  | 1 |",
+        "+--------+-------+------+----+----+---+",
+    ];
+    assert_batches_eq!(expected, &batches);
+    assert!(metrics[0] >= 1, "{metrics:?}");
+    assert!(metrics[1] >= 1, "{metrics:?}");
+    assert_eq!(metrics[2], 2, "{metrics:?}");
+    assert_eq!(metrics[3], 0, "{metrics:?}");
+
+    let explain = ctx
+        .sql(
+            "EXPLAIN SELECT active, SUM(id) AS total, AVG(id) AS mean, MIN(id) AS lo, \
+             MAX(id) AS hi, COUNT(id) AS c \
+             FROM events WHERE id >= 2 GROUP BY active",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let explain_text = pretty_format_batches(&explain).unwrap().to_string();
+    assert!(
+        explain_text.contains("CoveNativeBoolI64GroupAggregateExec"),
+        "{explain_text}"
+    );
+    assert_bool_i64_group_aggregate_native_contract(&explain_text);
+    assert!(!explain_text.contains("CoveExec"), "{explain_text}");
+    assert!(!explain_text.contains("CoveMetadataExec"), "{explain_text}");
+    fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn filtered_native_i64_i64_group_aggregates_use_native_exec() {
+    let path = write_temp_cove("filtered_native_i64_i64_group_aggs", numeric_scores_file());
+    let ctx = SessionContext::new();
+    register_cove_file(&ctx, "scores", &path).unwrap();
+
+    let sql = "SELECT id, SUM(score) AS total, AVG(score) AS mean, MIN(score) AS lo, MAX(score) AS hi, COUNT(score) AS c \
+               FROM scores WHERE score >= 20 GROUP BY id ORDER BY id";
+    let (batches, metrics) = collect_sql_with_cove_metrics(
+        &ctx,
+        sql,
+        &[
+            "cove_native_lane_predicates",
+            "cove_native_aggregate_kernels",
+            "cove_native_aggregate_rows_matched",
+            "cove_rows_materialized",
+        ],
+    )
+    .await;
+    let expected = [
+        "+----+-------+------+----+----+---+",
+        "| id | total | mean | lo | hi | c |",
+        "+----+-------+------+----+----+---+",
+        "| 1  | 80    | 40.0 | 30 | 50 | 2 |",
+        "| 2  | 60    | 30.0 | 20 | 40 | 2 |",
+        "+----+-------+------+----+----+---+",
+    ];
+    assert_batches_eq!(expected, &batches);
+    assert!(metrics[0] >= 1, "{metrics:?}");
+    assert!(metrics[1] >= 1, "{metrics:?}");
+    assert_eq!(metrics[2], 4, "{metrics:?}");
+    assert_eq!(metrics[3], 0, "{metrics:?}");
+
+    let explain = ctx
+        .sql(
+            "EXPLAIN SELECT id, SUM(score) AS total, AVG(score) AS mean, MIN(score) AS lo, \
+             MAX(score) AS hi, COUNT(score) AS c \
+             FROM scores WHERE score >= 20 GROUP BY id",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let explain_text = pretty_format_batches(&explain).unwrap().to_string();
+    assert!(
+        explain_text.contains("CoveNativeI64I64GroupAggregateExec"),
+        "{explain_text}"
+    );
+    assert_i64_i64_group_aggregate_native_contract(&explain_text);
+    assert!(!explain_text.contains("CoveExec"), "{explain_text}");
+    assert!(!explain_text.contains("CoveMetadataExec"), "{explain_text}");
+    fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn filtered_native_bool_distinct_group_uses_native_group_exec() {
+    let path = write_temp_cove(
+        "filtered_native_bool_distinct_group",
+        primitive_events_file(),
+    );
+    let ctx = SessionContext::new();
+    register_cove_file(&ctx, "events", &path).unwrap();
+
+    let (batches, metrics) = collect_sql_with_cove_metrics(
+        &ctx,
+        "SELECT active FROM events WHERE id >= 2 GROUP BY active ORDER BY active",
+        &[
+            "cove_native_lane_predicates",
+            "cove_native_group_kernels",
+            "cove_native_group_rows_matched",
+            "cove_rows_materialized",
+        ],
+    )
+    .await;
+    let expected = [
+        "+--------+",
+        "| active |",
+        "+--------+",
+        "| false  |",
+        "| true   |",
+        "+--------+",
+    ];
+    assert_batches_eq!(expected, &batches);
+    assert!(metrics[0] >= 1, "{metrics:?}");
+    assert!(metrics[1] >= 1, "{metrics:?}");
+    assert_eq!(metrics[2], 2, "{metrics:?}");
+    assert_eq!(metrics[3], 0, "{metrics:?}");
+
+    let explain = ctx
+        .sql("EXPLAIN SELECT active FROM events WHERE id >= 2 GROUP BY active")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let explain_text = pretty_format_batches(&explain).unwrap().to_string();
+    assert!(
+        explain_text.contains("CoveNativeGroupDistinctExec"),
+        "{explain_text}"
+    );
+    assert_bool_native_contract(&explain_text);
+    assert!(!explain_text.contains("CoveExec"), "{explain_text}");
+    assert!(!explain_text.contains("CoveMetadataExec"), "{explain_text}");
+    fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn filtered_native_bool_select_distinct_uses_native_group_exec() {
+    let path = write_temp_cove(
+        "filtered_native_bool_select_distinct",
+        primitive_events_file(),
+    );
+    let ctx = SessionContext::new();
+    register_cove_file(&ctx, "events", &path).unwrap();
+
+    let (batches, metrics) = collect_sql_with_cove_metrics(
+        &ctx,
+        "SELECT DISTINCT active FROM events WHERE id >= 2 ORDER BY active",
+        &[
+            "cove_native_lane_predicates",
+            "cove_native_group_kernels",
+            "cove_native_group_rows_matched",
+            "cove_rows_materialized",
+        ],
+    )
+    .await;
+    let expected = [
+        "+--------+",
+        "| active |",
+        "+--------+",
+        "| false  |",
+        "| true   |",
+        "+--------+",
+    ];
+    assert_batches_eq!(expected, &batches);
+    assert!(metrics[0] >= 1, "{metrics:?}");
+    assert!(metrics[1] >= 1, "{metrics:?}");
+    assert_eq!(metrics[2], 2, "{metrics:?}");
+    assert_eq!(metrics[3], 0, "{metrics:?}");
+
+    let explain = ctx
+        .sql("EXPLAIN SELECT DISTINCT active FROM events WHERE id >= 2")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let explain_text = pretty_format_batches(&explain).unwrap().to_string();
+    assert!(
+        explain_text.contains("CoveNativeGroupDistinctExec"),
+        "{explain_text}"
+    );
+    assert_bool_native_contract(&explain_text);
+    assert!(!explain_text.contains("CoveExec"), "{explain_text}");
+    assert!(!explain_text.contains("CoveMetadataExec"), "{explain_text}");
+    fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn filtered_native_i64_distinct_group_uses_native_group_exec() {
+    let path = write_temp_cove(
+        "filtered_native_i64_distinct_group",
+        primitive_events_file(),
+    );
+    let ctx = SessionContext::new();
+    register_cove_file(&ctx, "events", &path).unwrap();
+
+    let (batches, metrics) = collect_sql_with_cove_metrics(
+        &ctx,
+        "SELECT id FROM events WHERE id >= 2 GROUP BY id ORDER BY id",
+        &[
+            "cove_native_lane_predicates",
+            "cove_native_group_kernels",
+            "cove_native_group_rows_matched",
+            "cove_rows_materialized",
+        ],
+    )
+    .await;
+    let expected = ["+----+", "| id |", "+----+", "| 2  |", "| 3  |", "+----+"];
+    assert_batches_eq!(expected, &batches);
+    assert!(metrics[0] >= 1, "{metrics:?}");
+    assert!(metrics[1] >= 1, "{metrics:?}");
+    assert_eq!(metrics[2], 2, "{metrics:?}");
+    assert_eq!(metrics[3], 0, "{metrics:?}");
+
+    let explain = ctx
+        .sql("EXPLAIN SELECT id FROM events WHERE id >= 2 GROUP BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let explain_text = pretty_format_batches(&explain).unwrap().to_string();
+    assert!(
+        explain_text.contains("CoveNativeGroupDistinctExec"),
+        "{explain_text}"
+    );
+    assert_typed_i64_native_contract(&explain_text);
+    assert!(!explain_text.contains("CoveExec"), "{explain_text}");
+    assert!(!explain_text.contains("CoveMetadataExec"), "{explain_text}");
+    fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn filtered_native_i64_select_distinct_uses_native_group_exec() {
+    let path = write_temp_cove(
+        "filtered_native_i64_select_distinct",
+        primitive_events_file(),
+    );
+    let ctx = SessionContext::new();
+    register_cove_file(&ctx, "events", &path).unwrap();
+
+    let (batches, metrics) = collect_sql_with_cove_metrics(
+        &ctx,
+        "SELECT DISTINCT id FROM events WHERE id >= 2 ORDER BY id",
+        &[
+            "cove_native_lane_predicates",
+            "cove_native_group_kernels",
+            "cove_native_group_rows_matched",
+            "cove_rows_materialized",
+        ],
+    )
+    .await;
+    let expected = ["+----+", "| id |", "+----+", "| 2  |", "| 3  |", "+----+"];
+    assert_batches_eq!(expected, &batches);
+    assert!(metrics[0] >= 1, "{metrics:?}");
+    assert!(metrics[1] >= 1, "{metrics:?}");
+    assert_eq!(metrics[2], 2, "{metrics:?}");
+    assert_eq!(metrics[3], 0, "{metrics:?}");
+
+    let explain = ctx
+        .sql("EXPLAIN SELECT DISTINCT id FROM events WHERE id >= 2")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let explain_text = pretty_format_batches(&explain).unwrap().to_string();
+    assert!(
+        explain_text.contains("CoveNativeGroupDistinctExec"),
+        "{explain_text}"
+    );
+    assert!(!explain_text.contains("CoveExec"), "{explain_text}");
+    assert!(!explain_text.contains("CoveMetadataExec"), "{explain_text}");
+    fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn filtered_native_i64_scalar_aggregates_use_native_filter_and_aggregate_exec() {
+    let path = write_temp_cove("filtered_native_i64_aggregates", primitive_events_file());
+    let ctx = SessionContext::new();
+    register_cove_file(&ctx, "events", &path).unwrap();
+
+    let sql =
+        "SELECT SUM(id) AS total, AVG(id) AS mean, MIN(id) AS lo, MAX(id) AS hi FROM events WHERE id >= 2";
+    let (batches, metrics) = collect_sql_with_cove_metrics(
+        &ctx,
+        sql,
+        &[
+            "cove_native_lane_predicates",
+            "cove_native_aggregate_kernels",
+            "cove_native_aggregate_rows_matched",
+            "cove_rows_materialized",
+        ],
+    )
+    .await;
+    let expected = [
+        "+-------+------+----+----+",
+        "| total | mean | lo | hi |",
+        "+-------+------+----+----+",
+        "| 5     | 2.5  | 2  | 3  |",
+        "+-------+------+----+----+",
+    ];
+    assert_batches_eq!(expected, &batches);
+    assert!(metrics[0] >= 1, "{metrics:?}");
+    assert!(metrics[1] >= 1, "{metrics:?}");
+    assert_eq!(metrics[2], 2, "{metrics:?}");
+    assert_eq!(metrics[3], 0, "{metrics:?}");
+
+    let explain = ctx
+        .sql("EXPLAIN SELECT SUM(id), AVG(id), MIN(id), MAX(id) FROM events WHERE id >= 2")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let explain_text = pretty_format_batches(&explain).unwrap().to_string();
+    assert!(
+        explain_text.contains("CoveNativeAggregateExec"),
+        "{explain_text}"
+    );
+    assert!(!explain_text.contains("CoveExec"), "{explain_text}");
+    assert!(!explain_text.contains("CoveMetadataExec"), "{explain_text}");
+    fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn filtered_native_i64_group_count_uses_native_filter_and_group_exec() {
+    let path = write_temp_cove("filtered_native_i64_group_count", primitive_events_file());
+    let ctx = SessionContext::new();
+    register_cove_file(&ctx, "events", &path).unwrap();
+
+    let (batches, metrics) = collect_sql_with_cove_metrics(
+        &ctx,
+        "SELECT id, COUNT(*) AS n FROM events WHERE id >= 2 GROUP BY id ORDER BY id",
+        &[
+            "cove_native_lane_predicates",
+            "cove_native_group_kernels",
+            "cove_native_group_rows_matched",
+            "cove_rows_materialized",
+        ],
+    )
+    .await;
+    let expected = [
+        "+----+---+",
+        "| id | n |",
+        "+----+---+",
+        "| 2  | 1 |",
+        "| 3  | 1 |",
+        "+----+---+",
+    ];
+    assert_batches_eq!(expected, &batches);
+    assert!(metrics[0] >= 1, "{metrics:?}");
+    assert!(metrics[1] >= 1, "{metrics:?}");
+    assert_eq!(metrics[2], 2, "{metrics:?}");
+    assert_eq!(metrics[3], 0, "{metrics:?}");
+
+    let explain = ctx
+        .sql("EXPLAIN SELECT id, COUNT(*) AS n FROM events WHERE id >= 2 GROUP BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let explain_text = pretty_format_batches(&explain).unwrap().to_string();
+    assert!(
+        explain_text.contains("CoveNativeGroupCountExec"),
+        "{explain_text}"
+    );
+    assert!(!explain_text.contains("CoveExec"), "{explain_text}");
+    assert!(!explain_text.contains("CoveMetadataExec"), "{explain_text}");
+    fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn filtered_native_i64_count_column_uses_native_filter_and_aggregate_exec() {
+    let path = write_temp_cove("filtered_native_i64_count_column", primitive_events_file());
+    let ctx = SessionContext::new();
+    register_cove_file(&ctx, "events", &path).unwrap();
+
+    let (batches, metrics) = collect_sql_with_cove_metrics(
+        &ctx,
+        "SELECT COUNT(id) AS present FROM events WHERE id >= 2",
+        &[
+            "cove_native_lane_predicates",
+            "cove_native_aggregate_kernels",
+            "cove_native_aggregate_rows_matched",
+            "cove_rows_materialized",
+        ],
+    )
+    .await;
+    let expected = [
+        "+---------+",
+        "| present |",
+        "+---------+",
+        "| 2       |",
+        "+---------+",
+    ];
+    assert_batches_eq!(expected, &batches);
+    assert!(metrics[0] >= 1, "{metrics:?}");
+    assert!(metrics[1] >= 1, "{metrics:?}");
+    assert_eq!(metrics[2], 2, "{metrics:?}");
+    assert_eq!(metrics[3], 0, "{metrics:?}");
+
+    let explain = ctx
+        .sql("EXPLAIN SELECT COUNT(id) AS present FROM events WHERE id >= 2")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let explain_text = pretty_format_batches(&explain).unwrap().to_string();
+    assert!(
+        explain_text.contains("CoveNativeAggregateExec"),
+        "{explain_text}"
+    );
+    assert!(!explain_text.contains("CoveExec"), "{explain_text}");
+    assert!(!explain_text.contains("CoveMetadataExec"), "{explain_text}");
+    fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn filtered_native_count_star_uses_native_filter_and_count_exec() {
+    let path = write_temp_cove("filtered_native_count_star", primitive_events_file());
+    let ctx = SessionContext::new();
+    register_cove_file(&ctx, "events", &path).unwrap();
+
+    let (batches, metrics) = collect_sql_with_cove_metrics(
+        &ctx,
+        "SELECT COUNT(*) AS rows FROM events WHERE id >= 2",
+        &[
+            "cove_native_lane_predicates",
+            "cove_native_count_scans",
+            "cove_native_count_rows_matched",
+            "cove_rows_materialized",
+        ],
+    )
+    .await;
+    let expected = ["+------+", "| rows |", "+------+", "| 2    |", "+------+"];
+    assert_batches_eq!(expected, &batches);
+    assert!(metrics[0] >= 1, "{metrics:?}");
+    assert!(metrics[1] >= 1, "{metrics:?}");
+    assert_eq!(metrics[2], 2, "{metrics:?}");
+    assert_eq!(metrics[3], 0, "{metrics:?}");
+
+    let explain = ctx
+        .sql("EXPLAIN SELECT COUNT(*) AS rows FROM events WHERE id >= 2")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let explain_text = pretty_format_batches(&explain).unwrap().to_string();
+    assert!(
+        explain_text.contains("CoveNativeCountExec"),
+        "{explain_text}"
+    );
+    assert_rowset_count_native_contract(&explain_text);
+    assert!(!explain_text.contains("CoveExec"), "{explain_text}");
+    assert!(!explain_text.contains("CoveMetadataExec"), "{explain_text}");
+    fs::remove_file(path).unwrap();
+}
+
 #[cfg(feature = "covi")]
 #[tokio::test]
 async fn covi_sum_avg_answers_feed_datafusion_metadata_path() {
@@ -3127,7 +5224,7 @@ async fn covi_sum_avg_answers_feed_datafusion_metadata_path() {
 }
 
 #[tokio::test]
-async fn inexact_null_filters_remain_residual_and_correct() {
+async fn exact_null_filters_push_down_and_remain_correct() {
     let path = write_temp_cove("nullable_residual", nullable_events_file());
     let ctx = SessionContext::new();
     register_cove_file(&ctx, "events", &path).unwrap();
@@ -3161,7 +5258,8 @@ async fn inexact_null_filters_remain_residual_and_correct() {
         .unwrap();
     let explain_text = pretty_format_batches(&explain).unwrap().to_string();
     assert!(explain_text.contains("CoveExec"));
-    assert!(explain_text.contains("FilterExec") || explain_text.contains("Filter"));
+    assert!(!explain_text.contains("FilterExec"), "{explain_text}");
+    assert!(explain_text.contains("exact_filters=1"), "{explain_text}");
     fs::remove_file(path).unwrap();
 }
 
@@ -3580,7 +5678,7 @@ async fn m4d_metadata_count_star_rewrites_to_memtable() {
 }
 
 #[tokio::test]
-async fn m4d_metadata_count_nullable_column_uses_exact_synopsis_only() {
+async fn m4d_metadata_count_nullable_column_uses_synopsis_or_native_count() {
     let exact_path = write_temp_cove(
         "m4d_count_nullable_exact",
         nullable_events_file_with_count(),
@@ -3625,7 +5723,12 @@ async fn m4d_metadata_count_nullable_column_uses_exact_synopsis_only() {
         .await
         .unwrap();
     let explain_text = pretty_format_batches(&explain).unwrap().to_string();
-    assert!(explain_text.contains("CoveExec"), "{explain_text}");
+    assert!(
+        explain_text.contains("CoveNativeAggregateExec"),
+        "{explain_text}"
+    );
+    assert!(!explain_text.contains("CoveExec"), "{explain_text}");
+    assert!(!explain_text.contains("CoveMetadataExec"), "{explain_text}");
     fs::remove_file(fallback_path).unwrap();
 }
 
@@ -3652,20 +5755,26 @@ fn m4d_composite_tuple_prunes_multi_column_filecode_filters() {
 }
 
 #[tokio::test]
-async fn m4d_topn_optimizer_adds_read_order_hint_without_removing_sort() {
+async fn m4d_topn_optimizer_rewrites_single_i64_projection_to_native_order() {
     let path = write_temp_cove("m4d_topn", topn_events_file());
     let ctx = SessionContext::new();
     register_cove_file(&ctx, "events", &path).unwrap();
 
-    let batches = ctx
-        .sql("SELECT id FROM events ORDER BY id DESC LIMIT 1")
-        .await
-        .unwrap()
-        .collect()
-        .await
-        .unwrap();
+    let (batches, metrics) = collect_sql_with_cove_metrics(
+        &ctx,
+        "SELECT id FROM events ORDER BY id DESC LIMIT 1",
+        &[
+            "cove_native_sort_kernels",
+            "cove_native_sort_rows_matched",
+            "cove_rows_materialized",
+        ],
+    )
+    .await;
     let expected = ["+----+", "| id |", "+----+", "| 9  |", "+----+"];
     assert_batches_eq!(expected, &batches);
+    assert!(metrics[0] >= 1, "{metrics:?}");
+    assert!(metrics[1] >= 1, "{metrics:?}");
+    assert_eq!(metrics[2], 0, "{metrics:?}");
 
     let explain = ctx
         .sql("EXPLAIN SELECT id FROM events ORDER BY id DESC LIMIT 1")
@@ -3675,15 +5784,632 @@ async fn m4d_topn_optimizer_adds_read_order_hint_without_removing_sort() {
         .await
         .unwrap();
     let explain_text = pretty_format_batches(&explain).unwrap().to_string();
-    assert!(explain_text.contains("topn_hint=Some"), "{explain_text}");
     assert!(
-        explain_text.contains("materialization_mode=streaming"),
+        explain_text.contains("CoveNativeI64OrderExec"),
         "{explain_text}"
     );
+    assert_typed_i64_native_contract(&explain_text);
+    assert!(!explain_text.contains("SortExec"), "{explain_text}");
+    assert!(!explain_text.contains("CoveExec"), "{explain_text}");
+    fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn native_i64_order_without_limit_uses_native_order_exec() {
+    let path = write_temp_cove("native_i64_order_without_limit", primitive_events_file());
+    let ctx = SessionContext::new();
+    register_cove_file(&ctx, "events", &path).unwrap();
+
+    let (batches, metrics) = collect_sql_with_cove_metrics(
+        &ctx,
+        "SELECT id FROM events ORDER BY id DESC",
+        &[
+            "cove_native_sort_kernels",
+            "cove_native_sort_rows_matched",
+            "cove_rows_materialized",
+        ],
+    )
+    .await;
+    let expected = [
+        "+----+", "| id |", "+----+", "| 3  |", "| 2  |", "| 1  |", "+----+",
+    ];
+    assert_batches_eq!(expected, &batches);
+    assert!(metrics[0] >= 1, "{metrics:?}");
+    assert_eq!(metrics[1], 3, "{metrics:?}");
+    assert_eq!(metrics[2], 0, "{metrics:?}");
+
+    let explain = ctx
+        .sql("EXPLAIN SELECT id FROM events ORDER BY id DESC")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let explain_text = pretty_format_batches(&explain).unwrap().to_string();
     assert!(
-        explain_text.contains("SortExec") || explain_text.contains("Sort"),
+        explain_text.contains("CoveNativeI64OrderExec"),
         "{explain_text}"
     );
+    assert_typed_i64_native_contract(&explain_text);
+    assert!(!explain_text.contains("SortExec"), "{explain_text}");
+    assert!(!explain_text.contains("CoveExec"), "{explain_text}");
+    fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn filtered_native_i64_topn_order_uses_native_filter_and_order_exec() {
+    let path = write_temp_cove("filtered_native_i64_topn_order", primitive_events_file());
+    let ctx = SessionContext::new();
+    register_cove_file(&ctx, "events", &path).unwrap();
+
+    let (batches, metrics) = collect_sql_with_cove_metrics(
+        &ctx,
+        "SELECT id FROM events WHERE id >= 2 ORDER BY id DESC LIMIT 1",
+        &[
+            "cove_native_lane_predicates",
+            "cove_native_sort_kernels",
+            "cove_native_sort_rows_matched",
+            "cove_rows_materialized",
+        ],
+    )
+    .await;
+    let expected = ["+----+", "| id |", "+----+", "| 3  |", "+----+"];
+    assert_batches_eq!(expected, &batches);
+    assert!(metrics[0] >= 1, "{metrics:?}");
+    assert!(metrics[1] >= 1, "{metrics:?}");
+    assert_eq!(metrics[2], 2, "{metrics:?}");
+    assert_eq!(metrics[3], 0, "{metrics:?}");
+
+    let explain = ctx
+        .sql("EXPLAIN SELECT id FROM events WHERE id >= 2 ORDER BY id DESC LIMIT 1")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let explain_text = pretty_format_batches(&explain).unwrap().to_string();
+    assert!(
+        explain_text.contains("CoveNativeI64OrderExec"),
+        "{explain_text}"
+    );
+    assert!(!explain_text.contains("SortExec"), "{explain_text}");
+    assert!(!explain_text.contains("CoveExec"), "{explain_text}");
+    fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn native_i64_inner_join_uses_native_join_exec() {
+    let left_path = write_temp_cove("native_i64_join_left", topn_events_file());
+    let right_path = write_temp_cove("native_i64_join_right", topn_events_file());
+    let ctx = SessionContext::new();
+    register_cove_file(&ctx, "left_events", &left_path).unwrap();
+    register_cove_file(&ctx, "right_events", &right_path).unwrap();
+
+    let sql = "SELECT l.id AS lid, r.id AS rid \
+               FROM left_events AS l JOIN right_events AS r ON l.id = r.id \
+               ORDER BY lid";
+    let (batches, metrics) = collect_sql_with_cove_metrics(
+        &ctx,
+        sql,
+        &[
+            "cove_native_join_kernels",
+            "cove_native_join_rows_matched",
+            "cove_rows_materialized",
+        ],
+    )
+    .await;
+    let expected = [
+        "+-----+-----+",
+        "| lid | rid |",
+        "+-----+-----+",
+        "| 1   | 1   |",
+        "| 9   | 9   |",
+        "+-----+-----+",
+    ];
+    assert_batches_eq!(expected, &batches);
+    assert!(metrics[0] >= 3, "{metrics:?}");
+    assert_eq!(metrics[1], 6, "{metrics:?}");
+    assert_eq!(metrics[2], 0, "{metrics:?}");
+
+    let explain = ctx
+        .sql("EXPLAIN SELECT l.id AS lid, r.id AS rid FROM left_events AS l JOIN right_events AS r ON l.id = r.id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let explain_text = pretty_format_batches(&explain).unwrap().to_string();
+    assert!(
+        explain_text.contains("CoveNativeI64JoinExec"),
+        "{explain_text}"
+    );
+    assert_typed_i64_native_contract(&explain_text);
+    assert!(!explain_text.contains("HashJoinExec"), "{explain_text}");
+    assert!(!explain_text.contains("CoveExec"), "{explain_text}");
+    fs::remove_file(left_path).unwrap();
+    fs::remove_file(right_path).unwrap();
+}
+
+#[tokio::test]
+async fn native_filecode_inner_join_uses_native_join_exec_across_swapped_dictionaries() {
+    let left_path = write_temp_cove(
+        "native_filecode_join_left",
+        dictionary_items_file(sample_dictionary()),
+    );
+    let right_path = write_temp_cove(
+        "native_filecode_join_right",
+        dictionary_items_file(swapped_dictionary()),
+    );
+    let ctx = SessionContext::new();
+    register_cove_file(&ctx, "left_items", &left_path).unwrap();
+    register_cove_file(&ctx, "right_items", &right_path).unwrap();
+
+    let sql = "SELECT l.name AS lname, r.name AS rname \
+               FROM left_items AS l JOIN right_items AS r ON l.name = r.name \
+               ORDER BY lname";
+    let (batches, metrics) = collect_sql_with_cove_metrics(
+        &ctx,
+        sql,
+        &[
+            "cove_native_join_kernels",
+            "cove_native_join_rows_matched",
+            "cove_rows_materialized",
+        ],
+    )
+    .await;
+    let expected = [
+        "+-------+-------+",
+        "| lname | rname |",
+        "+-------+-------+",
+        "| blue  | blue  |",
+        "| red   | red   |",
+        "+-------+-------+",
+    ];
+    assert_batches_eq!(expected, &batches);
+    assert!(metrics[0] >= 3, "{metrics:?}");
+    assert_eq!(metrics[1], 6, "{metrics:?}");
+    assert_eq!(metrics[2], 0, "{metrics:?}");
+
+    let explain = ctx
+        .sql("EXPLAIN SELECT l.name AS lname, r.name AS rname FROM left_items AS l JOIN right_items AS r ON l.name = r.name")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let explain_text = pretty_format_batches(&explain).unwrap().to_string();
+    assert!(
+        explain_text.contains("CoveNativeFileCodeJoinExec"),
+        "{explain_text}"
+    );
+    assert_filecode_join_native_contract(&explain_text);
+    assert!(!explain_text.contains("HashJoinExec"), "{explain_text}");
+    assert!(!explain_text.contains("CoveExec"), "{explain_text}");
+    fs::remove_file(left_path).unwrap();
+    fs::remove_file(right_path).unwrap();
+}
+
+#[tokio::test]
+async fn native_filecode_left_semi_and_anti_join_use_native_join_exec() {
+    let left_path = write_temp_cove(
+        "native_filecode_join_semi_anti_left",
+        filecode_key_file(sample_dictionary(), &[0, 1, 0]),
+    );
+    let right_path = write_temp_cove(
+        "native_filecode_join_semi_anti_right",
+        filecode_key_file(swapped_dictionary(), &[1]),
+    );
+    let ctx = SessionContext::new();
+    register_cove_file(&ctx, "left_items", &left_path).unwrap();
+    register_cove_file(&ctx, "right_items", &right_path).unwrap();
+
+    let semi_sql = "SELECT l.name AS name \
+                    FROM left_items AS l LEFT SEMI JOIN right_items AS r ON l.name = r.name \
+                    ORDER BY name";
+    let (semi_batches, semi_metrics) = collect_sql_with_cove_metrics(
+        &ctx,
+        semi_sql,
+        &[
+            "cove_native_join_kernels",
+            "cove_native_join_rows_matched",
+            "cove_rows_materialized",
+        ],
+    )
+    .await;
+    let semi_expected = [
+        "+------+", "| name |", "+------+", "| red  |", "| red  |", "+------+",
+    ];
+    assert_batches_eq!(semi_expected, &semi_batches);
+    assert_eq!(semi_metrics[0], 3, "{semi_metrics:?}");
+    assert_eq!(semi_metrics[1], 6, "{semi_metrics:?}");
+    assert_eq!(semi_metrics[2], 0, "{semi_metrics:?}");
+
+    let anti_sql = "SELECT l.name AS name \
+                    FROM left_items AS l LEFT ANTI JOIN right_items AS r ON l.name = r.name \
+                    ORDER BY name";
+    let (anti_batches, anti_metrics) = collect_sql_with_cove_metrics(
+        &ctx,
+        anti_sql,
+        &[
+            "cove_native_join_kernels",
+            "cove_native_join_rows_matched",
+            "cove_rows_materialized",
+        ],
+    )
+    .await;
+    let anti_expected = ["+------+", "| name |", "+------+", "| blue |", "+------+"];
+    assert_batches_eq!(anti_expected, &anti_batches);
+    assert_eq!(anti_metrics[0], 3, "{anti_metrics:?}");
+    assert_eq!(anti_metrics[1], 5, "{anti_metrics:?}");
+    assert_eq!(anti_metrics[2], 0, "{anti_metrics:?}");
+
+    let explain = ctx
+        .sql("EXPLAIN SELECT l.name AS name FROM left_items AS l LEFT SEMI JOIN right_items AS r ON l.name = r.name")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let explain_text = pretty_format_batches(&explain).unwrap().to_string();
+    assert!(
+        explain_text.contains("CoveNativeFileCodeJoinExec"),
+        "{explain_text}"
+    );
+    assert_filecode_join_native_contract(&explain_text);
+    assert!(explain_text.contains("kind=left_semi"), "{explain_text}");
+    assert!(!explain_text.contains("HashJoinExec"), "{explain_text}");
+    assert!(!explain_text.contains("CoveExec"), "{explain_text}");
+    fs::remove_file(left_path).unwrap();
+    fs::remove_file(right_path).unwrap();
+}
+
+#[tokio::test]
+async fn native_i64_inner_join_skips_null_keys() {
+    let left_path = write_temp_cove("native_i64_join_nulls_left", nullable_i64_key_file());
+    let right_path = write_temp_cove("native_i64_join_nulls_right", nullable_i64_key_file());
+    let ctx = SessionContext::new();
+    register_cove_file(&ctx, "left_keys", &left_path).unwrap();
+    register_cove_file(&ctx, "right_keys", &right_path).unwrap();
+
+    let (batches, metrics) = collect_sql_with_cove_metrics(
+        &ctx,
+        "SELECT l.maybe AS left_maybe, r.maybe AS right_maybe \
+         FROM left_keys AS l JOIN right_keys AS r ON l.maybe = r.maybe \
+         ORDER BY left_maybe",
+        &[
+            "cove_native_join_kernels",
+            "cove_native_join_rows_matched",
+            "cove_rows_materialized",
+        ],
+    )
+    .await;
+    let expected = [
+        "+------------+-------------+",
+        "| left_maybe | right_maybe |",
+        "+------------+-------------+",
+        "| 10         | 10          |",
+        "| 40         | 40          |",
+        "+------------+-------------+",
+    ];
+    assert_batches_eq!(expected, &batches);
+    assert!(metrics[0] >= 3, "{metrics:?}");
+    assert_eq!(metrics[1], 10, "{metrics:?}");
+    assert_eq!(metrics[2], 0, "{metrics:?}");
+    fs::remove_file(left_path).unwrap();
+    fs::remove_file(right_path).unwrap();
+}
+
+#[tokio::test]
+async fn native_i64_inner_join_uses_row_pair_kernel_for_duplicate_negative_keys() {
+    let left_path = write_temp_cove(
+        "native_i64_join_duplicate_negative_left",
+        i64_key_file(&[-2, 3, -2]),
+    );
+    let right_path = write_temp_cove(
+        "native_i64_join_duplicate_negative_right",
+        i64_key_file(&[-2, -2, 4]),
+    );
+    let ctx = SessionContext::new();
+    register_cove_file(&ctx, "left_keys", &left_path).unwrap();
+    register_cove_file(&ctx, "right_keys", &right_path).unwrap();
+
+    let (batches, metrics) = collect_sql_with_cove_metrics(
+        &ctx,
+        "SELECT l.id AS lid, r.id AS rid \
+         FROM left_keys AS l JOIN right_keys AS r ON l.id = r.id \
+         ORDER BY lid, rid",
+        &[
+            "cove_native_join_kernels",
+            "cove_native_join_rows_matched",
+            "cove_native_join_dispatch_scalar",
+            "cove_rows_materialized",
+        ],
+    )
+    .await;
+    let expected = [
+        "+-----+-----+",
+        "| lid | rid |",
+        "+-----+-----+",
+        "| -2  | -2  |",
+        "| -2  | -2  |",
+        "| -2  | -2  |",
+        "| -2  | -2  |",
+        "+-----+-----+",
+    ];
+    assert_batches_eq!(expected, &batches);
+    assert_eq!(metrics[0], 3, "{metrics:?}");
+    assert_eq!(metrics[1], 10, "{metrics:?}");
+    assert_eq!(metrics[2], 3, "{metrics:?}");
+    assert_eq!(metrics[3], 0, "{metrics:?}");
+    fs::remove_file(left_path).unwrap();
+    fs::remove_file(right_path).unwrap();
+}
+
+#[tokio::test]
+async fn native_i64_left_semi_and_anti_join_use_native_join_exec() {
+    let left_path = write_temp_cove(
+        "native_i64_join_semi_anti_left",
+        i64_key_file(&[1, 2, 3, 3]),
+    );
+    let right_path = write_temp_cove("native_i64_join_semi_anti_right", i64_key_file(&[1, 3]));
+    let ctx = SessionContext::new();
+    register_cove_file(&ctx, "left_keys", &left_path).unwrap();
+    register_cove_file(&ctx, "right_keys", &right_path).unwrap();
+
+    let semi_sql = "SELECT l.id AS id \
+                    FROM left_keys AS l LEFT SEMI JOIN right_keys AS r ON l.id = r.id \
+                    ORDER BY id";
+    let (semi_batches, semi_metrics) = collect_sql_with_cove_metrics(
+        &ctx,
+        semi_sql,
+        &[
+            "cove_native_join_kernels",
+            "cove_native_join_rows_matched",
+            "cove_rows_materialized",
+        ],
+    )
+    .await;
+    let semi_expected = [
+        "+----+", "| id |", "+----+", "| 1  |", "| 3  |", "| 3  |", "+----+",
+    ];
+    assert_batches_eq!(semi_expected, &semi_batches);
+    assert_eq!(semi_metrics[0], 3, "{semi_metrics:?}");
+    assert_eq!(semi_metrics[1], 9, "{semi_metrics:?}");
+    assert_eq!(semi_metrics[2], 0, "{semi_metrics:?}");
+
+    let anti_sql = "SELECT l.id AS id \
+                    FROM left_keys AS l LEFT ANTI JOIN right_keys AS r ON l.id = r.id \
+                    ORDER BY id";
+    let (anti_batches, anti_metrics) = collect_sql_with_cove_metrics(
+        &ctx,
+        anti_sql,
+        &[
+            "cove_native_join_kernels",
+            "cove_native_join_rows_matched",
+            "cove_rows_materialized",
+        ],
+    )
+    .await;
+    let anti_expected = ["+----+", "| id |", "+----+", "| 2  |", "+----+"];
+    assert_batches_eq!(anti_expected, &anti_batches);
+    assert_eq!(anti_metrics[0], 3, "{anti_metrics:?}");
+    assert_eq!(anti_metrics[1], 7, "{anti_metrics:?}");
+    assert_eq!(anti_metrics[2], 0, "{anti_metrics:?}");
+
+    let explain = ctx
+        .sql("EXPLAIN SELECT l.id AS id FROM left_keys AS l LEFT SEMI JOIN right_keys AS r ON l.id = r.id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let explain_text = pretty_format_batches(&explain).unwrap().to_string();
+    assert!(
+        explain_text.contains("CoveNativeI64JoinExec"),
+        "{explain_text}"
+    );
+    assert!(explain_text.contains("kind=left_semi"), "{explain_text}");
+    assert!(!explain_text.contains("HashJoinExec"), "{explain_text}");
+    assert!(!explain_text.contains("CoveExec"), "{explain_text}");
+    fs::remove_file(left_path).unwrap();
+    fs::remove_file(right_path).unwrap();
+}
+
+#[tokio::test]
+async fn native_i64_left_anti_join_keeps_unmatched_null_left_keys() {
+    let left_path = write_temp_cove("native_i64_left_anti_null_left", nullable_i64_key_file());
+    let right_path = write_temp_cove("native_i64_left_anti_null_right", i64_key_file(&[10]));
+    let ctx = SessionContext::new();
+    register_cove_file(&ctx, "left_keys", &left_path).unwrap();
+    register_cove_file(&ctx, "right_keys", &right_path).unwrap();
+
+    let (batches, metrics) = collect_sql_with_cove_metrics(
+        &ctx,
+        "SELECT l.maybe AS maybe \
+         FROM left_keys AS l LEFT ANTI JOIN right_keys AS r ON l.maybe = r.id \
+         ORDER BY maybe NULLS FIRST",
+        &[
+            "cove_native_join_kernels",
+            "cove_native_join_rows_matched",
+            "cove_rows_materialized",
+        ],
+    )
+    .await;
+    let expected = [
+        "+-------+",
+        "| maybe |",
+        "+-------+",
+        "|       |",
+        "|       |",
+        "| 40    |",
+        "+-------+",
+    ];
+    assert_batches_eq!(expected, &batches);
+    assert_eq!(metrics[0], 3, "{metrics:?}");
+    assert_eq!(metrics[1], 8, "{metrics:?}");
+    assert_eq!(metrics[2], 0, "{metrics:?}");
+
+    let explain = ctx
+        .sql("EXPLAIN SELECT l.maybe AS maybe FROM left_keys AS l LEFT ANTI JOIN right_keys AS r ON l.maybe = r.id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let explain_text = pretty_format_batches(&explain).unwrap().to_string();
+    assert!(
+        explain_text.contains("CoveNativeI64JoinExec"),
+        "{explain_text}"
+    );
+    assert!(explain_text.contains("kind=left_anti"), "{explain_text}");
+    assert!(!explain_text.contains("HashJoinExec"), "{explain_text}");
+    assert!(!explain_text.contains("CoveExec"), "{explain_text}");
+    fs::remove_file(left_path).unwrap();
+    fs::remove_file(right_path).unwrap();
+}
+
+#[tokio::test]
+async fn native_i64_not_in_with_null_subquery_does_not_use_native_anti_join() {
+    let left_path = write_temp_cove("native_i64_not_in_null_left", i64_key_file(&[10, 40, 50]));
+    let right_path = write_temp_cove("native_i64_not_in_null_right", nullable_i64_key_file());
+    let ctx = SessionContext::new();
+    register_cove_file(&ctx, "left_keys", &left_path).unwrap();
+    register_cove_file(&ctx, "right_keys", &right_path).unwrap();
+
+    let batches = ctx
+        .sql(
+            "SELECT id FROM left_keys \
+             WHERE id NOT IN (SELECT maybe FROM right_keys) \
+             ORDER BY id",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+        0
+    );
+
+    let explain = ctx
+        .sql(
+            "EXPLAIN SELECT id FROM left_keys \
+             WHERE id NOT IN (SELECT maybe FROM right_keys)",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let explain_text = pretty_format_batches(&explain).unwrap().to_string();
+    assert!(
+        !explain_text.contains("CoveNativeI64JoinExec"),
+        "{explain_text}"
+    );
+    fs::remove_file(left_path).unwrap();
+    fs::remove_file(right_path).unwrap();
+}
+
+#[tokio::test]
+async fn filtered_native_i64_inner_join_inputs_use_native_join_exec() {
+    let left_path = write_temp_cove("filtered_native_i64_join_left", i64_key_file(&[1, 2, 3]));
+    let right_path = write_temp_cove("filtered_native_i64_join_right", i64_key_file(&[2, 3]));
+    let ctx = SessionContext::new();
+    register_cove_file(&ctx, "left_keys", &left_path).unwrap();
+    register_cove_file(&ctx, "right_keys", &right_path).unwrap();
+
+    let sql = "SELECT l.id AS lid, r.id AS rid \
+               FROM (SELECT id FROM left_keys WHERE id >= 2) AS l \
+               JOIN right_keys AS r ON l.id = r.id \
+               ORDER BY lid";
+    let (batches, metrics) = collect_sql_with_cove_metrics(
+        &ctx,
+        sql,
+        &[
+            "cove_native_lane_predicates",
+            "cove_native_join_kernels",
+            "cove_native_join_rows_matched",
+            "cove_rows_materialized",
+        ],
+    )
+    .await;
+    let expected = [
+        "+-----+-----+",
+        "| lid | rid |",
+        "+-----+-----+",
+        "| 2   | 2   |",
+        "| 3   | 3   |",
+        "+-----+-----+",
+    ];
+    assert_batches_eq!(expected, &batches);
+    assert!(metrics[0] >= 1, "{metrics:?}");
+    assert!(metrics[1] >= 3, "{metrics:?}");
+    assert_eq!(metrics[2], 6, "{metrics:?}");
+    assert_eq!(metrics[3], 0, "{metrics:?}");
+
+    let explain = ctx
+        .sql("EXPLAIN SELECT l.id AS lid, r.id AS rid FROM (SELECT id FROM left_keys WHERE id >= 2) AS l JOIN right_keys AS r ON l.id = r.id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let explain_text = pretty_format_batches(&explain).unwrap().to_string();
+    assert!(
+        explain_text.contains("CoveNativeI64JoinExec"),
+        "{explain_text}"
+    );
+    assert!(!explain_text.contains("HashJoinExec"), "{explain_text}");
+    assert!(!explain_text.contains("CoveExec"), "{explain_text}");
+    fs::remove_file(left_path).unwrap();
+    fs::remove_file(right_path).unwrap();
+}
+
+#[tokio::test]
+async fn native_i64_topn_order_respects_explicit_null_order() {
+    let path = write_temp_cove("native_i64_topn_order_nulls", nullable_events_file());
+    let ctx = SessionContext::new();
+    register_cove_file(&ctx, "events", &path).unwrap();
+
+    let (batches, metrics) = collect_sql_with_cove_metrics(
+        &ctx,
+        "SELECT maybe FROM events ORDER BY maybe ASC NULLS FIRST LIMIT 3",
+        &[
+            "cove_native_sort_kernels",
+            "cove_native_sort_rows_matched",
+            "cove_rows_materialized",
+        ],
+    )
+    .await;
+    let expected = [
+        "+-------+",
+        "| maybe |",
+        "+-------+",
+        "|       |",
+        "|       |",
+        "| 10    |",
+        "+-------+",
+    ];
+    assert_batches_eq!(expected, &batches);
+    assert!(metrics[0] >= 1, "{metrics:?}");
+    assert_eq!(metrics[1], 4, "{metrics:?}");
+    assert_eq!(metrics[2], 0, "{metrics:?}");
+
+    let explain = ctx
+        .sql("EXPLAIN SELECT maybe FROM events ORDER BY maybe ASC NULLS FIRST LIMIT 3")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let explain_text = pretty_format_batches(&explain).unwrap().to_string();
+    assert!(
+        explain_text.contains("CoveNativeI64OrderExec"),
+        "{explain_text}"
+    );
+    assert!(!explain_text.contains("SortExec"), "{explain_text}");
+    assert!(!explain_text.contains("CoveExec"), "{explain_text}");
     fs::remove_file(path).unwrap();
 }
 
@@ -4173,6 +6899,109 @@ fn topn_events_file() -> Vec<u8> {
     writer.write().unwrap()
 }
 
+fn i64_key_file(values: &[i64]) -> Vec<u8> {
+    let row_count = u32::try_from(values.len()).unwrap();
+    let catalog = TableCatalog {
+        flags: 0,
+        tables: vec![TableEntry {
+            table_id: 21,
+            namespace: "public".into(),
+            name: "keys".into(),
+            row_count: u64::from(row_count),
+            primary_sort_key_count: 0,
+            clustering_key_count: 0,
+            flags: 0,
+            columns: vec![column(
+                1,
+                "id",
+                CoveLogicalType::Int64,
+                CovePhysicalKind::NumCode,
+                false,
+            )],
+        }],
+    };
+    let mut segment = ScanSegment::new(21, 0, 0, row_count, 1);
+    segment.set_column_pages(1, vec![numcode_page(row_count, numcode_i64(values))]);
+
+    let mut writer = ScanProfileCoveWriter::new(catalog);
+    writer.push_segment(segment);
+    writer.write().unwrap()
+}
+
+fn numeric_scores_file() -> Vec<u8> {
+    let catalog = TableCatalog {
+        flags: 0,
+        tables: vec![TableEntry {
+            table_id: 22,
+            namespace: "public".into(),
+            name: "scores".into(),
+            row_count: 5,
+            primary_sort_key_count: 0,
+            clustering_key_count: 0,
+            flags: 0,
+            columns: vec![
+                column(
+                    1,
+                    "id",
+                    CoveLogicalType::Int64,
+                    CovePhysicalKind::NumCode,
+                    false,
+                ),
+                column(
+                    2,
+                    "score",
+                    CoveLogicalType::Int64,
+                    CovePhysicalKind::NumCode,
+                    false,
+                ),
+            ],
+        }],
+    };
+    let mut first = ScanSegment::new(22, 0, 0, 3, 2);
+    first.set_column_pages(1, vec![numcode_page(3, numcode_i64(&[1, 2, 1]))]);
+    first.set_column_pages(2, vec![numcode_page(3, numcode_i64(&[10, 20, 30]))]);
+
+    let mut second = ScanSegment::new(22, 1, 3, 2, 2);
+    second.set_column_pages(1, vec![numcode_page(2, numcode_i64(&[2, 1]))]);
+    second.set_column_pages(2, vec![numcode_page(2, numcode_i64(&[40, 50]))]);
+
+    let mut writer = ScanProfileCoveWriter::new(catalog);
+    writer.push_segment(first);
+    writer.push_segment(second);
+    writer.write().unwrap()
+}
+
+fn nullable_i64_key_file() -> Vec<u8> {
+    let catalog = TableCatalog {
+        flags: 0,
+        tables: vec![TableEntry {
+            table_id: 20,
+            namespace: "public".into(),
+            name: "keys".into(),
+            row_count: 4,
+            primary_sort_key_count: 0,
+            clustering_key_count: 0,
+            flags: 0,
+            columns: vec![column(
+                1,
+                "maybe",
+                CoveLogicalType::Int64,
+                CovePhysicalKind::NumCode,
+                true,
+            )],
+        }],
+    };
+    let mut segment = ScanSegment::new(20, 0, 0, 4, 1);
+    segment.set_column_pages(
+        1,
+        vec![nullable_numcode_page(&[Some(10), None, Some(40), None])],
+    );
+
+    let mut writer = ScanProfileCoveWriter::new(catalog);
+    writer.push_segment(segment);
+    writer.write().unwrap()
+}
+
 fn composite_index(
     table_id: u32,
     key_columns: Vec<u32>,
@@ -4232,6 +7061,67 @@ fn topn_summary(
 
 fn primitive_events_file() -> Vec<u8> {
     primitive_events_writer().write().unwrap()
+}
+
+fn fixed_uuid_events_file() -> Vec<u8> {
+    let catalog = TableCatalog {
+        flags: 0,
+        tables: vec![TableEntry {
+            table_id: 10,
+            namespace: "public".into(),
+            name: "events".into(),
+            row_count: 3,
+            primary_sort_key_count: 0,
+            clustering_key_count: 0,
+            flags: 0,
+            columns: vec![
+                column(
+                    1,
+                    "id",
+                    CoveLogicalType::Int64,
+                    CovePhysicalKind::NumCode,
+                    false,
+                ),
+                column(
+                    2,
+                    "uid",
+                    CoveLogicalType::Uuid,
+                    CovePhysicalKind::FixedBytes,
+                    false,
+                ),
+                column(
+                    3,
+                    "payload",
+                    CoveLogicalType::Utf8,
+                    CovePhysicalKind::VarBytes,
+                    false,
+                ),
+            ],
+        }],
+    };
+    let mut segment = ScanSegment::new(10, 0, 0, 3, 3);
+    segment.set_column_pages(1, vec![numcode_page(3, numcode_i64(&[1, 2, 3]))]);
+    segment.set_column_pages(
+        2,
+        vec![fixedbytes_page(
+            3,
+            [uuid_bytes(1), uuid_bytes(2), uuid_bytes(3)].concat(),
+        )],
+    );
+    segment.set_column_pages(
+        3,
+        vec![varbytes_page(3, varbytes(&["alpha", "beta", "gamma"]))],
+    );
+
+    let mut writer = ScanProfileCoveWriter::new(catalog);
+    writer.push_segment(segment);
+    writer.write().unwrap()
+}
+
+fn uuid_bytes(last: u8) -> Vec<u8> {
+    let mut out = vec![0u8; 16];
+    out[15] = last;
+    out
 }
 
 fn float_metrics_file() -> Vec<u8> {
@@ -5407,6 +8297,119 @@ fn dictionary_items_file(dictionary: FileDictionary) -> Vec<u8> {
     writer.write().unwrap()
 }
 
+fn filecode_key_file(dictionary: FileDictionary, codes: &[u32]) -> Vec<u8> {
+    let row_count = u32::try_from(codes.len()).unwrap();
+    let catalog = TableCatalog {
+        flags: 0,
+        tables: vec![TableEntry {
+            table_id: 7,
+            namespace: "public".into(),
+            name: "items".into(),
+            row_count: u64::from(row_count),
+            primary_sort_key_count: 0,
+            clustering_key_count: 0,
+            flags: 0,
+            columns: vec![column(
+                1,
+                "name",
+                CoveLogicalType::Utf8,
+                CovePhysicalKind::FileCode,
+                false,
+            )],
+        }],
+    };
+    let mut segment = ScanSegment::new(7, 0, 0, row_count, 1);
+    segment.set_column_pages(1, vec![filecode_page(row_count, filecodes(codes))]);
+    let mut writer = ScanProfileCoveWriter::new(catalog);
+    writer.push_file_dictionary(&dictionary);
+    if has_redacted_entries(&dictionary) {
+        writer.push_extra_section(redaction_manifest_section());
+    }
+    writer.push_segment(segment);
+    writer.write().unwrap()
+}
+
+fn scored_dictionary_items_file(dictionary: FileDictionary, scores: [i64; 2]) -> Vec<u8> {
+    let catalog = TableCatalog {
+        flags: 0,
+        tables: vec![TableEntry {
+            table_id: 7,
+            namespace: "public".into(),
+            name: "items".into(),
+            row_count: 2,
+            primary_sort_key_count: 0,
+            clustering_key_count: 0,
+            flags: 0,
+            columns: vec![
+                column(
+                    1,
+                    "name",
+                    CoveLogicalType::Utf8,
+                    CovePhysicalKind::FileCode,
+                    false,
+                ),
+                column(
+                    2,
+                    "score",
+                    CoveLogicalType::Int64,
+                    CovePhysicalKind::NumCode,
+                    false,
+                ),
+            ],
+        }],
+    };
+    let mut segment = ScanSegment::new(7, 0, 0, 2, 2);
+    segment.set_column_pages(1, vec![filecode_page(2, filecodes(&[0, 1]))]);
+    segment.set_column_pages(2, vec![numcode_page(2, numcode_i64(&scores))]);
+    let mut writer = ScanProfileCoveWriter::new(catalog);
+    writer.push_file_dictionary(&dictionary);
+    writer.push_segment(segment);
+    writer.write().unwrap()
+}
+
+fn local_codebook_scored_dictionary_items_file() -> Vec<u8> {
+    let dictionary = sample_dictionary();
+    let catalog = TableCatalog {
+        flags: 0,
+        tables: vec![TableEntry {
+            table_id: 23,
+            namespace: "public".into(),
+            name: "items".into(),
+            row_count: 4,
+            primary_sort_key_count: 0,
+            clustering_key_count: 0,
+            flags: 0,
+            columns: vec![
+                column(
+                    1,
+                    "name",
+                    CoveLogicalType::Utf8,
+                    CovePhysicalKind::FileCode,
+                    false,
+                ),
+                column(
+                    2,
+                    "score",
+                    CoveLogicalType::Int64,
+                    CovePhysicalKind::NumCode,
+                    false,
+                ),
+            ],
+        }],
+    };
+    let local_codebook = LocalCodebookPayload {
+        values: LocalCodebookValues::FileCode(vec![1, 0]),
+        indexes: LocalIndexPayload::BitPacked(BitPackedPayload::pack(&[1, 0, 1, 0], 1).unwrap()),
+    };
+    let mut segment = ScanSegment::new(23, 0, 0, 4, 2);
+    segment.set_column_pages(1, vec![local_codebook_page(4, local_codebook.encode())]);
+    segment.set_column_pages(2, vec![numcode_page(4, numcode_i64(&[10, 20, 30, 40]))]);
+    let mut writer = ScanProfileCoveWriter::new(catalog);
+    writer.push_file_dictionary(&dictionary);
+    writer.push_segment(segment);
+    writer.write().unwrap()
+}
+
 fn mixed_dictionary_items_file() -> Vec<u8> {
     let dictionary = FileDictionary {
         header: FileDictionaryHeaderV1 {
@@ -6001,8 +9004,16 @@ fn bool_page(row_count: u32, payload: Vec<u8>) -> ScanPageSpec {
     ScanPageSpec::new(row_count, payload).with_encoding_root(CoveEncodingKind::PlainFixed as u32)
 }
 
+fn fixedbytes_page(row_count: u32, payload: Vec<u8>) -> ScanPageSpec {
+    ScanPageSpec::new(row_count, payload).with_encoding_root(CoveEncodingKind::PlainFixed as u32)
+}
+
 fn filecode_page(row_count: u32, payload: Vec<u8>) -> ScanPageSpec {
     ScanPageSpec::new(row_count, payload).with_encoding_root(CoveEncodingKind::FileCode as u32)
+}
+
+fn local_codebook_page(row_count: u32, payload: Vec<u8>) -> ScanPageSpec {
+    ScanPageSpec::new(row_count, payload).with_encoding_root(CoveEncodingKind::LocalCodebook as u32)
 }
 
 fn has_redacted_entries(dictionary: &FileDictionary) -> bool {

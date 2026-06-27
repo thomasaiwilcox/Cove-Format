@@ -113,6 +113,14 @@ pub enum CovePredicate {
         op: NumericPredicateOp,
         literal: PredicateLiteral,
     },
+    NumericIn {
+        column_index: usize,
+        literals: Vec<PredicateLiteral>,
+    },
+    NumericNotIn {
+        column_index: usize,
+        literals: Vec<PredicateLiteral>,
+    },
     FileCodeIn {
         column_index: usize,
         /// Derived per-file execution codes for the current dataset view.
@@ -123,9 +131,35 @@ pub enum CovePredicate {
         /// COVE-I CanonicalValueBytes keys: [value_tag: varint][canonical payload].
         canonical_keys: Vec<Vec<u8>>,
     },
+    FileCodeNotIn {
+        column_index: usize,
+        /// Derived per-file execution codes for the current dataset view.
+        file_codes: Vec<u32>,
+        /// Canonical dictionary values are the source of truth and must be
+        /// resolved against each concrete file before pruning or execution.
+        canonical_values: Vec<Vec<u8>>,
+        /// COVE-I CanonicalValueBytes keys: [value_tag: varint][canonical payload].
+        canonical_keys: Vec<Vec<u8>>,
+    },
+    FixedBytesEq {
+        column_index: usize,
+        literal: Vec<u8>,
+    },
+    FixedBytesIn {
+        column_index: usize,
+        literals: Vec<Vec<u8>>,
+    },
     VarBytesEq {
         column_index: usize,
         literal: Vec<u8>,
+    },
+    VarBytesIn {
+        column_index: usize,
+        literals: Vec<Vec<u8>>,
+    },
+    VarBytesPrefix {
+        column_index: usize,
+        prefix: Vec<u8>,
     },
 }
 
@@ -223,6 +257,46 @@ impl FilterPlan {
         }
     }
 
+    pub fn pruning_numeric_in(
+        column_index: usize,
+        literals: Vec<PredicateLiteral>,
+        display: impl Into<String>,
+    ) -> Self {
+        let literals = normalize_numeric_literals(literals);
+        let predicate = CovePredicate::NumericIn {
+            column_index,
+            literals,
+        };
+        Self {
+            use_kind: CoveFilterUse::PruningOnly,
+            predicate_columns: vec![column_index],
+            display: display.into(),
+            predicate: Some(predicate.clone()),
+            predicate_expr: Some(CovePredicateExpr::atom(predicate)),
+            coverage_predicate_form_ref: None,
+        }
+    }
+
+    pub fn pruning_numeric_not_in(
+        column_index: usize,
+        literals: Vec<PredicateLiteral>,
+        display: impl Into<String>,
+    ) -> Self {
+        let literals = normalize_numeric_literals(literals);
+        let predicate = CovePredicate::NumericNotIn {
+            column_index,
+            literals,
+        };
+        Self {
+            use_kind: CoveFilterUse::PruningOnly,
+            predicate_columns: vec![column_index],
+            display: display.into(),
+            predicate: Some(predicate.clone()),
+            predicate_expr: Some(CovePredicateExpr::atom(predicate)),
+            coverage_predicate_form_ref: None,
+        }
+    }
+
     pub fn pruning_file_code_in(
         column_index: usize,
         file_codes: Vec<u32>,
@@ -275,6 +349,35 @@ impl FilterPlan {
         }
     }
 
+    pub fn pruning_file_code_not_in_with_canonical_keys(
+        column_index: usize,
+        mut file_codes: Vec<u32>,
+        mut canonical_values: Vec<Vec<u8>>,
+        mut canonical_keys: Vec<Vec<u8>>,
+        display: impl Into<String>,
+    ) -> Self {
+        file_codes.sort_unstable();
+        file_codes.dedup();
+        canonical_values.sort();
+        canonical_values.dedup();
+        canonical_keys.sort();
+        canonical_keys.dedup();
+        let predicate = CovePredicate::FileCodeNotIn {
+            column_index,
+            file_codes,
+            canonical_values,
+            canonical_keys,
+        };
+        Self {
+            use_kind: CoveFilterUse::PruningOnly,
+            predicate_columns: vec![column_index],
+            display: display.into(),
+            predicate: Some(predicate.clone()),
+            predicate_expr: Some(CovePredicateExpr::atom(predicate)),
+            coverage_predicate_form_ref: None,
+        }
+    }
+
     pub fn pruning_varbytes_eq(
         column_index: usize,
         literal: Vec<u8>,
@@ -294,10 +397,101 @@ impl FilterPlan {
         }
     }
 
+    pub fn pruning_varbytes_in(
+        column_index: usize,
+        mut literals: Vec<Vec<u8>>,
+        display: impl Into<String>,
+    ) -> Self {
+        literals.sort();
+        literals.dedup();
+        let predicate = CovePredicate::VarBytesIn {
+            column_index,
+            literals,
+        };
+        Self {
+            use_kind: CoveFilterUse::PruningOnly,
+            predicate_columns: vec![column_index],
+            display: display.into(),
+            predicate: Some(predicate.clone()),
+            predicate_expr: Some(CovePredicateExpr::atom(predicate)),
+            coverage_predicate_form_ref: None,
+        }
+    }
+
+    pub fn pruning_varbytes_prefix(
+        column_index: usize,
+        prefix: Vec<u8>,
+        display: impl Into<String>,
+    ) -> Self {
+        let predicate = CovePredicate::VarBytesPrefix {
+            column_index,
+            prefix,
+        };
+        Self {
+            use_kind: CoveFilterUse::PruningOnly,
+            predicate_columns: vec![column_index],
+            display: display.into(),
+            predicate: Some(predicate.clone()),
+            predicate_expr: Some(CovePredicateExpr::atom(predicate)),
+            coverage_predicate_form_ref: None,
+        }
+    }
+
+    pub fn pruning_fixed_bytes_eq(
+        column_index: usize,
+        literal: Vec<u8>,
+        display: impl Into<String>,
+    ) -> Self {
+        let predicate = CovePredicate::FixedBytesEq {
+            column_index,
+            literal,
+        };
+        Self {
+            use_kind: CoveFilterUse::PruningOnly,
+            predicate_columns: vec![column_index],
+            display: display.into(),
+            predicate: Some(predicate.clone()),
+            predicate_expr: Some(CovePredicateExpr::atom(predicate)),
+            coverage_predicate_form_ref: None,
+        }
+    }
+
+    pub fn pruning_fixed_bytes_in(
+        column_index: usize,
+        mut literals: Vec<Vec<u8>>,
+        display: impl Into<String>,
+    ) -> Self {
+        literals.sort();
+        literals.dedup();
+        let predicate = CovePredicate::FixedBytesIn {
+            column_index,
+            literals,
+        };
+        Self {
+            use_kind: CoveFilterUse::PruningOnly,
+            predicate_columns: vec![column_index],
+            display: display.into(),
+            predicate: Some(predicate.clone()),
+            predicate_expr: Some(CovePredicateExpr::atom(predicate)),
+            coverage_predicate_form_ref: None,
+        }
+    }
+
     pub fn with_coverage_predicate_form_ref(mut self, predicate_form_ref: u32) -> Self {
         self.coverage_predicate_form_ref = Some(predicate_form_ref);
         self
     }
+}
+
+fn normalize_numeric_literals(literals: Vec<PredicateLiteral>) -> Vec<PredicateLiteral> {
+    let mut out = Vec::with_capacity(literals.len());
+    for literal in literals {
+        let literal = literal.normalized();
+        if !out.contains(&literal) {
+            out.push(literal);
+        }
+    }
+    out
 }
 
 #[derive(Debug, Clone)]
@@ -478,6 +672,8 @@ fn lookup_keys_for_predicate(
             };
             Some((*column_index, vec![key]))
         }
+        CovePredicate::VarBytesIn { .. } | CovePredicate::VarBytesPrefix { .. } => None,
+        CovePredicate::FixedBytesEq { .. } | CovePredicate::FixedBytesIn { .. } => None,
         CovePredicate::Numeric {
             column_index,
             op: NumericPredicateOp::Eq,
@@ -486,6 +682,22 @@ fn lookup_keys_for_predicate(
             let column = &state.table().columns[*column_index];
             let key = numeric_canonical_key(column.logical, *literal).ok()?;
             Some((*column_index, vec![key]))
+        }
+        CovePredicate::NumericIn {
+            column_index,
+            literals,
+        } => {
+            let column = &state.table().columns[*column_index];
+            let mut keys = Vec::new();
+            for literal in literals {
+                let Ok(key) = numeric_canonical_key(column.logical, *literal) else {
+                    continue;
+                };
+                if !keys.contains(&key) {
+                    keys.push(key);
+                }
+            }
+            (!keys.is_empty()).then_some((*column_index, keys))
         }
         _ => None,
     }
@@ -661,11 +873,18 @@ fn validate_column_indexes(
 fn validate_filter_shapes(state: &DatasetState, filters: &[FilterPlan]) -> Result<(), CoveError> {
     for filter in filters {
         match &filter.predicate {
-            Some(CovePredicate::FileCodeIn {
-                column_index,
-                file_codes,
-                ..
-            }) => {
+            Some(
+                CovePredicate::FileCodeIn {
+                    column_index,
+                    file_codes,
+                    ..
+                }
+                | CovePredicate::FileCodeNotIn {
+                    column_index,
+                    file_codes,
+                    ..
+                },
+            ) => {
                 let column = &state.table().columns[*column_index];
                 if column.physical != CovePhysicalKind::FileCode {
                     return Err(CoveError::BadSchema(format!(
@@ -673,7 +892,9 @@ fn validate_filter_shapes(state: &DatasetState, filters: &[FilterPlan]) -> Resul
                         column.name
                     )));
                 }
-                if file_codes.is_empty() {
+                if matches!(filter.predicate, Some(CovePredicate::FileCodeIn { .. }))
+                    && file_codes.is_empty()
+                {
                     // Empty IN is valid as an optimization: it selects no rows.
                     continue;
                 }
@@ -687,12 +908,133 @@ fn validate_filter_shapes(state: &DatasetState, filters: &[FilterPlan]) -> Resul
                     )));
                 }
             }
+            Some(CovePredicate::NumericIn {
+                column_index,
+                literals,
+            }) => {
+                let column = &state.table().columns[*column_index];
+                if column.physical != CovePhysicalKind::NumCode {
+                    return Err(CoveError::BadSchema(format!(
+                        "numeric IN predicate planned for non-NumCode column {}",
+                        column.name
+                    )));
+                }
+                if literals.iter().any(
+                    |literal| matches!(literal, PredicateLiteral::Float64(value) if value.is_nan()),
+                ) {
+                    return Err(CoveError::BadSchema(
+                        "numeric IN predicate literal must not be NaN".into(),
+                    ));
+                }
+            }
+            Some(CovePredicate::NumericNotIn {
+                column_index,
+                literals,
+            }) => {
+                let column = &state.table().columns[*column_index];
+                if column.physical != CovePhysicalKind::NumCode {
+                    return Err(CoveError::BadSchema(format!(
+                        "numeric NOT IN predicate planned for non-NumCode column {}",
+                        column.name
+                    )));
+                }
+                if literals.iter().any(
+                    |literal| matches!(literal, PredicateLiteral::Float64(value) if value.is_nan()),
+                ) {
+                    return Err(CoveError::BadSchema(
+                        "numeric NOT IN predicate literal must not be NaN".into(),
+                    ));
+                }
+            }
             Some(CovePredicate::VarBytesEq { column_index, .. }) => {
                 let column = &state.table().columns[*column_index];
                 if column.physical != CovePhysicalKind::VarBytes {
                     return Err(CoveError::BadSchema(format!(
                         "VarBytes predicate planned for non-VarBytes column {}",
                         column.name
+                    )));
+                }
+            }
+            Some(CovePredicate::VarBytesIn {
+                column_index,
+                literals,
+            }) => {
+                let column = &state.table().columns[*column_index];
+                if column.physical != CovePhysicalKind::VarBytes {
+                    return Err(CoveError::BadSchema(format!(
+                        "VarBytes IN predicate planned for non-VarBytes column {}",
+                        column.name
+                    )));
+                }
+                if literals.is_empty() {
+                    return Err(CoveError::BadSchema(
+                        "VarBytes IN predicate requires at least one literal".into(),
+                    ));
+                }
+            }
+            Some(CovePredicate::VarBytesPrefix { column_index, .. }) => {
+                let column = &state.table().columns[*column_index];
+                if column.physical != CovePhysicalKind::VarBytes {
+                    return Err(CoveError::BadSchema(format!(
+                        "VarBytes prefix predicate planned for non-VarBytes column {}",
+                        column.name
+                    )));
+                }
+            }
+            Some(CovePredicate::FixedBytesEq {
+                column_index,
+                literal,
+            }) => {
+                let column = &state.table().columns[*column_index];
+                if column.physical != CovePhysicalKind::FixedBytes {
+                    return Err(CoveError::BadSchema(format!(
+                        "FixedBytes predicate planned for non-FixedBytes column {}",
+                        column.name
+                    )));
+                }
+                let expected = cove_core::array::logical_type_fixed_width(column.logical)
+                    .ok_or_else(|| {
+                        CoveError::BadSchema(format!(
+                            "FixedBytes predicate cannot infer width for column {}",
+                            column.name
+                        ))
+                    })?;
+                if literal.len() != expected {
+                    return Err(CoveError::BadSchema(format!(
+                        "FixedBytes predicate literal for column {} has width {}, expected {expected}",
+                        column.name,
+                        literal.len()
+                    )));
+                }
+            }
+            Some(CovePredicate::FixedBytesIn {
+                column_index,
+                literals,
+            }) => {
+                let column = &state.table().columns[*column_index];
+                if column.physical != CovePhysicalKind::FixedBytes {
+                    return Err(CoveError::BadSchema(format!(
+                        "FixedBytes IN predicate planned for non-FixedBytes column {}",
+                        column.name
+                    )));
+                }
+                let expected = cove_core::array::logical_type_fixed_width(column.logical)
+                    .ok_or_else(|| {
+                        CoveError::BadSchema(format!(
+                            "FixedBytes IN predicate cannot infer width for column {}",
+                            column.name
+                        ))
+                    })?;
+                if literals.is_empty() {
+                    return Err(CoveError::BadSchema(
+                        "FixedBytes IN predicate requires at least one literal".into(),
+                    ));
+                }
+                if let Some(literal) = literals.iter().find(|literal| literal.len() != expected) {
+                    return Err(CoveError::BadSchema(format!(
+                        "FixedBytes IN predicate literal for column {} has width {}, expected {expected}",
+                        column.name,
+                        literal.len()
                     )));
                 }
             }

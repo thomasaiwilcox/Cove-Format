@@ -3,12 +3,15 @@
 use std::{fmt::Debug, sync::Arc};
 
 use arrow_array::{Int32Array, Int64Array, RecordBatch, StringArray, UInt32Array, UInt64Array};
-use arrow_schema::{DataType, SchemaRef, TimeUnit};
+use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::{
-    common::{tree_node::Transformed, DataFusionError, Result, ScalarValue},
+    common::{
+        tree_node::Transformed, Column, DataFusionError, JoinConstraint, JoinType, NullEquality,
+        Result, ScalarValue, TableReference,
+    },
     datasource::{provider_as_source, source_as_provider},
     execution::context::SessionContext,
-    logical_expr::{Expr, LogicalPlan, TableScan},
+    logical_expr::{Distinct, Expr, Join, LogicalPlan, Projection, TableScan},
     optimizer::{ApplyOrder, OptimizerConfig, OptimizerRule},
 };
 
@@ -18,7 +21,20 @@ use crate::metadata_aggregate::{
 };
 use crate::{
     adapter_v53::{
-        filter::classify_filter, metadata::CoveMetadataTableProvider,
+        filter::classify_filter,
+        metadata::CoveMetadataTableProvider,
+        native_aggregate::{
+            CoveNativeAggregateTableProvider, CoveNativeBoolI64GroupAggregateTableProvider,
+            CoveNativeFileCodeI64GroupAggregateTableProvider,
+            CoveNativeI64I64GroupAggregateTableProvider, NativeI64AggregateKind,
+            NativeI64AggregateRequest,
+        },
+        native_count::CoveNativeCountTableProvider,
+        native_group::CoveNativeGroupCountTableProvider,
+        native_join::{
+            CoveNativeFileCodeJoinTableProvider, CoveNativeI64JoinTableProvider, NativeI64JoinKind,
+        },
+        native_order::CoveNativeI64OrderTableProvider,
         table_provider::CoveTableProvider,
     },
     metadata_aggregate::{
@@ -26,7 +42,7 @@ use crate::{
         exact_unfiltered_aggregate_synopses, exact_unfiltered_counts, MetadataAggregatePlan,
         MetadataAggregateValue, MetadataSynopsisAggregateKind,
     },
-    planner::{CovePredicate, TopNScanHint},
+    planner::{plan_scan, CoveFilterUse, CovePredicate, ScanPlan, TopNScanHint},
 };
 use cove_core::constants::{CoveLogicalType, CovePhysicalKind};
 #[cfg(feature = "covi")]
@@ -77,6 +93,36 @@ impl OptimizerRule for CoveMetadataOptimizerRule {
                     Ok(Transformed::no(LogicalPlan::Sort(sort)))
                 }
             }
+            LogicalPlan::Distinct(distinct) => {
+                if let Some(rewritten) = rewrite_native_i64_distinct_all(&distinct)? {
+                    Ok(Transformed::yes(rewritten))
+                } else if let Some(rewritten) = rewrite_native_bool_distinct_all(&distinct)? {
+                    Ok(Transformed::yes(rewritten))
+                } else if let Some(rewritten) = rewrite_native_filecode_distinct_all(&distinct)? {
+                    Ok(Transformed::yes(rewritten))
+                } else {
+                    Ok(Transformed::no(LogicalPlan::Distinct(distinct)))
+                }
+            }
+            LogicalPlan::Projection(projection) => {
+                if let Some(rewritten) = rewrite_native_filecode_key_join_projection(&projection)? {
+                    Ok(Transformed::yes(rewritten))
+                } else if let Some(rewritten) = rewrite_native_i64_key_join_projection(&projection)?
+                {
+                    Ok(Transformed::yes(rewritten))
+                } else {
+                    Ok(Transformed::no(LogicalPlan::Projection(projection)))
+                }
+            }
+            LogicalPlan::Join(join) => {
+                if let Some(rewritten) = rewrite_native_filecode_key_semi_anti_join(&join)? {
+                    Ok(Transformed::yes(rewritten))
+                } else if let Some(rewritten) = rewrite_native_i64_key_semi_anti_join(&join)? {
+                    Ok(Transformed::yes(rewritten))
+                } else {
+                    Ok(Transformed::no(LogicalPlan::Join(join)))
+                }
+            }
             other => Ok(Transformed::no(other)),
         }
     }
@@ -91,23 +137,73 @@ fn rewrite_exact_count_aggregate(
     let Some(provider) = cove_provider_from_scan(scan)? else {
         return Ok(None);
     };
-    let Some(plan) = metadata_aggregate_plan(aggregate, scan, &filters, provider.as_ref())? else {
-        return Ok(None);
-    };
-    let schema: SchemaRef = Arc::new(aggregate.schema.as_arrow().clone());
-    let Some(batch) = record_batch_for_metadata_plan(&plan, Arc::clone(&schema))? else {
-        return Ok(None);
-    };
-    let proof = plan.proof().clone();
-    let table = CoveMetadataTableProvider::new(Arc::clone(&schema), batch, proof);
-    let scan = TableScan::try_new(
-        scan.table_name.clone(),
-        provider_as_source(Arc::new(table)),
-        None,
-        Vec::new(),
-        None,
-    )?;
-    Ok(Some(LogicalPlan::TableScan(scan)))
+    if let Some(plan) = metadata_aggregate_plan(aggregate, scan, &filters, provider.as_ref())? {
+        let schema: SchemaRef = Arc::new(aggregate.schema.as_arrow().clone());
+        let Some(batch) = record_batch_for_metadata_plan(&plan, Arc::clone(&schema))? else {
+            return Ok(None);
+        };
+        let proof = plan.proof().clone();
+        let table = CoveMetadataTableProvider::new(Arc::clone(&schema), batch, proof);
+        let scan = TableScan::try_new(
+            scan.table_name.clone(),
+            provider_as_source(Arc::new(table)),
+            None,
+            Vec::new(),
+            None,
+        )?;
+        return Ok(Some(LogicalPlan::TableScan(scan)));
+    }
+    if let Some(rewritten) =
+        rewrite_native_count_star(aggregate, scan, &filters, provider.as_ref())?
+    {
+        return Ok(Some(rewritten));
+    }
+    if let Some(rewritten) =
+        rewrite_native_i64_aggregate(aggregate, scan, &filters, provider.as_ref())?
+    {
+        return Ok(Some(rewritten));
+    }
+    if let Some(rewritten) =
+        rewrite_native_i64_i64_group_aggregate(aggregate, scan, &filters, provider.as_ref())?
+    {
+        return Ok(Some(rewritten));
+    }
+    if let Some(rewritten) =
+        rewrite_native_bool_i64_group_aggregate(aggregate, scan, &filters, provider.as_ref())?
+    {
+        return Ok(Some(rewritten));
+    }
+    if let Some(rewritten) =
+        rewrite_native_filecode_i64_group_aggregate(aggregate, scan, &filters, provider.as_ref())?
+    {
+        return Ok(Some(rewritten));
+    }
+    if let Some(rewritten) =
+        rewrite_native_i64_group_count(aggregate, scan, &filters, provider.as_ref())?
+    {
+        return Ok(Some(rewritten));
+    }
+    if let Some(rewritten) =
+        rewrite_native_bool_group_count(aggregate, scan, &filters, provider.as_ref())?
+    {
+        return Ok(Some(rewritten));
+    }
+    if let Some(rewritten) =
+        rewrite_native_filecode_group_count(aggregate, scan, &filters, provider.as_ref())?
+    {
+        return Ok(Some(rewritten));
+    }
+    if let Some(rewritten) =
+        rewrite_native_i64_distinct_group(aggregate, scan, &filters, provider.as_ref())?
+    {
+        return Ok(Some(rewritten));
+    }
+    if let Some(rewritten) =
+        rewrite_native_bool_distinct_group(aggregate, scan, &filters, provider.as_ref())?
+    {
+        return Ok(Some(rewritten));
+    }
+    rewrite_native_filecode_distinct_group(aggregate, scan, &filters, provider.as_ref())
 }
 
 fn metadata_aggregate_plan(
@@ -279,6 +375,1596 @@ fn filecode_filter(provider: &CoveTableProvider, expr: &Expr) -> Option<(usize, 
     }
 }
 
+fn native_exact_filter_plan(
+    provider: &CoveTableProvider,
+    filters: &[Expr],
+) -> Result<Option<ScanPlan>> {
+    let lowered = filters
+        .iter()
+        .map(|filter| classify_filter(provider.state(), filter))
+        .collect::<Vec<_>>();
+    let projection = Vec::new();
+    let plan = plan_scan(provider.state(), Some(&projection), lowered)
+        .map_err(crate::adapter_v53::cove_to_datafusion)?;
+    if plan.scan_program.inexact_filters != 0 {
+        return Ok(None);
+    }
+    if plan.filters.iter().any(|filter| {
+        filter.use_kind != CoveFilterUse::FullRowPredicateExact || filter.predicate.is_none()
+    }) {
+        return Ok(None);
+    }
+    Ok(Some(plan))
+}
+
+fn rewrite_native_count_star(
+    aggregate: &datafusion::logical_expr::Aggregate,
+    scan: &TableScan,
+    filters: &[Expr],
+    provider: &CoveTableProvider,
+) -> Result<Option<LogicalPlan>> {
+    if !aggregate.group_expr.is_empty() || aggregate.aggr_expr.len() != 1 || filters.is_empty() {
+        return Ok(None);
+    }
+    if !matches!(
+        count_column_index(&aggregate.aggr_expr[0], provider),
+        Some(None)
+    ) {
+        return Ok(None);
+    }
+    let schema: SchemaRef = Arc::new(aggregate.schema.as_arrow().clone());
+    if schema.fields().len() != 1
+        || !matches!(
+            schema.field(0).data_type(),
+            DataType::Int64 | DataType::UInt64
+        )
+    {
+        return Ok(None);
+    }
+    let Some(filter_plan) = native_exact_filter_plan(provider, filters)? else {
+        return Ok(None);
+    };
+    let table = CoveNativeCountTableProvider::new(
+        Arc::clone(&schema),
+        Arc::clone(provider.state()),
+        filter_plan,
+    );
+    let rewritten_scan = TableScan::try_new(
+        scan.table_name.clone(),
+        provider_as_source(Arc::new(table)),
+        None,
+        Vec::new(),
+        None,
+    )?;
+    let projection_exprs = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            Expr::Column(Column::new(
+                Some(scan.table_name.clone()),
+                field.name().clone(),
+            ))
+            .alias(field.name().clone())
+        })
+        .collect::<Vec<_>>();
+    let projection = Projection::try_new_with_schema(
+        projection_exprs,
+        Arc::new(LogicalPlan::TableScan(rewritten_scan)),
+        aggregate.schema.clone(),
+    )?;
+    Ok(Some(LogicalPlan::Projection(projection)))
+}
+
+fn rewrite_native_i64_aggregate(
+    aggregate: &datafusion::logical_expr::Aggregate,
+    scan: &TableScan,
+    filters: &[Expr],
+    provider: &CoveTableProvider,
+) -> Result<Option<LogicalPlan>> {
+    if !aggregate.group_expr.is_empty() {
+        return Ok(None);
+    }
+    let Some(requests) = native_i64_aggregate_requests(aggregate, provider) else {
+        return Ok(None);
+    };
+    let Some(filter_plan) = native_exact_filter_plan(provider, filters)? else {
+        return Ok(None);
+    };
+    let schema: SchemaRef = Arc::new(aggregate.schema.as_arrow().clone());
+    for (index, request) in requests.iter().enumerate() {
+        let data_type = schema.field(index).data_type();
+        let supported = match request.kind {
+            NativeI64AggregateKind::Count => {
+                matches!(data_type, DataType::Int64 | DataType::UInt64)
+            }
+            NativeI64AggregateKind::Avg => data_type == &DataType::Float64,
+            NativeI64AggregateKind::Sum
+            | NativeI64AggregateKind::Min
+            | NativeI64AggregateKind::Max => data_type == &DataType::Int64,
+        };
+        if !supported {
+            return Ok(None);
+        }
+    }
+    let table = CoveNativeAggregateTableProvider::new(
+        Arc::clone(&schema),
+        Arc::clone(provider.state()),
+        requests,
+        filter_plan,
+    );
+    let rewritten_scan = TableScan::try_new(
+        scan.table_name.clone(),
+        provider_as_source(Arc::new(table)),
+        None,
+        Vec::new(),
+        None,
+    )?;
+    let projection_exprs = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            Expr::Column(Column::new(
+                Some(scan.table_name.clone()),
+                field.name().clone(),
+            ))
+            .alias(field.name().clone())
+        })
+        .collect::<Vec<_>>();
+    let projection = Projection::try_new_with_schema(
+        projection_exprs,
+        Arc::new(LogicalPlan::TableScan(rewritten_scan)),
+        aggregate.schema.clone(),
+    )?;
+    Ok(Some(LogicalPlan::Projection(projection)))
+}
+
+fn rewrite_native_i64_i64_group_aggregate(
+    aggregate: &datafusion::logical_expr::Aggregate,
+    scan: &TableScan,
+    filters: &[Expr],
+    provider: &CoveTableProvider,
+) -> Result<Option<LogicalPlan>> {
+    if aggregate.group_expr.len() != 1 || aggregate.aggr_expr.is_empty() {
+        return Ok(None);
+    }
+    let Expr::Column(group_column) = &aggregate.group_expr[0] else {
+        return Ok(None);
+    };
+    let Some(group_column_index) = provider
+        .state()
+        .table()
+        .columns
+        .iter()
+        .position(|candidate| candidate.name == group_column.name)
+    else {
+        return Ok(None);
+    };
+    let cove_group_column = &provider.state().table().columns[group_column_index];
+    if cove_group_column.logical != CoveLogicalType::Int64
+        || cove_group_column.physical != CovePhysicalKind::NumCode
+    {
+        return Ok(None);
+    }
+    let Some(requests) = native_i64_aggregate_requests(aggregate, provider) else {
+        return Ok(None);
+    };
+    let Some(first_request) = requests.first() else {
+        return Ok(None);
+    };
+    if requests
+        .iter()
+        .any(|request| request.column_index != first_request.column_index)
+    {
+        return Ok(None);
+    }
+    let schema: SchemaRef = Arc::new(aggregate.schema.as_arrow().clone());
+    if schema.fields().len() != requests.len() + 1
+        || schema.field(0).data_type() != &DataType::Int64
+    {
+        return Ok(None);
+    }
+    for (index, request) in requests.iter().enumerate() {
+        let data_type = schema.field(index + 1).data_type();
+        let supported = match request.kind {
+            NativeI64AggregateKind::Count => {
+                matches!(data_type, DataType::Int64 | DataType::UInt64)
+            }
+            NativeI64AggregateKind::Avg => data_type == &DataType::Float64,
+            NativeI64AggregateKind::Sum
+            | NativeI64AggregateKind::Min
+            | NativeI64AggregateKind::Max => data_type == &DataType::Int64,
+        };
+        if !supported {
+            return Ok(None);
+        }
+    }
+    let Some(filter_plan) = native_exact_filter_plan(provider, filters)? else {
+        return Ok(None);
+    };
+    let provider_fields = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(index, field)| {
+            Field::new(
+                format!("__cove_native_i64_group_agg_{index}"),
+                field.data_type().clone(),
+                field.is_nullable(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let provider_schema: SchemaRef = Arc::new(Schema::new(provider_fields));
+    let table = CoveNativeI64I64GroupAggregateTableProvider::new(
+        Arc::clone(&provider_schema),
+        Arc::clone(provider.state()),
+        group_column_index,
+        requests,
+        filter_plan,
+    );
+    let rewritten_scan = TableScan::try_new(
+        scan.table_name.clone(),
+        provider_as_source(Arc::new(table)),
+        None,
+        Vec::new(),
+        None,
+    )?;
+    let projection_exprs = provider_schema
+        .fields()
+        .iter()
+        .zip(schema.fields().iter())
+        .map(|(provider_field, output_field)| {
+            Expr::Column(Column::new(
+                Some(scan.table_name.clone()),
+                provider_field.name().clone(),
+            ))
+            .alias(output_field.name().clone())
+        })
+        .collect::<Vec<_>>();
+    let projection = Projection::try_new_with_schema(
+        projection_exprs,
+        Arc::new(LogicalPlan::TableScan(rewritten_scan)),
+        aggregate.schema.clone(),
+    )?;
+    Ok(Some(LogicalPlan::Projection(projection)))
+}
+
+fn rewrite_native_bool_i64_group_aggregate(
+    aggregate: &datafusion::logical_expr::Aggregate,
+    scan: &TableScan,
+    filters: &[Expr],
+    provider: &CoveTableProvider,
+) -> Result<Option<LogicalPlan>> {
+    if aggregate.group_expr.len() != 1 || aggregate.aggr_expr.is_empty() {
+        return Ok(None);
+    }
+    let Expr::Column(group_column) = &aggregate.group_expr[0] else {
+        return Ok(None);
+    };
+    let Some(group_column_index) = provider
+        .state()
+        .table()
+        .columns
+        .iter()
+        .position(|candidate| candidate.name == group_column.name)
+    else {
+        return Ok(None);
+    };
+    let cove_group_column = &provider.state().table().columns[group_column_index];
+    if cove_group_column.logical != CoveLogicalType::Bool
+        || cove_group_column.physical != CovePhysicalKind::Boolean
+    {
+        return Ok(None);
+    }
+    let Some(requests) = native_i64_aggregate_requests(aggregate, provider) else {
+        return Ok(None);
+    };
+    let Some(first_request) = requests.first() else {
+        return Ok(None);
+    };
+    if requests
+        .iter()
+        .any(|request| request.column_index != first_request.column_index)
+    {
+        return Ok(None);
+    }
+    let schema: SchemaRef = Arc::new(aggregate.schema.as_arrow().clone());
+    if schema.fields().len() != requests.len() + 1
+        || schema.field(0).data_type() != &DataType::Boolean
+    {
+        return Ok(None);
+    }
+    for (index, request) in requests.iter().enumerate() {
+        let data_type = schema.field(index + 1).data_type();
+        let supported = match request.kind {
+            NativeI64AggregateKind::Count => {
+                matches!(data_type, DataType::Int64 | DataType::UInt64)
+            }
+            NativeI64AggregateKind::Avg => data_type == &DataType::Float64,
+            NativeI64AggregateKind::Sum
+            | NativeI64AggregateKind::Min
+            | NativeI64AggregateKind::Max => data_type == &DataType::Int64,
+        };
+        if !supported {
+            return Ok(None);
+        }
+    }
+    let Some(filter_plan) = native_exact_filter_plan(provider, filters)? else {
+        return Ok(None);
+    };
+    let provider_fields = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(index, field)| {
+            Field::new(
+                format!("__cove_native_group_agg_{index}"),
+                field.data_type().clone(),
+                field.is_nullable(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let provider_schema: SchemaRef = Arc::new(Schema::new(provider_fields));
+    let table = CoveNativeBoolI64GroupAggregateTableProvider::new(
+        Arc::clone(&provider_schema),
+        Arc::clone(provider.state()),
+        group_column_index,
+        requests,
+        filter_plan,
+    );
+    let rewritten_scan = TableScan::try_new(
+        scan.table_name.clone(),
+        provider_as_source(Arc::new(table)),
+        None,
+        Vec::new(),
+        None,
+    )?;
+    let projection_exprs = provider_schema
+        .fields()
+        .iter()
+        .zip(schema.fields().iter())
+        .map(|(provider_field, output_field)| {
+            Expr::Column(Column::new(
+                Some(scan.table_name.clone()),
+                provider_field.name().clone(),
+            ))
+            .alias(output_field.name().clone())
+        })
+        .collect::<Vec<_>>();
+    let projection = Projection::try_new_with_schema(
+        projection_exprs,
+        Arc::new(LogicalPlan::TableScan(rewritten_scan)),
+        aggregate.schema.clone(),
+    )?;
+    Ok(Some(LogicalPlan::Projection(projection)))
+}
+
+fn rewrite_native_filecode_i64_group_aggregate(
+    aggregate: &datafusion::logical_expr::Aggregate,
+    scan: &TableScan,
+    filters: &[Expr],
+    provider: &CoveTableProvider,
+) -> Result<Option<LogicalPlan>> {
+    if aggregate.group_expr.len() != 1 || aggregate.aggr_expr.is_empty() {
+        return Ok(None);
+    }
+    let Expr::Column(group_column) = &aggregate.group_expr[0] else {
+        return Ok(None);
+    };
+    let Some(group_column_index) = provider
+        .state()
+        .table()
+        .columns
+        .iter()
+        .position(|candidate| candidate.name == group_column.name)
+    else {
+        return Ok(None);
+    };
+    let cove_group_column = &provider.state().table().columns[group_column_index];
+    if cove_group_column.logical != CoveLogicalType::Utf8
+        || cove_group_column.physical != CovePhysicalKind::FileCode
+    {
+        return Ok(None);
+    }
+    if provider
+        .state()
+        .files()
+        .iter()
+        .any(|file| file.has_redaction())
+    {
+        return Ok(None);
+    }
+    let Some(requests) = native_i64_aggregate_requests(aggregate, provider) else {
+        return Ok(None);
+    };
+    let Some(first_request) = requests.first() else {
+        return Ok(None);
+    };
+    if requests
+        .iter()
+        .any(|request| request.column_index != first_request.column_index)
+    {
+        return Ok(None);
+    }
+    let schema: SchemaRef = Arc::new(aggregate.schema.as_arrow().clone());
+    if schema.fields().len() != requests.len() + 1 || schema.field(0).data_type() != &DataType::Utf8
+    {
+        return Ok(None);
+    }
+    for (index, request) in requests.iter().enumerate() {
+        let data_type = schema.field(index + 1).data_type();
+        let supported = match request.kind {
+            NativeI64AggregateKind::Count => {
+                matches!(data_type, DataType::Int64 | DataType::UInt64)
+            }
+            NativeI64AggregateKind::Avg => data_type == &DataType::Float64,
+            NativeI64AggregateKind::Sum
+            | NativeI64AggregateKind::Min
+            | NativeI64AggregateKind::Max => data_type == &DataType::Int64,
+        };
+        if !supported {
+            return Ok(None);
+        }
+    }
+    let Some(filter_plan) = native_exact_filter_plan(provider, filters)? else {
+        return Ok(None);
+    };
+    let provider_fields = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(index, field)| {
+            Field::new(
+                format!("__cove_native_filecode_group_agg_{index}"),
+                field.data_type().clone(),
+                field.is_nullable(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let provider_schema: SchemaRef = Arc::new(Schema::new(provider_fields));
+    let table = CoveNativeFileCodeI64GroupAggregateTableProvider::new(
+        Arc::clone(&provider_schema),
+        Arc::clone(provider.state()),
+        group_column_index,
+        requests,
+        filter_plan,
+    );
+    let rewritten_scan = TableScan::try_new(
+        scan.table_name.clone(),
+        provider_as_source(Arc::new(table)),
+        None,
+        Vec::new(),
+        None,
+    )?;
+    let projection_exprs = provider_schema
+        .fields()
+        .iter()
+        .zip(schema.fields().iter())
+        .map(|(provider_field, output_field)| {
+            Expr::Column(Column::new(
+                Some(scan.table_name.clone()),
+                provider_field.name().clone(),
+            ))
+            .alias(output_field.name().clone())
+        })
+        .collect::<Vec<_>>();
+    let projection = Projection::try_new_with_schema(
+        projection_exprs,
+        Arc::new(LogicalPlan::TableScan(rewritten_scan)),
+        aggregate.schema.clone(),
+    )?;
+    Ok(Some(LogicalPlan::Projection(projection)))
+}
+
+fn rewrite_native_i64_group_count(
+    aggregate: &datafusion::logical_expr::Aggregate,
+    scan: &TableScan,
+    filters: &[Expr],
+    provider: &CoveTableProvider,
+) -> Result<Option<LogicalPlan>> {
+    if aggregate.group_expr.len() != 1 || aggregate.aggr_expr.len() != 1 {
+        return Ok(None);
+    }
+    if !matches!(
+        count_column_index(&aggregate.aggr_expr[0], provider),
+        Some(None)
+    ) {
+        return Ok(None);
+    }
+    let Expr::Column(column) = &aggregate.group_expr[0] else {
+        return Ok(None);
+    };
+    let Some(column_index) = provider
+        .state()
+        .table()
+        .columns
+        .iter()
+        .position(|candidate| candidate.name == column.name)
+    else {
+        return Ok(None);
+    };
+    let cove_column = &provider.state().table().columns[column_index];
+    if cove_column.logical != CoveLogicalType::Int64
+        || cove_column.physical != CovePhysicalKind::NumCode
+    {
+        return Ok(None);
+    }
+    let schema: SchemaRef = Arc::new(aggregate.schema.as_arrow().clone());
+    if schema.fields().len() != 2 || schema.field(0).data_type() != &DataType::Int64 {
+        return Ok(None);
+    }
+    if !matches!(
+        schema.field(1).data_type(),
+        DataType::Int64 | DataType::UInt64
+    ) {
+        return Ok(None);
+    }
+    let Some(filter_plan) = native_exact_filter_plan(provider, filters)? else {
+        return Ok(None);
+    };
+    let table = CoveNativeGroupCountTableProvider::new(
+        Arc::clone(&schema),
+        Arc::clone(provider.state()),
+        column_index,
+        filter_plan,
+    );
+    let rewritten_scan = TableScan::try_new(
+        scan.table_name.clone(),
+        provider_as_source(Arc::new(table)),
+        None,
+        Vec::new(),
+        None,
+    )?;
+    let projection_exprs = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            Expr::Column(Column::new(
+                Some(scan.table_name.clone()),
+                field.name().clone(),
+            ))
+            .alias(field.name().clone())
+        })
+        .collect::<Vec<_>>();
+    let projection = Projection::try_new_with_schema(
+        projection_exprs,
+        Arc::new(LogicalPlan::TableScan(rewritten_scan)),
+        aggregate.schema.clone(),
+    )?;
+    Ok(Some(LogicalPlan::Projection(projection)))
+}
+
+fn rewrite_native_bool_group_count(
+    aggregate: &datafusion::logical_expr::Aggregate,
+    scan: &TableScan,
+    filters: &[Expr],
+    provider: &CoveTableProvider,
+) -> Result<Option<LogicalPlan>> {
+    if aggregate.group_expr.len() != 1 || aggregate.aggr_expr.len() != 1 {
+        return Ok(None);
+    }
+    if !matches!(
+        count_column_index(&aggregate.aggr_expr[0], provider),
+        Some(None)
+    ) {
+        return Ok(None);
+    }
+    let Expr::Column(column) = &aggregate.group_expr[0] else {
+        return Ok(None);
+    };
+    let Some(column_index) = provider
+        .state()
+        .table()
+        .columns
+        .iter()
+        .position(|candidate| candidate.name == column.name)
+    else {
+        return Ok(None);
+    };
+    let cove_column = &provider.state().table().columns[column_index];
+    if cove_column.logical != CoveLogicalType::Bool
+        || cove_column.physical != CovePhysicalKind::Boolean
+    {
+        return Ok(None);
+    }
+    let schema: SchemaRef = Arc::new(aggregate.schema.as_arrow().clone());
+    if schema.fields().len() != 2 || schema.field(0).data_type() != &DataType::Boolean {
+        return Ok(None);
+    }
+    if !matches!(
+        schema.field(1).data_type(),
+        DataType::Int64 | DataType::UInt64
+    ) {
+        return Ok(None);
+    }
+    let Some(filter_plan) = native_exact_filter_plan(provider, filters)? else {
+        return Ok(None);
+    };
+    let table = CoveNativeGroupCountTableProvider::bool_count(
+        Arc::clone(&schema),
+        Arc::clone(provider.state()),
+        column_index,
+        filter_plan,
+    );
+    let rewritten_scan = TableScan::try_new(
+        scan.table_name.clone(),
+        provider_as_source(Arc::new(table)),
+        None,
+        Vec::new(),
+        None,
+    )?;
+    let projection_exprs = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            Expr::Column(Column::new(
+                Some(scan.table_name.clone()),
+                field.name().clone(),
+            ))
+            .alias(field.name().clone())
+        })
+        .collect::<Vec<_>>();
+    let projection = Projection::try_new_with_schema(
+        projection_exprs,
+        Arc::new(LogicalPlan::TableScan(rewritten_scan)),
+        aggregate.schema.clone(),
+    )?;
+    Ok(Some(LogicalPlan::Projection(projection)))
+}
+
+fn rewrite_native_filecode_group_count(
+    aggregate: &datafusion::logical_expr::Aggregate,
+    scan: &TableScan,
+    filters: &[Expr],
+    provider: &CoveTableProvider,
+) -> Result<Option<LogicalPlan>> {
+    if aggregate.group_expr.len() != 1 || aggregate.aggr_expr.len() != 1 {
+        return Ok(None);
+    }
+    if !matches!(
+        count_column_index(&aggregate.aggr_expr[0], provider),
+        Some(None)
+    ) {
+        return Ok(None);
+    }
+    let Expr::Column(column) = &aggregate.group_expr[0] else {
+        return Ok(None);
+    };
+    let Some(column_index) = provider
+        .state()
+        .table()
+        .columns
+        .iter()
+        .position(|candidate| candidate.name == column.name)
+    else {
+        return Ok(None);
+    };
+    let cove_column = &provider.state().table().columns[column_index];
+    if cove_column.logical != CoveLogicalType::Utf8
+        || cove_column.physical != CovePhysicalKind::FileCode
+    {
+        return Ok(None);
+    }
+    if provider
+        .state()
+        .files()
+        .iter()
+        .any(|file| file.has_redaction())
+    {
+        return Ok(None);
+    }
+    let schema: SchemaRef = Arc::new(aggregate.schema.as_arrow().clone());
+    if schema.fields().len() != 2 || schema.field(0).data_type() != &DataType::Utf8 {
+        return Ok(None);
+    }
+    if !matches!(
+        schema.field(1).data_type(),
+        DataType::Int64 | DataType::UInt64
+    ) {
+        return Ok(None);
+    }
+    let Some(filter_plan) = native_exact_filter_plan(provider, filters)? else {
+        return Ok(None);
+    };
+    let table = CoveNativeGroupCountTableProvider::filecode_utf8_count(
+        Arc::clone(&schema),
+        Arc::clone(provider.state()),
+        column_index,
+        filter_plan,
+    );
+    let rewritten_scan = TableScan::try_new(
+        scan.table_name.clone(),
+        provider_as_source(Arc::new(table)),
+        None,
+        Vec::new(),
+        None,
+    )?;
+    let projection_exprs = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            Expr::Column(Column::new(
+                Some(scan.table_name.clone()),
+                field.name().clone(),
+            ))
+            .alias(field.name().clone())
+        })
+        .collect::<Vec<_>>();
+    let projection = Projection::try_new_with_schema(
+        projection_exprs,
+        Arc::new(LogicalPlan::TableScan(rewritten_scan)),
+        aggregate.schema.clone(),
+    )?;
+    Ok(Some(LogicalPlan::Projection(projection)))
+}
+
+fn rewrite_native_i64_distinct_group(
+    aggregate: &datafusion::logical_expr::Aggregate,
+    scan: &TableScan,
+    filters: &[Expr],
+    provider: &CoveTableProvider,
+) -> Result<Option<LogicalPlan>> {
+    if aggregate.group_expr.len() != 1 || !aggregate.aggr_expr.is_empty() {
+        return Ok(None);
+    }
+    let Expr::Column(column) = &aggregate.group_expr[0] else {
+        return Ok(None);
+    };
+    let Some(column_index) = provider
+        .state()
+        .table()
+        .columns
+        .iter()
+        .position(|candidate| candidate.name == column.name)
+    else {
+        return Ok(None);
+    };
+    let cove_column = &provider.state().table().columns[column_index];
+    if cove_column.logical != CoveLogicalType::Int64
+        || cove_column.physical != CovePhysicalKind::NumCode
+    {
+        return Ok(None);
+    }
+    let schema: SchemaRef = Arc::new(aggregate.schema.as_arrow().clone());
+    if schema.fields().len() != 1 || schema.field(0).data_type() != &DataType::Int64 {
+        return Ok(None);
+    }
+    let Some(filter_plan) = native_exact_filter_plan(provider, filters)? else {
+        return Ok(None);
+    };
+    let table = CoveNativeGroupCountTableProvider::distinct(
+        Arc::clone(&schema),
+        Arc::clone(provider.state()),
+        column_index,
+        filter_plan,
+    );
+    let rewritten_scan = TableScan::try_new(
+        scan.table_name.clone(),
+        provider_as_source(Arc::new(table)),
+        None,
+        Vec::new(),
+        None,
+    )?;
+    Ok(Some(LogicalPlan::TableScan(rewritten_scan)))
+}
+
+fn rewrite_native_bool_distinct_group(
+    aggregate: &datafusion::logical_expr::Aggregate,
+    scan: &TableScan,
+    filters: &[Expr],
+    provider: &CoveTableProvider,
+) -> Result<Option<LogicalPlan>> {
+    if aggregate.group_expr.len() != 1 || !aggregate.aggr_expr.is_empty() {
+        return Ok(None);
+    }
+    let Expr::Column(column) = &aggregate.group_expr[0] else {
+        return Ok(None);
+    };
+    let Some(column_index) = provider
+        .state()
+        .table()
+        .columns
+        .iter()
+        .position(|candidate| candidate.name == column.name)
+    else {
+        return Ok(None);
+    };
+    let cove_column = &provider.state().table().columns[column_index];
+    if cove_column.logical != CoveLogicalType::Bool
+        || cove_column.physical != CovePhysicalKind::Boolean
+    {
+        return Ok(None);
+    }
+    let schema: SchemaRef = Arc::new(aggregate.schema.as_arrow().clone());
+    if schema.fields().len() != 1 || schema.field(0).data_type() != &DataType::Boolean {
+        return Ok(None);
+    }
+    let Some(filter_plan) = native_exact_filter_plan(provider, filters)? else {
+        return Ok(None);
+    };
+    let table = CoveNativeGroupCountTableProvider::bool_distinct(
+        Arc::clone(&schema),
+        Arc::clone(provider.state()),
+        column_index,
+        filter_plan,
+    );
+    let rewritten_scan = TableScan::try_new(
+        scan.table_name.clone(),
+        provider_as_source(Arc::new(table)),
+        None,
+        Vec::new(),
+        None,
+    )?;
+    Ok(Some(LogicalPlan::TableScan(rewritten_scan)))
+}
+
+fn rewrite_native_filecode_distinct_group(
+    aggregate: &datafusion::logical_expr::Aggregate,
+    scan: &TableScan,
+    filters: &[Expr],
+    provider: &CoveTableProvider,
+) -> Result<Option<LogicalPlan>> {
+    if aggregate.group_expr.len() != 1 || !aggregate.aggr_expr.is_empty() {
+        return Ok(None);
+    }
+    let Expr::Column(column) = &aggregate.group_expr[0] else {
+        return Ok(None);
+    };
+    let Some(column_index) = provider
+        .state()
+        .table()
+        .columns
+        .iter()
+        .position(|candidate| candidate.name == column.name)
+    else {
+        return Ok(None);
+    };
+    let cove_column = &provider.state().table().columns[column_index];
+    if cove_column.logical != CoveLogicalType::Utf8
+        || cove_column.physical != CovePhysicalKind::FileCode
+    {
+        return Ok(None);
+    }
+    if provider
+        .state()
+        .files()
+        .iter()
+        .any(|file| file.has_redaction())
+    {
+        return Ok(None);
+    }
+    let schema: SchemaRef = Arc::new(aggregate.schema.as_arrow().clone());
+    if schema.fields().len() != 1 || schema.field(0).data_type() != &DataType::Utf8 {
+        return Ok(None);
+    }
+    let Some(filter_plan) = native_exact_filter_plan(provider, filters)? else {
+        return Ok(None);
+    };
+    let table = CoveNativeGroupCountTableProvider::filecode_utf8_distinct(
+        Arc::clone(&schema),
+        Arc::clone(provider.state()),
+        column_index,
+        filter_plan,
+    );
+    let rewritten_scan = TableScan::try_new(
+        scan.table_name.clone(),
+        provider_as_source(Arc::new(table)),
+        None,
+        Vec::new(),
+        None,
+    )?;
+    Ok(Some(LogicalPlan::TableScan(rewritten_scan)))
+}
+
+enum DistinctColumnRef<'a> {
+    Named(&'a str),
+    ProjectedIndex(usize),
+}
+
+fn rewrite_native_i64_distinct_all(distinct: &Distinct) -> Result<Option<LogicalPlan>> {
+    let Distinct::All(input) = distinct else {
+        return Ok(None);
+    };
+    let Some((scan, filters, column_ref)) = distinct_all_scan_and_filters(input.as_ref()) else {
+        return Ok(None);
+    };
+    let Some(provider) = cove_provider_from_scan(scan)? else {
+        return Ok(None);
+    };
+    let column_index = match column_ref {
+        DistinctColumnRef::Named(name) => {
+            let Some(index) = provider
+                .state()
+                .table()
+                .columns
+                .iter()
+                .position(|candidate| candidate.name == name)
+            else {
+                return Ok(None);
+            };
+            index
+        }
+        DistinctColumnRef::ProjectedIndex(index) => index,
+    };
+    let Some(cove_column) = provider.state().table().columns.get(column_index) else {
+        return Ok(None);
+    };
+    if cove_column.logical != CoveLogicalType::Int64
+        || cove_column.physical != CovePhysicalKind::NumCode
+    {
+        return Ok(None);
+    }
+    let schema: SchemaRef = Arc::new(input.schema().as_arrow().clone());
+    if schema.fields().len() != 1 || schema.field(0).data_type() != &DataType::Int64 {
+        return Ok(None);
+    }
+    let Some(filter_plan) = native_exact_filter_plan(provider.as_ref(), &filters)? else {
+        return Ok(None);
+    };
+    let table = CoveNativeGroupCountTableProvider::distinct(
+        Arc::clone(&schema),
+        Arc::clone(provider.state()),
+        column_index,
+        filter_plan,
+    );
+    let rewritten_scan = TableScan::try_new(
+        scan.table_name.clone(),
+        provider_as_source(Arc::new(table)),
+        None,
+        Vec::new(),
+        None,
+    )?;
+    Ok(Some(LogicalPlan::TableScan(rewritten_scan)))
+}
+
+fn rewrite_native_bool_distinct_all(distinct: &Distinct) -> Result<Option<LogicalPlan>> {
+    let Distinct::All(input) = distinct else {
+        return Ok(None);
+    };
+    let Some((scan, filters, column_ref)) = distinct_all_scan_and_filters(input.as_ref()) else {
+        return Ok(None);
+    };
+    let Some(provider) = cove_provider_from_scan(scan)? else {
+        return Ok(None);
+    };
+    let column_index = match column_ref {
+        DistinctColumnRef::Named(name) => {
+            let Some(index) = provider
+                .state()
+                .table()
+                .columns
+                .iter()
+                .position(|candidate| candidate.name == name)
+            else {
+                return Ok(None);
+            };
+            index
+        }
+        DistinctColumnRef::ProjectedIndex(index) => index,
+    };
+    let Some(cove_column) = provider.state().table().columns.get(column_index) else {
+        return Ok(None);
+    };
+    if cove_column.logical != CoveLogicalType::Bool
+        || cove_column.physical != CovePhysicalKind::Boolean
+    {
+        return Ok(None);
+    }
+    let schema: SchemaRef = Arc::new(input.schema().as_arrow().clone());
+    if schema.fields().len() != 1 || schema.field(0).data_type() != &DataType::Boolean {
+        return Ok(None);
+    }
+    let Some(filter_plan) = native_exact_filter_plan(provider.as_ref(), &filters)? else {
+        return Ok(None);
+    };
+    let table = CoveNativeGroupCountTableProvider::bool_distinct(
+        Arc::clone(&schema),
+        Arc::clone(provider.state()),
+        column_index,
+        filter_plan,
+    );
+    let rewritten_scan = TableScan::try_new(
+        scan.table_name.clone(),
+        provider_as_source(Arc::new(table)),
+        None,
+        Vec::new(),
+        None,
+    )?;
+    Ok(Some(LogicalPlan::TableScan(rewritten_scan)))
+}
+
+fn rewrite_native_filecode_distinct_all(distinct: &Distinct) -> Result<Option<LogicalPlan>> {
+    let Distinct::All(input) = distinct else {
+        return Ok(None);
+    };
+    let Some((scan, filters, column_ref)) = distinct_all_scan_and_filters(input.as_ref()) else {
+        return Ok(None);
+    };
+    let Some(provider) = cove_provider_from_scan(scan)? else {
+        return Ok(None);
+    };
+    let column_index = match column_ref {
+        DistinctColumnRef::Named(name) => {
+            let Some(index) = provider
+                .state()
+                .table()
+                .columns
+                .iter()
+                .position(|candidate| candidate.name == name)
+            else {
+                return Ok(None);
+            };
+            index
+        }
+        DistinctColumnRef::ProjectedIndex(index) => index,
+    };
+    let Some(cove_column) = provider.state().table().columns.get(column_index) else {
+        return Ok(None);
+    };
+    if cove_column.logical != CoveLogicalType::Utf8
+        || cove_column.physical != CovePhysicalKind::FileCode
+    {
+        return Ok(None);
+    }
+    if provider
+        .state()
+        .files()
+        .iter()
+        .any(|file| file.has_redaction())
+    {
+        return Ok(None);
+    }
+    let schema: SchemaRef = Arc::new(input.schema().as_arrow().clone());
+    if schema.fields().len() != 1 || schema.field(0).data_type() != &DataType::Utf8 {
+        return Ok(None);
+    }
+    let Some(filter_plan) = native_exact_filter_plan(provider.as_ref(), &filters)? else {
+        return Ok(None);
+    };
+    let table = CoveNativeGroupCountTableProvider::filecode_utf8_distinct(
+        Arc::clone(&schema),
+        Arc::clone(provider.state()),
+        column_index,
+        filter_plan,
+    );
+    let rewritten_scan = TableScan::try_new(
+        scan.table_name.clone(),
+        provider_as_source(Arc::new(table)),
+        None,
+        Vec::new(),
+        None,
+    )?;
+    Ok(Some(LogicalPlan::TableScan(rewritten_scan)))
+}
+
+fn rewrite_native_i64_key_join_projection(projection: &Projection) -> Result<Option<LogicalPlan>> {
+    let LogicalPlan::Join(join) = projection.input.as_ref() else {
+        return Ok(None);
+    };
+    let Some(join_kind) = native_i64_join_kind(join) else {
+        return Ok(None);
+    };
+    let [(left_join_expr, right_join_expr)] = join.on.as_slice() else {
+        return Ok(None);
+    };
+    let Expr::Column(left_join_column) = left_join_expr else {
+        return Ok(None);
+    };
+    let Expr::Column(right_join_column) = right_join_expr else {
+        return Ok(None);
+    };
+    let schema: SchemaRef = Arc::new(projection.schema.as_arrow().clone());
+    match join_kind {
+        NativeI64JoinKind::Inner => {
+            let [left_projected_expr, right_projected_expr] = projection.expr.as_slice() else {
+                return Ok(None);
+            };
+            let Some(left_projected_column) = projected_column(left_projected_expr) else {
+                return Ok(None);
+            };
+            let Some(right_projected_column) = projected_column(right_projected_expr) else {
+                return Ok(None);
+            };
+            if left_projected_column != left_join_column
+                || right_projected_column != right_join_column
+            {
+                return Ok(None);
+            }
+            if schema.fields().len() != 2
+                || schema.field(0).data_type() != &DataType::Int64
+                || schema.field(1).data_type() != &DataType::Int64
+                || schema.field(0).name() == schema.field(1).name()
+            {
+                return Ok(None);
+            }
+        }
+        NativeI64JoinKind::LeftSemi | NativeI64JoinKind::LeftAnti => {
+            let [left_projected_expr] = projection.expr.as_slice() else {
+                return Ok(None);
+            };
+            let Some(left_projected_column) = projected_column(left_projected_expr) else {
+                return Ok(None);
+            };
+            if left_projected_column != left_join_column {
+                return Ok(None);
+            }
+            if schema.fields().len() != 1 || schema.field(0).data_type() != &DataType::Int64 {
+                return Ok(None);
+            }
+        }
+    }
+    let Some(scan) = native_i64_key_join_scan(join, Arc::clone(&schema), join_kind, None)? else {
+        return Ok(None);
+    };
+    let projection_exprs = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            Expr::Column(Column::new(
+                Some(scan.table_name.clone()),
+                field.name().clone(),
+            ))
+            .alias(field.name().clone())
+        })
+        .collect::<Vec<_>>();
+    let rewritten_projection = Projection::try_new_with_schema(
+        projection_exprs,
+        Arc::new(LogicalPlan::TableScan(scan)),
+        projection.schema.clone(),
+    )?;
+    Ok(Some(LogicalPlan::Projection(rewritten_projection)))
+}
+
+fn rewrite_native_filecode_key_join_projection(
+    projection: &Projection,
+) -> Result<Option<LogicalPlan>> {
+    let LogicalPlan::Join(join) = projection.input.as_ref() else {
+        return Ok(None);
+    };
+    let Some(join_kind) = native_i64_join_kind(join) else {
+        return Ok(None);
+    };
+    let [(left_join_expr, right_join_expr)] = join.on.as_slice() else {
+        return Ok(None);
+    };
+    let Expr::Column(left_join_column) = left_join_expr else {
+        return Ok(None);
+    };
+    let Expr::Column(right_join_column) = right_join_expr else {
+        return Ok(None);
+    };
+    let schema: SchemaRef = Arc::new(projection.schema.as_arrow().clone());
+    match join_kind {
+        NativeI64JoinKind::Inner => {
+            let [left_projected_expr, right_projected_expr] = projection.expr.as_slice() else {
+                return Ok(None);
+            };
+            let Some(left_projected_column) = projected_column(left_projected_expr) else {
+                return Ok(None);
+            };
+            let Some(right_projected_column) = projected_column(right_projected_expr) else {
+                return Ok(None);
+            };
+            if left_projected_column != left_join_column
+                || right_projected_column != right_join_column
+            {
+                return Ok(None);
+            }
+            if schema.fields().len() != 2
+                || schema.field(0).data_type() != &DataType::Utf8
+                || schema.field(1).data_type() != &DataType::Utf8
+                || schema.field(0).name() == schema.field(1).name()
+            {
+                return Ok(None);
+            }
+        }
+        NativeI64JoinKind::LeftSemi | NativeI64JoinKind::LeftAnti => {
+            let [left_projected_expr] = projection.expr.as_slice() else {
+                return Ok(None);
+            };
+            let Some(left_projected_column) = projected_column(left_projected_expr) else {
+                return Ok(None);
+            };
+            if left_projected_column != left_join_column {
+                return Ok(None);
+            }
+            if schema.fields().len() != 1 || schema.field(0).data_type() != &DataType::Utf8 {
+                return Ok(None);
+            }
+        }
+    }
+    let Some(scan) = native_filecode_key_join_scan(join, Arc::clone(&schema), join_kind, None)?
+    else {
+        return Ok(None);
+    };
+    let projection_exprs = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            Expr::Column(Column::new(
+                Some(scan.table_name.clone()),
+                field.name().clone(),
+            ))
+            .alias(field.name().clone())
+        })
+        .collect::<Vec<_>>();
+    let rewritten_projection = Projection::try_new_with_schema(
+        projection_exprs,
+        Arc::new(LogicalPlan::TableScan(scan)),
+        projection.schema.clone(),
+    )?;
+    Ok(Some(LogicalPlan::Projection(rewritten_projection)))
+}
+
+fn rewrite_native_i64_key_semi_anti_join(join: &Join) -> Result<Option<LogicalPlan>> {
+    let Some(join_kind @ (NativeI64JoinKind::LeftSemi | NativeI64JoinKind::LeftAnti)) =
+        native_i64_join_kind(join)
+    else {
+        return Ok(None);
+    };
+    let schema: SchemaRef = Arc::new(join.schema.as_arrow().clone());
+    if schema.fields().len() != 1 || schema.field(0).data_type() != &DataType::Int64 {
+        return Ok(None);
+    }
+    let table_name = join.schema.qualified_field(0).0.cloned();
+    let Some(scan) = native_i64_key_join_scan(join, schema, join_kind, table_name)? else {
+        return Ok(None);
+    };
+    Ok(Some(LogicalPlan::TableScan(scan)))
+}
+
+fn rewrite_native_filecode_key_semi_anti_join(join: &Join) -> Result<Option<LogicalPlan>> {
+    let Some(join_kind @ (NativeI64JoinKind::LeftSemi | NativeI64JoinKind::LeftAnti)) =
+        native_i64_join_kind(join)
+    else {
+        return Ok(None);
+    };
+    let schema: SchemaRef = Arc::new(join.schema.as_arrow().clone());
+    if schema.fields().len() != 1 || schema.field(0).data_type() != &DataType::Utf8 {
+        return Ok(None);
+    }
+    let table_name = join.schema.qualified_field(0).0.cloned();
+    let Some(scan) = native_filecode_key_join_scan(join, schema, join_kind, table_name)? else {
+        return Ok(None);
+    };
+    Ok(Some(LogicalPlan::TableScan(scan)))
+}
+
+fn native_i64_key_join_scan(
+    join: &Join,
+    schema: SchemaRef,
+    join_kind: NativeI64JoinKind,
+    table_name: Option<TableReference>,
+) -> Result<Option<TableScan>> {
+    if native_i64_join_kind(join) != Some(join_kind)
+        || join.join_constraint != JoinConstraint::On
+        || join.null_equality != NullEquality::NullEqualsNothing
+        || join.null_aware
+        || join.filter.is_some()
+    {
+        return Ok(None);
+    }
+    let [(left_expr, right_expr)] = join.on.as_slice() else {
+        return Ok(None);
+    };
+    let Expr::Column(left_column) = left_expr else {
+        return Ok(None);
+    };
+    let Expr::Column(right_column) = right_expr else {
+        return Ok(None);
+    };
+    let Some((left_scan, left_filters)) = join_input_scan_and_filters(join.left.as_ref()) else {
+        return Ok(None);
+    };
+    let Some((right_scan, right_filters)) = join_input_scan_and_filters(join.right.as_ref()) else {
+        return Ok(None);
+    };
+    if left_scan.fetch.is_some() || right_scan.fetch.is_some() {
+        return Ok(None);
+    }
+    let Some(left_provider) = cove_provider_from_scan(left_scan)? else {
+        return Ok(None);
+    };
+    let Some(right_provider) = cove_provider_from_scan(right_scan)? else {
+        return Ok(None);
+    };
+    let Some(left_column_index) = native_i64_join_column_index(left_provider.as_ref(), left_column)
+    else {
+        return Ok(None);
+    };
+    let Some(right_column_index) =
+        native_i64_join_column_index(right_provider.as_ref(), right_column)
+    else {
+        return Ok(None);
+    };
+    if !scan_projects_only_column(left_scan, left_provider.as_ref(), left_column_index)
+        || !scan_projects_only_column(right_scan, right_provider.as_ref(), right_column_index)
+    {
+        return Ok(None);
+    }
+    let Some(left_filter_plan) = native_exact_filter_plan(left_provider.as_ref(), &left_filters)?
+    else {
+        return Ok(None);
+    };
+    let Some(right_filter_plan) =
+        native_exact_filter_plan(right_provider.as_ref(), &right_filters)?
+    else {
+        return Ok(None);
+    };
+
+    let table = CoveNativeI64JoinTableProvider::new(
+        schema,
+        join_kind,
+        Arc::clone(left_provider.state()),
+        Arc::clone(right_provider.state()),
+        left_column_index,
+        right_column_index,
+        left_filter_plan,
+        right_filter_plan,
+    );
+    let table_name = table_name.unwrap_or_else(|| left_scan.table_name.clone());
+    let source = provider_as_source(Arc::new(table));
+    let rewritten_scan = TableScan::try_new(table_name, source, None, Vec::new(), None)?;
+    Ok(Some(rewritten_scan))
+}
+
+fn native_filecode_key_join_scan(
+    join: &Join,
+    schema: SchemaRef,
+    join_kind: NativeI64JoinKind,
+    table_name: Option<TableReference>,
+) -> Result<Option<TableScan>> {
+    if native_i64_join_kind(join) != Some(join_kind)
+        || join.join_constraint != JoinConstraint::On
+        || join.null_equality != NullEquality::NullEqualsNothing
+        || join.null_aware
+        || join.filter.is_some()
+    {
+        return Ok(None);
+    }
+    let [(left_expr, right_expr)] = join.on.as_slice() else {
+        return Ok(None);
+    };
+    let Expr::Column(left_column) = left_expr else {
+        return Ok(None);
+    };
+    let Expr::Column(right_column) = right_expr else {
+        return Ok(None);
+    };
+    let Some((left_scan, left_filters)) = join_input_scan_and_filters(join.left.as_ref()) else {
+        return Ok(None);
+    };
+    let Some((right_scan, right_filters)) = join_input_scan_and_filters(join.right.as_ref()) else {
+        return Ok(None);
+    };
+    if left_scan.fetch.is_some() || right_scan.fetch.is_some() {
+        return Ok(None);
+    }
+    let Some(left_provider) = cove_provider_from_scan(left_scan)? else {
+        return Ok(None);
+    };
+    let Some(right_provider) = cove_provider_from_scan(right_scan)? else {
+        return Ok(None);
+    };
+    if left_provider
+        .state()
+        .files()
+        .iter()
+        .any(|file| file.has_redaction())
+        || right_provider
+            .state()
+            .files()
+            .iter()
+            .any(|file| file.has_redaction())
+    {
+        return Ok(None);
+    }
+    let Some(left_column_index) =
+        native_filecode_join_column_index(left_provider.as_ref(), left_column)
+    else {
+        return Ok(None);
+    };
+    let Some(right_column_index) =
+        native_filecode_join_column_index(right_provider.as_ref(), right_column)
+    else {
+        return Ok(None);
+    };
+    if !scan_projects_only_column(left_scan, left_provider.as_ref(), left_column_index)
+        || !scan_projects_only_column(right_scan, right_provider.as_ref(), right_column_index)
+    {
+        return Ok(None);
+    }
+    let Some(left_filter_plan) = native_exact_filter_plan(left_provider.as_ref(), &left_filters)?
+    else {
+        return Ok(None);
+    };
+    let Some(right_filter_plan) =
+        native_exact_filter_plan(right_provider.as_ref(), &right_filters)?
+    else {
+        return Ok(None);
+    };
+
+    let table = CoveNativeFileCodeJoinTableProvider::new(
+        schema,
+        join_kind,
+        Arc::clone(left_provider.state()),
+        Arc::clone(right_provider.state()),
+        left_column_index,
+        right_column_index,
+        left_filter_plan,
+        right_filter_plan,
+    );
+    let table_name = table_name.unwrap_or_else(|| left_scan.table_name.clone());
+    let source = provider_as_source(Arc::new(table));
+    let rewritten_scan = TableScan::try_new(table_name, source, None, Vec::new(), None)?;
+    Ok(Some(rewritten_scan))
+}
+
+fn native_i64_join_kind(join: &Join) -> Option<NativeI64JoinKind> {
+    match join.join_type {
+        JoinType::Inner => Some(NativeI64JoinKind::Inner),
+        JoinType::LeftSemi => Some(NativeI64JoinKind::LeftSemi),
+        JoinType::LeftAnti => Some(NativeI64JoinKind::LeftAnti),
+        _ => None,
+    }
+}
+
+fn join_input_scan_and_filters(input: &LogicalPlan) -> Option<(&TableScan, Vec<Expr>)> {
+    match input {
+        LogicalPlan::TableScan(scan) => Some((scan, dedup_filters(scan.filters.clone()))),
+        LogicalPlan::SubqueryAlias(alias) => join_input_scan_and_filters(alias.input.as_ref()),
+        LogicalPlan::Projection(projection)
+            if projection
+                .expr
+                .iter()
+                .all(|expr| projected_column(expr).is_some()) =>
+        {
+            join_input_scan_and_filters(projection.input.as_ref())
+        }
+        LogicalPlan::Filter(filter) => {
+            let (scan, mut filters) = join_input_scan_and_filters(filter.input.as_ref())?;
+            filters.push(filter.predicate.clone());
+            Some((scan, dedup_filters(filters)))
+        }
+        _ => None,
+    }
+}
+
+fn native_filecode_join_column_index(
+    provider: &CoveTableProvider,
+    column: &Column,
+) -> Option<usize> {
+    let column_index = provider
+        .state()
+        .table()
+        .columns
+        .iter()
+        .position(|candidate| candidate.name == column.name)?;
+    let cove_column = &provider.state().table().columns[column_index];
+    if cove_column.logical == CoveLogicalType::Utf8
+        && cove_column.physical == CovePhysicalKind::FileCode
+    {
+        Some(column_index)
+    } else {
+        None
+    }
+}
+
+fn native_i64_join_column_index(provider: &CoveTableProvider, column: &Column) -> Option<usize> {
+    let column_index = provider
+        .state()
+        .table()
+        .columns
+        .iter()
+        .position(|candidate| candidate.name == column.name)?;
+    let cove_column = &provider.state().table().columns[column_index];
+    if cove_column.logical == CoveLogicalType::Int64
+        && cove_column.physical == CovePhysicalKind::NumCode
+    {
+        Some(column_index)
+    } else {
+        None
+    }
+}
+
+fn distinct_all_scan_and_filters(
+    input: &LogicalPlan,
+) -> Option<(&TableScan, Vec<Expr>, DistinctColumnRef<'_>)> {
+    match input {
+        LogicalPlan::Projection(projection) if projection.expr.len() == 1 => {
+            let column = projected_column(&projection.expr[0])?;
+            let (scan, filters) = aggregate_scan_and_filters(projection.input.as_ref())?;
+            Some((
+                scan,
+                filters,
+                DistinctColumnRef::Named(column.name.as_str()),
+            ))
+        }
+        LogicalPlan::TableScan(scan) => {
+            let projection = scan.projection.as_ref()?;
+            let [column_index] = projection.as_slice() else {
+                return None;
+            };
+            Some((
+                scan,
+                dedup_filters(scan.filters.clone()),
+                DistinctColumnRef::ProjectedIndex(*column_index),
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn projected_column(expr: &Expr) -> Option<&Column> {
+    match expr {
+        Expr::Column(column) => Some(column),
+        Expr::Alias(alias) => match alias.expr.as_ref() {
+            Expr::Column(column) => Some(column),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+#[allow(deprecated)]
+fn native_i64_aggregate_requests(
+    aggregate: &datafusion::logical_expr::Aggregate,
+    provider: &CoveTableProvider,
+) -> Option<Vec<NativeI64AggregateRequest>> {
+    let mut requests = Vec::with_capacity(aggregate.aggr_expr.len());
+    for expr in &aggregate.aggr_expr {
+        let Expr::AggregateFunction(func) = expr else {
+            return None;
+        };
+        if func.params.distinct || func.params.filter.is_some() || !func.params.order_by.is_empty()
+        {
+            return None;
+        }
+        let kind = if func.func.name().eq_ignore_ascii_case("count") {
+            NativeI64AggregateKind::Count
+        } else if func.func.name().eq_ignore_ascii_case("sum") {
+            NativeI64AggregateKind::Sum
+        } else if func.func.name().eq_ignore_ascii_case("avg") {
+            NativeI64AggregateKind::Avg
+        } else if func.func.name().eq_ignore_ascii_case("min") {
+            NativeI64AggregateKind::Min
+        } else if func.func.name().eq_ignore_ascii_case("max") {
+            NativeI64AggregateKind::Max
+        } else {
+            return None;
+        };
+        let [arg] = func.params.args.as_slice() else {
+            return None;
+        };
+        let column = native_aggregate_column_arg(arg)?;
+        let column_index = provider
+            .state()
+            .table()
+            .columns
+            .iter()
+            .position(|candidate| candidate.name == column.name)?;
+        let cove_column = &provider.state().table().columns[column_index];
+        if cove_column.logical != CoveLogicalType::Int64
+            || cove_column.physical != CovePhysicalKind::NumCode
+        {
+            return None;
+        }
+        requests.push(NativeI64AggregateRequest { column_index, kind });
+    }
+    if requests.is_empty() {
+        None
+    } else {
+        Some(requests)
+    }
+}
+
+fn native_aggregate_column_arg(expr: &Expr) -> Option<&datafusion::common::Column> {
+    match expr {
+        Expr::Column(column) => Some(column),
+        Expr::Cast(cast) => native_aggregate_column_arg(cast.expr.as_ref()),
+        _ => None,
+    }
+}
+
 #[allow(deprecated)]
 fn synopsis_aggregate_request(
     expr: &Expr,
@@ -403,9 +2089,6 @@ fn record_batch_for_metadata_plan(
 }
 
 fn rewrite_topn_sort(sort: &datafusion::logical_expr::Sort) -> Result<Option<LogicalPlan>> {
-    let Some(fetch) = sort.fetch else {
-        return Ok(None);
-    };
     if sort.expr.len() != 1 {
         return Ok(None);
     }
@@ -425,6 +2108,14 @@ fn rewrite_topn_sort(sort: &datafusion::logical_expr::Sort) -> Result<Option<Log
         .iter()
         .position(|candidate| candidate.name == column.name)
     else {
+        return Ok(None);
+    };
+    if let Some(rewritten) =
+        rewrite_native_i64_order_sort(sort, scan, provider.as_ref(), column_index)?
+    {
+        return Ok(Some(rewritten));
+    }
+    let Some(fetch) = sort.fetch else {
         return Ok(None);
     };
     let hint = TopNScanHint {
@@ -448,6 +2139,62 @@ fn rewrite_topn_sort(sort: &datafusion::logical_expr::Sort) -> Result<Option<Log
         input: Arc::new(LogicalPlan::TableScan(rewritten_scan)),
         fetch: sort.fetch,
     })))
+}
+
+fn rewrite_native_i64_order_sort(
+    sort: &datafusion::logical_expr::Sort,
+    scan: &TableScan,
+    provider: &CoveTableProvider,
+    column_index: usize,
+) -> Result<Option<LogicalPlan>> {
+    if scan.fetch.is_some() || !scan_projects_only_column(scan, provider, column_index) {
+        return Ok(None);
+    }
+    let Some(cove_column) = provider.state().table().columns.get(column_index) else {
+        return Ok(None);
+    };
+    if cove_column.logical != CoveLogicalType::Int64
+        || cove_column.physical != CovePhysicalKind::NumCode
+    {
+        return Ok(None);
+    }
+    let schema: SchemaRef = Arc::new(sort.input.schema().as_arrow().clone());
+    if schema.fields().len() != 1 || schema.field(0).data_type() != &DataType::Int64 {
+        return Ok(None);
+    }
+    let filters = dedup_filters(scan.filters.clone());
+    let Some(filter_plan) = native_exact_filter_plan(provider, &filters)? else {
+        return Ok(None);
+    };
+    let table = CoveNativeI64OrderTableProvider::new(
+        Arc::clone(&schema),
+        Arc::clone(provider.state()),
+        column_index,
+        filter_plan,
+        !sort.expr[0].asc,
+        sort.expr[0].nulls_first,
+        sort.fetch,
+    );
+    let rewritten_scan = TableScan::try_new(
+        scan.table_name.clone(),
+        provider_as_source(Arc::new(table)),
+        None,
+        Vec::new(),
+        None,
+    )?;
+    Ok(Some(LogicalPlan::TableScan(rewritten_scan)))
+}
+
+fn scan_projects_only_column(
+    scan: &TableScan,
+    provider: &CoveTableProvider,
+    column_index: usize,
+) -> bool {
+    match scan.projection.as_deref() {
+        Some([projected]) => *projected == column_index,
+        Some(_) => false,
+        None => provider.state().table().columns.len() == 1 && column_index == 0,
+    }
 }
 
 fn cove_provider_from_scan(scan: &TableScan) -> Result<Option<Arc<CoveTableProvider>>> {

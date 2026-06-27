@@ -377,11 +377,23 @@ impl DatasetState {
         let mut plan = plan.clone();
         let mut stats = ExecutionCodePlanStats::default();
         for filter in &mut plan.filters {
-            let Some(CovePredicate::FileCodeIn {
-                file_codes,
-                canonical_keys,
-                ..
-            }) = filter.predicate.as_mut()
+            let Some((file_codes, canonical_keys)) =
+                filter
+                    .predicate
+                    .as_mut()
+                    .and_then(|predicate| match predicate {
+                        CovePredicate::FileCodeIn {
+                            file_codes,
+                            canonical_keys,
+                            ..
+                        }
+                        | CovePredicate::FileCodeNotIn {
+                            file_codes,
+                            canonical_keys,
+                            ..
+                        } => Some((file_codes, canonical_keys.as_slice())),
+                        _ => None,
+                    })
             else {
                 continue;
             };

@@ -1,12 +1,14 @@
 use std::{collections::BTreeSet, time::Instant};
 
 use cove_arrow::arrow::{
-    arrow_buffer_owner, encoded_columns_to_record_batch_with_owners_options, ArrowEncodedColumn,
-    ArrowExportOptions, ArrowRowSelection,
+    arrow_buffer_owner, encoded_columns_to_record_batch_with_owners_options, ArrowDictionaryPolicy,
+    ArrowEncodedColumn, ArrowExportOptions, ArrowRowSelection,
 };
 use cove_core::{
     array::EncodedArray,
     constants::{CoveEncodingKind, CovePhysicalKind},
+    dictionary::FileDictionary,
+    mount::{mount_cove_file, MountOptions, OutputRepresentation},
     page_payload::PageBufferKind,
     profile::cove_o::{
         read_retained_object_temporal_segments, RetainedTemporalPropertyPage,
@@ -82,11 +84,25 @@ pub(crate) fn try_execute_retained_zero_copy_arrow(
             )
         }
     };
+    let expected_dictionary_semantics =
+        match zero_copy_dictionary_semantics_for_projection(&retained.segments, physical) {
+            Ok(semantics) => semantics,
+            Err(reason) => return zero_copy_fallback_or_reject(planned, reason),
+        };
+    let file_dictionary =
+        if expected_dictionary_semantics == ZeroCopyDictionarySemanticsV2::FileCodeDictionary {
+            match zero_copy_file_dictionary(input.as_slice()) {
+                Ok(dictionary) => Some(dictionary),
+                Err(reason) => return zero_copy_fallback_or_reject(planned, reason),
+            }
+        } else {
+            None
+        };
     let authority = object_authority(&retained.segments);
     let compatibility = ZeroCopyCompatibilityContext {
         active_visibility_overlay: false,
         accepts_cove_null_bitmap_polarity: true,
-        expected_dictionary_semantics: ZeroCopyDictionarySemanticsV2::NoDictionary,
+        expected_dictionary_semantics,
         expected_nested_layout_kind: ZeroCopyNestedLayoutKindV2::NotNested,
         required_lifetime_scope: ZeroCopyLifetimeScopeV2::ReaderSession,
     };
@@ -102,18 +118,23 @@ pub(crate) fn try_execute_retained_zero_copy_arrow(
         );
     }
 
-    let batch =
-        match retained_object_projection_batch(&retained.segments, physical, options, started) {
-            Ok(batch) => batch,
-            Err(error) => {
-                if planned.resolved.operation_context.request.fallback_policy
-                    == FallbackPolicy::RejectOnFallback
-                {
-                    return Err(error);
-                }
-                return Ok(None);
+    let batch = match retained_object_projection_batch(
+        &retained.segments,
+        physical,
+        options,
+        started,
+        file_dictionary.as_ref(),
+    ) {
+        Ok(batch) => batch,
+        Err(error) => {
+            if planned.resolved.operation_context.request.fallback_policy
+                == FallbackPolicy::RejectOnFallback
+            {
+                return Err(error);
             }
-        };
+            return Ok(None);
+        }
+    };
     let row_count = batch.num_rows();
     let result = CoveQlExecutionResult::ArrowRecordBatches(vec![batch]);
     let row_counts = ExecutionRowCounts {
@@ -213,6 +234,7 @@ fn retained_object_projection_batch(
     physical: &PhysicalPlannedQuery,
     options: &ExecutionOptions,
     started: Instant,
+    file_dictionary: Option<&FileDictionary>,
 ) -> Result<arrow_array::RecordBatch, BuildExecutionError> {
     check_time(&options.resource_budget, started)?;
     let planned = &physical.planned;
@@ -282,26 +304,17 @@ fn retained_object_projection_batch(
                 json!({ "property_id": property_id }),
             )
         })?;
-        if root_node.encoding_kind != CoveEncodingKind::NumCode
-            || root_node.physical_kind != CovePhysicalKind::NumCode
-        {
+        if !zero_copy_supported_page(root_node.encoding_kind, root_node.physical_kind) {
             return Err(exec_error(
                 "E_ZERO_COPY_UNSUPPORTED",
-                "zero-copy v1 supports retained no-null NumCode property pages only",
+                "zero-copy v1 supports retained NumCode, boolean, fixed-byte, and FileCode property pages only",
                 json!({ "property_id": property_id }),
             ));
         }
-        if payload
+        let validity = payload
             .buffer_bytes(PageBufferKind::NullBitmap)
             .map_err(|error| zero_copy_page_error(property_id, error))?
-            .is_some()
-        {
-            return Err(exec_error(
-                "E_ZERO_COPY_UNSUPPORTED",
-                "zero-copy v1 supports no-null NumCode property pages only",
-                json!({ "property_id": property_id }),
-            ));
-        }
+            .map(|bytes| ValidityBitmap::new(bytes, u64::from(page.index_entry.row_count)));
         let values = payload
             .buffer_bytes(PageBufferKind::Values)
             .map_err(|error| zero_copy_page_error(property_id, error))?
@@ -312,7 +325,9 @@ fn retained_object_projection_batch(
                     json!({ "property_id": property_id }),
                 )
             })?;
-        if !(values.as_ptr() as usize).is_multiple_of(std::mem::align_of::<u64>()) {
+        if root_node.physical_kind == CovePhysicalKind::NumCode
+            && !(values.as_ptr() as usize).is_multiple_of(std::mem::align_of::<u64>())
+        {
             return Err(exec_error(
                 "E_ZERO_COPY_UNSUPPORTED",
                 "retained NumCode values buffer is not aligned for direct Arrow export",
@@ -324,9 +339,19 @@ fn retained_object_projection_batch(
             root_node.physical_kind,
             u64::from(page.index_entry.row_count),
             root_node.encoding_kind,
-            None::<ValidityBitmap<'_>>,
+            validity,
             values,
-            None,
+            if root_node.physical_kind == CovePhysicalKind::FileCode {
+                Some(file_dictionary.ok_or_else(|| {
+                    exec_error(
+                        "E_ZERO_COPY_UNSUPPORTED",
+                        "retained FileCode zero-copy Arrow output requires a mounted file dictionary",
+                        json!({ "property_id": property_id }),
+                    )
+                })?)
+            } else {
+                None
+            },
         );
         names.push(
             item.alias
@@ -347,10 +372,18 @@ fn retained_object_projection_batch(
             )
         })
         .collect::<Vec<_>>();
+    let arrow_options = if file_dictionary.is_some() {
+        ArrowExportOptions {
+            dictionary_policy: ArrowDictionaryPolicy::DictionaryKeys,
+            ..ArrowExportOptions::default()
+        }
+    } else {
+        ArrowExportOptions::default()
+    };
     let result = encoded_columns_to_record_batch_with_owners_options(
         &columns,
         ArrowRowSelection::All,
-        ArrowExportOptions::default(),
+        arrow_options,
     )
     .map_err(|error| {
         exec_error(
@@ -367,6 +400,100 @@ fn retained_object_projection_batch(
         ));
     }
     Ok(result.value)
+}
+
+fn zero_copy_dictionary_semantics_for_projection(
+    segments: &[RetainedTemporalSegmentData],
+    physical: &PhysicalPlannedQuery,
+) -> Result<ZeroCopyDictionarySemanticsV2, String> {
+    let planned = &physical.planned;
+    let ResolvedRoot::Object(root) = &planned.resolved.root else {
+        return Err("zero-copy object projection requires an object root".into());
+    };
+    let segment = single_matching_segment_for_reason(segments, root.object_type_id)?;
+    let select = planned
+        .resolved
+        .method_chain
+        .select
+        .as_ref()
+        .ok_or_else(|| "zero-copy v1 requires an explicit direct property select".to_string())?;
+    let mut selected_semantics = None;
+    for item in select {
+        let ResolvedExpr::Path(path) = &item.expr else {
+            return Err("zero-copy object projection supports direct path items only".into());
+        };
+        let property_id = path
+            .property_id
+            .ok_or_else(|| "zero-copy v1 does not support system fields".to_string())?;
+        let column = segment
+            .property_columns
+            .iter()
+            .find(|column| column.directory.column_id == property_id)
+            .ok_or_else(|| {
+                format!("selected property has no retained temporal property column: {property_id}")
+            })?;
+        let semantics = if column.directory.physical_kind == CovePhysicalKind::FileCode {
+            ZeroCopyDictionarySemanticsV2::FileCodeDictionary
+        } else {
+            ZeroCopyDictionarySemanticsV2::NoDictionary
+        };
+        if selected_semantics.is_some_and(|selected| selected != semantics) {
+            return Err("zero-copy v1 does not support mixed FileCode dictionary and non-dictionary projection columns".into());
+        }
+        selected_semantics = Some(semantics);
+    }
+    Ok(selected_semantics.unwrap_or(ZeroCopyDictionarySemanticsV2::NoDictionary))
+}
+
+fn zero_copy_file_dictionary(bytes: &[u8]) -> Result<FileDictionary, String> {
+    let mounted = mount_cove_file(
+        bytes,
+        MountOptions {
+            representation: OutputRepresentation::DecodeToValue,
+            verify_digests: false,
+            allow_unknown_optional_extensions: true,
+            covx: None,
+            covm: None,
+        },
+        None,
+    )
+    .map_err(|error| format!("retained FileCode zero-copy dictionary mount failed: {error}"))?;
+    mounted.dictionary.ok_or_else(|| {
+        "retained FileCode zero-copy Arrow output requires a file dictionary".to_string()
+    })
+}
+
+fn zero_copy_supported_page(
+    encoding_kind: CoveEncodingKind,
+    physical_kind: CovePhysicalKind,
+) -> bool {
+    matches!(
+        (encoding_kind, physical_kind),
+        (CoveEncodingKind::NumCode, CovePhysicalKind::NumCode)
+            | (CoveEncodingKind::PlainFixed, CovePhysicalKind::Boolean)
+            | (CoveEncodingKind::PlainFixed, CovePhysicalKind::FixedBytes)
+            | (CoveEncodingKind::FileCode, CovePhysicalKind::FileCode)
+    )
+}
+
+fn single_matching_segment_for_reason(
+    segments: &[RetainedTemporalSegmentData],
+    object_type_id: u32,
+) -> Result<&RetainedTemporalSegmentData, String> {
+    let mut matches = segments
+        .iter()
+        .filter(|segment| segment.header.object_type_id == object_type_id);
+    let Some(segment) = matches.next() else {
+        return Err(format!(
+            "zero-copy object projection found no retained segment for root object type: {object_type_id}"
+        ));
+    };
+    if matches.next().is_some() {
+        return Err(format!(
+            "zero-copy v1 supports exactly one retained segment for the root object type: {object_type_id}"
+        ));
+    }
+    Ok(segment)
 }
 
 fn single_matching_segment(

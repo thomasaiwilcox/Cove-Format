@@ -69,8 +69,16 @@ pub(super) struct SegmentMetadata {
 
 #[derive(Debug)]
 pub(super) struct PreparedSegmentColumn {
+    directory: TableColumnDirectoryEntryV1,
     page_index: ColumnPageIndex,
     page_positions_by_morsel: HashMap<u32, usize>,
+}
+
+impl PreparedSegmentColumn {
+    #[inline]
+    pub(super) fn directory(&self) -> &TableColumnDirectoryEntryV1 {
+        &self.directory
+    }
 }
 
 impl SegmentMetadata {
@@ -113,6 +121,7 @@ impl SegmentMetadata {
             }
             column_positions.push((directory.column_id, position));
             prepared_columns.push(PreparedSegmentColumn {
+                directory,
                 page_index,
                 page_positions_by_morsel,
             });

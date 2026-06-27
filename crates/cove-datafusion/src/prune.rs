@@ -516,6 +516,28 @@ fn filter_prunes_morsel(
                     == PredicateZoneOutcome::NoMatch,
             )
         }
+        CovePredicate::NumericIn {
+            column_index,
+            literals,
+        } => {
+            if literals.is_empty() {
+                return Ok(true);
+            }
+            let column = &state.table().columns[*column_index];
+            let zone = state.zone_stats_for(segment_id, morsel_id, column.column_id);
+            for literal in literals {
+                let (lower, lower_inclusive, upper, upper_inclusive) =
+                    numeric_bounds(NumericPredicateOp::Eq, *literal)?;
+                if explain_numcode_range(lower, lower_inclusive, upper, upper_inclusive, zone)
+                    .final_outcome
+                    != PredicateZoneOutcome::NoMatch
+                {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        CovePredicate::NumericNotIn { .. } => Ok(false),
         CovePredicate::FileCodeIn {
             column_index,
             file_codes,
@@ -553,7 +575,10 @@ fn filter_prunes_morsel(
             }
             Ok(true)
         }
-        CovePredicate::VarBytesEq { .. } => Ok(false),
+        CovePredicate::FileCodeNotIn { .. } => Ok(false),
+        CovePredicate::FixedBytesEq { .. } | CovePredicate::FixedBytesIn { .. } => Ok(false),
+        CovePredicate::VarBytesEq { .. } | CovePredicate::VarBytesIn { .. } => Ok(false),
+        CovePredicate::VarBytesPrefix { .. } => Ok(false),
     }
 }
 
@@ -831,8 +856,15 @@ fn predicate_column_index(predicate: &CovePredicate) -> Option<usize> {
     match predicate {
         CovePredicate::Null { column_index, .. }
         | CovePredicate::Numeric { column_index, .. }
+        | CovePredicate::NumericIn { column_index, .. }
+        | CovePredicate::NumericNotIn { column_index, .. }
         | CovePredicate::FileCodeIn { column_index, .. }
-        | CovePredicate::VarBytesEq { column_index, .. } => Some(*column_index),
+        | CovePredicate::FileCodeNotIn { column_index, .. }
+        | CovePredicate::FixedBytesEq { column_index, .. }
+        | CovePredicate::FixedBytesIn { column_index, .. }
+        | CovePredicate::VarBytesEq { column_index, .. }
+        | CovePredicate::VarBytesIn { column_index, .. }
+        | CovePredicate::VarBytesPrefix { column_index, .. } => Some(*column_index),
     }
 }
 

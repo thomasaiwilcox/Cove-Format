@@ -532,6 +532,24 @@ pub fn read_object_surface_from_bytes_with_pushdown_options(
     bytes: &[u8],
     options: &CoveObjectReadWithPushdownOptions,
 ) -> Result<CoveObjectReadResult, CoveError> {
+    let read = read_object_surfaces_from_bytes_with_pushdown_options(bytes, options, false)?;
+    Ok(CoveObjectReadResult {
+        surface: read.surface,
+        pushdown_report: read.pushdown_report,
+    })
+}
+
+struct CoveObjectSurfacesReadResult {
+    surface: CoveObjectSurface,
+    kernel_surface: Option<CoveObjectKernelSurface>,
+    pushdown_report: CoveObjectReadPushdownReport,
+}
+
+fn read_object_surfaces_from_bytes_with_pushdown_options(
+    bytes: &[u8],
+    options: &CoveObjectReadWithPushdownOptions,
+    build_kernel_surface: bool,
+) -> Result<CoveObjectSurfacesReadResult, CoveError> {
     let read_options = &options.read;
     let pushdown_options = &options.pushdown;
     let mut pushdown_report = CoveObjectReadPushdownReport {
@@ -641,6 +659,12 @@ pub fn read_object_surface_from_bytes_with_pushdown_options(
         .iter()
         .map(|ty| (ty.object_type_id, ty))
         .collect::<BTreeMap<_, _>>();
+    let projection_shape_lookup = projection_catalog
+        .as_ref()
+        .map(projection_nested_shape_lookup)
+        .transpose()?;
+    let mut kernel_builder =
+        build_kernel_surface.then(|| CoveObjectKernelSurfaceBuilder::new(catalog.types.clone()));
     let mut records = Vec::new();
     record_pushdown_fallbacks(pushdown_options, &mut pushdown_report);
     if read_options.include_records {
@@ -691,14 +715,13 @@ pub fn read_object_surface_from_bytes_with_pushdown_options(
                 read_options,
                 pushdown_options,
                 &mut pushdown_report,
+                projection_shape_lookup.as_ref(),
+                kernel_builder.as_mut(),
             )?);
-        }
-        if let Some(catalog) = &projection_catalog {
-            apply_projection_nested_shapes(&mut records, catalog)?;
         }
     }
 
-    Ok(CoveObjectReadResult {
+    Ok(CoveObjectSurfacesReadResult {
         surface: CoveObjectSurface {
             object_types: catalog.types,
             records,
@@ -707,6 +730,7 @@ pub fn read_object_surface_from_bytes_with_pushdown_options(
             embedded_function_ids,
             embedded_map_sections,
         },
+        kernel_surface: kernel_builder.map(CoveObjectKernelSurfaceBuilder::finish),
         pushdown_report,
     })
 }
@@ -715,8 +739,10 @@ pub fn read_object_kernel_surface_from_bytes_with_options(
     bytes: &[u8],
     options: &CoveObjectKernelReadOptions,
 ) -> Result<CoveObjectKernelReadResult, CoveError> {
-    let read = read_object_surface_from_bytes_with_pushdown_options(bytes, &options.read)?;
-    let kernel_surface = kernel_surface_from_materialized(&read.surface)?;
+    let read = read_object_surfaces_from_bytes_with_pushdown_options(bytes, &options.read, true)?;
+    let kernel_surface = read
+        .kernel_surface
+        .ok_or_else(|| CoveError::BadSchema("COVE-O kernel surface was not built".into()))?;
     Ok(CoveObjectKernelReadResult {
         kernel_surface,
         materialized_surface: read.surface,
@@ -724,75 +750,94 @@ pub fn read_object_kernel_surface_from_bytes_with_options(
     })
 }
 
-fn kernel_surface_from_materialized(
-    surface: &CoveObjectSurface,
-) -> Result<CoveObjectKernelSurface, CoveError> {
-    let mut system = CoveObjectKernelSystemLanes::default();
-    for record in &surface.records {
-        system.object_type_ids.push(record.object_type_id);
-        system.segment_ids.push(record.segment_id);
-        system.row_indices.push(record.row_index);
-        system.timestamp_us.push(record.timestamp_us);
-        system.csn.push(record.csn);
-        system.branch_keys.push(record.branch_key);
-        system.goids.push(record.goid);
-        system.record_ids.push(record.record_id);
-        system.record_kinds.push(record.record_kind);
-        system.prev_refs.push(record.prev_ref);
-    }
+#[derive(Debug)]
+struct CoveObjectKernelSurfaceBuilder {
+    object_types: Vec<ObjectTypeEntryV1>,
+    system: CoveObjectKernelSystemLanes,
+    property_lanes: BTreeMap<(u32, u32), CoveObjectKernelPropertyLaneBuilder>,
+}
 
-    let mut lane_keys =
-        BTreeMap::<(u32, u32), (String, CoveLogicalType, CovePhysicalKind, u32)>::new();
-    for record in &surface.records {
-        for property in &record.properties {
-            lane_keys
-                .entry((record.object_type_id, property.property_id))
-                .or_insert_with(|| {
-                    (
-                        property.property_name.clone(),
-                        property.logical_type,
-                        property.physical_kind,
-                        property.flags,
-                    )
-                });
+#[derive(Debug)]
+struct CoveObjectKernelPropertyLaneBuilder {
+    object_type_id: u32,
+    property_id: u32,
+    property_name: String,
+    logical_type: CoveLogicalType,
+    physical_kind: CovePhysicalKind,
+    flags: u32,
+    values: Vec<Value>,
+}
+
+impl CoveObjectKernelSurfaceBuilder {
+    fn new(object_types: Vec<ObjectTypeEntryV1>) -> Self {
+        Self {
+            object_types,
+            system: CoveObjectKernelSystemLanes::default(),
+            property_lanes: BTreeMap::new(),
         }
     }
 
-    let mut property_lanes = Vec::with_capacity(lane_keys.len());
-    for ((object_type_id, property_id), (property_name, logical_type, physical_kind, flags)) in
-        lane_keys
-    {
-        let values = surface
-            .records
-            .iter()
-            .map(|record| {
-                if record.object_type_id != object_type_id {
-                    return Value::Null;
-                }
-                record
-                    .properties
-                    .iter()
-                    .find(|property| property.property_id == property_id)
-                    .map(|property| property.value.clone())
-                    .unwrap_or(Value::Null)
-            })
-            .collect::<Vec<_>>();
-        property_lanes.push(CoveObjectKernelPropertyLane {
-            object_type_id,
-            property_id,
-            property_name,
-            logical_type,
-            physical_kind,
-            flags,
-            values: kernel_property_values(values),
-        });
+    fn push_record(
+        &mut self,
+        object_type: &ObjectTypeEntryV1,
+        segment_id: u32,
+        row_index: u32,
+        row: &crate::profile::cove_o::TemporalRowEntryV1,
+        properties: &[CoveObjectPropertyValue],
+    ) {
+        let row_slot = self.system.len();
+        self.system.object_type_ids.push(object_type.object_type_id);
+        self.system.segment_ids.push(segment_id);
+        self.system.row_indices.push(row_index);
+        self.system.timestamp_us.push(row.timestamp_us);
+        self.system.csn.push(row.csn);
+        self.system.branch_keys.push(row.branch_key);
+        self.system.goids.push(row.goid);
+        self.system.record_ids.push(row.record_id);
+        self.system.record_kinds.push(row.record_kind);
+        self.system.prev_refs.push(row.prev_ref);
+
+        for lane in self.property_lanes.values_mut() {
+            lane.values.push(Value::Null);
+        }
+
+        let surface_len = self.system.len();
+        for property in properties {
+            let lane = self
+                .property_lanes
+                .entry((object_type.object_type_id, property.property_id))
+                .or_insert_with(|| CoveObjectKernelPropertyLaneBuilder {
+                    object_type_id: object_type.object_type_id,
+                    property_id: property.property_id,
+                    property_name: property.property_name.clone(),
+                    logical_type: property.logical_type,
+                    physical_kind: property.physical_kind,
+                    flags: property.flags,
+                    values: vec![Value::Null; surface_len],
+                });
+            lane.values[row_slot] = property.value.clone();
+        }
     }
 
-    Ok(CoveObjectKernelSurface {
-        object_types: surface.object_types.clone(),
-        system,
-        property_lanes,
-    })
+    fn finish(self) -> CoveObjectKernelSurface {
+        CoveObjectKernelSurface {
+            object_types: self.object_types,
+            system: self.system,
+            property_lanes: self
+                .property_lanes
+                .into_values()
+                .map(|lane| CoveObjectKernelPropertyLane {
+                    object_type_id: lane.object_type_id,
+                    property_id: lane.property_id,
+                    property_name: lane.property_name,
+                    logical_type: lane.logical_type,
+                    physical_kind: lane.physical_kind,
+                    flags: lane.flags,
+                    values: kernel_property_values(lane.values),
+                })
+                .collect(),
+        }
+    }
 }
 
 fn kernel_property_values(values: Vec<Value>) -> CoveObjectKernelPropertyValues {
@@ -1039,6 +1084,8 @@ fn records_from_segment(
     options: &CoveObjectReadOptions,
     pushdown: &CoveObjectReadPushdownOptions,
     report: &mut CoveObjectReadPushdownReport,
+    projection_lookup: Option<&BTreeMap<(String, String), ProjectionNestedShape>>,
+    mut kernel_builder: Option<&mut CoveObjectKernelSurfaceBuilder>,
 ) -> Result<Vec<CoveObjectRecord>, CoveError> {
     report.rows_seen += segment.rows.len();
     report.property_columns_requested += property_columns_requested(segment, object_type, options)?;
@@ -1104,8 +1151,22 @@ fn records_from_segment(
             continue;
         }
         report.rows_candidates += 1;
-        let properties = std::mem::take(&mut values_by_row[row_index]);
+        let mut properties = std::mem::take(&mut values_by_row[row_index]);
+        apply_projection_nested_shapes_to_properties(
+            object_type,
+            &mut properties,
+            projection_lookup,
+        )?;
         let association = association_metadata(object_type, &properties);
+        if let Some(builder) = kernel_builder.as_deref_mut() {
+            builder.push_record(
+                object_type,
+                segment.header.segment_id,
+                row_index as u32,
+                row,
+                &properties,
+            );
+        }
         records.push(CoveObjectRecord {
             object_type_id: object_type.object_type_id,
             object_type_name: object_type.type_name.clone(),
@@ -1317,28 +1378,6 @@ struct ProjectionNestedField {
     shape: ProjectionNestedShape,
 }
 
-fn apply_projection_nested_shapes(
-    records: &mut [CoveObjectRecord],
-    catalog: &MapProjectionCatalog,
-) -> Result<(), CoveError> {
-    let lookup = projection_nested_shape_lookup(catalog)?;
-    if lookup.is_empty() {
-        return Ok(());
-    }
-    for record in records {
-        for property in &mut record.properties {
-            let Some(shape) = lookup.get(&(
-                record.object_type_name.clone(),
-                property.property_name.clone(),
-            )) else {
-                continue;
-            };
-            property.value = restore_nested_projection_value(&property.value, shape)?;
-        }
-    }
-    Ok(())
-}
-
 fn projection_nested_shape_lookup(
     catalog: &MapProjectionCatalog,
 ) -> Result<BTreeMap<(String, String), ProjectionNestedShape>, CoveError> {
@@ -1357,6 +1396,29 @@ fn projection_nested_shape_lookup(
         }
     }
     Ok(lookup)
+}
+
+fn apply_projection_nested_shapes_to_properties(
+    object_type: &ObjectTypeEntryV1,
+    properties: &mut [CoveObjectPropertyValue],
+    lookup: Option<&BTreeMap<(String, String), ProjectionNestedShape>>,
+) -> Result<(), CoveError> {
+    let Some(lookup) = lookup else {
+        return Ok(());
+    };
+    if lookup.is_empty() {
+        return Ok(());
+    }
+    for property in properties {
+        let Some(shape) = lookup.get(&(
+            object_type.type_name.clone(),
+            property.property_name.clone(),
+        )) else {
+            continue;
+        };
+        property.value = restore_nested_projection_value(&property.value, shape)?;
+    }
+    Ok(())
 }
 
 fn parse_projection_nested_shape(
@@ -2538,6 +2600,66 @@ mod tests {
         assert_eq!(
             decoded.value,
             json!({"policy": "redacted", "status": "redacted"})
+        );
+    }
+
+    #[test]
+    fn kernel_surface_builder_backfills_property_lanes_without_record_walk() {
+        let object_type = ObjectTypeEntryV1 {
+            object_type_id: 7,
+            flags: 0,
+            type_name: "Person".into(),
+            properties: Vec::new(),
+        };
+        let mut builder = CoveObjectKernelSurfaceBuilder::new(vec![object_type.clone()]);
+        let first = crate::profile::cove_o::TemporalRowEntryV1 {
+            timestamp_us: 10,
+            csn: 10,
+            branch_key: 1,
+            goid: [1; 16],
+            record_id: [11; 16],
+            record_kind: RecordKind::Baseline,
+            prev_ref: None,
+        };
+        let second = crate::profile::cove_o::TemporalRowEntryV1 {
+            timestamp_us: 20,
+            csn: 20,
+            branch_key: 1,
+            goid: [2; 16],
+            record_id: [22; 16],
+            record_kind: RecordKind::Delta,
+            prev_ref: None,
+        };
+
+        builder.push_record(
+            &object_type,
+            3,
+            0,
+            &first,
+            &[property(1, "name", json!("Ada"))],
+        );
+        builder.push_record(
+            &object_type,
+            3,
+            1,
+            &second,
+            &[property(2, "city", json!("London"))],
+        );
+
+        let surface = builder.finish();
+        assert_eq!(surface.system.len(), 2);
+        assert_eq!(surface.system.segment_ids, vec![3, 3]);
+        assert_eq!(surface.system.row_indices, vec![0, 1]);
+        assert_eq!(surface.property_lanes.len(), 2);
+        assert_eq!(surface.property_lanes[0].property_id, 1);
+        assert_eq!(surface.property_lanes[1].property_id, 2);
+        assert_eq!(
+            surface.property_lanes[0].values,
+            CoveObjectKernelPropertyValues::String(vec![Some("Ada".into()), None])
+        );
+        assert_eq!(
+            surface.property_lanes[1].values,
+            CoveObjectKernelPropertyValues::String(vec![None, Some("London".into())])
         );
     }
 

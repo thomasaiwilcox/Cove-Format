@@ -67,8 +67,8 @@ pub(super) fn record_batch_for_selection(
         Selection::AllRows { .. } => ArrowRowSelection::All,
         Selection::RowIndices(rows) => ArrowRowSelection::Rows(rows),
         Selection::Bitset(mask) => ArrowRowSelection::Bitset {
-            words: &mask.words,
-            len: mask.len,
+            words: mask.words(),
+            len: mask.len(),
         },
     };
     let mut arrays = Vec::with_capacity(columns.len());
@@ -333,9 +333,7 @@ fn record_zero_copy_decision(
     options: ArrowExportOptions,
     direct_owner_used: bool,
 ) {
-    if options.varbytes_policy != ArrowVarBytesExportPolicy::View
-        || !zero_copy_direct_export_path(export_path)
-    {
+    if !zero_copy_export_path_eligible(export_path, options) {
         return;
     }
     let Some(decision) = decision else {
@@ -388,9 +386,8 @@ fn zero_copy_data_owner_for_export<'a>(
     export_path: ArrowExportPath,
     options: ArrowExportOptions,
 ) -> Option<&'a ArrowBufferOwner> {
-    if options.varbytes_policy != ArrowVarBytesExportPolicy::View
-        || !matches!(selection, Selection::AllRows { .. })
-        || !zero_copy_direct_export_path(export_path)
+    if !matches!(selection, Selection::AllRows { .. })
+        || !zero_copy_export_path_eligible(export_path, options)
         || !matches!(column.zero_copy, Some(ZeroCopyCompatibilityV2::Compatible))
     {
         return None;
@@ -399,7 +396,18 @@ fn zero_copy_data_owner_for_export<'a>(
 }
 
 fn zero_copy_direct_export_path(path: ArrowExportPath) -> bool {
-    matches!(path, ArrowExportPath::DirectVarBytes)
+    matches!(
+        path,
+        ArrowExportPath::DirectVarBytes
+            | ArrowExportPath::DirectNumCode
+            | ArrowExportPath::DirectPlainFixed
+    )
+}
+
+fn zero_copy_export_path_eligible(path: ArrowExportPath, options: ArrowExportOptions) -> bool {
+    zero_copy_direct_export_path(path)
+        && (!matches!(path, ArrowExportPath::DirectVarBytes)
+            || options.varbytes_policy == ArrowVarBytesExportPolicy::View)
 }
 
 pub(super) fn materialize_page_payload(

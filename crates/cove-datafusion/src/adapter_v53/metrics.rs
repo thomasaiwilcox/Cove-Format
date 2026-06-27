@@ -91,6 +91,54 @@ pub(crate) struct CoveFileMetrics {
     pub(crate) range_plan_mixed: Count,
     pub(crate) range_plan_dense: Count,
     pub(crate) kernel_fallbacks: Count,
+    pub(crate) native_bitmap_intersections: Count,
+    pub(crate) native_bitmap_intersection_scalar: Count,
+    pub(crate) native_bitmap_intersection_avx2: Count,
+    pub(crate) native_bitmap_intersection_neon: Count,
+    pub(crate) native_table_batches: Count,
+    pub(crate) native_table_pages: Count,
+    pub(crate) native_table_decode_boundaries: Count,
+    pub(crate) native_lane_predicates: Count,
+    pub(crate) native_lane_predicate_rows_seen: Count,
+    pub(crate) native_lane_predicate_rows_matched: Count,
+    pub(crate) native_lane_predicate_bytes_touched: Count,
+    pub(crate) native_lane_predicate_dispatch_scalar: Count,
+    pub(crate) native_lane_predicate_dispatch_avx2: Count,
+    pub(crate) native_lane_predicate_dispatch_neon: Count,
+    pub(crate) native_aggregate_kernels: Count,
+    pub(crate) native_aggregate_rows_seen: Count,
+    pub(crate) native_aggregate_rows_matched: Count,
+    pub(crate) native_aggregate_bytes_touched: Count,
+    pub(crate) native_aggregate_dispatch_scalar: Count,
+    pub(crate) native_aggregate_dispatch_avx2: Count,
+    pub(crate) native_aggregate_dispatch_neon: Count,
+    pub(crate) native_group_kernels: Count,
+    pub(crate) native_group_rows_seen: Count,
+    pub(crate) native_group_rows_matched: Count,
+    pub(crate) native_group_bytes_touched: Count,
+    pub(crate) native_group_dispatch_scalar: Count,
+    pub(crate) native_group_dispatch_avx2: Count,
+    pub(crate) native_group_dispatch_neon: Count,
+    pub(crate) native_count_scans: Count,
+    pub(crate) native_count_rows_seen: Count,
+    pub(crate) native_count_rows_matched: Count,
+    pub(crate) native_sort_kernels: Count,
+    pub(crate) native_sort_rows_seen: Count,
+    pub(crate) native_sort_rows_matched: Count,
+    pub(crate) native_sort_bytes_touched: Count,
+    pub(crate) native_sort_dispatch_scalar: Count,
+    pub(crate) native_sort_dispatch_avx2: Count,
+    pub(crate) native_sort_dispatch_neon: Count,
+    pub(crate) native_join_kernels: Count,
+    pub(crate) native_join_rows_seen: Count,
+    pub(crate) native_join_rows_matched: Count,
+    pub(crate) native_join_bytes_touched: Count,
+    pub(crate) native_join_dispatch_scalar: Count,
+    pub(crate) native_join_dispatch_avx2: Count,
+    pub(crate) native_join_dispatch_neon: Count,
+    pub(crate) native_projection_batches: Count,
+    pub(crate) native_projection_pages: Count,
+    pub(crate) native_projection_decode_boundaries: Count,
     pub(crate) arrow_export_direct_varbytes_rows: Count,
     pub(crate) arrow_export_direct_varbytes_bytes: Count,
     pub(crate) arrow_export_direct_numcode_rows: Count,
@@ -250,6 +298,102 @@ impl CoveFileMetrics {
                 .counter("cove_range_plan_dense", partition),
             kernel_fallbacks: MetricBuilder::new(metrics)
                 .counter("cove_kernel_fallbacks", partition),
+            native_bitmap_intersections: MetricBuilder::new(metrics)
+                .counter("cove_native_bitmap_intersections", partition),
+            native_bitmap_intersection_scalar: MetricBuilder::new(metrics)
+                .counter("cove_native_bitmap_intersection_scalar", partition),
+            native_bitmap_intersection_avx2: MetricBuilder::new(metrics)
+                .counter("cove_native_bitmap_intersection_avx2", partition),
+            native_bitmap_intersection_neon: MetricBuilder::new(metrics)
+                .counter("cove_native_bitmap_intersection_neon", partition),
+            native_table_batches: MetricBuilder::new(metrics)
+                .counter("cove_native_table_batches", partition),
+            native_table_pages: MetricBuilder::new(metrics)
+                .counter("cove_native_table_pages", partition),
+            native_table_decode_boundaries: MetricBuilder::new(metrics)
+                .counter("cove_native_table_decode_boundaries", partition),
+            native_lane_predicates: MetricBuilder::new(metrics)
+                .counter("cove_native_lane_predicates", partition),
+            native_lane_predicate_rows_seen: MetricBuilder::new(metrics)
+                .counter("cove_native_lane_predicate_rows_seen", partition),
+            native_lane_predicate_rows_matched: MetricBuilder::new(metrics)
+                .counter("cove_native_lane_predicate_rows_matched", partition),
+            native_lane_predicate_bytes_touched: MetricBuilder::new(metrics)
+                .counter("cove_native_lane_predicate_bytes_touched", partition),
+            native_lane_predicate_dispatch_scalar: MetricBuilder::new(metrics)
+                .counter("cove_native_lane_predicate_dispatch_scalar", partition),
+            native_lane_predicate_dispatch_avx2: MetricBuilder::new(metrics)
+                .counter("cove_native_lane_predicate_dispatch_avx2", partition),
+            native_lane_predicate_dispatch_neon: MetricBuilder::new(metrics)
+                .counter("cove_native_lane_predicate_dispatch_neon", partition),
+            native_aggregate_kernels: MetricBuilder::new(metrics)
+                .counter("cove_native_aggregate_kernels", partition),
+            native_aggregate_rows_seen: MetricBuilder::new(metrics)
+                .counter("cove_native_aggregate_rows_seen", partition),
+            native_aggregate_rows_matched: MetricBuilder::new(metrics)
+                .counter("cove_native_aggregate_rows_matched", partition),
+            native_aggregate_bytes_touched: MetricBuilder::new(metrics)
+                .counter("cove_native_aggregate_bytes_touched", partition),
+            native_aggregate_dispatch_scalar: MetricBuilder::new(metrics)
+                .counter("cove_native_aggregate_dispatch_scalar", partition),
+            native_aggregate_dispatch_avx2: MetricBuilder::new(metrics)
+                .counter("cove_native_aggregate_dispatch_avx2", partition),
+            native_aggregate_dispatch_neon: MetricBuilder::new(metrics)
+                .counter("cove_native_aggregate_dispatch_neon", partition),
+            native_group_kernels: MetricBuilder::new(metrics)
+                .counter("cove_native_group_kernels", partition),
+            native_group_rows_seen: MetricBuilder::new(metrics)
+                .counter("cove_native_group_rows_seen", partition),
+            native_group_rows_matched: MetricBuilder::new(metrics)
+                .counter("cove_native_group_rows_matched", partition),
+            native_group_bytes_touched: MetricBuilder::new(metrics)
+                .counter("cove_native_group_bytes_touched", partition),
+            native_group_dispatch_scalar: MetricBuilder::new(metrics)
+                .counter("cove_native_group_dispatch_scalar", partition),
+            native_group_dispatch_avx2: MetricBuilder::new(metrics)
+                .counter("cove_native_group_dispatch_avx2", partition),
+            native_group_dispatch_neon: MetricBuilder::new(metrics)
+                .counter("cove_native_group_dispatch_neon", partition),
+            native_count_scans: MetricBuilder::new(metrics)
+                .counter("cove_native_count_scans", partition),
+            native_count_rows_seen: MetricBuilder::new(metrics)
+                .counter("cove_native_count_rows_seen", partition),
+            native_count_rows_matched: MetricBuilder::new(metrics)
+                .counter("cove_native_count_rows_matched", partition),
+            native_sort_kernels: MetricBuilder::new(metrics)
+                .counter("cove_native_sort_kernels", partition),
+            native_sort_rows_seen: MetricBuilder::new(metrics)
+                .counter("cove_native_sort_rows_seen", partition),
+            native_sort_rows_matched: MetricBuilder::new(metrics)
+                .counter("cove_native_sort_rows_matched", partition),
+            native_sort_bytes_touched: MetricBuilder::new(metrics)
+                .counter("cove_native_sort_bytes_touched", partition),
+            native_sort_dispatch_scalar: MetricBuilder::new(metrics)
+                .counter("cove_native_sort_dispatch_scalar", partition),
+            native_sort_dispatch_avx2: MetricBuilder::new(metrics)
+                .counter("cove_native_sort_dispatch_avx2", partition),
+            native_sort_dispatch_neon: MetricBuilder::new(metrics)
+                .counter("cove_native_sort_dispatch_neon", partition),
+            native_join_kernels: MetricBuilder::new(metrics)
+                .counter("cove_native_join_kernels", partition),
+            native_join_rows_seen: MetricBuilder::new(metrics)
+                .counter("cove_native_join_rows_seen", partition),
+            native_join_rows_matched: MetricBuilder::new(metrics)
+                .counter("cove_native_join_rows_matched", partition),
+            native_join_bytes_touched: MetricBuilder::new(metrics)
+                .counter("cove_native_join_bytes_touched", partition),
+            native_join_dispatch_scalar: MetricBuilder::new(metrics)
+                .counter("cove_native_join_dispatch_scalar", partition),
+            native_join_dispatch_avx2: MetricBuilder::new(metrics)
+                .counter("cove_native_join_dispatch_avx2", partition),
+            native_join_dispatch_neon: MetricBuilder::new(metrics)
+                .counter("cove_native_join_dispatch_neon", partition),
+            native_projection_batches: MetricBuilder::new(metrics)
+                .counter("cove_native_projection_batches", partition),
+            native_projection_pages: MetricBuilder::new(metrics)
+                .counter("cove_native_projection_pages", partition),
+            native_projection_decode_boundaries: MetricBuilder::new(metrics)
+                .counter("cove_native_projection_decode_boundaries", partition),
             arrow_export_direct_varbytes_rows: MetricBuilder::new(metrics)
                 .counter("cove_arrow_export_direct_varbytes_rows", partition),
             arrow_export_direct_varbytes_bytes: MetricBuilder::new(metrics)
@@ -385,6 +529,94 @@ impl CoveFileMetrics {
         self.range_plan_mixed.add(stats.range_plan_mixed);
         self.range_plan_dense.add(stats.range_plan_dense);
         self.kernel_fallbacks.add(stats.kernel_fallbacks);
+        self.native_bitmap_intersections
+            .add(stats.native_bitmap_intersections);
+        self.native_bitmap_intersection_scalar
+            .add(stats.native_bitmap_intersection_scalar);
+        self.native_bitmap_intersection_avx2
+            .add(stats.native_bitmap_intersection_avx2);
+        self.native_bitmap_intersection_neon
+            .add(stats.native_bitmap_intersection_neon);
+        self.native_table_batches.add(stats.native_table_batches);
+        self.native_table_pages.add(stats.native_table_pages);
+        self.native_table_decode_boundaries
+            .add(stats.native_table_decode_boundaries);
+        self.native_lane_predicates
+            .add(stats.native_lane_predicates);
+        self.native_lane_predicate_rows_seen
+            .add(stats.native_lane_predicate_rows_seen);
+        self.native_lane_predicate_rows_matched
+            .add(stats.native_lane_predicate_rows_matched);
+        self.native_lane_predicate_bytes_touched
+            .add(stats.native_lane_predicate_bytes_touched);
+        self.native_lane_predicate_dispatch_scalar
+            .add(stats.native_lane_predicate_dispatch_scalar);
+        self.native_lane_predicate_dispatch_avx2
+            .add(stats.native_lane_predicate_dispatch_avx2);
+        self.native_lane_predicate_dispatch_neon
+            .add(stats.native_lane_predicate_dispatch_neon);
+        self.native_aggregate_kernels
+            .add(stats.native_aggregate_kernels);
+        self.native_aggregate_rows_seen
+            .add(stats.native_aggregate_rows_seen);
+        self.native_aggregate_rows_matched
+            .add(stats.native_aggregate_rows_matched);
+        self.native_aggregate_bytes_touched
+            .add(stats.native_aggregate_bytes_touched);
+        self.native_aggregate_dispatch_scalar
+            .add(stats.native_aggregate_dispatch_scalar);
+        self.native_aggregate_dispatch_avx2
+            .add(stats.native_aggregate_dispatch_avx2);
+        self.native_aggregate_dispatch_neon
+            .add(stats.native_aggregate_dispatch_neon);
+        self.native_group_kernels.add(stats.native_group_kernels);
+        self.native_group_rows_seen
+            .add(stats.native_group_rows_seen);
+        self.native_group_rows_matched
+            .add(stats.native_group_rows_matched);
+        self.native_group_bytes_touched
+            .add(stats.native_group_bytes_touched);
+        self.native_group_dispatch_scalar
+            .add(stats.native_group_dispatch_scalar);
+        self.native_group_dispatch_avx2
+            .add(stats.native_group_dispatch_avx2);
+        self.native_group_dispatch_neon
+            .add(stats.native_group_dispatch_neon);
+        self.native_count_scans.add(stats.native_count_scans);
+        self.native_count_rows_seen
+            .add(stats.native_count_rows_seen);
+        self.native_count_rows_matched
+            .add(stats.native_count_rows_matched);
+        self.native_sort_kernels.add(stats.native_sort_kernels);
+        self.native_sort_rows_seen.add(stats.native_sort_rows_seen);
+        self.native_sort_rows_matched
+            .add(stats.native_sort_rows_matched);
+        self.native_sort_bytes_touched
+            .add(stats.native_sort_bytes_touched);
+        self.native_sort_dispatch_scalar
+            .add(stats.native_sort_dispatch_scalar);
+        self.native_sort_dispatch_avx2
+            .add(stats.native_sort_dispatch_avx2);
+        self.native_sort_dispatch_neon
+            .add(stats.native_sort_dispatch_neon);
+        self.native_join_kernels.add(stats.native_join_kernels);
+        self.native_join_rows_seen.add(stats.native_join_rows_seen);
+        self.native_join_rows_matched
+            .add(stats.native_join_rows_matched);
+        self.native_join_bytes_touched
+            .add(stats.native_join_bytes_touched);
+        self.native_join_dispatch_scalar
+            .add(stats.native_join_dispatch_scalar);
+        self.native_join_dispatch_avx2
+            .add(stats.native_join_dispatch_avx2);
+        self.native_join_dispatch_neon
+            .add(stats.native_join_dispatch_neon);
+        self.native_projection_batches
+            .add(stats.native_projection_batches);
+        self.native_projection_pages
+            .add(stats.native_projection_pages);
+        self.native_projection_decode_boundaries
+            .add(stats.native_projection_decode_boundaries);
         self.arrow_export_direct_varbytes_rows
             .add(stats.arrow_export_direct_varbytes_rows);
         self.arrow_export_direct_varbytes_bytes

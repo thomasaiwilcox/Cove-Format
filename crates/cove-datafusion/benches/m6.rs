@@ -1,6 +1,7 @@
 #![allow(unused_imports)]
 
 use std::{
+    collections::HashMap,
     env, fs,
     io::{self, BufRead, Write},
     path::{Path, PathBuf},
@@ -36,6 +37,10 @@ use cove_core::{
         FileDictionaryKey,
     },
     domain::ColumnDomain,
+    encoding::{
+        bit_packed::BitPackedPayload,
+        local_codebook::{LocalCodebookPayload, LocalCodebookValues, LocalIndexPayload},
+    },
     index::{
         lookup::{
             LookupEntry, LookupIndex, LookupIndexHeaderV1, LookupIndexKind, LookupKeyKind,
@@ -54,7 +59,14 @@ use cove_datafusion::register::register_cove_covm;
 use cove_datafusion::{
     bootstrap::{bootstrap_bytes, bootstrap_local_file},
     dataset_state::DatasetState,
-    decode::{decode_scan, DecodeStats},
+    decode::{
+        decode_scan, native_bool_group_count_scan, native_bool_i64_group_aggregate_scan,
+        native_filecode_group_count_scan, native_filecode_i64_group_aggregate_scan,
+        native_filecode_values_scan, native_i64_aggregate_scan, native_i64_group_count_scan,
+        native_i64_i64_group_aggregate_scan, native_i64_order_scan, native_i64_values_scan,
+        native_row_count_scan, native_unfiltered_i64_aggregate_scan,
+        native_unfiltered_i64_group_count_scan, DecodeStats,
+    },
     metadata_aggregate::exact_unfiltered_counts,
     options::CoveTableOptions,
     overlay::{CoveOverlaySnapshot, OverlayFile, OverlayFileIdentity, RowRange, RowVisibility},
@@ -100,6 +112,23 @@ fn bench_m6_native(c: &mut Criterion) {
         .expect("scan fixture should bootstrap");
     let filecode_state = bootstrap_bytes("m6-filecode.cove", dictionary_items_file_with_domain())
         .expect("FileCode fixture should bootstrap");
+    let swapped_filecode_state = bootstrap_bytes(
+        "m6-filecode-swapped.cove",
+        dictionary_items_file_with_domain_dictionary(swapped_dictionary()),
+    )
+    .expect("swapped FileCode fixture should bootstrap");
+    let scored_filecode_state = bootstrap_bytes(
+        "m6-scored-filecode.cove",
+        scored_dictionary_items_file([10, 20]),
+    )
+    .expect("scored FileCode fixture should bootstrap");
+    let local_scored_filecode_state = bootstrap_bytes(
+        "m6-local-scored-filecode.cove",
+        local_codebook_scored_dictionary_items_file(),
+    )
+    .expect("local-codebook scored FileCode fixture should bootstrap");
+    let numeric_scores_state = bootstrap_bytes("m6-numeric-scores.cove", numeric_scores_file())
+        .expect("numeric score fixture should bootstrap");
     let lookup_state = bootstrap_bytes("m6-lookup.cove", numeric_lookup_events_file())
         .expect("lookup fixture should bootstrap");
     let wide_state =
@@ -108,6 +137,44 @@ fn bench_m6_native(c: &mut Criterion) {
         bootstrap_bytes("m6-topn.cove", topn_events_file()).expect("TopN fixture should bootstrap");
     let overlay_fixture = OverlayFixture::new();
     let runtime = Runtime::new().expect("benchmark runtime");
+    let empty_projection = Vec::new();
+    let filtered_i64_plan = plan_scan(
+        &scan_state,
+        Some(&empty_projection),
+        vec![FilterPlan::pruning_numeric(
+            0,
+            NumericPredicateOp::GtEq,
+            PredicateLiteral::Int64(2),
+            "id >= 2",
+        )],
+    )
+    .expect("filtered native aggregate scan plan");
+    let empty_scan_plan = plan_scan(&scan_state, Some(&empty_projection), Vec::new())
+        .expect("native empty scan plan");
+    let filecode_empty_plan = plan_scan(&filecode_state, Some(&empty_projection), Vec::new())
+        .expect("native FileCode empty scan plan");
+    let swapped_filecode_empty_plan =
+        plan_scan(&swapped_filecode_state, Some(&empty_projection), Vec::new())
+            .expect("native swapped FileCode empty scan plan");
+    let scored_filecode_empty_plan =
+        plan_scan(&scored_filecode_state, Some(&empty_projection), Vec::new())
+            .expect("native scored FileCode empty scan plan");
+    let local_scored_filecode_empty_plan = plan_scan(
+        &local_scored_filecode_state,
+        Some(&empty_projection),
+        Vec::new(),
+    )
+    .expect("native local scored FileCode empty scan plan");
+    let numeric_scores_plan = plan_scan(&numeric_scores_state, Some(&empty_projection), Vec::new())
+        .expect("native numeric score scan plan");
+    let filtered_filecode_plan = plan_scan(
+        &filecode_state,
+        Some(&empty_projection),
+        vec![FilterPlan::pruning_file_code_in(0, vec![0], "name = 'red'")],
+    )
+    .expect("filtered native FileCode scan plan");
+    let native_order_plan = plan_scan(&topn_state, Some(&empty_projection), Vec::new())
+        .expect("native i64 order scan plan");
 
     c.bench_function("m6_full_scan", |b| {
         b.iter(|| {
@@ -139,6 +206,221 @@ fn bench_m6_native(c: &mut Criterion) {
         })
     });
 
+    c.bench_function("m6_filecode_not_in_filter", |b| {
+        b.iter(|| {
+            let decoded = decode_planned(
+                &filecode_state,
+                Some(vec![1]),
+                vec![FilterPlan::pruning_file_code_not_in_with_canonical_keys(
+                    0,
+                    vec![0],
+                    Vec::new(),
+                    Vec::new(),
+                    "name NOT IN ('red')",
+                )],
+            );
+            assert_rows(&decoded.stats, 1, 1);
+            assert_eq!(decoded.stats.residual_predicates, 0);
+            assert!(decoded.stats.native_lane_predicates >= 1);
+            black_box(m6_metrics(decoded.stats))
+        })
+    });
+
+    c.bench_function("m6_native_filecode_group_count", |b| {
+        b.iter(|| {
+            let scanned =
+                native_filecode_group_count_scan(&filecode_state, 0, &filecode_empty_plan)
+                    .expect("native FileCode group count scan");
+            assert_eq!(scanned.groups.rows_grouped, 2);
+            assert_eq!(scanned.groups.counts.len(), 2);
+            assert_eq!(scanned.stats.rows_materialized, 0);
+            assert!(scanned.stats.native_group_kernels >= 1);
+            black_box(m6_metrics(scanned.stats))
+        })
+    });
+
+    c.bench_function("m6_filtered_native_filecode_group_count", |b| {
+        b.iter(|| {
+            let scanned =
+                native_filecode_group_count_scan(&filecode_state, 0, &filtered_filecode_plan)
+                    .expect("filtered native FileCode group count scan");
+            assert_eq!(scanned.groups.rows_grouped, 1);
+            assert_eq!(scanned.groups.counts.len(), 1);
+            assert_eq!(scanned.stats.rows_materialized, 0);
+            assert!(scanned.stats.native_lane_predicates >= 1);
+            assert!(scanned.stats.native_group_kernels >= 1);
+            black_box(m6_metrics(scanned.stats))
+        })
+    });
+
+    c.bench_function("m6_filtered_native_filecode_distinct_group", |b| {
+        b.iter(|| {
+            let scanned =
+                native_filecode_group_count_scan(&filecode_state, 0, &filtered_filecode_plan)
+                    .expect("filtered native FileCode distinct group scan");
+            assert_eq!(scanned.groups.counts.len(), 1);
+            assert_eq!(scanned.groups.null_count, 0);
+            assert_eq!(scanned.stats.rows_materialized, 0);
+            assert!(scanned.stats.native_lane_predicates >= 1);
+            assert!(scanned.stats.native_group_kernels >= 1);
+            black_box(m6_metrics(scanned.stats))
+        })
+    });
+
+    let red_key = canonical_utf8("red");
+    let blue_key = canonical_utf8("blue");
+
+    c.bench_function("m6_native_filecode_i64_group_aggregate", |b| {
+        b.iter(|| {
+            let scanned = native_filecode_i64_group_aggregate_scan(
+                &scored_filecode_state,
+                0,
+                1,
+                &scored_filecode_empty_plan,
+            )
+            .expect("native FileCode/i64 group aggregate scan");
+            assert_eq!(scanned.groups.groups.len(), 2);
+            assert_eq!(
+                scanned
+                    .groups
+                    .groups
+                    .get(red_key.as_slice())
+                    .unwrap()
+                    .aggregate
+                    .sum,
+                10
+            );
+            assert_eq!(
+                scanned
+                    .groups
+                    .groups
+                    .get(blue_key.as_slice())
+                    .unwrap()
+                    .aggregate
+                    .sum,
+                20
+            );
+            assert_eq!(scanned.stats.rows_materialized, 0);
+            assert!(scanned.stats.native_aggregate_kernels >= 1);
+            black_box(m6_metrics(scanned.stats))
+        })
+    });
+
+    c.bench_function("m6_native_local_filecode_i64_group_aggregate", |b| {
+        b.iter(|| {
+            let scanned = native_filecode_i64_group_aggregate_scan(
+                &local_scored_filecode_state,
+                0,
+                1,
+                &local_scored_filecode_empty_plan,
+            )
+            .expect("native local-codebook FileCode/i64 group aggregate scan");
+            assert_eq!(scanned.groups.groups.len(), 2);
+            assert_eq!(
+                scanned
+                    .groups
+                    .groups
+                    .get(red_key.as_slice())
+                    .unwrap()
+                    .aggregate
+                    .sum,
+                40
+            );
+            assert_eq!(
+                scanned
+                    .groups
+                    .groups
+                    .get(blue_key.as_slice())
+                    .unwrap()
+                    .aggregate
+                    .sum,
+                60
+            );
+            assert_eq!(scanned.stats.rows_materialized, 0);
+            assert!(scanned.stats.native_aggregate_kernels >= 1);
+            black_box(m6_metrics(scanned.stats))
+        })
+    });
+
+    c.bench_function("m6_native_i64_i64_group_aggregate", |b| {
+        b.iter(|| {
+            let scanned = native_i64_i64_group_aggregate_scan(
+                &numeric_scores_state,
+                0,
+                1,
+                &numeric_scores_plan,
+            )
+            .expect("native i64/i64 group aggregate scan");
+            assert_eq!(scanned.groups.aggregates.len(), 2);
+            assert_eq!(scanned.groups.aggregates.get(&1).unwrap().sum, 90);
+            assert_eq!(scanned.groups.aggregates.get(&2).unwrap().sum, 60);
+            assert_eq!(scanned.stats.rows_materialized, 0);
+            assert!(scanned.stats.native_aggregate_kernels >= 1);
+            black_box(m6_metrics(scanned.stats))
+        })
+    });
+
+    c.bench_function("m6_native_bool_group_count", |b| {
+        b.iter(|| {
+            let scanned = native_bool_group_count_scan(&scan_state, 2, &empty_scan_plan)
+                .expect("native bool group count scan");
+            assert_eq!(scanned.groups.rows_grouped, 3);
+            assert_eq!(scanned.groups.counts, vec![1, 2]);
+            assert_eq!(scanned.stats.rows_materialized, 0);
+            assert!(scanned.stats.native_group_kernels >= 1);
+            black_box(m6_metrics(scanned.stats))
+        })
+    });
+
+    c.bench_function("m6_filtered_native_bool_group_count", |b| {
+        b.iter(|| {
+            let scanned = native_bool_group_count_scan(&scan_state, 2, &filtered_i64_plan)
+                .expect("filtered native bool group count scan");
+            assert_eq!(scanned.groups.rows_grouped, 2);
+            assert_eq!(scanned.groups.counts, vec![1, 1]);
+            assert_eq!(scanned.stats.rows_materialized, 0);
+            assert!(scanned.stats.native_lane_predicates >= 1);
+            assert!(scanned.stats.native_group_kernels >= 1);
+            black_box(m6_metrics(scanned.stats))
+        })
+    });
+
+    c.bench_function("m6_filtered_native_bool_distinct_group", |b| {
+        b.iter(|| {
+            let scanned = native_bool_group_count_scan(&scan_state, 2, &filtered_i64_plan)
+                .expect("filtered native bool distinct group scan");
+            assert_eq!(
+                scanned
+                    .groups
+                    .counts
+                    .iter()
+                    .filter(|count| **count != 0)
+                    .count(),
+                2
+            );
+            assert_eq!(scanned.groups.null_count, 0);
+            assert_eq!(scanned.stats.rows_materialized, 0);
+            assert!(scanned.stats.native_lane_predicates >= 1);
+            assert!(scanned.stats.native_group_kernels >= 1);
+            black_box(m6_metrics(scanned.stats))
+        })
+    });
+
+    c.bench_function("m6_filtered_native_bool_i64_group_aggregate", |b| {
+        b.iter(|| {
+            let scanned =
+                native_bool_i64_group_aggregate_scan(&scan_state, 2, 0, &filtered_i64_plan)
+                    .expect("filtered native bool/i64 group aggregate scan");
+            assert_eq!(scanned.groups.row_counts, vec![1, 1]);
+            assert_eq!(scanned.groups.aggregates[0].sum, 2);
+            assert_eq!(scanned.groups.aggregates[1].sum, 3);
+            assert_eq!(scanned.stats.rows_materialized, 0);
+            assert!(scanned.stats.native_lane_predicates >= 1);
+            assert!(scanned.stats.native_aggregate_kernels >= 1);
+            black_box(m6_metrics(scanned.stats))
+        })
+    });
+
     c.bench_function("m6_numeric_range_filter", |b| {
         b.iter(|| {
             let decoded = decode_planned(
@@ -152,6 +434,60 @@ fn bench_m6_native(c: &mut Criterion) {
                 )],
             );
             assert_rows(&decoded.stats, 2, 2);
+            black_box(m6_metrics(decoded.stats))
+        })
+    });
+
+    c.bench_function("m6_numeric_in_filter", |b| {
+        b.iter(|| {
+            let decoded = decode_planned(
+                &scan_state,
+                Some(vec![1]),
+                vec![FilterPlan::pruning_numeric_in(
+                    0,
+                    vec![PredicateLiteral::Int64(1), PredicateLiteral::Int64(3)],
+                    "id IN (1, 3)",
+                )],
+            );
+            assert_rows(&decoded.stats, 2, 2);
+            assert_eq!(decoded.stats.residual_predicates, 0);
+            assert!(decoded.stats.native_lane_predicates >= 1);
+            black_box(m6_metrics(decoded.stats))
+        })
+    });
+
+    c.bench_function("m6_numeric_not_in_filter", |b| {
+        b.iter(|| {
+            let decoded = decode_planned(
+                &scan_state,
+                Some(vec![1]),
+                vec![FilterPlan::pruning_numeric_not_in(
+                    0,
+                    vec![PredicateLiteral::Int64(1)],
+                    "id NOT IN (1)",
+                )],
+            );
+            assert_rows(&decoded.stats, 2, 2);
+            assert_eq!(decoded.stats.residual_predicates, 0);
+            assert!(decoded.stats.native_lane_predicates >= 1);
+            black_box(m6_metrics(decoded.stats))
+        })
+    });
+
+    c.bench_function("m6_varbytes_in_filter", |b| {
+        b.iter(|| {
+            let decoded = decode_planned(
+                &scan_state,
+                Some(vec![0]),
+                vec![FilterPlan::pruning_varbytes_in(
+                    1,
+                    vec![b"alpha".to_vec(), b"gamma".to_vec()],
+                    "name IN ('alpha', 'gamma')",
+                )],
+            );
+            assert_rows(&decoded.stats, 2, 2);
+            assert_eq!(decoded.stats.residual_predicates, 0);
+            assert!(decoded.stats.native_lane_predicates >= 1);
             black_box(m6_metrics(decoded.stats))
         })
     });
@@ -202,6 +538,226 @@ fn bench_m6_native(c: &mut Criterion) {
         })
     });
 
+    c.bench_function("m6_filtered_native_count_star", |b| {
+        b.iter(|| {
+            let scanned =
+                native_row_count_scan(&scan_state, &filtered_i64_plan).expect("native row count");
+            assert_eq!(scanned.count, 2);
+            assert_eq!(scanned.stats.rows_materialized, 0);
+            assert_eq!(scanned.stats.native_count_rows_matched, 2);
+            assert!(scanned.stats.native_lane_predicates >= 1);
+            black_box(m6_metrics(scanned.stats))
+        })
+    });
+
+    c.bench_function("m6_native_i64_scalar_aggregate", |b| {
+        b.iter(|| {
+            let scanned = native_unfiltered_i64_aggregate_scan(&scan_state, 0)
+                .expect("native i64 aggregate scan");
+            assert_eq!(scanned.aggregate.count, 3);
+            assert_eq!(scanned.aggregate.sum, 6);
+            assert_eq!(scanned.aggregate.min, Some(1));
+            assert_eq!(scanned.aggregate.max, Some(3));
+            assert!(scanned.stats.native_aggregate_kernels >= 1);
+            black_box(m6_metrics(scanned.stats))
+        })
+    });
+
+    c.bench_function("m6_filtered_native_i64_scalar_aggregate", |b| {
+        b.iter(|| {
+            let scanned = native_i64_aggregate_scan(&scan_state, 0, &filtered_i64_plan)
+                .expect("filtered native i64 aggregate scan");
+            assert_eq!(scanned.aggregate.count, 2);
+            assert_eq!(scanned.aggregate.sum, 5);
+            assert_eq!(scanned.aggregate.min, Some(2));
+            assert_eq!(scanned.aggregate.max, Some(3));
+            assert_eq!(scanned.stats.rows_materialized, 0);
+            assert!(scanned.stats.native_lane_predicates >= 1);
+            assert!(scanned.stats.native_aggregate_kernels >= 1);
+            black_box(m6_metrics(scanned.stats))
+        })
+    });
+
+    c.bench_function("m6_native_i64_group_count", |b| {
+        b.iter(|| {
+            let scanned = native_unfiltered_i64_group_count_scan(&scan_state, 0)
+                .expect("native i64 group count scan");
+            assert_eq!(scanned.groups.rows_grouped, 3);
+            assert_eq!(scanned.groups.counts.get(&1), Some(&1));
+            assert_eq!(scanned.groups.counts.get(&2), Some(&1));
+            assert_eq!(scanned.groups.counts.get(&3), Some(&1));
+            assert!(scanned.stats.native_group_kernels >= 1);
+            black_box(m6_metrics(scanned.stats))
+        })
+    });
+
+    c.bench_function("m6_filtered_native_i64_group_count", |b| {
+        b.iter(|| {
+            let scanned = native_i64_group_count_scan(&scan_state, 0, &filtered_i64_plan)
+                .expect("filtered native i64 group count scan");
+            assert_eq!(scanned.groups.rows_grouped, 2);
+            assert_eq!(scanned.groups.counts.get(&1), None);
+            assert_eq!(scanned.groups.counts.get(&2), Some(&1));
+            assert_eq!(scanned.groups.counts.get(&3), Some(&1));
+            assert_eq!(scanned.stats.rows_materialized, 0);
+            assert!(scanned.stats.native_lane_predicates >= 1);
+            assert!(scanned.stats.native_group_kernels >= 1);
+            black_box(m6_metrics(scanned.stats))
+        })
+    });
+
+    c.bench_function("m6_filtered_native_i64_distinct_group", |b| {
+        b.iter(|| {
+            let scanned = native_i64_group_count_scan(&scan_state, 0, &filtered_i64_plan)
+                .expect("filtered native i64 distinct group scan");
+            let mut keys = scanned.groups.counts.keys().copied().collect::<Vec<_>>();
+            keys.sort_unstable();
+            assert_eq!(keys, vec![2, 3]);
+            assert_eq!(scanned.stats.rows_materialized, 0);
+            assert!(scanned.stats.native_lane_predicates >= 1);
+            assert!(scanned.stats.native_group_kernels >= 1);
+            black_box(m6_metrics(scanned.stats))
+        })
+    });
+
+    c.bench_function("m6_native_i64_topn_order", |b| {
+        b.iter(|| {
+            let scanned =
+                native_i64_order_scan(&topn_state, 0, &native_order_plan, true, false, Some(1))
+                    .expect("native i64 topn order scan");
+            assert_eq!(scanned.values, vec![Some(9)]);
+            assert_eq!(scanned.stats.rows_materialized, 0);
+            assert!(scanned.stats.native_sort_kernels >= 1);
+            black_box(m6_metrics(scanned.stats))
+        })
+    });
+
+    c.bench_function("m6_native_i64_full_order", |b| {
+        b.iter(|| {
+            let scanned =
+                native_i64_order_scan(&scan_state, 0, &empty_scan_plan, true, false, None)
+                    .expect("native i64 full order scan");
+            assert_eq!(scanned.values, vec![Some(3), Some(2), Some(1)]);
+            assert_eq!(scanned.stats.rows_materialized, 0);
+            assert!(scanned.stats.native_sort_kernels >= 1);
+            black_box(m6_metrics(scanned.stats))
+        })
+    });
+
+    c.bench_function("m6_filtered_native_i64_topn_order", |b| {
+        b.iter(|| {
+            let scanned =
+                native_i64_order_scan(&scan_state, 0, &filtered_i64_plan, true, false, Some(1))
+                    .expect("filtered native i64 topn order scan");
+            assert_eq!(scanned.values, vec![Some(3)]);
+            assert_eq!(scanned.stats.rows_materialized, 0);
+            assert!(scanned.stats.native_lane_predicates >= 1);
+            assert!(scanned.stats.native_sort_kernels >= 1);
+            black_box(m6_metrics(scanned.stats))
+        })
+    });
+
+    c.bench_function("m6_native_i64_inner_join", |b| {
+        b.iter(|| {
+            let left =
+                native_i64_values_scan(&topn_state, 0, &native_order_plan).expect("left keys");
+            let right =
+                native_i64_values_scan(&topn_state, 0, &native_order_plan).expect("right keys");
+            let left_values = left.values().expect("left key values");
+            let right_values = right.values().expect("right key values");
+            let mut right_counts = HashMap::<i64, usize>::with_capacity(right_values.len());
+            for value in right_values.iter().flatten().copied() {
+                *right_counts.entry(value).or_default() += 1;
+            }
+            let output_rows = left_values
+                .iter()
+                .flatten()
+                .filter_map(|value| right_counts.get(value))
+                .sum::<usize>();
+            let rows_materialized = left.stats.rows_materialized + right.stats.rows_materialized;
+            let native_join_rows_matched =
+                left.stats.native_join_rows_matched + right.stats.native_join_rows_matched;
+            let native_join_kernels =
+                left.stats.native_join_kernels + right.stats.native_join_kernels;
+            assert_eq!(output_rows, 2);
+            assert_eq!(rows_materialized, 0);
+            assert_eq!(native_join_rows_matched, 4);
+            assert!(native_join_kernels >= 2);
+            black_box((output_rows, m6_metrics(left.stats), m6_metrics(right.stats)))
+        })
+    });
+
+    c.bench_function("m6_native_filecode_inner_join_swapped_dictionary", |b| {
+        b.iter(|| {
+            let left = native_filecode_values_scan(&filecode_state, 0, &filecode_empty_plan)
+                .expect("left FileCode keys");
+            let right = native_filecode_values_scan(
+                &swapped_filecode_state,
+                0,
+                &swapped_filecode_empty_plan,
+            )
+            .expect("right FileCode keys");
+            let left_values = left.values().expect("left FileCode values");
+            let right_values = right.values().expect("right FileCode values");
+            let mut right_counts = HashMap::<Vec<u8>, usize>::with_capacity(right_values.len());
+            for value in right_values.iter().flatten() {
+                *right_counts.entry(value.clone()).or_default() += 1;
+            }
+            let output_rows = left_values
+                .iter()
+                .flatten()
+                .filter_map(|value| right_counts.get(value.as_slice()))
+                .sum::<usize>();
+            let rows_materialized = left.stats.rows_materialized + right.stats.rows_materialized;
+            let native_join_rows_matched =
+                left.stats.native_join_rows_matched + right.stats.native_join_rows_matched;
+            let native_join_kernels =
+                left.stats.native_join_kernels + right.stats.native_join_kernels;
+            assert_eq!(output_rows, 2);
+            assert_eq!(rows_materialized, 0);
+            assert_eq!(native_join_rows_matched, 4);
+            assert!(native_join_kernels >= 2);
+            black_box((output_rows, m6_metrics(left.stats), m6_metrics(right.stats)))
+        })
+    });
+
+    c.bench_function("m6_native_i64_semi_anti_join", |b| {
+        b.iter(|| {
+            let left = native_i64_values_scan(&scan_state, 0, &empty_scan_plan).expect("left keys");
+            let right =
+                native_i64_values_scan(&topn_state, 0, &native_order_plan).expect("right keys");
+            let left_values = left.values().expect("left key values");
+            let right_values = right.values().expect("right key values");
+            let mut right_counts = HashMap::<i64, usize>::with_capacity(right_values.len());
+            for value in right_values.iter().flatten().copied() {
+                *right_counts.entry(value).or_default() += 1;
+            }
+            let semi_rows = left_values
+                .iter()
+                .flatten()
+                .filter(|value| right_counts.contains_key(value))
+                .count();
+            let anti_rows = left_values
+                .iter()
+                .filter(|value| match value {
+                    Some(value) => !right_counts.contains_key(value),
+                    None => true,
+                })
+                .count();
+            let native_join_rows_matched =
+                left.stats.native_join_rows_matched + right.stats.native_join_rows_matched;
+            assert_eq!(semi_rows, 1);
+            assert_eq!(anti_rows, 2);
+            assert_eq!(native_join_rows_matched, 5);
+            black_box((
+                semi_rows,
+                anti_rows,
+                m6_metrics(left.stats),
+                m6_metrics(right.stats),
+            ))
+        })
+    });
+
     c.bench_function("m6_topn_hinted_scan", |b| {
         b.iter(|| {
             let mut plan = plan_scan(&topn_state, None, Vec::new()).expect("TopN scan plan");
@@ -235,6 +791,143 @@ fn bench_m6_native(c: &mut Criterion) {
             })
         });
     }
+}
+
+fn bench_m6_smoke(c: &mut Criterion) {
+    let scan_state = bootstrap_bytes("m6-smoke-scan.cove", primitive_events_file())
+        .expect("smoke scan fixture should bootstrap");
+    let filecode_state = bootstrap_bytes(
+        "m6-smoke-filecode.cove",
+        dictionary_items_file_with_domain(),
+    )
+    .expect("smoke FileCode fixture should bootstrap");
+    let scored_filecode_state = bootstrap_bytes(
+        "m6-smoke-scored-filecode.cove",
+        scored_dictionary_items_file([10, 20]),
+    )
+    .expect("smoke scored FileCode fixture should bootstrap");
+    let topn_state = bootstrap_bytes("m6-smoke-topn.cove", topn_events_file())
+        .expect("smoke TopN fixture should bootstrap");
+
+    let empty_projection = Vec::new();
+    let scored_filecode_empty_plan =
+        plan_scan(&scored_filecode_state, Some(&empty_projection), Vec::new())
+            .expect("smoke native scored FileCode empty scan plan");
+    let native_order_plan = plan_scan(&topn_state, Some(&empty_projection), Vec::new())
+        .expect("smoke native i64 order scan plan");
+    let red_key = canonical_utf8("red");
+    let blue_key = canonical_utf8("blue");
+
+    c.bench_function("m6_smoke_full_scan", |b| {
+        b.iter(|| {
+            let decoded = decode_planned(&scan_state, None, Vec::new());
+            assert_rows(&decoded.stats, 3, 3);
+            black_box(m6_metrics(decoded.stats))
+        })
+    });
+
+    c.bench_function("m6_smoke_projection_scan", |b| {
+        b.iter(|| {
+            let decoded = decode_planned(&scan_state, Some(vec![1]), Vec::new());
+            assert_rows(&decoded.stats, 3, 3);
+            black_box(m6_metrics(decoded.stats))
+        })
+    });
+
+    c.bench_function("m6_smoke_filecode_equality_filter", |b| {
+        b.iter(|| {
+            let decoded = decode_planned(
+                &filecode_state,
+                Some(vec![1]),
+                vec![FilterPlan::pruning_file_code_in(0, vec![0], "name = 'red'")],
+            );
+            assert_rows(&decoded.stats, 1, 1);
+            assert_eq!(decoded.stats.residual_predicates, 0);
+            assert!(decoded.stats.native_lane_predicates >= 1);
+            black_box(m6_metrics(decoded.stats))
+        })
+    });
+
+    c.bench_function("m6_smoke_native_filecode_i64_group_aggregate", |b| {
+        b.iter(|| {
+            let scanned = native_filecode_i64_group_aggregate_scan(
+                &scored_filecode_state,
+                0,
+                1,
+                &scored_filecode_empty_plan,
+            )
+            .expect("smoke native FileCode/i64 group aggregate scan");
+            assert_eq!(scanned.groups.groups.len(), 2);
+            assert_eq!(
+                scanned
+                    .groups
+                    .groups
+                    .get(red_key.as_slice())
+                    .unwrap()
+                    .aggregate
+                    .sum,
+                10
+            );
+            assert_eq!(
+                scanned
+                    .groups
+                    .groups
+                    .get(blue_key.as_slice())
+                    .unwrap()
+                    .aggregate
+                    .sum,
+                20
+            );
+            assert_eq!(scanned.stats.rows_materialized, 0);
+            assert!(scanned.stats.native_aggregate_kernels >= 1);
+            black_box(m6_metrics(scanned.stats))
+        })
+    });
+
+    c.bench_function("m6_smoke_numeric_range_filter", |b| {
+        b.iter(|| {
+            let decoded = decode_planned(
+                &scan_state,
+                Some(vec![1]),
+                vec![FilterPlan::pruning_numeric(
+                    0,
+                    NumericPredicateOp::GtEq,
+                    PredicateLiteral::Int64(2),
+                    "id >= 2",
+                )],
+            );
+            assert_rows(&decoded.stats, 2, 2);
+            assert_eq!(decoded.stats.residual_predicates, 0);
+            assert!(decoded.stats.native_lane_predicates >= 1);
+            black_box(m6_metrics(decoded.stats))
+        })
+    });
+
+    c.bench_function("m6_smoke_native_i64_topn_order", |b| {
+        b.iter(|| {
+            let scanned =
+                native_i64_order_scan(&topn_state, 0, &native_order_plan, true, false, Some(1))
+                    .expect("smoke native i64 topn order scan");
+            assert_eq!(scanned.values, vec![Some(9)]);
+            assert_eq!(scanned.stats.rows_materialized, 0);
+            assert!(scanned.stats.native_sort_kernels >= 1);
+            black_box(m6_metrics(scanned.stats))
+        })
+    });
+
+    c.bench_function("m6_smoke_topn_hinted_scan", |b| {
+        b.iter(|| {
+            let mut plan = plan_scan(&topn_state, None, Vec::new()).expect("smoke TopN scan plan");
+            plan.topn_hint = Some(TopNScanHint {
+                column_index: 0,
+                descending: true,
+                fetch: 1,
+            });
+            let decoded = decode_scan(&topn_state, &plan).expect("smoke TopN hinted decode");
+            assert_rows(&decoded.stats, 2, 2);
+            black_box(m6_metrics(decoded.stats))
+        })
+    });
 }
 
 #[cfg(feature = "parquet-compare")]
@@ -861,7 +1554,32 @@ fn assert_rows(stats: &DecodeStats, selected: usize, materialized: usize) {
     assert_eq!(stats.rows_materialized, materialized);
 }
 
-fn m6_metrics(stats: DecodeStats) -> (usize, usize, usize, usize, usize, usize, usize) {
+fn m6_metrics(
+    stats: DecodeStats,
+) -> (
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+) {
     (
         stats.metadata_bytes_read + stats.data_bytes_read,
         stats.pages_decoded,
@@ -870,6 +1588,21 @@ fn m6_metrics(stats: DecodeStats) -> (usize, usize, usize, usize, usize, usize, 
         stats.morsels_pruned,
         stats.range_requests,
         stats.residual_rows,
+        stats.native_lane_predicates,
+        stats.native_lane_predicate_rows_seen,
+        stats.native_lane_predicate_bytes_touched,
+        stats.native_aggregate_kernels,
+        stats.native_aggregate_rows_matched,
+        stats.native_aggregate_bytes_touched,
+        stats.native_group_kernels,
+        stats.native_group_rows_matched,
+        stats.native_group_bytes_touched,
+        stats.native_count_scans,
+        stats.native_count_rows_seen,
+        stats.native_count_rows_matched,
+        stats.native_sort_kernels,
+        stats.native_sort_rows_matched,
+        stats.native_sort_bytes_touched,
     )
 }
 
@@ -1574,7 +2307,54 @@ fn primitive_events_file() -> Vec<u8> {
     writer.write().expect("write primitive fixture")
 }
 
+fn numeric_scores_file() -> Vec<u8> {
+    let catalog = TableCatalog {
+        flags: 0,
+        tables: vec![TableEntry {
+            table_id: 22,
+            namespace: "public".into(),
+            name: "scores".into(),
+            row_count: 5,
+            primary_sort_key_count: 0,
+            clustering_key_count: 0,
+            flags: 0,
+            columns: vec![
+                column(
+                    1,
+                    "id",
+                    CoveLogicalType::Int64,
+                    CovePhysicalKind::NumCode,
+                    false,
+                ),
+                column(
+                    2,
+                    "score",
+                    CoveLogicalType::Int64,
+                    CovePhysicalKind::NumCode,
+                    false,
+                ),
+            ],
+        }],
+    };
+    let mut first = ScanSegment::new(22, 0, 0, 3, 2);
+    first.set_column_pages(1, vec![numcode_page(3, numcode_i64(&[1, 2, 1]))]);
+    first.set_column_pages(2, vec![numcode_page(3, numcode_i64(&[10, 20, 30]))]);
+
+    let mut second = ScanSegment::new(22, 1, 3, 2, 2);
+    second.set_column_pages(1, vec![numcode_page(2, numcode_i64(&[2, 1]))]);
+    second.set_column_pages(2, vec![numcode_page(2, numcode_i64(&[40, 50]))]);
+
+    let mut writer = ScanProfileCoveWriter::new(catalog);
+    writer.push_segment(first);
+    writer.push_segment(second);
+    writer.write().expect("write numeric score fixture")
+}
+
 fn dictionary_items_file_with_domain() -> Vec<u8> {
+    dictionary_items_file_with_domain_dictionary(sample_dictionary())
+}
+
+fn dictionary_items_file_with_domain_dictionary(dictionary: FileDictionary) -> Vec<u8> {
     let mut name_column = column(
         1,
         "name",
@@ -1613,12 +2393,98 @@ fn dictionary_items_file_with_domain() -> Vec<u8> {
     second.set_column_pages(2, vec![varbytes_page(1, varbytes(&["second"]))]);
 
     let mut writer = ScanProfileCoveWriter::new(catalog);
-    writer.push_file_dictionary(&sample_dictionary());
-    writer.push_extra_section(column_domain_section());
-    writer.push_extra_section(filecode_zone_stats_section());
+    writer.push_file_dictionary(&dictionary);
+    writer.push_extra_section(column_domain_section(&dictionary));
+    writer.push_extra_section(filecode_zone_stats_section(&dictionary));
     writer.push_segment(first);
     writer.push_segment(second);
     writer.write().expect("write FileCode fixture")
+}
+
+fn scored_dictionary_items_file(scores: [i64; 2]) -> Vec<u8> {
+    let catalog = TableCatalog {
+        flags: 0,
+        tables: vec![TableEntry {
+            table_id: 7,
+            namespace: "public".into(),
+            name: "items".into(),
+            row_count: 2,
+            primary_sort_key_count: 0,
+            clustering_key_count: 0,
+            flags: 0,
+            columns: vec![
+                column(
+                    1,
+                    "name",
+                    CoveLogicalType::Utf8,
+                    CovePhysicalKind::FileCode,
+                    false,
+                ),
+                column(
+                    2,
+                    "score",
+                    CoveLogicalType::Int64,
+                    CovePhysicalKind::NumCode,
+                    false,
+                ),
+            ],
+        }],
+    };
+    let mut segment = ScanSegment::new(7, 0, 0, 2, 2);
+    segment.set_column_pages(1, vec![filecode_page(2, filecodes(&[0, 1]))]);
+    segment.set_column_pages(2, vec![numcode_page(2, numcode_i64(&scores))]);
+
+    let mut writer = ScanProfileCoveWriter::new(catalog);
+    writer.push_file_dictionary(&sample_dictionary());
+    writer.push_segment(segment);
+    writer.write().expect("write scored FileCode fixture")
+}
+
+fn local_codebook_scored_dictionary_items_file() -> Vec<u8> {
+    let catalog = TableCatalog {
+        flags: 0,
+        tables: vec![TableEntry {
+            table_id: 23,
+            namespace: "public".into(),
+            name: "items".into(),
+            row_count: 4,
+            primary_sort_key_count: 0,
+            clustering_key_count: 0,
+            flags: 0,
+            columns: vec![
+                column(
+                    1,
+                    "name",
+                    CoveLogicalType::Utf8,
+                    CovePhysicalKind::FileCode,
+                    false,
+                ),
+                column(
+                    2,
+                    "score",
+                    CoveLogicalType::Int64,
+                    CovePhysicalKind::NumCode,
+                    false,
+                ),
+            ],
+        }],
+    };
+    let local_codebook = LocalCodebookPayload {
+        values: LocalCodebookValues::FileCode(vec![1, 0]),
+        indexes: LocalIndexPayload::BitPacked(
+            BitPackedPayload::pack(&[1, 0, 1, 0], 1).expect("local FileCode indexes should pack"),
+        ),
+    };
+    let mut segment = ScanSegment::new(23, 0, 0, 4, 2);
+    segment.set_column_pages(1, vec![local_codebook_page(4, local_codebook.encode())]);
+    segment.set_column_pages(2, vec![numcode_page(4, numcode_i64(&[10, 20, 30, 40]))]);
+
+    let mut writer = ScanProfileCoveWriter::new(catalog);
+    writer.push_file_dictionary(&sample_dictionary());
+    writer.push_segment(segment);
+    writer
+        .write()
+        .expect("write local-codebook scored FileCode fixture")
 }
 
 fn numeric_lookup_events_file() -> Vec<u8> {
@@ -2909,6 +3775,10 @@ fn filecode_page(row_count: u32, payload: Vec<u8>) -> ScanPageSpec {
     ScanPageSpec::new(row_count, payload).with_encoding_root(CoveEncodingKind::FileCode as u32)
 }
 
+fn local_codebook_page(row_count: u32, payload: Vec<u8>) -> ScanPageSpec {
+    ScanPageSpec::new(row_count, payload).with_encoding_root(CoveEncodingKind::LocalCodebook as u32)
+}
+
 fn numcode_i64(values: &[i64]) -> Vec<u8> {
     values
         .iter()
@@ -2951,6 +3821,21 @@ fn sample_dictionary() -> FileDictionary {
     }
 }
 
+fn swapped_dictionary() -> FileDictionary {
+    FileDictionary {
+        header: FileDictionaryHeaderV1 {
+            entry_count: 2,
+            flags: 0,
+            index_entry_len: FileDictionaryHeaderV1::INDEX_ENTRY_LEN,
+            value_hash_algorithm: 0,
+            payload_length: 0,
+            reserved: [0; 24],
+        },
+        entries: vec![inline_utf8_entry("blue"), inline_utf8_entry("red")],
+        payload: Vec::new(),
+    }
+}
+
 fn inline_utf8_entry(value: &str) -> FileDictionaryIndexEntryV1 {
     let canonical = canonical_utf8(value);
     let mut inline_data = [0u8; 16];
@@ -2975,10 +3860,11 @@ fn canonical_utf8(value: &str) -> Vec<u8> {
     canonical
 }
 
-fn column_domain_section() -> SectionPayload {
+fn column_domain_section(dictionary: &FileDictionary) -> SectionPayload {
+    let sorted_codes = sorted_filecode_domain_codes(dictionary);
     let domain = ColumnDomain::from_sorted_present_codes(
-        &[1, 0],
-        2,
+        &sorted_codes,
+        dictionary.len(),
         7,
         1,
         CoveLogicalType::Utf8 as u16,
@@ -3000,10 +3886,11 @@ fn column_domain_section() -> SectionPayload {
     }
 }
 
-fn filecode_zone_stats_section() -> SectionPayload {
+fn filecode_zone_stats_section(dictionary: &FileDictionary) -> SectionPayload {
+    let ranks = filecode_domain_ranks(dictionary);
     let entries = vec![
-        filecode_zone_stats_entry(0, 1),
-        filecode_zone_stats_entry(1, 0),
+        filecode_zone_stats_entry(0, ranks[0]),
+        filecode_zone_stats_entry(1, ranks[1]),
     ];
     let section = ZoneStatsSection { entries };
     SectionPayload {
@@ -3018,6 +3905,33 @@ fn filecode_zone_stats_section() -> SectionPayload {
         optional_features: 0,
         data: section.serialize().expect("serialize zone stats"),
     }
+}
+
+fn sorted_filecode_domain_codes(dictionary: &FileDictionary) -> Vec<u32> {
+    let mut codes = (0..dictionary.entries.len() as u32).collect::<Vec<_>>();
+    codes.sort_by(|left, right| {
+        dictionary_inline_sort_key(&dictionary.entries[*left as usize]).cmp(
+            dictionary_inline_sort_key(&dictionary.entries[*right as usize]),
+        )
+    });
+    codes
+}
+
+fn filecode_domain_ranks(dictionary: &FileDictionary) -> Vec<u32> {
+    let sorted_codes = sorted_filecode_domain_codes(dictionary);
+    let mut ranks = vec![0u32; dictionary.entries.len()];
+    for (rank, code) in sorted_codes.into_iter().enumerate() {
+        ranks[code as usize] = rank as u32;
+    }
+    ranks
+}
+
+fn dictionary_inline_sort_key(entry: &FileDictionaryIndexEntryV1) -> &[u8] {
+    debug_assert_eq!(entry.storage_class, StorageClass::Inline as u8);
+    let canonical = &entry.inline_data[..entry.inline_len as usize];
+    let (len, used) = wire::decode_u64_leb128(canonical).expect("inline UTF-8 canonical length");
+    let end = used + usize::try_from(len).expect("inline UTF-8 length fits usize");
+    &canonical[used..end]
 }
 
 fn filecode_zone_stats_entry(segment_id: u32, rank: u32) -> ZoneStatsEntry {
@@ -3119,6 +4033,17 @@ fn main() {
     #[cfg(feature = "parquet-compare")]
     if let Some(code) = maybe_run_query_profile_mode() {
         std::process::exit(code);
+    }
+
+    if env::var_os("COVE_M6_SMOKE").is_some() {
+        let mut criterion = Criterion::default()
+            .configure_from_args()
+            .sample_size(20)
+            .warm_up_time(Duration::from_millis(250))
+            .measurement_time(Duration::from_millis(750));
+        bench_m6_smoke(&mut criterion);
+        criterion.final_summary();
+        return;
     }
 
     benches();
