@@ -4,7 +4,7 @@ use cove_core::{
     reader::{OptionalPushdownPolicy, ValidationOptions},
 };
 
-pub(crate) const USAGE: &str = "Usage: cove validate [--semantic] [--verify-digests] [--fail-open-optional-pushdown] [--json] [--explain] [--requested-profile N] [--requested-operation NAME|N] [--needed-section ID] [--needed-page SECTION_ID:TARGET_REF] [--needed-column-page SECTION_ID:COLUMN_ID:MORSEL_ID] <file.cove|file.covemap> [<file2> ...]";
+pub(crate) const USAGE: &str = "Usage: cove validate [--semantic] [--verify-digests] [--fail-open-optional-pushdown] [--object-delta] [--json] [--explain] [--requested-profile N] [--requested-operation NAME|N] [--needed-section ID] [--needed-page SECTION_ID:TARGET_REF] [--needed-column-page SECTION_ID:COLUMN_ID:MORSEL_ID] <file.cove|file.covemap|file.covedelta> [<file2> ...]";
 
 #[derive(Clone)]
 pub(crate) struct CliArgs {
@@ -12,6 +12,7 @@ pub(crate) struct CliArgs {
     pub(crate) feature_use: Option<FeatureUseRequestV2>,
     pub(crate) json_out: bool,
     pub(crate) explain: bool,
+    pub(crate) object_delta: bool,
     pub(crate) file_paths: Vec<String>,
 }
 
@@ -21,6 +22,7 @@ pub(crate) fn parse_args(args: impl IntoIterator<Item = String>) -> Result<CliAr
     let mut fail_open_optional_pushdown = false;
     let mut json_out = false;
     let mut explain = false;
+    let mut object_delta = false;
     let mut feature_use: Option<FeatureUseRequestV2> = None;
     let mut file_paths = Vec::new();
 
@@ -34,6 +36,7 @@ pub(crate) fn parse_args(args: impl IntoIterator<Item = String>) -> Result<CliAr
                 "--fail-open-optional-pushdown" => fail_open_optional_pushdown = true,
                 "--json" => json_out = true,
                 "--explain" => explain = true,
+                "--object-delta" => object_delta = true,
                 "--requested-profile" => {
                     let value = args.next().ok_or_else(|| {
                         "--requested-profile requires a numeric profile id".to_string()
@@ -112,6 +115,7 @@ pub(crate) fn parse_args(args: impl IntoIterator<Item = String>) -> Result<CliAr
         feature_use,
         json_out,
         explain,
+        object_delta,
         file_paths,
     })
 }
