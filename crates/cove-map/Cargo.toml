@@ -14,6 +14,7 @@ arrow-schema = "58"
 cove-convert = { path = "../cove-convert" }
 cove-core = { path = "../cove-core" }
 cove-index = { path = "../cove-index" }
+csv = "1"
 icu_casemap = { version = "2.2", features = ["compiled_data"] }
 icu_normalizer = "2.2"
 serde_json = "1"

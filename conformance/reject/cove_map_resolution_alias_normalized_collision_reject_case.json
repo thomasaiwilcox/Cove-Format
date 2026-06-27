@@ -1,0 +1,6 @@
+{
+  "mapping": "accept/cove_map_resolution_alias_normalized_collision_reject.covemap",
+  "sources": [
+    "accept/company_alias_normalized_collision_reject.csv"
+  ]
+}

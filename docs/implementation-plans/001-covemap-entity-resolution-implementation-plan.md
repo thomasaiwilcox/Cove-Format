@@ -868,66 +868,84 @@ Resolve before or during the phase that needs the answer:
 5. How private alias catalogs expose proof to unauthorized readers without
    leaking raw aliases.
 
+Resolved implementation decisions:
+
+1. Section ID `69` is allocated as `MAP_RESOLUTION_CATALOG`; the Rust constants,
+   registry metadata, embedded COVE-MAP parser, and section-kind registry doc
+   all use that core section ID.
+2. Published resolver catalogs are embedded and digest-pinned in `.covemap`
+   inputs. Live mutable external resolver lookups are not part of deterministic
+   replay; alias CSV import materializes catalog content into the mapping.
+3. Candidate scoring uses deterministic token/Jaccard matching with stable
+   blocking, tie ordering, and fail-closed pair limits.
+4. CoveQL keeps resolution access under existing object, projection, and
+   evidence surfaces. COVE-MAP projection expressions expose explicit
+   `identity(...).resolution(...).field` selectors instead of adding a new
+   first-class CoveQL `identity(...)` root.
+5. Private alias evidence uses the resolver `evidence_policy` redaction path:
+   raw and normalized aliases are omitted while resolver, catalog, and pipeline
+   digests remain available as replay/explain proof.
+
 ## Proposal Coverage Matrix
 
-Every proposal heading must map to implementation work:
+Every proposal heading must map to implementation work and evidence:
 
-| Proposal section | Plan coverage |
-| --- | --- |
-| Summary | Objective, Implementation Contract |
-| Recommendation | Phase 0, Phase 1, Cross-feature ordering |
-| Motivation | Objective, CLI Surface Checklist |
-| Goals | Implementation Contract, all phase gates |
-| Non-Goals | Non-Goals |
-| Current Baseline | Primary Code Surfaces, Phase 0.3 |
-| Registry Path | Phase 0.1 |
-| Terminology | Phase 0.2 data structures, Phase 1 outcome model |
-| Design Principles | Implementation Contract, Phase 1 authority rules |
-| Merge Only From Declared Authority | Phase 1.3, Phase 3, Phase 4 |
-| Alias Lookup Is Data-Backed Resolution | Phase 0.4, Phase 1.2 |
-| Evidence Must Survive Canonicalization | Phase 1.5, Phase 5.2 |
-| Resolution Must Be Replayable | Phase 0.4, Phase 5.3 |
-| Candidate Generation Is Useful, But Not Truth | Phase 3 |
-| MAP_RESOLUTION_CATALOG | Phase 0.1, Phase 0.2 |
-| Canonical Digests | Phase 0.4 |
-| Identity Rule Extension | Phase 0.3 |
-| Evaluation Order | Phase 1.2 |
-| Hit and Miss Policies | Phase 1.2 |
-| Effective Merge Authority | Phase 1.3 |
-| Row-Level Merge Class | Phase 1.3 |
-| Evidence Shape | Phase 0.5, Phase 1.5 |
-| Materialization Semantics | Phase 1.4 |
-| Authoritative Alias Hit | Phase 1.4 |
-| Alias Miss | Phase 1.2, tests |
-| Ambiguous Alias | Phase 1.2, tests |
-| Reviewed Decisions | Phase 4 |
-| Deterministic Anchor Semantics | Phase 4.3 |
-| Candidate Match Rules | Phase 3 |
-| Normalization Functions | Phase 1.1 |
-| Property Expressions | Phase 2.1 |
-| Association Endpoint Resolution | Phase 2.4 |
-| CLI Workflow | CLI Surface Checklist, Phases 2-4 |
-| Candidate Discovery | Phase 3.3 |
-| Review | Phase 4.4 |
-| Alias Import | CLI Surface Checklist |
-| Build | Phase 1.6, CLI Surface Checklist |
-| Explain | Phase 2.2 |
-| CoveQL Read Surfaces | Phase 2.3 |
-| Governance and Security | Phase 5.1, Phase 5.2 |
-| Determinism and Replay | Phase 0.4, Phase 5.3 |
-| Compatibility | Phase 5.4 |
-| Interaction With COVE-O Delta Artifacts | Cross-feature ordering, plan 002 integration boundary |
-| Error Handling | Phase 0.6 |
-| Implementation Plan | Phases 0-5 |
-| Phase 0 | Phase 0 |
-| Phase 0: Schema and Registry Integration | Phase 0 |
-| Phase 1 | Phase 1 |
-| Phase 2 | Phase 2 |
-| Phase 2: Resolution Property Expressions and Explain | Phase 2 |
-| Phase 3 | Phase 3 |
-| Phase 4 | Phase 4 |
-| Phase 5 | Phase 5 |
-| Phase 5: Governance and Redaction | Phase 5 |
-| Test Plan | Required Test And Conformance Fixtures |
-| Example End-to-End Mapping Sketch | Phase 1 Tesco fixture, CLI Surface Checklist |
-| Open Questions | Open Decisions Before Coding |
+| Proposal section | Plan coverage | Implementation evidence |
+| --- | --- | --- |
+| Summary | Objective, Implementation Contract | Resolver-backed planning, materialization, reports, and replay are implemented in `crates/cove-map/src/lib.rs`, `crates/cove-map/src/identity.rs`, and `crates/cove-map/src/replay.rs`; conformance includes `accept/cove_map_resolution_alias_case.json` and `accept/cove_map_replay_verify_case.json`. |
+| Recommendation | Phase 0, Phase 1, Cross-feature ordering | `MAP_RESOLUTION_CATALOG` is registered in `crates/cove-core/src/constants.rs`, `crates/cove-core/src/registry.rs`, and `docs/governance/section-kind-registry.md`; resolver-aware delta patches are gated in plan 002. |
+| Motivation | Objective, CLI Surface Checklist | CLI surfaces in `crates/cove-map/src/cli.rs` cover `build`, `explain`, `candidates`, `review`, `aliases import`, and `replay verify`; fixtures exercise the Tesco alias workflow. |
+| Goals | Implementation Contract, all phase gates | The resolver, candidate, review, projection, and replay suites pass in `cargo test -p cove-map` and the generated conformance corpus. |
+| Non-Goals | Non-Goals | Fuzzy/candidate evidence stays non-authoritative unless reviewed; tests such as `alias_catalog_candidate_only_miss_emits_candidate_without_goid` and candidate fixtures prove this fail-closed behavior. |
+| Current Baseline | Primary Code Surfaces, Phase 0.3 | Existing COVE-MAP parsing remains in `crates/cove-core/src/profile/cove_map/embedded.rs`; legacy fixtures continue to pass in the full conformance run. |
+| Registry Path | Phase 0.1 | Section kind 69 is present in Rust constants, registry metadata, and `docs/governance/section-kind-registry.md`. |
+| Terminology | Phase 0.2 data structures, Phase 1 outcome model | Strict structs and enums live in `crates/cove-core/src/profile/cove_map.rs`; row-level outcomes and authority handling live in `crates/cove-map/src/identity.rs`. |
+| Design Principles | Implementation Contract, Phase 1 authority rules | Authority ranking, merge classes, do-not-merge checks, and candidate-only paths are enforced in `crates/cove-map/src/identity.rs` and unit-tested in `crates/cove-map/src/lib.rs`. |
+| Merge Only From Declared Authority | Phase 1.3, Phase 3, Phase 4 | Candidate-only misses and ambiguous aliases do not form GOIDs; reviewed decisions merge only when identity rules permit reviewed equivalence. |
+| Alias Lookup Is Data-Backed Resolution | Phase 0.4, Phase 1.2 | Alias catalogs, pipeline digests, catalog digests, and resolver digests are parsed in `embedded.rs` and evaluated in `identity.rs`; fixtures cover hit, miss, ambiguity, and stale digest cases. |
+| Evidence Must Survive Canonicalization | Phase 1.5, Phase 5.2 | Evidence entries carry raw/normalized/resolved values or redacted digest proof through `crates/cove-map/src/ui.rs`; conformance checks raw evidence and redacted evidence. |
+| Resolution Must Be Replayable | Phase 0.4, Phase 5.3 | Conversion reports bind source snapshots, resolver/catalog/pipeline digests, and reviewed decision digests; `cove map replay verify` and replay fixtures reject stale bindings. |
+| Candidate Generation Is Useful, But Not Truth | Phase 3 | `crates/cove-map/src/candidates.rs` emits deterministic candidate matches and review worklists without GOID authority; candidate conformance fixtures cover scoring, ties, and limits. |
+| MAP_RESOLUTION_CATALOG | Phase 0.1, Phase 0.2 | Core section support is in constants, registry, `MapResolutionCatalog`, and the embedded parser; accept/reject resolution catalog fixtures validate it. |
+| Canonical Digests | Phase 0.4 | Canonical JSON and digest formulas are enforced by `embedded.rs` and alias import code; tests cover order-insensitive aliases and stale pipeline/suffix-table digests. |
+| Identity Rule Extension | Phase 0.3 | `allow_reviewed_equivalence` and join-key `resolution` parsing are implemented in `embedded.rs` and exercised by resolver/review fixtures. |
+| Evaluation Order | Phase 1.2 | `identity.rs` evaluates source value, resolver pipeline, alias lookup, miss policy, then authority classification. |
+| Hit and Miss Policies | Phase 1.2 | `authoritative`, `candidate_only`, `source_scoped`, `normalized_value`, and reject policies are implemented and covered by generated fixtures. |
+| Effective Merge Authority | Phase 1.3 | Effective authority ranking is implemented in `identity.rs`; candidate and miss outcomes cannot escalate authoritative identity rules. |
+| Row-Level Merge Class | Phase 1.3 | Merge classes are encoded in planned identities and candidates, with source-scoped and candidate-only behavior verified by tests and fixtures. |
+| Evidence Shape | Phase 0.5, Phase 1.5 | Evidence metadata allowlists in `embedded.rs` include resolution and candidate fields; `ui.rs` emits stable evidence/explain JSON. |
+| Materialization Semantics | Phase 1.4 | `materialize_with_source_states` in `lib.rs` emits ordinary COVE-O rows and evidence while leaving candidate-only identities out of object truth. |
+| Authoritative Alias Hit | Phase 1.4 | Tesco alias fixtures and `alias_catalog_resolver_merges_alias_hits_and_emits_evidence` prove one GOID for authoritative hits. |
+| Alias Miss | Phase 1.2, tests | Generated conformance covers reject, candidate-only, source-scoped, and normalized-value miss policies. |
+| Ambiguous Alias | Phase 1.2, tests | Generated fixtures reject or route ambiguous aliases to candidates according to policy; unit tests cover both branches. |
+| Reviewed Decisions | Phase 4 | `crates/cove-map/src/review.rs` imports/exports reviewed decisions; conversion and replay bind the reviewed decision catalog digest. |
+| Deterministic Anchor Semantics | Phase 4.3 | Cross-rule/cross-resolver reviewed decisions require canonical anchors and are tested by cross-rule reviewed fixtures and unit tests. |
+| Candidate Match Rules | Phase 3 | Candidate rule schemas parse in `embedded.rs`; deterministic scoring and evidence are implemented in `candidates.rs` and `lib.rs`. |
+| Normalization Functions | Phase 1.1 | Built-in lower/trim/Unicode normalization and suffix stripping live in `identity.rs`; suffix table digest fixtures validate replay sensitivity. |
+| Property Expressions | Phase 2.1 | Projection expression parsing supports `identity(...).resolution(...).field` selectors in `crates/cove-map/src/project.rs`; missing-hit fixtures fail closed. |
+| Association Endpoint Resolution | Phase 2.4 | Alias-backed association endpoint resolution is implemented in projection/materialization paths and covered by unit/conformance tests. |
+| CLI Workflow | CLI Surface Checklist, Phases 2-4 | `crates/cove-map/src/cli.rs` and `crates/cove-map/src/ui.rs` expose the planned workflow and usage text. |
+| Candidate Discovery | Phase 3.3 | `cove map candidates` calls `candidate_matches` and can write stable JSON for review. |
+| Review | Phase 4.4 | `cove map review`, `review export`, and `review import` are implemented in CLI and `review.rs`. |
+| Alias Import | CLI Surface Checklist | `crates/cove-map/src/alias_import.rs` imports CSV aliases, updates catalog digests, and fail-closes ambiguous imports. |
+| Build | Phase 1.6, CLI Surface Checklist | Build reports include resolver hit/miss counts, GOID impact, resolver digests, reviewed decision counts, and replay digests. |
+| Explain | Phase 2.2 | `crates/cove-map/src/ui.rs` returns resolver/evidence details for GOID or assertion IDs. |
+| CoveQL Read Surfaces | Phase 2.3 | Resolution data is exposed through materialized COVE-O projection/evidence surfaces and semantic-map fingerprints; no new root is required. |
+| Governance and Security | Phase 5.1, Phase 5.2 | Governance policy and redacted resolver evidence paths are enforced in `lib.rs`, `identity.rs`, and generated redaction fixtures. |
+| Determinism and Replay | Phase 0.4, Phase 5.3 | `replay.rs` verifies source, resolver, catalog, pipeline, mapping, and reviewed-decision bindings; conformance includes stale resolver, review, and source cases. |
+| Compatibility | Phase 5.4 | Existing mappings remain valid; resolver requirements fail closed before materialization; legacy and resolver fixtures pass together. |
+| Interaction With COVE-O Delta Artifacts | Cross-feature ordering, plan 002 integration boundary | Plan 002 uses effective semantic-map fingerprints and gates resolver-aware evidence patches behind `DELTA_FEATURE_MAP_EVIDENCE_PATCH`. |
+| Error Handling | Phase 0.6 | Stable `MAP_RESOLUTION_*`, `MAP_REPLAY_*`, and map validation diagnostics are emitted by parser, materializer, and replay verifier. |
+| Implementation Plan | Phases 0-5 | Phase work is implemented across `cove-core`, `cove-map`, CLI, and conformance surfaces listed above. |
+| Phase 0 | Phase 0 | Registry, schemas, digest formulas, allowlists, and diagnostics are implemented and tested. |
+| Phase 0: Schema and Registry Integration | Phase 0 | `MapResolutionCatalog` parses under section 69 with strict unknown-field validation. |
+| Phase 1 | Phase 1 | Alias resolver evaluation, evidence, reports, and materialized COVE-O output are implemented. |
+| Phase 2 | Phase 2 | Projection expressions and explain output expose resolver fields with fail-closed missing-hit behavior. |
+| Phase 2: Resolution Property Expressions and Explain | Phase 2 | `project.rs` and `ui.rs` implement the expression and explain surfaces; fixtures cover role selection and missing hits. |
+| Phase 3 | Phase 3 | Candidate rules, deterministic scoring, CLI output, and candidate evidence are implemented. |
+| Phase 4 | Phase 4 | Reviewed decisions, canonical anchors, import/export, replay binding, and conflict rejection are implemented. |
+| Phase 5 | Phase 5 | Governance metadata, redacted proof, replay verification, and compatibility behavior are implemented. |
+| Phase 5: Governance and Redaction | Phase 5 | Redacted alias evidence conformance proves digest-backed proof without raw alias disclosure. |
+| Test Plan | Required Test And Conformance Fixtures | The generated corpus includes COVE-MAP resolver, candidate, review, projection, redaction, and replay fixtures; `cargo test -p cove-map` covers unit behavior. |
+| Example End-to-End Mapping Sketch | Phase 1 Tesco fixture, CLI Surface Checklist | The Tesco/company alias fixtures and CLI commands implement the end-to-end sketch. |
+| Open Questions | Open Decisions Before Coding | Resolved decisions are recorded above and reflected in code/fixtures. |

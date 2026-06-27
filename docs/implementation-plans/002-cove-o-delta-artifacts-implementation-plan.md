@@ -120,8 +120,40 @@ Initial defaults for implementation:
    COVM section before implementation starts.
 4. Keep checkpoint deltas as ordinary deltas with Snapshot/Baseline-heavy
    payloads.
-5. Defer parent dictionary aliases until the next tier.
+5. Parent dictionary aliases are a tier-2 surface and are implemented after the
+   MVP parser/reconstruction path.
 6. Defer historical commit-order insertion.
+
+Resolved implementation decisions:
+
+1. `.covedelta` object-temporal sections reuse the existing COVE-O
+   `TemporalSegmentData` grammar for temporal payloads, with delta-native
+   envelope, parent, descriptor, sparse patch, touched-set, tombstone-set, and
+   state-hash sections layered around it.
+2. Dictionary overlays support inline values, parent dictionary aliases, and
+   non-materializing canonical hash hints with fail-closed validation for
+   invalid refs, missing feature gates, and zero hash hints.
+3. The COVM delta-chain selector is implemented as a required COVM extension
+   profile rather than a core COVM section.
+4. Checkpoints remain ordinary `.covedelta` artifacts using the checkpoint
+   baseline feature and Snapshot/Baseline temporal rows.
+5. `CovmDeltaReadAmplificationPolicy::default()` sets the portable operational
+   limits: warn at chain depth 16, require override after depth 64, recommend
+   checkpoints after 32 patch rows, and recommend compaction at 20% delta/base
+   byte ratio.
+6. Schema/catalog/projection/semantic-map/visibility/redaction evolution is
+   represented by effective fingerprints. The MVP accepts additive catalog
+   patches and otherwise requires a new compatible base snapshot.
+7. Snapshot-level COVE-I is optional and digest-bound to the exact chain
+   digest. Delta-aware COVE-I correction is implemented for base tombstone
+   overlays; stale chain digest fixtures fail closed.
+8. Chain-summary size and read amplification are controlled by summary bytes,
+   range-request metrics, checkpoint recommendations, compaction
+   recommendations, and small-delta packing recommendations in
+   `CovmDeltaReadAmplificationPolicy`.
+9. Source publication ranges live in the delta header and COVM chain summary
+   for operational pruning metrics; they are not standardized as ordinary
+   queryable COVE-O object metadata in the MVP.
 
 Acceptance:
 
@@ -631,23 +663,27 @@ Reject:
 5. changed association endpoint flags for inherited property.
 6. changed projection authority for inherited projection.
 
-### 5.2 Implement Inline Dictionary Overlays
+### 5.2 Implement Dictionary Overlays
 
-MVP supports `InlineValue` only.
-
-Model future entry kinds but reject unsupported required use:
-
-1. `InlineValue`.
-2. `ParentDictionaryAlias`.
-3. `CanonicalHashHint`.
+The implementation supports `InlineValue`, digest-bound
+`ParentDictionaryAlias`, and hint-only `CanonicalHashHint` entries.
 
 Rules:
+
+1. Inline entries require the inline-dictionary feature bit.
+2. Parent aliases require the parent-dictionary-alias feature bit, resolve to a
+   declared parent ref, and require parent dictionary digest refs.
+3. Canonical hash hints are non-materializing equality/pruning hints only; they
+   must not be required for materialization and must carry a non-zero hash.
+
+Additional rules:
 
 1. Delta pages use delta-local FileCodes.
 2. Parent aliases are an optimization only, not cross-file code domains.
 3. Hash hints cannot reconstruct values unless bytes are recoverable from a
    validated source.
-4. Redaction policy gates equality leakage.
+4. Redaction-sensitive equality leakage remains outside materialization; hash
+   hints do not expose value bytes.
 
 ### 5.3 Implement Canonical Branch Identity
 
@@ -1133,18 +1169,21 @@ Rules:
 
 ### 9.6 Second-Tier Features
 
-After MVP acceptance, add in this order:
+Implemented after MVP acceptance:
 
 1. Parent dictionary aliases.
-2. Hash/equality dictionary hints with redaction policy gates.
-3. Property-level touched bitmaps.
-4. Delta-local COVE-I indexes.
-5. Delta coverage patches.
-6. Checkpoint deltas if not already included in MVP implementation.
-7. COVE-MAP evidence/projection patches after plan 001 is stable.
-8. Object-store layout hints.
-9. Snapshot-level COVE-I indexes.
-10. Small-delta packing when request cost dominates bytes returned.
+2. Hash/equality dictionary hints as non-materializing hints that do not expose
+   value bytes.
+3. Property-level touched bitmap refs with descriptor validation.
+4. Checkpoint deltas.
+5. COVE-MAP evidence patches.
+6. COVE-MAP projection patches as non-authoritative projection metadata.
+7. Snapshot-level COVE-I chain-digest binding.
+8. Small-delta packing recommendations when request cost dominates bytes
+   returned.
+9. Delta-local COVE-I/COVX index hints, COVE-COVERAGE patch hints, and
+   object-store layout hints validate on request while corrupt optional
+   metadata still falls back for ordinary object replay.
 
 Deferred required extensions:
 
@@ -1338,49 +1377,49 @@ The smallest useful implementation supports:
 
 ## Proposal Coverage Matrix
 
-| Proposal section | Plan coverage |
-| --- | --- |
-| Summary | Objective, Implementation Contract |
-| Motivation | Objective, Publication and Compaction phases |
-| Goals | Implementation Contract, MVP checklist |
-| Non-Goals | Non-Goals |
-| Design Principle | Implementation Contract, all phases |
-| Profile Shape | Phase 0, Phase 2 |
-| Core Invariants | Implementation Contract |
-| Artifact Naming | Phase 0, Phase 3 |
-| COVM Delta-Chain Extension | Phase 1 |
-| Authoritative Surfaces | Phase 1, Phase 3, Phase 10 |
-| Delta Chain Summary | Phase 2 |
-| Binary Envelope | Phase 3 |
-| Delta Header | Phase 4.1 |
-| Parent References | Phase 4.2 |
-| Sections | Phase 4.3 |
-| Descriptor Tables | Phase 4.4 |
-| Delta Feature Bits | Phase 4.5 |
-| Catalog Patches | Phase 5.1 |
-| Dictionary Overlays | Phase 5.2, Phase 9.6 |
-| Branch Identity | Phase 5.3 |
-| Temporal Records | Phase 5.4 |
-| Continuation Anchors | Phase 6.1 |
-| Delta State Hash V1 | Phase 6.2 |
-| Patch Encoding | Phase 6.3 |
-| Touched Object Set | Phase 6.4 |
-| Reconstruction | Phase 7.1 |
-| Query Planning | Phase 7.2 |
-| Publication Protocol | Phase 8.1 |
-| Compaction | Phase 8.2 |
-| Checkpoint Deltas | Phase 8.3, Phase 9.6 |
-| Interaction With COVE-MAP | Phase 9.1 |
-| Interaction With COVE-I | Phase 9.2 |
-| Interaction With COVE-L | Phase 9.3 |
-| Trust And Digest Continuity | Phase 9.4 |
-| Efficiency Model | Phase 2, Phase 7, Phase 8 |
-| Read Amplification Budget | Phase 8.4 |
-| Failure Semantics | Phase 7.3 |
-| Security And Governance | Phase 9.5 |
-| Validation Requirements | Phase 10.1, Phase 10.2 |
-| Conformance Tests | Phase 10.3 |
-| Benchmark Plan | Phase 10.4 |
-| Open Questions | Phase 0 |
-| Recommended First Implementation | Recommended First Implementation Checklist |
-| Positioning | Objective, Non-Goals, Release Gate |
+| Proposal section | Plan coverage | Implementation evidence |
+| --- | --- | --- |
+| Summary | Objective, Implementation Contract | `.covedelta` envelope, COVM chain selection, reconstruction, compaction checks, and conformance fixtures are implemented in `crates/cove-core/src/artifact/covedelta.rs`, `crates/cove-core/src/artifact/covm.rs`, and `crates/cove-core/src/profile/cove_o/readback.rs`. |
+| Motivation | Objective, Publication and Compaction phases | Generated fixtures cover base-plus-delta reconstruction, compacted equivalence, COVM chain selection, and read-amplification metrics. |
+| Goals | Implementation Contract, MVP checklist | MVP parser, validator, reconstruction, pruning, publication, and conformance paths pass in the workspace test/check commands and 661-fixture conformance corpus. |
+| Non-Goals | Non-Goals | In-place mutation, filename discovery, raw cross-artifact FileCode equality, historical inserts, and merge DAGs are rejected or deferred behind unsupported required feature bits. |
+| Design Principle | Implementation Contract, all phases | Chain digest, parent ref, feature-bit, section-directory, and effective-fingerprint validation live in `covm.rs` and `covedelta.rs`. |
+| Profile Shape | Phase 0, Phase 2 | The implementation uses `CVD2`, `.covedelta`, a required COVM delta-chain extension, and `CDS1` chain summaries. |
+| Core Invariants | Implementation Contract | Validators enforce final magic/footer/postscript consistency, exact ordered chain selection, lineage parent refs, append-only CSN/commit ranges, and no base-only selected delta reads. |
+| Artifact Naming | Phase 0, Phase 3 | `MAGIC_COVEDELTA` is `CVD2`; `crates/cove-core/src/artifact/mod.rs` exposes the `covedelta` artifact module. |
+| COVM Delta-Chain Extension | Phase 1 | `CovmDeltaChainExtensionV1`, artifact refs, chain digests, and selected-chain validators are implemented in `covm.rs`. |
+| Authoritative Surfaces | Phase 1, Phase 3, Phase 10 | Selected COVM chains, declared summaries, and full delta validation are the authoritative inputs; conformance rejects missing/extra/reordered/stale deltas. |
+| Delta Chain Summary | Phase 2 | `CovmDeltaChainSummaryV1` and `DeltaChainSummaryEntryV1` parse, validate, prune, and expose metrics in `covm.rs`. |
+| Binary Envelope | Phase 3 | `CoveDeltaFile` serializes/parses header, parent refs, section directory, footer, postscript, CRCs, and final `CVD2` magic. |
+| Delta Header | Phase 4.1 | `CoveDeltaHeaderV1` carries artifact/snapshot identity, features, ranges, scope, and effective fingerprint refs. |
+| Parent References | Phase 4.2 | `DeltaParentRefV1` validates lineage parent count, parent snapshot identity, file length, footer CRC, digest, and fingerprint refs. |
+| Sections | Phase 4.3 | `CoveDeltaSectionKind` covers catalog patches, temporal indexes/data, sparse property ops, anchors, touched/tombstone sets, descriptors, dictionary overlays, evidence patches, and optional hints. |
+| Descriptor Tables | Phase 4.4 | Scope, summary, temporal-role, touched, tombstone, and state-hash descriptors are parsed and cross-checked in `covedelta.rs`. |
+| Delta Feature Bits | Phase 4.5 | Required and optional delta feature bits gate sparse patches, tombstones, anchors, inline dictionaries, exact sets, checkpoints, evidence patches, coverage, indexes, projection patches, and deferred historical inserts. |
+| Catalog Patches | Phase 5.1 | Additive object catalog patch sections validate item counts and reject parent reinterpretation; reconstruction fixtures cover catalog patch output. |
+| Dictionary Overlays | Phase 5.2, Phase 9.6 | Inline dictionary overlays, parent dictionary aliases, and non-materializing canonical hash hints are supported with feature gates, parent-ref validation, and conformance fixtures. |
+| Branch Identity | Phase 5.3 | `DeltaBranchIdentityV1` validates canonical/hash-only branch identity and rejects raw parent FileCode identity across artifacts. |
+| Temporal Records | Phase 5.4 | Delta temporal sections reuse `TemporalSegmentData` parsing and enforce sorted rows, CSN bounds, record IDs, branch/scope invariants, and file-local `prev_ref`. |
+| Continuation Anchors | Phase 6.1 | `DeltaContinuationAnchorV1` validates scope, branch, predecessor CSN/record ID, anchor strength, and state-hash refs. |
+| Delta State Hash V1 | Phase 6.2 | `CoveObjectDeltaStateHashV1` and `DeltaStateHashDescriptorV1` materialize and validate stored state-hash material. |
+| Patch Encoding | Phase 6.3 | `DeltaSparsePatchRecordV1` supports `SetValue`, `SetNull`, `Clear`, `Tombstone`, and `Redact`, with reject fixtures for malformed op combinations. |
+| Touched Object Set | Phase 6.4, Phase 9.6 | Exact touched and tombstone range sections validate coverage, bind property bitmap refs to property-bitmap descriptors, and support point/projection skip decisions. |
+| Reconstruction | Phase 7.1 | `readback.rs` reconstructs latest object states from base plus deltas, including sparse patches, associations, catalog patches, and tombstones. |
+| Query Planning | Phase 7.2 | `CovmDeltaChainSummaryV1::prune_delta_chain`, read-amplification metrics, exact touched sets, property skip checks, and COVE-I tombstone correction support planning. |
+| Publication Protocol | Phase 8.1 | `durable_publish_delta_then_manifest` writes delta before manifest, and conformance covers manifest ordering. |
+| Compaction | Phase 8.2 | Compaction equivalence fixtures compare reconstructed base-plus-delta state with compacted self-contained COVE-O output. |
+| Checkpoint Deltas | Phase 8.3, Phase 9.6 | Checkpoint baseline features parse and require Snapshot/Baseline rows; checkpoint policy metrics recommend when to checkpoint. |
+| Interaction With COVE-MAP | Phase 9.1, Phase 9.6 | Delta effective semantic-map/projection fingerprints inherit/override through header and parent refs; evidence patch sections require `DELTA_FEATURE_MAP_EVIDENCE_PATCH`, and projection patch sections require `DELTA_FEATURE_PROJECTION_PATCH` plus a projection fingerprint. |
+| Interaction With COVE-I | Phase 9.2, Phase 9.6 | COVE-I delta-chain digests, tombstone overlay correction, stale digest fixtures, and requested delta-local index hint validation enforce index compatibility. |
+| Interaction With COVE-L | Phase 9.3, Phase 9.6 | Object-store layout/index/coverage corruption remains optional-fallback behavior unless required by the selected operation; requested layout/index/coverage hint validators reject malformed or misbound sidecar metadata. |
+| Trust And Digest Continuity | Phase 9.4 | Parent refs, chain digests, summary digests, state hashes, footer CRCs, and artifact digest checks bind selected snapshots. |
+| Efficiency Model | Phase 2, Phase 7, Phase 8 | Summary pruning, exact touched/tombstone sets, read-amplification metrics, checkpoint recommendations, compaction recommendations, and packing recommendations are implemented. |
+| Read Amplification Budget | Phase 8.4 | `CovmDeltaReadAmplificationMetrics` and `CovmDeltaReadAmplificationPolicy` expose chain depth, skipped/opened deltas, range requests, bytes returned, and policy recommendations. |
+| Failure Semantics | Phase 7.3 | Missing, corrupt, stale, reordered, unsupported-required, under-inclusive, and unsafe optional sections fail closed or fall back only when safe. |
+| Security And Governance | Phase 9.5 | Effective visibility/redaction fingerprints are bound in headers/parents/chain extensions; parent aliases and hash hints are validated without exposing protected parent values. |
+| Validation Requirements | Phase 10.1, Phase 10.2 | Snapshot-selection validators and full object-delta validators are implemented in `covm.rs` and `covedelta.rs`; conformance invokes both. |
+| Conformance Tests | Phase 10.3 | Generated fixtures cover the required MVP vectors, including sparse patches, anchors, tombstones, compaction, COVE-I correction, stale digests, optional fallback, and unsupported required features. |
+| Benchmark Plan | Phase 10.4 | Benchmark-facing metrics and policy recommendations are implemented; full benchmark execution remains a release measurement step outside conformance. |
+| Open Questions | Phase 0 | Resolved implementation decisions are recorded above and reflected in feature gates, validators, and fixtures. |
+| Recommended First Implementation | Recommended First Implementation Checklist | The MVP checklist maps to implemented COVM extension, chain summary, `CVD2` envelope, digests, fingerprints, inline dictionaries, temporal/sparse sections, tombstones, exact sets, anchors, append-only policy, and compaction tests. |
+| Positioning | Objective, Non-Goals, Release Gate | The implementation is an optional publication/efficiency layer; ordinary `.cove` files remain immutable and self-contained, with unsupported second-tier features fail-closed when required. |

@@ -1,0 +1,34 @@
+{
+  "expect_association_readback_flags": true,
+  "expect_cove_o_valid": true,
+  "expected_conversion": {
+    "association_count": 1,
+    "object_count": 2,
+    "resolver_hit_count": 1
+  },
+  "expected_conversion_summary": {
+    "assertion_count": 4,
+    "evidence_entry_count": 3,
+    "materialized_row_count": 3
+  },
+  "expected_evidence_entries": [
+    {
+      "contains": {
+        "alias_hit": true,
+        "canonical_key": "team:alpha",
+        "rule_id": "team_row",
+        "source_id": "cove_map_alias_teams"
+      },
+      "present": [
+        "resolver_digest",
+        "catalog_digest",
+        "pipeline_digest"
+      ]
+    }
+  ],
+  "mapping": "accept/cove_map_alias_backed_association.covemap",
+  "sources": [
+    "accept/cove_map_alias_memberships.csv",
+    "accept/cove_map_alias_teams.csv"
+  ]
+}

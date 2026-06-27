@@ -1,0 +1,22 @@
+{
+  "expect_persisted_projection_rows": true,
+  "expected_projected_rows": [
+    {
+      "canonical_key": "uk-company:tesco",
+      "canonical_label": "Tesco",
+      "normalized_value": "tesco plc",
+      "output_table": "company_resolution",
+      "projection_id": "company_resolution_projection",
+      "raw_observed_value": "Tesco PLC"
+    }
+  ],
+  "expected_projection": {
+    "format": "json",
+    "mapping_id": "company-map",
+    "mapping_version": "2026.06"
+  },
+  "mapping": "accept/cove_map_resolution_projection.covemap",
+  "sources": [
+    "accept/company_resolution_projection.csv"
+  ]
+}

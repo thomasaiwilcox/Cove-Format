@@ -29,7 +29,44 @@ pub(crate) fn usage(topic: HelpTopic) -> String {
 }
 
 fn global_usage() -> &'static str {
-    "Usage:\n  cove examples [--json]\n  cove showcase customer360 --out <dir> [--profile quick|standard|publication] [--force] [--json]\n  cove showcase proof-suite --out <dir> [--scenario customer360|claims|catalog|all] [--profile quick|standard|publication] [--force] [--json]\n  cove doctor [--json] <file>\n  cove inspect [--queries] [--performance] [--json] <file>\n  cove inspect [--json] [--sections stats,dictionary,execution,indexes,optional] <file...>\n  cove optimize <file> [--out-dir dir] [--full] [--json]\n  cove query [--format table|json|jsonl|csv] [--take n] [--max-cell-width n] [--explain [public|developer|proof|coded|forensic]] [--engine auto|materialized|physical|compare|kernel] [--no-auto-sidecars] [--strict-performance] [--perf-report] [--batch-size n] [--external-table name=path.csv|json|jsonl] [--enable-graph-traversal] [--max-graph-depth n] [--max-graph-paths n] [--max-graph-fanout n] [--mapping file.covemap] [--member id=path] [--dataset dir] [--covi file] [--covx file] [--cove-e file] [file] '<coveql>'\n  cove query [options] --query-file <path|-> [file]\n  cove convert <parquet|arrow|orc|csv|report> ...\n  cove validate ...\n  cove dump ...\n  cove map <validate|preview|plan-keys|convert|build|publish|doctor|suggest|parity|explain|diff|project|test> ...\n  cove export arrow ...\n  cove perf <explain-pruning|plan-cost> ...\n  cove sidecar inspect <index|coverage|layout|cache|runtime> <file>\n  cove sidecar build <covi|covx|covm> ...\n  cove digest verify <file.cove> [--require]\n  cove profile <inspect|generate|validate-section> ...\n  cove canonicalise <validate-payload|encode-json|check-domain|check-trust> ...\n\nExamples:\n  cove examples\n  cove showcase customer360 --profile quick --out examples/customer360 --force\n  cove showcase proof-suite --scenario all --profile quick --out target/cove-proof-suite --force\n  cove doctor people.cove\n  cove inspect --queries --performance people.cove\n  cove convert parquet source.parquet output.cove\n  cove validate --semantic output.cove\n  cove optimize output.cove\n  cove query output.cove 'table(source).take(10)'\n  cove query --format jsonl people.cove 'table(people).where(active == true)'\n  cove map preview mapping.covemap\n  cove map build --verify --publish-covm --out-dir bundle mapping.covemap source.csv\n  cove sidecar build covi output.cove output.covi --all-columns\n  cove sidecar build covi people.cove people.covi --object-properties\n  cove query --query-file query.coveql people.cove"
+    r#"Usage:
+  cove examples [--json]
+  cove showcase customer360 --out <dir> [--profile quick|standard|publication] [--force] [--json]
+  cove showcase proof-suite --out <dir> [--scenario customer360|claims|catalog|all] [--profile quick|standard|publication] [--force] [--json]
+  cove doctor [--json] <file>
+  cove inspect [--queries] [--performance] [--json] <file>
+  cove inspect [--json] [--sections stats,dictionary,execution,indexes,optional] <file...>
+  cove optimize <file> [--out-dir dir] [--full] [--json]
+  cove query [--format table|json|jsonl|csv] [--take n] [--max-cell-width n] [--explain [public|developer|proof|coded|forensic]] [--engine auto|materialized|physical|compare|kernel] [--no-auto-sidecars] [--strict-performance] [--perf-report] [--batch-size n] [--external-table name=path.csv|json|jsonl] [--enable-graph-traversal] [--max-graph-depth n] [--max-graph-paths n] [--max-graph-fanout n] [--mapping file.covemap] [--member id=path] [--dataset dir] [--covi file] [--covx file] [--cove-e file] [file] '<coveql>'
+  cove query [options] --query-file <path|-> [file]
+  cove convert <parquet|arrow|orc|csv|report> ...
+  cove validate ...
+  cove dump ...
+  cove map <validate|preview|plan-keys|candidates|review|aliases|replay|convert|build|publish|doctor|suggest|parity|explain|diff|project|test> ...
+  cove export arrow ...
+  cove perf <explain-pruning|plan-cost> ...
+  cove sidecar inspect <index|coverage|layout|cache|runtime> <file>
+  cove sidecar build <covi|covx|covm> ...
+  cove digest verify <file.cove> [--require]
+  cove profile <inspect|generate|validate-section> ...
+  cove canonicalise <validate-payload|encode-json|check-domain|check-trust> ...
+
+Examples:
+  cove examples
+  cove showcase customer360 --profile quick --out examples/customer360 --force
+  cove showcase proof-suite --scenario all --profile quick --out target/cove-proof-suite --force
+  cove doctor people.cove
+  cove inspect --queries --performance people.cove
+  cove convert parquet source.parquet output.cove
+  cove validate --semantic output.cove
+  cove optimize output.cove
+  cove query output.cove 'table(source).take(10)'
+  cove query --format jsonl people.cove 'table(people).where(active == true)'
+  cove map preview mapping.covemap
+  cove map build --verify --publish-covm --out-dir bundle mapping.covemap source.csv
+  cove sidecar build covi output.cove output.covi --all-columns
+  cove sidecar build covi people.cove people.covi --object-properties
+  cove query --query-file query.coveql people.cove"#
 }
 
 fn query_usage() -> &'static str {
@@ -57,7 +94,47 @@ fn convert_usage() -> &'static str {
 }
 
 fn map_usage() -> &'static str {
-    "Usage:\n  cove map validate <mapping.covemap>\n  cove map preview <mapping.covemap>\n  cove map plan-keys <mapping.covemap> <source...>\n  cove map convert [--format json|cove-o] [-o output] <mapping.covemap> <source...>\n  cove map build --out-dir <dir> [--verify] [--publish-covm] [--force] [--json] [--object-name name.cove] [--projection-output cove-t|none] [--evidence-encoding compact|expanded|both] [--section-compression zstd|none] <mapping.covemap> <source...>\n  cove map publish --bundle-dir <dir> --out <dataset.covm> [--force] [--json]
-  cove map doctor [--json] [--strict] --bundle-dir <dir>\n  cove map doctor [--json] [--strict] <mapping.covemap> <source...>\n  cove map suggest [--json] [--out suggestions.json] <source...>\n  cove map parity [--json] --projection-id <id> --expected <table> [--expected-query <coveql>] [--key col[,col...]] <mapping.covemap> <source...>\n  cove map parity-cove-o [--json] --projection-id <id> --expected <table> [--expected-query <coveql>] [--key col[,col...]] <object.cove>\n  cove map project [-o output] [--format json|arrow|cove-t|sql] <mapping.covemap> <source...>\n  cove map project-cove-o [--mapping mapping.covemap] [-o output] <object.cove>\n  cove map explain <mapping.covemap> <goid|assertion-id>\n  cove map diff <left.covemap> <right.covemap>\n  cove map test <fixture.json>\n\nBehavior:\n  cove map build emits COVE-O, COVE-T projections when enabled, reports, a bundle manifest, and COVE-I acceleration roots and optional normative COVM publication.\n\nExamples:\n  cove map validate people.covemap\n  cove map preview people.covemap\n  cove map convert --format cove-o -o people.cove people.covemap people.jsonl\n  cove map build --verify --publish-covm --out-dir people-bundle people.covemap people.jsonl\n  cove map publish --bundle-dir people-bundle --out people.covm --force
-  cove map doctor --bundle-dir people-bundle\n  cove map suggest people.csv people.jsonl\n  cove map parity --projection-id people.v1 --expected expected.csv --key id people.covemap people.jsonl\n  cove map project --format json people.covemap people.jsonl"
+    r#"Usage:
+  cove map validate <mapping.covemap>
+  cove map preview <mapping.covemap>
+  cove map plan-keys <mapping.covemap> <source...>
+  cove map candidates [--out candidates.json] <mapping.covemap> <source...>
+  cove map review [--out reviewed.json] <candidate-matches.json>
+  cove map review export <mapping.covemap> [--out reviewed.json]
+  cove map review import <mapping.covemap> <reviewed.json> --out <mapping.covemap> [--replace]
+  cove map aliases import <mapping.covemap> <aliases.csv> --catalog-id <id> --resolver-id <id> --out <mapping.covemap>
+  cove map replay verify <mapping.covemap> <conversion-report.json>
+  cove map convert [--format json|cove-o] [-o output] <mapping.covemap> <source...>
+  cove map build --out-dir <dir> [--verify] [--publish-covm] [--force] [--json] [--object-name name.cove] [--projection-output cove-t|none] [--evidence-encoding compact|expanded|both] [--section-compression zstd|none] <mapping.covemap> <source...>
+  cove map publish --bundle-dir <dir> --out <dataset.covm> [--force] [--json]
+  cove map doctor [--json] [--strict] --bundle-dir <dir>
+  cove map doctor [--json] [--strict] <mapping.covemap> <source...>
+  cove map suggest [--json] [--out suggestions.json] <source...>
+  cove map parity [--json] --projection-id <id> --expected <table> [--expected-query <coveql>] [--key col[,col...]] <mapping.covemap> <source...>
+  cove map parity-cove-o [--json] --projection-id <id> --expected <table> [--expected-query <coveql>] [--key col[,col...]] <object.cove>
+  cove map project [-o output] [--format json|arrow|cove-t|sql] <mapping.covemap> <source...>
+  cove map project-cove-o [--mapping mapping.covemap] [-o output] <object.cove>
+  cove map explain <mapping.covemap> <goid|assertion-id>
+  cove map diff <left.covemap> <right.covemap>
+  cove map test <fixture.json>
+
+Behavior:
+  cove map build emits COVE-O, COVE-T projections when enabled, reports, a bundle manifest, and COVE-I acceleration roots and optional normative COVM publication.
+
+Examples:
+  cove map validate people.covemap
+  cove map preview people.covemap
+  cove map convert --format cove-o -o people.cove people.covemap people.jsonl
+  cove map build --verify --publish-covm --out-dir people-bundle people.covemap people.jsonl
+  cove map publish --bundle-dir people-bundle --out people.covm --force
+  cove map candidates --out candidates.json people.covemap people.jsonl
+  cove map review --out reviewed.json candidates.json
+  cove map review export people-reviewed.covemap --out reviewed-export.json
+  cove map review import people.covemap reviewed.json --out people-reviewed.covemap
+  cove map aliases import people.covemap aliases.csv --catalog-id company_aliases --resolver-id company_name_resolver --out people-with-aliases.covemap
+  cove map replay verify people-reviewed.covemap conversion-report.json
+  cove map doctor --bundle-dir people-bundle
+  cove map suggest people.csv people.jsonl
+  cove map parity --projection-id people.v1 --expected expected.csv --key id people.covemap people.jsonl
+  cove map project --format json people.covemap people.jsonl"#
 }

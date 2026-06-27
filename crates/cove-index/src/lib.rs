@@ -668,6 +668,9 @@ pub struct CoviSnapshotValidityV2 {
     pub semantic_map_fingerprint_ref: u32,
     pub external_visibility_ref: u32,
     pub data_checksum_root_ref: u32,
+    pub delta_chain_digest_algorithm: u16,
+    pub delta_chain_digest_len: u16,
+    pub delta_chain_digest_offset: u64,
     pub valid_from_us: i64,
     pub valid_until_us: i64,
     pub flags: u32,
@@ -675,36 +678,99 @@ pub struct CoviSnapshotValidityV2 {
 }
 
 impl CoviSnapshotValidityV2 {
-    pub const LEN: usize = 76;
+    pub const LEGACY_LEN: usize = 76;
+    pub const LEN: usize = 88;
 
     pub fn parse(bytes: &[u8]) -> Result<Self, CoveError> {
-        if bytes.len() < Self::LEN {
-            return Err(CoveError::BufferTooShort);
-        }
-        let item = Self {
-            snapshot_validity_ref: read_u32(bytes, 0)?,
-            dataset_id: read_uuid(bytes, 4)?,
-            snapshot_id: read_uuid(bytes, 20)?,
-            schema_fingerprint_ref: read_u32(bytes, 36)?,
-            semantic_map_fingerprint_ref: read_u32(bytes, 40)?,
-            external_visibility_ref: read_u32(bytes, 44)?,
-            data_checksum_root_ref: read_u32(bytes, 48)?,
-            valid_from_us: read_i64(bytes, 52)?,
-            valid_until_us: read_i64(bytes, 60)?,
-            flags: read_u32(bytes, 68)?,
-            checksum: read_u32(bytes, 72)?,
+        let item = match bytes.len() {
+            Self::LEGACY_LEN => {
+                let item = Self {
+                    snapshot_validity_ref: read_u32(bytes, 0)?,
+                    dataset_id: read_uuid(bytes, 4)?,
+                    snapshot_id: read_uuid(bytes, 20)?,
+                    schema_fingerprint_ref: read_u32(bytes, 36)?,
+                    semantic_map_fingerprint_ref: read_u32(bytes, 40)?,
+                    external_visibility_ref: read_u32(bytes, 44)?,
+                    data_checksum_root_ref: read_u32(bytes, 48)?,
+                    delta_chain_digest_algorithm: DigestAlgorithm::None as u16,
+                    delta_chain_digest_len: 0,
+                    delta_chain_digest_offset: 0,
+                    valid_from_us: read_i64(bytes, 52)?,
+                    valid_until_us: read_i64(bytes, 60)?,
+                    flags: read_u32(bytes, 68)?,
+                    checksum: read_u32(bytes, 72)?,
+                };
+                verify_crc(bytes, 72, item.checksum)?;
+                item
+            }
+            Self::LEN => {
+                let item = Self {
+                    snapshot_validity_ref: read_u32(bytes, 0)?,
+                    dataset_id: read_uuid(bytes, 4)?,
+                    snapshot_id: read_uuid(bytes, 20)?,
+                    schema_fingerprint_ref: read_u32(bytes, 36)?,
+                    semantic_map_fingerprint_ref: read_u32(bytes, 40)?,
+                    external_visibility_ref: read_u32(bytes, 44)?,
+                    data_checksum_root_ref: read_u32(bytes, 48)?,
+                    delta_chain_digest_algorithm: read_u16(bytes, 52)?,
+                    delta_chain_digest_len: read_u16(bytes, 54)?,
+                    delta_chain_digest_offset: read_u64(bytes, 56)?,
+                    valid_from_us: read_i64(bytes, 64)?,
+                    valid_until_us: read_i64(bytes, 72)?,
+                    flags: read_u32(bytes, 80)?,
+                    checksum: read_u32(bytes, 84)?,
+                };
+                verify_crc(bytes, 84, item.checksum)?;
+                item
+            }
+            len if len < Self::LEGACY_LEN => return Err(CoveError::BufferTooShort),
+            _ => return Err(CoveError::BadCovi),
         };
-        verify_crc(&bytes[..Self::LEN], 72, item.checksum)?;
         if item.valid_until_us < item.valid_from_us {
             return Err(CoveError::BadCovi);
         }
+        item.validate_delta_chain_digest_ref()?;
         Ok(item)
     }
 
     pub fn parse_many(bytes: &[u8]) -> Result<Vec<Self>, CoveError> {
-        parse_dense_many(bytes, Self::LEN, Self::parse, |item| {
-            item.snapshot_validity_ref
-        })
+        let new_multiple = bytes.len().is_multiple_of(Self::LEN);
+        let legacy_multiple = bytes.len().is_multiple_of(Self::LEGACY_LEN);
+        if new_multiple {
+            match Self::parse_many_with_len(bytes, Self::LEN) {
+                Ok(items) => return Ok(items),
+                Err(err) if !legacy_multiple => return Err(err),
+                Err(_) => {}
+            }
+        }
+        if legacy_multiple {
+            return Self::parse_many_with_len(bytes, Self::LEGACY_LEN);
+        }
+        Err(CoveError::BadCovi)
+    }
+
+    pub fn parse_many_for_count(bytes: &[u8], count: u32) -> Result<Vec<Self>, CoveError> {
+        let count = usize::try_from(count).map_err(|_| CoveError::ArithOverflow)?;
+        let len = if bytes.len()
+            == count
+                .checked_mul(Self::LEN)
+                .ok_or(CoveError::ArithOverflow)?
+        {
+            Self::LEN
+        } else if bytes.len()
+            == count
+                .checked_mul(Self::LEGACY_LEN)
+                .ok_or(CoveError::ArithOverflow)?
+        {
+            Self::LEGACY_LEN
+        } else {
+            return Err(CoveError::BadCovi);
+        };
+        Self::parse_many_with_len(bytes, len)
+    }
+
+    fn parse_many_with_len(bytes: &[u8], len: usize) -> Result<Vec<Self>, CoveError> {
+        parse_dense_many(bytes, len, Self::parse, |item| item.snapshot_validity_ref)
     }
 
     pub fn serialize(&self) -> [u8; Self::LEN] {
@@ -716,12 +782,38 @@ impl CoviSnapshotValidityV2 {
         out[40..44].copy_from_slice(&self.semantic_map_fingerprint_ref.to_le_bytes());
         out[44..48].copy_from_slice(&self.external_visibility_ref.to_le_bytes());
         out[48..52].copy_from_slice(&self.data_checksum_root_ref.to_le_bytes());
-        out[52..60].copy_from_slice(&self.valid_from_us.to_le_bytes());
-        out[60..68].copy_from_slice(&self.valid_until_us.to_le_bytes());
-        out[68..72].copy_from_slice(&self.flags.to_le_bytes());
+        out[52..54].copy_from_slice(&self.delta_chain_digest_algorithm.to_le_bytes());
+        out[54..56].copy_from_slice(&self.delta_chain_digest_len.to_le_bytes());
+        out[56..64].copy_from_slice(&self.delta_chain_digest_offset.to_le_bytes());
+        out[64..72].copy_from_slice(&self.valid_from_us.to_le_bytes());
+        out[72..80].copy_from_slice(&self.valid_until_us.to_le_bytes());
+        out[80..84].copy_from_slice(&self.flags.to_le_bytes());
         let crc = checksum::crc32c(&out);
-        out[72..76].copy_from_slice(&crc.to_le_bytes());
+        out[84..88].copy_from_slice(&crc.to_le_bytes());
         out
+    }
+
+    fn validate_delta_chain_digest_ref(&self) -> Result<(), CoveError> {
+        let algorithm = DigestAlgorithm::from_u16(self.delta_chain_digest_algorithm)
+            .ok_or(CoveError::BadCovi)?;
+        match algorithm {
+            DigestAlgorithm::None => {
+                if self.delta_chain_digest_len != 0 || self.delta_chain_digest_offset != 0 {
+                    return Err(CoveError::BadCovi);
+                }
+            }
+            DigestAlgorithm::Sha256 | DigestAlgorithm::Blake3 => {
+                if self.delta_chain_digest_len != 32 {
+                    return Err(CoveError::BadCovi);
+                }
+                checked_end(
+                    self.delta_chain_digest_offset,
+                    u64::from(self.delta_chain_digest_len),
+                )?;
+            }
+            _ => return Err(CoveError::BadCovi),
+        }
+        Ok(())
     }
 }
 
@@ -2901,13 +2993,8 @@ impl CoviArtifactV2 {
             CoviReferencedFileV2::LEN,
             postscript_offset,
         )?)?;
-        let snapshot_validity = CoviSnapshotValidityV2::parse_many(parse_fixed_region(
-            bytes,
-            header.snapshot_validity_offset,
-            header.snapshot_validity_count,
-            CoviSnapshotValidityV2::LEN,
-            postscript_offset,
-        )?)?;
+        let snapshot_validity =
+            parse_snapshot_validity_region(bytes, &header, &sections, postscript_offset)?;
         let index_roots = CoviIndexRootV2::parse_many(parse_fixed_region(
             bytes,
             header.index_roots_offset,
@@ -3414,6 +3501,54 @@ fn parse_fixed_region(
     Ok(&bytes[start..end])
 }
 
+fn parse_snapshot_validity_region(
+    bytes: &[u8],
+    header: &CoviHeaderV2,
+    sections: &[CoviSectionEntryV2],
+    section_limit: usize,
+) -> Result<Vec<CoviSnapshotValidityV2>, CoveError> {
+    if header.snapshot_validity_count == 0 {
+        if header.snapshot_validity_offset != 0 {
+            return Err(CoveError::BadCovi);
+        }
+        return Ok(Vec::new());
+    }
+    if header.snapshot_validity_offset == 0 {
+        return Err(CoveError::BadCovi);
+    }
+    let start =
+        usize::try_from(header.snapshot_validity_offset).map_err(|_| CoveError::OffsetRange)?;
+    let end = snapshot_validity_region_end(header, sections, section_limit)?;
+    if end < start || end > section_limit || end > bytes.len() {
+        return Err(CoveError::OffsetRange);
+    }
+    CoviSnapshotValidityV2::parse_many_for_count(&bytes[start..end], header.snapshot_validity_count)
+}
+
+fn snapshot_validity_region_end(
+    header: &CoviHeaderV2,
+    sections: &[CoviSectionEntryV2],
+    section_limit: usize,
+) -> Result<usize, CoveError> {
+    let start = header.snapshot_validity_offset;
+    let mut end = u64::try_from(section_limit).map_err(|_| CoveError::OffsetRange)?;
+    let mut consider = |offset: u64| {
+        if offset > start && offset < end {
+            end = offset;
+        }
+    };
+    if header.index_root_count != 0 {
+        consider(header.index_roots_offset);
+    }
+    if header.capability_count != 0 {
+        consider(header.capabilities_offset);
+    }
+    for section in sections {
+        consider(section.offset);
+    }
+    usize::try_from(end).map_err(|_| CoveError::OffsetRange)
+}
+
 fn validate_dense_ids<T, F>(items: &[T], id: F) -> Result<(), CoveError>
 where
     F: Fn(&T) -> u32,
@@ -3641,11 +3776,31 @@ mod tests {
             semantic_map_fingerprint_ref: u32::MAX,
             external_visibility_ref: u32::MAX,
             data_checksum_root_ref: u32::MAX,
+            delta_chain_digest_algorithm: DigestAlgorithm::None as u16,
+            delta_chain_digest_len: 0,
+            delta_chain_digest_offset: 0,
             valid_from_us: 0,
             valid_until_us: i64::MAX,
             flags: 0,
             checksum: 0,
         }
+    }
+
+    fn serialize_legacy_snapshot_validity(item: &CoviSnapshotValidityV2) -> [u8; 76] {
+        let mut out = [0u8; 76];
+        out[0..4].copy_from_slice(&item.snapshot_validity_ref.to_le_bytes());
+        out[4..20].copy_from_slice(&item.dataset_id);
+        out[20..36].copy_from_slice(&item.snapshot_id);
+        out[36..40].copy_from_slice(&item.schema_fingerprint_ref.to_le_bytes());
+        out[40..44].copy_from_slice(&item.semantic_map_fingerprint_ref.to_le_bytes());
+        out[44..48].copy_from_slice(&item.external_visibility_ref.to_le_bytes());
+        out[48..52].copy_from_slice(&item.data_checksum_root_ref.to_le_bytes());
+        out[52..60].copy_from_slice(&item.valid_from_us.to_le_bytes());
+        out[60..68].copy_from_slice(&item.valid_until_us.to_le_bytes());
+        out[68..72].copy_from_slice(&item.flags.to_le_bytes());
+        let crc = checksum::crc32c(&out);
+        out[72..76].copy_from_slice(&crc.to_le_bytes());
+        out
     }
 
     fn index_root(index_root_id: u32) -> CoviIndexRootV2 {
@@ -3802,6 +3957,31 @@ mod tests {
         assert!(capability
             .validate_for_use_context(&overlay_context)
             .is_ok());
+    }
+
+    #[test]
+    fn snapshot_validity_parse_many_falls_back_for_ambiguous_legacy_table() {
+        let mut bytes = Vec::new();
+        for snapshot_validity_ref in 0..22 {
+            let mut item = snapshot_validity(snapshot_validity_ref);
+            item.valid_from_us = i64::from(snapshot_validity_ref);
+            item.valid_until_us = i64::MAX - i64::from(snapshot_validity_ref);
+            bytes.extend_from_slice(&serialize_legacy_snapshot_validity(&item));
+        }
+        assert!(bytes.len().is_multiple_of(CoviSnapshotValidityV2::LEN));
+        assert!(bytes
+            .len()
+            .is_multiple_of(CoviSnapshotValidityV2::LEGACY_LEN));
+
+        let parsed = CoviSnapshotValidityV2::parse_many(&bytes).unwrap();
+
+        assert_eq!(parsed.len(), 22);
+        assert_eq!(parsed[21].snapshot_validity_ref, 21);
+        assert!(parsed.iter().all(|item| {
+            item.delta_chain_digest_algorithm == DigestAlgorithm::None as u16
+                && item.delta_chain_digest_len == 0
+                && item.delta_chain_digest_offset == 0
+        }));
     }
 
     #[test]

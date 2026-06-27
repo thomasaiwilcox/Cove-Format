@@ -1,0 +1,16 @@
+{
+  "expect_cove_o_valid": true,
+  "expected_conversion": {
+    "candidate_match_count": 1,
+    "object_count": 2
+  },
+  "expected_conversion_summary": {
+    "assertion_count": 3,
+    "evidence_entry_count": 3,
+    "materialized_row_count": 2
+  },
+  "mapping": "accept/cove_map_candidate_rules.covemap",
+  "sources": [
+    "accept/company_candidates.csv"
+  ]
+}

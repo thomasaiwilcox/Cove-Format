@@ -554,6 +554,15 @@ fn rows() -> Vec<Row> {
             notes: "TrustManifest parser plus trust_chain.rs reader integration; full-file accept/reject corpus; `TrustManifest::serialize` round-trips with parser",
         },
         Row {
+            section: "§63.1",
+            capability: "COVE-O delta artifact profile",
+            modeled: "yes",
+            parsed: "yes",
+            validated: "yes",
+            written: "yes",
+            notes: "artifact/covedelta.rs models, parses, serializes, and validates `CVD2` envelopes, digest-bound parent refs, descriptors, sparse patch ops, anchors, state hashes, inline dictionaries, parent dictionary aliases, non-materializing hash hints, exact touched/tombstone sets, property bitmap refs, additive catalog/projection patches, requested index/coverage/layout sidecar hints, optional fallback, reconstruction, and compaction fixtures",
+        },
+        Row {
             section: "§64",
             capability: "Redaction manifest",
             modeled: "yes",
@@ -659,7 +668,7 @@ fn rows() -> Vec<Row> {
             parsed: "yes",
             validated: "yes",
             written: "yes",
-            notes: "artifact/covm.rs; accept/reject manifest corpus plus mount-time freshness/fallback fixtures; `CovmFile::serialize` round-trips with parser",
+            notes: "artifact/covm.rs; accept/reject manifest corpus plus mount-time freshness/fallback fixtures; `CovmFile::serialize` round-trips with parser; delta-chain extension and summary validation cover ordered base-plus-delta selection, digest binding, pruning, and fail-closed non-delta readers",
         },
         Row {
             section: "§69.5",
@@ -707,13 +716,22 @@ fn rows() -> Vec<Row> {
             notes: "cove-map builds canonical length-delimited join key tuples from declared components/functions; execution corpus covers multi-rule identity planning and rejects undeclared join-key functions",
         },
         Row {
+            section: "§70.5.1",
+            capability: "COVE-MAP resolver catalog",
+            modeled: "yes",
+            parsed: "yes",
+            validated: "yes",
+            written: "yes",
+            notes: "profile/cove_map.rs and embedded.rs model and strictly validate `MAP_RESOLUTION_CATALOG`, alias resolvers, normalization pipelines, catalog/pipeline/resolver digests, candidate rules, reviewed decisions, redacted evidence policy, and resolver-backed projection expressions",
+        },
+        Row {
             section: "§70.6",
             capability: "COVE-MAP deterministic identity resolution",
             modeled: "yes",
             parsed: "n/a",
             validated: "yes",
             written: "yes",
-            notes: "cove-map resolves deterministic identity components, applies do-not-merge constraints, and emits equivalence/evidence records; conversion corpus executes the path and rejects do-not-merge/equivalence conflicts",
+            notes: "cove-map resolves deterministic and resolver-backed identity components, applies row-level resolver authority, reviewed same-object decisions, canonical anchors, and do-not-merge constraints, and emits equivalence/evidence records; conversion corpus rejects candidate-only escalation and merge conflicts",
         },
         Row {
             section: "§70.8",

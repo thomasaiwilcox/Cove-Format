@@ -10,7 +10,7 @@ use cove_core::profile::cove_map::MapProjectionCatalog;
 use serde_json::{json, Value};
 
 use crate::{
-    candidate_match_id,
+    candidate_match_id, candidate_matches,
     emit::build_cove_o_with_source_states,
     hex_encode,
     input::{read_source_inputs, validate_source_inputs, SourceRow},
@@ -89,6 +89,11 @@ pub fn conversion_report_from_paths(map: &Path, sources: &[PathBuf]) -> Result<V
     Ok(materialize_from_paths(map, sources)?.conversion_report)
 }
 
+pub fn verify_replay_report_from_paths(map: &Path, report: &Value) -> Result<Value, String> {
+    let file = parse_map(map)?;
+    crate::verify_replay_report(&file, report)
+}
+
 pub fn conversion_summary_from_paths(map: &Path, sources: &[PathBuf]) -> Result<Value, String> {
     let materialized = materialize_from_paths(map, sources)?;
     Ok(json!({
@@ -96,7 +101,16 @@ pub fn conversion_summary_from_paths(map: &Path, sources: &[PathBuf]) -> Result<
         "materialized_row_count": materialized.rows.len(),
         "evidence_entry_count": materialized.evidence_entries.len(),
         "assertion_count": materialized.assertions.len(),
+        "identity_equivalence_index": materialized.identity_equivalence_index,
+        "evidence_entries": materialized.evidence_entries,
     }))
+}
+
+pub fn candidate_matches_from_paths(map: &Path, sources: &[PathBuf]) -> Result<Value, String> {
+    let file = parse_map(map)?;
+    let inputs = read_source_inputs(sources)?;
+    validate_source_inputs(&file, &inputs.states)?;
+    candidate_matches(&file, &inputs.rows)
 }
 
 pub fn cove_o_from_paths(map: &Path, sources: &[PathBuf]) -> Result<Vec<u8>, String> {
@@ -477,6 +491,17 @@ pub(crate) fn plan_keys(file: &CovemapFile, rows: &[SourceRow]) -> Value {
                 "equivalence_id": identity.equivalence_id,
                 "canonical_anchor": identity.canonical_anchor,
                 "goid": hex_encode(&identity.goid),
+                "resolution": identity.resolution_metadata.iter().map(|metadata| json!({
+                    "role_id": metadata.role_id,
+                    "resolution_kind": metadata.resolution_kind,
+                    "resolver_id": metadata.resolver_id,
+                    "normalized_value": metadata.normalized_value,
+                    "resolved_identity_value": metadata.resolved_identity_value,
+                    "canonical_key": metadata.canonical_key,
+                    "alias_hit": metadata.alias_hit,
+                    "alias_miss": metadata.alias_miss,
+                    "alias_ambiguous": metadata.alias_ambiguous,
+                })).collect::<Vec<_>>(),
             })
         }).collect::<Vec<_>>(),
         "candidate_matches": planned.candidates.iter().map(|candidate| {
@@ -491,6 +516,17 @@ pub(crate) fn plan_keys(file: &CovemapFile, rows: &[SourceRow]) -> Value {
                 "join_key_sha256": candidate.join_key_sha256,
                 "identity_alias": candidate.identity_alias,
                 "candidate_match_id": candidate_match_id(candidate),
+                "resolution": candidate.resolution_metadata.iter().map(|metadata| json!({
+                    "role_id": metadata.role_id,
+                    "resolution_kind": metadata.resolution_kind,
+                    "resolver_id": metadata.resolver_id,
+                    "normalized_value": metadata.normalized_value,
+                    "resolved_identity_value": metadata.resolved_identity_value,
+                    "canonical_key": metadata.canonical_key,
+                    "alias_hit": metadata.alias_hit,
+                    "alias_miss": metadata.alias_miss,
+                    "alias_ambiguous": metadata.alias_ambiguous,
+                })).collect::<Vec<_>>(),
             })
         }).collect::<Vec<_>>()
     })

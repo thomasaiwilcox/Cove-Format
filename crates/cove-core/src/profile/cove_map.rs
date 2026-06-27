@@ -47,6 +47,169 @@ pub struct MapFunctionRegistry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MapResolutionCatalog {
+    pub mapping_id: String,
+    pub mapping_version: String,
+    pub normalization_pipelines: Vec<MapNormalizationPipeline>,
+    pub resolvers: Vec<MapResolver>,
+    pub match_rules: Vec<MapCandidateMatchRule>,
+    pub reviewed_decisions: Vec<MapReviewedDecision>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MapNormalizationPipeline {
+    pub pipeline_id: String,
+    pub functions: Vec<MapNormalizationFunction>,
+    pub tables: Vec<MapNormalizationTable>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MapNormalizationFunction {
+    pub function_id: String,
+    pub version: String,
+    pub table_id: Option<String>,
+    pub suffix_table_digest: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MapNormalizationTable {
+    pub table_id: String,
+    pub digest: String,
+    pub values: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MapResolver {
+    pub resolver_id: String,
+    pub kind: String,
+    pub object_type: String,
+    pub authority: String,
+    pub confidence_class: String,
+    pub normalization_pipeline_id: String,
+    pub on_hit: String,
+    pub on_miss: String,
+    pub miss_confidence_class: Option<String>,
+    pub ambiguous_policy: String,
+    pub catalog_digest: String,
+    pub pipeline_digest: String,
+    pub resolver_digest: String,
+    pub order_sensitive_catalog: bool,
+    pub evidence_policy: String,
+    pub alias_catalog: Option<MapAliasCatalog>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MapAliasCatalog {
+    pub alias_catalog_id: String,
+    pub entries: Vec<MapAliasEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MapAliasEntry {
+    pub alias_entry_id: String,
+    pub canonical_key: String,
+    pub canonical_label: String,
+    pub aliases: Vec<String>,
+    pub ambiguous: bool,
+    pub metadata: BTreeMap<String, serde_json::Value>,
+    pub non_semantic_metadata: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MapCandidateMatchRule {
+    pub match_rule_id: String,
+    pub object_type: String,
+    pub inputs: Vec<MapCandidateMatchInput>,
+    pub blocking: BTreeMap<String, serde_json::Value>,
+    pub normalization_pipeline_id: String,
+    pub scoring: BTreeMap<String, serde_json::Value>,
+    pub limits: MapCandidateMatchLimits,
+    pub output: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MapCandidateMatchInput {
+    pub source_id: String,
+    pub column: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MapCandidateMatchLimits {
+    pub max_pairs_per_block: u64,
+    pub max_pairs_total: u64,
+    pub on_limit: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MapReviewedDecision {
+    pub decision_id: String,
+    pub decision: String,
+    pub confidence_class: String,
+    pub reviewed_by: String,
+    pub reviewed_at: String,
+    pub reason: Option<String>,
+    pub left: MapTypedIdentityReference,
+    pub right: MapTypedIdentityReference,
+    pub canonical_anchor: Option<MapCanonicalAnchor>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MapTypedIdentityReference {
+    pub kind: String,
+    pub object_type: String,
+    pub identity_rule_id: Option<String>,
+    pub resolver_id: Option<String>,
+    pub canonical_key: Option<String>,
+    pub join_key_sha256: Option<String>,
+    pub source_id: Option<String>,
+    pub source_row_identity: Option<String>,
+    pub source_snapshot_digest: Option<String>,
+    pub schema_fingerprint: Option<String>,
+    pub row_digest: Option<String>,
+    pub identity_alias: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MapCanonicalAnchor {
+    pub kind: String,
+    pub object_type: String,
+    pub identity_rule_id: String,
+    pub components: Vec<MapCanonicalAnchorComponent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MapCanonicalAnchorComponent {
+    pub role_id: String,
+    pub logical_type: String,
+    pub resolved_value: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MapResolutionOutcome {
+    AliasHit,
+    AliasMiss,
+    AliasAmbiguous,
+    ReviewedSameObject,
+    ReviewedDoNotMerge,
+    CandidateOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MapEffectiveMergeAuthority {
+    Authoritative,
+    StrongDeterministic,
+    WeakDeterministic,
+    SourceScoped,
+    CandidateOnly,
+    ReviewedAuthoritative,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MapResolutionBinding {
+    pub resolver_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MapJoinKeyComponent {
     pub role_id: String,
     pub source_column: String,
@@ -54,6 +217,7 @@ pub struct MapJoinKeyComponent {
     pub canonicalization: String,
     pub null_policy: String,
     pub ordering: String,
+    pub resolution: Option<MapResolutionBinding>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,6 +229,7 @@ pub struct MapIdentityRule {
     pub auto_merge: Option<bool>,
     pub candidate_only: bool,
     pub property_conflicts_declared: bool,
+    pub allow_reviewed_equivalence: bool,
     pub function_ids: Vec<String>,
     pub join_keys: Vec<MapJoinKeyComponent>,
 }
@@ -315,6 +480,7 @@ pub struct MapProjectionCatalog {
 pub enum EmbeddedMapSection {
     SourceCatalog(MapSourceCatalog),
     FunctionRegistry(MapFunctionRegistry),
+    ResolutionCatalog(MapResolutionCatalog),
     IdentityRuleCatalog(MapIdentityRuleCatalog),
     RowSemanticsCatalog(MapRowSemanticsCatalog),
     AssertionLog(MapAssertionLog),

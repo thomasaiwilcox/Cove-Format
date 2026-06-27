@@ -1,0 +1,42 @@
+{
+  "expect_cove_o_valid": true,
+  "expected_conversion": {
+    "ambiguous_alias_count": 0,
+    "candidate_match_count": 0,
+    "object_count": 1,
+    "resolver_hit_count": 1,
+    "resolver_miss_count": 0
+  },
+  "expected_conversion_summary": {
+    "assertion_count": 1,
+    "evidence_entry_count": 1,
+    "materialized_row_count": 1
+  },
+  "expected_evidence_entries": [
+    {
+      "absent": [
+        "raw_observed_value",
+        "normalized_value"
+      ],
+      "contains": {
+        "alias_hit": true,
+        "canonical_key": "uk-company:tesco",
+        "canonical_label": "Tesco",
+        "evidence_policy": "redact_raw",
+        "redacted": true,
+        "redacted_resolution_evidence": true,
+        "redaction_scope": "resolver_evidence",
+        "resolver_id": "uk_company_name_resolver"
+      },
+      "present": [
+        "resolver_digest",
+        "catalog_digest",
+        "pipeline_digest"
+      ]
+    }
+  ],
+  "mapping": "accept/cove_map_resolution_alias_redacted.covemap",
+  "sources": [
+    "accept/company_alias_redacted.csv"
+  ]
+}

@@ -5,6 +5,10 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     array::{CoveArrayValue, EncodedArray},
+    artifact::covedelta::{
+        CoveDeltaFile, DeltaDictionaryEntryV1, DELTA_DICTIONARY_ENTRY_KIND_INLINE_VALUE,
+        DELTA_DICTIONARY_ENTRY_KIND_PARENT_DICTIONARY_ALIAS,
+    },
     codec::CodecExtensionDescriptorV2,
     compression,
     constants::{CompressionCodec, CoveLogicalType, CovePhysicalKind, SectionKind, ValueTag},
@@ -13,7 +17,8 @@ use crate::{
     page_payload::PageBufferKind,
     profile::{
         cove_map::{
-            EmbeddedMapSection, MapEvidenceIndex, MapFunctionRegistry, MapProjectionCatalog,
+            EmbeddedMapSection, MapEvidenceEntry, MapEvidenceIndex, MapFunctionRegistry,
+            MapProjectionCatalog,
         },
         cove_o::{
             CoveRecordRefV1, ObjectTypeCatalog, ObjectTypeEntryV1, PropertyEntryV1, RecordKind,
@@ -471,6 +476,333 @@ pub fn read_object_surface_from_bytes_with_options(
     .surface)
 }
 
+pub fn read_object_surface_from_base_and_delta_files(
+    base_bytes: &[u8],
+    delta_files: &[CoveDeltaFile],
+) -> Result<CoveObjectSurface, CoveError> {
+    read_object_surface_from_base_and_delta_files_with_options(
+        base_bytes,
+        delta_files,
+        &CoveObjectReadOptions::default(),
+    )
+}
+
+pub fn read_object_surface_from_base_and_delta_files_with_options(
+    base_bytes: &[u8],
+    delta_files: &[CoveDeltaFile],
+    options: &CoveObjectReadOptions,
+) -> Result<CoveObjectSurface, CoveError> {
+    let mut surface = read_object_surface_from_bytes_with_options(base_bytes, options)?;
+    append_delta_records_to_object_surface(&mut surface, delta_files, options)?;
+    Ok(surface)
+}
+
+pub fn reconstruct_object_states_from_base_and_delta_files(
+    base_bytes: &[u8],
+    delta_files: &[CoveDeltaFile],
+    read_options: &CoveObjectReadOptions,
+    reconstruction_options: &CoveObjectReconstructionOptions,
+) -> Result<Vec<CoveObjectState>, CoveError> {
+    let surface = read_object_surface_from_base_and_delta_files_with_options(
+        base_bytes,
+        delta_files,
+        read_options,
+    )?;
+    reconstruct_object_states(&surface, reconstruction_options)
+}
+
+fn append_delta_records_to_object_surface(
+    surface: &mut CoveObjectSurface,
+    delta_files: &[CoveDeltaFile],
+    options: &CoveObjectReadOptions,
+) -> Result<(), CoveError> {
+    if !options.include_records
+        && !options.include_evidence_index
+        && !options.include_projection_catalog
+    {
+        return Ok(());
+    }
+
+    let pushdown_options = CoveObjectReadPushdownOptions::default();
+    let mut pushdown_report = CoveObjectReadPushdownReport::default();
+    let mut next_segment_id = if options.include_records {
+        next_available_segment_id(&surface.records)?
+    } else {
+        0
+    };
+    let mut effective_catalog = ObjectTypeCatalog {
+        flags: 0,
+        types: surface.object_types.clone(),
+    };
+
+    for delta_file in delta_files {
+        let validation = delta_file.validate_object_delta()?;
+        if options.include_evidence_index {
+            append_delta_evidence_patches_to_object_surface(surface, &validation.evidence_patches)?;
+        }
+        if options.include_projection_catalog {
+            append_delta_projection_patches_to_object_surface(
+                surface,
+                &validation.projection_patches,
+            )?;
+        }
+        if !options.include_records {
+            continue;
+        }
+        for patch in &validation.catalog_patches {
+            effective_catalog.apply_additive_patch(patch)?;
+        }
+        surface.object_types = effective_catalog.types.clone();
+        let object_types_by_id = effective_catalog
+            .types
+            .iter()
+            .map(|ty| (ty.object_type_id, ty))
+            .collect::<BTreeMap<_, _>>();
+        let segment_id_offset = next_segment_id;
+        let mut max_remapped_segment_id = None::<u32>;
+
+        for segment in &validation.temporal_segments {
+            let remapped_segment_id = checked_segment_id_add(
+                segment.header.segment_id,
+                segment_id_offset,
+                "delta temporal segment_id overflow during base readback",
+            )?;
+            max_remapped_segment_id = Some(
+                max_remapped_segment_id
+                    .map(|current| current.max(remapped_segment_id))
+                    .unwrap_or(remapped_segment_id),
+            );
+
+            let object_type = object_types_by_id
+                .get(&segment.header.object_type_id)
+                .copied()
+                .ok_or_else(|| {
+                    CoveError::BadSchema(format!(
+                        "delta temporal segment references missing object_type_id {}",
+                        segment.header.object_type_id
+                    ))
+                })?;
+            if !options.requests_object_type(object_type) {
+                continue;
+            }
+            reject_unsupported_delta_dictionary_overlay_readback(
+                segment,
+                object_type,
+                &validation.dictionary_overlay_entries,
+                options,
+            )?;
+
+            let mut records = records_from_segment(
+                segment,
+                object_type,
+                None,
+                &[],
+                options,
+                &pushdown_options,
+                &mut pushdown_report,
+                None,
+                None,
+            )?;
+            for record in &mut records {
+                remap_record_segment_refs(record, segment_id_offset)?;
+            }
+            surface.records.extend(records);
+        }
+
+        if let Some(max_remapped_segment_id) = max_remapped_segment_id {
+            next_segment_id = checked_segment_id_add(
+                max_remapped_segment_id,
+                1,
+                "delta temporal segment_id overflow after base readback",
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+fn reject_unsupported_delta_dictionary_overlay_readback(
+    segment: &TemporalSegmentData,
+    object_type: &ObjectTypeEntryV1,
+    dictionary_overlay_entries: &[DeltaDictionaryEntryV1],
+    options: &CoveObjectReadOptions,
+) -> Result<(), CoveError> {
+    if !dictionary_overlay_entries
+        .iter()
+        .any(delta_dictionary_overlay_entry_requires_materialization)
+    {
+        return Ok(());
+    }
+    if !segment_has_requested_filecode_property(segment, object_type, options)? {
+        return Ok(());
+    }
+    Err(CoveError::UnsupportedEncoding(
+        "COVEDELTA dictionary overlay materialization is required for requested FileCode properties"
+            .into(),
+    ))
+}
+
+fn delta_dictionary_overlay_entry_requires_materialization(entry: &DeltaDictionaryEntryV1) -> bool {
+    matches!(
+        entry.entry_kind,
+        DELTA_DICTIONARY_ENTRY_KIND_INLINE_VALUE
+            | DELTA_DICTIONARY_ENTRY_KIND_PARENT_DICTIONARY_ALIAS
+    )
+}
+
+fn segment_has_requested_filecode_property(
+    segment: &TemporalSegmentData,
+    object_type: &ObjectTypeEntryV1,
+    options: &CoveObjectReadOptions,
+) -> Result<bool, CoveError> {
+    let properties_by_id = object_type
+        .properties
+        .iter()
+        .map(|property| (property.property_id, property))
+        .collect::<BTreeMap<_, _>>();
+    for column in &segment.property_columns {
+        let property = properties_by_id
+            .get(&column.directory.column_id)
+            .copied()
+            .ok_or_else(|| {
+                CoveError::BadSchema(format!(
+                    "temporal property column references missing property_id {}",
+                    column.directory.column_id
+                ))
+            })?;
+        if options.requests_property(property)
+            && property.physical_kind == CovePhysicalKind::FileCode
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+type EvidenceEntryIdentityKey = (String, String, String, String, String);
+
+fn append_delta_evidence_patches_to_object_surface(
+    surface: &mut CoveObjectSurface,
+    patches: &[MapEvidenceIndex],
+) -> Result<(), CoveError> {
+    for patch in patches {
+        match &mut surface.evidence_index {
+            Some(index) => merge_evidence_patch(index, patch)?,
+            None => surface.evidence_index = Some(patch.clone()),
+        }
+        surface
+            .embedded_map_sections
+            .push(EmbeddedMapSection::EvidenceIndex(patch.clone()));
+    }
+    Ok(())
+}
+
+fn merge_evidence_patch(
+    target: &mut MapEvidenceIndex,
+    patch: &MapEvidenceIndex,
+) -> Result<(), CoveError> {
+    if target.mapping_id != patch.mapping_id || target.mapping_version != patch.mapping_version {
+        return Err(CoveError::MapEvidenceInvalid);
+    }
+
+    let mut seen = target
+        .entries
+        .iter()
+        .map(evidence_entry_identity_key)
+        .collect::<BTreeSet<_>>();
+    for entry in &patch.entries {
+        if !seen.insert(evidence_entry_identity_key(entry)) {
+            return Err(CoveError::MapEvidenceInvalid);
+        }
+    }
+    target.entries.extend(patch.entries.iter().cloned());
+    Ok(())
+}
+
+fn append_delta_projection_patches_to_object_surface(
+    surface: &mut CoveObjectSurface,
+    patches: &[MapProjectionCatalog],
+) -> Result<(), CoveError> {
+    for patch in patches {
+        match &mut surface.projection_catalog {
+            Some(catalog) => merge_projection_patch(catalog, patch)?,
+            None => surface.projection_catalog = Some(patch.clone()),
+        }
+        surface
+            .embedded_map_sections
+            .push(EmbeddedMapSection::ProjectionCatalog(patch.clone()));
+    }
+    Ok(())
+}
+
+fn merge_projection_patch(
+    target: &mut MapProjectionCatalog,
+    patch: &MapProjectionCatalog,
+) -> Result<(), CoveError> {
+    if target.mapping_id != patch.mapping_id || target.mapping_version != patch.mapping_version {
+        return Err(CoveError::MapInvalid);
+    }
+
+    let mut seen = target
+        .projections
+        .iter()
+        .map(|projection| projection.projection_id.clone())
+        .collect::<BTreeSet<_>>();
+    for projection in &patch.projections {
+        if !seen.insert(projection.projection_id.clone()) {
+            return Err(CoveError::MapInvalid);
+        }
+    }
+    target.projections.extend(patch.projections.iter().cloned());
+    Ok(())
+}
+
+fn evidence_entry_identity_key(entry: &MapEvidenceEntry) -> EvidenceEntryIdentityKey {
+    (
+        entry.source_id.clone(),
+        entry.source_row_identity.clone(),
+        entry.rule_id.clone(),
+        entry.assertion_id.clone(),
+        entry.output_object_id.clone(),
+    )
+}
+
+fn next_available_segment_id(records: &[CoveObjectRecord]) -> Result<u32, CoveError> {
+    records.iter().try_fold(0u32, |next, record| {
+        let candidate = checked_segment_id_add(
+            record.segment_id,
+            1,
+            "base temporal segment_id overflow during delta readback",
+        )?;
+        Ok(next.max(candidate))
+    })
+}
+
+fn remap_record_segment_refs(
+    record: &mut CoveObjectRecord,
+    segment_id_offset: u32,
+) -> Result<(), CoveError> {
+    record.segment_id = checked_segment_id_add(
+        record.segment_id,
+        segment_id_offset,
+        "delta record segment_id overflow during base readback",
+    )?;
+    if let Some(prev_ref) = record.prev_ref.as_mut() {
+        prev_ref.segment_id = checked_segment_id_add(
+            prev_ref.segment_id,
+            segment_id_offset,
+            "delta record prev_ref segment_id overflow during base readback",
+        )?;
+    }
+    Ok(())
+}
+
+fn checked_segment_id_add(segment_id: u32, offset: u32, context: &str) -> Result<u32, CoveError> {
+    segment_id
+        .checked_add(offset)
+        .ok_or_else(|| CoveError::BadSchema(context.into()))
+}
+
 pub fn read_retained_object_temporal_segments(
     data: impl Into<RetainedBytes>,
     validation_options: ValidationOptions,
@@ -639,7 +971,8 @@ fn read_object_surfaces_from_bytes_with_pushdown_options(
             | SectionKind::MapRowSemanticsCatalog
             | SectionKind::MapAssertionLog
             | SectionKind::MapIdentityEquivalenceIndex
-            | SectionKind::MapConversionReport => {}
+            | SectionKind::MapConversionReport
+            | SectionKind::MapResolutionCatalog => {}
             _ => {}
         }
     }
@@ -2500,8 +2833,19 @@ mod tests {
     use super::*;
     use crate::canonical::{CanonicalField, CanonicalValue};
     use crate::{
-        constants::StorageClass,
+        artifact::covedelta::{
+            DeltaDictionaryEntryV1, DELTA_DICTIONARY_ENTRY_KIND_CANONICAL_HASH_HINT,
+            DELTA_DICTIONARY_ENTRY_KIND_INLINE_VALUE, DELTA_REF_NONE,
+        },
+        checksum,
+        constants::{CoveEncodingKind, StorageClass},
         dictionary::{FileDictionaryHeaderV1, FileDictionaryIndexEntryV1},
+        page::ColumnPageIndexEntryV1,
+        page_payload::ColumnPagePayloadV1,
+        profile::cove_o::{
+            TemporalRowEntryV1, TEMPORAL_ROW_ENTRY_LEN, TEMPORAL_SEGMENT_HEADER_LEN,
+        },
+        segment::{TableColumnDirectoryEntryV1, TABLE_COLUMN_DIRECTORY_ENTRY_LEN},
     };
 
     fn property(id: u32, name: &str, value: Value) -> CoveObjectPropertyValue {
@@ -2601,6 +2945,171 @@ mod tests {
             decoded.value,
             json!({"policy": "redacted", "status": "redacted"})
         );
+    }
+
+    fn filecode_object_type() -> ObjectTypeEntryV1 {
+        ObjectTypeEntryV1 {
+            object_type_id: 1,
+            type_name: "Entity".into(),
+            flags: 0,
+            properties: vec![PropertyEntryV1 {
+                property_id: 1,
+                property_name: "name".into(),
+                logical_type: CoveLogicalType::Utf8,
+                physical_kind: CovePhysicalKind::FileCode,
+                nullable: false,
+                collation_id: 0,
+                flags: 0,
+            }],
+        }
+    }
+
+    fn temporal_row(timestamp_us: i64, csn: u64) -> TemporalRowEntryV1 {
+        TemporalRowEntryV1 {
+            timestamp_us,
+            csn,
+            branch_key: 0,
+            goid: [0; 16],
+            record_id: [csn as u8; 16],
+            record_kind: RecordKind::Delta,
+            prev_ref: None,
+        }
+    }
+
+    fn temporal_segment_with_filecode_property(codes: &[u32]) -> TemporalSegmentData {
+        let rows = codes
+            .iter()
+            .enumerate()
+            .map(|(idx, _)| temporal_row(10 + idx as i64, idx as u64 + 1))
+            .collect::<Vec<_>>();
+        let row_directory_offset = TEMPORAL_SEGMENT_HEADER_LEN as u64;
+        let row_bytes = (rows.len() * TEMPORAL_ROW_ENTRY_LEN) as u64;
+        let row_end = row_directory_offset + row_bytes;
+        let column_directory_offset = row_end;
+        let page_index_offset = column_directory_offset + TABLE_COLUMN_DIRECTORY_ENTRY_LEN as u64;
+        let page_index_length = crate::page::COLUMN_PAGE_INDEX_ENTRY_LEN as u64;
+        let data_offset = page_index_offset + page_index_length;
+        let mut value_bytes = Vec::with_capacity(codes.len() * 4);
+        for code in codes {
+            value_bytes.extend_from_slice(&code.to_le_bytes());
+        }
+        let payload = ColumnPagePayloadV1::build_single_node(
+            rows.len() as u32,
+            CoveEncodingKind::FileCode,
+            CoveLogicalType::Utf8,
+            CovePhysicalKind::FileCode,
+            None,
+            value_bytes,
+        )
+        .unwrap();
+        let header = TemporalSegmentHeaderV1 {
+            segment_id: 7,
+            object_type_id: 1,
+            time_range_start_us: rows.first().map(|row| row.timestamp_us).unwrap_or(0),
+            time_range_end_us: rows.last().map(|row| row.timestamp_us).unwrap_or(0),
+            csn_min: rows.first().map(|row| row.csn).unwrap_or(0),
+            csn_max: rows.last().map(|row| row.csn).unwrap_or(0),
+            row_count: rows.len() as u32,
+            morsel_count: u32::from(!rows.is_empty()),
+            morsel_row_count: rows.len() as u32,
+            column_count: 1,
+            row_directory_offset,
+            column_directory_offset,
+            page_index_offset,
+            data_offset,
+            flags: 0,
+            checksum: 0,
+        };
+        let directory = TableColumnDirectoryEntryV1 {
+            column_id: 1,
+            logical_type: CoveLogicalType::Utf8,
+            physical_kind: CovePhysicalKind::FileCode,
+            flags: 0,
+            page_index_offset,
+            page_index_length,
+            data_offset,
+            data_length: payload.len() as u64,
+            stats_ref: u32::MAX,
+            domain_ref: u32::MAX,
+            checksum: 0,
+        };
+        let page = ColumnPageIndexEntryV1 {
+            column_id: 1,
+            morsel_id: 0,
+            row_count: rows.len() as u32,
+            non_null_count: rows.len() as u32,
+            null_count: 0,
+            encoding_root: CoveEncodingKind::FileCode as u32,
+            page_offset: data_offset,
+            page_length: payload.len() as u64,
+            uncompressed_length: payload.len() as u64,
+            stats_ref: u32::MAX,
+            flags: 0,
+            checksum: checksum::crc32c(&payload),
+        };
+
+        let mut bytes = header.serialize().to_vec();
+        for row in rows {
+            bytes.extend_from_slice(&row.serialize());
+        }
+        bytes.extend_from_slice(&directory.serialize());
+        bytes.extend_from_slice(&page.serialize());
+        bytes.extend_from_slice(&payload);
+        TemporalSegmentData::parse(&bytes).unwrap()
+    }
+
+    fn dictionary_overlay_entry(entry_kind: u8) -> DeltaDictionaryEntryV1 {
+        DeltaDictionaryEntryV1 {
+            local_dictionary_id: 0,
+            local_code: 0,
+            logical_type: CoveLogicalType::Utf8 as u16,
+            collation_id: 0,
+            entry_kind,
+            flags: 0,
+            inline_value_ref: if entry_kind == DELTA_DICTIONARY_ENTRY_KIND_INLINE_VALUE {
+                7
+            } else {
+                DELTA_REF_NONE
+            },
+            parent_ref: DELTA_REF_NONE,
+            parent_dictionary_id: 0,
+            parent_code: 0,
+            parent_dictionary_digest_ref: DELTA_REF_NONE,
+            canonical_hash128: [1; 16],
+            checksum: 0,
+        }
+    }
+
+    #[test]
+    fn delta_dictionary_overlay_readback_rejects_requested_filecode_materialization() {
+        let segment = temporal_segment_with_filecode_property(&[0]);
+        let object_type = filecode_object_type();
+        let entry = dictionary_overlay_entry(DELTA_DICTIONARY_ENTRY_KIND_INLINE_VALUE);
+
+        let err = reject_unsupported_delta_dictionary_overlay_readback(
+            &segment,
+            &object_type,
+            &[entry],
+            &CoveObjectReadOptions::default(),
+        )
+        .unwrap_err();
+
+        assert!(format!("{err}").contains("dictionary overlay materialization"));
+    }
+
+    #[test]
+    fn delta_dictionary_overlay_hash_hint_does_not_require_materialization() {
+        let segment = temporal_segment_with_filecode_property(&[0]);
+        let object_type = filecode_object_type();
+        let entry = dictionary_overlay_entry(DELTA_DICTIONARY_ENTRY_KIND_CANONICAL_HASH_HINT);
+
+        reject_unsupported_delta_dictionary_overlay_readback(
+            &segment,
+            &object_type,
+            &[entry],
+            &CoveObjectReadOptions::default(),
+        )
+        .unwrap();
     }
 
     #[test]

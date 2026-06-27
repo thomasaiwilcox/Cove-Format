@@ -724,6 +724,15 @@ pub const SECTION_REGISTRY: &[SectionInfo] = &[
         description: "Object-and-association to table projection definitions and read-surface declarations.",
     },
     SectionInfo {
+        kind: SectionKind::MapResolutionCatalog,
+        id: 69,
+        wire_name: "MAP_RESOLUTION_CATALOG",
+        profiles: &[PrimaryProfile::SemanticMapping],
+        required_feature: Some(FEATURE_SEMANTIC_MAP),
+        spec_section: "Spec §14",
+        description: "Resolver catalogs, normalization pipelines, candidate rules, and reviewed entity-resolution decisions.",
+    },
+    SectionInfo {
         kind: SectionKind::VendorExtension,
         id: 255,
         wire_name: "VENDOR_EXTENSION",
@@ -1264,12 +1273,17 @@ mod tests {
             assert_eq!(SectionKind::from_u16(info.id), Some(info.kind));
             assert_eq!(info.kind as u16, info.id);
         }
-        assert_eq!(SECTION_REGISTRY.len(), 45);
+        assert_eq!(SECTION_REGISTRY.len(), 46);
         let exact_set = section_info(SectionKind::ExactSetIndex).unwrap();
         assert!(exact_set.profiles.contains(&PrimaryProfile::TableScan));
         assert!(exact_set
             .profiles
             .contains(&PrimaryProfile::ArchiveAcceleration));
+        let resolution = section_info(SectionKind::MapResolutionCatalog).unwrap();
+        assert!(resolution
+            .profiles
+            .contains(&PrimaryProfile::SemanticMapping));
+        assert_eq!(resolution.required_feature, Some(FEATURE_SEMANTIC_MAP));
     }
 
     #[test]

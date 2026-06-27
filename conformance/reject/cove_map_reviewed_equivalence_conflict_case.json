@@ -1,0 +1,7 @@
+{
+  "mapping": "accept/cove_map_reviewed_equivalence_conflict.covemap",
+  "sources": [
+    "accept/reviewed_crm.csv",
+    "accept/reviewed_support.csv"
+  ]
+}

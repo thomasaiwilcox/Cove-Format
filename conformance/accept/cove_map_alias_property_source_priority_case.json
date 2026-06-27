@@ -1,0 +1,61 @@
+{
+  "expect_cove_o_valid": true,
+  "expected_conversion": {
+    "governance": {
+      "access_policy_ids": [
+        "internal"
+      ],
+      "effective_sensitivity_labels": [
+        "public"
+      ],
+      "effective_sensitivity_rank": 1,
+      "reconciliation_policy": "emit_effective_policy",
+      "sources": [
+        {
+          "access_policy_ids": [
+            "internal"
+          ],
+          "sensitivity_label": "public",
+          "sensitivity_rank": 1,
+          "source_id": "company_alias_conflict_crm",
+          "source_priority": 10
+        },
+        {
+          "access_policy_ids": [
+            "internal"
+          ],
+          "sensitivity_label": "public",
+          "sensitivity_rank": 1,
+          "source_id": "company_alias_conflict_support",
+          "source_priority": 1
+        }
+      ]
+    },
+    "mapping_id": "company-alias-conflict-map",
+    "mapping_version": "2026.06",
+    "object_count": 1,
+    "property_value_count": 1,
+    "resolver_hit_count": 2
+  },
+  "expected_conversion_summary": {
+    "assertion_count": 3,
+    "evidence_entry_count": 3,
+    "materialized_row_count": 1
+  },
+  "expected_evidence_entries": [
+    {
+      "contains": {
+        "property_name": "display_name",
+        "rule_id": "property_conflict_resolution",
+        "suppressed": true,
+        "suppressed_reason": "source_priority_wins",
+        "suppressed_value": "CRM Alpha"
+      }
+    }
+  ],
+  "mapping": "accept/cove_map_alias_property_source_priority.covemap",
+  "sources": [
+    "accept/company_alias_conflict_crm.csv",
+    "accept/company_alias_conflict_support.csv"
+  ]
+}

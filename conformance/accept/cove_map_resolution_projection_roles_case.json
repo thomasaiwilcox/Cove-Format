@@ -1,0 +1,19 @@
+{
+  "expected_projected_rows": [
+    {
+      "company_raw": "Tesco",
+      "output_table": "company_resolution",
+      "parent_raw": "Tesco PLC",
+      "projection_id": "company_resolution_projection"
+    }
+  ],
+  "expected_projection": {
+    "format": "json",
+    "mapping_id": "company-map",
+    "mapping_version": "2026.06"
+  },
+  "mapping": "accept/cove_map_resolution_projection_roles.covemap",
+  "sources": [
+    "accept/company_resolution_projection_roles.csv"
+  ]
+}

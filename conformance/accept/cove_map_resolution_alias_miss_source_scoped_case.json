@@ -1,0 +1,22 @@
+{
+  "expect_cove_o_valid": true,
+  "expected_conversion": {
+    "ambiguous_alias_count": 0,
+    "candidate_match_count": 0,
+    "object_count": 2,
+    "resolver_hit_count": 0,
+    "resolver_miss_count": 2,
+    "row_count": 2,
+    "source_count": 2
+  },
+  "expected_conversion_summary": {
+    "assertion_count": 2,
+    "evidence_entry_count": 2,
+    "materialized_row_count": 2
+  },
+  "mapping": "accept/cove_map_resolution_alias_miss_source_scoped.covemap",
+  "sources": [
+    "accept/company_alias_source_a.csv",
+    "accept/company_alias_source_b.csv"
+  ]
+}

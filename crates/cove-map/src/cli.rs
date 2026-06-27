@@ -2,6 +2,13 @@ use std::path::PathBuf;
 
 use serde_json::json;
 
+use crate::{
+    alias_import::{import_aliases_from_paths, AliasImportOptions},
+    review::{
+        export_reviewed_decisions, import_reviewed_decisions_from_paths, ReviewImportOptions,
+    },
+};
+
 use super::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -15,6 +22,36 @@ pub(crate) enum Command {
     PlanKeys {
         map: PathBuf,
         sources: Vec<PathBuf>,
+    },
+    Candidates {
+        map: PathBuf,
+        sources: Vec<PathBuf>,
+        output: Option<PathBuf>,
+    },
+    Review {
+        candidates: PathBuf,
+        output: Option<PathBuf>,
+    },
+    ReviewExport {
+        map: PathBuf,
+        output: Option<PathBuf>,
+    },
+    ReviewImport {
+        map: PathBuf,
+        review: PathBuf,
+        output: PathBuf,
+        replace: bool,
+    },
+    AliasesImport {
+        map: PathBuf,
+        aliases: PathBuf,
+        catalog_id: String,
+        resolver_id: String,
+        output: PathBuf,
+    },
+    ReplayVerify {
+        map: PathBuf,
+        report: PathBuf,
     },
     Convert {
         map: PathBuf,
@@ -119,6 +156,70 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<(), String> {
             let inputs = read_source_inputs(&sources)?;
             validate_source_inputs(&file, &inputs.states)?;
             print_json(&plan_keys(&file, &inputs.rows));
+        }
+        Command::Candidates {
+            map,
+            sources,
+            output,
+        } => {
+            let file = parse_map(&map)?;
+            let inputs = read_source_inputs(&sources)?;
+            validate_source_inputs(&file, &inputs.states)?;
+            let candidates = candidate_matches(&file, &inputs.rows)?;
+            write_or_print(output, &candidates)?;
+        }
+        Command::Review { candidates, output } => {
+            let bytes = std::fs::read(&candidates)
+                .map_err(|err| format!("cannot read {}: {err}", candidates.display()))?;
+            let candidates_json: serde_json::Value = serde_json::from_slice(&bytes)
+                .map_err(|err| format!("invalid candidate review input JSON: {err}"))?;
+            let worklist = review_worklist_from_candidate_matches(&candidates_json)?;
+            write_or_print(output, &worklist)?;
+        }
+        Command::ReviewExport { map, output } => {
+            let file = parse_map(&map)?;
+            let review = export_reviewed_decisions(&file)?;
+            write_or_print(output, &review)?;
+        }
+        Command::ReviewImport {
+            map,
+            review,
+            output,
+            replace,
+        } => {
+            let report = import_reviewed_decisions_from_paths(
+                &map,
+                &review,
+                &output,
+                &ReviewImportOptions { replace },
+            )?;
+            print_json(&report);
+        }
+        Command::AliasesImport {
+            map,
+            aliases,
+            catalog_id,
+            resolver_id,
+            output,
+        } => {
+            let report = import_aliases_from_paths(
+                &map,
+                &aliases,
+                &output,
+                &AliasImportOptions {
+                    catalog_id,
+                    resolver_id,
+                },
+            )?;
+            print_json(&report);
+        }
+        Command::ReplayVerify { map, report } => {
+            let file = parse_map(&map)?;
+            let bytes = std::fs::read(&report)
+                .map_err(|err| format!("cannot read {}: {err}", report.display()))?;
+            let report_json: serde_json::Value = serde_json::from_slice(&bytes)
+                .map_err(|err| format!("invalid replay report JSON: {err}"))?;
+            print_json(&verify_replay_report(&file, &report_json)?);
         }
         Command::Convert {
             map,
@@ -339,6 +440,25 @@ pub(crate) fn parse_args(
                 sources: args.map(PathBuf::from).collect(),
             }
         }
+        "candidates" => {
+            let (output, positional) = parse_output_and_positionals(args)?;
+            let mut positional = positional.into_iter();
+            let map = positional
+                .next()
+                .ok_or_else(|| "candidates requires <mapping.covemap>".to_string())?;
+            let sources = positional.collect::<Vec<_>>();
+            if sources.is_empty() {
+                return Err("candidates requires at least one source path".into());
+            }
+            Command::Candidates {
+                map,
+                sources,
+                output,
+            }
+        }
+        "review" => parse_review_args(args)?,
+        "aliases" => parse_aliases_args(args)?,
+        "replay" => parse_replay_args(args)?,
         "convert" => {
             let (output, format, positional) = parse_output_format_and_positionals(args)?;
             let mut positional = positional.into_iter();
@@ -499,6 +619,185 @@ fn one_path(args: &mut impl Iterator<Item = String>, usage: &str) -> Result<Path
     args.next()
         .map(PathBuf::from)
         .ok_or_else(|| format!("usage: cove map {usage}"))
+}
+
+fn parse_output_and_positionals(
+    args: impl Iterator<Item = String>,
+) -> Result<(Option<PathBuf>, Vec<PathBuf>), String> {
+    let mut output = None;
+    let mut positional = Vec::new();
+    let mut args = args.peekable();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--out" | "--output" | "-o" => {
+                output = Some(
+                    args.next()
+                        .map(PathBuf::from)
+                        .ok_or_else(|| format!("{arg} requires a path"))?,
+                );
+            }
+            _ if arg.starts_with("--out=") => {
+                output = Some(PathBuf::from(arg.trim_start_matches("--out=")));
+            }
+            _ if arg.starts_with('-') => return Err(format!("unknown option {arg}")),
+            _ => positional.push(PathBuf::from(arg)),
+        }
+    }
+    Ok((output, positional))
+}
+
+fn parse_review_args(args: impl Iterator<Item = String>) -> Result<Command, String> {
+    let collected = args.collect::<Vec<_>>();
+    if collected.first().is_some_and(|arg| arg == "export") {
+        return parse_review_export_args(collected.into_iter().skip(1));
+    }
+    if collected.first().is_some_and(|arg| arg == "import") {
+        return parse_review_import_args(collected.into_iter().skip(1));
+    }
+
+    let (output, positional) = parse_output_and_positionals(collected.into_iter())?;
+    if positional.len() != 1 {
+        return Err("review requires <candidate-matches.json>".into());
+    }
+    Ok(Command::Review {
+        candidates: positional[0].clone(),
+        output,
+    })
+}
+
+fn parse_review_export_args(args: impl Iterator<Item = String>) -> Result<Command, String> {
+    let (output, positional) = parse_output_and_positionals(args)?;
+    if positional.len() != 1 {
+        return Err("review export requires <mapping.covemap>".into());
+    }
+    Ok(Command::ReviewExport {
+        map: positional[0].clone(),
+        output,
+    })
+}
+
+fn parse_review_import_args(args: impl Iterator<Item = String>) -> Result<Command, String> {
+    let mut output = None;
+    let mut replace = false;
+    let mut positional = Vec::new();
+    let mut args = args.peekable();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--out" | "--output" | "-o" => {
+                output = Some(
+                    args.next()
+                        .map(PathBuf::from)
+                        .ok_or_else(|| format!("{arg} requires a path"))?,
+                );
+            }
+            "--replace" => replace = true,
+            _ if arg.starts_with("--out=") => {
+                output = Some(PathBuf::from(arg.trim_start_matches("--out=")));
+            }
+            _ if arg.starts_with('-') => return Err(format!("unknown option {arg}")),
+            _ => positional.push(PathBuf::from(arg)),
+        }
+    }
+    if positional.len() != 2 {
+        return Err(
+            "review import requires <mapping.covemap> <reviewed.json> --out <mapping.covemap>"
+                .into(),
+        );
+    }
+    Ok(Command::ReviewImport {
+        map: positional[0].clone(),
+        review: positional[1].clone(),
+        output: output
+            .ok_or_else(|| "review import requires --out <mapping.covemap>".to_string())?,
+        replace,
+    })
+}
+
+fn parse_aliases_args(args: impl Iterator<Item = String>) -> Result<Command, String> {
+    let mut args = args.into_iter();
+    let subcommand = args
+        .next()
+        .ok_or_else(|| "aliases requires a subcommand: import".to_string())?;
+    if subcommand != "import" {
+        return Err("aliases supports only: import".into());
+    }
+
+    let mut output = None;
+    let mut catalog_id = None;
+    let mut resolver_id = None;
+    let mut positional = Vec::new();
+    let mut args = args.peekable();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--out" | "--output" | "-o" => {
+                output = Some(
+                    args.next()
+                        .map(PathBuf::from)
+                        .ok_or_else(|| format!("{arg} requires a path"))?,
+                );
+            }
+            "--catalog-id" => {
+                catalog_id = Some(
+                    args.next()
+                        .ok_or_else(|| "--catalog-id requires an id".to_string())?,
+                );
+            }
+            "--resolver-id" => {
+                resolver_id = Some(
+                    args.next()
+                        .ok_or_else(|| "--resolver-id requires an id".to_string())?,
+                );
+            }
+            _ if arg.starts_with("--out=") => {
+                output = Some(PathBuf::from(arg.trim_start_matches("--out=")));
+            }
+            _ if arg.starts_with("--catalog-id=") => {
+                catalog_id = Some(arg.trim_start_matches("--catalog-id=").to_string());
+            }
+            _ if arg.starts_with("--resolver-id=") => {
+                resolver_id = Some(arg.trim_start_matches("--resolver-id=").to_string());
+            }
+            _ if arg.starts_with('-') => return Err(format!("unknown option {arg}")),
+            _ => positional.push(PathBuf::from(arg)),
+        }
+    }
+
+    if positional.len() != 2 {
+        return Err(
+            "aliases import requires <mapping.covemap> <aliases.csv> --catalog-id <id> --resolver-id <id> --out <mapping.covemap>"
+                .into(),
+        );
+    }
+    Ok(Command::AliasesImport {
+        map: positional[0].clone(),
+        aliases: positional[1].clone(),
+        catalog_id: catalog_id
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| "aliases import requires --catalog-id <id>".to_string())?,
+        resolver_id: resolver_id
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| "aliases import requires --resolver-id <id>".to_string())?,
+        output: output
+            .ok_or_else(|| "aliases import requires --out <mapping.covemap>".to_string())?,
+    })
+}
+
+fn parse_replay_args(args: impl Iterator<Item = String>) -> Result<Command, String> {
+    let mut args = args.into_iter();
+    let subcommand = args
+        .next()
+        .ok_or_else(|| "replay requires a subcommand: verify".to_string())?;
+    if subcommand != "verify" {
+        return Err("replay supports only: verify".into());
+    }
+    let positional = args.map(PathBuf::from).collect::<Vec<_>>();
+    if positional.len() != 2 {
+        return Err("replay verify requires <mapping.covemap> <conversion-report.json>".into());
+    }
+    Ok(Command::ReplayVerify {
+        map: positional[0].clone(),
+        report: positional[1].clone(),
+    })
 }
 
 fn parse_output_format_and_positionals(

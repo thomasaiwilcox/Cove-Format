@@ -1025,6 +1025,7 @@ fn is_map_section(kind: SectionKind) -> bool {
             | SectionKind::MapEvidenceIndex
             | SectionKind::MapConversionReport
             | SectionKind::MapProjectionCatalog
+            | SectionKind::MapResolutionCatalog
     )
 }
 

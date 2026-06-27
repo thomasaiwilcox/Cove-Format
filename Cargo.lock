@@ -937,6 +937,7 @@ dependencies = [
  "cove-convert",
  "cove-core",
  "cove-index",
+ "csv",
  "icu_casemap",
  "icu_normalizer",
  "orc-rust",

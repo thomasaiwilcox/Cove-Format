@@ -1,0 +1,8 @@
+{
+  "expected_error_contains": "MAP_REPLAY_SOURCE_STALE",
+  "mapping": "accept/cove_map_reviewed_cross_rule_canonical_anchor.covemap",
+  "mutate_report": "source_snapshot_digest",
+  "sources": [
+    "accept/reviewed_cross_rule.csv"
+  ]
+}

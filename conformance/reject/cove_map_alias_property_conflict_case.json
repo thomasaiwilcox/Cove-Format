@@ -1,0 +1,7 @@
+{
+  "mapping": "accept/cove_map_alias_property_conflict.covemap",
+  "sources": [
+    "accept/company_alias_conflict_crm.csv",
+    "accept/company_alias_conflict_support.csv"
+  ]
+}

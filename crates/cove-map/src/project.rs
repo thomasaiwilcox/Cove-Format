@@ -1019,6 +1019,20 @@ fn collect_projection_expression_requirements(
         }
         return;
     }
+    if let Some(resolution) = parse_resolution_expression(expression) {
+        *include_evidence_index = true;
+        for key in [
+            "identity_rule_id",
+            "resolution_role_id",
+            "alias_hit",
+            resolution.field,
+        ] {
+            if !is_builtin_evidence_field(key) {
+                evidence_metadata_keys.insert(key.to_string());
+            }
+        }
+        return;
+    }
     if let Some(traversal) = parse_association_traversal(expression) {
         add_association_access_requirements(property_names);
         property_names.insert(traversal.property_name.to_string());
@@ -2844,6 +2858,110 @@ fn projection_evidence_value(entry: &ProjectionEvidenceEntry, key: &str) -> Valu
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ResolutionProjectionExpression<'a> {
+    identity_rule_id: &'a str,
+    role_id: &'a str,
+    field: &'a str,
+}
+
+fn parse_resolution_expression(expression: &str) -> Option<ResolutionProjectionExpression<'_>> {
+    let expression = expression.trim();
+    let rest = expression.strip_prefix("identity(")?;
+    let (identity_rule_id, rest) = rest.split_once(").resolution(")?;
+    let (role_id, field) = rest.split_once(").")?;
+    let identity_rule_id = identity_rule_id.trim();
+    let role_id = role_id.trim();
+    let field = field.trim();
+    if identity_rule_id.is_empty() || role_id.is_empty() || field.is_empty() {
+        return None;
+    }
+    Some(ResolutionProjectionExpression {
+        identity_rule_id,
+        role_id,
+        field,
+    })
+}
+
+fn resolution_expression_field_allowed(field: &str) -> bool {
+    matches!(
+        field,
+        "canonical_key"
+            | "canonical_label"
+            | "normalized_value"
+            | "raw_observed_value"
+            | "resolved_identity_value"
+    )
+}
+
+fn resolution_expression_value(
+    model: &ProjectionModel,
+    row: &ProjectionRow,
+    expression: ResolutionProjectionExpression<'_>,
+    expression_text: &str,
+) -> Result<Value, String> {
+    if !resolution_expression_field_allowed(expression.field) {
+        return Err(format!(
+            "unsupported resolution expression field '{}'",
+            expression.field
+        ));
+    }
+    let row_goid = hex_encode(&row.goid);
+    let mut values = Vec::new();
+    for entry in &model.evidence_entries {
+        if projection_evidence_value(entry, "output_object_id").as_str() != Some(row_goid.as_str())
+            || projection_evidence_value(entry, "identity_rule_id").as_str()
+                != Some(expression.identity_rule_id)
+        {
+            continue;
+        }
+
+        let metadata = projection_evidence_value(entry, "resolution_metadata");
+        if let Some(items) = metadata.as_array() {
+            for item in items {
+                if item
+                    .as_object()
+                    .and_then(|object| object.get("resolution_role_id"))
+                    .and_then(Value::as_str)
+                    != Some(expression.role_id)
+                    || item
+                        .as_object()
+                        .and_then(|object| object.get("alias_hit"))
+                        .and_then(Value::as_bool)
+                        != Some(true)
+                {
+                    continue;
+                }
+                let value = item
+                    .as_object()
+                    .and_then(|object| object.get(expression.field))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                push_unique_resolution_expression_value(&mut values, value);
+            }
+        } else if projection_evidence_value(entry, "resolution_role_id").as_str()
+            == Some(expression.role_id)
+            && projection_evidence_value(entry, "alias_hit").as_bool() == Some(true)
+        {
+            let value = projection_evidence_value(entry, expression.field);
+            push_unique_resolution_expression_value(&mut values, value);
+        }
+    }
+    match values.len() {
+        0 => Err(format!(
+            "resolution expression '{expression_text}' found no resolver hit"
+        )),
+        1 => Ok(values.remove(0)),
+        _ => Ok(Value::Array(values)),
+    }
+}
+
+fn push_unique_resolution_expression_value(values: &mut Vec<Value>, value: Value) {
+    if !value.is_null() && !values.contains(&value) {
+        values.push(value);
+    }
+}
+
 fn temporal_sort_key(row: &ProjectionRow) -> (i64, u64, u32, u32, [u8; 16]) {
     (
         row.timestamp_us,
@@ -2923,6 +3041,15 @@ fn validate_projection_expression(
     }
     if expression.starts_with("evidence.") {
         return Ok(());
+    }
+    if let Some(resolution) = parse_resolution_expression(expression) {
+        if resolution_expression_field_allowed(resolution.field) {
+            return Ok(());
+        }
+        return Err(format!(
+            "unsupported resolution expression field '{}'",
+            resolution.field
+        ));
     }
     if let Some(traversal) = parse_association_traversal(expression) {
         let association_type = traversal.association_type;
@@ -3759,6 +3886,9 @@ fn projection_value(
     }
     if let Some(literal) = literal_value(expression) {
         return Ok(literal);
+    }
+    if let Some(resolution) = parse_resolution_expression(expression) {
+        return resolution_expression_value(model, row, resolution, expression);
     }
     if let Some(value) = conditional_expression(model, projection, row, expression)? {
         return Ok(value);

@@ -1,0 +1,6 @@
+{
+  "mapping": "accept/cove_map_candidate_rules_limit.covemap",
+  "sources": [
+    "accept/company_candidates.csv"
+  ]
+}

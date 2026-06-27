@@ -1,0 +1,18 @@
+{
+  "expect_cove_o_valid": true,
+  "expected_conversion": {
+    "candidate_match_count": 0,
+    "object_count": 3
+  },
+  "expected_conversion_summary": {
+    "assertion_count": 1,
+    "evidence_entry_count": 3,
+    "materialized_row_count": 3
+  },
+  "mapping": "accept/cove_map_reviewed_equivalence_transitive.covemap",
+  "sources": [
+    "accept/reviewed_crm.csv",
+    "accept/reviewed_support.csv",
+    "accept/reviewed_ops.csv"
+  ]
+}

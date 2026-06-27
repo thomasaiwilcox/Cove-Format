@@ -1,0 +1,32 @@
+{
+  "expected_candidates": {
+    "candidate_match_count": 1,
+    "diagnostic_count": 0,
+    "first_left": {
+      "column": "company_name",
+      "normalized_value": "tesco plc",
+      "raw_value": "Tesco PLC",
+      "row_index": 0,
+      "source_id": "company_candidates"
+    },
+    "first_match": {
+      "blocking_key": "tesc",
+      "candidate_score": 333333,
+      "match_rule_id": "company_name_similarity",
+      "merge_behavior": "never",
+      "object_type": "Company",
+      "score_scale": 1000000
+    },
+    "first_right": {
+      "column": "company_name",
+      "normalized_value": "tesco supermarket",
+      "raw_value": "Tesco supermarket",
+      "row_index": 1,
+      "source_id": "company_candidates"
+    }
+  },
+  "mapping": "accept/cove_map_candidate_rules.covemap",
+  "sources": [
+    "accept/company_candidates.csv"
+  ]
+}

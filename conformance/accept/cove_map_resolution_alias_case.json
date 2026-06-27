@@ -1,0 +1,30 @@
+{
+  "expect_cove_o_valid": true,
+  "expected_conversion": {
+    "ambiguous_alias_count": 0,
+    "candidate_match_count": 0,
+    "resolver_goid_impact": [
+      {
+        "affected_goid_count": 1,
+        "affected_goids": [
+          "516c085f5d89fc2d932e752730328f93"
+        ],
+        "catalog_digest": "sha256:c187296cadea6f14c2b5446ab911c878699b6b10fa3ecd9577d8ba563dea7f98",
+        "normalization_pipeline_id": "company_name.v1",
+        "pipeline_digest": "sha256:0d921701ad4913337d694fbf0bcf760106fb4f9ddbfd65f5c1d64d45d62af5df",
+        "resolver_digest": "sha256:c0a34cad9d13cfca032a251e5b9374ab81a80cfc0624ef2958912835ae1ae6e5",
+        "resolver_id": "uk_company_name_resolver"
+      }
+    ],
+    "resolver_hit_count": 3,
+    "resolver_miss_count": 0
+  },
+  "expected_conversion_summary": {
+    "evidence_entry_count": 3,
+    "materialized_row_count": 3
+  },
+  "mapping": "accept/cove_map_resolution_alias.covemap",
+  "sources": [
+    "accept/company_aliases.csv"
+  ]
+}

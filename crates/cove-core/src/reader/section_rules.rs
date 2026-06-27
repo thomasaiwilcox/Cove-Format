@@ -174,7 +174,8 @@ fn allowed_profiles_for_section(section: SectionKind) -> &'static [u8] {
         | SectionKind::MapIdentityEquivalenceIndex
         | SectionKind::MapEvidenceIndex
         | SectionKind::MapConversionReport
-        | SectionKind::MapProjectionCatalog => &[6],
+        | SectionKind::MapProjectionCatalog
+        | SectionKind::MapResolutionCatalog => &[6],
     }
 }
 
@@ -324,6 +325,7 @@ fn is_map_section(kind: SectionKind) -> bool {
             | SectionKind::MapEvidenceIndex
             | SectionKind::MapConversionReport
             | SectionKind::MapProjectionCatalog
+            | SectionKind::MapResolutionCatalog
     )
 }
 

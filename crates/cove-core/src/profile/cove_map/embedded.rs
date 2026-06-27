@@ -5,7 +5,7 @@ use std::{
     fmt,
 };
 
-use crate::checksum;
+use crate::{checksum, constants::DigestAlgorithm, digest::compute_digest};
 use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Value};
 
@@ -21,6 +21,7 @@ impl EmbeddedMapSection {
         match self {
             Self::SourceCatalog(section) => &section.mapping_id,
             Self::FunctionRegistry(section) => &section.mapping_id,
+            Self::ResolutionCatalog(section) => &section.mapping_id,
             Self::IdentityRuleCatalog(section) => &section.mapping_id,
             Self::RowSemanticsCatalog(section) => &section.mapping_id,
             Self::AssertionLog(section) => &section.mapping_id,
@@ -35,6 +36,7 @@ impl EmbeddedMapSection {
         match self {
             Self::SourceCatalog(section) => &section.mapping_version,
             Self::FunctionRegistry(section) => &section.mapping_version,
+            Self::ResolutionCatalog(section) => &section.mapping_version,
             Self::IdentityRuleCatalog(section) => &section.mapping_version,
             Self::RowSemanticsCatalog(section) => &section.mapping_version,
             Self::AssertionLog(section) => &section.mapping_version,
@@ -56,6 +58,9 @@ pub(super) fn parse_embedded_section(
         }
         SectionKind::MapFunctionRegistry => {
             MapFunctionRegistry::parse(bytes).map(EmbeddedMapSection::FunctionRegistry)
+        }
+        SectionKind::MapResolutionCatalog => {
+            MapResolutionCatalog::parse(bytes).map(EmbeddedMapSection::ResolutionCatalog)
         }
         SectionKind::MapIdentityRuleCatalog => {
             MapIdentityRuleCatalog::parse(bytes).map(EmbeddedMapSection::IdentityRuleCatalog)
@@ -96,8 +101,12 @@ pub(super) fn validate_embedded_sections(sections: &[EmbeddedMapSection]) -> Res
 
     let mut sources = BTreeMap::<String, MapSourceEntry>::new();
     let mut function_ids = BTreeSet::<String>::new();
+    let mut function_versions = BTreeSet::<(String, String)>::new();
     let mut referenced_function_ids = BTreeSet::<String>::new();
+    let mut referenced_function_versions = BTreeSet::<(String, String)>::new();
     let mut identity_rule_ids = BTreeSet::<String>::new();
+    let mut resolver_object_types = BTreeMap::<String, String>::new();
+    let mut referenced_resolvers = BTreeSet::<(String, String)>::new();
     let mut do_not_merge = BTreeSet::<(String, String)>::new();
     let mut row_rules = BTreeMap::<String, MapRowSemanticRule>::new();
     let mut assertion_ids = BTreeSet::<String>::new();
@@ -121,7 +130,10 @@ pub(super) fn validate_embedded_sections(sections: &[EmbeddedMapSection]) -> Res
             }
             EmbeddedMapSection::FunctionRegistry(registry) => {
                 for function in &registry.functions {
-                    if !function_ids.insert(function.function_id.clone()) {
+                    function_ids.insert(function.function_id.clone());
+                    if !function_versions
+                        .insert((function.function_id.clone(), function.version.clone()))
+                    {
                         return Err(CoveError::MapInvalid);
                     }
                     if !function.deterministic
@@ -138,12 +150,45 @@ pub(super) fn validate_embedded_sections(sections: &[EmbeddedMapSection]) -> Res
                     }
                 }
             }
+            EmbeddedMapSection::ResolutionCatalog(catalog) => {
+                for pipeline in &catalog.normalization_pipelines {
+                    for function in &pipeline.functions {
+                        referenced_function_versions
+                            .insert((function.function_id.clone(), function.version.clone()));
+                    }
+                }
+                for resolver in &catalog.resolvers {
+                    if resolver_object_types
+                        .insert(resolver.resolver_id.clone(), resolver.object_type.clone())
+                        .is_some()
+                    {
+                        return Err(CoveError::MapInvalid);
+                    }
+                }
+                for rule in &catalog.match_rules {
+                    if !catalog
+                        .normalization_pipelines
+                        .iter()
+                        .any(|pipeline| pipeline.pipeline_id == rule.normalization_pipeline_id)
+                    {
+                        return Err(CoveError::MapInvalid);
+                    }
+                }
+            }
             EmbeddedMapSection::IdentityRuleCatalog(catalog) => {
                 for rule in &catalog.identity_rules {
                     if !identity_rule_ids.insert(rule.rule_id.clone()) {
                         return Err(CoveError::MapInvalid);
                     }
                     referenced_function_ids.extend(rule.function_ids.iter().cloned());
+                    referenced_resolvers.extend(
+                        rule.join_keys
+                            .iter()
+                            .filter_map(|component| component.resolution.as_ref())
+                            .map(|resolution| {
+                                (resolution.resolver_id.clone(), rule.object_type.clone())
+                            }),
+                    );
                 }
                 for constraint in &catalog.do_not_merge {
                     let pair =
@@ -193,6 +238,19 @@ pub(super) fn validate_embedded_sections(sections: &[EmbeddedMapSection]) -> Res
     for function_id in referenced_function_ids {
         if !function_ids.contains(&function_id) {
             return Err(CoveError::MapFunctionUndeclared);
+        }
+    }
+
+    for function_version in referenced_function_versions {
+        if !function_versions.contains(&function_version) {
+            return Err(CoveError::MapFunctionUndeclared);
+        }
+    }
+
+    for (resolver_id, object_type) in referenced_resolvers {
+        match resolver_object_types.get(&resolver_id) {
+            Some(resolver_object_type) if resolver_object_type == &object_type => {}
+            _ => return Err(CoveError::MapInvalid),
         }
     }
 
@@ -537,6 +595,516 @@ impl MapFunctionRegistry {
     }
 }
 
+impl MapResolutionCatalog {
+    pub fn parse(bytes: &[u8]) -> Result<Self, CoveError> {
+        let root = parse_root_for_section(SectionKind::MapResolutionCatalog, bytes)?;
+        let object = as_object(&root)?;
+        let (mapping_id, mapping_version) = parse_mapping_identity(object)?;
+
+        let mut normalization_pipelines = Vec::new();
+        let mut pipeline_ids = BTreeSet::new();
+        let mut pipeline_digests = BTreeMap::<String, String>::new();
+        for value in required_array(object, "normalization_pipelines")? {
+            let pipeline = as_object(value)?;
+            validate_keys(pipeline, &["pipeline_id", "functions", "tables"])?;
+            let pipeline_id = required_non_empty_str(pipeline, "pipeline_id")?;
+            if !pipeline_ids.insert(pipeline_id.clone()) {
+                return Err(CoveError::MapInvalid);
+            }
+
+            let mut functions = Vec::new();
+            for value in required_array(pipeline, "functions")? {
+                let function = as_object(value)?;
+                validate_keys(
+                    function,
+                    &["function_id", "version", "table_id", "suffix_table_digest"],
+                )?;
+                functions.push(MapNormalizationFunction {
+                    function_id: required_non_empty_str(function, "function_id")?,
+                    version: required_non_empty_str(function, "version")?,
+                    table_id: optional_non_empty_str(function, "table_id")?,
+                    suffix_table_digest: optional_non_empty_str(function, "suffix_table_digest")?,
+                });
+            }
+            if functions.is_empty() {
+                return Err(CoveError::MapInvalid);
+            }
+
+            let mut tables = Vec::new();
+            if let Some(values) = optional_array(pipeline, "tables")? {
+                let mut table_ids = BTreeSet::new();
+                for value in values {
+                    let table = as_object(value)?;
+                    validate_keys(table, &["table_id", "digest", "values"])?;
+                    let table_id = required_non_empty_str(table, "table_id")?;
+                    if !table_ids.insert(table_id.clone()) {
+                        return Err(CoveError::MapInvalid);
+                    }
+                    let digest = required_sha256_digest(table, "digest")?;
+                    tables.push(MapNormalizationTable {
+                        table_id,
+                        digest,
+                        values: optional_string_list(table, "values")?,
+                    });
+                }
+            }
+            for function in &functions {
+                if let Some(table_id) = &function.table_id {
+                    if !tables.iter().any(|table| &table.table_id == table_id) {
+                        return Err(CoveError::MapInvalid);
+                    }
+                }
+                if let Some(digest) = &function.suffix_table_digest {
+                    validate_sha256_digest_string(digest)?;
+                }
+            }
+
+            let digest_input = pipeline_digest_input(&pipeline_id, &functions, &tables)?;
+            let pipeline_digest = sha256_digest_string(&canonical_json(&digest_input)?)?;
+            pipeline_digests.insert(pipeline_id.clone(), pipeline_digest);
+            normalization_pipelines.push(MapNormalizationPipeline {
+                pipeline_id,
+                functions,
+                tables,
+            });
+        }
+
+        let mut resolvers = Vec::new();
+        let mut resolver_ids = BTreeSet::new();
+        for value in required_array(object, "resolvers")? {
+            let resolver = as_object(value)?;
+            validate_keys(
+                resolver,
+                &[
+                    "resolver_id",
+                    "kind",
+                    "object_type",
+                    "authority",
+                    "confidence_class",
+                    "normalization_pipeline_id",
+                    "on_hit",
+                    "on_miss",
+                    "miss_confidence_class",
+                    "ambiguous_policy",
+                    "catalog_digest",
+                    "pipeline_digest",
+                    "resolver_digest",
+                    "order_sensitive_catalog",
+                    "evidence_policy",
+                    "alias_catalog",
+                ],
+            )?;
+            let resolver_id = required_non_empty_str(resolver, "resolver_id")?;
+            if !resolver_ids.insert(resolver_id.clone()) {
+                return Err(CoveError::MapInvalid);
+            }
+            let kind = required_non_empty_str(resolver, "kind")?;
+            if kind != "alias_catalog" {
+                return Err(CoveError::MapInvalid);
+            }
+            let object_type = required_non_empty_str(resolver, "object_type")?;
+            let authority = required_non_empty_str(resolver, "authority")?;
+            let confidence_class = required_non_empty_str(resolver, "confidence_class")?;
+            let normalization_pipeline_id =
+                required_non_empty_str(resolver, "normalization_pipeline_id")?;
+            let expected_pipeline_digest = pipeline_digests
+                .get(&normalization_pipeline_id)
+                .ok_or(CoveError::MapInvalid)?;
+            let on_hit = required_non_empty_str(resolver, "on_hit")?;
+            if on_hit != "canonical_key" {
+                return Err(CoveError::MapInvalid);
+            }
+            let on_miss = required_non_empty_str(resolver, "on_miss")?;
+            if !matches!(
+                on_miss.as_str(),
+                "reject" | "normalized_value" | "candidate_only" | "source_scoped"
+            ) {
+                return Err(CoveError::MapInvalid);
+            }
+            let miss_confidence_class = optional_non_empty_str(resolver, "miss_confidence_class")?;
+            if on_miss == "normalized_value" {
+                if !matches!(
+                    miss_confidence_class.as_deref(),
+                    Some("strong_deterministic" | "weak_deterministic")
+                ) {
+                    return Err(CoveError::MapInvalid);
+                }
+            } else if miss_confidence_class.as_deref() == Some("authoritative") {
+                return Err(CoveError::MapInvalid);
+            }
+            let ambiguous_policy = optional_non_empty_str(resolver, "ambiguous_policy")?
+                .unwrap_or_else(|| "reject_auto_merge".to_string());
+            if !matches!(
+                ambiguous_policy.as_str(),
+                "reject_auto_merge" | "candidate_only" | "reject"
+            ) {
+                return Err(CoveError::MapInvalid);
+            }
+            let order_sensitive_catalog =
+                optional_bool(resolver, "order_sensitive_catalog", false)?;
+            let evidence_policy = optional_non_empty_str(resolver, "evidence_policy")?
+                .unwrap_or_else(|| "retain_raw".to_string());
+            if !matches!(evidence_policy.as_str(), "retain_raw" | "redact_raw") {
+                return Err(CoveError::MapInvalid);
+            }
+            let catalog_digest = required_sha256_digest(resolver, "catalog_digest")?;
+            let pipeline_digest = required_sha256_digest(resolver, "pipeline_digest")?;
+            if &pipeline_digest != expected_pipeline_digest {
+                return Err(CoveError::DigestMismatch);
+            }
+            let resolver_digest = required_sha256_digest(resolver, "resolver_digest")?;
+            let alias_catalog_value = resolver.get("alias_catalog").ok_or(CoveError::MapInvalid)?;
+            let alias_catalog_object = as_object(alias_catalog_value)?;
+            let alias_catalog = parse_alias_catalog(
+                alias_catalog_object,
+                &ambiguous_policy,
+                order_sensitive_catalog,
+            )?;
+            let expected_catalog_digest = sha256_digest_string(&canonical_json(
+                &alias_catalog_digest_input(&alias_catalog, order_sensitive_catalog)?,
+            )?)?;
+            if catalog_digest != expected_catalog_digest {
+                return Err(CoveError::DigestMismatch);
+            }
+
+            let expected_resolver_digest =
+                sha256_digest_string(&canonical_json(&resolver_digest_input(
+                    &resolver_id,
+                    &kind,
+                    &object_type,
+                    &authority,
+                    &confidence_class,
+                    &normalization_pipeline_id,
+                    &pipeline_digest,
+                    &on_hit,
+                    &on_miss,
+                    miss_confidence_class.as_deref(),
+                    &ambiguous_policy,
+                    &catalog_digest,
+                    &evidence_policy,
+                )?)?)?;
+            if resolver_digest != expected_resolver_digest {
+                return Err(CoveError::DigestMismatch);
+            }
+
+            resolvers.push(MapResolver {
+                resolver_id,
+                kind,
+                object_type,
+                authority,
+                confidence_class,
+                normalization_pipeline_id,
+                on_hit,
+                on_miss,
+                miss_confidence_class,
+                ambiguous_policy,
+                catalog_digest,
+                pipeline_digest,
+                resolver_digest,
+                order_sensitive_catalog,
+                evidence_policy,
+                alias_catalog: Some(alias_catalog),
+            });
+        }
+
+        let mut match_rules = Vec::new();
+        let mut match_rule_ids = BTreeSet::new();
+        for value in required_array(object, "match_rules")? {
+            let rule = parse_candidate_match_rule(as_object(value)?)?;
+            if !match_rule_ids.insert(rule.match_rule_id.clone()) {
+                return Err(CoveError::MapInvalid);
+            }
+            if !pipeline_ids.contains(&rule.normalization_pipeline_id) {
+                return Err(CoveError::MapInvalid);
+            }
+            match_rules.push(rule);
+        }
+
+        let mut reviewed_decisions = Vec::new();
+        let mut reviewed_decision_ids = BTreeSet::new();
+        for value in required_array(object, "reviewed_decisions")? {
+            let decision = parse_reviewed_decision(as_object(value)?)?;
+            if !reviewed_decision_ids.insert(decision.decision_id.clone()) {
+                return Err(CoveError::MapInvalid);
+            }
+            reviewed_decisions.push(decision);
+        }
+
+        Ok(Self {
+            mapping_id,
+            mapping_version,
+            normalization_pipelines,
+            resolvers,
+            match_rules,
+            reviewed_decisions,
+        })
+    }
+}
+
+fn parse_alias_catalog(
+    object: &Map<String, Value>,
+    ambiguous_policy: &str,
+    order_sensitive_catalog: bool,
+) -> Result<MapAliasCatalog, CoveError> {
+    validate_keys(object, &["alias_catalog_id", "entries"])?;
+    let alias_catalog_id = required_non_empty_str(object, "alias_catalog_id")?;
+    let mut entries = Vec::new();
+    let mut entry_ids = BTreeSet::new();
+    let mut alias_targets = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut alias_ambiguity = BTreeMap::<String, bool>::new();
+    for value in required_array(object, "entries")? {
+        let entry = as_object(value)?;
+        validate_keys(
+            entry,
+            &[
+                "alias_entry_id",
+                "canonical_key",
+                "canonical_label",
+                "aliases",
+                "ambiguous",
+                "metadata",
+                "non_semantic_metadata",
+            ],
+        )?;
+        let alias_entry_id = required_non_empty_str(entry, "alias_entry_id")?;
+        if !entry_ids.insert(alias_entry_id.clone()) {
+            return Err(CoveError::MapInvalid);
+        }
+        let canonical_key = required_non_empty_str(entry, "canonical_key")?;
+        let canonical_label = required_non_empty_str(entry, "canonical_label")?;
+        let aliases = string_list(entry, "aliases")?;
+        if aliases.is_empty() {
+            return Err(CoveError::MapInvalid);
+        }
+        let ambiguous = optional_bool(entry, "ambiguous", false)?;
+        for alias in &aliases {
+            alias_targets
+                .entry(alias.clone())
+                .or_default()
+                .insert(canonical_key.clone());
+            alias_ambiguity
+                .entry(alias.clone())
+                .and_modify(|existing| *existing &= ambiguous)
+                .or_insert(ambiguous);
+        }
+        entries.push(MapAliasEntry {
+            alias_entry_id,
+            canonical_key,
+            canonical_label,
+            aliases,
+            ambiguous,
+            metadata: optional_value_object(entry, "metadata")?,
+            non_semantic_metadata: optional_value_object(entry, "non_semantic_metadata")?,
+        });
+    }
+    if !order_sensitive_catalog {
+        entries.sort_by(|left, right| left.alias_entry_id.cmp(&right.alias_entry_id));
+    }
+    let resolver_marks_ambiguous = ambiguous_policy == "candidate_only";
+    for (alias, targets) in alias_targets {
+        if targets.len() > 1
+            && !resolver_marks_ambiguous
+            && !alias_ambiguity.get(&alias).copied().unwrap_or(false)
+        {
+            return Err(CoveError::MapInvalid);
+        }
+    }
+    Ok(MapAliasCatalog {
+        alias_catalog_id,
+        entries,
+    })
+}
+
+fn parse_candidate_match_rule(
+    object: &Map<String, Value>,
+) -> Result<MapCandidateMatchRule, CoveError> {
+    validate_keys(
+        object,
+        &[
+            "match_rule_id",
+            "object_type",
+            "inputs",
+            "blocking",
+            "normalization_pipeline_id",
+            "scoring",
+            "limits",
+            "output",
+        ],
+    )?;
+    let mut inputs = Vec::new();
+    for value in required_array(object, "inputs")? {
+        let input = as_object(value)?;
+        validate_keys(input, &["source_id", "column"])?;
+        inputs.push(MapCandidateMatchInput {
+            source_id: required_non_empty_str(input, "source_id")?,
+            column: required_non_empty_str(input, "column")?,
+        });
+    }
+    if inputs.is_empty() {
+        return Err(CoveError::MapInvalid);
+    }
+
+    let scoring = required_value_object(object, "scoring")?;
+    if scoring.get("merge_behavior").and_then(Value::as_str) != Some("never") {
+        return Err(CoveError::MapInvalid);
+    }
+    let limits_object = object
+        .get("limits")
+        .and_then(Value::as_object)
+        .ok_or(CoveError::MapInvalid)?;
+    validate_keys(
+        limits_object,
+        &["max_pairs_per_block", "max_pairs_total", "on_limit"],
+    )?;
+    let on_limit = required_non_empty_str(limits_object, "on_limit")?;
+    if !matches!(
+        on_limit.as_str(),
+        "fail_closed" | "emit_diagnostic_and_truncate"
+    ) {
+        return Err(CoveError::MapInvalid);
+    }
+
+    Ok(MapCandidateMatchRule {
+        match_rule_id: required_non_empty_str(object, "match_rule_id")?,
+        object_type: required_non_empty_str(object, "object_type")?,
+        inputs,
+        blocking: required_value_object(object, "blocking")?,
+        normalization_pipeline_id: required_non_empty_str(object, "normalization_pipeline_id")?,
+        scoring,
+        limits: MapCandidateMatchLimits {
+            max_pairs_per_block: required_u64(limits_object, "max_pairs_per_block")?,
+            max_pairs_total: required_u64(limits_object, "max_pairs_total")?,
+            on_limit,
+        },
+        output: required_value_object(object, "output")?,
+    })
+}
+
+fn parse_reviewed_decision(object: &Map<String, Value>) -> Result<MapReviewedDecision, CoveError> {
+    validate_keys(
+        object,
+        &[
+            "decision_id",
+            "decision",
+            "confidence_class",
+            "reviewed_by",
+            "reviewed_at",
+            "reason",
+            "left",
+            "right",
+            "canonical_anchor",
+        ],
+    )?;
+    let decision = required_non_empty_str(object, "decision")?;
+    if !matches!(decision.as_str(), "same_object" | "do_not_merge") {
+        return Err(CoveError::MapInvalid);
+    }
+    Ok(MapReviewedDecision {
+        decision_id: required_non_empty_str(object, "decision_id")?,
+        decision,
+        confidence_class: required_non_empty_str(object, "confidence_class")?,
+        reviewed_by: required_non_empty_str(object, "reviewed_by")?,
+        reviewed_at: required_non_empty_str(object, "reviewed_at")?,
+        reason: optional_non_empty_str(object, "reason")?,
+        left: parse_typed_identity_reference(
+            object
+                .get("left")
+                .and_then(Value::as_object)
+                .ok_or(CoveError::MapInvalid)?,
+        )?,
+        right: parse_typed_identity_reference(
+            object
+                .get("right")
+                .and_then(Value::as_object)
+                .ok_or(CoveError::MapInvalid)?,
+        )?,
+        canonical_anchor: match object.get("canonical_anchor") {
+            Some(value) => Some(parse_canonical_anchor(as_object(value)?)?),
+            None => None,
+        },
+    })
+}
+
+fn parse_typed_identity_reference(
+    object: &Map<String, Value>,
+) -> Result<MapTypedIdentityReference, CoveError> {
+    validate_keys(
+        object,
+        &[
+            "kind",
+            "object_type",
+            "identity_rule_id",
+            "resolver_id",
+            "canonical_key",
+            "join_key_sha256",
+            "source_id",
+            "source_row_identity",
+            "source_snapshot_digest",
+            "schema_fingerprint",
+            "row_digest",
+            "identity_alias",
+        ],
+    )?;
+    let kind = required_non_empty_str(object, "kind")?;
+    let reference = MapTypedIdentityReference {
+        kind: kind.clone(),
+        object_type: required_non_empty_str(object, "object_type")?,
+        identity_rule_id: optional_non_empty_str(object, "identity_rule_id")?,
+        resolver_id: optional_non_empty_str(object, "resolver_id")?,
+        canonical_key: optional_non_empty_str(object, "canonical_key")?,
+        join_key_sha256: optional_non_empty_str(object, "join_key_sha256")?,
+        source_id: optional_non_empty_str(object, "source_id")?,
+        source_row_identity: optional_non_empty_str(object, "source_row_identity")?,
+        source_snapshot_digest: optional_non_empty_str(object, "source_snapshot_digest")?,
+        schema_fingerprint: optional_non_empty_str(object, "schema_fingerprint")?,
+        row_digest: optional_non_empty_str(object, "row_digest")?,
+        identity_alias: optional_non_empty_str(object, "identity_alias")?,
+    };
+    let valid = match kind.as_str() {
+        "identity_join_key" => {
+            reference.identity_rule_id.is_some() && reference.join_key_sha256.is_some()
+        }
+        "resolver_key" => reference.resolver_id.is_some() && reference.canonical_key.is_some(),
+        "source_row" => {
+            reference.identity_rule_id.is_some()
+                && reference.source_id.is_some()
+                && reference.source_row_identity.is_some()
+                && reference.source_snapshot_digest.is_some()
+                && reference.schema_fingerprint.is_some()
+        }
+        "row_digest" => reference.row_digest.is_some(),
+        "identity_alias" => reference.identity_alias.is_some(),
+        _ => false,
+    };
+    valid.then_some(reference).ok_or(CoveError::MapInvalid)
+}
+
+fn parse_canonical_anchor(object: &Map<String, Value>) -> Result<MapCanonicalAnchor, CoveError> {
+    validate_keys(
+        object,
+        &["kind", "object_type", "identity_rule_id", "components"],
+    )?;
+    let mut components = Vec::new();
+    for value in required_array(object, "components")? {
+        let component = as_object(value)?;
+        validate_keys(component, &["role_id", "logical_type", "resolved_value"])?;
+        components.push(MapCanonicalAnchorComponent {
+            role_id: required_non_empty_str(component, "role_id")?,
+            logical_type: required_non_empty_str(component, "logical_type")?,
+            resolved_value: required_non_empty_str(component, "resolved_value")?,
+        });
+    }
+    if components.is_empty() {
+        return Err(CoveError::MapInvalid);
+    }
+    Ok(MapCanonicalAnchor {
+        kind: required_non_empty_str(object, "kind")?,
+        object_type: required_non_empty_str(object, "object_type")?,
+        identity_rule_id: required_non_empty_str(object, "identity_rule_id")?,
+        components,
+    })
+}
+
 impl MapIdentityRuleCatalog {
     pub fn parse(bytes: &[u8]) -> Result<Self, CoveError> {
         let root = parse_root_for_section(SectionKind::MapIdentityRuleCatalog, bytes)?;
@@ -556,6 +1124,7 @@ impl MapIdentityRuleCatalog {
                         "auto_merge",
                         "candidate_only",
                         "property_conflicts_declared",
+                        "allow_reviewed_equivalence",
                         "function_ids",
                         "join_keys",
                     ],
@@ -572,8 +1141,24 @@ impl MapIdentityRuleCatalog {
                             "canonicalization",
                             "null_policy",
                             "ordering",
+                            "resolution",
                         ],
                     )?;
+                    let resolution = match join_key.get("resolution") {
+                        Some(value) => {
+                            let resolution = as_object(value)?;
+                            validate_keys(resolution, &["resolver_id"])?;
+                            let canonicalization =
+                                required_non_empty_str(join_key, "canonicalization")?;
+                            if !matches!(canonicalization.as_str(), "identity" | "none") {
+                                return Err(CoveError::MapInvalid);
+                            }
+                            Some(MapResolutionBinding {
+                                resolver_id: required_non_empty_str(resolution, "resolver_id")?,
+                            })
+                        }
+                        None => None,
+                    };
                     join_keys.push(MapJoinKeyComponent {
                         role_id: required_non_empty_str(join_key, "role_id")?,
                         source_column: required_non_empty_str(join_key, "source_column")?,
@@ -581,6 +1166,7 @@ impl MapIdentityRuleCatalog {
                         canonicalization: required_non_empty_str(join_key, "canonicalization")?,
                         null_policy: required_non_empty_str(join_key, "null_policy")?,
                         ordering: required_non_empty_str(join_key, "ordering")?,
+                        resolution,
                     });
                 }
                 if join_keys.is_empty() {
@@ -596,6 +1182,11 @@ impl MapIdentityRuleCatalog {
                     property_conflicts_declared: required_bool(
                         entry,
                         "property_conflicts_declared",
+                    )?,
+                    allow_reviewed_equivalence: optional_bool(
+                        entry,
+                        "allow_reviewed_equivalence",
+                        false,
                     )?,
                     function_ids: optional_string_list(entry, "function_ids")?,
                     join_keys,
@@ -959,16 +1550,70 @@ impl MapEvidenceIndex {
                         "object_type",
                         "association_type",
                         "join_key_sha256",
+                        "resolution_metadata",
+                        "resolution_role_id",
+                        "resolution_kind",
+                        "resolver_id",
+                        "resolver_digest",
+                        "catalog_digest",
+                        "pipeline_digest",
+                        "normalization_pipeline_id",
+                        "evidence_policy",
+                        "redacted_resolution_evidence",
+                        "raw_observed_value",
+                        "normalized_value",
+                        "resolved_identity_value",
+                        "canonical_key",
+                        "canonical_label",
+                        "alias_catalog_id",
+                        "alias_entry_id",
+                        "alias_hit",
+                        "alias_miss",
+                        "alias_ambiguous",
+                        "miss_policy",
+                        "candidate_match_id",
+                        "candidate_score",
+                        "left_source_id",
+                        "left_source_row_identity",
+                        "left_raw_observed_value",
+                        "left_normalized_value",
+                        "left_row_digest",
+                        "right_source_id",
+                        "right_source_row_identity",
+                        "right_raw_observed_value",
+                        "right_normalized_value",
+                        "right_row_digest",
+                        "blocking_key",
+                        "match_rule_id",
+                        "review_decision_id",
+                        "redacted_resolution_evidence",
+                        "operation_metadata",
                     ],
                 )?;
-                let operation_metadata = entry
+                let mut operation_metadata = entry
                     .iter()
                     .filter(|(key, _)| {
                         is_evidence_operation_metadata_key(key)
                             && (requested_keys.is_empty() || requested_keys.contains(key.as_str()))
                     })
                     .map(|(key, value)| (key.clone(), value.clone()))
-                    .collect();
+                    .collect::<BTreeMap<_, _>>();
+                if let Some(metadata) = entry.get("operation_metadata") {
+                    let metadata = as_object(metadata)?;
+                    for (key, value) in metadata {
+                        if !is_evidence_operation_metadata_key(key) {
+                            return Err(CoveError::MapEvidenceInvalid);
+                        }
+                        if requested_keys.is_empty() || requested_keys.contains(key.as_str()) {
+                            if operation_metadata
+                                .insert(key.clone(), value.clone())
+                                .is_some()
+                            {
+                                return Err(CoveError::MapEvidenceInvalid);
+                            }
+                        }
+                    }
+                }
                 entries.push(MapEvidenceEntry {
                     source_id: required_non_empty_str(entry, "source_id")?,
                     source_row_identity: required_non_empty_str(entry, "source_row_identity")?,
@@ -1317,6 +1962,42 @@ fn is_evidence_operation_metadata_key(key: &str) -> bool {
             | "object_type"
             | "association_type"
             | "join_key_sha256"
+            | "resolution_metadata"
+            | "resolution_role_id"
+            | "resolution_kind"
+            | "resolver_id"
+            | "resolver_digest"
+            | "catalog_digest"
+            | "pipeline_digest"
+            | "normalization_pipeline_id"
+            | "evidence_policy"
+            | "redacted_resolution_evidence"
+            | "raw_observed_value"
+            | "normalized_value"
+            | "resolved_identity_value"
+            | "canonical_key"
+            | "canonical_label"
+            | "alias_catalog_id"
+            | "alias_entry_id"
+            | "alias_hit"
+            | "alias_miss"
+            | "alias_ambiguous"
+            | "miss_policy"
+            | "candidate_match_id"
+            | "candidate_score"
+            | "left_source_id"
+            | "left_source_row_identity"
+            | "left_raw_observed_value"
+            | "left_normalized_value"
+            | "left_row_digest"
+            | "right_source_id"
+            | "right_source_row_identity"
+            | "right_raw_observed_value"
+            | "right_normalized_value"
+            | "right_row_digest"
+            | "blocking_key"
+            | "match_rule_id"
+            | "review_decision_id"
     )
 }
 
@@ -1773,6 +2454,7 @@ fn section_kind_schema_name(kind: SectionKind) -> &'static str {
     match kind {
         SectionKind::MapSourceCatalog => "MAP_SOURCE_CATALOG",
         SectionKind::MapFunctionRegistry => "MAP_FUNCTION_REGISTRY",
+        SectionKind::MapResolutionCatalog => "MAP_RESOLUTION_CATALOG",
         SectionKind::MapIdentityRuleCatalog => "MAP_IDENTITY_RULE_CATALOG",
         SectionKind::MapRowSemanticsCatalog => "MAP_ROW_SEMANTICS_CATALOG",
         SectionKind::MapAssertionLog => "MAP_ASSERTION_LOG",
@@ -1793,6 +2475,10 @@ fn is_allowed_root_key(kind: SectionKind, key: &str) -> bool {
             matches!(key, "governance_reconciliation_policy" | "sources")
         }
         SectionKind::MapFunctionRegistry => key == "functions",
+        SectionKind::MapResolutionCatalog => matches!(
+            key,
+            "normalization_pipelines" | "resolvers" | "match_rules" | "reviewed_decisions"
+        ),
         SectionKind::MapIdentityRuleCatalog => matches!(key, "identity_rules" | "do_not_merge"),
         SectionKind::MapRowSemanticsCatalog => key == "rules",
         SectionKind::MapAssertionLog => key == "assertions",
@@ -1807,6 +2493,10 @@ fn is_allowed_root_key(kind: SectionKind, key: &str) -> bool {
                 | "association_count"
                 | "property_value_count"
                 | "candidate_match_count"
+                | "resolver_hit_count"
+                | "resolver_miss_count"
+                | "ambiguous_alias_count"
+                | "resolver_catalog_digests"
                 | "candidate_matches"
                 | "generated_artifacts"
                 | "unsupported"
@@ -1894,6 +2584,20 @@ fn validate_conversion_report_details(object: &Map<String, Value>) -> Result<(),
                     "identity_rule_id",
                     "object_type",
                     "join_key_sha256",
+                    "match_rule_id",
+                    "candidate_score",
+                    "score_scale",
+                    "blocking_key",
+                    "left_source_id",
+                    "left_source_row_identity",
+                    "left_raw_observed_value",
+                    "left_normalized_value",
+                    "left_row_digest",
+                    "right_source_id",
+                    "right_source_row_identity",
+                    "right_raw_observed_value",
+                    "right_normalized_value",
+                    "right_row_digest",
                 ],
             )?;
         }
@@ -2037,6 +2741,13 @@ fn required_u32(object: &Map<String, Value>, key: &str) -> Result<u32, CoveError
         .ok_or(CoveError::MapInvalid)
 }
 
+fn required_u64(object: &Map<String, Value>, key: &str) -> Result<u64, CoveError> {
+    object
+        .get(key)
+        .and_then(Value::as_u64)
+        .ok_or(CoveError::MapInvalid)
+}
+
 fn required_bool(object: &Map<String, Value>, key: &str) -> Result<bool, CoveError> {
     object
         .get(key)
@@ -2069,6 +2780,37 @@ fn optional_string_list(object: &Map<String, Value>, key: &str) -> Result<Vec<St
     }
 }
 
+fn required_value_object(
+    object: &Map<String, Value>,
+    key: &str,
+) -> Result<BTreeMap<String, Value>, CoveError> {
+    object
+        .get(key)
+        .and_then(Value::as_object)
+        .map(value_object_to_btree)
+        .ok_or(CoveError::MapInvalid)
+}
+
+fn optional_value_object(
+    object: &Map<String, Value>,
+    key: &str,
+) -> Result<BTreeMap<String, Value>, CoveError> {
+    match object.get(key) {
+        None => Ok(BTreeMap::new()),
+        Some(value) => value
+            .as_object()
+            .map(value_object_to_btree)
+            .ok_or(CoveError::MapInvalid),
+    }
+}
+
+fn value_object_to_btree(object: &Map<String, Value>) -> BTreeMap<String, Value> {
+    object
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
 fn parse_string_values(values: &[Value]) -> Result<Vec<String>, CoveError> {
     values
         .iter()
@@ -2091,5 +2833,656 @@ fn normalize_pair(left: &str, right: &str) -> Result<(String, String), CoveError
         Ok((left.to_string(), right.to_string()))
     } else {
         Ok((right.to_string(), left.to_string()))
+    }
+}
+
+fn required_sha256_digest(object: &Map<String, Value>, key: &str) -> Result<String, CoveError> {
+    let digest = required_non_empty_str(object, key)?;
+    validate_sha256_digest_string(&digest)?;
+    Ok(digest)
+}
+
+fn validate_sha256_digest_string(value: &str) -> Result<(), CoveError> {
+    let Some(hex) = value.strip_prefix("sha256:") else {
+        return Err(CoveError::MapInvalid);
+    };
+    if hex.len() != 64
+        || !hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(CoveError::MapInvalid);
+    }
+    Ok(())
+}
+
+fn sha256_digest_string(bytes: &[u8]) -> Result<String, CoveError> {
+    let digest = compute_digest(DigestAlgorithm::Sha256, bytes)?;
+    let mut out = String::with_capacity("sha256:".len() + digest.len() * 2);
+    out.push_str("sha256:");
+    for byte in digest {
+        out.push(hex_char(byte >> 4));
+        out.push(hex_char(byte & 0x0f));
+    }
+    Ok(out)
+}
+
+fn hex_char(nibble: u8) -> char {
+    match nibble {
+        0..=9 => (b'0' + nibble) as char,
+        10..=15 => (b'a' + nibble - 10) as char,
+        _ => unreachable!(),
+    }
+}
+
+fn pipeline_digest_input(
+    pipeline_id: &str,
+    functions: &[MapNormalizationFunction],
+    tables: &[MapNormalizationTable],
+) -> Result<Value, CoveError> {
+    let function_values = functions
+        .iter()
+        .map(|function| {
+            let mut object = Map::new();
+            object.insert(
+                "function_id".into(),
+                Value::String(function.function_id.clone()),
+            );
+            object.insert("version".into(), Value::String(function.version.clone()));
+            if let Some(table_id) = &function.table_id {
+                object.insert("table_id".into(), Value::String(table_id.clone()));
+            }
+            if let Some(digest) = &function.suffix_table_digest {
+                object.insert("suffix_table_digest".into(), Value::String(digest.clone()));
+            }
+            Value::Object(object)
+        })
+        .collect::<Vec<_>>();
+    let mut table_values = tables
+        .iter()
+        .map(|table| {
+            let mut object = Map::new();
+            object.insert("table_id".into(), Value::String(table.table_id.clone()));
+            object.insert("digest".into(), Value::String(table.digest.clone()));
+            Value::Object(object)
+        })
+        .collect::<Vec<_>>();
+    table_values.sort_by(|left, right| {
+        left.get("table_id")
+            .and_then(Value::as_str)
+            .cmp(&right.get("table_id").and_then(Value::as_str))
+    });
+    Ok(json_object([
+        ("pipeline_id", Value::String(pipeline_id.to_string())),
+        ("functions", Value::Array(function_values)),
+        ("tables", Value::Array(table_values)),
+    ]))
+}
+
+fn alias_catalog_digest_input(
+    catalog: &MapAliasCatalog,
+    order_sensitive_catalog: bool,
+) -> Result<Value, CoveError> {
+    let mut entries = catalog.entries.clone();
+    if !order_sensitive_catalog {
+        entries.sort_by(|left, right| left.alias_entry_id.cmp(&right.alias_entry_id));
+    }
+    let entry_values = entries
+        .iter()
+        .map(|entry| {
+            let mut aliases = entry.aliases.clone();
+            if !order_sensitive_catalog {
+                aliases.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+            }
+            let mut object = Map::new();
+            object.insert(
+                "alias_entry_id".into(),
+                Value::String(entry.alias_entry_id.clone()),
+            );
+            object.insert(
+                "canonical_key".into(),
+                Value::String(entry.canonical_key.clone()),
+            );
+            object.insert(
+                "canonical_label".into(),
+                Value::String(entry.canonical_label.clone()),
+            );
+            object.insert(
+                "aliases".into(),
+                Value::Array(aliases.into_iter().map(Value::String).collect()),
+            );
+            if entry.ambiguous {
+                object.insert("ambiguous".into(), Value::Bool(true));
+            }
+            if !entry.metadata.is_empty() {
+                object.insert(
+                    "metadata".into(),
+                    Value::Object(btree_to_json_map(&entry.metadata)),
+                );
+            }
+            Value::Object(object)
+        })
+        .collect::<Vec<_>>();
+    Ok(json_object([
+        (
+            "alias_catalog_id",
+            Value::String(catalog.alias_catalog_id.clone()),
+        ),
+        ("entries", Value::Array(entry_values)),
+    ]))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolver_digest_input(
+    resolver_id: &str,
+    kind: &str,
+    object_type: &str,
+    authority: &str,
+    confidence_class: &str,
+    normalization_pipeline_id: &str,
+    pipeline_digest: &str,
+    on_hit: &str,
+    on_miss: &str,
+    miss_confidence_class: Option<&str>,
+    ambiguous_policy: &str,
+    catalog_digest: &str,
+    evidence_policy: &str,
+) -> Result<Value, CoveError> {
+    Ok(json_object([
+        ("resolver_id", Value::String(resolver_id.to_string())),
+        ("kind", Value::String(kind.to_string())),
+        ("object_type", Value::String(object_type.to_string())),
+        ("authority", Value::String(authority.to_string())),
+        (
+            "confidence_class",
+            Value::String(confidence_class.to_string()),
+        ),
+        (
+            "normalization_pipeline_id",
+            Value::String(normalization_pipeline_id.to_string()),
+        ),
+        (
+            "pipeline_digest",
+            Value::String(pipeline_digest.to_string()),
+        ),
+        ("on_hit", Value::String(on_hit.to_string())),
+        ("on_miss", Value::String(on_miss.to_string())),
+        (
+            "miss_confidence_class",
+            miss_confidence_class
+                .map(|value| Value::String(value.to_string()))
+                .unwrap_or(Value::Null),
+        ),
+        (
+            "ambiguous_policy",
+            Value::String(ambiguous_policy.to_string()),
+        ),
+        ("catalog_digest", Value::String(catalog_digest.to_string())),
+        (
+            "evidence_policy",
+            Value::String(evidence_policy.to_string()),
+        ),
+    ]))
+}
+
+fn json_object<const N: usize>(entries: [(&str, Value); N]) -> Value {
+    let mut object = Map::new();
+    for (key, value) in entries {
+        object.insert(key.to_string(), value);
+    }
+    Value::Object(object)
+}
+
+fn btree_to_json_map(values: &BTreeMap<String, Value>) -> Map<String, Value> {
+    values
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
+fn canonical_json(value: &Value) -> Result<Vec<u8>, CoveError> {
+    let mut out = Vec::new();
+    write_canonical_json(value, &mut out)?;
+    Ok(out)
+}
+
+fn write_canonical_json(value: &Value, out: &mut Vec<u8>) -> Result<(), CoveError> {
+    match value {
+        Value::Null => out.extend_from_slice(b"null"),
+        Value::Bool(true) => out.extend_from_slice(b"true"),
+        Value::Bool(false) => out.extend_from_slice(b"false"),
+        Value::Number(number) => out.extend_from_slice(number.to_string().as_bytes()),
+        Value::String(value) => {
+            let encoded = serde_json::to_string(value).map_err(|_| CoveError::MapInvalid)?;
+            out.extend_from_slice(encoded.as_bytes());
+        }
+        Value::Array(values) => {
+            out.push(b'[');
+            for (idx, value) in values.iter().enumerate() {
+                if idx > 0 {
+                    out.push(b',');
+                }
+                write_canonical_json(value, out)?;
+            }
+            out.push(b']');
+        }
+        Value::Object(object) => {
+            out.push(b'{');
+            let mut keys = object
+                .keys()
+                .filter(|key| key.as_str() != "non_semantic_metadata")
+                .collect::<Vec<_>>();
+            keys.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+            for (idx, key) in keys.iter().enumerate() {
+                if idx > 0 {
+                    out.push(b',');
+                }
+                let encoded_key = serde_json::to_string(key).map_err(|_| CoveError::MapInvalid)?;
+                out.extend_from_slice(encoded_key.as_bytes());
+                out.push(b':');
+                let value = object.get(*key).ok_or(CoveError::MapInvalid)?;
+                write_canonical_json(value, out)?;
+            }
+            out.push(b'}');
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn payload(kind: SectionKind, mut value: Value) -> Vec<u8> {
+        if let Value::Object(object) = &mut value {
+            object.insert(
+                "schema_id".to_string(),
+                Value::String("org.coveformat.covemap.v2".to_string()),
+            );
+            object.insert(
+                "section_id".to_string(),
+                Value::Number((kind as u16).into()),
+            );
+        }
+        serde_json::to_vec_pretty(&value).unwrap()
+    }
+
+    fn resolution_catalog_payload(aliases: Vec<&str>) -> Value {
+        let functions = vec![MapNormalizationFunction {
+            function_id: "identity".into(),
+            version: "1".into(),
+            table_id: None,
+            suffix_table_digest: None,
+        }];
+        let tables = Vec::new();
+        let pipeline_digest = sha256_digest_string(
+            &canonical_json(
+                &pipeline_digest_input("company_name.v1", &functions, &tables).unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        let alias_catalog = MapAliasCatalog {
+            alias_catalog_id: "company_aliases".into(),
+            entries: vec![MapAliasEntry {
+                alias_entry_id: "company:tesco".into(),
+                canonical_key: "uk-company:tesco".into(),
+                canonical_label: "Tesco".into(),
+                aliases: aliases.into_iter().map(str::to_string).collect(),
+                ambiguous: false,
+                metadata: BTreeMap::new(),
+                non_semantic_metadata: BTreeMap::new(),
+            }],
+        };
+        let catalog_digest = sha256_digest_string(
+            &canonical_json(&alias_catalog_digest_input(&alias_catalog, false).unwrap()).unwrap(),
+        )
+        .unwrap();
+        let resolver_digest = sha256_digest_string(
+            &canonical_json(
+                &resolver_digest_input(
+                    "uk_company_name_resolver",
+                    "alias_catalog",
+                    "Company",
+                    "curated",
+                    "authoritative",
+                    "company_name.v1",
+                    &pipeline_digest,
+                    "canonical_key",
+                    "candidate_only",
+                    None,
+                    "reject_auto_merge",
+                    &catalog_digest,
+                    "retain_raw",
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        json!({
+            "mapping_id": "company-map",
+            "mapping_version": "2026.06",
+            "normalization_pipelines": [{
+                "pipeline_id": "company_name.v1",
+                "functions": [{
+                    "function_id": "identity",
+                    "version": "1"
+                }],
+                "tables": []
+            }],
+            "resolvers": [{
+                "resolver_id": "uk_company_name_resolver",
+                "kind": "alias_catalog",
+                "object_type": "Company",
+                "authority": "curated",
+                "confidence_class": "authoritative",
+                "normalization_pipeline_id": "company_name.v1",
+                "on_hit": "canonical_key",
+                "on_miss": "candidate_only",
+                "ambiguous_policy": "reject_auto_merge",
+                "catalog_digest": catalog_digest,
+                "pipeline_digest": pipeline_digest,
+                "resolver_digest": resolver_digest,
+                "alias_catalog": {
+                    "alias_catalog_id": "company_aliases",
+                    "entries": [{
+                        "alias_entry_id": "company:tesco",
+                        "canonical_key": "uk-company:tesco",
+                        "canonical_label": "Tesco",
+                        "aliases": alias_catalog.entries[0].aliases
+                    }]
+                }
+            }],
+            "match_rules": [],
+            "reviewed_decisions": []
+        })
+    }
+
+    #[test]
+    fn resolution_catalog_parse_accepts_alias_catalog_with_verified_digests() {
+        let catalog = MapResolutionCatalog::parse(&payload(
+            SectionKind::MapResolutionCatalog,
+            resolution_catalog_payload(vec!["Tesco", "Tesco PLC", "tesco supermarket"]),
+        ))
+        .unwrap();
+
+        assert_eq!(
+            catalog.normalization_pipelines[0].pipeline_id,
+            "company_name.v1"
+        );
+        assert_eq!(catalog.resolvers[0].resolver_id, "uk_company_name_resolver");
+        assert_eq!(
+            catalog.resolvers[0]
+                .alias_catalog
+                .as_ref()
+                .unwrap()
+                .entries
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn resolution_catalog_digest_is_stable_for_alias_order_changes() {
+        MapResolutionCatalog::parse(&payload(
+            SectionKind::MapResolutionCatalog,
+            resolution_catalog_payload(vec!["Tesco", "Tesco PLC", "tesco supermarket"]),
+        ))
+        .unwrap();
+        MapResolutionCatalog::parse(&payload(
+            SectionKind::MapResolutionCatalog,
+            resolution_catalog_payload(vec!["tesco supermarket", "Tesco PLC", "Tesco"]),
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn resolution_catalog_rejects_pipeline_digest_mismatch() {
+        let mut value = resolution_catalog_payload(vec!["Tesco"]);
+        value["normalization_pipelines"][0]["functions"][0]["version"] = json!("2");
+        assert_eq!(
+            MapResolutionCatalog::parse(&payload(SectionKind::MapResolutionCatalog, value)),
+            Err(CoveError::DigestMismatch)
+        );
+    }
+
+    #[test]
+    fn embedded_validation_checks_resolution_pipeline_function_versions() {
+        let functions = EmbeddedMapSection::FunctionRegistry(
+            MapFunctionRegistry::parse(&payload(
+                SectionKind::MapFunctionRegistry,
+                json!({
+                    "mapping_id": "company-map",
+                    "mapping_version": "2026.06",
+                    "functions": [{
+                        "function_id": "identity",
+                        "version": "1",
+                        "deterministic": true,
+                        "dependency": "pure"
+                    }]
+                }),
+            ))
+            .unwrap(),
+        );
+        let resolution = EmbeddedMapSection::ResolutionCatalog(
+            MapResolutionCatalog::parse(&payload(
+                SectionKind::MapResolutionCatalog,
+                resolution_catalog_payload(vec!["Tesco"]),
+            ))
+            .unwrap(),
+        );
+        validate_embedded_sections(&[functions.clone(), resolution.clone()]).unwrap();
+
+        let wrong_functions = EmbeddedMapSection::FunctionRegistry(
+            MapFunctionRegistry::parse(&payload(
+                SectionKind::MapFunctionRegistry,
+                json!({
+                    "mapping_id": "company-map",
+                    "mapping_version": "2026.06",
+                    "functions": [{
+                        "function_id": "identity",
+                        "version": "2",
+                        "deterministic": true,
+                        "dependency": "pure"
+                    }]
+                }),
+            ))
+            .unwrap(),
+        );
+        assert_eq!(
+            validate_embedded_sections(&[wrong_functions, resolution]),
+            Err(CoveError::MapFunctionUndeclared)
+        );
+    }
+
+    #[test]
+    fn embedded_validation_rejects_identity_rule_referencing_missing_resolver() {
+        let functions = EmbeddedMapSection::FunctionRegistry(
+            MapFunctionRegistry::parse(&payload(
+                SectionKind::MapFunctionRegistry,
+                json!({
+                    "mapping_id": "company-map",
+                    "mapping_version": "2026.06",
+                    "functions": [{
+                        "function_id": "identity",
+                        "version": "1",
+                        "deterministic": true,
+                        "dependency": "pure"
+                    }]
+                }),
+            ))
+            .unwrap(),
+        );
+        let identity = EmbeddedMapSection::IdentityRuleCatalog(
+            MapIdentityRuleCatalog::parse(&payload(
+                SectionKind::MapIdentityRuleCatalog,
+                json!({
+                    "mapping_id": "company-map",
+                    "mapping_version": "2026.06",
+                    "identity_rules": [{
+                        "rule_id": "company_by_resolved_name",
+                        "object_type": "Company",
+                        "semantic_role": "subject",
+                        "confidence_class": "authoritative",
+                        "candidate_only": false,
+                        "property_conflicts_declared": true,
+                        "function_ids": ["identity"],
+                        "join_keys": [{
+                            "role_id": "company",
+                            "source_column": "company_name",
+                            "logical_type": "utf8",
+                            "canonicalization": "identity",
+                            "null_policy": "reject",
+                            "ordering": "declared",
+                            "resolution": {
+                                "resolver_id": "uk_company_name_resolver"
+                            }
+                        }]
+                    }],
+                    "do_not_merge": []
+                }),
+            ))
+            .unwrap(),
+        );
+
+        assert_eq!(
+            validate_embedded_sections(&[functions, identity]),
+            Err(CoveError::MapInvalid)
+        );
+    }
+
+    #[test]
+    fn embedded_validation_rejects_resolver_object_type_mismatch() {
+        let functions = EmbeddedMapSection::FunctionRegistry(
+            MapFunctionRegistry::parse(&payload(
+                SectionKind::MapFunctionRegistry,
+                json!({
+                    "mapping_id": "company-map",
+                    "mapping_version": "2026.06",
+                    "functions": [{
+                        "function_id": "identity",
+                        "version": "1",
+                        "deterministic": true,
+                        "dependency": "pure"
+                    }]
+                }),
+            ))
+            .unwrap(),
+        );
+        let resolution = EmbeddedMapSection::ResolutionCatalog(
+            MapResolutionCatalog::parse(&payload(
+                SectionKind::MapResolutionCatalog,
+                resolution_catalog_payload(vec!["Tesco"]),
+            ))
+            .unwrap(),
+        );
+        let identity = EmbeddedMapSection::IdentityRuleCatalog(
+            MapIdentityRuleCatalog::parse(&payload(
+                SectionKind::MapIdentityRuleCatalog,
+                json!({
+                    "mapping_id": "company-map",
+                    "mapping_version": "2026.06",
+                    "identity_rules": [{
+                        "rule_id": "person_by_resolved_company",
+                        "object_type": "Person",
+                        "semantic_role": "subject",
+                        "confidence_class": "authoritative",
+                        "candidate_only": false,
+                        "property_conflicts_declared": true,
+                        "function_ids": ["identity"],
+                        "join_keys": [{
+                            "role_id": "company",
+                            "source_column": "company_name",
+                            "logical_type": "utf8",
+                            "canonicalization": "identity",
+                            "null_policy": "reject",
+                            "ordering": "declared",
+                            "resolution": {
+                                "resolver_id": "uk_company_name_resolver"
+                            }
+                        }]
+                    }],
+                    "do_not_merge": []
+                }),
+            ))
+            .unwrap(),
+        );
+
+        assert_eq!(
+            validate_embedded_sections(&[functions, resolution, identity]),
+            Err(CoveError::MapInvalid)
+        );
+    }
+
+    #[test]
+    fn identity_rule_rejects_double_normalized_resolver_join_key() {
+        let value = json!({
+            "mapping_id": "company-map",
+            "mapping_version": "2026.06",
+            "identity_rules": [{
+                "rule_id": "company_by_resolved_name",
+                "object_type": "Company",
+                "semantic_role": "subject",
+                "confidence_class": "authoritative",
+                "candidate_only": false,
+                "property_conflicts_declared": true,
+                "function_ids": ["identity"],
+                "join_keys": [{
+                    "role_id": "company",
+                    "source_column": "company_name",
+                    "logical_type": "utf8",
+                    "canonicalization": "trim",
+                    "null_policy": "reject",
+                    "ordering": "declared",
+                    "resolution": {
+                        "resolver_id": "uk_company_name_resolver"
+                    }
+                }],
+                "allow_reviewed_equivalence": true
+            }],
+            "do_not_merge": []
+        });
+
+        assert_eq!(
+            MapIdentityRuleCatalog::parse(&payload(SectionKind::MapIdentityRuleCatalog, value)),
+            Err(CoveError::MapInvalid)
+        );
+    }
+
+    #[test]
+    fn evidence_index_accepts_resolution_operation_metadata_keys() {
+        let value = json!({
+            "mapping_id": "company-map",
+            "mapping_version": "2026.06",
+            "entries": [{
+                "source_id": "supplier_master",
+                "source_row_identity": "supplier_master:1",
+                "rule_id": "upsert_company",
+                "assertion_id": "company_name",
+                "output_object_id": "goid:company:1",
+                "operation_metadata": {
+                    "resolver_id": "uk_company_name_resolver",
+                    "resolver_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                    "raw_observed_value": "Tesco PLC",
+                    "normalized_value": "tesco",
+                    "canonical_key": "uk-company:tesco",
+                    "alias_hit": true,
+                    "left_source_id": "supplier_master",
+                    "right_source_id": "crm_accounts",
+                    "candidate_score": 1000000
+                }
+            }]
+        });
+
+        let index =
+            MapEvidenceIndex::parse(&payload(SectionKind::MapEvidenceIndex, value)).unwrap();
+        assert_eq!(
+            index.entries[0].operation_metadata["canonical_key"],
+            json!("uk-company:tesco")
+        );
     }
 }
