@@ -3135,10 +3135,10 @@ mod tests {
     #[test]
     fn delta_chain_extension_rejects_unsupported_required_features() {
         let mut extension = sample_delta_chain_extension();
-        extension.required_delta_features = 1;
+        extension.required_delta_features = 1u64 << 63;
         assert_eq!(
             extension.serialize(),
-            Err(CoveError::UnknownRequiredFeature(1))
+            Err(CoveError::UnknownRequiredFeature(1u64 << 63))
         );
     }
 
