@@ -1554,9 +1554,7 @@ fn assert_rows(stats: &DecodeStats, selected: usize, materialized: usize) {
     assert_eq!(stats.rows_materialized, materialized);
 }
 
-fn m6_metrics(
-    stats: DecodeStats,
-) -> (
+type M6Metrics = (
     usize,
     usize,
     usize,
@@ -1579,7 +1577,9 @@ fn m6_metrics(
     usize,
     usize,
     usize,
-) {
+);
+
+fn m6_metrics(stats: DecodeStats) -> M6Metrics {
     (
         stats.metadata_bytes_read + stats.data_bytes_read,
         stats.pages_decoded,

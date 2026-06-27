@@ -1604,13 +1604,12 @@ impl MapEvidenceIndex {
                         if !is_evidence_operation_metadata_key(key) {
                             return Err(CoveError::MapEvidenceInvalid);
                         }
-                        if requested_keys.is_empty() || requested_keys.contains(key.as_str()) {
-                            if operation_metadata
+                        if (requested_keys.is_empty() || requested_keys.contains(key.as_str()))
+                            && operation_metadata
                                 .insert(key.clone(), value.clone())
                                 .is_some()
-                            {
-                                return Err(CoveError::MapEvidenceInvalid);
-                            }
+                        {
+                            return Err(CoveError::MapEvidenceInvalid);
                         }
                     }
                 }
@@ -2497,6 +2496,9 @@ fn is_allowed_root_key(kind: SectionKind, key: &str) -> bool {
                 | "resolver_miss_count"
                 | "ambiguous_alias_count"
                 | "resolver_catalog_digests"
+                | "reviewed_decision_count"
+                | "reviewed_decision_catalog_digest"
+                | "resolver_goid_impact"
                 | "candidate_matches"
                 | "generated_artifacts"
                 | "unsupported"
@@ -2571,6 +2573,41 @@ fn validate_identity_components(object: &Map<String, Value>) -> Result<(), CoveE
 }
 
 fn validate_conversion_report_details(object: &Map<String, Value>) -> Result<(), CoveError> {
+    if let Some(value) = object.get("reviewed_decision_count") {
+        if value.as_u64().is_none() {
+            return Err(CoveError::MapInvalid);
+        }
+    }
+    if let Some(digest) = optional_non_empty_str(object, "reviewed_decision_catalog_digest")? {
+        validate_sha256_digest_string(&digest)?;
+    }
+    if let Some(impacts) = optional_array(object, "resolver_goid_impact")? {
+        for value in impacts {
+            let impact = as_object(value)?;
+            validate_keys(
+                impact,
+                &[
+                    "resolver_id",
+                    "normalization_pipeline_id",
+                    "resolver_digest",
+                    "catalog_digest",
+                    "pipeline_digest",
+                    "affected_goid_count",
+                    "affected_goids",
+                ],
+            )?;
+            required_non_empty_str(impact, "resolver_id")?;
+            required_non_empty_str(impact, "normalization_pipeline_id")?;
+            required_sha256_digest(impact, "resolver_digest")?;
+            required_sha256_digest(impact, "catalog_digest")?;
+            required_sha256_digest(impact, "pipeline_digest")?;
+            let affected_goid_count = required_u64(impact, "affected_goid_count")?;
+            let affected_goids = parse_string_values(required_array(impact, "affected_goids")?)?;
+            if affected_goid_count != affected_goids.len() as u64 {
+                return Err(CoveError::MapInvalid);
+            }
+        }
+    }
     if let Some(matches) = optional_array(object, "candidate_matches")? {
         for value in matches {
             let candidate = as_object(value)?;
@@ -3484,5 +3521,44 @@ mod tests {
             index.entries[0].operation_metadata["canonical_key"],
             json!("uk-company:tesco")
         );
+    }
+
+    #[test]
+    fn conversion_report_accepts_review_decision_and_resolver_impact_fields() {
+        let digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+        let value = json!({
+            "mapping_id": "company-map",
+            "mapping_version": "2026.06",
+            "sources": [{
+                "source_id": "crm_accounts",
+                "source_kind": "table",
+                "schema_fingerprint": digest,
+                "snapshot_digest": digest
+            }],
+            "source_count": 1,
+            "row_count": 1,
+            "object_count": 1,
+            "association_count": 0,
+            "property_value_count": 1,
+            "candidate_match_count": 0,
+            "resolver_hit_count": 1,
+            "resolver_miss_count": 0,
+            "ambiguous_alias_count": 0,
+            "reviewed_decision_count": 1,
+            "reviewed_decision_catalog_digest": digest,
+            "resolver_goid_impact": [{
+                "resolver_id": "customer_resolver",
+                "normalization_pipeline_id": "customer_name.v1",
+                "resolver_digest": digest,
+                "catalog_digest": digest,
+                "pipeline_digest": digest,
+                "affected_goid_count": 2,
+                "affected_goids": ["goid:customer:1", "goid:customer:2"]
+            }]
+        });
+
+        let report =
+            MapConversionReport::parse(&payload(SectionKind::MapConversionReport, value)).unwrap();
+        assert_eq!(report.sources[0].source_id, "crm_accounts");
     }
 }

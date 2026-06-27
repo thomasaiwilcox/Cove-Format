@@ -27,18 +27,13 @@ use crate::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NativeLaneId(pub u32);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum NativeKernelDispatch {
+    #[default]
     Scalar,
     Auto,
     Avx2,
     Neon,
-}
-
-impl Default for NativeKernelDispatch {
-    fn default() -> Self {
-        Self::Scalar
-    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1101,7 +1096,7 @@ fn append_dense_u32_rows_avx2_dispatch(
         unsafe {
             append_dense_u32_rows_avx2(rows, base);
         }
-        return Some(NativeKernelDispatch::Avx2);
+        Some(NativeKernelDispatch::Avx2)
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
@@ -1122,7 +1117,7 @@ fn append_dense_u32_rows_neon_dispatch(
         unsafe {
             append_dense_u32_rows_neon(rows, base);
         }
-        return Some(NativeKernelDispatch::Neon);
+        Some(NativeKernelDispatch::Neon)
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
@@ -1264,7 +1259,7 @@ pub fn filter_u64_eq(
     let mut stats = KernelStats {
         rows_seen: values.len(),
         bitmap_words_touched: values.len().div_ceil(64),
-        bytes_touched_estimate: values.len() * std::mem::size_of::<u64>(),
+        bytes_touched_estimate: std::mem::size_of_val(values),
         dispatch: NativeKernelDispatch::Scalar,
         ..KernelStats::default()
     };
@@ -1308,7 +1303,7 @@ pub fn filter_u32_in_sorted(
     let mut stats = KernelStats {
         rows_seen: values.len(),
         bitmap_words_touched: values.len().div_ceil(64),
-        bytes_touched_estimate: values.len() * std::mem::size_of::<u32>(),
+        bytes_touched_estimate: std::mem::size_of_val(values),
         dispatch: NativeKernelDispatch::Scalar,
         ..KernelStats::default()
     };
@@ -1355,7 +1350,7 @@ pub fn filter_u32_not_in_sorted(
     let mut stats = KernelStats {
         rows_seen: values.len(),
         bitmap_words_touched: values.len().div_ceil(64),
-        bytes_touched_estimate: values.len() * std::mem::size_of::<u32>(),
+        bytes_touched_estimate: std::mem::size_of_val(values),
         dispatch: NativeKernelDispatch::Scalar,
         ..KernelStats::default()
     };
@@ -1852,7 +1847,7 @@ pub fn filter_i64_range(
     let mut stats = KernelStats {
         rows_seen: values.len(),
         bitmap_words_touched: values.len().div_ceil(64),
-        bytes_touched_estimate: values.len() * std::mem::size_of::<i64>(),
+        bytes_touched_estimate: std::mem::size_of_val(values),
         dispatch: NativeKernelDispatch::Scalar,
         ..KernelStats::default()
     };
@@ -1963,7 +1958,7 @@ pub fn filter_local_u16_membership(
                 rows_valid: values.len(),
                 rows_matched,
                 bitmap_words_touched: values.len().div_ceil(64),
-                bytes_touched_estimate: values.len() * std::mem::size_of::<u16>(),
+                bytes_touched_estimate: std::mem::size_of_val(values),
                 dispatch,
             },
         );
@@ -1972,7 +1967,7 @@ pub fn filter_local_u16_membership(
     let mut stats = KernelStats {
         rows_seen: values.len(),
         bitmap_words_touched: values.len().div_ceil(64),
-        bytes_touched_estimate: values.len() * std::mem::size_of::<u16>(),
+        bytes_touched_estimate: std::mem::size_of_val(values),
         dispatch: NativeKernelDispatch::Scalar,
         ..KernelStats::default()
     };
@@ -2013,7 +2008,7 @@ pub fn filter_local_u32_membership(
                 rows_valid: values.len(),
                 rows_matched,
                 bitmap_words_touched: values.len().div_ceil(64),
-                bytes_touched_estimate: values.len() * std::mem::size_of::<u32>(),
+                bytes_touched_estimate: std::mem::size_of_val(values),
                 dispatch,
             },
         );
@@ -2022,7 +2017,7 @@ pub fn filter_local_u32_membership(
     let mut stats = KernelStats {
         rows_seen: values.len(),
         bitmap_words_touched: values.len().div_ceil(64),
-        bytes_touched_estimate: values.len() * std::mem::size_of::<u32>(),
+        bytes_touched_estimate: std::mem::size_of_val(values),
         dispatch: NativeKernelDispatch::Scalar,
         ..KernelStats::default()
     };
@@ -2154,7 +2149,7 @@ pub fn filter_fixed_bytes_in(
     needles: &[u8],
     base: Option<&SelectionBitmap>,
 ) -> Result<(SelectionBitmap, KernelStats), CoveError> {
-    if width == 0 || needles.is_empty() || needles.len() % width != 0 {
+    if width == 0 || needles.is_empty() || !needles.len().is_multiple_of(width) {
         return Err(CoveError::BadSchema(
             "fixed-byte IN requires non-empty literals with a width multiple".into(),
         ));
@@ -2218,7 +2213,7 @@ pub fn filter_varbytes_eq(
         bitmap_words_touched: row_count.div_ceil(64),
         bytes_touched_estimate: values
             .len()
-            .checked_add(row_offsets.len() * std::mem::size_of::<u32>())
+            .checked_add(std::mem::size_of_val(row_offsets))
             .ok_or(CoveError::ArithOverflow)?,
         dispatch: NativeKernelDispatch::Scalar,
         ..KernelStats::default()
@@ -2261,7 +2256,7 @@ pub fn filter_varbytes_in(
         bitmap_words_touched: row_count.div_ceil(64),
         bytes_touched_estimate: values
             .len()
-            .checked_add(row_offsets.len() * std::mem::size_of::<u32>())
+            .checked_add(std::mem::size_of_val(row_offsets))
             .and_then(|value| {
                 needles
                     .iter()
@@ -2280,7 +2275,7 @@ pub fn filter_varbytes_in(
         }
         stats.rows_valid += 1;
         let value = varbytes_payload_at(row_offsets, values, row)?;
-        if needles.iter().any(|needle| value == *needle) {
+        if needles.contains(&value) {
             out.set(row);
             stats.rows_matched += 1;
         }
@@ -2326,13 +2321,13 @@ pub fn filter_length_prefixed_varbytes_eq(
             return Err(CoveError::BufferTooShort);
         };
 
-        if all_selected || base.is_some_and(|bitmap| bitmap.contains(row)) {
-            if validity.is_valid(row) {
-                stats.rows_valid += 1;
-                if value == needle {
-                    out.set(row);
-                    stats.rows_matched += 1;
-                }
+        if (all_selected || base.is_some_and(|bitmap| bitmap.contains(row)))
+            && validity.is_valid(row)
+        {
+            stats.rows_valid += 1;
+            if value == needle {
+                out.set(row);
+                stats.rows_matched += 1;
             }
         }
         offset = value_end;
@@ -2389,13 +2384,13 @@ pub fn filter_length_prefixed_varbytes_in(
             return Err(CoveError::BufferTooShort);
         };
 
-        if all_selected || base.is_some_and(|bitmap| bitmap.contains(row)) {
-            if validity.is_valid(row) {
-                stats.rows_valid += 1;
-                if needles.iter().any(|needle| value == *needle) {
-                    out.set(row);
-                    stats.rows_matched += 1;
-                }
+        if (all_selected || base.is_some_and(|bitmap| bitmap.contains(row)))
+            && validity.is_valid(row)
+        {
+            stats.rows_valid += 1;
+            if needles.contains(&value) {
+                out.set(row);
+                stats.rows_matched += 1;
             }
         }
         offset = value_end;
@@ -2444,13 +2439,13 @@ pub fn filter_length_prefixed_varbytes_prefix(
             return Err(CoveError::BufferTooShort);
         };
 
-        if all_selected || base.is_some_and(|bitmap| bitmap.contains(row)) {
-            if validity.is_valid(row) {
-                stats.rows_valid += 1;
-                if value.starts_with(prefix) {
-                    out.set(row);
-                    stats.rows_matched += 1;
-                }
+        if (all_selected || base.is_some_and(|bitmap| bitmap.contains(row)))
+            && validity.is_valid(row)
+        {
+            stats.rows_valid += 1;
+            if value.starts_with(prefix) {
+                out.set(row);
+                stats.rows_matched += 1;
             }
         }
         offset = value_end;
@@ -2478,7 +2473,7 @@ pub fn filter_varbytes_prefix(
         bitmap_words_touched: row_count.div_ceil(64),
         bytes_touched_estimate: values
             .len()
-            .checked_add(row_offsets.len() * std::mem::size_of::<u32>())
+            .checked_add(std::mem::size_of_val(row_offsets))
             .ok_or(CoveError::ArithOverflow)?,
         dispatch: NativeKernelDispatch::Scalar,
         ..KernelStats::default()
@@ -2584,7 +2579,7 @@ pub fn group_count_u32_dense(
     let mut stats = KernelStats {
         rows_seen: values.len(),
         bitmap_words_touched: values.len().div_ceil(64),
-        bytes_touched_estimate: values.len() * std::mem::size_of::<u32>(),
+        bytes_touched_estimate: std::mem::size_of_val(values),
         dispatch: NativeKernelDispatch::Scalar,
         ..KernelStats::default()
     };
@@ -2623,7 +2618,7 @@ pub fn group_count_u8_dense(
     let mut stats = KernelStats {
         rows_seen: values.len(),
         bitmap_words_touched: values.len().div_ceil(64),
-        bytes_touched_estimate: values.len() * std::mem::size_of::<u8>(),
+        bytes_touched_estimate: std::mem::size_of_val(values),
         dispatch: NativeKernelDispatch::Scalar,
         ..KernelStats::default()
     };
@@ -2662,7 +2657,7 @@ pub fn group_count_u16_dense(
     let mut stats = KernelStats {
         rows_seen: values.len(),
         bitmap_words_touched: values.len().div_ceil(64),
-        bytes_touched_estimate: values.len() * std::mem::size_of::<u16>(),
+        bytes_touched_estimate: std::mem::size_of_val(values),
         dispatch: NativeKernelDispatch::Scalar,
         ..KernelStats::default()
     };
@@ -2747,7 +2742,7 @@ pub fn group_count_u32_hash(
     let mut stats = KernelStats {
         rows_seen: values.len(),
         bitmap_words_touched: values.len().div_ceil(64),
-        bytes_touched_estimate: values.len() * std::mem::size_of::<u32>(),
+        bytes_touched_estimate: std::mem::size_of_val(values),
         dispatch: NativeKernelDispatch::Scalar,
         ..KernelStats::default()
     };
@@ -2872,7 +2867,7 @@ pub fn distinct_u32(
     let mut stats = KernelStats {
         rows_seen: values.len(),
         bitmap_words_touched: values.len().div_ceil(64),
-        bytes_touched_estimate: values.len() * std::mem::size_of::<u32>(),
+        bytes_touched_estimate: std::mem::size_of_val(values),
         dispatch: NativeKernelDispatch::Scalar,
         ..KernelStats::default()
     };
@@ -3071,7 +3066,7 @@ pub fn aggregate_i64(
     let mut stats = KernelStats {
         rows_seen: values.len(),
         bitmap_words_touched: values.len().div_ceil(64),
-        bytes_touched_estimate: values.len() * std::mem::size_of::<i64>(),
+        bytes_touched_estimate: std::mem::size_of_val(values),
         dispatch: NativeKernelDispatch::Scalar,
         ..KernelStats::default()
     };
@@ -4331,13 +4326,21 @@ where
 }
 
 fn compare_bound(ordering: Ordering, inclusive: BoundInclusive, upper: bool) -> bool {
-    match (upper, inclusive, ordering) {
-        (false, BoundInclusive::Inclusive, Ordering::Less) => false,
-        (false, BoundInclusive::Exclusive, Ordering::Less | Ordering::Equal) => false,
-        (true, BoundInclusive::Inclusive, Ordering::Greater) => false,
-        (true, BoundInclusive::Exclusive, Ordering::Greater | Ordering::Equal) => false,
-        _ => true,
-    }
+    !matches!(
+        (upper, inclusive, ordering),
+        (false, BoundInclusive::Inclusive, Ordering::Less)
+            | (
+                false,
+                BoundInclusive::Exclusive,
+                Ordering::Less | Ordering::Equal
+            )
+            | (true, BoundInclusive::Inclusive, Ordering::Greater)
+            | (
+                true,
+                BoundInclusive::Exclusive,
+                Ordering::Greater | Ordering::Equal
+            )
+    )
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -5313,18 +5316,23 @@ fn filter_u64_le_eq_auto(
 ) -> Option<(SelectionBitmap, NativeKernelDispatch)> {
     #[cfg(target_arch = "aarch64")]
     {
-        return filter_u64_le_eq_neon_dispatch(bytes, row_count, needle);
+        filter_u64_le_eq_neon_dispatch(bytes, row_count, needle)
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
         #[cfg(target_arch = "x86_64")]
         {
             if std::arch::is_x86_feature_detected!("avx2") {
-                return filter_u64_le_eq_avx2_dispatch(bytes, row_count, needle);
+                filter_u64_le_eq_avx2_dispatch(bytes, row_count, needle)
+            } else {
+                None
             }
         }
-        let _ = (bytes, row_count, needle);
-        None
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = (bytes, row_count, needle);
+            None
+        }
     }
 }
 
@@ -5335,18 +5343,23 @@ fn filter_u32_le_eq_auto(
 ) -> Option<(SelectionBitmap, NativeKernelDispatch)> {
     #[cfg(target_arch = "aarch64")]
     {
-        return filter_u32_le_eq_neon_dispatch(bytes, row_count, needle);
+        filter_u32_le_eq_neon_dispatch(bytes, row_count, needle)
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
         #[cfg(target_arch = "x86_64")]
         {
             if std::arch::is_x86_feature_detected!("avx2") {
-                return filter_u32_le_eq_avx2_dispatch(bytes, row_count, needle);
+                filter_u32_le_eq_avx2_dispatch(bytes, row_count, needle)
+            } else {
+                None
             }
         }
-        let _ = (bytes, row_count, needle);
-        None
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = (bytes, row_count, needle);
+            None
+        }
     }
 }
 
@@ -5358,18 +5371,23 @@ fn filter_i64_le_cmp_auto(
 ) -> Option<(SelectionBitmap, NativeKernelDispatch)> {
     #[cfg(target_arch = "aarch64")]
     {
-        return filter_i64_le_cmp_neon_dispatch(bytes, row_count, op, needle);
+        filter_i64_le_cmp_neon_dispatch(bytes, row_count, op, needle)
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
         #[cfg(target_arch = "x86_64")]
         {
             if std::arch::is_x86_feature_detected!("avx2") {
-                return filter_i64_le_cmp_avx2_dispatch(bytes, row_count, op, needle);
+                filter_i64_le_cmp_avx2_dispatch(bytes, row_count, op, needle)
+            } else {
+                None
             }
         }
-        let _ = (bytes, row_count, op, needle);
-        None
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = (bytes, row_count, op, needle);
+            None
+        }
     }
 }
 
@@ -5390,7 +5408,7 @@ fn filter_local_u8_membership_avx2_dispatch(
         unsafe {
             filter_local_u8_membership_avx2(values, needles, &mut out);
         }
-        return Some((out, NativeKernelDispatch::Avx2));
+        Some((out, NativeKernelDispatch::Avx2))
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
@@ -5413,7 +5431,7 @@ fn filter_local_u8_membership_neon_dispatch(
         unsafe {
             filter_local_u8_membership_neon(values, needles, &mut out);
         }
-        return Some((out, NativeKernelDispatch::Neon));
+        Some((out, NativeKernelDispatch::Neon))
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
@@ -5439,7 +5457,7 @@ fn filter_local_u16_membership_avx2_dispatch(
         unsafe {
             filter_local_u16_membership_avx2(values, needles, &mut out);
         }
-        return Some((out, NativeKernelDispatch::Avx2));
+        Some((out, NativeKernelDispatch::Avx2))
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
@@ -5462,7 +5480,7 @@ fn filter_local_u16_membership_neon_dispatch(
         unsafe {
             filter_local_u16_membership_neon(values, needles, &mut out);
         }
-        return Some((out, NativeKernelDispatch::Neon));
+        Some((out, NativeKernelDispatch::Neon))
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
@@ -5488,7 +5506,7 @@ fn filter_local_u32_membership_avx2_dispatch(
         unsafe {
             filter_local_u32_membership_avx2(values, needles, &mut out);
         }
-        return Some((out, NativeKernelDispatch::Avx2));
+        Some((out, NativeKernelDispatch::Avx2))
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
@@ -5511,7 +5529,7 @@ fn filter_local_u32_membership_neon_dispatch(
         unsafe {
             filter_local_u32_membership_neon(values, needles, &mut out);
         }
-        return Some((out, NativeKernelDispatch::Neon));
+        Some((out, NativeKernelDispatch::Neon))
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
@@ -5537,10 +5555,13 @@ fn filter_u64_le_eq_avx2_dispatch(
         unsafe {
             filter_u64_le_eq_avx2(bytes, row_count, needle, &mut out);
         }
-        return Some((out, NativeKernelDispatch::Avx2));
+        Some((out, NativeKernelDispatch::Avx2))
     }
-    let _ = (bytes, row_count, needle);
-    None
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (bytes, row_count, needle);
+        None
+    }
 }
 
 fn filter_u32_le_eq_avx2_dispatch(
@@ -5560,10 +5581,13 @@ fn filter_u32_le_eq_avx2_dispatch(
         unsafe {
             filter_u32_le_eq_avx2(bytes, row_count, needle, &mut out);
         }
-        return Some((out, NativeKernelDispatch::Avx2));
+        Some((out, NativeKernelDispatch::Avx2))
     }
-    let _ = (bytes, row_count, needle);
-    None
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (bytes, row_count, needle);
+        None
+    }
 }
 
 fn filter_i64_le_cmp_avx2_dispatch(
@@ -5585,10 +5609,13 @@ fn filter_i64_le_cmp_avx2_dispatch(
         unsafe {
             filter_i64_le_cmp_avx2(bytes, row_count, op, needle, &mut out);
         }
-        return Some((out, NativeKernelDispatch::Avx2));
+        Some((out, NativeKernelDispatch::Avx2))
     }
-    let _ = (bytes, row_count, op, needle);
-    None
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (bytes, row_count, op, needle);
+        None
+    }
 }
 
 fn filter_i64_le_range_avx2_dispatch(
@@ -5610,7 +5637,7 @@ fn filter_i64_le_range_avx2_dispatch(
         unsafe {
             filter_i64_le_range_avx2(bytes, row_count, lower, upper, &mut out);
         }
-        return Some((out, NativeKernelDispatch::Avx2));
+        Some((out, NativeKernelDispatch::Avx2))
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
@@ -5633,7 +5660,7 @@ fn filter_u64_le_eq_neon_dispatch(
         unsafe {
             filter_u64_le_eq_neon(bytes, row_count, needle, &mut out);
         }
-        return Some((out, NativeKernelDispatch::Neon));
+        Some((out, NativeKernelDispatch::Neon))
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
@@ -5656,7 +5683,7 @@ fn filter_u32_le_eq_neon_dispatch(
         unsafe {
             filter_u32_le_eq_neon(bytes, row_count, needle, &mut out);
         }
-        return Some((out, NativeKernelDispatch::Neon));
+        Some((out, NativeKernelDispatch::Neon))
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
@@ -5681,7 +5708,7 @@ fn filter_i64_le_cmp_neon_dispatch(
         unsafe {
             filter_i64_le_cmp_neon(bytes, row_count, op, needle, &mut out);
         }
-        return Some((out, NativeKernelDispatch::Neon));
+        Some((out, NativeKernelDispatch::Neon))
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
@@ -5706,7 +5733,7 @@ fn filter_i64_le_range_neon_dispatch(
         unsafe {
             filter_i64_le_range_neon(bytes, row_count, lower, upper, &mut out);
         }
-        return Some((out, NativeKernelDispatch::Neon));
+        Some((out, NativeKernelDispatch::Neon))
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
@@ -5750,7 +5777,7 @@ fn intersect_words_auto(left: &mut [u64], right: &[u64]) -> NativeKernelDispatch
         unsafe {
             intersect_words_neon(left, right);
         }
-        return NativeKernelDispatch::Neon;
+        NativeKernelDispatch::Neon
     }
 
     #[cfg(not(target_arch = "aarch64"))]
@@ -9098,8 +9125,10 @@ mod tests {
         column.domain_ref = 17;
         let segment = table_segment_with_one_column(column);
         let page = table_page_index_entry(42, 5, 3, 0);
-        let mut domain = NativeCodeDomain::default();
-        domain.table_id = Some(segment.header.table_id);
+        let domain = NativeCodeDomain {
+            table_id: Some(segment.header.table_id),
+            ..NativeCodeDomain::default()
+        };
 
         let lane =
             native_lane_from_column_page_payload(&segment.columns[0], &page, &payload, domain)

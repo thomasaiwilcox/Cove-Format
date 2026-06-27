@@ -520,7 +520,7 @@ fn resolve_typed_reference(
 }
 
 fn reference_matches_optional(expected: Option<&str>, actual: &str) -> bool {
-    expected.map_or(true, |expected| expected == actual)
+    expected.is_none_or(|expected| expected == actual)
 }
 
 fn validate_reviewed_same_object_allowed<'a>(

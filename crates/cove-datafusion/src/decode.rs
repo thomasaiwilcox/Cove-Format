@@ -696,7 +696,7 @@ pub(crate) struct NativeI64DenseLane {
 impl NativeI64DenseLane {
     fn push(&mut self, value: Option<i64>) -> Result<(), CoveError> {
         let row = self.values.len();
-        if row % 8 == 0 {
+        if row.is_multiple_of(8) {
             self.null_bitmap.push(0);
         }
         match value {
@@ -818,7 +818,7 @@ pub(crate) struct NativeFileCodeDenseLane {
 impl NativeFileCodeDenseLane {
     fn push(&mut self, value: Option<Vec<u8>>) -> Result<(), CoveError> {
         let row = self.codes.len();
-        if row % 8 == 0 {
+        if row.is_multiple_of(8) {
             self.null_bitmap.push(0);
         }
         match value {
@@ -3764,7 +3764,7 @@ fn collect_i64_values(
     }
     let mut kernel_stats = KernelStats {
         rows_seen: values.len(),
-        bytes_touched_estimate: values.len() * std::mem::size_of::<i64>(),
+        bytes_touched_estimate: std::mem::size_of_val(values),
         dispatch: NativeKernelDispatch::Scalar,
         ..KernelStats::default()
     };
@@ -3799,7 +3799,7 @@ fn collect_filecode_codes(
     let mut code_cache = filecode_decode_cache(dictionary)?;
     let mut kernel_stats = KernelStats {
         rows_seen: values.len(),
-        bytes_touched_estimate: values.len() * std::mem::size_of::<u32>(),
+        bytes_touched_estimate: std::mem::size_of_val(values),
         dispatch: NativeKernelDispatch::Scalar,
         ..KernelStats::default()
     };
@@ -3882,7 +3882,7 @@ where
     let mut code_cache = filecode_decode_cache(dictionary)?;
     let mut kernel_stats = KernelStats {
         rows_seen: values.len(),
-        bytes_touched_estimate: values.len() * std::mem::size_of::<K>(),
+        bytes_touched_estimate: std::mem::size_of_val(values),
         dispatch: NativeKernelDispatch::Scalar,
         ..KernelStats::default()
     };

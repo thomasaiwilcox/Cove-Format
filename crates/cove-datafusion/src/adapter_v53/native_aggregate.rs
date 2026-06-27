@@ -933,11 +933,12 @@ fn native_aggregate_batch(
 ) -> Result<RecordBatch> {
     let mut scans = BTreeMap::<usize, NativeI64AggregateScan>::new();
     for request in requests {
-        if !scans.contains_key(&request.column_index) {
+        if let std::collections::btree_map::Entry::Vacant(entry) = scans.entry(request.column_index)
+        {
             let scan = native_i64_aggregate_scan(state, request.column_index, filter_plan)
                 .map_err(crate::adapter_v53::cove_to_datafusion)?;
             CoveFileMetrics::new(metrics, partition).record_decode(scan.stats);
-            scans.insert(request.column_index, scan);
+            entry.insert(scan);
         }
     }
 
@@ -1023,11 +1024,7 @@ fn native_i64_i64_group_aggregate_batch(
                 .into(),
         ));
     }
-    let mut values = groups
-        .aggregates
-        .into_iter()
-        .map(|(key, aggregate)| (key, aggregate))
-        .collect::<Vec<_>>();
+    let mut values = groups.aggregates.into_iter().collect::<Vec<_>>();
     values.sort_unstable_by_key(|(key, _)| *key);
 
     let mut keys = Vec::with_capacity(values.len() + usize::from(groups.null_row_count != 0));

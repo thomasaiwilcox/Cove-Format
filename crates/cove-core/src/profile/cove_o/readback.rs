@@ -595,13 +595,15 @@ fn append_delta_records_to_object_surface(
             let mut records = records_from_segment(
                 segment,
                 object_type,
-                None,
-                &[],
-                options,
-                &pushdown_options,
-                &mut pushdown_report,
-                None,
-                None,
+                SegmentReadContext {
+                    dictionary: None,
+                    zone_stats: &[],
+                    options,
+                    pushdown: &pushdown_options,
+                    report: &mut pushdown_report,
+                    projection_lookup: None,
+                    kernel_builder: None,
+                },
             )?;
             for record in &mut records {
                 remap_record_segment_refs(record, segment_id_offset)?;
@@ -1043,13 +1045,15 @@ fn read_object_surfaces_from_bytes_with_pushdown_options(
             records.extend(records_from_segment(
                 &segment,
                 object_type,
-                dictionary.as_ref(),
-                &zone_stats,
-                read_options,
-                pushdown_options,
-                &mut pushdown_report,
-                projection_shape_lookup.as_ref(),
-                kernel_builder.as_mut(),
+                SegmentReadContext {
+                    dictionary: dictionary.as_ref(),
+                    zone_stats: &zone_stats,
+                    options: read_options,
+                    pushdown: pushdown_options,
+                    report: &mut pushdown_report,
+                    projection_lookup: projection_shape_lookup.as_ref(),
+                    kernel_builder: kernel_builder.as_mut(),
+                },
             )?);
         }
     }
@@ -1409,19 +1413,24 @@ fn object_type_is_association_like(object_type: &ObjectTypeEntryV1) -> bool {
         || object_type.type_name.starts_with("Association:")
 }
 
+struct SegmentReadContext<'a> {
+    dictionary: Option<&'a FileDictionary>,
+    zone_stats: &'a [ZoneStatsEntry],
+    options: &'a CoveObjectReadOptions,
+    pushdown: &'a CoveObjectReadPushdownOptions,
+    report: &'a mut CoveObjectReadPushdownReport,
+    projection_lookup: Option<&'a BTreeMap<(String, String), ProjectionNestedShape>>,
+    kernel_builder: Option<&'a mut CoveObjectKernelSurfaceBuilder>,
+}
+
 fn records_from_segment(
     segment: &TemporalSegmentData,
     object_type: &ObjectTypeEntryV1,
-    dictionary: Option<&FileDictionary>,
-    zone_stats: &[ZoneStatsEntry],
-    options: &CoveObjectReadOptions,
-    pushdown: &CoveObjectReadPushdownOptions,
-    report: &mut CoveObjectReadPushdownReport,
-    projection_lookup: Option<&BTreeMap<(String, String), ProjectionNestedShape>>,
-    mut kernel_builder: Option<&mut CoveObjectKernelSurfaceBuilder>,
+    mut context: SegmentReadContext<'_>,
 ) -> Result<Vec<CoveObjectRecord>, CoveError> {
-    report.rows_seen += segment.rows.len();
-    report.property_columns_requested += property_columns_requested(segment, object_type, options)?;
+    context.report.rows_seen += segment.rows.len();
+    context.report.property_columns_requested +=
+        property_columns_requested(segment, object_type, context.options)?;
     let mut values_by_row = vec![Vec::new(); segment.rows.len()];
     let properties_by_id = object_type
         .properties
@@ -1439,16 +1448,16 @@ fn records_from_segment(
                     column.directory.column_id
                 ))
             })?;
-        if !options.requests_property(property) {
+        if !context.options.requests_property(property) {
             continue;
         }
         let values = decode_property_column(
             segment,
             property,
             column,
-            dictionary,
-            zone_stats,
-            options.redaction_read_policy,
+            context.dictionary,
+            context.zone_stats,
+            context.options.redaction_read_policy,
         )?;
         for (row_values, value) in values_by_row.iter_mut().zip(values) {
             row_values.push(CoveObjectPropertyValue {
@@ -1463,11 +1472,15 @@ fn records_from_segment(
         }
     }
 
-    let endpoint_candidate_record_goids =
-        endpoint_candidate_record_goids(object_type, &values_by_row, &segment.rows, pushdown);
+    let endpoint_candidate_record_goids = endpoint_candidate_record_goids(
+        object_type,
+        &values_by_row,
+        &segment.rows,
+        context.pushdown,
+    );
     let mut records = Vec::with_capacity(segment.rows.len());
     for (row_index, row) in segment.rows.iter().enumerate() {
-        if !row_matches_pushdown(row, object_type, pushdown) {
+        if !row_matches_pushdown(row, object_type, context.pushdown) {
             continue;
         }
         if let Some(candidate_goids) = &endpoint_candidate_record_goids {
@@ -1478,20 +1491,20 @@ fn records_from_segment(
         if !property_candidates_match(
             object_type.object_type_id,
             &values_by_row[row_index],
-            pushdown,
+            context.pushdown,
         ) {
-            report.rows_skipped_by_property_candidates += 1;
+            context.report.rows_skipped_by_property_candidates += 1;
             continue;
         }
-        report.rows_candidates += 1;
+        context.report.rows_candidates += 1;
         let mut properties = std::mem::take(&mut values_by_row[row_index]);
         apply_projection_nested_shapes_to_properties(
             object_type,
             &mut properties,
-            projection_lookup,
+            context.projection_lookup,
         )?;
         let association = association_metadata(object_type, &properties);
-        if let Some(builder) = kernel_builder.as_deref_mut() {
+        if let Some(builder) = context.kernel_builder.as_deref_mut() {
             builder.push_record(
                 object_type,
                 segment.header.segment_id,

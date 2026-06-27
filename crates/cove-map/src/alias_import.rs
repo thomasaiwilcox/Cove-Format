@@ -468,10 +468,7 @@ fn alias_catalog_digest_input(
         .as_object()
         .ok_or_else(|| "alias_catalog must be an object".to_string())?;
     let alias_catalog_id = required_str(catalog, "alias_catalog_id")?;
-    let mut entries = required_array(catalog, "entries")?
-        .iter()
-        .cloned()
-        .collect::<Vec<_>>();
+    let mut entries = required_array(catalog, "entries")?.to_vec();
     if !order_sensitive_catalog {
         entries.sort_by(|left, right| {
             left.get("alias_entry_id")

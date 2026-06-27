@@ -2399,8 +2399,7 @@ impl CoveDeltaFile {
         header.parent_refs_offset = COVEDELTA_HEADER_LEN as u64;
         header.parent_refs_length = (self.parent_refs.len() * COVEDELTA_PARENT_REF_LEN) as u64;
 
-        let mut out = Vec::new();
-        out.resize(COVEDELTA_HEADER_LEN as usize, 0);
+        let mut out = vec![0; COVEDELTA_HEADER_LEN as usize];
         for parent in &self.parent_refs {
             out.extend_from_slice(&parent.serialize());
         }
@@ -3496,15 +3495,16 @@ fn validate_sparse_patch_records_cover_temporal_rows(
             if row.record_kind != RecordKind::Delta {
                 continue;
             }
-            temporal_delta_keys.insert(sparse_temporal_key(
+            let branch_identity_ref = u32::try_from(row.branch_key).map_err(|_| {
+                CoveError::BadSection(
+                    "COVEDELTA temporal row branch_key exceeds sparse patch ref width".into(),
+                )
+            })?;
+            temporal_delta_keys.insert((
                 header.scope_kind,
                 header.scope_id,
                 segment.header.object_type_id,
-                u32::try_from(row.branch_key).map_err(|_| {
-                    CoveError::BadSection(
-                        "COVEDELTA temporal row branch_key exceeds sparse patch ref width".into(),
-                    )
-                })?,
+                branch_identity_ref,
                 row.goid,
                 row.record_id,
                 row.timestamp_us,
@@ -3537,7 +3537,7 @@ fn validate_sparse_patch_records_cover_temporal_rows(
 }
 
 fn sparse_patch_record_key(record: &DeltaSparsePatchRecordV1) -> SparsePatchTemporalKey {
-    sparse_temporal_key(
+    (
         record.scope_kind,
         record.scope_id,
         record.object_type_id,
@@ -3546,28 +3546,6 @@ fn sparse_patch_record_key(record: &DeltaSparsePatchRecordV1) -> SparsePatchTemp
         record.record_id,
         record.timestamp_us,
         record.csn,
-    )
-}
-
-fn sparse_temporal_key(
-    scope_kind: u16,
-    scope_id: [u8; 16],
-    object_type_id: u32,
-    branch_identity_ref: u32,
-    goid: [u8; 16],
-    record_id: [u8; 16],
-    timestamp_us: i64,
-    csn: u64,
-) -> SparsePatchTemporalKey {
-    (
-        scope_kind,
-        scope_id,
-        object_type_id,
-        branch_identity_ref,
-        goid,
-        record_id,
-        timestamp_us,
-        csn,
     )
 }
 
@@ -3662,7 +3640,7 @@ fn parse_fixed_records<T>(
     parse: impl Fn(&[u8]) -> Result<T, CoveError>,
     label: &str,
 ) -> Result<Vec<T>, CoveError> {
-    if section.payload.len() % record_len != 0 {
+    if !section.payload.len().is_multiple_of(record_len) {
         return Err(CoveError::BadSection(format!(
             "{label} section payload length is not a multiple of record length"
         )));
@@ -4978,7 +4956,7 @@ mod tests {
     fn covedelta_object_delta_accepts_inline_dictionary_overlay() {
         let entry = sample_dictionary_entry();
         let expected = DeltaDictionaryEntryV1::parse(&entry.serialize().unwrap()).unwrap();
-        let bytes = object_delta_with_dictionary_overlay_entries(&[entry.clone()])
+        let bytes = object_delta_with_dictionary_overlay_entries(std::slice::from_ref(&entry))
             .serialize()
             .unwrap();
         let parsed = CoveDeltaFile::parse(&bytes).unwrap();

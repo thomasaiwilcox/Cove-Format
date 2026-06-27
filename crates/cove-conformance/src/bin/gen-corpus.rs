@@ -11053,16 +11053,23 @@ fn covi_key_and_entries_with_kinds(
         .iter()
         .enumerate()
         .map(|(index, (offset, len))| {
-            entry(
-                index as u32,
-                *offset,
-                *len,
-                posting_refs.get(index).copied().unwrap_or(u32::MAX),
-                aggregate_refs.get(index).copied().unwrap_or(u32::MAX),
-                duplicate_refs.get(index).copied().unwrap_or(u32::MAX),
-                encoding_kind,
+            let entry_ref = index as u32;
+            CoviIndexEntryV2 {
+                entry_ref,
+                index_root_id: 0,
+                entry_id: u64::from(entry_ref),
+                key_kind: encoding_kind,
                 comparator_kind,
-            )
+                flags: 0,
+                key_offset: *offset,
+                key_length: *len,
+                key_hash64: u64::from(entry_ref),
+                postings_ref: posting_refs.get(index).copied().unwrap_or(u32::MAX),
+                coverage_set_ref: u32::MAX,
+                aggregate_answer_ref: aggregate_refs.get(index).copied().unwrap_or(u32::MAX),
+                next_duplicate_ref: duplicate_refs.get(index).copied().unwrap_or(u32::MAX),
+                checksum: 0,
+            }
         })
         .collect();
     (key_block, entries)
@@ -11102,34 +11109,6 @@ fn covi_key_block(
     .serialize()
     .unwrap();
     (block, refs)
-}
-
-fn entry(
-    entry_ref: u32,
-    key_offset: u64,
-    key_length: u32,
-    postings_ref: u32,
-    aggregate_answer_ref: u32,
-    next_duplicate_ref: u32,
-    key_kind: CoviKeyEncodingKindV2,
-    comparator_kind: CoviComparatorKindV2,
-) -> CoviIndexEntryV2 {
-    CoviIndexEntryV2 {
-        entry_ref,
-        index_root_id: 0,
-        entry_id: u64::from(entry_ref),
-        key_kind,
-        comparator_kind,
-        flags: 0,
-        key_offset,
-        key_length,
-        key_hash64: u64::from(entry_ref),
-        postings_ref,
-        coverage_set_ref: u32::MAX,
-        aggregate_answer_ref,
-        next_duplicate_ref,
-        checksum: 0,
-    }
 }
 
 fn entry_block_payload(
