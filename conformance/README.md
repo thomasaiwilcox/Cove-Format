@@ -43,7 +43,8 @@ Each manifest line is one JSON object:
 - `error_code` — (preferred when `expect=reject`) stable Spec §76 error code
     Fixtures with `error_code` are automatically tagged as `§76` evidence by `gen-corpus`.
 - `error`    — optional fallback substring match for ad hoc cases
-- `sections` — list of `"§N.M"` markers from `spec.md`
+- `sections` — list of `"§N.M"` markers from the split specification documents
+    under `spec/`
 - `morsel_count` — required only for `row_morsel_directory` fixtures
 
 `suite_contract_case` fixtures are repo-level meta checks used for Spec §§78-79. They

@@ -10,7 +10,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use serde_json::Value;
@@ -1133,9 +1133,41 @@ fn validate_row_sections_exist(rows: &[Row], spec_text: &str) {
         .collect::<Vec<_>>();
     assert!(
         missing.is_empty(),
-        "capability matrix references section ids missing from spec.md: {}",
+        "capability matrix references section ids missing from split specification documents: {}",
         missing.join(", ")
     );
+}
+
+fn read_split_spec_text(repo_root: &Path) -> String {
+    let mut spec_paths = vec![repo_root.join("spec.md")];
+    let spec_dir = repo_root.join("spec");
+    if spec_dir.is_dir() {
+        let mut stack = vec![spec_dir];
+        while let Some(dir) = stack.pop() {
+            let entries = fs::read_dir(&dir)
+                .unwrap_or_else(|err| panic!("cannot read {}: {err}", dir.display()));
+            for entry in entries {
+                let entry = entry
+                    .unwrap_or_else(|err| panic!("cannot read entry in {}: {err}", dir.display()));
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|extension| extension == "md") {
+                    spec_paths.push(path);
+                }
+            }
+        }
+    }
+    spec_paths.sort();
+
+    let mut spec_text = String::new();
+    for path in spec_paths {
+        let text = fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("cannot read {}: {err}", path.display()));
+        spec_text.push_str(&text);
+        spec_text.push('\n');
+    }
+    spec_text
 }
 
 fn main() {
@@ -1145,9 +1177,8 @@ fn main() {
         .parent()
         .unwrap()
         .join("conformance");
-    let spec_path = root.parent().unwrap().join("spec.md");
-    let spec_text = fs::read_to_string(&spec_path)
-        .unwrap_or_else(|err| panic!("cannot read {}: {err}", spec_path.display()));
+    let repo_root = root.parent().unwrap();
+    let spec_text = read_split_spec_text(repo_root);
     let manifest_path = root.join("manifest.jsonl");
     let manifest_text = fs::read_to_string(&manifest_path)
         .unwrap_or_else(|err| panic!("cannot read {}: {err}", manifest_path.display()));

@@ -48,7 +48,8 @@ This repository is a working standards-suite prototype, not a production data
 standard with external adoption.
 
 - The root workspace is the active COVE standards-suite workspace. Its
-  normative baseline is [`spec.md`](./spec.md).
+  normative baseline is the split specification tree under [`spec/`](./spec/),
+  with [`spec.md`](./spec.md) retained as the stable entrypoint.
 - The reference implementation is Rust and includes readers, writers,
   validators, conversion tools, DataFusion access, CoveQL, mapping, sidecar
   tooling, benchmark harnesses, and conformance generators.
@@ -498,8 +499,9 @@ implement the baseline tabular archive path.
 
 Important paths:
 
-- [`spec.md`](./spec.md): COVE full specification and current
-  normative baseline for implementation and conformance-vector development.
+- [`spec.md`](./spec.md): stable entrypoint for the split COVE specification
+  tree in [`spec/`](./spec/), which is the current normative baseline for
+  implementation and conformance-vector development.
 - [`IMPLEMENTERS.md`](./IMPLEMENTERS.md): practical COVE-Core plus
   COVE-T reader/writer starting point for independent implementations.
 - [`crates/cove-core`](./crates/cove-core): core file structures,
