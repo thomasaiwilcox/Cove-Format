@@ -39,9 +39,10 @@ use cove_core::{
     digest::compute_digest,
     durable,
     profile::cove_o::{
-        read_object_surface_from_base_and_delta_files_with_options,
+        read_object_surface_from_base_and_delta_files_with_parent_identity,
         read_object_surface_from_bytes_with_options, reconstruct_object_states,
-        CoveObjectReadOptions, CoveObjectReconstructionOptions, CoveObjectState, ObjectTypeEntryV1,
+        CoveObjectDeltaParentIdentity, CoveObjectReadOptions, CoveObjectReconstructionOptions,
+        CoveObjectState, ObjectTypeEntryV1,
     },
     reader::{validate_bytes_with_options, ValidationOptions},
     utility::{build_covm_artifact_from_bytes, hex_encode, CovmInputArtifact},
@@ -1797,8 +1798,11 @@ fn reconstruct_validated_object_snapshot(
         read_object_surface_from_bytes_with_options(&snapshot.base.bytes, &read_options)
             .map_err(|error| format!("cannot read selected COVE-O base snapshot: {error}"))?
     } else {
-        read_object_surface_from_base_and_delta_files_with_options(
+        read_object_surface_from_base_and_delta_files_with_parent_identity(
             &snapshot.base.bytes,
+            Some(&cove_object_delta_parent_identity(
+                &snapshot.extension.base_artifact_ref,
+            )),
             &snapshot.parsed_deltas,
             &read_options,
         )
@@ -2233,6 +2237,17 @@ fn base_identity(path: &Path, bytes: &[u8]) -> Result<ArtifactBytesWithRef, Stri
         path: path.to_path_buf(),
         reference,
     })
+}
+
+fn cove_object_delta_parent_identity(
+    reference: &CovmDeltaArtifactRefV1,
+) -> CoveObjectDeltaParentIdentity {
+    CoveObjectDeltaParentIdentity {
+        artifact_id: reference.artifact_id,
+        snapshot_id: reference.snapshot_id,
+        file_len: reference.file_len,
+        footer_crc32c: reference.footer_crc32c,
+    }
 }
 
 #[derive(Debug, Clone)]

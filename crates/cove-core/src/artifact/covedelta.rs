@@ -8,8 +8,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
-    checksum,
-    constants::{CoveLogicalType, DigestAlgorithm, MAGIC_COVEDELTA},
+    canonical, checksum,
+    constants::{CoveLogicalType, DigestAlgorithm, ValueTag, MAGIC_COVEDELTA},
     digest::compute_digest,
     profile::{
         cove_map::{MapEvidenceIndex, MapProjectionCatalog},
@@ -32,6 +32,7 @@ pub const DELTA_BRANCH_IDENTITY_LEN: usize = 37;
 pub const DELTA_CONTINUATION_ANCHOR_LEN: usize = 95;
 pub const DELTA_STATE_HASH_DESCRIPTOR_LEN: usize = 21;
 pub const DELTA_DICTIONARY_ENTRY_LEN: usize = 57;
+pub const DELTA_INLINE_VALUE_HEADER_LEN: usize = 16;
 pub const DELTA_SIDECAR_HINT_LEN: usize = 32;
 pub const DELTA_SCOPE_DESCRIPTOR_LEN: usize = 28;
 pub const DELTA_SUMMARY_DESCRIPTOR_LEN: usize = 25;
@@ -806,6 +807,121 @@ pub struct DeltaDictionaryEntryV1 {
     pub parent_dictionary_digest_ref: u32,
     pub canonical_hash128: [u8; 16],
     pub checksum: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeltaInlineValueV1 {
+    pub value_ref: u32,
+    pub value_tag: u16,
+    pub flags: u32,
+    pub value: Vec<u8>,
+    pub checksum: u32,
+}
+
+impl DeltaInlineValueV1 {
+    pub fn serialize(&self) -> Result<Vec<u8>, CoveError> {
+        self.validate()?;
+        let value_len = u32::try_from(self.value.len()).map_err(|_| CoveError::ArithOverflow)?;
+        let record_len = DELTA_INLINE_VALUE_HEADER_LEN
+            .checked_add(self.value.len())
+            .and_then(|len| len.checked_add(4))
+            .ok_or(CoveError::ArithOverflow)?;
+        let mut out = Vec::with_capacity(record_len);
+        out.extend_from_slice(&self.value_ref.to_le_bytes());
+        out.extend_from_slice(&self.value_tag.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&self.flags.to_le_bytes());
+        out.extend_from_slice(&value_len.to_le_bytes());
+        debug_assert_eq!(out.len(), DELTA_INLINE_VALUE_HEADER_LEN);
+        out.extend_from_slice(&self.value);
+        out.extend_from_slice(&0u32.to_le_bytes());
+        let checksum_pos = out.len() - 4;
+        let crc = checksum::crc32c(&out);
+        out[checksum_pos..checksum_pos + 4].copy_from_slice(&crc.to_le_bytes());
+        Ok(out)
+    }
+
+    pub fn parse(bytes: &[u8]) -> Result<Self, CoveError> {
+        let (record, consumed) = Self::parse_with_len(bytes)?;
+        if consumed != bytes.len() {
+            return Err(CoveError::BadSection(
+                "COVEDELTA inline value record has trailing bytes".into(),
+            ));
+        }
+        Ok(record)
+    }
+
+    pub fn parse_many(bytes: &[u8]) -> Result<Vec<Self>, CoveError> {
+        let mut pos = 0usize;
+        let mut records = Vec::new();
+        while pos < bytes.len() {
+            let (record, consumed) = Self::parse_with_len(&bytes[pos..])?;
+            pos = pos.checked_add(consumed).ok_or(CoveError::ArithOverflow)?;
+            records.push(record);
+        }
+        Ok(records)
+    }
+
+    fn parse_with_len(bytes: &[u8]) -> Result<(Self, usize), CoveError> {
+        if bytes.len() < DELTA_INLINE_VALUE_HEADER_LEN + 4 {
+            return Err(CoveError::BufferTooShort);
+        }
+        let mut pos = 0usize;
+        let value_ref = take_u32(bytes, &mut pos)?;
+        let value_tag = take_u16(bytes, &mut pos)?;
+        let reserved = take_u16(bytes, &mut pos)?;
+        if reserved != 0 {
+            return Err(CoveError::ReservedNotZero);
+        }
+        let flags = take_u32(bytes, &mut pos)?;
+        let value_len =
+            usize::try_from(take_u32(bytes, &mut pos)?).map_err(|_| CoveError::ArithOverflow)?;
+        if pos != DELTA_INLINE_VALUE_HEADER_LEN {
+            return Err(CoveError::BadSection(
+                "COVEDELTA inline value header length mismatch".into(),
+            ));
+        }
+        let record_len = DELTA_INLINE_VALUE_HEADER_LEN
+            .checked_add(value_len)
+            .and_then(|len| len.checked_add(4))
+            .ok_or(CoveError::ArithOverflow)?;
+        if record_len > bytes.len() {
+            return Err(CoveError::BufferTooShort);
+        }
+        let record_bytes = &bytes[..record_len];
+        let value = take(record_bytes, &mut pos, value_len)?.to_vec();
+        let checksum = take_u32(record_bytes, &mut pos)?;
+        if pos != record_len {
+            return Err(CoveError::BadSection(
+                "COVEDELTA inline value parse length mismatch".into(),
+            ));
+        }
+        let mut for_crc = record_bytes.to_vec();
+        for_crc[record_len - 4..record_len].fill(0);
+        if checksum::crc32c(&for_crc) != checksum {
+            return Err(CoveError::ChecksumMismatch);
+        }
+        let record = Self {
+            value_ref,
+            value_tag,
+            flags,
+            value,
+            checksum,
+        };
+        record.validate()?;
+        Ok((record, record_len))
+    }
+
+    pub fn validate(&self) -> Result<(), CoveError> {
+        if self.flags != 0 {
+            return Err(CoveError::ReservedNotZero);
+        }
+        let value_tag = ValueTag::from_u16(self.value_tag).ok_or_else(|| {
+            CoveError::BadSection("COVEDELTA inline value has unknown value_tag".into())
+        })?;
+        canonical::validate_canonical_payload(value_tag, &self.value)?;
+        Ok(())
+    }
 }
 
 impl DeltaDictionaryEntryV1 {
@@ -2367,6 +2483,7 @@ pub struct CoveDeltaObjectValidation {
     pub scope_id: [u8; 16],
     pub catalog_patches: Vec<ObjectTypeCatalog>,
     pub dictionary_overlay_entries: Vec<DeltaDictionaryEntryV1>,
+    pub inline_values: Vec<DeltaInlineValueV1>,
     pub evidence_patches: Vec<MapEvidenceIndex>,
     pub projection_patches: Vec<MapProjectionCatalog>,
     pub index_hints: Vec<DeltaSidecarHintV1>,
@@ -2715,6 +2832,8 @@ impl CoveDeltaFile {
         let mut catalog_patches = Vec::new();
         let mut dictionary_overlay_entries = Vec::new();
         let mut dictionary_overlay_local_codes = BTreeSet::new();
+        let mut inline_values = Vec::new();
+        let mut inline_value_refs = BTreeSet::new();
         let mut evidence_patches = Vec::new();
         let mut projection_patches = Vec::new();
         let mut index_hints = Vec::new();
@@ -2795,6 +2914,33 @@ impl CoveDeltaFile {
                         }
                     }
                     dictionary_overlay_entries.extend(entries);
+                }
+                CoveDeltaSectionKind::StringTable => {
+                    if section.entry.compression != 0 {
+                        return Err(CoveError::BadSection(
+                            "COVEDELTA string table validation requires uncompressed payload"
+                                .into(),
+                        ));
+                    }
+                    if section.entry.item_count == 0 {
+                        return Err(CoveError::BadSection(
+                            "COVEDELTA string table section requires inline value records".into(),
+                        ));
+                    }
+                    let records = DeltaInlineValueV1::parse_many(&section.payload)?;
+                    if section.entry.item_count != records.len() as u64 {
+                        return Err(CoveError::BadSection(
+                            "COVEDELTA string table item_count does not match payload".into(),
+                        ));
+                    }
+                    for record in &records {
+                        if !inline_value_refs.insert(record.value_ref) {
+                            return Err(CoveError::BadSection(
+                                "COVEDELTA string table contains duplicate value_ref".into(),
+                            ));
+                        }
+                    }
+                    inline_values.extend(records);
                 }
                 CoveDeltaSectionKind::EvidencePatch => {
                     if self.header.required_delta_features & DELTA_FEATURE_MAP_EVIDENCE_PATCH == 0 {
@@ -3098,6 +3244,9 @@ impl CoveDeltaFile {
             "COVEDELTA tombstone summary descriptors",
             &tombstone_summary_descriptors,
         )?;
+        validate_dense_inline_value_refs(&inline_values)?;
+        validate_dictionary_overlay_inline_value_refs(&dictionary_overlay_entries, &inline_values)?;
+        validate_sparse_patch_value_refs(&sparse_patch_records, &inline_values)?;
         validate_property_bitmap_refs(
             "COVEDELTA touched range property_bitmap_ref",
             &touched_object_ranges,
@@ -3172,6 +3321,7 @@ impl CoveDeltaFile {
             scope_id: self.header.scope_id,
             catalog_patches,
             dictionary_overlay_entries,
+            inline_values,
             evidence_patches,
             projection_patches,
             index_hints,
@@ -3316,6 +3466,98 @@ fn validate_dense_summary_descriptors(
         }
     }
     Ok(())
+}
+
+fn validate_dense_inline_value_refs(values: &[DeltaInlineValueV1]) -> Result<(), CoveError> {
+    for (index, value) in values.iter().enumerate() {
+        let expected = u32::try_from(index).map_err(|_| CoveError::ArithOverflow)?;
+        if value.value_ref != expected {
+            return Err(CoveError::BadSection(
+                "COVEDELTA inline values must be dense zero-based by value_ref".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_dictionary_overlay_inline_value_refs(
+    entries: &[DeltaDictionaryEntryV1],
+    values: &[DeltaInlineValueV1],
+) -> Result<(), CoveError> {
+    for entry in entries {
+        if entry.entry_kind != DELTA_DICTIONARY_ENTRY_KIND_INLINE_VALUE {
+            continue;
+        }
+        let value = inline_value_by_ref(values, entry.inline_value_ref)?;
+        let logical_type = CoveLogicalType::from_u16(entry.logical_type).ok_or_else(|| {
+            CoveError::BadSection(
+                "COVEDELTA inline dictionary entry has unknown logical_type".into(),
+            )
+        })?;
+        let value_tag = ValueTag::from_u16(value.value_tag).ok_or_else(|| {
+            CoveError::BadSection("COVEDELTA inline value has unknown value_tag".into())
+        })?;
+        if !logical_type_accepts_value_tag(logical_type, value_tag) {
+            return Err(CoveError::BadSection(
+                "COVEDELTA inline dictionary value tag is incompatible with entry logical type"
+                    .into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_sparse_patch_value_refs(
+    records: &[DeltaSparsePatchRecordV1],
+    values: &[DeltaInlineValueV1],
+) -> Result<(), CoveError> {
+    for record in records {
+        for property in &record.changed_properties {
+            if property.property_op == DELTA_PROPERTY_OP_SET_VALUE {
+                inline_value_by_ref(values, property.value_ref)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn inline_value_by_ref(
+    values: &[DeltaInlineValueV1],
+    value_ref: u32,
+) -> Result<&DeltaInlineValueV1, CoveError> {
+    let index = usize::try_from(value_ref).map_err(|_| CoveError::ArithOverflow)?;
+    values.get(index).ok_or_else(|| {
+        CoveError::BadSection("COVEDELTA value_ref does not resolve to an inline value".into())
+    })
+}
+
+fn logical_type_accepts_value_tag(logical_type: CoveLogicalType, value_tag: ValueTag) -> bool {
+    match logical_type {
+        CoveLogicalType::Null => value_tag == ValueTag::Null,
+        CoveLogicalType::Bool => matches!(value_tag, ValueTag::BoolFalse | ValueTag::BoolTrue),
+        CoveLogicalType::Int8
+        | CoveLogicalType::Int16
+        | CoveLogicalType::Int32
+        | CoveLogicalType::Int64 => value_tag == ValueTag::Int64,
+        CoveLogicalType::UInt8
+        | CoveLogicalType::UInt16
+        | CoveLogicalType::UInt32
+        | CoveLogicalType::UInt64 => value_tag == ValueTag::UInt64,
+        CoveLogicalType::Float32 => value_tag == ValueTag::Float32Bits,
+        CoveLogicalType::Float64 => value_tag == ValueTag::Float64Bits,
+        CoveLogicalType::Decimal64 => value_tag == ValueTag::Decimal64,
+        CoveLogicalType::Decimal128 => value_tag == ValueTag::Decimal128,
+        CoveLogicalType::DateDays => value_tag == ValueTag::DateDays,
+        CoveLogicalType::TimestampMicros => value_tag == ValueTag::TimestampMicros,
+        CoveLogicalType::TimestampNanos => value_tag == ValueTag::TimestampNanos,
+        CoveLogicalType::Utf8 => value_tag == ValueTag::Utf8,
+        CoveLogicalType::Binary => value_tag == ValueTag::Binary,
+        CoveLogicalType::Uuid => value_tag == ValueTag::Uuid,
+        CoveLogicalType::Json => value_tag == ValueTag::Json,
+        CoveLogicalType::List => value_tag == ValueTag::List,
+        CoveLogicalType::Struct => value_tag == ValueTag::Struct,
+        CoveLogicalType::Map => value_tag == ValueTag::Map,
+    }
 }
 
 fn validate_property_bitmap_refs(
@@ -3873,6 +4115,7 @@ mod tests {
             },
             payload: sample_sparse_patch_record().serialize().unwrap(),
         });
+        push_string_table_section(&mut delta, &[0]);
         delta
     }
 
@@ -3915,7 +4158,60 @@ mod tests {
             },
             payload,
         });
+        let inline_value_refs = entries
+            .iter()
+            .filter_map(|entry| {
+                (entry.entry_kind == DELTA_DICTIONARY_ENTRY_KIND_INLINE_VALUE)
+                    .then_some(entry.inline_value_ref)
+            })
+            .collect::<Vec<_>>();
+        if !inline_value_refs.is_empty() {
+            push_string_table_section(&mut delta, &inline_value_refs);
+        }
         delta
+    }
+
+    fn push_string_table_section(delta: &mut CoveDeltaFile, value_refs: &[u32]) {
+        let max_ref = value_refs.iter().copied().max().unwrap_or(0);
+        let values = (0..=max_ref).map(sample_inline_value).collect::<Vec<_>>();
+        let payload = values
+            .iter()
+            .map(DeltaInlineValueV1::serialize)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        delta.sections.push(CoveDeltaSection {
+            entry: CoveDeltaSectionDirectoryEntryV1 {
+                section_id: delta.sections.len() as u32 + 1,
+                section_kind: CoveDeltaSectionKind::StringTable as u16,
+                flags: 0,
+                offset: 0,
+                length: 0,
+                uncompressed_length: 0,
+                item_count: values.len() as u64,
+                compression: 0,
+                encryption: 0,
+                alignment_log2: 0,
+                reserved0: 0,
+                required_delta_features: 0,
+                optional_delta_features: 0,
+                crc32c: 0,
+                checksum: 0,
+            },
+            payload,
+        });
+    }
+
+    fn sample_inline_value(value_ref: u32) -> DeltaInlineValueV1 {
+        DeltaInlineValueV1 {
+            value_ref,
+            value_tag: ValueTag::Utf8 as u16,
+            flags: 0,
+            value: vec![1, b'x'],
+            checksum: 0,
+        }
     }
 
     fn dictionary_overlay_required_features(entries: &[DeltaDictionaryEntryV1]) -> u64 {
@@ -4531,7 +4827,7 @@ mod tests {
                     property_id: 1,
                     property_op: DELTA_PROPERTY_OP_SET_VALUE,
                     tombstone_kind: DELTA_TOMBSTONE_KIND_NONE,
-                    value_ref: 11,
+                    value_ref: 0,
                     redaction_ref: DELTA_REF_NONE,
                     flags: 0,
                 },
@@ -4580,7 +4876,7 @@ mod tests {
             collation_id: 0,
             entry_kind: DELTA_DICTIONARY_ENTRY_KIND_INLINE_VALUE,
             flags: 0,
-            inline_value_ref: 11,
+            inline_value_ref: 0,
             parent_ref: DELTA_REF_NONE,
             parent_dictionary_id: 0,
             parent_code: 0,
@@ -5062,7 +5358,7 @@ mod tests {
     fn covedelta_object_delta_rejects_duplicate_dictionary_overlay_local_code() {
         let first = sample_dictionary_entry();
         let mut second = sample_dictionary_entry();
-        second.inline_value_ref = 12;
+        second.inline_value_ref = 1;
 
         let bytes = object_delta_with_dictionary_overlay_entries(&[first, second])
             .serialize()
@@ -5995,7 +6291,7 @@ mod tests {
 
         assert_eq!(
             state.get(&1),
-            Some(&DeltaSparsePatchPropertyStateV1::ValueRef(11))
+            Some(&DeltaSparsePatchPropertyStateV1::ValueRef(0))
         );
         assert_eq!(state.get(&2), Some(&DeltaSparsePatchPropertyStateV1::Null));
         assert_eq!(state.get(&3), Some(&DeltaSparsePatchPropertyStateV1::Clear));

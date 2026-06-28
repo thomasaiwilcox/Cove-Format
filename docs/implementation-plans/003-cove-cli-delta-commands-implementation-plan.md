@@ -1,7 +1,11 @@
 # COVE CLI Delta Commands Implementation Plan
 
-Status: implemented for the `cove delta` command surface; broader
-query/export/sidecar/map integrations remain follow-up work.
+Status: implemented for the `cove delta` command surface, delta-aware
+query/export materialization, direct COVE-O delta query execution for supported
+object and graph roots, snapshot sidecars, map snapshot-bundle generation,
+initial resolver-aware map semantic delta generation, and release-gate coverage.
+Remaining architectural work is listed under
+"Follow-Up Work".
 
 Derived from:
 
@@ -18,10 +22,46 @@ Implemented in the CLI:
 4. `cove delta publish` and `publish-atomic`.
 5. `.covedelta` routing through `cove inspect` and `cove validate
    --object-delta`.
+6. Delta-aware `cove query` for COVM delta manifests, with chain validation,
+   CSN/commit-time snapshot pruning, direct COVE-O object-surface execution for
+   supported object-backed roots and graph traversal/algorithm node roots,
+   materialized fallback for unsupported roots, and optional delta plan
+   diagnostics.
+7. Delta-aware `cove export arrow` for COVM delta manifests, including native
+   table-style direct export over validated COVE-O projection surfaces when the
+   selected snapshot exposes exactly one Arrow projection, materialized fallback
+   for native-planner snapshots, and explicit `--query` Arrow export for
+   supported COVE-O roots over the direct delta object surface.
+8. Snapshot-bound `cove sidecar build covi|covm|covx --snapshot ...`.
+9. `cove map delta build` for building COVE-MAP bundle artifacts from a
+   materialized delta snapshot, plus `cove map delta build --base ... --mapping
+   ... --out ... <source...>` for generating resolver-aware semantic
+   `.covedelta` artifacts with additive object-catalog, evidence, and
+   projection patches.
+10. Snapshot-bound COVE-I sidecars carry the validated delta-chain digest in
+    `CoviSnapshotValidityV2`, so COVE-I validation fails closed unless callers
+    provide the matching chain digest.
+11. Release gates include static delta inspect/validate checks plus the targeted
+    CLI smoke path that publishes a chain and exercises query, export, sidecar,
+    and map delta commands.
 
-Remaining integration work is outside the `cove delta` namespace: delta-aware
-query/export execution, snapshot-bound sidecar generation, and COVE-MAP
-semantic delta production.
+The current query/export implementation validates the full declared chain
+before execution. `cove query` can execute supported COVE-O object-backed roots
+and graph traversal/algorithm node roots directly against a validated
+delta-composed object surface, falling back to a materialized snapshot when
+planner metadata or unsupported roots require it. `cove export arrow --query`
+can export supported CoveQL roots directly as Arrow batches over the same
+validated object surface. Native table-style `cove export arrow` can export a
+validated delta-composed COVE-O projection surface directly when the selected
+snapshot exposes exactly one Arrow projection; ambiguous projection surfaces
+fail closed and require explicit `--query`.
+Source-publish range pruning is exposed for `cove delta chain plan`,
+`cove query`, and explicit CoveQL Arrow export. Query/export treat
+`--source-publish-range` as an artifact relevance predicate, not an
+object-state temporal cut: execution is allowed only when the summary proves
+exact source-publish ranges and the selected ordinals form a reconstructable
+dense prefix. Missing source-publish summary metadata or non-prefix selections
+fail closed.
 
 ## Objective
 
@@ -104,6 +144,15 @@ cove delta compact <manifest.covm> --dataset <dir> --out <snapshot.cove> [--publ
 cove delta checkpoint <manifest.covm> --dataset <dir> --out <checkpoint.covedelta> [--summary-out <file>] [--json]
 cove delta publish --base <base.cove> --delta <delta.covedelta>... --out <manifest.covm> [--summary <file>|--summary-out <file>] [--json]
 cove delta publish-atomic --delta <delta.covedelta> --manifest <manifest.covm> [--json]
+
+cove query <manifest.covm> --dataset <dir> [--as-of-csn n|--as-of-commit-us n] [--delta-plan|--delta-plan-json] '<coveql>'
+cove export arrow <manifest.covm> <output.arrow|output.json> --dataset <dir> [--as-of-csn n|--as-of-commit-us n] [--delta-plan-json]
+cove export arrow --query '<coveql>' <manifest.covm> <output.arrow|output.json> --dataset <dir> [--as-of-csn n|--as-of-commit-us n] [--delta-plan|--delta-plan-json]
+cove sidecar build covi --snapshot <manifest.covm> --dataset <dir> --out <snapshot.covi> [--as-of-csn n|--as-of-commit-us n] [covi options]
+cove sidecar build covm --snapshot <manifest.covm> --dataset <dir> --out <snapshot.covm> [--as-of-csn n|--as-of-commit-us n]
+cove sidecar build covx --snapshot <manifest.covm> --dataset <dir> --out <snapshot.covx> [--as-of-csn n|--as-of-commit-us n]
+cove map delta build <manifest.covm> --dataset <dir> --out-dir <dir> [--as-of-csn n|--as-of-commit-us n] [--projection-output cove-t|none] [--publish-covm] [--verify]
+cove map delta build --base <manifest.covm> --dataset <dir> --mapping <mapping.covemap> --out <delta.covedelta> [--source-publish-range start:end] <source...>
 ```
 
 ## Command Details
@@ -448,6 +497,17 @@ without duplicating `cove delta chain plan`.
 eventually export the selected delta-aware snapshot with the same fail-closed
 rules as query.
 
+Implemented direct mode:
+
+```text
+cove export arrow --query '<coveql>' <manifest.covm> <out.arrow> --dataset <dir>
+```
+
+This mode validates the declared chain, reads the selected COVE-O object surface
+directly, and fails closed if selected deltas require materialized planner
+metadata. Native table-style export remains materialized until table/export
+semantics over a delta object surface are specified.
+
 ### `cove sidecar`
 
 Delta-aware sidecar generation should be explicit:
@@ -636,18 +696,69 @@ Acceptance:
 
 ### Phase 7: Checkpoints And Delta-Aware Sidecars
 
-Implement checkpoint generation and snapshot-bound sidecar generation.
+Implemented checkpoint generation and initial snapshot-bound sidecar
+generation.
 
 Acceptance:
 
 1. Checkpoint deltas validate as ordinary `.covedelta` artifacts.
 2. Chain plan recommendations change after checkpointing.
-3. Snapshot-level COVE-I and COVX sidecars bind the exact chain digest.
-4. Stale sidecars fail closed when used with a different chain digest.
+3. Snapshot-level COVE-I, COVM, and COVX sidecars are built from the validated
+   materialized snapshot.
+4. Snapshot-level COVE-I sidecars carry explicit delta-chain binding metadata.
+   Snapshot COVM and COVX sidecars remain bound to the materialized snapshot
+   file identity because those artifact formats do not yet expose equivalent
+   delta-chain digest fields.
 
 ### Phase 8: COVE-MAP Delta Production
 
-Implement semantic delta production in COVE-MAP.
+Initial `cove map delta build` support builds COVE-MAP bundle artifacts from a
+validated materialized delta snapshot.
+
+Initial semantic delta production is also implemented through:
+
+```text
+cove map delta build --base <manifest.covm> --dataset <dir> --mapping <mapping.covemap> --out <delta.covedelta> <source...>
+```
+
+This mode validates the parent manifest chain, reads the selected parent object
+surface, materializes COVE-MAP source rows, rewrites generated rows as
+full-value temporal `Delta` records, emits additive object-catalog patches,
+emits additive evidence patches, emits projection patch upserts when projection
+IDs are new or their definitions changed, binds deterministic
+semantic/object/projection fingerprint refs in the COVEDELTA header, emits
+strong continuation anchors with state-hash descriptors for full-value rows
+that update existing parent objects, emits exact touched-object ranges and
+exact tombstone ranges when tombstones are generated, and validates the
+generated bytes with `CoveDeltaFile::validate_object_delta`. The CLI smoke
+extends a published chain with generated map deltas for new and existing
+objects, validates the extended chains, queries the resulting mapped object
+state, and asserts touched-object ranges are present. Focused COVE-MAP tests
+also cover reviewed-decision and alias-catalog semantic changes by validating
+that generated semantic deltas carry changed semantic-map fingerprints and
+compose to the same logical object state as a full rebuild for additive
+new-object deltas. Existing-parent reviewed-decision and alias-catalog remaps
+that merge prior live parent objects now synthesize parent-object tombstone rows,
+emit exact tombstone ranges and continuation anchors, and compose to the same
+logical object state as a full rebuilt snapshot. Delta evidence patches now
+upsert by source evidence identity, so remaps replace stale parent
+`output_object_id` targets instead of leaving old evidence targets visible.
+Semantic delta builds emit sparse property-op sections for delta rows whose
+changed properties can be represented as explicit `SetNull` or `SetValue`
+operations with real inline value refs. FileCode-backed semantic deltas now
+emit delta-local inline value tables plus inline dictionary-overlay entries,
+and delta readback materializes those values for requested FileCode
+properties. Parent dictionary aliases materialize through the selected parent
+dictionary registry for base and previously applied delta dictionaries, with
+COVM-aware callers passing the selected base artifact identity into readback and
+redacted parent aliases preserving the existing FileCode redaction policy.
+
+Current full-support implementation status: complete for the supported delta
+contract. Non-additive object catalog migrations are intentionally not delta
+operations in the proposal: catalog patches are additive-only, and
+renames/removals/reinterpretive schema changes must publish a new base `.cove`
+snapshot or use a separate schema-generation branch. The implementation fails
+closed for reinterpretive patches and treats absence from a patch as no removal.
 
 Acceptance:
 
@@ -659,9 +770,62 @@ Acceptance:
 4. Published map delta chains pass `cove delta chain validate`.
 5. Parity tests prove equivalence against a full rebuilt snapshot.
 
+## Follow-Up Work
+
+1. Completed for CoveQL object-surface query roots: `cove query` can execute
+   supported COVE-O object-backed roots and graph traversal/algorithm node roots
+   over a validated delta-composed object surface without first writing
+   reconstructed snapshot bytes. Completed for explicit CoveQL Arrow export:
+   `cove export arrow --query ...` emits Arrow IPC/JSON from the same direct
+   object surface. Completed for native table-style export where the selected
+   COVE-O delta snapshot has exactly one Arrow projection:
+   `cove export arrow <manifest.covm> <out>` projects directly from the
+   validated object surface and reports `direct_projection_surface`. Future
+   extension point: add any future query/export roots that still require
+   materialized planner metadata.
+2. Completed initial safe source-publish scoped query/export semantics:
+   `--source-publish-range` prunes by exact source-publish summary metadata and
+   executes only when the selected chain remains a dense-prefix snapshot.
+   Missing exact summaries and non-prefix selections fail closed. Future product
+   question: decide whether a non-prefix "changes for source publish range"
+   result model is needed separately from snapshot query/export.
+3. Completed for generated sidecars at the current format level:
+   snapshot COVE-I carries the validated delta-chain digest, while snapshot
+   COVM and COVX bind the materialized snapshot by referenced file ID, file
+   length, footer CRC, and digest. Future format question: decide whether
+   future COVM/COVX versions need logical delta-chain digest fields in addition
+   to materialized snapshot identity.
+4. Resolver-aware semantic delta production is implemented for additive
+   object-catalog/evidence patches, projection patch upserts, full-value
+   temporal delta rows, and continuation-anchor/state-hash descriptors for
+   full-value updates to existing parent objects, plus exact touched-object
+   ranges and exact tombstone ranges when tombstone rows are generated. Initial
+   reviewed-decision and alias-catalog parity fixtures validate semantic
+   fingerprint changes and full-rebuild equivalence for additive new-object
+   deltas. Existing-parent reviewed-decision and alias-catalog remap fixtures
+   now validate object-state parity through generated parent-object tombstones.
+   Delta evidence patches replace stale evidence targets by source evidence
+   identity during readback.
+   Sparse property-op sections are emitted for explicit `SetNull` and
+   `SetValue` updates with real inline value refs. FileCode-backed semantic
+   deltas emit inline dictionary overlays and readback materializes those
+   delta-local FileCode values. Parent dictionary alias overlays materialize
+   through validated selected-parent dictionary identities and preserve redaction
+   policy. Non-additive object catalog migrations are intentionally outside the
+   delta patch contract and require a new base snapshot or schema-generation
+   branch.
+5. Completed: release-gate conformance coverage now requires delta
+   inspect/validate commands and the targeted CLI delta smoke path covering
+   query/export/sidecar/map delta commands.
+
 ### Phase 9: Conformance, Docs, And Release Gates
 
 Add release-gate coverage and user-facing examples.
+
+Status: release-gate coverage is implemented through
+`conformance/accept/suite_release_gates_contract.json` and
+`scripts/release-gates.sh`. The end-to-end implementer example is included
+below.
 
 Acceptance:
 
@@ -688,22 +852,24 @@ cove delta compact dataset.covm --dataset bundle --out compacted.cove
 
 ## Open Decisions
 
-Resolve before implementing the dependent phases:
+Resolved and remaining decisions:
 
-1. Whether `cove delta chain inspect` should parse extension bytes embedded in
+1. Resolved: `cove delta chain inspect` parses extension bytes embedded in
    COVM only, or also accept a raw extension fixture through `--extension`.
-2. Whether `--summary` should mean external summary bytes only, or should also
+2. Resolved: `--summary` means external summary bytes when accepted, while
+   inline summary bytes remain the default.
+3. Resolved: query time-selection flags are accepted on `cove query` for
+   delta-bearing COVM inputs.
+4. Resolved: the COVE-MAP delta command spelling is
+   `cove map delta build`.
+5. Remaining: Whether `--summary` should ever
    override a COVM-declared inline summary.
-3. Whether query time-selection flags belong first on `cove query` or only on
-   `cove delta chain plan`.
-4. Whether `reconstruct` and `compact` should be separate implementations or
+6. Remaining: Whether `reconstruct` and `compact` should be separate implementations or
    one implementation with different output reporting.
-5. The final spelling for COVE-MAP delta production:
-   `cove map build --delta-from ...` versus `cove map delta build ...`.
-6. Whether `publish` should accept only paths or also a JSON manifest of
+7. Remaining: Whether `publish` should accept only paths or also a JSON manifest of
    artifact refs for object-store deployments.
-7. How to represent external catalog snapshots once COVM is not the selector.
-8. Which JSON schemas become stability commitments for downstream automation.
+8. Remaining: How to represent external catalog snapshots once COVM is not the selector.
+9. Remaining: Which JSON schemas become stability commitments for downstream automation.
 
 ## Recommended Initial Cut
 

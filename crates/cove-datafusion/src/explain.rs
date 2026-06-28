@@ -10,7 +10,7 @@ use cove_core::{
 use serde_json::{json, Value};
 
 use crate::{
-    bootstrap::bootstrap_local_file_with_options,
+    bootstrap::{bootstrap_bytes_with_options, bootstrap_local_file_with_options},
     dataset_state::DatasetState,
     decode::{decode_local_dataset_scan, DecodeStats, DecodedScan},
     options::CoveTableOptions,
@@ -204,7 +204,20 @@ pub fn plan_local_file(
     path: impl AsRef<Path>,
     options: ExplainOptions,
 ) -> Result<PlannedScan, CoveError> {
-    let state = bootstrap_local_file_with_options(path.as_ref(), options.table_options)?;
+    let state = bootstrap_local_file_with_options(path.as_ref(), options.table_options.clone())?;
+    plan_state(state, options)
+}
+
+pub fn plan_bytes(
+    source: impl Into<Arc<str>>,
+    bytes: Vec<u8>,
+    options: ExplainOptions,
+) -> Result<PlannedScan, CoveError> {
+    let state = bootstrap_bytes_with_options(source, bytes, options.table_options.clone())?;
+    plan_state(state, options)
+}
+
+fn plan_state(state: Arc<DatasetState>, options: ExplainOptions) -> Result<PlannedScan, CoveError> {
     let projection = options
         .projection
         .as_ref()

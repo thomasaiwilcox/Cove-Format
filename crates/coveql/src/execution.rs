@@ -805,6 +805,28 @@ pub fn parse_resolve_plan_and_execute_query(
     execute_planned_query(bytes, planned, execution_options)
 }
 
+pub fn parse_resolve_plan_and_execute_query_on_object_surface(
+    planning_bytes: &[u8],
+    surface: &CoveObjectSurface,
+    text: &str,
+    parse_options: ParseOptions,
+    resolve_options: ResolveOptions,
+    plan_options: PlanOptions,
+    execution_options: ExecutionOptions,
+    validation_options: ValidationOptions,
+) -> Result<ExecutedQuery, BuildExecutionError> {
+    let planned = parse_resolve_and_plan_query(
+        planning_bytes,
+        text,
+        parse_options,
+        resolve_options,
+        plan_options,
+        validation_options,
+    )
+    .map_err(BuildExecutionError::from_plan)?;
+    execute_planned_query_on_object_surface(surface, planned, execution_options)
+}
+
 pub fn execute_planned_query(
     bytes: &[u8],
     planned: PlannedQuery,
@@ -876,6 +898,67 @@ pub fn execute_planned_query_retained(
     options: ExecutionOptions,
 ) -> Result<ExecutedQuery, BuildExecutionError> {
     execute_planned_query(input.as_slice(), planned, options)
+}
+
+pub fn execute_planned_query_on_object_surface(
+    surface: &CoveObjectSurface,
+    planned: PlannedQuery,
+    options: ExecutionOptions,
+) -> Result<ExecutedQuery, BuildExecutionError> {
+    let started = Instant::now();
+    validate_security_scope(&planned, &options)?;
+    validate_execution_grain(&planned)?;
+
+    let mut diagnostics = planned
+        .diagnostics
+        .iter()
+        .cloned()
+        .map(ExecutionDiagnostic::from)
+        .collect::<Vec<_>>();
+    diagnostics.push(exec_warning(
+        "W_MATERIALIZED_OBJECT_SURFACE_BASELINE",
+        "validated COVE-O object surface execution produced the visible output; byte-level pushdown is not applied to pre-composed surfaces",
+        json!({ "pushdown_enabled": options.pushdown.enabled }),
+    ));
+    if let Some(warning) = zero_copy_owned_fallback_warning(&planned) {
+        diagnostics.push(warning);
+    }
+
+    let (result, row_counts, pushdown_report, evidence_authority) =
+        match &planned.resolved.output_mode {
+            CoveQlOutputMode::ExplainJson => {
+                let explain = planned.explain_json();
+                (
+                    CoveQlExecutionResult::ExplainJson(explain),
+                    ExecutionRowCounts::default(),
+                    PushdownReport::not_executed(&options.pushdown),
+                    None,
+                )
+            }
+            CoveQlOutputMode::DataFusionTableProvider => {
+                return Err(exec_error(
+                    "E_UNSUPPORTED_OUTPUT",
+                    "DataFusion output is exposed through the Phase 3 registration helper, not object surface execution",
+                    json!({}),
+                ))
+            }
+            _ => execute_rows_on_object_surface(surface, &planned, &options, started)?,
+        };
+
+    enforce_result_budgets(&result, &row_counts, &planned, &options, started)?;
+    let output_fingerprint = result_fingerprint(&result)?;
+    Ok(ExecutedQuery {
+        planned,
+        result,
+        diagnostics,
+        row_counts,
+        output_fingerprint,
+        pushdown_report,
+        evidence_authority,
+        authority: ExecutionAuthorityReport::materialized_baseline(
+            "validated COVE-O object surface execution produced the visible output without compacting the surface into snapshot bytes",
+        ),
+    })
 }
 
 pub fn execute_manifest_planned_query(
@@ -1122,6 +1205,53 @@ fn execute_rows(
     }
 }
 
+fn execute_rows_on_object_surface(
+    surface: &CoveObjectSurface,
+    planned: &PlannedQuery,
+    options: &ExecutionOptions,
+    started: Instant,
+) -> Result<
+    (
+        CoveQlExecutionResult,
+        ExecutionRowCounts,
+        PushdownReport,
+        Option<EvidenceAuthority>,
+    ),
+    BuildExecutionError,
+> {
+    match &planned.resolved.root {
+        ResolvedRoot::Object(_)
+        | ResolvedRoot::Association(_)
+        | ResolvedRoot::Edge(_)
+        | ResolvedRoot::Evidence(_) => {
+            execute_object_surface_root(surface, planned, options, started)
+        }
+        ResolvedRoot::Node(_) if planned.resolved.method_chain.traversals.is_empty()
+            && planned.resolved.method_chain.graph_algorithms.is_empty() =>
+        {
+            execute_object_surface_root(surface, planned, options, started)
+        }
+        ResolvedRoot::Node(root) => {
+            let (result, row_counts) =
+                execute_graph_traverse_surface_root(surface, planned, options, started, root)?;
+            Ok((
+                result,
+                row_counts,
+                PushdownReport::not_applicable(
+                    &options.pushdown,
+                    "object surface execution reads a pre-composed COVE-O surface and cannot apply byte-level pushdown",
+                ),
+                None,
+            ))
+        }
+        ResolvedRoot::Projection(_) | ResolvedRoot::Table(_) => Err(exec_error(
+            "E_UNSUPPORTED_SURFACE_ROOT",
+            "object surface execution does not yet support projection or table roots; use materialized snapshot execution",
+            json!({}),
+        )),
+    }
+}
+
 fn execute_object_backed_root(
     bytes: &[u8],
     planned: &PlannedQuery,
@@ -1137,6 +1267,49 @@ fn execute_object_backed_root(
     BuildExecutionError,
 > {
     let mut source = object_backed_row_source(bytes, planned, options, started)?;
+    let evidence_authority = source.evidence_authority;
+    let (result, row_counts) = finish_materialized_rows(
+        source.rows,
+        &source.associations,
+        &source.evidence_rows,
+        &source.object_rows,
+        planned,
+        options,
+        started,
+    )?;
+    source.pushdown_report.counters.rows_after_candidate_retain = row_counts.input_rows;
+    Ok((
+        result,
+        row_counts,
+        source.pushdown_report,
+        evidence_authority,
+    ))
+}
+
+fn execute_object_surface_root(
+    surface: &CoveObjectSurface,
+    planned: &PlannedQuery,
+    options: &ExecutionOptions,
+    started: Instant,
+) -> Result<
+    (
+        CoveQlExecutionResult,
+        ExecutionRowCounts,
+        PushdownReport,
+        Option<EvidenceAuthority>,
+    ),
+    BuildExecutionError,
+> {
+    let mut source = object_surface_row_source(
+        surface,
+        planned,
+        options,
+        started,
+        PushdownReport::not_applicable(
+            &options.pushdown,
+            "object surface execution reads a pre-composed COVE-O surface and cannot apply byte-level pushdown",
+        ),
+    )?;
     let evidence_authority = source.evidence_authority;
     let (result, row_counts) = finish_materialized_rows(
         source.rows,
@@ -1501,7 +1674,18 @@ fn object_backed_row_source(
         .report
         .merge_core_report(read_result.pushdown_report);
     let surface = read_result.surface;
-    let states = object_states_for_temporal_context(&surface, planned)?;
+    object_surface_row_source(&surface, planned, options, started, pushdown_plan.report)
+}
+
+fn object_surface_row_source(
+    surface: &CoveObjectSurface,
+    planned: &PlannedQuery,
+    options: &ExecutionOptions,
+    started: Instant,
+    pushdown_report: PushdownReport,
+) -> Result<MaterializedRowSource, BuildExecutionError> {
+    check_time(&options.resource_budget, started)?;
+    let states = object_states_for_temporal_context(surface, planned)?;
     let object_rows = states
         .iter()
         .map(MaterializedObjectRow::from_state)
@@ -1551,13 +1735,13 @@ fn object_backed_row_source(
             if planned.resolved.method_chain.history.is_some()
                 || planned.resolved.method_chain.changes.is_some() =>
         {
-            temporal_object_rows(&surface, planned, root.object_type_id)?
+            temporal_object_rows(surface, planned, root.object_type_id)?
         }
         ResolvedRoot::Association(root)
             if planned.resolved.method_chain.history.is_some()
                 || planned.resolved.method_chain.changes.is_some() =>
         {
-            temporal_association_rows(&surface, planned, root.object_type_id)?
+            temporal_association_rows(surface, planned, root.object_type_id)?
         }
         ResolvedRoot::Object(root) => object_rows
             .iter()
@@ -1604,7 +1788,7 @@ fn object_backed_row_source(
         associations: context_associations,
         evidence_rows: context_evidence_rows,
         object_rows,
-        pushdown_report: pushdown_plan.report,
+        pushdown_report,
         evidence_authority,
     })
 }
@@ -3764,7 +3948,18 @@ fn execute_graph_traverse_root(
         )
     })?;
     let surface = read_result.surface;
-    let states = object_states_for_temporal_context(&surface, planned)?;
+    execute_graph_traverse_surface_root(&surface, planned, options, started, root)
+}
+
+fn execute_graph_traverse_surface_root(
+    surface: &CoveObjectSurface,
+    planned: &PlannedQuery,
+    options: &ExecutionOptions,
+    started: Instant,
+    root: &crate::ResolvedGraphNodeRoot,
+) -> Result<(CoveQlExecutionResult, ExecutionRowCounts), BuildExecutionError> {
+    check_time(&options.resource_budget, started)?;
+    let states = object_states_for_temporal_context(surface, planned)?;
     let object_rows = states
         .iter()
         .map(MaterializedObjectRow::from_state)

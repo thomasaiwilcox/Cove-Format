@@ -124,6 +124,47 @@ Candidate rules still compute canonical join-key evidence. They are reported in
 union-find, GOID selection, identity-equivalence output, or COVE-O object row
 materialization.
 
+## Resolution Catalog
+
+`MAP_RESOLUTION_CATALOG` is section kind `69`. It supports deterministic,
+replayable entity-resolution inputs for COVE-MAP and has these top-level
+arrays:
+
+- `normalization_pipelines`
+- `resolvers`
+- `match_rules`
+- `reviewed_decisions`
+
+The reference resolver kind is `alias_catalog`. Alias resolvers normalize the
+observed source value through a declared pipeline, look up the normalized alias
+in a digest-pinned catalog, and produce row-level resolution evidence. The
+canonical key is identity data; `canonical_label` is display data and is not an
+identity key.
+
+Identity rules may opt into `allow_reviewed_equivalence`. Join-key components
+may include `resolution`, which binds the component to a resolver. Resolver
+normalization owns that component; resolver-backed join keys reject
+double-normalization through non-identity canonicalization.
+
+Curated alias hits and reviewed same-object decisions can contribute GOID merge
+edges only when the effective merge authority and identity rule allow them.
+Candidate matches, ambiguous aliases routed to candidate-only mode, and resolver
+misses under candidate-only policy emit evidence and review inputs but do not
+enter union-find, GOID selection, identity-equivalence output, or COVE-O object
+row materialization.
+
+Replay-sensitive data is digest-bound. Conversion reports and evidence can bind
+the mapping bytes, source snapshots, source schema fingerprints, resolver
+digests, catalog digests, pipeline digests, suffix-table digests, and reviewed
+decision digests. `cove map replay verify` rejects stale or missing bindings
+for replay-claimed inputs.
+
+Resolution metadata may appear in `MAP_EVIDENCE_INDEX.operation_metadata`,
+including resolver IDs, catalog and pipeline digests, raw/normalized/resolved
+values, canonical keys, canonical labels, candidate match IDs, candidate scores,
+review decision IDs, and redacted proof fields. Redacted evidence omits protected
+raw values while preserving digest-backed proof.
+
 ## Source Fingerprints
 
 For local CSV, JSONL, Parquet, ORC, and Arrow IPC replay checks, the reference
@@ -214,6 +255,10 @@ The reference projection expression grammar is intentionally finite:
 - `association.valid_to`
 - `association.cardinality_policy`
 - `evidence.<field>`
+- `identity(<identity_rule_id>).resolution(<role>).canonical_key`
+- `identity(<identity_rule_id>).resolution(<role>).canonical_label`
+- `identity(<identity_rule_id>).resolution(<role>).normalized_value`
+- `identity(<identity_rule_id>).resolution(<role>).raw_observed_value`
 - `count(association(<association_type>))`
 
 Unsupported expressions fail closed with `MAP_INVALID`.

@@ -142,11 +142,12 @@ pub use evidence_opt::{
 };
 pub use execution::{
     execute_manifest_planned_query, execute_manifest_planned_query_retained, execute_planned_query,
-    execute_planned_query_retained, execute_planned_query_stream,
-    parse_resolve_plan_and_execute_query, BuildExecutionError, CoveQlExecutionResult,
-    CoveQlResultStream, CoveQlRetainedInput, CoveQlRetainedManifestMember, EvidenceAuthority,
-    ExecutedQuery, ExecutionAuthorityReport, ExecutionAuthoritySource, ExecutionDiagnostic,
-    ExecutionOptions, ExecutionRowCounts, VisibilityOverlay,
+    execute_planned_query_on_object_surface, execute_planned_query_retained,
+    execute_planned_query_stream, parse_resolve_plan_and_execute_query,
+    parse_resolve_plan_and_execute_query_on_object_surface, BuildExecutionError,
+    CoveQlExecutionResult, CoveQlResultStream, CoveQlRetainedInput, CoveQlRetainedManifestMember,
+    EvidenceAuthority, ExecutedQuery, ExecutionAuthorityReport, ExecutionAuthoritySource,
+    ExecutionDiagnostic, ExecutionOptions, ExecutionRowCounts, VisibilityOverlay,
 };
 pub use explain::render_explain_text;
 pub use kernel_execution::{

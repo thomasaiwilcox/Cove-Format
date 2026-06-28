@@ -465,6 +465,23 @@ pub(crate) fn project_cove_o_bytes_record_batches_with_catalog(
     )
 }
 
+pub(crate) fn project_cove_o_surface_record_batches_with_catalog(
+    surface: &CoveObjectSurface,
+    projection_catalog: &MapProjectionCatalog,
+    projection_id: &str,
+    options: &ProjectionBatchOptions,
+) -> Result<Vec<RecordBatch>, String> {
+    let catalog =
+        enrich_projection_catalog_lineage(projection_catalog.clone(), &surface.object_types);
+    project_arrow_record_batches_from_surface(
+        surface,
+        &catalog,
+        &surface.embedded_function_ids,
+        projection_id,
+        options,
+    )
+}
+
 pub(crate) fn projection_sidecar_columns_from_cove_o_bytes(
     bytes: &[u8],
     object_label: &str,

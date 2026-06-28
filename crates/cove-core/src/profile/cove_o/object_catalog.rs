@@ -380,4 +380,50 @@ mod tests {
             Err(CoveError::BadSchema(_))
         ));
     }
+
+    #[test]
+    fn additive_catalog_patch_rejects_object_type_rename() {
+        let mut catalog = ObjectTypeCatalog {
+            flags: 0,
+            types: vec![object_type(vec![property(
+                1,
+                "active",
+                CoveLogicalType::Bool,
+            )])],
+        };
+        let patch = ObjectTypeCatalog {
+            flags: 0,
+            types: vec![ObjectTypeEntryV1 {
+                object_type_id: 7,
+                type_name: "RenamedThing".into(),
+                flags: OBJECT_TYPE_FLAG_ENTITY_OBJECT,
+                properties: vec![property(2, "name", CoveLogicalType::Utf8)],
+            }],
+        };
+
+        assert!(matches!(
+            catalog.apply_additive_patch(&patch),
+            Err(CoveError::BadSchema(_))
+        ));
+    }
+
+    #[test]
+    fn additive_catalog_patch_absence_does_not_remove_parent_properties() {
+        let mut catalog = ObjectTypeCatalog {
+            flags: 0,
+            types: vec![object_type(vec![
+                property(1, "active", CoveLogicalType::Bool),
+                property(2, "name", CoveLogicalType::Utf8),
+            ])],
+        };
+        let patch = ObjectTypeCatalog {
+            flags: 0,
+            types: vec![object_type(Vec::new())],
+        };
+
+        catalog.apply_additive_patch(&patch).unwrap();
+        assert_eq!(catalog.types[0].properties.len(), 2);
+        assert_eq!(catalog.types[0].properties[0].property_name, "active");
+        assert_eq!(catalog.types[0].properties[1].property_name, "name");
+    }
 }

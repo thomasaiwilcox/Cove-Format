@@ -230,6 +230,7 @@ preview <mapping.covemap>\n  \
 	  replay verify <mapping.covemap> <conversion-report.json>\n  \
 	  convert [--format json|cove-o] [-o output] <mapping.covemap> <source.csv|source.jsonl|source.parquet|source.orc|source.arrow>...\n  \
 build --out-dir <dir> [--verify] [--publish-covm] [--force] [--json] [--object-name name.cove] [--projection-output cove-t|none] [--evidence-encoding compact|expanded|both] [--section-compression zstd|none] <mapping.covemap> <source.csv|source.jsonl|source.parquet|source.orc|source.arrow>...\n  \
+delta build <manifest.covm> --dataset <dir> --out-dir <dir> | --base <manifest.covm> --dataset <dir> --mapping <mapping.covemap> --out <delta.covedelta> <source...>\n  \
 publish --bundle-dir <dir> --out <dataset.covm> [--force] [--json]\n  \
 doctor [--json] [--strict] --bundle-dir <dir>\n  \
 doctor [--json] [--strict] <mapping.covemap> <source.csv|source.jsonl|source.parquet|source.orc|source.arrow>...\n  \

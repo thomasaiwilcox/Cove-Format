@@ -1,6 +1,7 @@
 # COVE-MAP Resolver Catalog and Entity Resolution
 
-Status: draft proposal
+Status: implemented design proposal for the reference prototype; retained for
+design context and future standardization work.
 
 Owning profiles: COVE-MAP / COVE-O / CoveQL
 
@@ -1165,10 +1166,13 @@ COVE-O object records and evidence rows. In that form, ordinary object
 reconstruction does not require a delta-aware reader or resolver execution.
 
 Delta artifacts become relevant when a publisher wants to append new
-resolver-derived facts without rewriting the full base `.cove`. A future delta
-may carry new source-row evidence, resolver-run metadata, identity-equivalence
-assertions, reviewed decision outputs, projection invalidations, or object
-temporal records produced by resolver-backed identity rules.
+resolver-derived facts without rewriting the full base `.cove`. The reference
+prototype can generate additive semantic `.covedelta` artifacts from
+COVE-MAP source rows under inherited mapping and resolver semantics. Such a
+delta may carry new source-row evidence, resolver-run metadata,
+identity-equivalence assertions, reviewed decision outputs, projection
+invalidations, or object temporal records produced by resolver-backed identity
+rules.
 
 The authority boundary remains the same:
 
@@ -1185,7 +1189,8 @@ The authority boundary remains the same:
   semantics may inherit the parent semantic-map fingerprint while adding new
   materialized object/evidence records.
 
-Implementation order with delta artifacts:
+Implementation order with delta artifacts, now reflected in the reference
+prototype:
 
 1. Implement this proposal's Phase 0 schema and registry work first, including
    section 69 or its extension fallback, canonical digest inputs, evidence
@@ -1195,9 +1200,10 @@ Implementation order with delta artifacts:
 3. Implement the core COVE-O delta MVP independently, binding effective
    semantic-map fingerprints but not requiring resolver-specific patch
    sections.
-4. Add resolver-aware delta evidence/projection patches only after
-   `resolver_digest`, `catalog_digest`, `pipeline_digest`, and resolution
-   evidence semantics are stable enough for conformance fixtures.
+4. Keep more advanced resolver-aware delta evidence/projection patch sections
+   behind explicit feature gates until `resolver_digest`, `catalog_digest`,
+   `pipeline_digest`, and resolution evidence semantics are stable enough for
+   broader conformance fixtures.
 
 ## Error Handling
 
@@ -1484,13 +1490,24 @@ existing MAP sections.
 
 ## Open Questions
 
-- Should section 69 be allocated as `MAP_RESOLUTION_CATALOG`, or should the
-  first implementation use a registered extension with fallback?
-- Should external resolver catalogs be allowed in published archives, or only in
-  build-time `.covemap` inputs with materialized evidence snapshots?
-- What is the minimum candidate scoring set that is useful without pulling in
-  large dependencies?
-- Should CoveQL add a first-class `identity(...)` root, or keep resolution
-  queries under `object(...)`, projections, and `evidence(...)`?
-- How should private alias catalogs expose proof to unauthorized readers without
-  leaking raw alias values?
+Resolved in the reference prototype:
+
+- Section ID `69` is allocated as `MAP_RESOLUTION_CATALOG`.
+- Published resolver catalogs are embedded and digest-pinned in `.covemap`
+  inputs; live mutable resolver lookups are not part of deterministic replay.
+- Candidate scoring uses deterministic token/Jaccard matching with stable
+  blocking, tie ordering, and fail-closed limits.
+- CoveQL keeps resolution access under existing object, projection, and
+  evidence surfaces; no first-class `identity(...)` CoveQL root is required for
+  the current implementation.
+- Private alias evidence uses redaction policy metadata and digest-backed proof
+  without exposing protected raw aliases.
+
+Remaining standardization questions:
+
+- Whether external resolver catalogs should be standardized as published
+  archive dependencies in addition to the embedded digest-pinned workflow.
+- Which candidate scoring functions should become portable conformance
+  commitments beyond the deterministic reference implementation subset.
+- How broadly redacted resolver proof should be standardized across visibility
+  and access-policy profiles.

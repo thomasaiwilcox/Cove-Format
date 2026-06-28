@@ -7,6 +7,7 @@ use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use cove_core::artifact::covemap::CovemapFile;
 use cove_core::profile::cove_map::MapProjectionCatalog;
+use cove_core::profile::cove_o::CoveObjectSurface;
 use serde_json::{json, Value};
 
 use crate::{
@@ -202,6 +203,20 @@ pub fn projected_record_batches_from_cove_o_bytes_with_catalog(
         projection_id,
         options,
         "<bytes>",
+    )
+}
+
+pub fn projected_record_batches_from_cove_o_surface_with_catalog(
+    surface: &CoveObjectSurface,
+    catalog: &MapProjectionCatalog,
+    projection_id: &str,
+    options: &ProjectionBatchOptions,
+) -> Result<Vec<RecordBatch>, String> {
+    crate::project::project_cove_o_surface_record_batches_with_catalog(
+        surface,
+        catalog,
+        projection_id,
+        options,
     )
 }
 

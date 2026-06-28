@@ -9,11 +9,13 @@ use std::{
     fs,
     io::{self, Read},
     path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use cove_core::{
-    artifact::covm::CovmFile,
+    artifact::covm::{CovmDeltaPruneRequest, CovmFile},
     constants::SectionKind,
+    profile::cove_o::CoveObjectSurface,
     reader::{validate_bytes_with_options, ValidationOptions},
     table::TableCatalog,
     writer::ScanProfileCoveWriter,
@@ -21,9 +23,10 @@ use cove_core::{
 use coveql::{
     acceleration_report_json, apply_acceleration_bundle, discover_acceleration_bundle,
     discover_query_surfaces, execute_query_from_artifact, generate_acceleration_sidecars,
-    plan_acceleration, suggest_queries, AccelerationBundleOptions, ArtifactExecutionEngine,
-    CoveAccelerationBundle, CoveOptimizationOptions, ExecuteArtifactOptions,
-    ExecuteArtifactQueryError, ExplainDisclosurePolicy, GraphTraversalContract,
+    parse_resolve_plan_and_execute_query_on_object_surface, plan_acceleration, suggest_queries,
+    AccelerationBundleOptions, ArtifactExecutionEngine, CoveAccelerationBundle,
+    CoveOptimizationOptions, CoveQlExecutionResult, CoveQlOutputMode, ExecuteArtifactOptions,
+    ExecuteArtifactQueryError, ExecutedQuery, ExplainDisclosurePolicy, GraphTraversalContract,
     GraphTraversalDistinctPolicy, GraphTraversalMode, KernelExecutionMode, KernelExecutionOptions,
     PhysicalPlanOptions, PhysicalSidecarInputs, QueryArtifactMember, QuerySurfaceDiscovery,
     QuerySurfaceDiscoveryOptions, COVEQL_PROFILE_CONTRACT_VERSION,
@@ -130,6 +133,36 @@ enum ExportFormat {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArrowQueryExportOutputFormat {
+    Ipc,
+    Json,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ArrowQueryExportReportTarget {
+    Stdout,
+    Path(PathBuf),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ArrowQueryExportCommand {
+    input: PathBuf,
+    output: PathBuf,
+    query: Option<String>,
+    query_file: Option<PathBuf>,
+    format: ArrowQueryExportOutputFormat,
+    report: Option<ArrowQueryExportReportTarget>,
+    dataset: Option<PathBuf>,
+    delta_request: CovmDeltaPruneRequest,
+    delta_plan: bool,
+    delta_plan_json: bool,
+    perf_report: bool,
+    take: Option<usize>,
+    graph_budget: GraphBudgetOverrides,
+    enable_graph_traversal: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PerfCommand {
     ExplainPruning,
     PlanCost,
@@ -158,6 +191,9 @@ struct QueryCommand {
     strict_performance: bool,
     perf_report: bool,
     json_diagnostics: bool,
+    delta_request: CovmDeltaPruneRequest,
+    delta_plan: bool,
+    delta_plan_json: bool,
     max_cell_width: usize,
 }
 
@@ -217,6 +253,9 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<(), String> {
                 strict_performance: command.strict_performance,
                 perf_report: command.perf_report,
                 json_diagnostics: command.json_diagnostics,
+                delta_request: command.delta_request,
+                delta_plan: command.delta_plan,
+                delta_plan_json: command.delta_plan_json,
                 max_cell_width: command.max_cell_width,
             },
         ),
@@ -224,7 +263,7 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<(), String> {
         Command::Validate { args } => run_validate(args),
         Command::InspectDetailed { args } => run_inspect_detailed(args),
         Command::Dump { args } => cove_dump::run_cli(args),
-        Command::Map { args } => cove_map::run_cli(args),
+        Command::Map { args } => run_map(args),
         Command::Export { format, args } => run_export(format, args),
         Command::Perf { command, args } => run_perf(command, args),
         Command::Sidecar { args } => run_sidecar(args),
@@ -255,6 +294,9 @@ struct QueryCommandOptions {
     strict_performance: bool,
     perf_report: bool,
     json_diagnostics: bool,
+    delta_request: CovmDeltaPruneRequest,
+    delta_plan: bool,
+    delta_plan_json: bool,
     max_cell_width: usize,
 }
 
@@ -678,6 +720,9 @@ fn parse_query(args: Vec<String>) -> Result<Command, String> {
     let mut strict_performance = false;
     let mut perf_report = false;
     let mut json_diagnostics = false;
+    let mut delta_request = CovmDeltaPruneRequest::default();
+    let mut delta_plan = false;
+    let mut delta_plan_json = false;
     let mut query_file = None;
     let mut max_cell_width = 32usize;
     let mut positionals = Vec::new();
@@ -866,6 +911,25 @@ fn parse_query(args: Vec<String>) -> Result<Command, String> {
                         "--dataset requires a directory path".to_string()
                     })?));
             }
+            "--as-of-csn" => {
+                delta_request.as_of_csn = Some(parse_u64(iter.next().as_deref(), "--as-of-csn")?);
+            }
+            "--as-of-commit-us" => {
+                delta_request.as_of_commit_timestamp_us =
+                    Some(parse_i64(iter.next().as_deref(), "--as-of-commit-us")?);
+            }
+            "--source-publish-range" => {
+                let raw = iter
+                    .next()
+                    .ok_or_else(|| "--source-publish-range requires start:end".to_string())?;
+                delta_request.source_publish_range_us =
+                    Some(parse_i64_range(&raw, "--source-publish-range")?);
+            }
+            "--delta-plan" => delta_plan = true,
+            "--delta-plan-json" => {
+                delta_plan = true;
+                delta_plan_json = true;
+            }
             "--query-file" => {
                 query_file = Some(PathBuf::from(iter.next().ok_or_else(|| {
                     "--query-file requires a path or '-' for stdin".to_string()
@@ -917,6 +981,9 @@ fn parse_query(args: Vec<String>) -> Result<Command, String> {
         strict_performance,
         perf_report,
         json_diagnostics,
+        delta_request,
+        delta_plan,
+        delta_plan_json,
         max_cell_width,
     })))
 }
@@ -954,6 +1021,34 @@ fn parse_positive_u32(value: Option<&str>, flag: &str) -> Result<u32, String> {
         return Err(format!("{flag} requires a positive integer"));
     }
     Ok(parsed)
+}
+
+fn parse_u64(value: Option<&str>, flag: &str) -> Result<u64, String> {
+    value
+        .ok_or_else(|| format!("{flag} requires an unsigned integer"))?
+        .parse::<u64>()
+        .map_err(|_| format!("{flag} requires an unsigned integer"))
+}
+
+fn parse_i64(value: Option<&str>, flag: &str) -> Result<i64, String> {
+    value
+        .ok_or_else(|| format!("{flag} requires an integer"))?
+        .parse::<i64>()
+        .map_err(|_| format!("{flag} requires an integer"))
+}
+
+fn parse_i64_range(raw: &str, flag: &str) -> Result<(i64, i64), String> {
+    let (start, end) = raw
+        .split_once(':')
+        .ok_or_else(|| format!("{flag} requires start:end"))?;
+    Ok((parse_i64(Some(start), flag)?, parse_i64(Some(end), flag)?))
+}
+
+fn current_time_us() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_micros().min(i64::MAX as u128) as i64)
+        .unwrap_or(0)
 }
 
 fn parse_output_format(value: &str) -> Result<OutputFormat, String> {
@@ -1012,8 +1107,594 @@ fn run_inspect_detailed(args: Vec<String>) -> Result<(), String> {
 
 fn run_export(format: ExportFormat, args: Vec<String>) -> Result<(), String> {
     match format {
+        ExportFormat::Arrow if arrow_export_uses_coveql_query(&args) => {
+            run_arrow_query_export(args)
+        }
         ExportFormat::Arrow => cove_datafusion::arrow_export_cli::run(args),
     }
+}
+
+fn arrow_export_uses_coveql_query(args: &[String]) -> bool {
+    args.iter()
+        .any(|arg| matches!(arg.as_str(), "--query" | "--query-file"))
+}
+
+fn run_arrow_query_export(args: Vec<String>) -> Result<(), String> {
+    let command = parse_arrow_query_export_args(args)?;
+    let input_bytes = fs::read(&command.input)
+        .map_err(|error| format!("cannot read {}: {error}", command.input.display()))?;
+    let query = match (&command.query, &command.query_file) {
+        (Some(query), None) => query.clone(),
+        (None, Some(path)) => read_query_file(path)?,
+        _ => return Err("cove export arrow --query accepts exactly one query source".into()),
+    };
+    let query = prepare_query_text(&query, command.take, None)?;
+    let mut execute_options = ExecuteArtifactOptions::default();
+    execute_options.resolve_options.output_mode = Some(CoveQlOutputMode::ArrowRecordBatch {
+        zero_copy_requested: false,
+    });
+    apply_graph_budget(&mut execute_options, command.graph_budget);
+    if command.enable_graph_traversal {
+        execute_options.resolve_options.graph_traversal_contract =
+            Some(cli_graph_traversal_contract(&execute_options));
+    }
+
+    let delta_manifest =
+        cove_datafusion::delta_snapshot::delta_chain_required(&input_bytes).unwrap_or(false);
+    let mut delta_report = None;
+    let mut delta_execution = None;
+    let executed = if delta_manifest {
+        let dataset = command
+            .dataset
+            .as_deref()
+            .ok_or_else(|| "delta manifest CoveQL export requires --dataset <dir>".to_string())?;
+        let snapshot = cove_datafusion::delta_snapshot::load_validated_delta_snapshot(
+            &command.input,
+            dataset,
+            command.delta_request,
+        )?;
+        let plan_json = cove_datafusion::delta_snapshot::delta_snapshot_plan_json(
+            Some(&command.input),
+            &snapshot.plan,
+            &snapshot.extension,
+        );
+        if command.delta_plan_json {
+            eprintln!("{}", serde_json::to_string_pretty(&plan_json).unwrap());
+        } else if command.delta_plan {
+            print_query_delta_plan_text(&command.input, &snapshot.plan);
+        }
+        if command.perf_report {
+            eprintln!(
+                "delta_chain_depth={} selected_delta_count={} skipped_delta_count={}",
+                snapshot.plan.metrics.delta_chain_depth,
+                snapshot.plan.metrics.selected_delta_count,
+                snapshot.plan.metrics.skipped_delta_count
+            );
+        }
+        delta_report = Some(plan_json);
+        match cove_datafusion::delta_snapshot::direct_object_surface_support(&snapshot) {
+            cove_datafusion::delta_snapshot::DirectDeltaObjectSurfaceSupport::Supported => {
+                let surface =
+                    cove_datafusion::delta_snapshot::read_validated_delta_object_surface(
+                        &snapshot,
+                    )?;
+                delta_execution = Some("direct_object_surface");
+                if command.perf_report {
+                    eprintln!("delta_execution=direct_object_surface");
+                }
+                execute_delta_object_surface_query(
+                    &snapshot.base.bytes,
+                    &surface,
+                    &query,
+                    &execute_options,
+                )
+                .map_err(|error| format_execution_error(error, false))?
+            }
+            cove_datafusion::delta_snapshot::DirectDeltaObjectSurfaceSupport::RequiresMaterializedPlannerMetadata {
+                reason,
+            } => {
+                return Err(format!(
+                    "non-materializing CoveQL export requires a direct COVE-O object surface, but this delta snapshot requires materialized planner metadata: {reason}"
+                ));
+            }
+        }
+    } else {
+        if command.delta_request != CovmDeltaPruneRequest::default()
+            || command.delta_plan
+            || command.delta_plan_json
+        {
+            return Err("delta snapshot options require a COVM delta manifest input".into());
+        }
+        execute_query_from_artifact(&input_bytes, &query, execute_options)
+            .map_err(|error| format_artifact_query_error(error, false))?
+    };
+
+    let rows = executed.row_counts.output_rows;
+    let output_fingerprint = executed.output_fingerprint.clone();
+    let batches = match executed.result {
+        CoveQlExecutionResult::ArrowRecordBatches(batches) => batches,
+        _ => return Err("CoveQL export did not produce Arrow record batches".into()),
+    };
+    let schema = batches
+        .first()
+        .map(|batch| batch.schema())
+        .ok_or_else(|| "CoveQL export produced no Arrow batches".to_string())?;
+    let output_bytes = match command.format {
+        ArrowQueryExportOutputFormat::Ipc => {
+            cove_datafusion::arrow_export_cli::write_ipc(&schema, &batches)?
+        }
+        ArrowQueryExportOutputFormat::Json => {
+            cove_datafusion::arrow_export_cli::write_json(&batches)?
+        }
+    };
+    cove_core::durable::durable_replace(&command.output, &output_bytes).map_err(|error| {
+        format!(
+            "cannot durably publish {}: {error}",
+            command.output.display()
+        )
+    })?;
+
+    if let Some(report) = command.report {
+        let report_json = serde_json::json!({
+            "version": 1,
+            "source": command.input.display().to_string(),
+            "output": command.output.display().to_string(),
+            "format": match command.format {
+                ArrowQueryExportOutputFormat::Ipc => "ipc",
+                ArrowQueryExportOutputFormat::Json => "json",
+            },
+            "execution": "coveql_arrow_record_batches",
+            "delta_execution": delta_execution,
+            "batches": batches.len(),
+            "rows": rows,
+            "columns": schema.fields().len(),
+            "output_fingerprint": output_fingerprint,
+            "delta_snapshot": delta_report,
+        });
+        let text = serde_json::to_string_pretty(&report_json)
+            .map_err(|error| format!("cannot serialize export report: {error}"))?;
+        match report {
+            ArrowQueryExportReportTarget::Stdout => println!("{text}"),
+            ArrowQueryExportReportTarget::Path(path) => fs::write(&path, text)
+                .map_err(|error| format!("cannot write {}: {error}", path.display()))?,
+        }
+    }
+    Ok(())
+}
+
+fn parse_arrow_query_export_args(args: Vec<String>) -> Result<ArrowQueryExportCommand, String> {
+    let mut query = None;
+    let mut query_file = None;
+    let mut format = ArrowQueryExportOutputFormat::Ipc;
+    let mut report = None;
+    let mut dataset = None;
+    let mut delta_request = CovmDeltaPruneRequest::default();
+    let mut delta_plan = false;
+    let mut delta_plan_json = false;
+    let mut perf_report = false;
+    let mut take = None;
+    let mut graph_budget = GraphBudgetOverrides::default();
+    let mut enable_graph_traversal = false;
+    let mut positional = Vec::new();
+    let mut iter = args.into_iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--query" => {
+                if query.is_some() || query_file.is_some() {
+                    return Err("cove export arrow accepts only one --query or --query-file".into());
+                }
+                query = Some(
+                    iter.next()
+                        .ok_or_else(|| "--query requires CoveQL text".to_string())?,
+                );
+            }
+            "--query-file" => {
+                if query.is_some() || query_file.is_some() {
+                    return Err("cove export arrow accepts only one --query or --query-file".into());
+                }
+                query_file =
+                    Some(PathBuf::from(iter.next().ok_or_else(|| {
+                        "--query-file requires a path or '-'".to_string()
+                    })?));
+            }
+            "--format" => {
+                format = parse_arrow_query_export_format(
+                    &iter
+                        .next()
+                        .ok_or_else(|| "--format requires ipc or json".to_string())?,
+                )?;
+            }
+            "--report" => {
+                let raw = iter
+                    .next()
+                    .ok_or_else(|| "--report requires '-' or a file path".to_string())?;
+                report = Some(if raw == "-" {
+                    ArrowQueryExportReportTarget::Stdout
+                } else {
+                    ArrowQueryExportReportTarget::Path(PathBuf::from(raw))
+                });
+            }
+            "--dataset" => {
+                dataset =
+                    Some(PathBuf::from(iter.next().ok_or_else(|| {
+                        "--dataset requires a directory path".to_string()
+                    })?));
+            }
+            "--as-of-csn" => {
+                delta_request.as_of_csn = Some(parse_u64(iter.next().as_deref(), "--as-of-csn")?);
+            }
+            "--as-of-commit-us" => {
+                delta_request.as_of_commit_timestamp_us =
+                    Some(parse_i64(iter.next().as_deref(), "--as-of-commit-us")?);
+            }
+            "--source-publish-range" => {
+                let raw = iter
+                    .next()
+                    .ok_or_else(|| "--source-publish-range requires start:end".to_string())?;
+                delta_request.source_publish_range_us =
+                    Some(parse_i64_range(&raw, "--source-publish-range")?);
+            }
+            "--delta-plan" => delta_plan = true,
+            "--delta-plan-json" => {
+                delta_plan = true;
+                delta_plan_json = true;
+            }
+            "--perf-report" => perf_report = true,
+            "--take" => {
+                take = Some(parse_positive_usize(iter.next().as_deref(), "--take")?);
+            }
+            "--enable-graph-traversal" => enable_graph_traversal = true,
+            "--max-graph-depth" => {
+                graph_budget.max_depth = Some(parse_positive_u32(
+                    iter.next().as_deref(),
+                    "--max-graph-depth",
+                )?);
+                enable_graph_traversal = true;
+            }
+            "--max-graph-paths" => {
+                graph_budget.max_paths = Some(parse_positive_usize(
+                    iter.next().as_deref(),
+                    "--max-graph-paths",
+                )?);
+                enable_graph_traversal = true;
+            }
+            "--max-graph-fanout" => {
+                graph_budget.max_fanout = Some(parse_positive_usize(
+                    iter.next().as_deref(),
+                    "--max-graph-fanout",
+                )?);
+                enable_graph_traversal = true;
+            }
+            "-h" | "--help" => {
+                return Err("usage: cove export arrow --query '<coveql>' [--format ipc|json] [--report -|path] [--dataset dir] [--as-of-csn n|--as-of-commit-us n] [--delta-plan|--delta-plan-json] <input.cove|manifest.covm> <output.arrow|output.json>".into());
+            }
+            other if other.starts_with('-') => {
+                return Err(format!("unknown CoveQL export option '{other}'"));
+            }
+            positional_arg => positional.push(PathBuf::from(positional_arg)),
+        }
+    }
+    if query.is_none() && query_file.is_none() {
+        return Err("cove export arrow --query requires --query or --query-file".into());
+    }
+    if positional.len() != 2 {
+        return Err("expected <input.cove|manifest.covm> and <output.arrow|output.json>".into());
+    }
+    Ok(ArrowQueryExportCommand {
+        input: positional.remove(0),
+        output: positional.remove(0),
+        query,
+        query_file,
+        format,
+        report,
+        dataset,
+        delta_request,
+        delta_plan,
+        delta_plan_json,
+        perf_report,
+        take,
+        graph_budget,
+        enable_graph_traversal,
+    })
+}
+
+fn parse_arrow_query_export_format(raw: &str) -> Result<ArrowQueryExportOutputFormat, String> {
+    match raw {
+        "ipc" => Ok(ArrowQueryExportOutputFormat::Ipc),
+        "json" => Ok(ArrowQueryExportOutputFormat::Json),
+        _ => Err("--format must be ipc or json".into()),
+    }
+}
+
+fn run_map(args: Vec<String>) -> Result<(), String> {
+    if args.first().is_some_and(|arg| arg == "delta") {
+        return run_map_delta(args.into_iter().skip(1).collect());
+    }
+    cove_map::run_cli(args)
+}
+
+const MAP_DELTA_BUILD_USAGE: &str = "usage: cove map delta build <manifest.covm> --dataset <dir> --out-dir <dir> [--as-of-csn n|--as-of-commit-us n] [--force] [--json] [--publish-covm] [--verify] [--projection-output cove-t|none] [--object-name <file.cove>]\n       cove map delta build --base <manifest.covm> --dataset <dir> --mapping <mapping.covemap> --out <delta.covedelta> [--source-publish-range start:end] [--force] [--json] <source...>";
+
+fn run_map_delta(mut args: Vec<String>) -> Result<(), String> {
+    if args.is_empty() || args[0] == "-h" || args[0] == "--help" {
+        return Err(MAP_DELTA_BUILD_USAGE.into());
+    }
+    let command = args.remove(0);
+    if command != "build" {
+        return Err(format!(
+            "unknown map delta command '{command}'; expected build"
+        ));
+    }
+    run_map_delta_build(args)
+}
+
+fn run_map_delta_build(args: Vec<String>) -> Result<(), String> {
+    let mut manifest = None;
+    let mut base_manifest = None;
+    let mut mapping = None;
+    let mut dataset = None;
+    let mut out_dir = None;
+    let mut out = None;
+    let mut force = false;
+    let mut json = false;
+    let mut publish_covm = false;
+    let mut verify = false;
+    let mut object_name = None;
+    let mut projection_output = cove_map::MapBuildProjectionOutput::CoveT;
+    let mut request = CovmDeltaPruneRequest::default();
+    let mut positional = Vec::new();
+    let mut iter = args.into_iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--manifest" | "--snapshot" => {
+                manifest = Some(PathBuf::from(
+                    iter.next()
+                        .ok_or_else(|| format!("{arg} requires a manifest path"))?,
+                ));
+            }
+            "--base" => {
+                base_manifest =
+                    Some(PathBuf::from(iter.next().ok_or_else(|| {
+                        "--base requires a manifest path".to_string()
+                    })?));
+            }
+            "--mapping" | "--map" => {
+                mapping = Some(PathBuf::from(
+                    iter.next()
+                        .ok_or_else(|| format!("{arg} requires a COVE-MAP path"))?,
+                ));
+            }
+            "--dataset" => {
+                dataset =
+                    Some(PathBuf::from(iter.next().ok_or_else(|| {
+                        "--dataset requires a directory path".to_string()
+                    })?));
+            }
+            "--out-dir" => {
+                out_dir =
+                    Some(PathBuf::from(iter.next().ok_or_else(|| {
+                        "--out-dir requires a directory path".to_string()
+                    })?));
+            }
+            "--out" => {
+                out = Some(PathBuf::from(
+                    iter.next()
+                        .ok_or_else(|| "--out requires a delta path".to_string())?,
+                ));
+            }
+            "--as-of-csn" => {
+                request.as_of_csn = Some(parse_u64(iter.next().as_deref(), "--as-of-csn")?);
+            }
+            "--as-of-commit-us" => {
+                request.as_of_commit_timestamp_us =
+                    Some(parse_i64(iter.next().as_deref(), "--as-of-commit-us")?);
+            }
+            "--source-publish-range" => {
+                let raw = iter
+                    .next()
+                    .ok_or_else(|| "--source-publish-range requires start:end".to_string())?;
+                request.source_publish_range_us =
+                    Some(parse_i64_range(&raw, "--source-publish-range")?);
+            }
+            "--force" => force = true,
+            "--json" => json = true,
+            "--publish-covm" => publish_covm = true,
+            "--verify" => verify = true,
+            "--object-name" => {
+                object_name = Some(
+                    iter.next()
+                        .ok_or_else(|| "--object-name requires a file name".to_string())?,
+                );
+            }
+            "--projection-output" => {
+                let raw = iter
+                    .next()
+                    .ok_or_else(|| "--projection-output requires cove-t or none".to_string())?;
+                projection_output = match raw.as_str() {
+                    "cove-t" => cove_map::MapBuildProjectionOutput::CoveT,
+                    "none" => cove_map::MapBuildProjectionOutput::None,
+                    _ => return Err("--projection-output must be cove-t or none".into()),
+                };
+            }
+            "-h" | "--help" => {
+                return Err(MAP_DELTA_BUILD_USAGE.into());
+            }
+            _ if arg.starts_with("--") => {
+                return Err(format!("unknown map delta build option '{arg}'"))
+            }
+            _ => positional.push(PathBuf::from(arg)),
+        }
+    }
+    let semantic_mode = base_manifest.is_some() || mapping.is_some() || out.is_some();
+    if semantic_mode {
+        if manifest.is_some() {
+            return Err("map semantic delta build uses --base, not --manifest/--snapshot".into());
+        }
+        if out_dir.is_some() {
+            return Err(
+                "map semantic delta build writes --out <delta.covedelta>, not --out-dir".into(),
+            );
+        }
+        if publish_covm || verify || object_name.is_some() {
+            return Err(
+                "map semantic delta build does not support --publish-covm, --verify, or --object-name"
+                    .into(),
+            );
+        }
+        if request.as_of_csn.is_some() || request.as_of_commit_timestamp_us.is_some() {
+            return Err(
+                "map semantic delta build currently uses the latest validated parent snapshot"
+                    .into(),
+            );
+        }
+        let base_manifest = base_manifest.ok_or_else(|| {
+            "map semantic delta build requires --base <manifest.covm>".to_string()
+        })?;
+        let dataset = dataset
+            .ok_or_else(|| "map semantic delta build requires --dataset <dir>".to_string())?;
+        let mapping = mapping
+            .ok_or_else(|| "map semantic delta build requires --mapping <file>".to_string())?;
+        let out = out.ok_or_else(|| {
+            "map semantic delta build requires --out <delta.covedelta>".to_string()
+        })?;
+        if positional.is_empty() {
+            return Err("map semantic delta build requires at least one source path".into());
+        }
+        return run_map_semantic_delta_build(
+            base_manifest,
+            dataset,
+            mapping,
+            positional,
+            out,
+            force,
+            json,
+            request.source_publish_range_us,
+        );
+    }
+    if manifest.is_none() && positional.len() == 1 {
+        manifest = Some(positional.remove(0));
+    }
+    if !positional.is_empty() {
+        return Err("map delta build accepts only one manifest positional argument".into());
+    }
+    let manifest =
+        manifest.ok_or_else(|| "map delta build requires <manifest.covm>".to_string())?;
+    let dataset = dataset.ok_or_else(|| "map delta build requires --dataset <dir>".to_string())?;
+    let out_dir = out_dir.ok_or_else(|| "map delta build requires --out-dir <dir>".to_string())?;
+    let (_snapshot, materialized) =
+        cove_datafusion::delta_snapshot::materialize_delta_snapshot(&manifest, &dataset, request)?;
+    let result = cove_map::build_from_cove_o_bytes(
+        &format!("{}#delta-snapshot", manifest.display()),
+        materialized.bytes,
+        cove_map::MapBuildOptions {
+            out_dir: out_dir.clone(),
+            force,
+            object_name,
+            projection_output,
+            evidence_encoding: cove_map::MapEvidenceEncoding::Compact,
+            section_compression: cove_map::MapBuildSectionCompression::Zstd,
+            verify,
+            publish_covm,
+            reuse_cache: true,
+        },
+    )?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&result.manifest).unwrap()
+        );
+    } else {
+        println!("COVE-MAP delta build: {}", out_dir.display());
+        if let Some(object) = result
+            .manifest
+            .pointer("/artifacts/object/path")
+            .and_then(serde_json::Value::as_str)
+        {
+            println!("Object: {object}");
+        }
+        if let Some(covm) = result
+            .manifest
+            .pointer("/artifacts/covm/path")
+            .and_then(serde_json::Value::as_str)
+        {
+            println!("Manifest: {covm}");
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_map_semantic_delta_build(
+    base_manifest: PathBuf,
+    dataset: PathBuf,
+    mapping: PathBuf,
+    sources: Vec<PathBuf>,
+    out: PathBuf,
+    force: bool,
+    json: bool,
+    source_publish_range_us: Option<(i64, i64)>,
+) -> Result<(), String> {
+    let snapshot = cove_datafusion::delta_snapshot::load_validated_delta_snapshot(
+        &base_manifest,
+        &dataset,
+        CovmDeltaPruneRequest::default(),
+    )?;
+    let parent_surface =
+        cove_datafusion::delta_snapshot::read_validated_delta_object_surface(&snapshot)?;
+    let parent_object_states =
+        cove_core::profile::cove_o::reconstruct_object_states(&parent_surface, &Default::default())
+            .map_err(|error| {
+                format!("cannot reconstruct map semantic delta parent states: {error}")
+            })?;
+    let parent_ref = snapshot
+        .extension
+        .ordered_delta_artifact_refs
+        .last()
+        .unwrap_or(&snapshot.extension.base_artifact_ref)
+        .clone();
+    let chain_ordinal = u32::try_from(snapshot.extension.ordered_delta_artifact_refs.len() + 1)
+        .map_err(|_| "map semantic delta chain ordinal overflows".to_string())?;
+    let commit_time_start_us =
+        current_time_us().max(snapshot.extension.created_at_us.saturating_add(1));
+    let result = cove_map::build_semantic_delta_from_paths(
+        &mapping,
+        &sources,
+        cove_map::MapSemanticDeltaBuildOptions {
+            out: out.clone(),
+            force,
+            parent: cove_map::MapSemanticDeltaParent {
+                dataset_id: snapshot.extension.dataset_id,
+                parent_snapshot_id: snapshot.extension.result_snapshot_id,
+                chain_ordinal,
+                chain_depth: chain_ordinal,
+                parent_ref,
+            },
+            parent_object_types: parent_surface.object_types,
+            parent_object_states,
+            parent_evidence_entries: parent_surface
+                .evidence_index
+                .map(|index| index.entries)
+                .unwrap_or_default(),
+            parent_projection_catalog: parent_surface.projection_catalog,
+            csn_start: snapshot.extension.csn_max.saturating_add(1),
+            commit_time_start_us,
+            source_publish_range_us,
+        },
+    )?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&result.report).unwrap());
+    } else {
+        println!("COVE-MAP semantic delta: {}", out.display());
+        if let Some(snapshot_id) = result
+            .report
+            .pointer("/delta/snapshot_id")
+            .and_then(serde_json::Value::as_str)
+        {
+            println!("  snapshot_id: {snapshot_id}");
+        }
+        println!("  bytes_written: {}", result.bytes_written);
+    }
+    Ok(())
 }
 
 fn run_perf(command: PerfCommand, args: Vec<String>) -> Result<(), String> {
@@ -1476,12 +2157,91 @@ fn run_optimize(file: &Path, out_dir: Option<&Path>, full: bool, json: bool) -> 
 }
 
 fn run_query(file: Option<&Path>, query: &str, options: QueryCommandOptions) -> Result<(), String> {
-    let bytes = match file {
+    let mut bytes = match file {
         Some(file) => {
             fs::read(file).map_err(|error| format!("cannot read {}: {error}", file.display()))?
         }
         None => external_only_context_bytes(),
     };
+    let delta_manifest = file.is_some()
+        && cove_datafusion::delta_snapshot::delta_chain_required(&bytes).unwrap_or(false);
+    let mut delta_plan = None;
+    let mut delta_snapshot = None;
+    let mut delta_direct_surface = None;
+    if delta_manifest {
+        let manifest = file.expect("delta_manifest implies file");
+        let dataset = options
+            .dataset
+            .as_deref()
+            .ok_or_else(|| "delta manifest query requires --dataset <dir>".to_string())?;
+        if options.physical_sidecars.has_any() {
+            return Err(
+                "explicit physical sidecars are not supported for materialized delta snapshots; build snapshot-bound sidecars or omit the sidecar flags"
+                    .into(),
+            );
+        }
+        let snapshot = cove_datafusion::delta_snapshot::load_validated_delta_snapshot(
+            manifest,
+            dataset,
+            options.delta_request,
+        )?;
+        if options.strict_performance
+            && snapshot
+                .plan
+                .recommendations
+                .iter()
+                .any(|item| {
+                    *item
+                        == cove_core::artifact::covm::CovmDeltaReadAmplificationRecommendation::RequireOverrideChainDepth
+                })
+        {
+            return Err(
+                "strict performance requested, but the delta chain exceeds the hard read-amplification policy"
+                    .into(),
+            );
+        }
+        if options.delta_plan_json {
+            eprintln!(
+                "{}",
+                serde_json::to_string_pretty(
+                    &cove_datafusion::delta_snapshot::delta_snapshot_plan_json(
+                        Some(manifest),
+                        &snapshot.plan,
+                        &snapshot.extension,
+                    )
+                )
+                .unwrap()
+            );
+        } else if options.delta_plan {
+            print_query_delta_plan_text(manifest, &snapshot.plan);
+        }
+        delta_plan = Some(snapshot.plan.clone());
+        match cove_datafusion::delta_snapshot::direct_object_surface_support(&snapshot) {
+            cove_datafusion::delta_snapshot::DirectDeltaObjectSurfaceSupport::Supported => {
+                delta_direct_surface = Some(
+                    cove_datafusion::delta_snapshot::read_validated_delta_object_surface(
+                        &snapshot,
+                    )?,
+                );
+                bytes = snapshot.base.bytes.clone();
+            }
+            cove_datafusion::delta_snapshot::DirectDeltaObjectSurfaceSupport::RequiresMaterializedPlannerMetadata {
+                ..
+            } => {
+                let materialized =
+                    cove_datafusion::delta_snapshot::materialize_validated_delta_snapshot(
+                        &snapshot,
+                    )?;
+                bytes = materialized.bytes;
+            }
+        }
+        delta_snapshot = Some(snapshot);
+    } else if options.delta_request != CovmDeltaPruneRequest::default()
+        || options.delta_plan
+        || options.delta_plan_json
+    {
+        return Err("delta snapshot options require a COVM delta manifest input".into());
+    }
     let mut execute_options = ExecuteArtifactOptions::default();
     register_external_tables(&mut execute_options, &options.external_tables)?;
     if let Some(mapping) = &options.mapping {
@@ -1499,7 +2259,7 @@ fn run_query(file: Option<&Path>, query: &str, options: QueryCommandOptions) -> 
         execute_options.resolve_options.security.explain_policy = explain_policy_for_cli(explain);
     }
     configure_execution_engine(&mut execute_options, &options)?;
-    let acceleration_bundle = if !options.no_auto_sidecars {
+    let acceleration_bundle = if !options.no_auto_sidecars && !delta_manifest {
         file.map(|file| {
             discover_acceleration_bundle(
                 &bytes,
@@ -1530,44 +2290,80 @@ fn run_query(file: Option<&Path>, query: &str, options: QueryCommandOptions) -> 
             ));
         }
     }
-    execute_options.manifest_members = manifest_members_for(file, &bytes, &options)?;
+    execute_options.manifest_members = if delta_manifest {
+        explicit_manifest_members_for(&options)?
+    } else {
+        manifest_members_for(file, &bytes, &options)?
+    };
     let query = match &options.query_file {
         Some(query_file) => read_query_file(query_file)?,
         None => query.to_string(),
     };
     let query = prepare_query_text(&query, options.take, options.explain.as_deref())?;
-    let executed = match execute_query_from_artifact(&bytes, &query, execute_options.clone()) {
-        Ok(executed) => {
-            if options.perf_report {
-                print_query_perf_report(acceleration_bundle.as_ref(), None);
-            }
-            executed
-        }
-        Err(error) if options.engine == QueryEngine::Auto && !options.strict_performance => {
-            let mut fallback_options = execute_options;
-            fallback_options.execution_engine = ArtifactExecutionEngine::Materialized;
-            match execute_query_from_artifact(&bytes, &query, fallback_options) {
-                Ok(executed) => {
-                    if options.perf_report {
-                        print_query_perf_report(
-                            acceleration_bundle.as_ref(),
-                            Some(&format_artifact_query_error(
-                                error,
-                                options.json_diagnostics,
-                            )),
+    let use_direct_delta_surface = delta_direct_surface.is_some()
+        && matches!(
+            execute_options.execution_engine,
+            ArtifactExecutionEngine::Materialized
+        );
+    let executed = if use_direct_delta_surface {
+        let surface = delta_direct_surface
+            .as_ref()
+            .expect("checked direct delta surface");
+        match execute_delta_object_surface_query(&bytes, surface, &query, &execute_options) {
+            Ok(executed) => {
+                if options.perf_report {
+                    print_query_perf_report(acceleration_bundle.as_ref(), None);
+                    if let Some(plan) = &delta_plan {
+                        eprintln!(
+                            "delta_chain_depth={} selected_delta_count={} skipped_delta_count={}",
+                            plan.metrics.delta_chain_depth,
+                            plan.metrics.selected_delta_count,
+                            plan.metrics.skipped_delta_count
                         );
+                        eprintln!("delta_execution=direct_object_surface");
                     }
-                    executed
                 }
-                Err(fallback_error) => {
-                    return Err(format_artifact_query_error(
-                        fallback_error,
-                        options.json_diagnostics,
-                    ))
-                }
+                executed
+            }
+            Err(direct_error) => {
+                let direct_error = direct_error.to_string();
+                let snapshot = delta_snapshot
+                    .as_ref()
+                    .expect("delta snapshot is loaded when direct surface exists");
+                let materialized =
+                    cove_datafusion::delta_snapshot::materialize_validated_delta_snapshot(
+                        snapshot,
+                    )?;
+                bytes = materialized.bytes;
+                execute_query_with_cli_fallback(
+                    &bytes,
+                    &query,
+                    execute_options.clone(),
+                    &options,
+                    acceleration_bundle.as_ref(),
+                    delta_plan.as_ref(),
+                    Some(&direct_error),
+                )?
             }
         }
-        Err(error) => return Err(format_artifact_query_error(error, options.json_diagnostics)),
+    } else {
+        if delta_direct_surface.is_some() {
+            let snapshot = delta_snapshot
+                .as_ref()
+                .expect("delta snapshot is loaded when direct surface exists");
+            let materialized =
+                cove_datafusion::delta_snapshot::materialize_validated_delta_snapshot(snapshot)?;
+            bytes = materialized.bytes;
+        }
+        execute_query_with_cli_fallback(
+            &bytes,
+            &query,
+            execute_options.clone(),
+            &options,
+            acceleration_bundle.as_ref(),
+            delta_plan.as_ref(),
+            None,
+        )?
     };
     if options.explain.is_some() {
         println!("{}", executed.explain_text());
@@ -1577,6 +2373,72 @@ fn run_query(file: Option<&Path>, query: &str, options: QueryCommandOptions) -> 
         .result_json()
         .map_err(|error| format_execution_error(error, options.json_diagnostics))?;
     write_result(&value, options.format, options.max_cell_width)
+}
+
+fn execute_delta_object_surface_query(
+    planning_bytes: &[u8],
+    surface: &CoveObjectSurface,
+    query: &str,
+    options: &ExecuteArtifactOptions,
+) -> Result<ExecutedQuery, coveql::BuildExecutionError> {
+    parse_resolve_plan_and_execute_query_on_object_surface(
+        planning_bytes,
+        surface,
+        query,
+        options.parse_options.clone(),
+        options.resolve_options.clone(),
+        options.plan_options.clone(),
+        options.execution_options.clone(),
+        options.validation_options.clone(),
+    )
+}
+
+fn execute_query_with_cli_fallback(
+    bytes: &[u8],
+    query: &str,
+    execute_options: ExecuteArtifactOptions,
+    options: &QueryCommandOptions,
+    acceleration_bundle: Option<&CoveAccelerationBundle>,
+    delta_plan: Option<&cove_datafusion::delta_snapshot::DeltaSnapshotPlan>,
+    materialized_fallback_reason: Option<&str>,
+) -> Result<ExecutedQuery, String> {
+    match execute_query_from_artifact(bytes, query, execute_options.clone()) {
+        Ok(executed) => {
+            if options.perf_report {
+                print_query_perf_report(acceleration_bundle, materialized_fallback_reason);
+                if let Some(plan) = delta_plan {
+                    eprintln!(
+                        "delta_chain_depth={} selected_delta_count={} skipped_delta_count={}",
+                        plan.metrics.delta_chain_depth,
+                        plan.metrics.selected_delta_count,
+                        plan.metrics.skipped_delta_count
+                    );
+                }
+            }
+            Ok(executed)
+        }
+        Err(error) if options.engine == QueryEngine::Auto && !options.strict_performance => {
+            let mut fallback_options = execute_options;
+            fallback_options.execution_engine = ArtifactExecutionEngine::Materialized;
+            match execute_query_from_artifact(bytes, query, fallback_options) {
+                Ok(executed) => {
+                    if options.perf_report {
+                        let formatted_error =
+                            format_artifact_query_error(error, options.json_diagnostics);
+                        let fallback_reason =
+                            materialized_fallback_reason.unwrap_or(&formatted_error);
+                        print_query_perf_report(acceleration_bundle, Some(fallback_reason));
+                    }
+                    Ok(executed)
+                }
+                Err(fallback_error) => Err(format_artifact_query_error(
+                    fallback_error,
+                    options.json_diagnostics,
+                )),
+            }
+        }
+        Err(error) => Err(format_artifact_query_error(error, options.json_diagnostics)),
+    }
 }
 
 fn external_only_context_bytes() -> Vec<u8> {
@@ -1783,6 +2645,67 @@ fn manifest_members_for(
         }
     }
     Ok(members)
+}
+
+fn explicit_manifest_members_for(
+    options: &QueryCommandOptions,
+) -> Result<Vec<QueryArtifactMember>, String> {
+    options
+        .members
+        .iter()
+        .map(|(source, path)| {
+            Ok(QueryArtifactMember {
+                source: source.clone(),
+                bytes: fs::read(path)
+                    .map_err(|error| format!("cannot read member {}: {error}", path.display()))?,
+            })
+        })
+        .collect()
+}
+
+fn print_query_delta_plan_text(
+    manifest: &Path,
+    plan: &cove_datafusion::delta_snapshot::DeltaSnapshotPlan,
+) {
+    eprintln!("Delta snapshot plan: {}", manifest.display());
+    eprintln!("  selected: {:?}", plan.decision.selected_chain_ordinals);
+    if plan.decision.skipped.is_empty() {
+        eprintln!("  skipped: none");
+    } else {
+        eprintln!("  skipped:");
+        for skip in &plan.decision.skipped {
+            eprintln!(
+                "    - {} ({})",
+                skip.chain_ordinal,
+                cove_datafusion::delta_snapshot::prune_reason_name(skip.reason)
+            );
+        }
+    }
+    eprintln!("  chain_depth: {}", plan.metrics.delta_chain_depth);
+    eprintln!(
+        "  selected_delta_count: {}",
+        plan.metrics.selected_delta_count
+    );
+    eprintln!(
+        "  skipped_delta_count: {}",
+        plan.metrics.skipped_delta_count
+    );
+    eprintln!(
+        "  object_store_request_count: {}",
+        plan.metrics.object_store_request_count
+    );
+    eprintln!("  bytes_returned: {}", plan.metrics.bytes_returned);
+    if plan.recommendations.is_empty() {
+        eprintln!("  recommendations: none");
+    } else {
+        eprintln!("  recommendations:");
+        for item in &plan.recommendations {
+            eprintln!(
+                "    - {}",
+                cove_datafusion::delta_snapshot::recommendation_name(*item)
+            );
+        }
+    }
 }
 
 fn prepare_query_text(

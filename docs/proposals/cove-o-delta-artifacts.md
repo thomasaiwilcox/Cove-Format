@@ -1,6 +1,7 @@
 # COVE-O Delta Artifacts
 
-Status: exploratory proposal
+Status: implemented for the supported reference-prototype delta contract;
+retained as design context for future standardization and advanced tiers.
 
 Owning profiles: COVE-O / COVM / COVE-COVERAGE / COVE-I / COVE-MAP
 
@@ -18,6 +19,13 @@ This proposal defines an optional **COVE-O delta artifact**: an immutable
 overlay file that records object-temporal additions, patches, tombstones,
 association changes, evidence additions, and additive catalog changes against a
 published COVE-O snapshot.
+
+The current reference implementation supports the core COVM-selected
+base-plus-delta workflow, `cove delta` chain commands, delta-aware query/export,
+snapshot-bound sidecars, COVE-MAP semantic delta generation, inline dictionary
+overlays, parent dictionary aliases, reconstruction, compaction, and
+checkpointing. Broader items such as delta-local COVE-I indexes, COVE-COVERAGE
+patches, object-store layout hints, and merge DAGs remain future design work.
 
 The intent is to make COVE-O logically appendable without making `.cove` files
 mutable.
@@ -1697,8 +1705,6 @@ The benchmark matrix should vary:
 
 - Should `.covedelta` reuse exact COVE section encodings for temporal segments,
   or use a smaller artifact-native segment grammar?
-- Should parent dictionary aliases be part of tier 2 or wait until after
-  snapshot-level indexing is implemented?
 - Should the COVM delta-chain block become a core COVM section or remain an
   extension block with required profile bits?
 - Should checkpoint deltas have a distinct artifact kind, or remain ordinary
@@ -1714,6 +1720,12 @@ The benchmark matrix should vary:
 - Should source publication/ingest date ranges be represented only in COVM, or
   also standardized as queryable COVE-O operational metadata?
 
+Resolved in the reference prototype:
+
+- Parent dictionary aliases are supported for selected base and prior-delta
+  dictionaries. Redacted parent aliases preserve the configured redaction
+  policy and do not expose protected values as ordinary decoded values.
+
 ## Recommended First Implementation
 
 The smallest useful implementation should support:
@@ -1726,7 +1738,7 @@ The smallest useful implementation should support:
 4. Mandatory cryptographic digest for base and delta references.
 5. Effective catalog, schema, projection, map, visibility, and redaction
    fingerprints.
-6. Inline-only delta dictionaries.
+6. Inline delta dictionary overlays and parent dictionary aliases.
 7. Delta-local temporal segment index and temporal segment data.
 8. Sparse `SetValue`, `SetNull`, `Clear`, `Redact`, and `Tombstone` property
    operations.
@@ -1740,17 +1752,16 @@ The smallest useful implementation should support:
 
 The next implementation tier should add:
 
-1. Parent dictionary aliases.
-2. Hash/equality dictionary hints with redaction policy gates.
-3. Property-level touched bitmaps.
-4. Delta-local COVE-I indexes.
-5. Delta coverage patches.
-6. Checkpoint deltas.
-7. COVE-MAP evidence/projection patches, after the COVE-MAP resolver catalog
+1. Hash/equality dictionary hints with redaction policy gates.
+2. Property-level touched bitmaps.
+3. Delta-local COVE-I indexes.
+4. Delta coverage patches.
+5. Additional checkpoint-delta planning heuristics.
+6. COVE-MAP evidence/projection patches, after the COVE-MAP resolver catalog
    MVP has stable section IDs, digest semantics, and evidence metadata.
-8. Object-store layout hints.
-9. Snapshot-level COVE-I indexes.
-10. Small-delta packing when request cost dominates bytes returned.
+7. Object-store layout hints.
+8. Snapshot-level COVE-I indexes.
+9. Small-delta packing when request cost dominates bytes returned.
 
 Deferred until separate required extensions:
 

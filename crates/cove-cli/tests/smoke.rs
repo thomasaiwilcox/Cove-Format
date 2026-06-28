@@ -10,10 +10,12 @@ use cove_core::{
     artifact::{
         covedelta::{
             CoveDeltaFile, CoveDeltaFooterV1, CoveDeltaHeaderV1, CoveDeltaPostscriptV1,
-            DeltaParentRefV1, DELTA_PARENT_REF_LINEAGE_PARENT,
+            DeltaParentRefV1, DELTA_FLAG_SOURCE_PUBLISH_RANGE_PRESENT,
+            DELTA_PARENT_REF_LINEAGE_PARENT,
         },
         covemap::{CovemapFile, CovemapHeaderV1, CovemapPostscriptV1},
         covm::{CovmFile, CovmFileEntryV1, CovmHeaderV1, CovmPostscriptV1},
+        covx::CovxFile,
     },
     constants::{
         CoveEncodingKind, CoveLogicalType, CovePhysicalKind, DigestAlgorithm, PrimaryProfile,
@@ -26,6 +28,7 @@ use cove_core::{
     },
     reader::validate_bytes,
     table::{ColumnEntry, TableCatalog, TableEntry},
+    utility::hex_decode_exact,
     writer::{ScanPageSpec, ScanProfileCoveWriter, ScanSegment},
 };
 use cove_coverage::{
@@ -496,6 +499,18 @@ fn runtime_hint_bytes() -> Vec<u8> {
 fn simple_delta_bytes_for_base(base: &[u8]) -> Vec<u8> {
     let validated = validate_bytes(base).unwrap();
     simple_delta_bytes_for_base_with_snapshot(base, validated.header.file_id)
+}
+
+fn simple_delta_bytes_for_base_with_source_publish(
+    base: &[u8],
+    start_us: i64,
+    end_us: i64,
+) -> Vec<u8> {
+    let mut delta = CoveDeltaFile::parse(&simple_delta_bytes_for_base(base)).unwrap();
+    delta.header.flags |= DELTA_FLAG_SOURCE_PUBLISH_RANGE_PRESENT;
+    delta.header.source_publish_range_start_us = start_us;
+    delta.header.source_publish_range_end_us = end_us;
+    delta.serialize().unwrap()
 }
 
 fn simple_delta_bytes_for_base_with_snapshot(base: &[u8], base_snapshot_id: [u8; 16]) -> Vec<u8> {
@@ -2256,6 +2271,718 @@ fn delta_cli_commands_validate_plan_and_publish_delta_chains() {
         String::from_utf8_lossy(&object_publish.stdout),
         String::from_utf8_lossy(&object_publish.stderr)
     );
+    let object_published: serde_json::Value =
+        serde_json::from_slice(&object_publish.stdout).unwrap();
+    let object_chain_digest = hex_decode_exact::<32>(
+        object_published["chain_digest"]
+            .as_str()
+            .expect("publish JSON chain_digest"),
+    )
+    .unwrap();
+
+    let object_query = run_cove(&[
+        "query",
+        object_manifest.to_str().unwrap(),
+        "--dataset",
+        "/",
+        "--delta-plan",
+        "--perf-report",
+        "--format",
+        "jsonl",
+        "object(Thing).select(active)",
+    ]);
+    assert!(
+        object_query.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&object_query.stdout),
+        String::from_utf8_lossy(&object_query.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&object_query.stdout).contains(r#""active":true"#),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&object_query.stdout),
+        String::from_utf8_lossy(&object_query.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&object_query.stderr).contains("Delta snapshot plan"),
+        "stderr={}",
+        String::from_utf8_lossy(&object_query.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&object_query.stderr)
+            .contains("delta_execution=direct_object_surface"),
+        "stderr={}",
+        String::from_utf8_lossy(&object_query.stderr)
+    );
+
+    let object_query_export = temp_file("delta-cli-object-query-export.json");
+    let object_query_export_output = run_cove(&[
+        "export",
+        "arrow",
+        "--query",
+        "object(Thing).select(active)",
+        "--format",
+        "json",
+        "--report",
+        "-",
+        "--dataset",
+        "/",
+        "--perf-report",
+        object_manifest.to_str().unwrap(),
+        object_query_export.to_str().unwrap(),
+    ]);
+    assert!(
+        object_query_export_output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&object_query_export_output.stdout),
+        String::from_utf8_lossy(&object_query_export_output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&fs::read(&object_query_export).unwrap())
+            .contains(r#""active":true"#)
+    );
+    assert!(
+        String::from_utf8_lossy(&object_query_export_output.stdout)
+            .contains(r#""delta_execution": "direct_object_surface""#),
+        "stdout={}",
+        String::from_utf8_lossy(&object_query_export_output.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&object_query_export_output.stderr)
+            .contains("delta_execution=direct_object_surface"),
+        "stderr={}",
+        String::from_utf8_lossy(&object_query_export_output.stderr)
+    );
+
+    let graph_base = temp_file("delta-cli-graph-base.cove");
+    let graph_delta = temp_file("delta-cli-graph-delta.covedelta");
+    let graph_manifest = temp_file("delta-cli-graph-chain.covm");
+    let graph_base_bytes = fs::read(sample_path("people.cove")).unwrap();
+    fs::write(&graph_base, &graph_base_bytes).unwrap();
+    fs::write(&graph_delta, simple_delta_bytes_for_base(&graph_base_bytes)).unwrap();
+    let graph_publish = run_cove(&[
+        "delta",
+        "publish",
+        "--base",
+        graph_base.to_str().unwrap(),
+        "--delta",
+        graph_delta.to_str().unwrap(),
+        "--out",
+        graph_manifest.to_str().unwrap(),
+        "--json",
+    ]);
+    assert!(
+        graph_publish.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&graph_publish.stdout),
+        String::from_utf8_lossy(&graph_publish.stderr)
+    );
+    let graph_query = run_cove(&[
+        "query",
+        graph_manifest.to_str().unwrap(),
+        "--dataset",
+        "/",
+        "--perf-report",
+        "--format",
+        "jsonl",
+        "node(Person) as p.connectedComponents().degree(kind: total).select(id: p.goid, component_id, degree).take(2)",
+    ]);
+    assert!(
+        graph_query.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&graph_query.stdout),
+        String::from_utf8_lossy(&graph_query.stderr)
+    );
+    let graph_stdout = String::from_utf8_lossy(&graph_query.stdout);
+    assert!(graph_stdout.contains(r#""component_id":0"#));
+    assert!(graph_stdout.contains(r#""degree":0"#));
+    assert!(
+        String::from_utf8_lossy(&graph_query.stderr)
+            .contains("delta_execution=direct_object_surface"),
+        "stderr={}",
+        String::from_utf8_lossy(&graph_query.stderr)
+    );
+    let graph_table_export = temp_file("delta-cli-graph-table-export.json");
+    let graph_table_export_output = run_cove(&[
+        "export",
+        "arrow",
+        "--format",
+        "json",
+        "--report",
+        "-",
+        "--dataset",
+        "/",
+        "--columns",
+        "score,status",
+        "--filter",
+        "column=score,op=gte,value=20",
+        graph_manifest.to_str().unwrap(),
+        graph_table_export.to_str().unwrap(),
+    ]);
+    assert!(
+        graph_table_export_output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&graph_table_export_output.stdout),
+        String::from_utf8_lossy(&graph_table_export_output.stderr)
+    );
+    let graph_table_export_rows = String::from_utf8_lossy(&fs::read(&graph_table_export).unwrap())
+        .lines()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    assert!(
+        graph_table_export_rows
+            .iter()
+            .any(|row| row.contains(r#""score":20"#)),
+        "rows={graph_table_export_rows:?}"
+    );
+    assert!(
+        graph_table_export_rows
+            .iter()
+            .any(|row| row.contains(r#""score":30"#)),
+        "rows={graph_table_export_rows:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&graph_table_export_output.stdout)
+            .contains(r#""delta_execution": "direct_projection_surface""#),
+        "stdout={}",
+        String::from_utf8_lossy(&graph_table_export_output.stdout)
+    );
+
+    let source_publish_query = run_cove(&[
+        "query",
+        object_manifest.to_str().unwrap(),
+        "--dataset",
+        "/",
+        "--source-publish-range",
+        "1:2",
+        "object(Thing).select(active)",
+    ]);
+    assert!(!source_publish_query.status.success());
+    assert!(
+        String::from_utf8_lossy(&source_publish_query.stderr).contains("source-publish"),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&source_publish_query.stdout),
+        String::from_utf8_lossy(&source_publish_query.stderr)
+    );
+    let source_publish_export = temp_file("delta-cli-source-publish-export.json");
+    let source_publish_export_output = run_cove(&[
+        "export",
+        "arrow",
+        "--format",
+        "json",
+        object_manifest.to_str().unwrap(),
+        source_publish_export.to_str().unwrap(),
+        "--dataset",
+        "/",
+        "--source-publish-range",
+        "1:2",
+    ]);
+    assert!(!source_publish_export_output.status.success());
+    assert!(
+        String::from_utf8_lossy(&source_publish_export_output.stderr).contains("source-publish"),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&source_publish_export_output.stdout),
+        String::from_utf8_lossy(&source_publish_export_output.stderr)
+    );
+    assert!(!source_publish_export.exists());
+
+    let source_publish_base = temp_file("delta-cli-source-publish-base.cove");
+    let source_publish_delta = temp_file("delta-cli-source-publish-delta.covedelta");
+    let source_publish_manifest = temp_file("delta-cli-source-publish-chain.covm");
+    fs::write(&source_publish_base, &object_bytes).unwrap();
+    fs::write(
+        &source_publish_delta,
+        simple_delta_bytes_for_base_with_source_publish(&object_bytes, 10, 20),
+    )
+    .unwrap();
+    let source_publish_publish = run_cove(&[
+        "delta",
+        "publish",
+        "--base",
+        source_publish_base.to_str().unwrap(),
+        "--delta",
+        source_publish_delta.to_str().unwrap(),
+        "--out",
+        source_publish_manifest.to_str().unwrap(),
+        "--json",
+    ]);
+    assert!(
+        source_publish_publish.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&source_publish_publish.stdout),
+        String::from_utf8_lossy(&source_publish_publish.stderr)
+    );
+    let source_publish_scoped_query = run_cove(&[
+        "query",
+        source_publish_manifest.to_str().unwrap(),
+        "--dataset",
+        "/",
+        "--source-publish-range",
+        "12:18",
+        "--perf-report",
+        "--format",
+        "jsonl",
+        "object(Thing).select(active)",
+    ]);
+    assert!(
+        source_publish_scoped_query.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&source_publish_scoped_query.stdout),
+        String::from_utf8_lossy(&source_publish_scoped_query.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&source_publish_scoped_query.stdout).contains(r#""active":true"#)
+    );
+    assert!(
+        String::from_utf8_lossy(&source_publish_scoped_query.stderr)
+            .contains("delta_execution=direct_object_surface"),
+        "stderr={}",
+        String::from_utf8_lossy(&source_publish_scoped_query.stderr)
+    );
+    let source_publish_query_export = temp_file("delta-cli-source-publish-query-export.json");
+    let source_publish_query_export_output = run_cove(&[
+        "export",
+        "arrow",
+        "--query",
+        "object(Thing).select(active)",
+        "--format",
+        "json",
+        "--report",
+        "-",
+        "--dataset",
+        "/",
+        "--source-publish-range",
+        "12:18",
+        source_publish_manifest.to_str().unwrap(),
+        source_publish_query_export.to_str().unwrap(),
+    ]);
+    assert!(
+        source_publish_query_export_output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&source_publish_query_export_output.stdout),
+        String::from_utf8_lossy(&source_publish_query_export_output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&fs::read(&source_publish_query_export).unwrap())
+            .contains(r#""active":true"#)
+    );
+    assert!(
+        String::from_utf8_lossy(&source_publish_query_export_output.stdout)
+            .contains(r#""delta_execution": "direct_object_surface""#),
+        "stdout={}",
+        String::from_utf8_lossy(&source_publish_query_export_output.stdout)
+    );
+
+    let snapshot_covi = temp_file("delta-cli-snapshot.covi");
+    let snapshot_covi_build = run_cove(&[
+        "sidecar",
+        "build",
+        "covi",
+        "--snapshot",
+        object_manifest.to_str().unwrap(),
+        "--dataset",
+        "/",
+        "--out",
+        snapshot_covi.to_str().unwrap(),
+        "--object-properties",
+    ]);
+    assert!(
+        snapshot_covi_build.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&snapshot_covi_build.stdout),
+        String::from_utf8_lossy(&snapshot_covi_build.stderr)
+    );
+    let snapshot_covi_inspect = run_cove(&[
+        "sidecar",
+        "inspect",
+        "index",
+        snapshot_covi.to_str().unwrap(),
+    ]);
+    assert!(
+        snapshot_covi_inspect.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&snapshot_covi_inspect.stderr)
+    );
+    let snapshot_covi_bytes = fs::read(&snapshot_covi).unwrap();
+    let snapshot_covi_artifact = cove_index::CoviArtifactV2::parse(&snapshot_covi_bytes).unwrap();
+    let snapshot_validity = snapshot_covi_artifact
+        .snapshot_validity
+        .first()
+        .expect("snapshot validity row");
+    assert_eq!(
+        snapshot_validity.delta_chain_digest_algorithm,
+        DigestAlgorithm::Sha256 as u16
+    );
+    assert_eq!(snapshot_validity.delta_chain_digest_len, 32);
+    let string_table = snapshot_covi_artifact
+        .section_payload_from_bytes(
+            &snapshot_covi_bytes,
+            snapshot_covi_artifact.header.string_table_section_ref,
+        )
+        .unwrap();
+    let digest_start = snapshot_validity.delta_chain_digest_offset as usize;
+    let digest_end = digest_start + usize::from(snapshot_validity.delta_chain_digest_len);
+    assert_eq!(
+        &string_table[digest_start..digest_end],
+        &object_chain_digest
+    );
+    let referenced_file = &snapshot_covi_artifact.referenced_files[0];
+    let base_only_context = cove_index::execution::CoviValidationContextV2::for_file(
+        referenced_file.file_id,
+        referenced_file.file_len,
+        referenced_file.footer_crc32c,
+    );
+    assert!(
+        cove_index::execution::ValidatedCoviArtifactV2::parse_and_validate(
+            &snapshot_covi_bytes,
+            base_only_context
+        )
+        .is_err()
+    );
+    let bound_context = cove_index::execution::CoviValidationContextV2::for_file(
+        referenced_file.file_id,
+        referenced_file.file_len,
+        referenced_file.footer_crc32c,
+    )
+    .with_delta_chain_digest(DigestAlgorithm::Sha256, object_chain_digest.to_vec());
+    cove_index::execution::ValidatedCoviArtifactV2::parse_and_validate(
+        &snapshot_covi_bytes,
+        bound_context,
+    )
+    .unwrap();
+
+    let snapshot_covm = temp_file("delta-cli-snapshot.covm");
+    let snapshot_covm_build = run_cove(&[
+        "sidecar",
+        "build",
+        "covm",
+        "--snapshot",
+        object_manifest.to_str().unwrap(),
+        "--dataset",
+        "/",
+        "--out",
+        snapshot_covm.to_str().unwrap(),
+    ]);
+    assert!(
+        snapshot_covm_build.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&snapshot_covm_build.stdout),
+        String::from_utf8_lossy(&snapshot_covm_build.stderr)
+    );
+    assert!(snapshot_covm.exists());
+    let expected_snapshot_identity = validate_bytes(&object_bytes).unwrap();
+    let expected_snapshot_digest = compute_digest(DigestAlgorithm::Sha256, &object_bytes).unwrap();
+    let snapshot_covm_file = CovmFile::parse(&fs::read(&snapshot_covm).unwrap()).unwrap();
+    assert_eq!(snapshot_covm_file.files.len(), 1);
+    let snapshot_covm_entry = &snapshot_covm_file.files[0];
+    assert_eq!(
+        snapshot_covm_entry.file_id,
+        expected_snapshot_identity.header.file_id
+    );
+    assert_eq!(
+        snapshot_covm_entry.file_len,
+        expected_snapshot_identity.postscript.file_len
+    );
+    assert_eq!(
+        snapshot_covm_entry.footer_crc32c,
+        expected_snapshot_identity.postscript.footer.crc32c
+    );
+    assert_eq!(snapshot_covm_entry.digest, expected_snapshot_digest);
+
+    let snapshot_covx = temp_file("delta-cli-snapshot.covx");
+    let snapshot_covx_build = run_cove(&[
+        "sidecar",
+        "build",
+        "covx",
+        "--snapshot",
+        object_manifest.to_str().unwrap(),
+        "--dataset",
+        "/",
+        "--out",
+        snapshot_covx.to_str().unwrap(),
+    ]);
+    assert!(
+        snapshot_covx_build.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&snapshot_covx_build.stdout),
+        String::from_utf8_lossy(&snapshot_covx_build.stderr)
+    );
+    let snapshot_covx_file = CovxFile::parse(&fs::read(&snapshot_covx).unwrap()).unwrap();
+    assert_eq!(snapshot_covx_file.referenced_files.len(), 1);
+    let snapshot_covx_entry = &snapshot_covx_file.referenced_files[0];
+    assert_eq!(
+        snapshot_covx_entry.file_id,
+        expected_snapshot_identity.header.file_id
+    );
+    assert_eq!(
+        snapshot_covx_entry.file_len,
+        expected_snapshot_identity.postscript.file_len
+    );
+    assert_eq!(
+        snapshot_covx_entry.footer_crc32c,
+        expected_snapshot_identity.postscript.footer.crc32c
+    );
+    assert_eq!(snapshot_covx_entry.digest, expected_snapshot_digest);
+
+    let map_delta_bundle = temp_file("delta-cli-map-bundle");
+    let map_delta_build = run_cove(&[
+        "map",
+        "delta",
+        "build",
+        object_manifest.to_str().unwrap(),
+        "--dataset",
+        "/",
+        "--out-dir",
+        map_delta_bundle.to_str().unwrap(),
+        "--projection-output",
+        "none",
+        "--force",
+        "--json",
+    ]);
+    assert!(
+        map_delta_build.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&map_delta_build.stdout),
+        String::from_utf8_lossy(&map_delta_build.stderr)
+    );
+    let map_delta_json: serde_json::Value =
+        serde_json::from_slice(&map_delta_build.stdout).unwrap();
+    assert_eq!(
+        map_delta_json["format"],
+        serde_json::json!("cove-map-delta-build-manifest-v1")
+    );
+
+    let semantic_map_source = temp_file("people.jsonl");
+    fs::write(
+        &semantic_map_source,
+        r#"{"id":"p4","active":true,"score":40,"rating":45,"status":"pending","nickname":"alan"}"#,
+    )
+    .unwrap();
+    let semantic_map_delta = temp_file("delta-cli-map-semantic.covedelta");
+    let semantic_map_delta_build = run_cove(&[
+        "map",
+        "delta",
+        "build",
+        "--base",
+        graph_manifest.to_str().unwrap(),
+        "--dataset",
+        "/",
+        "--mapping",
+        sample_path("people.covemap").to_str().unwrap(),
+        "--out",
+        semantic_map_delta.to_str().unwrap(),
+        "--force",
+        "--json",
+        semantic_map_source.to_str().unwrap(),
+    ]);
+    assert!(
+        semantic_map_delta_build.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&semantic_map_delta_build.stdout),
+        String::from_utf8_lossy(&semantic_map_delta_build.stderr)
+    );
+    let semantic_map_report: serde_json::Value =
+        serde_json::from_slice(&semantic_map_delta_build.stdout).unwrap();
+    assert_eq!(
+        semantic_map_report["format"],
+        serde_json::json!("cove-map-semantic-delta-build-report-v1")
+    );
+    assert!(
+        semantic_map_report["object_delta_validation"]["touched_object_ranges"]
+            .as_u64()
+            .unwrap_or_default()
+            > 0,
+        "report={semantic_map_report}"
+    );
+    assert!(semantic_map_delta.exists());
+
+    let semantic_map_validate = run_cove(&[
+        "delta",
+        "validate",
+        semantic_map_delta.to_str().unwrap(),
+        "--object-delta",
+        "--json",
+    ]);
+    assert!(
+        semantic_map_validate.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&semantic_map_validate.stdout),
+        String::from_utf8_lossy(&semantic_map_validate.stderr)
+    );
+    let semantic_map_inspect = run_cove(&[
+        "delta",
+        "inspect",
+        semantic_map_delta.to_str().unwrap(),
+        "--json",
+    ]);
+    assert!(
+        semantic_map_inspect.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&semantic_map_inspect.stdout),
+        String::from_utf8_lossy(&semantic_map_inspect.stderr)
+    );
+    let semantic_map_inspected: serde_json::Value =
+        serde_json::from_slice(&semantic_map_inspect.stdout).unwrap();
+    assert_eq!(
+        semantic_map_inspected["object_delta"]["catalog_patches"],
+        serde_json::json!(0)
+    );
+    assert_eq!(
+        semantic_map_inspected["object_delta"]["evidence_patches"],
+        serde_json::json!(1)
+    );
+
+    fs::write(
+        &semantic_map_source,
+        r#"{"id":"p1","active":true,"score":55,"rating":65,"status":"reopened","nickname":"ada"}"#,
+    )
+    .unwrap();
+    let semantic_map_update_delta = temp_file("delta-cli-map-semantic-update.covedelta");
+    let semantic_map_update_build = run_cove(&[
+        "map",
+        "delta",
+        "build",
+        "--base",
+        graph_manifest.to_str().unwrap(),
+        "--dataset",
+        "/",
+        "--mapping",
+        sample_path("people.covemap").to_str().unwrap(),
+        "--out",
+        semantic_map_update_delta.to_str().unwrap(),
+        "--force",
+        "--json",
+        semantic_map_source.to_str().unwrap(),
+    ]);
+    assert!(
+        semantic_map_update_build.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&semantic_map_update_build.stdout),
+        String::from_utf8_lossy(&semantic_map_update_build.stderr)
+    );
+    let semantic_map_update_report: serde_json::Value =
+        serde_json::from_slice(&semantic_map_update_build.stdout).unwrap();
+    assert_eq!(
+        semantic_map_update_report["format"],
+        serde_json::json!("cove-map-semantic-delta-build-report-v1")
+    );
+    assert!(
+        semantic_map_update_report["object_delta_validation"]["continuation_anchors"]
+            .as_u64()
+            .unwrap_or_default()
+            > 0,
+        "report={semantic_map_update_report}"
+    );
+    assert!(
+        semantic_map_update_report["object_delta_validation"]["touched_object_ranges"]
+            .as_u64()
+            .unwrap_or_default()
+            > 0,
+        "report={semantic_map_update_report}"
+    );
+    let semantic_map_update_validate = run_cove(&[
+        "delta",
+        "validate",
+        semantic_map_update_delta.to_str().unwrap(),
+        "--object-delta",
+        "--json",
+    ]);
+    assert!(
+        semantic_map_update_validate.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&semantic_map_update_validate.stdout),
+        String::from_utf8_lossy(&semantic_map_update_validate.stderr)
+    );
+    let semantic_map_update_manifest = temp_file("delta-cli-map-semantic-update-chain.covm");
+    let semantic_map_update_extend = run_cove(&[
+        "delta",
+        "chain",
+        "extend",
+        "--manifest",
+        graph_manifest.to_str().unwrap(),
+        "--delta",
+        semantic_map_update_delta.to_str().unwrap(),
+        "--out",
+        semantic_map_update_manifest.to_str().unwrap(),
+        "--json",
+    ]);
+    assert!(
+        semantic_map_update_extend.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&semantic_map_update_extend.stdout),
+        String::from_utf8_lossy(&semantic_map_update_extend.stderr)
+    );
+    let semantic_map_update_query = run_cove(&[
+        "query",
+        semantic_map_update_manifest.to_str().unwrap(),
+        "--dataset",
+        "/",
+        "--format",
+        "jsonl",
+        "object(Person).where(score >= 50).select(score, status, nickname)",
+    ]);
+    assert!(
+        semantic_map_update_query.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&semantic_map_update_query.stdout),
+        String::from_utf8_lossy(&semantic_map_update_query.stderr)
+    );
+    let semantic_map_update_stdout = String::from_utf8_lossy(&semantic_map_update_query.stdout);
+    assert!(semantic_map_update_stdout.contains(r#""score":55"#));
+    assert!(semantic_map_update_stdout.contains(r#""status":"reopened"#));
+
+    let semantic_map_manifest = temp_file("delta-cli-map-semantic-chain.covm");
+    let semantic_map_extend = run_cove(&[
+        "delta",
+        "chain",
+        "extend",
+        "--manifest",
+        graph_manifest.to_str().unwrap(),
+        "--delta",
+        semantic_map_delta.to_str().unwrap(),
+        "--out",
+        semantic_map_manifest.to_str().unwrap(),
+        "--json",
+    ]);
+    assert!(
+        semantic_map_extend.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&semantic_map_extend.stdout),
+        String::from_utf8_lossy(&semantic_map_extend.stderr)
+    );
+    let semantic_map_chain_validate = run_cove(&[
+        "delta",
+        "chain",
+        "validate",
+        semantic_map_manifest.to_str().unwrap(),
+        "--dataset",
+        "/",
+        "--json",
+    ]);
+    assert!(
+        semantic_map_chain_validate.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&semantic_map_chain_validate.stdout),
+        String::from_utf8_lossy(&semantic_map_chain_validate.stderr)
+    );
+    let semantic_map_query = run_cove(&[
+        "query",
+        semantic_map_manifest.to_str().unwrap(),
+        "--dataset",
+        "/",
+        "--format",
+        "jsonl",
+        "object(Person).where(score >= 40).select(score, status, nickname)",
+    ]);
+    assert!(
+        semantic_map_query.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&semantic_map_query.stdout),
+        String::from_utf8_lossy(&semantic_map_query.stderr)
+    );
+    let semantic_map_query_stdout = String::from_utf8_lossy(&semantic_map_query.stdout);
+    assert!(semantic_map_query_stdout.contains(r#""score":40"#));
+    assert!(semantic_map_query_stdout.contains(r#""status":"pending"#));
 
     let checkpoint = temp_file("delta-cli-checkpoint.covedelta");
     let checkpoint_summary = temp_file("delta-cli-checkpoint.cds1");

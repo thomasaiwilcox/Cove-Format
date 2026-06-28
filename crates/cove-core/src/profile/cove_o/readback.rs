@@ -6,13 +6,18 @@ use sha2::{Digest, Sha256};
 use crate::{
     array::{CoveArrayValue, EncodedArray},
     artifact::covedelta::{
-        CoveDeltaFile, DeltaDictionaryEntryV1, DELTA_DICTIONARY_ENTRY_KIND_INLINE_VALUE,
+        CoveDeltaFile, DeltaDictionaryEntryV1, DeltaInlineValueV1, DeltaParentRefV1,
+        DELTA_DICTIONARY_ENTRY_KIND_INLINE_VALUE,
         DELTA_DICTIONARY_ENTRY_KIND_PARENT_DICTIONARY_ALIAS,
     },
     codec::CodecExtensionDescriptorV2,
     compression,
-    constants::{CompressionCodec, CoveLogicalType, CovePhysicalKind, SectionKind, ValueTag},
-    dictionary::{DictionaryValue, FileDictionary},
+    constants::{
+        CompressionCodec, CoveLogicalType, CovePhysicalKind, SectionKind, StorageClass, ValueTag,
+    },
+    dictionary::{
+        DictionaryValue, FileDictionary, FileDictionaryHeaderV1, FileDictionaryIndexEntryV1,
+    },
     page::{PAGE_FLAG_ALL_NULL, PAGE_FLAG_STATS_ONLY_CONSTANT},
     page_payload::PageBufferKind,
     profile::{
@@ -99,6 +104,14 @@ pub struct CoveObjectReadOptions {
     pub include_records: bool,
     pub include_evidence_index: bool,
     pub redaction_read_policy: CoveObjectRedactionReadPolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoveObjectDeltaParentIdentity {
+    pub artifact_id: [u8; 16],
+    pub snapshot_id: [u8; 16],
+    pub file_len: u64,
+    pub footer_crc32c: u32,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -492,8 +505,50 @@ pub fn read_object_surface_from_base_and_delta_files_with_options(
     delta_files: &[CoveDeltaFile],
     options: &CoveObjectReadOptions,
 ) -> Result<CoveObjectSurface, CoveError> {
-    let mut surface = read_object_surface_from_bytes_with_options(base_bytes, options)?;
-    append_delta_records_to_object_surface(&mut surface, delta_files, options)?;
+    read_object_surface_from_base_and_delta_files_with_parent_identity(
+        base_bytes,
+        None,
+        delta_files,
+        options,
+    )
+}
+
+pub fn read_object_surface_from_base_and_delta_files_with_parent_identity(
+    base_bytes: &[u8],
+    base_identity: Option<&CoveObjectDeltaParentIdentity>,
+    delta_files: &[CoveDeltaFile],
+    options: &CoveObjectReadOptions,
+) -> Result<CoveObjectSurface, CoveError> {
+    let base_read = read_object_surfaces_from_bytes_with_pushdown_options(
+        base_bytes,
+        &CoveObjectReadWithPushdownOptions {
+            read: options.clone(),
+            pushdown: CoveObjectReadPushdownOptions::default(),
+        },
+        false,
+    )?;
+    let mut surface = base_read.surface;
+    let mut parent_dictionaries = DeltaParentDictionaryRegistry::default();
+    if let Some(dictionary) = base_read.dictionary {
+        let identity = match base_identity {
+            Some(identity) => {
+                if identity.file_len != base_read.identity.file_len
+                    || identity.footer_crc32c != base_read.identity.footer_crc32c
+                {
+                    return Err(CoveError::SidecarStale);
+                }
+                identity.clone()
+            }
+            None => base_read.identity,
+        };
+        parent_dictionaries.push(identity, dictionary);
+    }
+    append_delta_records_to_object_surface(
+        &mut surface,
+        delta_files,
+        options,
+        &mut parent_dictionaries,
+    )?;
     Ok(surface)
 }
 
@@ -515,6 +570,7 @@ fn append_delta_records_to_object_surface(
     surface: &mut CoveObjectSurface,
     delta_files: &[CoveDeltaFile],
     options: &CoveObjectReadOptions,
+    parent_dictionaries: &mut DeltaParentDictionaryRegistry,
 ) -> Result<(), CoveError> {
     if !options.include_records
         && !options.include_evidence_index
@@ -536,6 +592,9 @@ fn append_delta_records_to_object_surface(
     };
 
     for delta_file in delta_files {
+        if delta_file.sections.is_empty() {
+            continue;
+        }
         let validation = delta_file.validate_object_delta()?;
         if options.include_evidence_index {
             append_delta_evidence_patches_to_object_surface(surface, &validation.evidence_patches)?;
@@ -553,6 +612,12 @@ fn append_delta_records_to_object_surface(
             effective_catalog.apply_additive_patch(patch)?;
         }
         surface.object_types = effective_catalog.types.clone();
+        let delta_dictionary = delta_file_dictionary_from_overlay(
+            &validation.dictionary_overlay_entries,
+            &validation.inline_values,
+            &delta_file.parent_refs,
+            parent_dictionaries,
+        )?;
         let object_types_by_id = effective_catalog
             .types
             .iter()
@@ -585,18 +650,11 @@ fn append_delta_records_to_object_surface(
             if !options.requests_object_type(object_type) {
                 continue;
             }
-            reject_unsupported_delta_dictionary_overlay_readback(
-                segment,
-                object_type,
-                &validation.dictionary_overlay_entries,
-                options,
-            )?;
-
             let mut records = records_from_segment(
                 segment,
                 object_type,
                 SegmentReadContext {
-                    dictionary: None,
+                    dictionary: delta_dictionary.as_ref(),
                     zone_stats: &[],
                     options,
                     pushdown: &pushdown_options,
@@ -618,70 +676,205 @@ fn append_delta_records_to_object_surface(
                 "delta temporal segment_id overflow after base readback",
             )?;
         }
+        if let Some(delta_dictionary) = delta_dictionary {
+            parent_dictionaries.push(
+                CoveObjectDeltaParentIdentity {
+                    artifact_id: delta_file.header.delta_artifact_id,
+                    snapshot_id: delta_file.header.snapshot_id,
+                    file_len: delta_file.postscript.file_len,
+                    footer_crc32c: delta_file.footer.footer_crc32c,
+                },
+                delta_dictionary,
+            );
+        }
     }
 
     Ok(())
 }
 
-fn reject_unsupported_delta_dictionary_overlay_readback(
-    segment: &TemporalSegmentData,
-    object_type: &ObjectTypeEntryV1,
-    dictionary_overlay_entries: &[DeltaDictionaryEntryV1],
-    options: &CoveObjectReadOptions,
-) -> Result<(), CoveError> {
-    if !dictionary_overlay_entries
-        .iter()
-        .any(delta_dictionary_overlay_entry_requires_materialization)
-    {
-        return Ok(());
+fn delta_file_dictionary_from_overlay(
+    entries: &[DeltaDictionaryEntryV1],
+    inline_values: &[DeltaInlineValueV1],
+    parent_refs: &[DeltaParentRefV1],
+    parent_dictionaries: &DeltaParentDictionaryRegistry,
+) -> Result<Option<FileDictionary>, CoveError> {
+    if entries.is_empty() {
+        return Ok(None);
     }
-    if !segment_has_requested_filecode_property(segment, object_type, options)? {
-        return Ok(());
-    }
-    Err(CoveError::UnsupportedEncoding(
-        "COVEDELTA dictionary overlay materialization is required for requested FileCode properties"
-            .into(),
-    ))
-}
 
-fn delta_dictionary_overlay_entry_requires_materialization(entry: &DeltaDictionaryEntryV1) -> bool {
-    matches!(
-        entry.entry_kind,
-        DELTA_DICTIONARY_ENTRY_KIND_INLINE_VALUE
-            | DELTA_DICTIONARY_ENTRY_KIND_PARENT_DICTIONARY_ALIAS
-    )
-}
-
-fn segment_has_requested_filecode_property(
-    segment: &TemporalSegmentData,
-    object_type: &ObjectTypeEntryV1,
-    options: &CoveObjectReadOptions,
-) -> Result<bool, CoveError> {
-    let properties_by_id = object_type
-        .properties
+    let mut sorted_entries = entries
         .iter()
-        .map(|property| (property.property_id, property))
-        .collect::<BTreeMap<_, _>>();
-    for column in &segment.property_columns {
-        let property = properties_by_id
-            .get(&column.directory.column_id)
-            .copied()
-            .ok_or_else(|| {
-                CoveError::BadSchema(format!(
-                    "temporal property column references missing property_id {}",
-                    column.directory.column_id
-                ))
-            })?;
-        if options.requests_property(property)
-            && property.physical_kind == CovePhysicalKind::FileCode
-        {
-            return Ok(true);
+        .filter(|entry| {
+            matches!(
+                entry.entry_kind,
+                DELTA_DICTIONARY_ENTRY_KIND_INLINE_VALUE
+                    | DELTA_DICTIONARY_ENTRY_KIND_PARENT_DICTIONARY_ALIAS
+            )
+        })
+        .collect::<Vec<_>>();
+    sorted_entries.sort_by_key(|entry| (entry.local_dictionary_id, entry.local_code));
+    let mut dictionary_entries = Vec::with_capacity(sorted_entries.len());
+    let mut payload = Vec::new();
+    for (expected_code, entry) in sorted_entries.into_iter().enumerate() {
+        if entry.local_dictionary_id != 0 {
+            return Err(CoveError::UnsupportedEncoding(
+                "COVEDELTA readback supports only local dictionary id 0 for FileCode pages".into(),
+            ));
         }
+        if entry.local_code != u32::try_from(expected_code).map_err(|_| CoveError::ArithOverflow)? {
+            return Err(CoveError::BadSection(
+                "COVEDELTA inline dictionary overlay must be dense by local_code".into(),
+            ));
+        }
+        let dictionary_entry = if entry.entry_kind == DELTA_DICTIONARY_ENTRY_KIND_INLINE_VALUE {
+            let value = inline_values
+                .get(
+                    usize::try_from(entry.inline_value_ref)
+                        .map_err(|_| CoveError::ArithOverflow)?,
+                )
+                .ok_or_else(|| {
+                    CoveError::BadSection(
+                        "COVEDELTA inline dictionary value_ref does not resolve".into(),
+                    )
+                })?;
+            dictionary_entry_from_canonical_bytes(value.value_tag, &value.value, &mut payload)?
+        } else {
+            if entry.parent_dictionary_id != 0 {
+                return Err(CoveError::UnsupportedEncoding(
+                    "COVEDELTA readback supports only parent dictionary id 0 for FileCode aliases"
+                        .into(),
+                ));
+            }
+            let parent_ref = parent_refs
+                .iter()
+                .find(|parent| parent.parent_ref == entry.parent_ref)
+                .ok_or_else(|| {
+                    CoveError::BadSection(
+                        "COVEDELTA parent dictionary alias references unknown parent_ref".into(),
+                    )
+                })?;
+            let parent_dictionary = parent_dictionaries.resolve(parent_ref)?;
+            let parent_entry = parent_dictionary.get_entry(entry.parent_code)?;
+            match parent_dictionary.decode_value(entry.parent_code)? {
+                DictionaryValue::RawBytes(bytes) => dictionary_entry_from_canonical_bytes(
+                    parent_entry.value_tag,
+                    &bytes,
+                    &mut payload,
+                )?,
+                DictionaryValue::RedactedPresent => {
+                    redacted_dictionary_entry(parent_entry.value_tag)
+                }
+            }
+        };
+        dictionary_entries.push(FileDictionaryIndexEntryV1 {
+            canonical_hash64: 0,
+            ..dictionary_entry
+        });
     }
-    Ok(false)
+
+    if dictionary_entries.is_empty() {
+        return Ok(None);
+    }
+    let header = FileDictionaryHeaderV1 {
+        entry_count: u32::try_from(dictionary_entries.len())
+            .map_err(|_| CoveError::ArithOverflow)?,
+        flags: 0,
+        index_entry_len: FileDictionaryHeaderV1::INDEX_ENTRY_LEN,
+        value_hash_algorithm: 0,
+        payload_length: payload.len() as u64,
+        reserved: [0; 24],
+    };
+    let mut index = Vec::new();
+    index.extend_from_slice(&header.serialize());
+    for entry in &dictionary_entries {
+        index.extend_from_slice(&entry.serialize());
+    }
+    FileDictionary::parse(&index, &payload).map(Some)
 }
 
-type EvidenceEntryIdentityKey = (String, String, String, String, String);
+#[derive(Debug, Default)]
+struct DeltaParentDictionaryRegistry {
+    dictionaries: Vec<DeltaParentDictionary>,
+}
+
+#[derive(Debug)]
+struct DeltaParentDictionary {
+    identity: CoveObjectDeltaParentIdentity,
+    dictionary: FileDictionary,
+}
+
+impl DeltaParentDictionaryRegistry {
+    fn push(&mut self, identity: CoveObjectDeltaParentIdentity, dictionary: FileDictionary) {
+        self.dictionaries.push(DeltaParentDictionary {
+            identity,
+            dictionary,
+        });
+    }
+
+    fn resolve(&self, parent_ref: &DeltaParentRefV1) -> Result<&FileDictionary, CoveError> {
+        self.dictionaries
+            .iter()
+            .find(|candidate| {
+                candidate.identity.artifact_id == parent_ref.artifact_id
+                    && candidate.identity.snapshot_id == parent_ref.snapshot_id
+                    && candidate.identity.file_len == parent_ref.file_len
+                    && candidate.identity.footer_crc32c == parent_ref.footer_crc32c
+            })
+            .map(|candidate| &candidate.dictionary)
+            .ok_or(CoveError::SidecarStale)
+    }
+}
+
+fn dictionary_entry_from_canonical_bytes(
+    value_tag: u16,
+    value: &[u8],
+    payload: &mut Vec<u8>,
+) -> Result<FileDictionaryIndexEntryV1, CoveError> {
+    let mut inline_data = [0u8; 16];
+    let (storage_class, inline_len, payload_offset, payload_length) = if value.len() <= 16 {
+        inline_data[..value.len()].copy_from_slice(value);
+        (
+            StorageClass::Inline as u8,
+            u8::try_from(value.len()).map_err(|_| CoveError::ArithOverflow)?,
+            0,
+            0,
+        )
+    } else {
+        let offset = u64::try_from(payload.len()).map_err(|_| CoveError::ArithOverflow)?;
+        let length = u32::try_from(value.len()).map_err(|_| CoveError::ArithOverflow)?;
+        payload.extend_from_slice(value);
+        (StorageClass::Payload as u8, 0, offset, length)
+    };
+    Ok(FileDictionaryIndexEntryV1 {
+        value_tag,
+        storage_class,
+        flags: 0,
+        inline_len,
+        reserved0: [0; 3],
+        inline_data,
+        payload_offset,
+        payload_length,
+        canonical_hash64: 0,
+        reserved1: 0,
+    })
+}
+
+fn redacted_dictionary_entry(value_tag: u16) -> FileDictionaryIndexEntryV1 {
+    FileDictionaryIndexEntryV1 {
+        value_tag,
+        storage_class: StorageClass::Redacted as u8,
+        flags: 0,
+        inline_len: 0,
+        reserved0: [0; 3],
+        inline_data: [0; 16],
+        payload_offset: 0,
+        payload_length: 0,
+        canonical_hash64: 0,
+        reserved1: 0,
+    }
+}
+
+type EvidenceEntrySourceKey = (String, String, String, String);
 
 fn append_delta_evidence_patches_to_object_surface(
     surface: &mut CoveObjectSurface,
@@ -707,17 +900,20 @@ fn merge_evidence_patch(
         return Err(CoveError::MapEvidenceInvalid);
     }
 
-    let mut seen = target
-        .entries
-        .iter()
-        .map(evidence_entry_identity_key)
-        .collect::<BTreeSet<_>>();
+    let mut seen_patch_sources = BTreeSet::new();
     for entry in &patch.entries {
-        if !seen.insert(evidence_entry_identity_key(entry)) {
+        if !seen_patch_sources.insert(evidence_entry_source_key(entry)) {
             return Err(CoveError::MapEvidenceInvalid);
         }
     }
-    target.entries.extend(patch.entries.iter().cloned());
+    for entry in &patch.entries {
+        match target.entries.iter_mut().find(|existing| {
+            evidence_entry_source_key(existing) == evidence_entry_source_key(entry)
+        }) {
+            Some(existing) => *existing = entry.clone(),
+            None => target.entries.push(entry.clone()),
+        }
+    }
     Ok(())
 }
 
@@ -745,27 +941,31 @@ fn merge_projection_patch(
         return Err(CoveError::MapInvalid);
     }
 
-    let mut seen = target
-        .projections
-        .iter()
-        .map(|projection| projection.projection_id.clone())
-        .collect::<BTreeSet<_>>();
+    let mut seen = BTreeSet::new();
     for projection in &patch.projections {
         if !seen.insert(projection.projection_id.clone()) {
             return Err(CoveError::MapInvalid);
         }
     }
-    target.projections.extend(patch.projections.iter().cloned());
+    for projection in &patch.projections {
+        match target
+            .projections
+            .iter_mut()
+            .find(|existing| existing.projection_id == projection.projection_id)
+        {
+            Some(existing) => *existing = projection.clone(),
+            None => target.projections.push(projection.clone()),
+        }
+    }
     Ok(())
 }
 
-fn evidence_entry_identity_key(entry: &MapEvidenceEntry) -> EvidenceEntryIdentityKey {
+fn evidence_entry_source_key(entry: &MapEvidenceEntry) -> EvidenceEntrySourceKey {
     (
         entry.source_id.clone(),
         entry.source_row_identity.clone(),
         entry.rule_id.clone(),
         entry.assertion_id.clone(),
-        entry.output_object_id.clone(),
     )
 }
 
@@ -877,6 +1077,8 @@ struct CoveObjectSurfacesReadResult {
     surface: CoveObjectSurface,
     kernel_surface: Option<CoveObjectKernelSurface>,
     pushdown_report: CoveObjectReadPushdownReport,
+    dictionary: Option<FileDictionary>,
+    identity: CoveObjectDeltaParentIdentity,
 }
 
 fn read_object_surfaces_from_bytes_with_pushdown_options(
@@ -1069,6 +1271,13 @@ fn read_object_surfaces_from_bytes_with_pushdown_options(
         },
         kernel_surface: kernel_builder.map(CoveObjectKernelSurfaceBuilder::finish),
         pushdown_report,
+        dictionary,
+        identity: CoveObjectDeltaParentIdentity {
+            artifact_id: report.validated.header.file_id,
+            snapshot_id: report.validated.header.file_id,
+            file_len: report.validated.postscript.file_len,
+            footer_crc32c: report.validated.postscript.footer.crc32c,
+        },
     })
 }
 
@@ -2848,17 +3057,15 @@ mod tests {
     use crate::{
         artifact::covedelta::{
             DeltaDictionaryEntryV1, DELTA_DICTIONARY_ENTRY_KIND_CANONICAL_HASH_HINT,
-            DELTA_DICTIONARY_ENTRY_KIND_INLINE_VALUE, DELTA_REF_NONE,
+            DELTA_DICTIONARY_ENTRY_KIND_INLINE_VALUE,
+            DELTA_DICTIONARY_ENTRY_KIND_PARENT_DICTIONARY_ALIAS, DELTA_REF_NONE,
         },
-        checksum,
-        constants::{CoveEncodingKind, StorageClass},
-        dictionary::{FileDictionaryHeaderV1, FileDictionaryIndexEntryV1},
-        page::ColumnPageIndexEntryV1,
-        page_payload::ColumnPagePayloadV1,
-        profile::cove_o::{
-            TemporalRowEntryV1, TEMPORAL_ROW_ENTRY_LEN, TEMPORAL_SEGMENT_HEADER_LEN,
+        constants::StorageClass,
+        dictionary::{
+            FileDictionaryEncoding, FileDictionaryHeaderV1, FileDictionaryIndexEntryV1,
+            FileDictionaryKey,
         },
-        segment::{TableColumnDirectoryEntryV1, TABLE_COLUMN_DIRECTORY_ENTRY_LEN},
+        profile::cove_map::{MapProjectionColumn, MapProjectionEntry},
     };
 
     fn property(id: u32, name: &str, value: Value) -> CoveObjectPropertyValue {
@@ -2977,100 +3184,6 @@ mod tests {
         }
     }
 
-    fn temporal_row(timestamp_us: i64, csn: u64) -> TemporalRowEntryV1 {
-        TemporalRowEntryV1 {
-            timestamp_us,
-            csn,
-            branch_key: 0,
-            goid: [0; 16],
-            record_id: [csn as u8; 16],
-            record_kind: RecordKind::Delta,
-            prev_ref: None,
-        }
-    }
-
-    fn temporal_segment_with_filecode_property(codes: &[u32]) -> TemporalSegmentData {
-        let rows = codes
-            .iter()
-            .enumerate()
-            .map(|(idx, _)| temporal_row(10 + idx as i64, idx as u64 + 1))
-            .collect::<Vec<_>>();
-        let row_directory_offset = TEMPORAL_SEGMENT_HEADER_LEN as u64;
-        let row_bytes = (rows.len() * TEMPORAL_ROW_ENTRY_LEN) as u64;
-        let row_end = row_directory_offset + row_bytes;
-        let column_directory_offset = row_end;
-        let page_index_offset = column_directory_offset + TABLE_COLUMN_DIRECTORY_ENTRY_LEN as u64;
-        let page_index_length = crate::page::COLUMN_PAGE_INDEX_ENTRY_LEN as u64;
-        let data_offset = page_index_offset + page_index_length;
-        let mut value_bytes = Vec::with_capacity(codes.len() * 4);
-        for code in codes {
-            value_bytes.extend_from_slice(&code.to_le_bytes());
-        }
-        let payload = ColumnPagePayloadV1::build_single_node(
-            rows.len() as u32,
-            CoveEncodingKind::FileCode,
-            CoveLogicalType::Utf8,
-            CovePhysicalKind::FileCode,
-            None,
-            value_bytes,
-        )
-        .unwrap();
-        let header = TemporalSegmentHeaderV1 {
-            segment_id: 7,
-            object_type_id: 1,
-            time_range_start_us: rows.first().map(|row| row.timestamp_us).unwrap_or(0),
-            time_range_end_us: rows.last().map(|row| row.timestamp_us).unwrap_or(0),
-            csn_min: rows.first().map(|row| row.csn).unwrap_or(0),
-            csn_max: rows.last().map(|row| row.csn).unwrap_or(0),
-            row_count: rows.len() as u32,
-            morsel_count: u32::from(!rows.is_empty()),
-            morsel_row_count: rows.len() as u32,
-            column_count: 1,
-            row_directory_offset,
-            column_directory_offset,
-            page_index_offset,
-            data_offset,
-            flags: 0,
-            checksum: 0,
-        };
-        let directory = TableColumnDirectoryEntryV1 {
-            column_id: 1,
-            logical_type: CoveLogicalType::Utf8,
-            physical_kind: CovePhysicalKind::FileCode,
-            flags: 0,
-            page_index_offset,
-            page_index_length,
-            data_offset,
-            data_length: payload.len() as u64,
-            stats_ref: u32::MAX,
-            domain_ref: u32::MAX,
-            checksum: 0,
-        };
-        let page = ColumnPageIndexEntryV1 {
-            column_id: 1,
-            morsel_id: 0,
-            row_count: rows.len() as u32,
-            non_null_count: rows.len() as u32,
-            null_count: 0,
-            encoding_root: CoveEncodingKind::FileCode as u32,
-            page_offset: data_offset,
-            page_length: payload.len() as u64,
-            uncompressed_length: payload.len() as u64,
-            stats_ref: u32::MAX,
-            flags: 0,
-            checksum: checksum::crc32c(&payload),
-        };
-
-        let mut bytes = header.serialize().to_vec();
-        for row in rows {
-            bytes.extend_from_slice(&row.serialize());
-        }
-        bytes.extend_from_slice(&directory.serialize());
-        bytes.extend_from_slice(&page.serialize());
-        bytes.extend_from_slice(&payload);
-        TemporalSegmentData::parse(&bytes).unwrap()
-    }
-
     fn dictionary_overlay_entry(entry_kind: u8) -> DeltaDictionaryEntryV1 {
         DeltaDictionaryEntryV1 {
             local_dictionary_id: 0,
@@ -3080,7 +3193,7 @@ mod tests {
             entry_kind,
             flags: 0,
             inline_value_ref: if entry_kind == DELTA_DICTIONARY_ENTRY_KIND_INLINE_VALUE {
-                7
+                0
             } else {
                 DELTA_REF_NONE
             },
@@ -3093,36 +3206,151 @@ mod tests {
         }
     }
 
-    #[test]
-    fn delta_dictionary_overlay_readback_rejects_requested_filecode_materialization() {
-        let segment = temporal_segment_with_filecode_property(&[0]);
-        let object_type = filecode_object_type();
-        let entry = dictionary_overlay_entry(DELTA_DICTIONARY_ENTRY_KIND_INLINE_VALUE);
+    fn parent_alias_dictionary_overlay_entry() -> DeltaDictionaryEntryV1 {
+        let mut entry =
+            dictionary_overlay_entry(DELTA_DICTIONARY_ENTRY_KIND_PARENT_DICTIONARY_ALIAS);
+        entry.parent_ref = 0;
+        entry.parent_dictionary_id = 0;
+        entry.parent_code = 0;
+        entry.parent_dictionary_digest_ref = 0;
+        entry
+    }
 
-        let err = reject_unsupported_delta_dictionary_overlay_readback(
-            &segment,
-            &object_type,
+    fn parent_identity() -> CoveObjectDeltaParentIdentity {
+        CoveObjectDeltaParentIdentity {
+            artifact_id: [0xA0; 16],
+            snapshot_id: [0xA1; 16],
+            file_len: 4096,
+            footer_crc32c: 0xCAFE_BABE,
+        }
+    }
+
+    fn parent_ref() -> DeltaParentRefV1 {
+        let identity = parent_identity();
+        DeltaParentRefV1 {
+            parent_ref: 0,
+            parent_kind: 0,
+            flags: 0,
+            artifact_id: identity.artifact_id,
+            snapshot_id: identity.snapshot_id,
+            file_len: identity.file_len,
+            footer_crc32c: identity.footer_crc32c,
+            digest_algorithm: 1,
+            digest_len: 32,
+            digest_ref: 0,
+            uri_ref: 0,
+            schema_fingerprint_ref: 0,
+            object_catalog_fingerprint_ref: 0,
+            semantic_map_fingerprint_ref: 0,
+            projection_fingerprint_ref: 0,
+            checksum: 0,
+        }
+    }
+
+    fn utf8_dictionary(value: &str) -> FileDictionary {
+        FileDictionaryEncoding::from_keys([FileDictionaryKey::from_logical_bytes(
+            CoveLogicalType::Utf8,
+            value.as_bytes(),
+        )
+        .unwrap()])
+        .unwrap()
+        .dictionary
+    }
+
+    #[test]
+    fn delta_inline_dictionary_overlay_materializes_filecode_values() {
+        let entry = dictionary_overlay_entry(DELTA_DICTIONARY_ENTRY_KIND_INLINE_VALUE);
+        let value = DeltaInlineValueV1 {
+            value_ref: 0,
+            value_tag: ValueTag::Utf8 as u16,
+            flags: 0,
+            value: [5u8, b'A', b'l', b'p', b'h', b'a'].to_vec(),
+            checksum: 0,
+        };
+        let dictionary = delta_file_dictionary_from_overlay(
             &[entry],
-            &CoveObjectReadOptions::default(),
+            &[value],
+            &[],
+            &DeltaParentDictionaryRegistry::default(),
+        )
+        .unwrap()
+        .unwrap();
+        let object_type = filecode_object_type();
+        let decoded = decode_file_code_value(
+            &object_type.properties[0],
+            0,
+            Some(&dictionary),
+            CoveObjectRedactionReadPolicy::Refuse,
+        )
+        .unwrap();
+
+        assert_eq!(decoded.value, json!("Alpha"));
+    }
+
+    #[test]
+    fn delta_parent_dictionary_alias_materializes_filecode_values() {
+        let entry = parent_alias_dictionary_overlay_entry();
+        let mut registry = DeltaParentDictionaryRegistry::default();
+        registry.push(parent_identity(), utf8_dictionary("Alpha"));
+
+        let dictionary =
+            delta_file_dictionary_from_overlay(&[entry], &[], &[parent_ref()], &registry)
+                .unwrap()
+                .unwrap();
+        let object_type = filecode_object_type();
+        let decoded = decode_file_code_value(
+            &object_type.properties[0],
+            0,
+            Some(&dictionary),
+            CoveObjectRedactionReadPolicy::Refuse,
+        )
+        .unwrap();
+
+        assert_eq!(decoded.value, json!("Alpha"));
+    }
+
+    #[test]
+    fn delta_parent_dictionary_alias_redaction_policy_is_preserved() {
+        let entry = parent_alias_dictionary_overlay_entry();
+        let mut registry = DeltaParentDictionaryRegistry::default();
+        registry.push(parent_identity(), redacted_dictionary());
+
+        let dictionary =
+            delta_file_dictionary_from_overlay(&[entry], &[], &[parent_ref()], &registry)
+                .unwrap()
+                .unwrap();
+        let object_type = filecode_object_type();
+        let err = decode_file_code_value(
+            &object_type.properties[0],
+            0,
+            Some(&dictionary),
+            CoveObjectRedactionReadPolicy::Refuse,
         )
         .unwrap_err();
+        assert!(format!("{err}").contains("redacted FileCode payload bytes"));
 
-        assert!(format!("{err}").contains("dictionary overlay materialization"));
+        let decoded = decode_file_code_value(
+            &object_type.properties[0],
+            0,
+            Some(&dictionary),
+            CoveObjectRedactionReadPolicy::PreserveMarker,
+        )
+        .unwrap();
+        assert!(decoded.redacted);
     }
 
     #[test]
     fn delta_dictionary_overlay_hash_hint_does_not_require_materialization() {
-        let segment = temporal_segment_with_filecode_property(&[0]);
-        let object_type = filecode_object_type();
         let entry = dictionary_overlay_entry(DELTA_DICTIONARY_ENTRY_KIND_CANONICAL_HASH_HINT);
 
-        reject_unsupported_delta_dictionary_overlay_readback(
-            &segment,
-            &object_type,
+        assert!(delta_file_dictionary_from_overlay(
             &[entry],
-            &CoveObjectReadOptions::default(),
+            &[],
+            &[],
+            &DeltaParentDictionaryRegistry::default(),
         )
-        .unwrap();
+        .unwrap()
+        .is_none());
     }
 
     #[test]
@@ -3221,6 +3449,76 @@ mod tests {
         }
     }
 
+    fn projection(id: &str, column_name: &str) -> MapProjectionEntry {
+        MapProjectionEntry {
+            projection_id: id.into(),
+            assertion_ids: Vec::new(),
+            output_table: Some(id.into()),
+            row_grain: Some("one_row_per_object".into()),
+            anchor: None,
+            temporal_mode: Some("latest_committed".into()),
+            columns: vec![MapProjectionColumn {
+                name: column_name.into(),
+                value: column_name.into(),
+                logical_type: Some("utf8".into()),
+                nested_shape: None,
+                conflict_policy: "canonical_value".into(),
+                missing_policy: "null".into(),
+                lineage: None,
+            }],
+            multi_value_policy: Some("first".into()),
+            missing_policy: "null".into(),
+            ordering: Vec::new(),
+            evidence_policy: "omit".into(),
+            output_modes: vec!["arrow".into()],
+        }
+    }
+
+    fn projection_catalog(projections: Vec<MapProjectionEntry>) -> MapProjectionCatalog {
+        MapProjectionCatalog {
+            mapping_id: "map".into(),
+            mapping_version: "v1".into(),
+            projections,
+        }
+    }
+
+    #[test]
+    fn delta_projection_patches_upsert_existing_projection_ids() {
+        let mut catalog = projection_catalog(vec![projection("people", "name")]);
+        let patch = projection_catalog(vec![
+            projection("people", "status"),
+            projection("accounts", "account_name"),
+        ]);
+
+        merge_projection_patch(&mut catalog, &patch).unwrap();
+
+        assert_eq!(catalog.projections.len(), 2);
+        let people = catalog
+            .projections
+            .iter()
+            .find(|projection| projection.projection_id == "people")
+            .unwrap();
+        assert_eq!(people.columns[0].name, "status");
+        assert!(catalog
+            .projections
+            .iter()
+            .any(|projection| projection.projection_id == "accounts"));
+    }
+
+    #[test]
+    fn delta_projection_patches_reject_duplicate_ids_inside_patch() {
+        let mut catalog = projection_catalog(vec![projection("people", "name")]);
+        let patch = projection_catalog(vec![
+            projection("people", "status"),
+            projection("people", "score"),
+        ]);
+
+        assert!(matches!(
+            merge_projection_patch(&mut catalog, &patch),
+            Err(CoveError::MapInvalid)
+        ));
+    }
+
     #[test]
     fn reconstructs_baseline_delta_and_tombstone() {
         let baseline = record(
@@ -3308,6 +3606,59 @@ mod tests {
         assert!(result.pushdown_report.segments_seen >= 1);
         assert!(result.pushdown_report.segments_skipped >= 1);
         assert!(result.surface.records.is_empty());
+    }
+
+    fn evidence_entry_for_patch(output_object_id: &str) -> MapEvidenceEntry {
+        MapEvidenceEntry {
+            source_id: "crm".into(),
+            source_row_identity: "crm:0".into(),
+            rule_id: "person".into(),
+            assertion_id: "crm_person".into(),
+            output_object_id: output_object_id.into(),
+            observed_schema_fingerprint: None,
+            observed_snapshot_digest: None,
+            operation_metadata: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn evidence_patch_replaces_existing_source_identity_target() {
+        let mut target = MapEvidenceIndex {
+            mapping_id: "people-map".into(),
+            mapping_version: "test/v1".into(),
+            entries: vec![evidence_entry_for_patch("old-goid")],
+        };
+        let patch = MapEvidenceIndex {
+            mapping_id: "people-map".into(),
+            mapping_version: "test/v1".into(),
+            entries: vec![evidence_entry_for_patch("new-goid")],
+        };
+
+        merge_evidence_patch(&mut target, &patch).unwrap();
+
+        assert_eq!(target.entries.len(), 1);
+        assert_eq!(target.entries[0].output_object_id, "new-goid");
+    }
+
+    #[test]
+    fn evidence_patch_rejects_duplicate_source_identity_targets() {
+        let mut target = MapEvidenceIndex {
+            mapping_id: "people-map".into(),
+            mapping_version: "test/v1".into(),
+            entries: Vec::new(),
+        };
+        let mut second = evidence_entry_for_patch("new-goid-2");
+        second.output_object_id = "new-goid-2".into();
+        let patch = MapEvidenceIndex {
+            mapping_id: "people-map".into(),
+            mapping_version: "test/v1".into(),
+            entries: vec![evidence_entry_for_patch("new-goid-1"), second],
+        };
+
+        assert_eq!(
+            merge_evidence_patch(&mut target, &patch),
+            Err(CoveError::MapEvidenceInvalid)
+        );
     }
 
     #[test]

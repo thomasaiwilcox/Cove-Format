@@ -19,6 +19,7 @@ pub mod bootstrap;
 pub mod coverage_plan;
 pub mod dataset_state;
 pub mod decode;
+pub mod delta_snapshot;
 pub mod execution_code;
 pub mod explain;
 pub mod expr_lowering;

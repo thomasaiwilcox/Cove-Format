@@ -1,8 +1,13 @@
 use std::{fs, path::PathBuf};
 
 use cove_core::{
+    artifact::covm::CovmDeltaPruneRequest,
+    constants::DigestAlgorithm,
     durable,
-    utility::{build_covm_artifact, build_covx_artifact},
+    utility::{
+        build_covm_artifact, build_covm_artifact_from_bytes, build_covx_artifact,
+        build_covx_artifact_from_bytes, CovmInputArtifact,
+    },
 };
 
 pub(crate) fn run_sidecar(mut args: Vec<String>) -> Result<(), String> {
@@ -222,6 +227,9 @@ fn inspect_runtime_sidecar(path: &std::path::Path, bytes: &[u8]) -> Result<(), S
 }
 
 fn build_covx_or_covm_sidecar(mut args: Vec<String>, covx: bool) -> Result<(), String> {
+    if args.iter().any(|arg| arg == "--snapshot") {
+        return build_covx_or_covm_snapshot_sidecar(args, covx);
+    }
     if args.len() < 2 {
         return Err(if covx {
             "usage: cove sidecar build covx <output.covx> <input.cove>...".into()
@@ -246,11 +254,87 @@ fn build_covx_or_covm_sidecar(mut args: Vec<String>, covx: bool) -> Result<(), S
     Ok(())
 }
 
+fn build_covx_or_covm_snapshot_sidecar(args: Vec<String>, covx: bool) -> Result<(), String> {
+    let mut snapshot = None;
+    let mut dataset = None;
+    let mut output = None;
+    let mut request = CovmDeltaPruneRequest::default();
+    let mut positional = Vec::new();
+    let mut iter = args.into_iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--snapshot" => {
+                snapshot = Some(PathBuf::from(next_value(&mut iter, "--snapshot")?));
+            }
+            "--dataset" => {
+                dataset = Some(PathBuf::from(next_value(&mut iter, "--dataset")?));
+            }
+            "--out" | "--output" => {
+                output = Some(PathBuf::from(next_value(&mut iter, "--out")?));
+            }
+            "--as-of-csn" => {
+                request.as_of_csn = Some(parse_u64(
+                    &next_value(&mut iter, "--as-of-csn")?,
+                    "--as-of-csn",
+                )?);
+            }
+            "--as-of-commit-us" => {
+                request.as_of_commit_timestamp_us = Some(parse_i64(
+                    &next_value(&mut iter, "--as-of-commit-us")?,
+                    "--as-of-commit-us",
+                )?);
+            }
+            "-h" | "--help" => {
+                return Err(if covx {
+                    "usage: cove sidecar build covx --snapshot <manifest.covm> --dataset <dir> --out <output.covx> [--as-of-csn n|--as-of-commit-us n]".into()
+                } else {
+                    "usage: cove sidecar build covm --snapshot <manifest.covm> --dataset <dir> --out <output.covm> [--as-of-csn n|--as-of-commit-us n]".into()
+                })
+            }
+            _ if arg.starts_with("--") => return Err(format!("unknown option: {arg}")),
+            _ => positional.push(PathBuf::from(arg)),
+        }
+    }
+    if output.is_none() && positional.len() == 1 {
+        output = Some(positional.remove(0));
+    }
+    if !positional.is_empty() {
+        return Err("snapshot sidecar build accepts only one output path".into());
+    }
+    let snapshot = snapshot.ok_or_else(|| "--snapshot <manifest.covm> is required".to_string())?;
+    let dataset = dataset.ok_or_else(|| "--dataset <dir> is required".to_string())?;
+    let output = output.ok_or_else(|| "--out <path> is required".to_string())?;
+    let (_snapshot, materialized) =
+        cove_datafusion::delta_snapshot::materialize_delta_snapshot(&snapshot, &dataset, request)?;
+    let uri = snapshot_artifact_uri(&snapshot, request);
+    let input = CovmInputArtifact {
+        uri,
+        bytes: &materialized.bytes,
+    };
+    let (bytes, report) = if covx {
+        build_covx_artifact_from_bytes(&output, &[input]).map_err(|error| error.to_string())?
+    } else {
+        build_covm_artifact_from_bytes(&output, &[input]).map_err(|error| error.to_string())?
+    };
+    durable::durable_replace(&output, &bytes)
+        .map_err(|error| format!("cannot durably publish {}: {error}", output.display()))?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report.to_json_value())
+            .map_err(|error| format!("cannot serialize report: {error}"))?
+    );
+    Ok(())
+}
+
 fn build_covi_sidecar(args: Vec<String>) -> Result<(), String> {
     use cove_index::build::{
         build_covi_from_cove_bytes, build_covi_from_cove_o_bytes, CoviBuildOptions,
         CoviObjectPropertyBuildOptions,
     };
+
+    if args.iter().any(|arg| arg == "--snapshot") {
+        return build_covi_snapshot_sidecar(args);
+    }
 
     if args.len() == 1 {
         let output = PathBuf::from(&args[0]);
@@ -345,4 +429,166 @@ fn build_covi_sidecar(args: Vec<String>) -> Result<(), String> {
         .map_err(|error| format!("cannot durably publish {}: {error}", output_path.display()))?;
     println!("wrote COVE-I artifact to {}", output_path.display());
     Ok(())
+}
+
+fn build_covi_snapshot_sidecar(args: Vec<String>) -> Result<(), String> {
+    use cove_index::build::{
+        build_covi_from_cove_bytes_with_delta_chain_binding,
+        build_covi_from_cove_o_bytes_with_delta_chain_binding, CoviBuildOptions,
+        CoviDeltaChainBinding, CoviObjectPropertyBuildOptions,
+    };
+
+    let mut snapshot = None;
+    let mut dataset = None;
+    let mut output = None;
+    let mut request = CovmDeltaPruneRequest::default();
+    let mut options = CoviBuildOptions::default();
+    let mut object_options = CoviObjectPropertyBuildOptions::default();
+    let mut object_properties = false;
+    let mut positional = Vec::new();
+    let mut iter = args.into_iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--snapshot" => {
+                snapshot = Some(PathBuf::from(next_value(&mut iter, "--snapshot")?));
+            }
+            "--dataset" => {
+                dataset = Some(PathBuf::from(next_value(&mut iter, "--dataset")?));
+            }
+            "--out" | "--output" => {
+                output = Some(PathBuf::from(next_value(&mut iter, "--out")?));
+            }
+            "--as-of-csn" => {
+                request.as_of_csn = Some(parse_u64(
+                    &next_value(&mut iter, "--as-of-csn")?,
+                    "--as-of-csn",
+                )?);
+            }
+            "--as-of-commit-us" => {
+                request.as_of_commit_timestamp_us = Some(parse_i64(
+                    &next_value(&mut iter, "--as-of-commit-us")?,
+                    "--as-of-commit-us",
+                )?);
+            }
+            "--table-id" => {
+                let value = next_value(&mut iter, "--table-id")?;
+                options.table_id = Some(
+                    value
+                        .parse::<u32>()
+                        .map_err(|_| format!("invalid --table-id value: {value}"))?,
+                );
+            }
+            "--column-id" => {
+                let value = next_value(&mut iter, "--column-id")?;
+                options.column_ids.push(
+                    value
+                        .parse::<u32>()
+                        .map_err(|_| format!("invalid --column-id value: {value}"))?,
+                );
+            }
+            "--all-columns" => options.all_columns = true,
+            "--object-properties" => object_properties = true,
+            "--index-only-counts" => {
+                options.include_index_only_counts = true;
+                object_options.include_index_only_counts = true;
+            }
+            "--index-only-exists" => {
+                options.include_index_only_exists = true;
+                object_options.include_index_only_exists = true;
+            }
+            "--index-only-min-max" => {
+                options.include_index_only_min_max = true;
+                object_options.include_index_only_min_max = true;
+            }
+            "--index-only-distinct-count" => {
+                options.include_index_only_distinct_count = true;
+                object_options.include_index_only_distinct_count = true;
+            }
+            "--index-only-sum-avg" => {
+                options.include_index_only_sum_avg = true;
+                object_options.include_index_only_sum_avg = true;
+            }
+            "-h" | "--help" => {
+                println!("usage: cove sidecar build covi --snapshot <manifest.covm> --dataset <dir> --out <output.covi> [--as-of-csn n|--as-of-commit-us n] [--table-id <id>] [--column-id <id> ... | --all-columns | --object-properties] [--index-only-counts] [--index-only-exists] [--index-only-min-max] [--index-only-distinct-count] [--index-only-sum-avg]");
+                return Ok(());
+            }
+            _ if arg.starts_with("--") => return Err(format!("unknown option: {arg}")),
+            _ => positional.push(PathBuf::from(arg)),
+        }
+    }
+    if output.is_none() && positional.len() == 1 {
+        output = Some(positional.remove(0));
+    }
+    if !positional.is_empty() {
+        return Err("snapshot COVE-I build accepts only one output path".into());
+    }
+    if options.all_columns && !options.column_ids.is_empty() {
+        return Err("--all-columns cannot be combined with --column-id".into());
+    }
+    if object_properties
+        && (options.all_columns || options.table_id.is_some() || !options.column_ids.is_empty())
+    {
+        return Err("--object-properties cannot be combined with table or column selection".into());
+    }
+    let snapshot = snapshot.ok_or_else(|| "--snapshot <manifest.covm> is required".to_string())?;
+    let dataset = dataset.ok_or_else(|| "--dataset <dir> is required".to_string())?;
+    let output = output.ok_or_else(|| "--out <output.covi> is required".to_string())?;
+    let (validated_snapshot, materialized) =
+        cove_datafusion::delta_snapshot::materialize_delta_snapshot(&snapshot, &dataset, request)?;
+    let algorithm = DigestAlgorithm::from_u16(validated_snapshot.extension.chain_digest_algorithm)
+        .filter(|algorithm| *algorithm != DigestAlgorithm::None)
+        .ok_or_else(|| "delta chain manifest has no usable chain digest".to_string())?;
+    let delta_chain_binding = CoviDeltaChainBinding {
+        algorithm,
+        digest: validated_snapshot.extension.chain_digest.clone(),
+    };
+    let bytes = if object_properties {
+        build_covi_from_cove_o_bytes_with_delta_chain_binding(
+            &materialized.bytes,
+            &object_options,
+            Some(&delta_chain_binding),
+        )
+    } else {
+        build_covi_from_cove_bytes_with_delta_chain_binding(
+            &materialized.bytes,
+            &options,
+            Some(&delta_chain_binding),
+        )
+    }
+    .map_err(|error| format!("{}: {error}", snapshot.display()))?;
+    durable::durable_replace(&output, &bytes)
+        .map_err(|error| format!("cannot durably publish {}: {error}", output.display()))?;
+    println!("wrote COVE-I artifact to {}", output.display());
+    Ok(())
+}
+
+fn next_value(iter: &mut impl Iterator<Item = String>, option: &str) -> Result<String, String> {
+    iter.next()
+        .ok_or_else(|| format!("{option} requires a value"))
+}
+
+fn parse_u64(value: &str, flag: &str) -> Result<u64, String> {
+    value
+        .parse::<u64>()
+        .map_err(|_| format!("{flag} requires an unsigned integer"))
+}
+
+fn parse_i64(value: &str, flag: &str) -> Result<i64, String> {
+    value
+        .parse::<i64>()
+        .map_err(|_| format!("{flag} requires an integer"))
+}
+
+fn snapshot_artifact_uri(snapshot: &std::path::Path, request: CovmDeltaPruneRequest) -> String {
+    let stem = snapshot
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("snapshot");
+    if let Some(csn) = request.as_of_csn {
+        format!("{stem}.as_of_csn_{csn}.cove")
+    } else if let Some(timestamp_us) = request.as_of_commit_timestamp_us {
+        format!("{stem}.as_of_commit_us_{timestamp_us}.cove")
+    } else {
+        format!("{stem}.snapshot.cove")
+    }
 }
