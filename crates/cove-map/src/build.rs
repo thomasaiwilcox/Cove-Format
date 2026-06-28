@@ -1330,7 +1330,7 @@ fn semantic_delta_projection_payload(
         catalog.projections.retain(|projection| {
             parent_by_id
                 .get(projection.projection_id.as_str())
-                .map_or(true, |parent| *parent != projection)
+                .is_none_or(|parent| *parent != projection)
         });
     }
     if catalog.projections.is_empty() {
