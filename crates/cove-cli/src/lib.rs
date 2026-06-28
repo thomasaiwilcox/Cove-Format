@@ -1,4 +1,5 @@
 pub mod customer360;
+mod delta;
 mod external_tables;
 mod help;
 mod output;
@@ -31,6 +32,7 @@ use customer360::{
     generate_customer360, generate_proof_suite, Customer360Options, Customer360Profile,
     ProofSuiteOptions, ProofSuiteScenario,
 };
+use delta::run_delta;
 use external_tables::{register_external_tables, ExternalTableSpec};
 use help::{print_usage, usage, HelpTopic};
 use output::{write_result, OutputFormat};
@@ -96,6 +98,9 @@ enum Command {
         args: Vec<String>,
     },
     Sidecar {
+        args: Vec<String>,
+    },
+    Delta {
         args: Vec<String>,
     },
     Digest {
@@ -223,6 +228,7 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<(), String> {
         Command::Export { format, args } => run_export(format, args),
         Command::Perf { command, args } => run_perf(command, args),
         Command::Sidecar { args } => run_sidecar(args),
+        Command::Delta { args } => run_delta(args),
         Command::Digest { args } => run_digest(args),
         Command::Profile { args } => run_profile(args),
         Command::Canonicalise { args } => run_canonicalise(args),
@@ -335,6 +341,14 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, String>
             Ok(Command::Help(HelpTopic::Sidecar))
         }
         "sidecar" => Ok(Command::Sidecar { args }),
+        "delta"
+            if args
+                .first()
+                .is_some_and(|arg| arg == "-h" || arg == "--help") =>
+        {
+            Ok(Command::Help(HelpTopic::Delta))
+        }
+        "delta" => Ok(Command::Delta { args }),
         "digest" => parse_digest(args),
         "profile" => Ok(Command::Profile { args }),
         "canonicalise" | "canonicalize" => Ok(Command::Canonicalise { args }),
@@ -1366,6 +1380,15 @@ fn run_doctor(file: &Path, json: bool) -> Result<(), String> {
 fn run_inspect(file: &Path, queries: bool, json: bool, performance: bool) -> Result<(), String> {
     let bytes =
         fs::read(file).map_err(|error| format!("cannot read {}: {error}", file.display()))?;
+    if delta::is_covedelta_bytes(&bytes) {
+        if queries || performance {
+            return Err(
+                "COVEDELTA inspect does not support --queries or --performance; use `cove delta inspect`"
+                    .into(),
+            );
+        }
+        return delta::inspect_covedelta_for_beginner(file, json);
+    }
     let discovery = discover_query_surfaces(
         &bytes,
         QuerySurfaceDiscoveryOptions {

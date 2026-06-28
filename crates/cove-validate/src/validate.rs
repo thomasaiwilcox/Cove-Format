@@ -1,8 +1,8 @@
 use std::path::Path;
 
 use cove_core::{
-    artifact::covemap::CovemapFile,
-    constants::{MAGIC_COVE, MAGIC_COVEMAP},
+    artifact::{covedelta::CoveDeltaFile, covemap::CovemapFile},
+    constants::{MAGIC_COVE, MAGIC_COVEDELTA, MAGIC_COVEMAP},
     feature_scope::FeatureUseRequestV2,
     reader::{self, ValidationOptions},
 };
@@ -26,6 +26,7 @@ pub(crate) fn validate_paths(args: &CliArgs) -> bool {
                 Path::new(path),
                 args.validation.clone(),
                 args.feature_use.clone(),
+                args.object_delta,
                 args.explain,
             )
         } else {
@@ -33,6 +34,7 @@ pub(crate) fn validate_paths(args: &CliArgs) -> bool {
                 Path::new(path),
                 args.validation.clone(),
                 args.feature_use.clone(),
+                args.object_delta,
             )
         };
         if !ok {
@@ -52,6 +54,7 @@ fn validate_file_json(
     path: &Path,
     opts: ValidationOptions,
     feature_use: Option<FeatureUseRequestV2>,
+    object_delta: bool,
     explain: bool,
 ) -> bool {
     let path_str = path.display().to_string();
@@ -75,6 +78,10 @@ fn validate_file_json(
             opts.verify_digests,
             explain,
         );
+    }
+
+    if data.len() >= 4 && data[data.len() - 4..] == MAGIC_COVEDELTA {
+        return validate_covedelta_json(&path_str, &data, object_delta, explain);
     }
 
     match validate_cove_bytes(&data, opts, feature_use) {
@@ -122,6 +129,54 @@ fn validate_file_json(
         }
         Err(error) => {
             print!("{{\"path\":{},\"ok\":false", json_str(&path_str));
+            if let Some(code) = error.spec_code() {
+                print!(",\"error_code\":{}", json_str(code));
+            }
+            print!(",\"error\":{}}}", json_str(&error.to_string()));
+            false
+        }
+    }
+}
+
+fn validate_covedelta_json(path_str: &str, data: &[u8], object_delta: bool, explain: bool) -> bool {
+    match CoveDeltaFile::parse(data).and_then(|file| {
+        if object_delta {
+            file.validate_object_delta().map(|_| file)
+        } else {
+            Ok(file)
+        }
+    }) {
+        Ok(file) => {
+            print!(
+                "{{\"path\":{},\"ok\":true,\"artifact\":\"covedelta\",\"object_delta\":{},\"version_major\":{},\"version_minor\":{},\"section_count\":{},\"parent_ref_count\":{}",
+                json_str(path_str),
+                object_delta,
+                file.header.version_major,
+                file.header.version_minor,
+                file.sections.len(),
+                file.parent_refs.len()
+            );
+            if explain {
+                print!(",\"sections\":[");
+                for (index, section) in file.sections.iter().enumerate() {
+                    if index > 0 {
+                        print!(",");
+                    }
+                    print!(
+                        "{{\"id\":{},\"kind\":{},\"offset\":{},\"length\":{}}}",
+                        section.entry.section_id,
+                        section.entry.section_kind,
+                        section.entry.offset,
+                        section.entry.length
+                    );
+                }
+                print!("]");
+            }
+            print!("}}");
+            true
+        }
+        Err(error) => {
+            print!("{{\"path\":{},\"ok\":false", json_str(path_str));
             if let Some(code) = error.spec_code() {
                 print!(",\"error_code\":{}", json_str(code));
             }
@@ -206,6 +261,7 @@ fn validate_file_text(
     path: &Path,
     opts: ValidationOptions,
     feature_use: Option<FeatureUseRequestV2>,
+    object_delta: bool,
 ) -> bool {
     let display = path.display();
     print!("Validating {display} ... ");
@@ -221,6 +277,10 @@ fn validate_file_text(
 
     if data.len() >= 4 && data[data.len() - 4..] == MAGIC_COVEMAP {
         return validate_covemap_file(&data, opts.semantic, opts.verify_digests);
+    }
+
+    if data.len() >= 4 && data[data.len() - 4..] == MAGIC_COVEDELTA {
+        return validate_covedelta_file(&data, object_delta);
     }
 
     if data.len() < 4 || data[data.len() - 4..] != MAGIC_COVE {
@@ -265,6 +325,31 @@ fn validate_file_text(
             if !metadata_json_preview.is_empty() {
                 println!("  metadata (first 120 chars): {}", &metadata_json_preview);
             }
+            true
+        }
+        Err(error) => {
+            println!("INVALID");
+            eprintln!("  [ERR] {error}");
+            false
+        }
+    }
+}
+
+fn validate_covedelta_file(data: &[u8], object_delta: bool) -> bool {
+    match CoveDeltaFile::parse(data).and_then(|file| {
+        if object_delta {
+            file.validate_object_delta().map(|_| file)
+        } else {
+            Ok(file)
+        }
+    }) {
+        Ok(_) => {
+            let mode = if object_delta {
+                "object-delta"
+            } else {
+                "structural"
+            };
+            println!("OK [covedelta {mode}]");
             true
         }
         Err(error) => {

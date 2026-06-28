@@ -26,8 +26,8 @@
 use std::collections::BTreeSet;
 
 use super::covedelta::{
-    CoveDeltaFile, DeltaParentRefV1, DELTA_FLAG_SOURCE_PUBLISH_RANGE_PRESENT,
-    DELTA_PARENT_REF_LINEAGE_PARENT, DELTA_REF_NONE,
+    CoveDeltaFile, DeltaParentRefV1, COVEDELTA_OBJECT_TEMPORAL_SUPPORTED_REQUIRED_FEATURES,
+    DELTA_FLAG_SOURCE_PUBLISH_RANGE_PRESENT, DELTA_PARENT_REF_LINEAGE_PARENT, DELTA_REF_NONE,
 };
 use crate::checksum;
 use crate::constants::{DigestAlgorithm, MAGIC_COVM, POSTSCRIPT_VERSION_V1};
@@ -75,8 +75,10 @@ pub const COVM_DELTA_CHAIN_PROFILE_ID_V1: u32 = 0x3143_4443;
 pub const COVM_DELTA_CHAIN_PROFILE_VERSION_MAJOR_V1: u16 = 1;
 pub const COVM_DELTA_CHAIN_PROFILE_VERSION_MINOR_V1: u16 = 0;
 
-/// MVP readers support no required delta feature bits yet.
-pub const COVM_DELTA_CHAIN_SUPPORTED_REQUIRED_FEATURES: u64 = 0;
+/// Delta-chain readers support the required object-temporal feature bits that
+/// `CoveDeltaFile::validate_object_delta` can validate and read back.
+pub const COVM_DELTA_CHAIN_SUPPORTED_REQUIRED_FEATURES: u64 =
+    COVEDELTA_OBJECT_TEMPORAL_SUPPORTED_REQUIRED_FEATURES;
 
 /// Encoded length of [`CovmDeltaArtifactRefV1`].
 pub const COVM_DELTA_ARTIFACT_REF_LEN: usize = 112;
@@ -3133,10 +3135,10 @@ mod tests {
     #[test]
     fn delta_chain_extension_rejects_unsupported_required_features() {
         let mut extension = sample_delta_chain_extension();
-        extension.required_delta_features = 1;
+        extension.required_delta_features = 1u64 << 63;
         assert_eq!(
             extension.serialize(),
-            Err(CoveError::UnknownRequiredFeature(1))
+            Err(CoveError::UnknownRequiredFeature(1u64 << 63))
         );
     }
 

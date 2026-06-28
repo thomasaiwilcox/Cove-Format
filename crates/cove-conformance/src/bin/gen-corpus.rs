@@ -2144,7 +2144,7 @@ fn main() {
         bad_covm_delta_chain_digest,
     );
     let mut unsupported_covm_delta_feature = covm_delta_chain_bytes.clone();
-    rewrite_covm_delta_chain_required_features(&mut unsupported_covm_delta_feature, 1);
+    rewrite_covm_delta_chain_required_features(&mut unsupported_covm_delta_feature, 1u64 << 63);
     write_fixture(
         &root,
         &mut entries,
@@ -2230,7 +2230,7 @@ fn main() {
     rewrite_covm_delta_summary_entry_required_features(
         &mut unsupported_covm_delta_summary_feature,
         0,
-        1,
+        1u64 << 63,
     );
     write_fixture(
         &root,

@@ -8,6 +8,10 @@ use std::{
 use cove_cache::CoveCoverageCacheHeaderV2;
 use cove_core::{
     artifact::{
+        covedelta::{
+            CoveDeltaFile, CoveDeltaFooterV1, CoveDeltaHeaderV1, CoveDeltaPostscriptV1,
+            DeltaParentRefV1, DELTA_PARENT_REF_LINEAGE_PARENT,
+        },
         covemap::{CovemapFile, CovemapHeaderV1, CovemapPostscriptV1},
         covm::{CovmFile, CovmFileEntryV1, CovmHeaderV1, CovmPostscriptV1},
     },
@@ -16,6 +20,10 @@ use cove_core::{
         FEATURE_SEMANTIC_MAP,
     },
     digest::compute_digest,
+    profile::cove_o::{
+        CoveObjectPropertyValue, CoveObjectState, CoveObjectTombstoneStatus, ObjectTypeEntryV1,
+        PropertyEntryV1, RecordKind, OBJECT_TYPE_FLAG_ENTITY_OBJECT,
+    },
     reader::validate_bytes,
     table::{ColumnEntry, TableCatalog, TableEntry},
     writer::{ScanPageSpec, ScanProfileCoveWriter, ScanSegment},
@@ -135,6 +143,48 @@ fn cove_t_events_bytes() -> Vec<u8> {
     let mut writer = ScanProfileCoveWriter::new(catalog);
     writer.push_segment(segment);
     writer.write().unwrap()
+}
+
+fn cove_o_thing_bytes() -> Vec<u8> {
+    let object_type = ObjectTypeEntryV1 {
+        object_type_id: 1,
+        type_name: "Thing".into(),
+        flags: OBJECT_TYPE_FLAG_ENTITY_OBJECT,
+        properties: vec![PropertyEntryV1 {
+            property_id: 1,
+            property_name: "active".into(),
+            logical_type: CoveLogicalType::Bool,
+            physical_kind: CovePhysicalKind::Boolean,
+            nullable: false,
+            collation_id: 0,
+            flags: 0,
+        }],
+    };
+    let state = CoveObjectState {
+        object_type_id: 1,
+        object_type_name: "Thing".into(),
+        object_type_flags: OBJECT_TYPE_FLAG_ENTITY_OBJECT,
+        branch_key: 0,
+        goid: [0x51; 16],
+        latest_record_id: [0x52; 16],
+        latest_segment_id: 0,
+        latest_row_index: 0,
+        timestamp_us: 1_700_000_000_000_010,
+        csn: 1,
+        record_kind: RecordKind::Snapshot,
+        tombstone_status: CoveObjectTombstoneStatus::Live,
+        properties: vec![CoveObjectPropertyValue {
+            property_id: 1,
+            property_name: "active".into(),
+            logical_type: CoveLogicalType::Bool,
+            physical_kind: CovePhysicalKind::Boolean,
+            flags: 0,
+            value: serde_json::json!(true),
+            redacted: false,
+        }],
+        association: None,
+    };
+    cove_map::compact_cove_o_from_object_states(vec![object_type], &[state]).unwrap()
 }
 
 fn cove_t_labels_bytes() -> Vec<u8> {
@@ -438,6 +488,127 @@ fn runtime_hint_bytes() -> Vec<u8> {
         version_minor: 0,
         payload_ref: u32::MAX,
         checksum: 0,
+    }
+    .serialize()
+    .unwrap()
+}
+
+fn simple_delta_bytes_for_base(base: &[u8]) -> Vec<u8> {
+    let validated = validate_bytes(base).unwrap();
+    simple_delta_bytes_for_base_with_snapshot(base, validated.header.file_id)
+}
+
+fn simple_delta_bytes_for_base_with_snapshot(base: &[u8], base_snapshot_id: [u8; 16]) -> Vec<u8> {
+    let validated = validate_bytes(base).unwrap();
+    let base_id = validated.header.file_id;
+    let mut header = CoveDeltaHeaderV1::new([0xD1; 16], [0xD0; 16], [0xD2; 16], base_snapshot_id);
+    header.chain_ordinal = 1;
+    header.chain_depth = 1;
+    header.csn_min = 1;
+    header.csn_max = 1;
+    header.commit_time_range_start_us = 1_700_000_000_000_001;
+    header.commit_time_range_end_us = 1_700_000_000_000_001;
+    header.created_at_us = 1_700_000_000_000_001;
+    let parent = DeltaParentRefV1 {
+        parent_ref: 0,
+        parent_kind: 0,
+        flags: DELTA_PARENT_REF_LINEAGE_PARENT,
+        artifact_id: base_id,
+        snapshot_id: base_snapshot_id,
+        file_len: base.len() as u64,
+        footer_crc32c: validated.postscript.footer.crc32c,
+        digest_algorithm: DigestAlgorithm::Sha256 as u16,
+        digest_len: 32,
+        digest_ref: 0,
+        uri_ref: 0,
+        schema_fingerprint_ref: 0,
+        object_catalog_fingerprint_ref: 0,
+        semantic_map_fingerprint_ref: 0,
+        projection_fingerprint_ref: 0,
+        checksum: 0,
+    };
+    CoveDeltaFile {
+        header,
+        parent_refs: vec![parent],
+        sections: Vec::new(),
+        footer: CoveDeltaFooterV1 {
+            header_offset: 0,
+            header_length: 0,
+            section_directory_offset: 0,
+            section_directory_length: 0,
+            section_count: 0,
+            parent_ref_count: 0,
+            footer_crc32c: 0,
+            checksum: 0,
+        },
+        postscript: CoveDeltaPostscriptV1 {
+            required_delta_features: 0,
+            optional_delta_features: 0,
+            file_len: 0,
+            footer_offset: 0,
+            footer_length: 0,
+            checksum: 0,
+        },
+    }
+    .serialize()
+    .unwrap()
+}
+
+fn simple_delta_bytes_for_delta_parent(parent: &[u8]) -> Vec<u8> {
+    let parsed_parent = CoveDeltaFile::parse(parent).unwrap();
+    let mut header = CoveDeltaHeaderV1::new(
+        [0xD3; 16],
+        parsed_parent.header.dataset_id,
+        [0xD4; 16],
+        parsed_parent.header.snapshot_id,
+    );
+    header.chain_ordinal = parsed_parent.header.chain_ordinal + 1;
+    header.chain_depth = parsed_parent.header.chain_depth + 1;
+    header.csn_min = parsed_parent.header.csn_max + 1;
+    header.csn_max = parsed_parent.header.csn_max + 1;
+    header.commit_time_range_start_us = parsed_parent.header.commit_time_range_end_us + 1;
+    header.commit_time_range_end_us = parsed_parent.header.commit_time_range_end_us + 1;
+    header.created_at_us = parsed_parent.header.created_at_us + 1;
+    let parent_ref = DeltaParentRefV1 {
+        parent_ref: 0,
+        parent_kind: 0,
+        flags: DELTA_PARENT_REF_LINEAGE_PARENT,
+        artifact_id: parsed_parent.header.delta_artifact_id,
+        snapshot_id: parsed_parent.header.snapshot_id,
+        file_len: parent.len() as u64,
+        footer_crc32c: parsed_parent.footer.footer_crc32c,
+        digest_algorithm: DigestAlgorithm::Sha256 as u16,
+        digest_len: 32,
+        digest_ref: 0,
+        uri_ref: parsed_parent.header.chain_ordinal,
+        schema_fingerprint_ref: 0,
+        object_catalog_fingerprint_ref: 0,
+        semantic_map_fingerprint_ref: 0,
+        projection_fingerprint_ref: 0,
+        checksum: 0,
+    };
+    CoveDeltaFile {
+        header,
+        parent_refs: vec![parent_ref],
+        sections: Vec::new(),
+        footer: CoveDeltaFooterV1 {
+            header_offset: 0,
+            header_length: 0,
+            section_directory_offset: 0,
+            section_directory_length: 0,
+            section_count: 0,
+            parent_ref_count: 0,
+            footer_crc32c: 0,
+            checksum: 0,
+        },
+        postscript: CoveDeltaPostscriptV1 {
+            required_delta_features: 0,
+            optional_delta_features: 0,
+            file_len: 0,
+            footer_offset: 0,
+            footer_length: 0,
+            checksum: 0,
+        },
     }
     .serialize()
     .unwrap()
@@ -1798,6 +1969,344 @@ fn unified_convert_and_map_commands_delegate_existing_tools() {
         String::from_utf8_lossy(&map_preview.stderr)
     );
     assert!(String::from_utf8_lossy(&map_preview.stdout).contains("test/v1"));
+}
+
+#[test]
+fn delta_cli_commands_validate_plan_and_publish_delta_chains() {
+    let workspace = workspace_dir();
+    let fixture = workspace.join("conformance/accept/covedelta_object_delta_valid.covedelta");
+
+    let inspect = run_cove(&["delta", "inspect", fixture.to_str().unwrap(), "--json"]);
+    assert!(
+        inspect.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&inspect.stderr)
+    );
+    let inspected: serde_json::Value = serde_json::from_slice(&inspect.stdout).unwrap();
+    assert_eq!(inspected["artifact"], serde_json::json!("covedelta"));
+    assert_eq!(inspected["object_delta"]["valid"], serde_json::json!(true));
+
+    let validate = run_cove(&[
+        "delta",
+        "validate",
+        fixture.to_str().unwrap(),
+        "--object-delta",
+        "--json",
+    ]);
+    assert!(
+        validate.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&validate.stderr)
+    );
+    let validated: serde_json::Value = serde_json::from_slice(&validate.stdout).unwrap();
+    assert_eq!(validated["ok"], serde_json::json!(true));
+
+    let routed_validate = run_cove(&["validate", "--object-delta", fixture.to_str().unwrap()]);
+    assert!(
+        routed_validate.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&routed_validate.stderr)
+    );
+
+    let dump_summary = run_cove(&["delta", "dump", fixture.to_str().unwrap(), "--summary"]);
+    assert!(
+        dump_summary.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&dump_summary.stderr)
+    );
+    assert!(String::from_utf8_lossy(&dump_summary.stdout).contains("temporal_segments"));
+
+    let base = temp_file("delta-cli-base.cove");
+    let delta = temp_file("delta-cli-delta.covedelta");
+    let manifest = temp_file("delta-cli-chain.covm");
+    let base_bytes = cove_t_events_bytes();
+    fs::write(&base, &base_bytes).unwrap();
+    let first_delta_bytes = simple_delta_bytes_for_base_with_snapshot(&base_bytes, [0xB0; 16]);
+    fs::write(&delta, &first_delta_bytes).unwrap();
+
+    let publish = run_cove(&[
+        "delta",
+        "publish",
+        "--base",
+        base.to_str().unwrap(),
+        "--delta",
+        delta.to_str().unwrap(),
+        "--out",
+        manifest.to_str().unwrap(),
+        "--json",
+    ]);
+    assert!(
+        publish.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&publish.stdout),
+        String::from_utf8_lossy(&publish.stderr)
+    );
+    let published: serde_json::Value = serde_json::from_slice(&publish.stdout).unwrap();
+    assert_eq!(published["ok"], serde_json::json!(true));
+    assert_eq!(published["delta_count"], serde_json::json!(1));
+
+    let bad_parent_delta = temp_file("delta-cli-bad-parent.covedelta");
+    let bad_parent_manifest = temp_file("delta-cli-bad-parent.covm");
+    let mut bad_parent_file = CoveDeltaFile::parse(&first_delta_bytes).unwrap();
+    bad_parent_file.parent_refs[0].artifact_id = [0xEE; 16];
+    fs::write(&bad_parent_delta, bad_parent_file.serialize().unwrap()).unwrap();
+    let bad_parent_publish = run_cove(&[
+        "delta",
+        "publish",
+        "--base",
+        base.to_str().unwrap(),
+        "--delta",
+        bad_parent_delta.to_str().unwrap(),
+        "--out",
+        bad_parent_manifest.to_str().unwrap(),
+    ]);
+    assert!(!bad_parent_publish.status.success());
+    assert!(String::from_utf8_lossy(&bad_parent_publish.stderr).contains("base artifact ID"));
+
+    let chain_inspect = run_cove(&["delta", "chain", "inspect", manifest.to_str().unwrap()]);
+    assert!(
+        chain_inspect.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&chain_inspect.stderr)
+    );
+    assert!(String::from_utf8_lossy(&chain_inspect.stdout).contains("delta_chain_required: true"));
+
+    let chain_validate = run_cove(&[
+        "delta",
+        "chain",
+        "validate",
+        manifest.to_str().unwrap(),
+        "--dataset",
+        "/",
+        "--json",
+    ]);
+    assert!(
+        chain_validate.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&chain_validate.stdout),
+        String::from_utf8_lossy(&chain_validate.stderr)
+    );
+    let chain_validated: serde_json::Value =
+        serde_json::from_slice(&chain_validate.stdout).unwrap();
+    assert_eq!(chain_validated["ok"], serde_json::json!(true));
+
+    let plan = run_cove(&[
+        "delta",
+        "chain",
+        "plan",
+        manifest.to_str().unwrap(),
+        "--dataset",
+        "/",
+        "--as-of-csn",
+        "1",
+        "--json",
+    ]);
+    assert!(
+        plan.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&plan.stdout),
+        String::from_utf8_lossy(&plan.stderr)
+    );
+    let planned: serde_json::Value = serde_json::from_slice(&plan.stdout).unwrap();
+    assert_eq!(planned["selected_chain_ordinals"][0], serde_json::json!(1));
+
+    let graph = run_cove(&[
+        "delta",
+        "chain",
+        "graph",
+        manifest.to_str().unwrap(),
+        "--dataset",
+        "/",
+    ]);
+    assert!(
+        graph.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&graph.stderr)
+    );
+    assert!(String::from_utf8_lossy(&graph.stdout).contains("->"));
+
+    let second_delta = temp_file("delta-cli-delta-2.covedelta");
+    let second_delta_bytes = simple_delta_bytes_for_delta_parent(&first_delta_bytes);
+    fs::write(&second_delta, &second_delta_bytes).unwrap();
+
+    let bad_second_delta = temp_file("delta-cli-bad-second-parent.covedelta");
+    let bad_second_manifest = temp_file("delta-cli-bad-second-parent.covm");
+    let mut bad_second_file = CoveDeltaFile::parse(&second_delta_bytes).unwrap();
+    bad_second_file.parent_refs[0].artifact_id = [0xEF; 16];
+    fs::write(&bad_second_delta, bad_second_file.serialize().unwrap()).unwrap();
+    let bad_second_publish = run_cove(&[
+        "delta",
+        "publish",
+        "--base",
+        base.to_str().unwrap(),
+        "--delta",
+        delta.to_str().unwrap(),
+        "--delta",
+        bad_second_delta.to_str().unwrap(),
+        "--out",
+        bad_second_manifest.to_str().unwrap(),
+    ]);
+    assert!(!bad_second_publish.status.success());
+    assert!(
+        String::from_utf8_lossy(&bad_second_publish.stderr).contains("previous delta artifact ID")
+    );
+
+    let extended_manifest = temp_file("delta-cli-chain-extended.covm");
+    let extend = run_cove(&[
+        "delta",
+        "chain",
+        "extend",
+        "--manifest",
+        manifest.to_str().unwrap(),
+        "--delta",
+        second_delta.to_str().unwrap(),
+        "--out",
+        extended_manifest.to_str().unwrap(),
+        "--json",
+    ]);
+    assert!(
+        extend.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&extend.stdout),
+        String::from_utf8_lossy(&extend.stderr)
+    );
+    let extended_validate = run_cove(&[
+        "delta",
+        "chain",
+        "validate",
+        extended_manifest.to_str().unwrap(),
+        "--dataset",
+        "/",
+        "--json",
+    ]);
+    assert!(
+        extended_validate.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&extended_validate.stdout),
+        String::from_utf8_lossy(&extended_validate.stderr)
+    );
+
+    let reconstructed = temp_file("delta-cli-reconstructed.cove");
+    let reconstruct = run_cove(&[
+        "delta",
+        "reconstruct",
+        manifest.to_str().unwrap(),
+        "--dataset",
+        "/",
+        "--out",
+        reconstructed.to_str().unwrap(),
+        "--json",
+    ]);
+    assert!(
+        reconstruct.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&reconstruct.stdout),
+        String::from_utf8_lossy(&reconstruct.stderr)
+    );
+    let reconstructed_json: serde_json::Value =
+        serde_json::from_slice(&reconstruct.stdout).unwrap();
+    assert_eq!(reconstructed_json["ok"], serde_json::json!(true));
+    assert!(reconstructed.exists());
+
+    let compacted = temp_file("delta-cli-compacted.cove");
+    let compacted_covm = temp_file("delta-cli-compacted.covm");
+    let compact = run_cove(&[
+        "delta",
+        "compact",
+        manifest.to_str().unwrap(),
+        "--dataset",
+        "/",
+        "--out",
+        compacted.to_str().unwrap(),
+        "--publish-covm",
+        compacted_covm.to_str().unwrap(),
+        "--json",
+    ]);
+    assert!(
+        compact.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&compact.stdout),
+        String::from_utf8_lossy(&compact.stderr)
+    );
+    let compacted_json: serde_json::Value = serde_json::from_slice(&compact.stdout).unwrap();
+    assert_eq!(compacted_json["ok"], serde_json::json!(true));
+    assert!(compacted.exists());
+    assert!(compacted_covm.exists());
+
+    let object_base = temp_file("delta-cli-object-base.cove");
+    let object_delta = temp_file("delta-cli-object-delta.covedelta");
+    let object_manifest = temp_file("delta-cli-object-chain.covm");
+    let object_bytes = cove_o_thing_bytes();
+    fs::write(&object_base, &object_bytes).unwrap();
+    fs::write(&object_delta, simple_delta_bytes_for_base(&object_bytes)).unwrap();
+    let object_publish = run_cove(&[
+        "delta",
+        "publish",
+        "--base",
+        object_base.to_str().unwrap(),
+        "--delta",
+        object_delta.to_str().unwrap(),
+        "--out",
+        object_manifest.to_str().unwrap(),
+        "--json",
+    ]);
+    assert!(
+        object_publish.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&object_publish.stdout),
+        String::from_utf8_lossy(&object_publish.stderr)
+    );
+
+    let checkpoint = temp_file("delta-cli-checkpoint.covedelta");
+    let checkpoint_summary = temp_file("delta-cli-checkpoint.cds1");
+    let checkpoint_output = run_cove(&[
+        "delta",
+        "checkpoint",
+        object_manifest.to_str().unwrap(),
+        "--dataset",
+        "/",
+        "--out",
+        checkpoint.to_str().unwrap(),
+        "--summary-out",
+        checkpoint_summary.to_str().unwrap(),
+        "--json",
+    ]);
+    assert!(
+        checkpoint_output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&checkpoint_output.stdout),
+        String::from_utf8_lossy(&checkpoint_output.stderr)
+    );
+    let checkpoint_json: serde_json::Value =
+        serde_json::from_slice(&checkpoint_output.stdout).unwrap();
+    assert_eq!(checkpoint_json["ok"], serde_json::json!(true));
+    assert_eq!(checkpoint_json["state_count"], serde_json::json!(1));
+    assert!(checkpoint.exists());
+    assert!(checkpoint_summary.exists());
+
+    let checkpoint_validate = run_cove(&[
+        "delta",
+        "validate",
+        checkpoint.to_str().unwrap(),
+        "--object-delta",
+    ]);
+    assert!(
+        checkpoint_validate.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&checkpoint_validate.stderr)
+    );
+
+    let same_path_publish = run_cove(&[
+        "delta",
+        "publish-atomic",
+        "--delta",
+        delta.to_str().unwrap(),
+        "--manifest",
+        delta.to_str().unwrap(),
+        "--json",
+    ]);
+    assert!(!same_path_publish.status.success());
+    assert!(String::from_utf8_lossy(&same_path_publish.stderr).contains("must differ"));
 }
 
 #[test]

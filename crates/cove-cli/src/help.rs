@@ -6,6 +6,7 @@ pub(crate) enum HelpTopic {
     Optimize,
     Showcase,
     Sidecar,
+    Delta,
     Convert,
     Map,
 }
@@ -22,6 +23,7 @@ pub(crate) fn usage(topic: HelpTopic) -> String {
         HelpTopic::Optimize => optimize_usage(),
         HelpTopic::Showcase => showcase_usage(),
         HelpTopic::Sidecar => sidecar_usage(),
+        HelpTopic::Delta => delta_usage(),
         HelpTopic::Convert => convert_usage(),
         HelpTopic::Map => map_usage(),
     }
@@ -47,6 +49,7 @@ fn global_usage() -> &'static str {
   cove perf <explain-pruning|plan-cost> ...
   cove sidecar inspect <index|coverage|layout|cache|runtime> <file>
   cove sidecar build <covi|covx|covm> ...
+  cove delta <inspect|validate|dump|chain|publish|publish-atomic|reconstruct|compact|checkpoint> ...
   cove digest verify <file.cove> [--require]
   cove profile <inspect|generate|validate-section> ...
   cove canonicalise <validate-payload|encode-json|check-domain|check-trust> ...
@@ -66,6 +69,7 @@ Examples:
   cove map build --verify --publish-covm --out-dir bundle mapping.covemap source.csv
   cove sidecar build covi output.cove output.covi --all-columns
   cove sidecar build covi people.cove people.covi --object-properties
+  cove delta inspect delta-0001.covedelta
   cove query --query-file query.coveql people.cove"#
 }
 
@@ -87,6 +91,10 @@ fn showcase_usage() -> &'static str {
 
 fn sidecar_usage() -> &'static str {
     "Usage:\n  cove sidecar inspect <index|coverage|layout|cache|runtime> <file>\n  cove sidecar build covi <input.cove> <output.covi> [--table-id id] [--column-id id ... | --all-columns | --object-properties]\n  cove sidecar build covx <output.covx> <input.cove>...\n  cove sidecar build covm <output.covm> <input.cove>...\n\nExamples:\n  cove sidecar inspect index events.covi\n  cove sidecar build covi events.cove events.covi --all-columns --index-only-counts\n  cove sidecar build covi people.cove people-object-properties.covi --object-properties\n  cove sidecar build covm dataset.covm shard-1.cove shard-2.cove"
+}
+
+fn delta_usage() -> &'static str {
+    crate::delta::usage()
 }
 
 fn convert_usage() -> &'static str {
