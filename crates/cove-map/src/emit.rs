@@ -307,7 +307,7 @@ pub(crate) fn evidence_encoding_summary(
     })
 }
 
-fn evidence_index_section_bytes(
+pub(crate) fn evidence_index_section_bytes(
     materialized: &MaterializedModel,
     encoding: MapEvidenceEncoding,
 ) -> Result<Vec<u8>, String> {
@@ -329,7 +329,7 @@ fn expanded_evidence_index_bytes(materialized: &MaterializedModel) -> Result<Vec
     ))
 }
 
-fn evidence_index_from_materialized(
+pub(crate) fn evidence_index_from_materialized(
     materialized: &MaterializedModel,
 ) -> Result<MapEvidenceIndex, String> {
     let bytes = expanded_evidence_index_bytes(materialized)?;

@@ -94,6 +94,21 @@ pub struct CoviObjectPropertyBuildOptions {
     pub include_projection_fragments: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoviDeltaChainBinding {
+    pub algorithm: DigestAlgorithm,
+    pub digest: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SnapshotStringTable {
+    payload: Vec<u8>,
+    item_count: u64,
+    delta_chain_digest_algorithm: u16,
+    delta_chain_digest_len: u16,
+    delta_chain_digest_offset: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct CoviProjectionColumnInput {
     pub table_id: u32,
@@ -130,6 +145,43 @@ impl CoviObjectPropertyBuildOptions {
             ..CoviBuildOptions::default()
         }
     }
+}
+
+fn snapshot_string_table(
+    file_digest: Vec<u8>,
+    delta_chain_binding: Option<&CoviDeltaChainBinding>,
+) -> Result<SnapshotStringTable, CoveError> {
+    let mut payload = file_digest;
+    let Some(binding) = delta_chain_binding else {
+        return Ok(SnapshotStringTable {
+            payload,
+            item_count: 1,
+            delta_chain_digest_algorithm: DigestAlgorithm::None as u16,
+            delta_chain_digest_len: 0,
+            delta_chain_digest_offset: 0,
+        });
+    };
+    match binding.algorithm {
+        DigestAlgorithm::None => return Err(CoveError::BadCovi),
+        DigestAlgorithm::Sha256 | DigestAlgorithm::Blake3 => {
+            if binding.digest.len() != 32 {
+                return Err(CoveError::BadCovi);
+            }
+        }
+        _ => return Err(CoveError::BadCovi),
+    }
+    let delta_chain_digest_offset =
+        u64::try_from(payload.len()).map_err(|_| CoveError::ArithOverflow)?;
+    let delta_chain_digest_len =
+        u16::try_from(binding.digest.len()).map_err(|_| CoveError::ArithOverflow)?;
+    payload.extend_from_slice(&binding.digest);
+    Ok(SnapshotStringTable {
+        payload,
+        item_count: 2,
+        delta_chain_digest_algorithm: binding.algorithm as u16,
+        delta_chain_digest_len,
+        delta_chain_digest_offset,
+    })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -177,6 +229,14 @@ pub fn build_covi_from_cove_bytes(
     input: &[u8],
     options: &CoviBuildOptions,
 ) -> Result<Vec<u8>, CoveError> {
+    build_covi_from_cove_bytes_with_delta_chain_binding(input, options, None)
+}
+
+pub fn build_covi_from_cove_bytes_with_delta_chain_binding(
+    input: &[u8],
+    options: &CoviBuildOptions,
+    delta_chain_binding: Option<&CoviDeltaChainBinding>,
+) -> Result<Vec<u8>, CoveError> {
     if options.all_columns && !options.column_ids.is_empty() {
         return Err(CoveError::BadCovi);
     }
@@ -212,6 +272,11 @@ pub fn build_covi_from_cove_bytes(
     let dataset_id = mounted.header.file_id;
     let snapshot_id = derived_snapshot_id(input, postscript.footer.crc32c);
     let file_digest = compute_digest(DigestAlgorithm::Sha256, input)?;
+    let digest_len = file_digest
+        .len()
+        .try_into()
+        .map_err(|_| CoveError::ArithOverflow)?;
+    let string_table = snapshot_string_table(file_digest, delta_chain_binding)?;
     let referenced_file = CoviReferencedFileV2 {
         file_ref: 0,
         flags: 0,
@@ -219,10 +284,7 @@ pub fn build_covi_from_cove_bytes(
         file_len: input.len() as u64,
         footer_crc32c: postscript.footer.crc32c,
         digest_algorithm: DigestAlgorithm::Sha256 as u16,
-        digest_len: file_digest
-            .len()
-            .try_into()
-            .map_err(|_| CoveError::ArithOverflow)?,
+        digest_len,
         digest_offset: 0,
         uri_ref: u32::MAX,
         schema_fingerprint_ref: u32::MAX,
@@ -236,9 +298,9 @@ pub fn build_covi_from_cove_bytes(
         semantic_map_fingerprint_ref: u32::MAX,
         external_visibility_ref: u32::MAX,
         data_checksum_root_ref: u32::MAX,
-        delta_chain_digest_algorithm: DigestAlgorithm::None as u16,
-        delta_chain_digest_len: 0,
-        delta_chain_digest_offset: 0,
+        delta_chain_digest_algorithm: string_table.delta_chain_digest_algorithm,
+        delta_chain_digest_len: string_table.delta_chain_digest_len,
+        delta_chain_digest_offset: string_table.delta_chain_digest_offset,
         valid_from_us: mounted.header.created_at_us,
         valid_until_us: i64::MAX,
         flags: 0,
@@ -250,8 +312,8 @@ pub fn build_covi_from_cove_bytes(
     let mut section_payloads = vec![CoviSectionPayloadV2 {
         section_id: 1,
         section_kind: CoviSectionKindV2::StringTable,
-        payload: file_digest,
-        item_count: 1,
+        payload: string_table.payload,
+        item_count: string_table.item_count,
         required_features: 0,
         optional_features: 0,
     }];
@@ -452,6 +514,14 @@ pub fn build_covi_from_cove_o_bytes(
     input: &[u8],
     options: &CoviObjectPropertyBuildOptions,
 ) -> Result<Vec<u8>, CoveError> {
+    build_covi_from_cove_o_bytes_with_delta_chain_binding(input, options, None)
+}
+
+pub fn build_covi_from_cove_o_bytes_with_delta_chain_binding(
+    input: &[u8],
+    options: &CoviObjectPropertyBuildOptions,
+    delta_chain_binding: Option<&CoviDeltaChainBinding>,
+) -> Result<Vec<u8>, CoveError> {
     let postscript = CovePostscriptV1::parse_from_tail(input)?;
     let validation = validate_bytes_with_options(
         input,
@@ -475,6 +545,11 @@ pub fn build_covi_from_cove_o_bytes(
     let dataset_id = validation.validated.header.file_id;
     let snapshot_id = derived_snapshot_id(input, postscript.footer.crc32c);
     let file_digest = compute_digest(DigestAlgorithm::Sha256, input)?;
+    let digest_len = file_digest
+        .len()
+        .try_into()
+        .map_err(|_| CoveError::ArithOverflow)?;
+    let string_table = snapshot_string_table(file_digest, delta_chain_binding)?;
     let referenced_file = CoviReferencedFileV2 {
         file_ref: 0,
         flags: 0,
@@ -482,10 +557,7 @@ pub fn build_covi_from_cove_o_bytes(
         file_len: input.len() as u64,
         footer_crc32c: postscript.footer.crc32c,
         digest_algorithm: DigestAlgorithm::Sha256 as u16,
-        digest_len: file_digest
-            .len()
-            .try_into()
-            .map_err(|_| CoveError::ArithOverflow)?,
+        digest_len,
         digest_offset: 0,
         uri_ref: u32::MAX,
         schema_fingerprint_ref: u32::MAX,
@@ -499,9 +571,9 @@ pub fn build_covi_from_cove_o_bytes(
         semantic_map_fingerprint_ref: u32::MAX,
         external_visibility_ref: u32::MAX,
         data_checksum_root_ref: u32::MAX,
-        delta_chain_digest_algorithm: DigestAlgorithm::None as u16,
-        delta_chain_digest_len: 0,
-        delta_chain_digest_offset: 0,
+        delta_chain_digest_algorithm: string_table.delta_chain_digest_algorithm,
+        delta_chain_digest_len: string_table.delta_chain_digest_len,
+        delta_chain_digest_offset: string_table.delta_chain_digest_offset,
         valid_from_us: validation.validated.header.created_at_us,
         valid_until_us: i64::MAX,
         flags: 0,
@@ -515,8 +587,8 @@ pub fn build_covi_from_cove_o_bytes(
     let mut section_payloads = vec![CoviSectionPayloadV2 {
         section_id: 1,
         section_kind: CoviSectionKindV2::StringTable,
-        payload: file_digest,
-        item_count: 1,
+        payload: string_table.payload,
+        item_count: string_table.item_count,
         required_features: 0,
         optional_features: 0,
     }];
@@ -811,6 +883,14 @@ pub fn build_projection_columns_covi_for_cove_o_bytes(
     input: &[u8],
     columns: &[CoviProjectionColumnInput],
 ) -> Result<Vec<u8>, CoveError> {
+    build_projection_columns_covi_for_cove_o_bytes_with_delta_chain_binding(input, columns, None)
+}
+
+pub fn build_projection_columns_covi_for_cove_o_bytes_with_delta_chain_binding(
+    input: &[u8],
+    columns: &[CoviProjectionColumnInput],
+    delta_chain_binding: Option<&CoviDeltaChainBinding>,
+) -> Result<Vec<u8>, CoveError> {
     let postscript = CovePostscriptV1::parse_from_tail(input)?;
     let validation = validate_bytes_with_options(
         input,
@@ -825,6 +905,11 @@ pub fn build_projection_columns_covi_for_cove_o_bytes(
     let dataset_id = validation.validated.header.file_id;
     let snapshot_id = derived_snapshot_id(input, postscript.footer.crc32c);
     let file_digest = compute_digest(DigestAlgorithm::Sha256, input)?;
+    let digest_len = file_digest
+        .len()
+        .try_into()
+        .map_err(|_| CoveError::ArithOverflow)?;
+    let string_table = snapshot_string_table(file_digest, delta_chain_binding)?;
     let referenced_file = CoviReferencedFileV2 {
         file_ref: 0,
         flags: 0,
@@ -832,10 +917,7 @@ pub fn build_projection_columns_covi_for_cove_o_bytes(
         file_len: input.len() as u64,
         footer_crc32c: postscript.footer.crc32c,
         digest_algorithm: DigestAlgorithm::Sha256 as u16,
-        digest_len: file_digest
-            .len()
-            .try_into()
-            .map_err(|_| CoveError::ArithOverflow)?,
+        digest_len,
         digest_offset: 0,
         uri_ref: u32::MAX,
         schema_fingerprint_ref: u32::MAX,
@@ -849,9 +931,9 @@ pub fn build_projection_columns_covi_for_cove_o_bytes(
         semantic_map_fingerprint_ref: u32::MAX,
         external_visibility_ref: u32::MAX,
         data_checksum_root_ref: u32::MAX,
-        delta_chain_digest_algorithm: DigestAlgorithm::None as u16,
-        delta_chain_digest_len: 0,
-        delta_chain_digest_offset: 0,
+        delta_chain_digest_algorithm: string_table.delta_chain_digest_algorithm,
+        delta_chain_digest_len: string_table.delta_chain_digest_len,
+        delta_chain_digest_offset: string_table.delta_chain_digest_offset,
         valid_from_us: validation.validated.header.created_at_us,
         valid_until_us: i64::MAX,
         flags: 0,
@@ -863,8 +945,8 @@ pub fn build_projection_columns_covi_for_cove_o_bytes(
     let mut section_payloads = vec![CoviSectionPayloadV2 {
         section_id: 1,
         section_kind: CoviSectionKindV2::StringTable,
-        payload: file_digest,
-        item_count: 1,
+        payload: string_table.payload,
+        item_count: string_table.item_count,
         required_features: 0,
         optional_features: 0,
     }];

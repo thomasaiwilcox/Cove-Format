@@ -147,6 +147,30 @@ pub fn build_covx_artifact(
     inputs: &[PathBuf],
 ) -> Result<(Vec<u8>, UtilityArtifactReport), CoveError> {
     let identities = input_identities(inputs)?;
+    build_covx_artifact_from_identities(output, "cove sidecar build covx", &identities)
+}
+
+pub fn build_covx_artifact_from_bytes(
+    output: impl AsRef<Path>,
+    inputs: &[CovmInputArtifact<'_>],
+) -> Result<(Vec<u8>, UtilityArtifactReport), CoveError> {
+    if inputs.is_empty() {
+        return Err(CoveError::BadSection(
+            "expected at least one COVE input".into(),
+        ));
+    }
+    let identities = inputs
+        .iter()
+        .map(|input| input_identity_from_bytes(input.uri.clone(), input.bytes))
+        .collect::<Result<Vec<_>, _>>()?;
+    build_covx_artifact_from_identities(output, "cove sidecar build covx", &identities)
+}
+
+fn build_covx_artifact_from_identities(
+    output: impl AsRef<Path>,
+    tool: &str,
+    identities: &[InputIdentity],
+) -> Result<(Vec<u8>, UtilityArtifactReport), CoveError> {
     let accelerator_id = artifact_id(&identities)?;
     let referenced_files = identities
         .iter()
@@ -172,7 +196,7 @@ pub fn build_covx_artifact(
     let validation_result = CovxFile::parse(&bytes).is_ok();
     let digest = compute_digest(DigestAlgorithm::Sha256, &bytes)?;
     let report = UtilityArtifactReport {
-        tool: "cove sidecar build covx".into(),
+        tool: tool.into(),
         inputs: input_json(&identities),
         output: output.as_ref().display().to_string(),
         file_id: accelerator_id,

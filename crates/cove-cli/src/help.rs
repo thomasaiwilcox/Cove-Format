@@ -39,13 +39,13 @@ fn global_usage() -> &'static str {
   cove inspect [--queries] [--performance] [--json] <file>
   cove inspect [--json] [--sections stats,dictionary,execution,indexes,optional] <file...>
   cove optimize <file> [--out-dir dir] [--full] [--json]
-  cove query [--format table|json|jsonl|csv] [--take n] [--max-cell-width n] [--explain [public|developer|proof|coded|forensic]] [--engine auto|materialized|physical|compare|kernel] [--no-auto-sidecars] [--strict-performance] [--perf-report] [--batch-size n] [--external-table name=path.csv|json|jsonl] [--enable-graph-traversal] [--max-graph-depth n] [--max-graph-paths n] [--max-graph-fanout n] [--mapping file.covemap] [--member id=path] [--dataset dir] [--covi file] [--covx file] [--cove-e file] [file] '<coveql>'
+  cove query [--format table|json|jsonl|csv] [--take n] [--max-cell-width n] [--explain [public|developer|proof|coded|forensic]] [--engine auto|materialized|physical|compare|kernel] [--no-auto-sidecars] [--strict-performance] [--perf-report] [--batch-size n] [--external-table name=path.csv|json|jsonl] [--enable-graph-traversal] [--max-graph-depth n] [--max-graph-paths n] [--max-graph-fanout n] [--mapping file.covemap] [--member id=path] [--dataset dir] [--as-of-csn n|--as-of-commit-us n] [--delta-plan|--delta-plan-json] [--covi file] [--covx file] [--cove-e file] [file] '<coveql>'
   cove query [options] --query-file <path|-> [file]
   cove convert <parquet|arrow|orc|csv|report> ...
   cove validate ...
   cove dump ...
-  cove map <validate|preview|plan-keys|candidates|review|aliases|replay|convert|build|publish|doctor|suggest|parity|explain|diff|project|test> ...
-  cove export arrow ...
+  cove map <validate|preview|plan-keys|candidates|review|aliases|replay|convert|build|delta|publish|doctor|suggest|parity|explain|diff|project|test> ...
+  cove export arrow [--query '<coveql>'] ...
   cove perf <explain-pruning|plan-cost> ...
   cove sidecar inspect <index|coverage|layout|cache|runtime> <file>
   cove sidecar build <covi|covx|covm> ...
@@ -69,12 +69,13 @@ Examples:
   cove map build --verify --publish-covm --out-dir bundle mapping.covemap source.csv
   cove sidecar build covi output.cove output.covi --all-columns
   cove sidecar build covi people.cove people.covi --object-properties
+  cove sidecar build covi --snapshot dataset.covm --dataset bundle --out snapshot.covi --object-properties
   cove delta inspect delta-0001.covedelta
   cove query --query-file query.coveql people.cove"#
 }
 
 fn query_usage() -> &'static str {
-    "Usage:\n  cove query [options] [file.cove|manifest.covm] '<coveql>'\n  cove query [options] --query-file <path|-> [file.cove|manifest.covm]\n\nOutput options:\n  --format table|json|jsonl|csv\n  --take n\n  --max-cell-width n\n  --json-diagnostics\n\nExecution options:\n  --engine auto|materialized|physical|compare|kernel\n  --explain [public|developer|proof|coded|forensic]\n  --perf-report\n  --strict-performance\n  --no-auto-sidecars\n  --batch-size n\n\nInputs and sidecars:\n  --mapping file.covemap\n  --external-table name=path.csv|json|jsonl\n  --member manifest-uri=path\n  --dataset dir\n  --covi file.covi\n  --covx file.covx\n  --coverage-plan file\n  --coverage-proof file\n  --coverage-set file\n  --layout-plan file\n  --scan-split-index file\n  --page-cluster-directory file\n  --zero-copy-buffer-map file\n  --coverage-cache file\n  --cove-e file\n\nGraph traversal:\n  --enable-graph-traversal\n  --max-graph-depth n\n  --max-graph-paths n\n  --max-graph-fanout n\n\nAuthority model:\n  Materialized CoveQL readback is the semantic authority. Auto, physical, kernel,\n  and sidecar-backed execution may accelerate a query only when validated metadata\n  proves equivalence; otherwise the CLI falls back or rejects when strict mode is set.\n\nExamples:\n  cove query events.cove 'table(events).where(score >= 20).select(id, score)'\n  cove query --format jsonl people.cove 'table(people).select(score, status).take(5)'\n  cove query --engine compare --perf-report events.cove 'table(events).where(score >= 20).select(id, score)'\n  cove query --external-table weights=weights.jsonl events.cove 'table(events) as e.join(table(weights) as w, on: e.id == w.id).select(id: e.id, score: e.score, weight: w.weight)'\n  printf 'table(events).take(5)' | cove query --query-file - events.cove"
+    "Usage:\n  cove query [options] [file.cove|manifest.covm] '<coveql>'\n  cove query [options] --query-file <path|-> [file.cove|manifest.covm]\n\nOutput options:\n  --format table|json|jsonl|csv\n  --take n\n  --max-cell-width n\n  --json-diagnostics\n\nExecution options:\n  --engine auto|materialized|physical|compare|kernel\n  --explain [public|developer|proof|coded|forensic]\n  --perf-report\n  --strict-performance\n  --no-auto-sidecars\n  --batch-size n\n\nDelta snapshot options:\n  --dataset dir\n  --as-of-csn n\n  --as-of-commit-us n\n  --delta-plan\n  --delta-plan-json\n\nInputs and sidecars:\n  --mapping file.covemap\n  --external-table name=path.csv|json|jsonl\n  --member manifest-uri=path\n  --covi file.covi\n  --covx file.covx\n  --coverage-plan file\n  --coverage-proof file\n  --coverage-set file\n  --layout-plan file\n  --scan-split-index file\n  --page-cluster-directory file\n  --zero-copy-buffer-map file\n  --coverage-cache file\n  --cove-e file\n\nGraph traversal:\n  --enable-graph-traversal\n  --max-graph-depth n\n  --max-graph-paths n\n  --max-graph-fanout n\n\nAuthority model:\n  Materialized CoveQL readback is the semantic authority. Auto, physical, kernel,\n  and sidecar-backed execution may accelerate a query only when validated metadata\n  proves equivalence; otherwise the CLI falls back or rejects when strict mode is set.\n\nExamples:\n  cove query events.cove 'table(events).where(score >= 20).select(id, score)'\n  cove query --format jsonl people.cove 'table(people).select(score, status).take(5)'\n  cove query dataset.covm --dataset bundle --as-of-csn 100 --delta-plan 'object(Thing).take(10)'\n  cove query --engine compare --perf-report events.cove 'table(events).where(score >= 20).select(id, score)'\n  cove query --external-table weights=weights.jsonl events.cove 'table(events) as e.join(table(weights) as w, on: e.id == w.id).select(id: e.id, score: e.score, weight: w.weight)'\n  printf 'table(events).take(5)' | cove query --query-file - events.cove"
 }
 
 fn inspect_usage() -> &'static str {
@@ -90,7 +91,7 @@ fn showcase_usage() -> &'static str {
 }
 
 fn sidecar_usage() -> &'static str {
-    "Usage:\n  cove sidecar inspect <index|coverage|layout|cache|runtime> <file>\n  cove sidecar build covi <input.cove> <output.covi> [--table-id id] [--column-id id ... | --all-columns | --object-properties]\n  cove sidecar build covx <output.covx> <input.cove>...\n  cove sidecar build covm <output.covm> <input.cove>...\n\nExamples:\n  cove sidecar inspect index events.covi\n  cove sidecar build covi events.cove events.covi --all-columns --index-only-counts\n  cove sidecar build covi people.cove people-object-properties.covi --object-properties\n  cove sidecar build covm dataset.covm shard-1.cove shard-2.cove"
+    "Usage:\n  cove sidecar inspect <index|coverage|layout|cache|runtime> <file>\n  cove sidecar build covi <input.cove> <output.covi> [--table-id id] [--column-id id ... | --all-columns | --object-properties]\n  cove sidecar build covi --snapshot <manifest.covm> --dataset <dir> --out <output.covi> [--as-of-csn n|--as-of-commit-us n] [covi options]\n  cove sidecar build covx <output.covx> <input.cove>...\n  cove sidecar build covx --snapshot <manifest.covm> --dataset <dir> --out <output.covx> [--as-of-csn n|--as-of-commit-us n]\n  cove sidecar build covm <output.covm> <input.cove>...\n  cove sidecar build covm --snapshot <manifest.covm> --dataset <dir> --out <output.covm> [--as-of-csn n|--as-of-commit-us n]\n\nExamples:\n  cove sidecar inspect index events.covi\n  cove sidecar build covi events.cove events.covi --all-columns --index-only-counts\n  cove sidecar build covi people.cove people-object-properties.covi --object-properties\n  cove sidecar build covi --snapshot dataset.covm --dataset bundle --out snapshot.covi --object-properties\n  cove sidecar build covm dataset.covm shard-1.cove shard-2.cove"
 }
 
 fn delta_usage() -> &'static str {
@@ -114,6 +115,8 @@ fn map_usage() -> &'static str {
   cove map replay verify <mapping.covemap> <conversion-report.json>
   cove map convert [--format json|cove-o] [-o output] <mapping.covemap> <source...>
   cove map build --out-dir <dir> [--verify] [--publish-covm] [--force] [--json] [--object-name name.cove] [--projection-output cove-t|none] [--evidence-encoding compact|expanded|both] [--section-compression zstd|none] <mapping.covemap> <source...>
+  cove map delta build <manifest.covm> --dataset <dir> --out-dir <dir> [--as-of-csn n|--as-of-commit-us n] [--force] [--json] [--publish-covm] [--verify] [--projection-output cove-t|none] [--object-name name.cove]
+  cove map delta build --base <manifest.covm> --dataset <dir> --mapping <mapping.covemap> --out <delta.covedelta> [--source-publish-range start:end] [--force] [--json] <source...>
   cove map publish --bundle-dir <dir> --out <dataset.covm> [--force] [--json]
   cove map doctor [--json] [--strict] --bundle-dir <dir>
   cove map doctor [--json] [--strict] <mapping.covemap> <source...>
@@ -134,6 +137,7 @@ Examples:
   cove map preview people.covemap
   cove map convert --format cove-o -o people.cove people.covemap people.jsonl
   cove map build --verify --publish-covm --out-dir people-bundle people.covemap people.jsonl
+  cove map delta build dataset.covm --dataset bundle --out-dir delta-bundle --projection-output none
   cove map publish --bundle-dir people-bundle --out people.covm --force
   cove map candidates --out candidates.json people.covemap people.jsonl
   cove map review --out reviewed.json candidates.json

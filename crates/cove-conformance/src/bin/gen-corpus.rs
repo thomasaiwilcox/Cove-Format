@@ -35,11 +35,11 @@ use cove_core::{
             CoveDeltaFile, CoveDeltaFooterV1, CoveDeltaHeaderV1, CoveDeltaPostscriptV1,
             CoveDeltaSection, CoveDeltaSectionDirectoryEntryV1, CoveDeltaSectionKind,
             CoveObjectDeltaStateHashPropertyV1, CoveObjectDeltaStateHashV1, DeltaBranchIdentityV1,
-            DeltaContinuationAnchorV1, DeltaDictionaryEntryV1, DeltaParentRefV1,
-            DeltaScopeDescriptorV1, DeltaSidecarHintV1, DeltaSparsePatchPropertyOpV1,
-            DeltaSparsePatchRecordV1, DeltaStateHashDescriptorV1, DeltaSummaryDescriptorV1,
-            DeltaTouchedObjectRangeV1, COVEDELTA_FOOTER_LEN, COVEDELTA_HEADER_LEN,
-            COVEDELTA_POSTSCRIPT_LEN, COVEDELTA_POSTSCRIPT_TAIL_SIZE,
+            DeltaContinuationAnchorV1, DeltaDictionaryEntryV1, DeltaInlineValueV1,
+            DeltaParentRefV1, DeltaScopeDescriptorV1, DeltaSidecarHintV1,
+            DeltaSparsePatchPropertyOpV1, DeltaSparsePatchRecordV1, DeltaStateHashDescriptorV1,
+            DeltaSummaryDescriptorV1, DeltaTouchedObjectRangeV1, COVEDELTA_FOOTER_LEN,
+            COVEDELTA_HEADER_LEN, COVEDELTA_POSTSCRIPT_LEN, COVEDELTA_POSTSCRIPT_TAIL_SIZE,
             DELTA_ANCHOR_STRENGTH_KEY_AND_RECORD_ID, DELTA_ANCHOR_STRENGTH_KEY_ONLY,
             DELTA_ANCHOR_STRENGTH_KEY_RECORD_AND_STATE_HASH,
             DELTA_BRANCH_IDENTITY_KIND_CANONICAL_VALUE_REF,
@@ -6876,6 +6876,9 @@ fn main() {
                     "cargo run -p cove-cli -- profile validate-section /tmp/cove-release-gate-engine-registry.bin --kind engine-registry > /dev/null",
                     "cargo run -p cove-cli -- canonicalise validate-payload --tag int64 --hex 2a00000000000000 > /dev/null",
                     "cargo run -p cove-cli -- digest verify conformance/accept/cove_t_scan_table.cove > /dev/null",
+                    "cargo run -p cove-cli -- delta inspect conformance/accept/covedelta_valid.covedelta --json > /dev/null",
+                    "cargo run -p cove-cli -- delta validate conformance/accept/covedelta_object_delta_valid.covedelta --object-delta > /dev/null",
+                    "cargo test -p cove-cli delta_cli_commands_validate_plan_and_publish_delta_chains",
                     "cargo run -p cove-cli -- sidecar build covm /tmp/cove-release-gate.covm conformance/accept/cove_t_scan_table.cove > /dev/null",
                     "cargo run -p cove-cli -- sidecar build covx /tmp/cove-release-gate.covx conformance/accept/cove_t_scan_table.cove > /dev/null",
                     "cargo run -p cove-cli -- perf explain-pruning conformance/accept/cove_t_scan_table.cove > /dev/null",
@@ -16104,24 +16107,28 @@ fn covedelta_object_delta_with_single_scope_anchor_mismatch_file() -> Vec<u8> {
 }
 
 fn covedelta_object_delta_with_sparse_patch_file() -> Vec<u8> {
+    let mut record = valid_delta_sparse_patch_record();
+    record.changed_properties[0].value_ref = 0;
     covedelta_object_delta_file_with_rows_and_sections(
         &valid_temporal_rows(),
         DELTA_FEATURE_SPARSE_PATCH_ROWS,
-        vec![delta_property_ops_section(
-            2,
-            valid_delta_sparse_patch_record().serialize().unwrap(),
-        )],
+        vec![
+            delta_property_ops_section(2, record.serialize().unwrap()),
+            delta_string_table_section(3, 1),
+        ],
     )
 }
 
 fn covedelta_object_delta_with_dictionary_overlay_file() -> Vec<u8> {
+    let mut entry = valid_delta_dictionary_entry();
+    entry.inline_value_ref = 0;
     covedelta_object_delta_file_with_rows_and_sections(
         &valid_temporal_rows(),
         DELTA_FEATURE_INLINE_DICTIONARY,
-        vec![delta_dictionary_overlay_section(
-            2,
-            &[valid_delta_dictionary_entry()],
-        )],
+        vec![
+            delta_dictionary_overlay_section(2, &[entry]),
+            delta_string_table_section(3, 1),
+        ],
     )
 }
 
@@ -16208,11 +16215,14 @@ fn covedelta_object_delta_with_required_hash_hint_dictionary_overlay_file() -> V
 fn covedelta_object_delta_with_duplicate_dictionary_overlay_file() -> Vec<u8> {
     let first = valid_delta_dictionary_entry();
     let mut second = valid_delta_dictionary_entry();
-    second.inline_value_ref = 12;
+    second.inline_value_ref = 1;
     covedelta_object_delta_file_with_rows_and_sections(
         &valid_temporal_rows(),
         DELTA_FEATURE_INLINE_DICTIONARY,
-        vec![delta_dictionary_overlay_section(2, &[first, second])],
+        vec![
+            delta_dictionary_overlay_section(2, &[first, second]),
+            delta_string_table_section(3, 2),
+        ],
     )
 }
 
@@ -16458,10 +16468,14 @@ fn covedelta_object_delta_with_optional_section_file(
 fn covedelta_object_delta_with_mismatched_sparse_patch_file() -> Vec<u8> {
     let mut record = valid_delta_sparse_patch_record();
     record.goid = [0x01; 16];
+    record.changed_properties[0].value_ref = 0;
     covedelta_object_delta_file_with_rows_and_sections(
         &valid_temporal_rows(),
         DELTA_FEATURE_SPARSE_PATCH_ROWS,
-        vec![delta_property_ops_section(2, record.serialize().unwrap())],
+        vec![
+            delta_property_ops_section(2, record.serialize().unwrap()),
+            delta_string_table_section(3, 1),
+        ],
     )
 }
 
@@ -16521,6 +16535,40 @@ fn delta_dictionary_overlay_section(
             alignment_log2: 0,
             reserved0: 0,
             required_delta_features: dictionary_overlay_required_features(entries),
+            optional_delta_features: 0,
+            crc32c: 0,
+            checksum: 0,
+        },
+        payload,
+    }
+}
+
+fn delta_string_table_section(section_id: u32, value_count: u32) -> CoveDeltaSection {
+    let values = (0..value_count)
+        .map(valid_delta_inline_value)
+        .collect::<Vec<_>>();
+    let payload = values
+        .iter()
+        .map(DeltaInlineValueV1::serialize)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    CoveDeltaSection {
+        entry: CoveDeltaSectionDirectoryEntryV1 {
+            section_id,
+            section_kind: CoveDeltaSectionKind::StringTable as u16,
+            flags: 0,
+            offset: 0,
+            length: 0,
+            uncompressed_length: 0,
+            item_count: values.len() as u64,
+            compression: 0,
+            encryption: 0,
+            alignment_log2: 0,
+            reserved0: 0,
+            required_delta_features: 0,
             optional_delta_features: 0,
             crc32c: 0,
             checksum: 0,
@@ -18066,12 +18114,22 @@ fn valid_delta_dictionary_entry() -> DeltaDictionaryEntryV1 {
         collation_id: 0,
         entry_kind: DELTA_DICTIONARY_ENTRY_KIND_INLINE_VALUE,
         flags: 0,
-        inline_value_ref: 11,
+        inline_value_ref: 0,
         parent_ref: DELTA_REF_NONE,
         parent_dictionary_id: 0,
         parent_code: 0,
         parent_dictionary_digest_ref: DELTA_REF_NONE,
         canonical_hash128: [0; 16],
+        checksum: 0,
+    }
+}
+
+fn valid_delta_inline_value(value_ref: u32) -> DeltaInlineValueV1 {
+    DeltaInlineValueV1 {
+        value_ref,
+        value_tag: ValueTag::Utf8 as u16,
+        flags: 0,
+        value: CanonicalValue::Utf8("delta-value").encode().unwrap(),
         checksum: 0,
     }
 }

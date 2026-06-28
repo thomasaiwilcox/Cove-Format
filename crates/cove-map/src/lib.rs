@@ -65,7 +65,8 @@ pub use api::{
     cove_o_from_paths, projected_output_from_cove_o_bytes, projected_output_from_cove_o_path,
     projected_output_from_paths, projected_record_batch_from_cove_o_bytes,
     projected_record_batches_from_cove_o_bytes,
-    projected_record_batches_from_cove_o_bytes_with_catalog, projected_rows_from_cove_o_path,
+    projected_record_batches_from_cove_o_bytes_with_catalog,
+    projected_record_batches_from_cove_o_surface_with_catalog, projected_rows_from_cove_o_path,
     projected_rows_from_paths, projection_arrow_schema, projection_catalog_from_cove_o_bytes,
     projection_covi_filter_plan, projection_descriptors_from_cove_o_path,
     projection_read_requirements_for_catalog, verify_replay_report_from_paths,
@@ -75,8 +76,10 @@ pub use api::{
 pub(crate) use api::{parse_map, plan_keys, preview};
 use build::verify_from_paths;
 pub use build::{
-    build_from_paths, publish_covm_from_bundle, MapBuildOptions, MapBuildProjectionOutput,
-    MapBuildResult, MapBuildSectionCompression, MapEvidenceEncoding,
+    build_from_cove_o_bytes, build_from_paths, build_semantic_delta_from_paths,
+    publish_covm_from_bundle, MapBuildOptions, MapBuildProjectionOutput, MapBuildResult,
+    MapBuildSectionCompression, MapEvidenceEncoding, MapSemanticDeltaBuildOptions,
+    MapSemanticDeltaBuildResult, MapSemanticDeltaParent,
 };
 pub(crate) use candidates::candidate_matches;
 pub(crate) use context::{mapping_context, MappingContext};
@@ -3724,18 +3727,27 @@ mod tests {
     use arrow_array::{Array, Int64Array, RecordBatch, StringArray};
     use arrow_ipc::writer::FileWriter as IpcFileWriter;
     use cove_core::{
+        artifact::covedelta::{
+            CoveDeltaFile, DELTA_FEATURE_INLINE_DICTIONARY, DELTA_FEATURE_SPARSE_PATCH_ROWS,
+            DELTA_PROPERTY_OP_SET_VALUE,
+        },
         artifact::covemap::{
             CovemapHeaderV1, CovemapPayloadEncodingV2, CovemapPostscriptV1, CovemapSection,
             CovemapSectionEntryV1,
         },
+        artifact::covm::CovmDeltaArtifactRefV1,
         compression,
-        constants::{FEATURE_CODEC_ZSTD, FEATURE_SEMANTIC_MAP},
+        constants::{DigestAlgorithm, FEATURE_CODEC_ZSTD, FEATURE_SEMANTIC_MAP},
+        digest::compute_digest,
         profile::cove_map::{is_compact_evidence_index_bytes, MapEvidenceIndex},
         profile::cove_o::{
-            read_object_surface_from_bytes, TemporalSegmentData,
-            PROPERTY_FLAG_ASSOCIATION_FROM_GOID, PROPERTY_FLAG_ASSOCIATION_TO_GOID,
-            PROPERTY_FLAG_ASSOCIATION_TYPE, PROPERTY_FLAG_EVIDENCE_REF,
+            read_object_surface_from_base_and_delta_files, read_object_surface_from_bytes,
+            reconstruct_object_states, reconstruct_object_states_from_base_and_delta_files,
+            CoveObjectState, TemporalSegmentData, PROPERTY_FLAG_ASSOCIATION_FROM_GOID,
+            PROPERTY_FLAG_ASSOCIATION_TO_GOID, PROPERTY_FLAG_ASSOCIATION_TYPE,
+            PROPERTY_FLAG_EVIDENCE_REF,
         },
+        reader::validate_bytes,
     };
     use orc_rust::ArrowWriterBuilder as OrcWriterBuilder;
     use parquet::arrow::ArrowWriter;
@@ -4771,6 +4783,199 @@ mod tests {
         fs::write(&crm, "id,name\n1,CRM Name\n").unwrap();
         fs::write(&support, "id,name\n1,Support Name\n").unwrap();
         (map, vec![crm, support], dir)
+    }
+
+    fn write_map_and_sources(
+        label: &str,
+        map_file: &CovemapFile,
+        sources: &[(&str, &str)],
+    ) -> (PathBuf, Vec<PathBuf>, PathBuf) {
+        let dir = temp_build_dir(label);
+        let map = dir.join("mapping.covemap");
+        fs::write(&map, map_file.serialize().unwrap()).unwrap();
+        let source_paths = sources
+            .iter()
+            .map(|(name, contents)| {
+                let path = dir.join(name);
+                fs::write(&path, contents).unwrap();
+                path
+            })
+            .collect::<Vec<_>>();
+        (map, source_paths, dir)
+    }
+
+    fn empty_cove_o_parent_bytes() -> Vec<u8> {
+        compact_cove_o_from_object_states(Vec::new(), &[]).unwrap()
+    }
+
+    fn delta_parent_from_base_bytes(base: &[u8]) -> MapSemanticDeltaParent {
+        let validation = validate_bytes(base).unwrap();
+        let digest = compute_digest(DigestAlgorithm::Sha256, base).unwrap();
+        let mut digest_array = [0u8; 32];
+        digest_array.copy_from_slice(&digest);
+        let file_id = validation.header.file_id;
+        MapSemanticDeltaParent {
+            dataset_id: [0xDD; 16],
+            parent_snapshot_id: file_id,
+            chain_ordinal: 1,
+            chain_depth: 1,
+            parent_ref: CovmDeltaArtifactRefV1 {
+                chain_ordinal: 0,
+                flags: 0,
+                artifact_id: file_id,
+                snapshot_id: file_id,
+                parent_snapshot_id: [0; 16],
+                file_len: base.len() as u64,
+                footer_crc32c: validation.postscript.footer.crc32c,
+                digest_algorithm: DigestAlgorithm::Sha256 as u16,
+                digest_len: 32,
+                digest: digest_array,
+                uri_ref: 0,
+                checksum: 0,
+            },
+        }
+    }
+
+    fn semantic_delta_options(
+        out: PathBuf,
+        parent: MapSemanticDeltaParent,
+    ) -> MapSemanticDeltaBuildOptions {
+        MapSemanticDeltaBuildOptions {
+            out,
+            force: true,
+            parent,
+            parent_object_types: Vec::new(),
+            parent_object_states: Vec::new(),
+            parent_evidence_entries: Vec::new(),
+            parent_projection_catalog: None,
+            csn_start: 1,
+            commit_time_start_us: 1_800_000_000_000_000,
+            source_publish_range_us: None,
+        }
+    }
+
+    fn semantic_delta_options_from_parent_bytes(
+        out: PathBuf,
+        parent_bytes: &[u8],
+    ) -> MapSemanticDeltaBuildOptions {
+        let surface = read_object_surface_from_bytes(parent_bytes).unwrap();
+        let parent_object_states =
+            reconstruct_object_states(&surface, &Default::default()).unwrap();
+        let mut options = semantic_delta_options(out, delta_parent_from_base_bytes(parent_bytes));
+        options.parent_object_types = surface.object_types;
+        options.parent_object_states = parent_object_states;
+        options.parent_evidence_entries = surface
+            .evidence_index
+            .map(|index| index.entries)
+            .unwrap_or_default();
+        options.parent_projection_catalog = surface.projection_catalog;
+        options
+    }
+
+    fn build_semantic_delta_fixture(
+        label: &str,
+        map_file: &CovemapFile,
+        sources: &[(&str, &str)],
+        parent: MapSemanticDeltaParent,
+    ) -> (Value, Vec<u8>, PathBuf) {
+        let (map, source_paths, dir) = write_map_and_sources(label, map_file, sources);
+        let out = dir.join("semantic.covedelta");
+        let result = build_semantic_delta_from_paths(
+            &map,
+            &source_paths,
+            semantic_delta_options(out.clone(), parent),
+        )
+        .unwrap();
+        let bytes = fs::read(&out).unwrap();
+        assert_eq!(
+            result.report["format"],
+            json!("cove-map-semantic-delta-build-report-v1")
+        );
+        (result.report, bytes, dir)
+    }
+
+    fn full_rebuild_state_keys(
+        label: &str,
+        map_file: &CovemapFile,
+        sources: &[(&str, &str)],
+    ) -> Vec<StateKey> {
+        let (_map, source_paths, _dir) = write_map_and_sources(label, map_file, sources);
+        let inputs = read_source_inputs(&source_paths).unwrap();
+        validate_source_inputs(map_file, &inputs.states).unwrap();
+        let object_bytes =
+            build_cove_o_with_source_states(map_file, &inputs.rows, &inputs.states).unwrap();
+        let surface = read_object_surface_from_bytes(&object_bytes).unwrap();
+        let states = reconstruct_object_states(&surface, &Default::default()).unwrap();
+        state_keys(&states)
+    }
+
+    type StateKey = (u32, [u8; 16], Vec<(u32, Value)>);
+    type EvidenceKey = (String, String, String, String, String);
+
+    fn state_keys(states: &[CoveObjectState]) -> Vec<StateKey> {
+        let mut keys = states
+            .iter()
+            .map(|state| {
+                let mut properties = state
+                    .properties
+                    .iter()
+                    .map(|property| (property.property_id, property.value.clone()))
+                    .collect::<Vec<_>>();
+                properties.sort_by_key(|(property_id, _)| *property_id);
+                (state.object_type_id, state.goid, properties)
+            })
+            .collect::<Vec<_>>();
+        keys.sort_by_key(|(object_type_id, goid, _)| (*object_type_id, *goid));
+        keys
+    }
+
+    fn composed_delta_state_keys(base: &[u8], delta_bytes: &[u8]) -> Vec<StateKey> {
+        let delta = CoveDeltaFile::parse(delta_bytes).unwrap();
+        delta.validate_object_delta().unwrap();
+        let states = reconstruct_object_states_from_base_and_delta_files(
+            base,
+            &[delta],
+            &Default::default(),
+            &Default::default(),
+        )
+        .unwrap();
+        state_keys(&states)
+    }
+
+    fn evidence_keys_from_cove_o_bytes(bytes: &[u8]) -> BTreeSet<EvidenceKey> {
+        let surface = read_object_surface_from_bytes(bytes).unwrap();
+        evidence_keys_from_surface(&surface)
+    }
+
+    fn composed_delta_evidence_keys(base: &[u8], delta_bytes: &[u8]) -> BTreeSet<EvidenceKey> {
+        let delta = CoveDeltaFile::parse(delta_bytes).unwrap();
+        delta.validate_object_delta().unwrap();
+        let surface = read_object_surface_from_base_and_delta_files(base, &[delta]).unwrap();
+        evidence_keys_from_surface(&surface)
+    }
+
+    fn evidence_keys_from_surface(
+        surface: &cove_core::profile::cove_o::CoveObjectSurface,
+    ) -> BTreeSet<EvidenceKey> {
+        surface
+            .evidence_index
+            .as_ref()
+            .map(|index| {
+                index
+                    .entries
+                    .iter()
+                    .map(|entry| {
+                        (
+                            entry.source_id.clone(),
+                            entry.source_row_identity.clone(),
+                            entry.rule_id.clone(),
+                            entry.assertion_id.clone(),
+                            entry.output_object_id.clone(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     fn primitive_projection_map() -> CovemapFile {
@@ -6887,6 +7092,432 @@ uk-company:acme,Acme,ACME LIMITED,curated,authoritative,
                 .as_str()
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn semantic_delta_reviewed_decision_changes_fingerprint_and_matches_rebuild() {
+        let base = empty_cove_o_parent_bytes();
+        let parent = delta_parent_from_base_bytes(&base);
+        let sources = [("crm.csv", "id\n1\n"), ("support.csv", "id\n2\n")];
+        let plain = two_source_identity_map(Vec::new());
+        let mut reviewed = two_source_identity_map(Vec::new());
+        set_person_reviewed_equivalence(&mut reviewed, true);
+        add_reviewed_decisions(
+            &mut reviewed,
+            vec![reviewed_same_object_decision(
+                identity_alias_ref("Person", "crm:0"),
+                identity_alias_ref("Person", "support:0"),
+                None,
+            )],
+        );
+
+        let (plain_report, plain_delta, plain_dir) = build_semantic_delta_fixture(
+            "semantic-delta-reviewed-plain",
+            &plain,
+            &sources,
+            parent.clone(),
+        );
+        let (reviewed_report, reviewed_delta, reviewed_dir) = build_semantic_delta_fixture(
+            "semantic-delta-reviewed-merged",
+            &reviewed,
+            &sources,
+            parent,
+        );
+
+        assert_ne!(
+            plain_report["fingerprints"]["semantic_map_sha256"],
+            reviewed_report["fingerprints"]["semantic_map_sha256"]
+        );
+        assert_eq!(
+            reviewed_report["object_delta_validation"]["evidence_patches"],
+            json!(1)
+        );
+        assert!(
+            reviewed_report["object_delta_validation"]["touched_object_ranges"]
+                .as_u64()
+                .unwrap_or_default()
+                > 0,
+            "report={reviewed_report}"
+        );
+        assert_ne!(
+            composed_delta_state_keys(&base, &plain_delta),
+            composed_delta_state_keys(&base, &reviewed_delta)
+        );
+        assert_eq!(
+            composed_delta_state_keys(&base, &reviewed_delta),
+            full_rebuild_state_keys("semantic-delta-reviewed-full", &reviewed, &sources)
+        );
+
+        fs::remove_dir_all(plain_dir).unwrap();
+        fs::remove_dir_all(reviewed_dir).unwrap();
+    }
+
+    #[test]
+    fn semantic_delta_existing_parent_reviewed_identity_remap_matches_rebuild() {
+        let sources = [("crm.csv", "id\n1\n"), ("support.csv", "id\n2\n")];
+        let plain = two_source_identity_map(Vec::new());
+        let (_plain_map, plain_source_paths, plain_dir) =
+            write_map_and_sources("semantic-delta-reviewed-parent", &plain, &sources);
+        let inputs = read_source_inputs(&plain_source_paths).unwrap();
+        validate_source_inputs(&plain, &inputs.states).unwrap();
+        let parent_bytes =
+            build_cove_o_with_source_states(&plain, &inputs.rows, &inputs.states).unwrap();
+        let parent_surface = read_object_surface_from_bytes(&parent_bytes).unwrap();
+        let parent_states =
+            reconstruct_object_states(&parent_surface, &Default::default()).unwrap();
+        assert_eq!(state_keys(&parent_states).len(), 2);
+
+        let mut reviewed = two_source_identity_map(Vec::new());
+        set_person_reviewed_equivalence(&mut reviewed, true);
+        add_reviewed_decisions(
+            &mut reviewed,
+            vec![reviewed_same_object_decision(
+                identity_alias_ref("Person", "crm:0"),
+                identity_alias_ref("Person", "support:0"),
+                None,
+            )],
+        );
+        validate_source_inputs(&reviewed, &inputs.states).unwrap();
+        let rebuilt_bytes =
+            build_cove_o_with_source_states(&reviewed, &inputs.rows, &inputs.states).unwrap();
+        let rebuilt_surface = read_object_surface_from_bytes(&rebuilt_bytes).unwrap();
+        let rebuilt_states =
+            reconstruct_object_states(&rebuilt_surface, &Default::default()).unwrap();
+        assert_eq!(state_keys(&rebuilt_states).len(), 1);
+
+        let (reviewed_map, reviewed_source_paths, reviewed_dir) =
+            write_map_and_sources("semantic-delta-reviewed-remap", &reviewed, &sources);
+        let out = reviewed_dir.join("semantic.covedelta");
+        let result = build_semantic_delta_from_paths(
+            &reviewed_map,
+            &reviewed_source_paths,
+            semantic_delta_options_from_parent_bytes(out, &parent_bytes),
+        )
+        .unwrap();
+        assert!(
+            result.report["object_delta_validation"]["tombstone_object_ranges"]
+                .as_u64()
+                .unwrap_or_default()
+                > 0,
+            "report={}",
+            result.report
+        );
+        let delta_bytes = fs::read(reviewed_dir.join("semantic.covedelta")).unwrap();
+        assert_eq!(
+            composed_delta_state_keys(&parent_bytes, &delta_bytes),
+            state_keys(&rebuilt_states)
+        );
+        assert_eq!(
+            composed_delta_evidence_keys(&parent_bytes, &delta_bytes),
+            evidence_keys_from_cove_o_bytes(&rebuilt_bytes)
+        );
+
+        fs::remove_dir_all(plain_dir).unwrap();
+        fs::remove_dir_all(reviewed_dir).unwrap();
+    }
+
+    #[test]
+    fn semantic_delta_alias_catalog_change_updates_fingerprint_and_matches_rebuild() {
+        let base = empty_cove_o_parent_bytes();
+        let parent = delta_parent_from_base_bytes(&base);
+        let base_map = company_resolution_map();
+        let alias_csv =
+            br#"canonical_key,canonical_label,alias,authority,confidence_class,metadata_json
+uk-company:tesco,Tesco,Tesco PLC,curated,authoritative,{}
+uk-company:tesco,Tesco,Tesco Holdings,curated,authoritative,{}
+"#;
+        let (updated_map, alias_report) = alias_import::import_aliases_from_csv_bytes(
+            &base_map,
+            alias_csv,
+            &alias_import::AliasImportOptions {
+                catalog_id: "company_aliases".into(),
+                resolver_id: "uk_company_name_resolver".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(alias_report["alias_count"], json!(2));
+        let sources = [("suppliers.csv", "company_name\nTesco PLC\n")];
+
+        let (base_report, base_delta, base_dir) = build_semantic_delta_fixture(
+            "semantic-delta-alias-base",
+            &base_map,
+            &sources,
+            parent.clone(),
+        );
+        let (updated_report, updated_delta, updated_dir) = build_semantic_delta_fixture(
+            "semantic-delta-alias-updated",
+            &updated_map,
+            &sources,
+            parent,
+        );
+
+        assert_eq!(updated_report["counts"]["evidence_entries"], json!(1));
+        assert!(
+            updated_report["object_delta_validation"]["touched_object_ranges"]
+                .as_u64()
+                .unwrap_or_default()
+                > 0,
+            "report={updated_report}"
+        );
+        assert_ne!(
+            base_report["fingerprints"]["semantic_map_sha256"],
+            updated_report["fingerprints"]["semantic_map_sha256"]
+        );
+        assert_eq!(
+            composed_delta_state_keys(&base, &base_delta),
+            composed_delta_state_keys(&base, &updated_delta)
+        );
+        assert_eq!(
+            composed_delta_state_keys(&base, &updated_delta),
+            full_rebuild_state_keys("semantic-delta-alias-full", &updated_map, &sources)
+        );
+
+        fs::remove_dir_all(base_dir).unwrap();
+        fs::remove_dir_all(updated_dir).unwrap();
+    }
+
+    #[test]
+    fn semantic_delta_emits_inline_dictionary_overlay_for_filecode_properties() {
+        let base = empty_cove_o_parent_bytes();
+        let parent = delta_parent_from_base_bytes(&base);
+        let mut map_file = two_source_property_map("reject_conflict", None, None);
+        mutate_section_payload(&mut map_file, 3, |payload| {
+            for rule in payload["rules"].as_array_mut().unwrap() {
+                rule["property_bindings"][0]["physical_kind"] = json!("filecode");
+            }
+        });
+        let sources = [
+            ("crm.csv", "id,name\n1,Ada\n"),
+            ("support.csv", "id,name\n2,Grace\n"),
+        ];
+        let (map, source_paths, dir) =
+            write_map_and_sources("semantic-delta-filecode-overlay", &map_file, &sources);
+        let out = dir.join("semantic.covedelta");
+        let result = build_semantic_delta_from_paths(
+            &map,
+            &source_paths,
+            semantic_delta_options(out, parent),
+        )
+        .unwrap();
+        let delta_bytes = fs::read(dir.join("semantic.covedelta")).unwrap();
+        let delta = CoveDeltaFile::parse(&delta_bytes).unwrap();
+        let validation = delta.validate_object_delta().unwrap();
+        assert_eq!(validation.dictionary_overlay_entries.len(), 2);
+        assert_eq!(validation.inline_values.len(), 2);
+        assert!(
+            delta.header.required_delta_features & DELTA_FEATURE_INLINE_DICTIONARY != 0,
+            "report={}",
+            result.report
+        );
+        let states = reconstruct_object_states_from_base_and_delta_files(
+            &base,
+            &[delta],
+            &Default::default(),
+            &Default::default(),
+        )
+        .unwrap();
+        let names = states
+            .iter()
+            .flat_map(|state| state.properties.iter())
+            .filter(|property| property.property_name == "name")
+            .map(|property| property.value.clone())
+            .collect::<Vec<_>>();
+        assert!(names.contains(&json!("Ada")));
+        assert!(names.contains(&json!("Grace")));
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn semantic_delta_emits_sparse_property_ops_for_null_only_delta_rows() {
+        let map_file = two_source_property_map("reject_conflict", None, None);
+        let parent_sources = [
+            ("crm.jsonl", "{\"id\":\"1\",\"name\":\"Ada\"}\n"),
+            ("support.jsonl", "{\"id\":\"2\",\"name\":\"Grace\"}\n"),
+        ];
+        let (_parent_map, parent_source_paths, parent_dir) =
+            write_map_and_sources("semantic-delta-sparse-parent", &map_file, &parent_sources);
+        let parent_inputs = read_source_inputs(&parent_source_paths).unwrap();
+        validate_source_inputs(&map_file, &parent_inputs.states).unwrap();
+        let parent_bytes =
+            build_cove_o_with_source_states(&map_file, &parent_inputs.rows, &parent_inputs.states)
+                .unwrap();
+
+        let delta_sources = [
+            ("crm.jsonl", "{\"id\":\"1\",\"name\":null}\n"),
+            ("support.jsonl", "{\"id\":\"3\",\"name\":\"Hedy\"}\n"),
+        ];
+        let (map, source_paths, delta_dir) =
+            write_map_and_sources("semantic-delta-sparse-null", &map_file, &delta_sources);
+        let out = delta_dir.join("semantic.covedelta");
+        let result = build_semantic_delta_from_paths(
+            &map,
+            &source_paths,
+            semantic_delta_options_from_parent_bytes(out.clone(), &parent_bytes),
+        )
+        .unwrap();
+        assert_eq!(
+            result.report["object_delta_validation"]["sparse_patch_rows"],
+            json!(1),
+            "report={}",
+            result.report
+        );
+
+        let delta_bytes = fs::read(out).unwrap();
+        let delta = CoveDeltaFile::parse(&delta_bytes).unwrap();
+        let validation = delta.validate_object_delta().unwrap();
+        assert_eq!(validation.sparse_patch_records.len(), 1);
+        assert_ne!(
+            delta.header.required_delta_features & DELTA_FEATURE_SPARSE_PATCH_ROWS,
+            0
+        );
+        let states = reconstruct_object_states_from_base_and_delta_files(
+            &parent_bytes,
+            &[delta],
+            &Default::default(),
+            &Default::default(),
+        )
+        .unwrap();
+        assert!(states.iter().any(|state| {
+            state
+                .properties
+                .iter()
+                .any(|property| property.property_name == "name" && property.value == Value::Null)
+        }));
+
+        fs::remove_dir_all(parent_dir).unwrap();
+        fs::remove_dir_all(delta_dir).unwrap();
+    }
+
+    #[test]
+    fn semantic_delta_emits_sparse_set_value_property_ops() {
+        let map_file = two_source_property_map("reject_conflict", None, None);
+        let parent_sources = [
+            ("crm.jsonl", "{\"id\":\"1\",\"name\":\"Ada\"}\n"),
+            ("support.jsonl", "{\"id\":\"2\",\"name\":\"Grace\"}\n"),
+        ];
+        let (_parent_map, parent_source_paths, parent_dir) = write_map_and_sources(
+            "semantic-delta-sparse-set-parent",
+            &map_file,
+            &parent_sources,
+        );
+        let parent_inputs = read_source_inputs(&parent_source_paths).unwrap();
+        validate_source_inputs(&map_file, &parent_inputs.states).unwrap();
+        let parent_bytes =
+            build_cove_o_with_source_states(&map_file, &parent_inputs.rows, &parent_inputs.states)
+                .unwrap();
+
+        let delta_sources = [
+            ("crm.jsonl", "{\"id\":\"1\",\"name\":\"Ada Lovelace\"}\n"),
+            ("support.jsonl", "{\"id\":\"3\",\"name\":\"Hedy\"}\n"),
+        ];
+        let (map, source_paths, delta_dir) =
+            write_map_and_sources("semantic-delta-sparse-set", &map_file, &delta_sources);
+        let out = delta_dir.join("semantic.covedelta");
+        build_semantic_delta_from_paths(
+            &map,
+            &source_paths,
+            semantic_delta_options_from_parent_bytes(out.clone(), &parent_bytes),
+        )
+        .unwrap();
+
+        let delta_bytes = fs::read(out).unwrap();
+        let delta = CoveDeltaFile::parse(&delta_bytes).unwrap();
+        let validation = delta.validate_object_delta().unwrap();
+        assert_eq!(validation.sparse_patch_records.len(), 1);
+        assert_eq!(
+            validation.sparse_patch_records[0].changed_properties[0].property_op,
+            DELTA_PROPERTY_OP_SET_VALUE
+        );
+        assert!(!validation.inline_values.is_empty());
+        let states = reconstruct_object_states_from_base_and_delta_files(
+            &parent_bytes,
+            &[delta],
+            &Default::default(),
+            &Default::default(),
+        )
+        .unwrap();
+        assert!(states.iter().any(|state| {
+            state.properties.iter().any(|property| {
+                property.property_name == "name" && property.value == json!("Ada Lovelace")
+            })
+        }));
+
+        fs::remove_dir_all(parent_dir).unwrap();
+        fs::remove_dir_all(delta_dir).unwrap();
+    }
+
+    #[test]
+    fn semantic_delta_existing_parent_alias_identity_remap_matches_rebuild() {
+        let sources = [(
+            "suppliers.csv",
+            "company_name\nAcme Trading\nAcme Holdings\n",
+        )];
+        let mut base_map = company_resolution_map();
+        base_map.sections[4] = normalized_miss_resolution_catalog_section("company-map", "test/v1");
+        let (_base_map_path, base_source_paths, base_dir) =
+            write_map_and_sources("semantic-delta-alias-parent", &base_map, &sources);
+        let inputs = read_source_inputs(&base_source_paths).unwrap();
+        validate_source_inputs(&base_map, &inputs.states).unwrap();
+        let parent_bytes =
+            build_cove_o_with_source_states(&base_map, &inputs.rows, &inputs.states).unwrap();
+        let parent_surface = read_object_surface_from_bytes(&parent_bytes).unwrap();
+        let parent_states =
+            reconstruct_object_states(&parent_surface, &Default::default()).unwrap();
+        assert_eq!(state_keys(&parent_states).len(), 2);
+
+        let alias_csv =
+            br#"canonical_key,canonical_label,alias,authority,confidence_class,metadata_json
+uk-company:acme,Acme,Acme Trading,curated,authoritative,{}
+uk-company:acme,Acme,Acme Holdings,curated,authoritative,{}
+"#;
+        let (updated_map, alias_report) = alias_import::import_aliases_from_csv_bytes(
+            &base_map,
+            alias_csv,
+            &alias_import::AliasImportOptions {
+                catalog_id: "company_aliases".into(),
+                resolver_id: "uk_company_name_resolver".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(alias_report["alias_count"], json!(2));
+        validate_source_inputs(&updated_map, &inputs.states).unwrap();
+        let rebuilt_bytes =
+            build_cove_o_with_source_states(&updated_map, &inputs.rows, &inputs.states).unwrap();
+        let rebuilt_surface = read_object_surface_from_bytes(&rebuilt_bytes).unwrap();
+        let rebuilt_states =
+            reconstruct_object_states(&rebuilt_surface, &Default::default()).unwrap();
+        assert_eq!(state_keys(&rebuilt_states).len(), 1);
+
+        let (updated_map_path, updated_source_paths, updated_dir) =
+            write_map_and_sources("semantic-delta-alias-remap", &updated_map, &sources);
+        let out = updated_dir.join("semantic.covedelta");
+        let result = build_semantic_delta_from_paths(
+            &updated_map_path,
+            &updated_source_paths,
+            semantic_delta_options_from_parent_bytes(out, &parent_bytes),
+        )
+        .unwrap();
+        assert!(
+            result.report["object_delta_validation"]["tombstone_object_ranges"]
+                .as_u64()
+                .unwrap_or_default()
+                > 0,
+            "report={}",
+            result.report
+        );
+        let delta_bytes = fs::read(updated_dir.join("semantic.covedelta")).unwrap();
+        assert_eq!(
+            composed_delta_state_keys(&parent_bytes, &delta_bytes),
+            state_keys(&rebuilt_states)
+        );
+        assert_eq!(
+            composed_delta_evidence_keys(&parent_bytes, &delta_bytes),
+            evidence_keys_from_cove_o_bytes(&rebuilt_bytes)
+        );
+
+        fs::remove_dir_all(base_dir).unwrap();
+        fs::remove_dir_all(updated_dir).unwrap();
     }
 
     #[test]

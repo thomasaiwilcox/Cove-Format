@@ -79,6 +79,56 @@ The bundle writes a mapped COVE-O object, `map-build-report.json`,
 mapping declares COVE-T projection output, the command also writes
 `projections/*.cove` table baselines.
 
+## Resolver-Backed Entity Resolution
+
+COVE-MAP can resolve messy source labels through deterministic resolver
+catalogs. The supported workflow is explicit: import curated aliases, generate
+candidate evidence, review candidate matches, rebuild, and verify replay. Fuzzy
+or candidate-only matches do not merge objects unless a reviewed decision or
+authoritative resolver path permits that merge.
+
+Generate candidate matches from a mapping and source rows:
+
+```bash
+cove map candidates --out target/company-candidates.json \
+  company.covemap suppliers.jsonl invoices.jsonl crm.jsonl
+```
+
+Turn candidates into a review worklist, add reviewed decisions to the
+`reviewed_decisions` array, then import those decisions into a new mapping:
+
+```bash
+cove map review --out target/company-reviewed.json \
+  target/company-candidates.json
+
+cove map review import company.covemap target/company-reviewed.json \
+  --out company-reviewed.covemap
+```
+
+Curated alias catalogs can be imported from CSV and bound to a resolver ID:
+
+```bash
+cove map aliases import company-reviewed.covemap aliases.csv \
+  --catalog-id company_aliases \
+  --resolver-id company_name_resolver \
+  --out company-with-resolution.covemap
+```
+
+After building, verify the conversion report against the mapping, source
+fingerprints, resolver/catalog/pipeline digests, and reviewed-decision digests:
+
+```bash
+cove map build --out-dir target/company-build --force \
+  company-with-resolution.covemap suppliers.jsonl invoices.jsonl crm.jsonl
+
+cove map replay verify company-with-resolution.covemap \
+  target/company-build/map-build-report.json
+```
+
+Resolution evidence is exposed through the ordinary COVE-O evidence and
+projection surfaces, so `cove query` and DataFusion can read the materialized
+object snapshot without needing a live resolver service.
+
 ## Query A COVE-T Table
 
 `events.cove` is a tiny COVE-T table file:
@@ -212,6 +262,58 @@ back when no validated acceleration metadata is available. Physical sidecars can
 be supplied with flags such as
 `--covi`, `--covx`, `--coverage-plan`, `--coverage-proof`, `--coverage-set`,
 `--layout-plan`, `--zero-copy-buffer-map`, and `--cove-e`.
+
+## Delta Snapshots
+
+Delta-bearing datasets are selected through COVM manifests. A selected snapshot
+is an immutable base `.cove` plus an ordered `.covedelta` chain; the CLI never
+discovers undeclared deltas by scanning a directory, and a delta-bearing
+snapshot must not silently fall back to base-only results.
+
+Inspect and validate the selected chain:
+
+```bash
+cove delta chain inspect dataset.covm
+cove delta chain validate dataset.covm --dataset bundle
+cove delta chain graph dataset.covm --dataset bundle --format text
+```
+
+Plan an as-of read, then query the selected snapshot directly:
+
+```bash
+cove delta chain plan dataset.covm --dataset bundle \
+  --as-of-csn 100 --json
+
+cove query dataset.covm --dataset bundle --as-of-csn 100 --delta-plan \
+  'object(Thing).take(10)'
+```
+
+The same selected snapshot can be exported, indexed, reconstructed, or
+compacted:
+
+```bash
+cove export arrow --query 'object(Thing).take(10)' \
+  --dataset bundle --as-of-csn 100 --delta-plan-json \
+  dataset.covm snapshot.arrow
+
+cove sidecar build covi --snapshot dataset.covm --dataset bundle \
+  --out snapshot.covi --object-properties
+
+cove delta reconstruct dataset.covm --dataset bundle --out snapshot.cove
+cove delta compact dataset.covm --dataset bundle --out compacted.cove \
+  --publish-covm compacted.covm
+```
+
+COVE-MAP can also produce semantic object deltas from source rows:
+
+```bash
+cove map delta build --base dataset.covm --dataset bundle \
+  --mapping mapping.covemap --out delta-0002.covedelta sources.jsonl
+```
+
+Ordinary supported catalog patches are additive. Breaking catalog changes,
+object type reinterpretation, or resolver behavior changes should publish a new
+effective semantic-map fingerprint and usually a new base or schema branch.
 
 ## Query External Tables
 

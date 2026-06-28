@@ -30,6 +30,18 @@ sidecars, coverage proofs, layout plans, caches, indexes, and runtime planning
 hints. The rule is simple: authoritative data and validated metadata define
 truth.
 
+The current reference CLI also covers two newer workflows around those
+surfaces:
+
+- **Delta snapshots:** immutable `.covedelta` artifacts are selected through a
+  COVM dataset manifest, validated as an ordered base-plus-delta chain, and
+  exposed through `cove delta`, `cove query`, `cove export arrow`, and
+  snapshot-bound sidecar commands.
+- **Deterministic entity resolution:** COVE-MAP can use digest-pinned resolver
+  catalogs, curated aliases, reviewed decisions, candidate evidence, replay
+  verification, and resolver-aware projections without allowing silent fuzzy
+  auto-merge.
+
 ## Current Status
 
 This repository is a working standards-suite prototype, not a production data
@@ -101,6 +113,13 @@ mandatory feature pile:
   meaning, provenance, and deterministic projections.
 - **Query and access:** the CLI, CoveQL, Arrow export, and DataFusion
   integration are how users and engines touch COVE archives.
+- **Delta snapshots:** `.covedelta` artifacts, COVM delta-chain manifests,
+  reconstruction, compaction, checkpointing, source-publish pruning, and
+  delta-aware query/export paths support incremental COVE-O publication without
+  mutating existing `.cove` files.
+- **Resolver-backed mapping:** COVE-MAP resolver catalogs, alias import,
+  candidate generation, reviewed equivalences, redacted evidence, and replay
+  checks support deterministic entity-resolution workflows.
 - **Acceleration and planning:** COVE-COVERAGE, COVE-I, COVX, COVE-L, COVE-E,
   COVE-CACHE, COVE-R, range planning, and zero-copy maps help readers skip work
   safely when their contracts prove equivalence.
@@ -115,6 +134,7 @@ The format is shaped around query planning:
 - zone statistics, exact sets, blooms, lookup indexes, aggregate synopses, and
   composite indexes;
 - optional manifests, sidecars, secondary indexes, and layout metadata;
+- COVM-selected base-plus-delta object snapshots;
 - object, association, evidence, and projection metadata for semantic archives.
 
 The important distinction is authority. COVE metadata can be used as a proof
@@ -134,8 +154,9 @@ query results.
   file-format claims.
 - Some conversion/export paths are reference-grade and report unsupported
   features rather than pretending to be complete.
-- COVE-MAP is deterministic mapping and provenance machinery, not probabilistic
-  entity resolution, ETL orchestration, or AI schema matching.
+- COVE-MAP entity resolution is deterministic, digest-pinned resolver and
+  review machinery; it is not probabilistic auto-merge, ETL orchestration, or
+  AI schema matching.
 
 ## CoveQL Companion Query Layer
 
@@ -183,7 +204,8 @@ Key paths:
   inputs.
 - [`docs/coveql-quickstart.md`](./docs/coveql-quickstart.md): start here
   to inspect sample COVE files, run table/object/projection/evidence queries,
-  export JSONL/CSV, and read explain output.
+  export JSONL/CSV, work with resolver-backed mapping and delta snapshots, and
+  read explain output.
 - [`docs/customer360-showcase.md`](./docs/customer360-showcase.md): the
   data-science-oriented Customer 360 walkthrough for generating messy
   multi-source CRM/support/billing/event data, querying canonical customers and
@@ -197,6 +219,14 @@ Key paths:
   CoveQL/Object proposal and conformance decisions.
 - [`docs/proposals/coveql-query-profiles.md`](./docs/proposals/coveql-query-profiles.md):
   CoveQL-Core, Object, Table, and Graph profile contract RFC.
+- [`docs/proposals/cove-o-delta-artifacts.md`](./docs/proposals/cove-o-delta-artifacts.md):
+  design context for immutable COVE-O delta artifacts and COVM chain
+  selection.
+- [`docs/proposals/covemap-entity-resolution.md`](./docs/proposals/covemap-entity-resolution.md):
+  resolver catalog and deterministic entity-resolution design context.
+- [`docs/covemap-json-schema-v1.md`](./docs/covemap-json-schema-v1.md):
+  reference companion schema for COVE-MAP JSON payloads, including resolver
+  catalog and projection fields.
 
 Try the beginner CLI from the repository root:
 
@@ -250,9 +280,16 @@ The public utility surface is grouped under the single `cove` binary:
   common columnar or row-oriented source formats.
 - `cove validate`, `cove inspect`, and `cove dump` cover structural
   validation, readable summaries, and lower-level metadata inspection.
-- `cove map validate|preview|plan-keys|convert|build|explain|diff|project|test
-  ...` works with COVE-MAP mapping definitions, build bundles, and projection
+- `cove map validate|preview|plan-keys|convert|build|explain|diff|project|test ...`
+  works with COVE-MAP mapping definitions, build bundles, and projection
   workflows.
+- `cove map candidates|review|aliases import|replay verify ...` covers
+  resolver-backed entity-resolution review, alias import, and replay checks.
+- `cove map delta build ...` emits either a delta-built mapped bundle from a
+  selected COVM snapshot or a direct semantic `.covedelta` from source rows.
+- `cove delta inspect|validate|dump|chain|publish|publish-atomic|reconstruct|compact|checkpoint ...`
+  covers delta artifact inspection, COVM chain planning, publication,
+  maintenance, and compatibility materialization.
 - `cove sidecar inspect ...` and `cove sidecar build ...` expose expert COVE-I,
   COVX, COVM, COVE-COVERAGE, COVE-L, COVE-CACHE, and COVE-R sidecar tooling.
 - `cove export arrow`, `cove perf explain-pruning`, `cove perf plan-cost`,
@@ -311,6 +348,15 @@ It separates source-row identity from semantic object identity. Source rows are
 provenance; destination object identity is produced by declared deterministic
 identity rules and semantic join keys.
 
+Resolver-backed mapping extends that identity path with explicit resolution
+inputs. A mapping may declare normalization pipelines, `alias_catalog`
+resolvers, candidate-match rules, and reviewed decisions. Curated aliases and
+reviewed equivalences can authorize GOID merge edges when the identity rule
+permits them; fuzzy or candidate-only matches remain evidence and review input,
+not object truth. Replay verification binds the mapping, source fingerprints,
+resolver/catalog/pipeline digests, reviewed-decision digests, and generated
+evidence so a future reader can explain why rows did or did not merge.
+
 The mapping layer is intended to be:
 
 - deterministic: the same declared sources, mapping rules, and function
@@ -328,6 +374,45 @@ projection semantics.
 CoveQL is the optional read/query layer over that semantic surface. It is
 described above because it is a companion to COVE-O and COVE-MAP rather than a
 requirement for basic COVE file interoperability.
+
+### Delta Snapshots
+
+COVE files remain immutable. Incremental COVE-O publication uses an immutable
+base `.cove`, immutable `.covedelta` artifacts, and an explicit COVM snapshot
+that selects the ordered chain. Readers do not scan a directory for undeclared
+deltas, and a delta-bearing snapshot must not silently answer from base-only
+data.
+
+The current CLI can inspect and validate individual deltas, validate and plan a
+selected chain, query or export the selected snapshot, build snapshot-bound
+sidecars, reconstruct or compact to a self-contained `.cove`, and publish or
+extend COVM manifests:
+
+```bash
+cove delta inspect delta-0001.covedelta
+cove delta chain validate dataset.covm --dataset bundle
+cove delta chain plan dataset.covm --dataset bundle --as-of-csn 100 --json
+cove query dataset.covm --dataset bundle --as-of-csn 100 --delta-plan \
+  'object(Thing).take(10)'
+cove export arrow dataset.covm snapshot.arrow --dataset bundle --delta-plan-json
+cove sidecar build covi --snapshot dataset.covm --dataset bundle \
+  --out snapshot.covi --object-properties
+cove delta reconstruct dataset.covm --dataset bundle --out snapshot.cove
+cove delta compact dataset.covm --dataset bundle --out compacted.cove \
+  --publish-covm compacted.covm
+```
+
+COVE-MAP owns semantic production of resolver-aware object deltas:
+
+```bash
+cove map delta build --base dataset.covm --dataset bundle \
+  --mapping mapping.covemap --out delta-0002.covedelta sources.jsonl
+```
+
+Delta object catalogs are additive for the supported contract. Breaking catalog
+changes, object type reinterpretation, or resolver behavior changes require a
+new effective semantic-map fingerprint and normally a new base or schema branch
+rather than being hidden inside an ordinary additive delta.
 
 ### Long-Term Direction
 
@@ -382,8 +467,8 @@ implement the baseline tabular archive path.
   validation, and table scans.
 - **COVE-COVERAGE**: formal coverage providers and sets for conservative
   predicate and index planning.
-- **COVE-A / COVX / COVM**: acceleration indexes, sidecars, and dataset
-  manifests that must preserve file truth.
+- **COVE-A / COVX / COVM**: acceleration indexes, sidecars, delta-chain
+  snapshot selection, and dataset manifests that must preserve file truth.
 - **COVE-I**: optional `.covi` secondary index artifacts, including artifact
   framing, index roots, referenced-file/snapshot validity records, local block
   containers, postings, row ordinal sets, aggregate answers, and capability
@@ -393,7 +478,8 @@ implement the baseline tabular archive path.
 - **COVE-O**: optional object-temporal profile for object catalogs, temporal
   segments, deltas, branches, tombstones, and trust surfaces.
 - **COVE-MAP**: optional semantic mapping from source rows into objects,
-  associations, evidence, and deterministic projection readback.
+  associations, resolver-backed identity evidence, reviewed equivalences, and
+  deterministic projection readback.
 - **CoveQL**: optional semantic query layer over COVE-O/COVE-MAP and
   projection-backed table/graph profiles, with materialized readback as the
   authority and proof-gated optimized execution.
@@ -425,13 +511,22 @@ Important paths:
   consumption, optional COVI candidate/index-only use, metrics, COVM/COVX
   bootstrap paths, and benchmarks.
 - [`crates/cove-map`](./crates/cove-map): reference COVE-MAP execution,
-  materialization, evidence, and projection helpers.
+  materialization, resolver-backed identity planning, evidence, replay, and
+  projection helpers.
 - [`crates/coveql`](./crates/coveql): CoveQL parser, builder API,
   resolver, dependency contracts, materialized and coded execution, stable
   explain output, Arrow output, manifest-aware planning, and DataFusion table
   provider integration for COVE-O reads.
 - [`docs/mapped-cove-o-datafusion-showcase.md`](./docs/mapped-cove-o-datafusion-showcase.md):
   end-to-end multi-source mapped COVE-O showcase through DataFusion SQL.
+- [`docs/proposals/cove-o-delta-artifacts.md`](./docs/proposals/cove-o-delta-artifacts.md):
+  design context for immutable COVE-O delta artifacts, COVM chain selection,
+  pruning, compaction, and checkpointing.
+- [`docs/proposals/covemap-entity-resolution.md`](./docs/proposals/covemap-entity-resolution.md):
+  resolver catalog and deterministic entity-resolution design context.
+- [`docs/covemap-json-schema-v1.md`](./docs/covemap-json-schema-v1.md):
+  reference companion schema for COVE-MAP JSON payloads, including resolver
+  catalog and projection fields.
 - [`docs/proposals/coveql-object-query-language.md`](./docs/proposals/coveql-object-query-language.md):
   CoveQL/Object proposal and conformance decisions.
 - [`docs/proposals/coveql-query-profiles.md`](./docs/proposals/coveql-query-profiles.md):

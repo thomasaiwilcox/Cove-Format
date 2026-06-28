@@ -64,6 +64,9 @@ full_gate() {
     cargo run -p cove-cli -- canonicalise check-domain conformance/accept/cove_t_zone_stats_valid.cove > /dev/null
     cargo run -p cove-cli -- canonicalise check-trust conformance/accept/cove_o_trust_manifest_valid.cove > /dev/null
     cargo run -p cove-cli -- digest verify conformance/accept/cove_t_scan_table.cove > /dev/null
+    cargo run -p cove-cli -- delta inspect conformance/accept/covedelta_valid.covedelta --json > /dev/null
+    cargo run -p cove-cli -- delta validate conformance/accept/covedelta_object_delta_valid.covedelta --object-delta > /dev/null
+    cargo test -p cove-cli delta_cli_commands_validate_plan_and_publish_delta_chains
     cargo run -p cove-cli -- sidecar build covm /tmp/cove-release-gate.covm conformance/accept/cove_t_scan_table.cove > /dev/null
     cargo run -p cove-cli -- sidecar build covx /tmp/cove-release-gate.covx conformance/accept/cove_t_scan_table.cove > /dev/null
     cargo run -p cove-cli -- perf explain-pruning conformance/accept/cove_t_scan_table.cove > /dev/null
