@@ -33,11 +33,19 @@ Reader obligations:
   scope;
 - use canonical value hash, schema/path binding, dictionary digest, or an
   explicit code-domain bridge across files, manifests, rewrites, or snapshots;
+- validate model-input identity descriptors when
+  `AI_FEATURE_MODEL_INPUT_IDENTITY` is required, without reading
+  `AI_PAYLOAD_BYTES`;
 - treat approximate vector indexes as candidate generators unless exactness is
   proven for the requested metric, visibility scope, redaction scope, and query
   class;
 - fall back from stale or unsupported vector indexes to exact vector scan when
   vector payloads are valid and the query permits it.
+
+The reference runtime supports dense row-major vector payload decoding for
+these element type IDs: `0 = Float32`, `1 = Float16`, `2 = BFloat16`,
+`3 = Int8`, `4 = UInt8`, and `6 = Float64`. Runtime scoring converts these
+encodings to finite `f32` lanes after payload integrity and policy checks.
 
 ### 83.50.2 Vector Spaces
 
@@ -171,6 +179,123 @@ struct TrainingSampleVectorBindingV1 {
 }
 ```
 
+COVE-VEC defines V2 layouts for the four standard `AI_VECTOR_BINDING` record
+kinds by appending `model_input_digest_ref: u32` immediately before
+`flags/checksum`. V1 records remain valid and carry no model-input identity.
+Writers MUST emit V2 for these bindings whenever `model_input_digest_ref != 0`;
+writers that cannot know the exact model input MAY continue to emit V1 unless
+the identity feature is required for the artifact, section, or operation.
+
+```rust
+struct FileCodeVectorBindingV2 {
+    binding_id: u64,
+    vector_space_id: u32,
+    slot_policy_ref: u32,
+    file_ref: u32,
+    dictionary_digest_ref: u32,
+    schema_fingerprint_ref: u32,
+    table_id: u32,
+    column_id: u32,
+    object_type_id: u32,
+    property_id: u32,
+    association_type_id: u32,
+    path_ref: u32,
+    file_code: u32,
+    reserved0: u32,
+    canonical_value_hash_ref: u32,
+    vector_ref: u64,
+    model_input_digest_ref: u32,
+    flags: u32,
+    checksum: u32,
+}
+
+struct ChunkVectorBindingV2 {
+    binding_id: u64,
+    vector_space_id: u32,
+    chunk_id: u64,
+    chunk_profile_id: u32,
+    source_value_hash_ref: u32,
+    chunk_text_hash_ref: u32,
+    vector_ref: u64,
+    model_input_digest_ref: u32,
+    flags: u32,
+    checksum: u32,
+}
+
+struct ObjectStateVectorBindingV2 {
+    binding_id: u64,
+    vector_space_id: u32,
+    composition_profile_ref: u32,
+    file_ref: u32,
+    object_type_id: u32,
+    goid_ref: u32,
+    branch_ref: u32,
+    temporal_kind: u8,
+    csn: u64,
+    timestamp_us: i64,
+    property_dependency_fingerprint_ref: u32,
+    vector_ref: u64,
+    model_input_digest_ref: u32,
+    flags: u32,
+    checksum: u32,
+}
+
+struct TrainingSampleVectorBindingV2 {
+    binding_id: u64,
+    vector_space_id: u32,
+    training_profile_ref: u32,
+    sample_id: u64,
+    source_snapshot_ref: u32,
+    sample_fingerprint_ref: u32,
+    vector_ref: u64,
+    model_input_digest_ref: u32,
+    flags: u32,
+    checksum: u32,
+}
+
+struct AssociationStateVectorBindingV2 {
+    binding_id: u64,
+    vector_space_id: u32,
+    composition_profile_ref: u32,
+    file_ref: u32,
+    association_type_id: u32,
+    association_key_ref: u32,
+    branch_ref: u32,
+    temporal_kind: u8,
+    csn: u64,
+    timestamp_us: i64,
+    property_dependency_fingerprint_ref: u32,
+    vector_ref: u64,
+    model_input_digest_ref: u32,
+    flags: u32,
+    checksum: u32,
+}
+
+struct AssetVectorBindingV2 {
+    binding_id: u64,
+    vector_space_id: u32,
+    asset_ref: u64,
+    transform_ref: u32,
+    asset_digest_ref: u32,
+    vector_ref: u64,
+    model_input_digest_ref: u32,
+    flags: u32,
+    checksum: u32,
+}
+
+struct MultimodalSequenceVectorBindingV2 {
+    binding_id: u64,
+    vector_space_id: u32,
+    sequence_pack_id: u64,
+    sequence_profile_ref: u32,
+    source_snapshot_ref: u32,
+    vector_ref: u64,
+    model_input_digest_ref: u32,
+    flags: u32,
+    checksum: u32,
+}
+```
+
 `file_code` is the COVE v2 `FileCode` type and is therefore `u32`.
 `reserved0` MUST be zero. A raw FileCode from another file MUST NOT be used as
 a vector key unless the plan proves a shared code domain or validates an
@@ -180,6 +305,34 @@ Chunk, object-state, association-state, training-sample, prompt-context,
 asset, and multimodal-sequence bindings MUST reference `VectorEntryV1` through
 `vector_ref` and MUST carry enough source, slot, temporal, and model lineage to
 validate freshness.
+
+The current standard binding record kinds under `AI_VECTOR_BINDING` are:
+FileCode `1`, chunk `2`, object-state `3`, training-sample `4`,
+association-state `5`, asset `6`, and multimodal-sequence `7`. V1 records omit
+`model_input_digest_ref`; V2 records add it and can satisfy
+`AI_FEATURE_MODEL_INPUT_IDENTITY`.
+
+`model_input_digest_ref` resolves to `AI_DIGEST_TABLE` and MUST use
+`AiDigestDomainV1::ModelInputBytes`. The digest covers the exact model input
+bytes after declared source binding, mapping/slot/template selection,
+chunk/tokenizer processing, normalization, and vector-space preprocessing have
+been applied. It is a descriptor-level identity for the input bytes used to
+produce the vector; validators MUST NOT read `AI_PAYLOAD_BYTES` merely to
+enforce deduplication.
+
+When `AI_FEATURE_MODEL_INPUT_IDENTITY` is required for an artifact, section, or
+operation, every vector binding in that scope MUST be V2 and MUST carry a
+non-zero `model_input_digest_ref`. V1 bindings cannot satisfy this feature.
+Readers MUST reject V2 vector bindings whose `model_input_digest_ref` is zero,
+missing, or not in the `ModelInputBytes` digest domain.
+
+For deduplication, readers resolve the effective source binding from the
+binding's own source field when present, otherwise from the referenced
+chunk/source record, otherwise from the containing section's
+`source_binding_ref`. Within the same `(effective_source_binding,
+vector_space_id, model_input_digest_ref)`, the digest MUST map to exactly one
+`vector_ref`. Multiple distinct semantic bindings MAY point at that same
+`vector_ref`, but identical semantic binding keys MUST NOT be duplicated.
 
 ### 83.50.4 Payload Blocks and Directory
 
@@ -335,6 +488,18 @@ requested metric and query class. If temporal, visibility, or redaction filters
 are applied after candidate generation, filtered top-k results MUST be marked
 possibly incomplete unless coverage for the filtered universe is proven.
 
+Reference implementations MAY execute validated ANN descriptors for HNSW,
+IVF-flat, IVF-PQ, DiskANN-style, or Vamana-style requests only behind explicit
+AI feature gates. Descriptor-backed ANN execution is a candidate-generation
+path unless the descriptor proves exactness for the requested metric and query
+class; returned scores may be exact over the candidate set while the result
+authority remains approximate. When a requested ANN descriptor is present but
+exactness is not proven, results MUST be labeled approximate and MUST report
+the selected index name and result authority. When a requested index is absent,
+stale, unsupported, or policy blocked, the operation MUST either reject with
+diagnostics or report exact-flat fallback if valid vectors exist and query
+policy allows scanning them.
+
 ### 83.50.7 Tensor Layouts and Assets
 
 Tensor layout descriptors define dtype, rank, shape, stride, alignment,
@@ -342,6 +507,10 @@ storage offset, layout kind, quantization, sparsity, and device-transfer hints.
 Zero-copy export MAY be used only after validating payload bounds, dtype,
 shape, strides, alignment, compression state, quantization profile, lifetime,
 visibility/redaction policy, and target runtime compatibility.
+The Rust zero-copy/DLPack-style API MUST borrow from validated sidecar bytes
+for no longer than the source artifact lifetime and MUST reject byte-swapped,
+compressed, sparse, quantized, out-of-bounds, negatively-strided, or
+misaligned layouts.
 
 ```rust
 struct TensorLayoutDescriptorV1 {

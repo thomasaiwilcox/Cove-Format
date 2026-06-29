@@ -7,7 +7,14 @@
 //! carrier rules. Higher-level COVE-CHUNK, COVE-TOK, COVE-VEC, COVE-TRAIN, and
 //! COVE-MMSEQ semantics are layered on top of these validated descriptor tables.
 
-use std::{borrow::Cow, collections::BTreeSet};
+use std::{
+    borrow::Cow,
+    collections::{BTreeMap, BTreeSet},
+};
+
+mod wire;
+
+use wire::*;
 
 use crate::{
     checksum, compression,
@@ -15,9 +22,10 @@ use crate::{
         CompressionCodec, PrimaryProfile, SectionKind, AI_FEATURE_ASSET_REF,
         AI_FEATURE_CANONICAL_FIXED_POINT_VECTOR, AI_FEATURE_CHUNK, AI_FEATURE_COVEQL_AI,
         AI_FEATURE_EXTERNAL_ASSET_DIGEST_REQUIRED, AI_FEATURE_GENERATOR_PROVENANCE,
-        AI_FEATURE_MAP_AI_POLICY, AI_FEATURE_MMSEQ, AI_FEATURE_PRIVACY_SUMMARY,
-        AI_FEATURE_TENSOR_LAYOUT, AI_FEATURE_TOKEN, AI_FEATURE_TRAIN, AI_FEATURE_VECTOR,
-        AI_FEATURE_VECTOR_INDEX, AI_FEATURE_VECTOR_SPACE_COMPATIBILITY, MAGIC_COVEAI, MAGIC_COVEV,
+        AI_FEATURE_MAP_AI_POLICY, AI_FEATURE_MMSEQ, AI_FEATURE_MODEL_INPUT_IDENTITY,
+        AI_FEATURE_PRIVACY_SUMMARY, AI_FEATURE_TENSOR_LAYOUT, AI_FEATURE_TOKEN, AI_FEATURE_TRAIN,
+        AI_FEATURE_VECTOR, AI_FEATURE_VECTOR_INDEX, AI_FEATURE_VECTOR_SPACE_COMPATIBILITY,
+        MAGIC_COVEAI, MAGIC_COVEV,
     },
     feature_binding::{FeatureScopeV2, OperationKindV2},
     CoveError,
@@ -46,12 +54,15 @@ pub const AI_KNOWN_FEATURES_V1: u64 = AI_FEATURE_MAP_AI_POLICY
     | AI_FEATURE_CANONICAL_FIXED_POINT_VECTOR
     | AI_FEATURE_EXTERNAL_ASSET_DIGEST_REQUIRED
     | AI_FEATURE_PRIVACY_SUMMARY
-    | AI_FEATURE_VECTOR_SPACE_COMPATIBILITY;
+    | AI_FEATURE_VECTOR_SPACE_COMPATIBILITY
+    | AI_FEATURE_MODEL_INPUT_IDENTITY;
 
 pub const AI_FLAG_REQUIRED_RECORD: u32 = 1 << 0;
 pub const AI_FLAG_PAYLOAD_CRC32C_PRESENT: u32 = 1 << 1;
 pub const AI_FLAG_POLICY_PROTECTED: u32 = 1 << 2;
 pub const AI_FLAG_REVOKED: u32 = 1 << 3;
+
+const AI_DIGEST_DOMAIN_MODEL_INPUT_BYTES: u8 = 4;
 
 pub const AI_COMPANION_ARTIFACT_KIND_CVA2: u8 = 1;
 pub const AI_COMPANION_ARTIFACT_KIND_CVV2: u8 = 2;
@@ -531,7 +542,7 @@ impl CoveAiFile {
             });
         }
 
-        descriptor_tables.validate(&sections, data.len() as u64)?;
+        descriptor_tables.validate(&sections, data.len() as u64, header.required_ai_features)?;
         let payload_access = if descriptor_tables.privacy_summaries.is_empty()
             && sections
                 .iter()
@@ -600,6 +611,9 @@ pub struct AiDescriptorTablesV1 {
     pub chunk_vector_bindings: Vec<ChunkVectorBindingV1>,
     pub object_state_vector_bindings: Vec<ObjectStateVectorBindingV1>,
     pub training_sample_vector_bindings: Vec<TrainingSampleVectorBindingV1>,
+    pub association_state_vector_bindings: Vec<AssociationStateVectorBindingV1>,
+    pub asset_vector_bindings: Vec<AssetVectorBindingV1>,
+    pub multimodal_sequence_vector_bindings: Vec<MultimodalSequenceVectorBindingV1>,
     pub vector_payload_blocks: Vec<VectorPayloadBlockHeaderV1>,
     pub vector_entries: Vec<VectorEntryV1>,
     pub vector_composition_profiles: Vec<VectorCompositionProfileV1>,
@@ -609,7 +623,12 @@ pub struct AiDescriptorTablesV1 {
 }
 
 impl AiDescriptorTablesV1 {
-    fn validate(&self, sections: &[CoveAiSection], file_len: u64) -> Result<(), CoveError> {
+    fn validate(
+        &self,
+        sections: &[CoveAiSection],
+        file_len: u64,
+        artifact_required_ai_features: u64,
+    ) -> Result<(), CoveError> {
         validate_unique(
             self.companion_artifacts
                 .iter()
@@ -818,6 +837,24 @@ impl AiDescriptorTablesV1 {
                 .map(|record| record.binding_id),
             "AI_VECTOR_BINDING training_sample binding_id",
         )?;
+        validate_unique_u64(
+            self.association_state_vector_bindings
+                .iter()
+                .map(|record| record.binding_id),
+            "AI_VECTOR_BINDING association_state binding_id",
+        )?;
+        validate_unique_u64(
+            self.asset_vector_bindings
+                .iter()
+                .map(|record| record.binding_id),
+            "AI_VECTOR_BINDING asset binding_id",
+        )?;
+        validate_unique_u64(
+            self.multimodal_sequence_vector_bindings
+                .iter()
+                .map(|record| record.binding_id),
+            "AI_VECTOR_BINDING multimodal_sequence binding_id",
+        )?;
         validate_unique(
             self.vector_composition_profiles
                 .iter()
@@ -870,6 +907,12 @@ impl AiDescriptorTablesV1 {
         let digest_ref_ids = self
             .digests
             .iter()
+            .map(|record| record.digest_ref)
+            .collect::<BTreeSet<_>>();
+        let model_input_digest_refs = self
+            .digests
+            .iter()
+            .filter(|record| record.domain_hint == AI_DIGEST_DOMAIN_MODEL_INPUT_BYTES)
             .map(|record| record.digest_ref)
             .collect::<BTreeSet<_>>();
         let source_binding_ids = self
@@ -1016,6 +1059,21 @@ impl AiDescriptorTablesV1 {
             .iter()
             .map(|record| record.arithmetic_profile_id)
             .collect::<BTreeSet<_>>();
+        let vector_binding_ids = VectorBindingValidationIds {
+            vector_space_ids: &vector_space_ids,
+            chunk_ids: &chunk_ids,
+            chunk_profile_ids: &chunk_profile_ids,
+            composition_profile_ids: &composition_profile_ids,
+            source_binding_ids: &source_binding_ids,
+            digest_ref_ids: &digest_ref_ids,
+            model_input_digest_refs: &model_input_digest_refs,
+            string_ref_ids: &string_ref_ids,
+            training_profile_ids: &training_profile_ids,
+            training_sample_ids: &training_sample_ids,
+            multimodal_sequence_pack_ids: &multimodal_sequence_pack_ids,
+            payload_ref_ids: &payload_ref_ids,
+            vector_ref_ids: &vector_ref_ids,
+        };
 
         for string in &self.strings {
             string.validate(self)?;
@@ -1226,39 +1284,37 @@ impl AiDescriptorTablesV1 {
                 &vector_space_ids,
                 &source_binding_ids,
                 &digest_ref_ids,
+                &model_input_digest_refs,
                 &string_ref_ids,
                 &vector_ref_ids,
             )?;
         }
         for binding in &self.chunk_vector_bindings {
-            binding.validate(
-                &vector_space_ids,
-                &chunk_ids,
-                &chunk_profile_ids,
-                &digest_ref_ids,
-                &vector_ref_ids,
-            )?;
+            binding.validate(&vector_binding_ids)?;
         }
         for binding in &self.object_state_vector_bindings {
-            binding.validate(
-                &vector_space_ids,
-                &composition_profile_ids,
-                &source_binding_ids,
-                &digest_ref_ids,
-                &string_ref_ids,
-                &vector_ref_ids,
-            )?;
+            binding.validate(&vector_binding_ids)?;
         }
         for binding in &self.training_sample_vector_bindings {
+            binding.validate(&vector_binding_ids)?;
+        }
+        for binding in &self.association_state_vector_bindings {
+            binding.validate(&vector_binding_ids)?;
+        }
+        for binding in &self.asset_vector_bindings {
             binding.validate(
                 &vector_space_ids,
-                &training_profile_ids,
-                &training_sample_ids,
-                &source_binding_ids,
+                &asset_ref_ids,
+                &transform_ids,
                 &digest_ref_ids,
+                &model_input_digest_refs,
                 &vector_ref_ids,
             )?;
         }
+        for binding in &self.multimodal_sequence_vector_bindings {
+            binding.validate(&vector_binding_ids)?;
+        }
+        self.validate_vector_model_input_identity(sections, artifact_required_ai_features)?;
         for arithmetic in &self.vector_arithmetic_profiles {
             arithmetic.validate(&string_ref_ids)?;
         }
@@ -1325,6 +1381,308 @@ impl AiDescriptorTablesV1 {
                 }
             }
         }
+        Ok(())
+    }
+
+    fn validate_vector_model_input_identity(
+        &self,
+        sections: &[CoveAiSection],
+        artifact_required_ai_features: u64,
+    ) -> Result<(), CoveError> {
+        let identity_required =
+            artifact_required_ai_features & AI_FEATURE_MODEL_INPUT_IDENTITY != 0
+                || sections.iter().any(|section| {
+                    section.entry.required_ai_features & AI_FEATURE_MODEL_INPUT_IDENTITY != 0
+                })
+                || self.section_feature_bindings.iter().any(|binding| {
+                    binding.required_ai_features & AI_FEATURE_MODEL_INPUT_IDENTITY != 0
+                });
+        let vector_binding_section_source_ref =
+            unique_section_source_binding_ref(sections, SectionKind::AiVectorBinding as u32)?;
+        let chunk_section_source_ref =
+            unique_section_source_binding_ref(sections, SectionKind::AiTextChunkIndex as u32)?;
+        let chunk_source_refs = self
+            .text_chunks
+            .iter()
+            .map(|chunk| {
+                (
+                    chunk.chunk_id,
+                    if chunk.source_ref != 0 {
+                        chunk.source_ref
+                    } else {
+                        chunk_section_source_ref
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        let mut model_input_vectors = BTreeMap::<(u32, u32, u32), u64>::new();
+        let mut semantic_keys = BTreeSet::<VectorSemanticBindingKey>::new();
+
+        for binding in &self.filecode_vector_bindings {
+            require_model_input_identity_if_needed(
+                identity_required,
+                "FileCodeVectorBinding",
+                binding.binding_id,
+                binding.model_input_digest_ref,
+            )?;
+            let effective_source =
+                effective_source_binding(binding.file_ref, 0, vector_binding_section_source_ref);
+            validate_model_input_vector_mapping(
+                "FileCodeVectorBinding",
+                binding.binding_id,
+                effective_source,
+                binding.vector_space_id,
+                binding.model_input_digest_ref,
+                binding.vector_ref,
+                &mut model_input_vectors,
+            )?;
+            insert_vector_semantic_key(
+                &mut semantic_keys,
+                VectorSemanticBindingKey::FileCode {
+                    effective_source,
+                    vector_space_id: binding.vector_space_id,
+                    slot_policy_ref: binding.slot_policy_ref,
+                    file_ref: binding.file_ref,
+                    dictionary_digest_ref: binding.dictionary_digest_ref,
+                    schema_fingerprint_ref: binding.schema_fingerprint_ref,
+                    table_id: binding.table_id,
+                    column_id: binding.column_id,
+                    object_type_id: binding.object_type_id,
+                    property_id: binding.property_id,
+                    association_type_id: binding.association_type_id,
+                    path_ref: binding.path_ref,
+                    file_code: binding.file_code,
+                    canonical_value_hash_ref: binding.canonical_value_hash_ref,
+                    model_input_digest_ref: binding.model_input_digest_ref,
+                },
+                "FileCodeVectorBinding",
+                binding.binding_id,
+            )?;
+        }
+
+        for binding in &self.chunk_vector_bindings {
+            require_model_input_identity_if_needed(
+                identity_required,
+                "ChunkVectorBinding",
+                binding.binding_id,
+                binding.model_input_digest_ref,
+            )?;
+            let chunk_source_ref = chunk_source_refs
+                .get(&binding.chunk_id)
+                .copied()
+                .unwrap_or_default();
+            let effective_source =
+                effective_source_binding(0, chunk_source_ref, vector_binding_section_source_ref);
+            validate_model_input_vector_mapping(
+                "ChunkVectorBinding",
+                binding.binding_id,
+                effective_source,
+                binding.vector_space_id,
+                binding.model_input_digest_ref,
+                binding.vector_ref,
+                &mut model_input_vectors,
+            )?;
+            insert_vector_semantic_key(
+                &mut semantic_keys,
+                VectorSemanticBindingKey::Chunk {
+                    effective_source,
+                    vector_space_id: binding.vector_space_id,
+                    chunk_id: binding.chunk_id,
+                    chunk_profile_id: binding.chunk_profile_id,
+                    source_value_hash_ref: binding.source_value_hash_ref,
+                    chunk_text_hash_ref: binding.chunk_text_hash_ref,
+                    model_input_digest_ref: binding.model_input_digest_ref,
+                },
+                "ChunkVectorBinding",
+                binding.binding_id,
+            )?;
+        }
+
+        for binding in &self.object_state_vector_bindings {
+            require_model_input_identity_if_needed(
+                identity_required,
+                "ObjectStateVectorBinding",
+                binding.binding_id,
+                binding.model_input_digest_ref,
+            )?;
+            let effective_source =
+                effective_source_binding(binding.file_ref, 0, vector_binding_section_source_ref);
+            validate_model_input_vector_mapping(
+                "ObjectStateVectorBinding",
+                binding.binding_id,
+                effective_source,
+                binding.vector_space_id,
+                binding.model_input_digest_ref,
+                binding.vector_ref,
+                &mut model_input_vectors,
+            )?;
+            insert_vector_semantic_key(
+                &mut semantic_keys,
+                VectorSemanticBindingKey::ObjectState {
+                    effective_source,
+                    vector_space_id: binding.vector_space_id,
+                    composition_profile_ref: binding.composition_profile_ref,
+                    file_ref: binding.file_ref,
+                    object_type_id: binding.object_type_id,
+                    goid_ref: binding.goid_ref,
+                    branch_ref: binding.branch_ref,
+                    temporal_kind: binding.temporal_kind,
+                    csn: binding.csn,
+                    timestamp_us: binding.timestamp_us,
+                    property_dependency_fingerprint_ref: binding
+                        .property_dependency_fingerprint_ref,
+                    model_input_digest_ref: binding.model_input_digest_ref,
+                },
+                "ObjectStateVectorBinding",
+                binding.binding_id,
+            )?;
+        }
+
+        for binding in &self.training_sample_vector_bindings {
+            require_model_input_identity_if_needed(
+                identity_required,
+                "TrainingSampleVectorBinding",
+                binding.binding_id,
+                binding.model_input_digest_ref,
+            )?;
+            let effective_source = effective_source_binding(
+                binding.source_snapshot_ref,
+                0,
+                vector_binding_section_source_ref,
+            );
+            validate_model_input_vector_mapping(
+                "TrainingSampleVectorBinding",
+                binding.binding_id,
+                effective_source,
+                binding.vector_space_id,
+                binding.model_input_digest_ref,
+                binding.vector_ref,
+                &mut model_input_vectors,
+            )?;
+            insert_vector_semantic_key(
+                &mut semantic_keys,
+                VectorSemanticBindingKey::TrainingSample {
+                    effective_source,
+                    vector_space_id: binding.vector_space_id,
+                    training_profile_ref: binding.training_profile_ref,
+                    sample_id: binding.sample_id,
+                    source_snapshot_ref: binding.source_snapshot_ref,
+                    sample_fingerprint_ref: binding.sample_fingerprint_ref,
+                    model_input_digest_ref: binding.model_input_digest_ref,
+                },
+                "TrainingSampleVectorBinding",
+                binding.binding_id,
+            )?;
+        }
+
+        for binding in &self.association_state_vector_bindings {
+            require_model_input_identity_if_needed(
+                identity_required,
+                "AssociationStateVectorBinding",
+                binding.binding_id,
+                binding.model_input_digest_ref,
+            )?;
+            let effective_source =
+                effective_source_binding(binding.file_ref, 0, vector_binding_section_source_ref);
+            validate_model_input_vector_mapping(
+                "AssociationStateVectorBinding",
+                binding.binding_id,
+                effective_source,
+                binding.vector_space_id,
+                binding.model_input_digest_ref,
+                binding.vector_ref,
+                &mut model_input_vectors,
+            )?;
+            insert_vector_semantic_key(
+                &mut semantic_keys,
+                VectorSemanticBindingKey::AssociationState {
+                    effective_source,
+                    vector_space_id: binding.vector_space_id,
+                    composition_profile_ref: binding.composition_profile_ref,
+                    file_ref: binding.file_ref,
+                    association_type_id: binding.association_type_id,
+                    association_key_ref: binding.association_key_ref,
+                    branch_ref: binding.branch_ref,
+                    temporal_kind: binding.temporal_kind,
+                    csn: binding.csn,
+                    timestamp_us: binding.timestamp_us,
+                    property_dependency_fingerprint_ref: binding
+                        .property_dependency_fingerprint_ref,
+                    model_input_digest_ref: binding.model_input_digest_ref,
+                },
+                "AssociationStateVectorBinding",
+                binding.binding_id,
+            )?;
+        }
+
+        for binding in &self.asset_vector_bindings {
+            require_model_input_identity_if_needed(
+                identity_required,
+                "AssetVectorBinding",
+                binding.binding_id,
+                binding.model_input_digest_ref,
+            )?;
+            validate_model_input_vector_mapping(
+                "AssetVectorBinding",
+                binding.binding_id,
+                vector_binding_section_source_ref,
+                binding.vector_space_id,
+                binding.model_input_digest_ref,
+                binding.vector_ref,
+                &mut model_input_vectors,
+            )?;
+            insert_vector_semantic_key(
+                &mut semantic_keys,
+                VectorSemanticBindingKey::Asset {
+                    effective_source: vector_binding_section_source_ref,
+                    vector_space_id: binding.vector_space_id,
+                    asset_ref: binding.asset_ref,
+                    transform_ref: binding.transform_ref,
+                    asset_digest_ref: binding.asset_digest_ref,
+                    model_input_digest_ref: binding.model_input_digest_ref,
+                },
+                "AssetVectorBinding",
+                binding.binding_id,
+            )?;
+        }
+
+        for binding in &self.multimodal_sequence_vector_bindings {
+            require_model_input_identity_if_needed(
+                identity_required,
+                "MultimodalSequenceVectorBinding",
+                binding.binding_id,
+                binding.model_input_digest_ref,
+            )?;
+            let effective_source = effective_source_binding(
+                binding.source_snapshot_ref,
+                0,
+                vector_binding_section_source_ref,
+            );
+            validate_model_input_vector_mapping(
+                "MultimodalSequenceVectorBinding",
+                binding.binding_id,
+                effective_source,
+                binding.vector_space_id,
+                binding.model_input_digest_ref,
+                binding.vector_ref,
+                &mut model_input_vectors,
+            )?;
+            insert_vector_semantic_key(
+                &mut semantic_keys,
+                VectorSemanticBindingKey::MultimodalSequence {
+                    effective_source,
+                    vector_space_id: binding.vector_space_id,
+                    sequence_pack_id: binding.sequence_pack_id,
+                    sequence_profile_ref: binding.sequence_profile_ref,
+                    source_snapshot_ref: binding.source_snapshot_ref,
+                    model_input_digest_ref: binding.model_input_digest_ref,
+                },
+                "MultimodalSequenceVectorBinding",
+                binding.binding_id,
+            )?;
+        }
+
         Ok(())
     }
 
@@ -1580,6 +1938,179 @@ impl AiDescriptorTablesV1 {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum VectorSemanticBindingKey {
+    FileCode {
+        effective_source: u32,
+        vector_space_id: u32,
+        slot_policy_ref: u32,
+        file_ref: u32,
+        dictionary_digest_ref: u32,
+        schema_fingerprint_ref: u32,
+        table_id: u32,
+        column_id: u32,
+        object_type_id: u32,
+        property_id: u32,
+        association_type_id: u32,
+        path_ref: u32,
+        file_code: u32,
+        canonical_value_hash_ref: u32,
+        model_input_digest_ref: u32,
+    },
+    Chunk {
+        effective_source: u32,
+        vector_space_id: u32,
+        chunk_id: u64,
+        chunk_profile_id: u32,
+        source_value_hash_ref: u32,
+        chunk_text_hash_ref: u32,
+        model_input_digest_ref: u32,
+    },
+    ObjectState {
+        effective_source: u32,
+        vector_space_id: u32,
+        composition_profile_ref: u32,
+        file_ref: u32,
+        object_type_id: u32,
+        goid_ref: u32,
+        branch_ref: u32,
+        temporal_kind: u8,
+        csn: u64,
+        timestamp_us: i64,
+        property_dependency_fingerprint_ref: u32,
+        model_input_digest_ref: u32,
+    },
+    TrainingSample {
+        effective_source: u32,
+        vector_space_id: u32,
+        training_profile_ref: u32,
+        sample_id: u64,
+        source_snapshot_ref: u32,
+        sample_fingerprint_ref: u32,
+        model_input_digest_ref: u32,
+    },
+    AssociationState {
+        effective_source: u32,
+        vector_space_id: u32,
+        composition_profile_ref: u32,
+        file_ref: u32,
+        association_type_id: u32,
+        association_key_ref: u32,
+        branch_ref: u32,
+        temporal_kind: u8,
+        csn: u64,
+        timestamp_us: i64,
+        property_dependency_fingerprint_ref: u32,
+        model_input_digest_ref: u32,
+    },
+    Asset {
+        effective_source: u32,
+        vector_space_id: u32,
+        asset_ref: u64,
+        transform_ref: u32,
+        asset_digest_ref: u32,
+        model_input_digest_ref: u32,
+    },
+    MultimodalSequence {
+        effective_source: u32,
+        vector_space_id: u32,
+        sequence_pack_id: u64,
+        sequence_profile_ref: u32,
+        source_snapshot_ref: u32,
+        model_input_digest_ref: u32,
+    },
+}
+
+fn unique_section_source_binding_ref(
+    sections: &[CoveAiSection],
+    section_kind: u32,
+) -> Result<u32, CoveError> {
+    let mut source_binding_ref = 0;
+    for section in sections
+        .iter()
+        .filter(|section| section.entry.section_kind == section_kind)
+    {
+        let candidate = section.entry.source_binding_ref;
+        if candidate == 0 {
+            continue;
+        }
+        if source_binding_ref != 0 && source_binding_ref != candidate {
+            return Err(CoveError::BadSection(format!(
+                "multiple source_binding_ref values for section kind {section_kind} cannot be used for effective source fallback"
+            )));
+        }
+        source_binding_ref = candidate;
+    }
+    Ok(source_binding_ref)
+}
+
+fn effective_source_binding(
+    own_source_ref: u32,
+    referenced_source_ref: u32,
+    section_source_ref: u32,
+) -> u32 {
+    if own_source_ref != 0 {
+        own_source_ref
+    } else if referenced_source_ref != 0 {
+        referenced_source_ref
+    } else {
+        section_source_ref
+    }
+}
+
+fn require_model_input_identity_if_needed(
+    identity_required: bool,
+    label: &str,
+    binding_id: u64,
+    model_input_digest_ref: u32,
+) -> Result<(), CoveError> {
+    if identity_required && model_input_digest_ref == 0 {
+        return Err(CoveError::BadSection(format!(
+            "AI_FEATURE_MODEL_INPUT_IDENTITY requires {label} {binding_id} to carry a non-zero model_input_digest_ref"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_model_input_vector_mapping(
+    label: &str,
+    binding_id: u64,
+    effective_source: u32,
+    vector_space_id: u32,
+    model_input_digest_ref: u32,
+    vector_ref: u64,
+    model_input_vectors: &mut BTreeMap<(u32, u32, u32), u64>,
+) -> Result<(), CoveError> {
+    if model_input_digest_ref == 0 {
+        return Ok(());
+    }
+    let key = (effective_source, vector_space_id, model_input_digest_ref);
+    if let Some(existing_vector_ref) = model_input_vectors.get(&key) {
+        if *existing_vector_ref != vector_ref {
+            return Err(CoveError::BadSection(format!(
+                "{label} {binding_id} maps model_input_digest_ref {model_input_digest_ref} in vector_space_id {vector_space_id} to vector_ref {vector_ref}, but the same effective source already maps it to vector_ref {existing_vector_ref}"
+            )));
+        }
+    } else {
+        model_input_vectors.insert(key, vector_ref);
+    }
+    Ok(())
+}
+
+fn insert_vector_semantic_key(
+    semantic_keys: &mut BTreeSet<VectorSemanticBindingKey>,
+    key: VectorSemanticBindingKey,
+    label: &str,
+    binding_id: u64,
+) -> Result<(), CoveError> {
+    if !semantic_keys.insert(key) {
+        return Err(CoveError::BadSection(format!(
+            "duplicate {label} semantic binding key for binding_id {binding_id}"
+        )));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AiRecordHeaderV1 {
     pub record_kind: u16,
@@ -1603,12 +2134,6 @@ impl AiRecordHeaderV1 {
             flags: read_u32(record_bytes, 16)?,
             crc32c: read_u32(record_bytes, 20)?,
         };
-        if header.record_version != 1 {
-            return Err(CoveError::BadSection(format!(
-                "unsupported COVE-AI record_version {}",
-                header.record_version
-            )));
-        }
         if header.record_len as usize != record_bytes.len() {
             return Err(CoveError::BadSection(
                 "COVE-AI record_len does not match record bytes".into(),
@@ -4651,6 +5176,7 @@ pub struct FileCodeVectorBindingV1 {
     pub reserved0: u32,
     pub canonical_value_hash_ref: u32,
     pub vector_ref: u64,
+    pub model_input_digest_ref: u32,
     pub flags: u32,
     pub checksum: u32,
 }
@@ -4661,6 +5187,7 @@ impl FileCodeVectorBindingV1 {
         vector_space_ids: &BTreeSet<u32>,
         source_binding_ids: &BTreeSet<u32>,
         digest_ref_ids: &BTreeSet<u32>,
+        model_input_digest_refs: &BTreeSet<u32>,
         string_ref_ids: &BTreeSet<u32>,
         vector_ref_ids: &BTreeSet<u64>,
     ) -> Result<(), CoveError> {
@@ -4702,6 +5229,13 @@ impl FileCodeVectorBindingV1 {
         if self.reserved0 != 0 {
             return Err(CoveError::ReservedNotZero);
         }
+        validate_model_input_digest_ref(
+            "FileCodeVectorBinding",
+            self.binding_id,
+            self.model_input_digest_ref,
+            digest_ref_ids,
+            model_input_digest_refs,
+        )?;
         if !vector_ref_ids.contains(&self.vector_ref) {
             return Err(CoveError::BadSection(format!(
                 "FileCodeVectorBinding {} references missing vector_ref {}",
@@ -4721,37 +5255,47 @@ pub struct ChunkVectorBindingV1 {
     pub source_value_hash_ref: u32,
     pub chunk_text_hash_ref: u32,
     pub vector_ref: u64,
+    pub model_input_digest_ref: u32,
     pub flags: u32,
     pub checksum: u32,
 }
 
+struct VectorBindingValidationIds<'a> {
+    vector_space_ids: &'a BTreeSet<u32>,
+    chunk_ids: &'a BTreeSet<u64>,
+    chunk_profile_ids: &'a BTreeSet<u32>,
+    composition_profile_ids: &'a BTreeSet<u32>,
+    source_binding_ids: &'a BTreeSet<u32>,
+    digest_ref_ids: &'a BTreeSet<u32>,
+    model_input_digest_refs: &'a BTreeSet<u32>,
+    string_ref_ids: &'a BTreeSet<u32>,
+    training_profile_ids: &'a BTreeSet<u32>,
+    training_sample_ids: &'a BTreeSet<u64>,
+    multimodal_sequence_pack_ids: &'a BTreeSet<u64>,
+    payload_ref_ids: &'a BTreeSet<u32>,
+    vector_ref_ids: &'a BTreeSet<u64>,
+}
+
 impl ChunkVectorBindingV1 {
-    fn validate(
-        &self,
-        vector_space_ids: &BTreeSet<u32>,
-        chunk_ids: &BTreeSet<u64>,
-        chunk_profile_ids: &BTreeSet<u32>,
-        digest_ref_ids: &BTreeSet<u32>,
-        vector_ref_ids: &BTreeSet<u64>,
-    ) -> Result<(), CoveError> {
+    fn validate(&self, ids: &VectorBindingValidationIds<'_>) -> Result<(), CoveError> {
         if self.binding_id == 0 {
             return Err(CoveError::BadSection(
                 "ChunkVectorBindingV1 binding_id must be non-zero".into(),
             ));
         }
-        if !vector_space_ids.contains(&self.vector_space_id) {
+        if !ids.vector_space_ids.contains(&self.vector_space_id) {
             return Err(CoveError::BadSection(format!(
                 "ChunkVectorBinding {} references missing vector_space_id {}",
                 self.binding_id, self.vector_space_id
             )));
         }
-        if self.chunk_id == 0 || !chunk_ids.contains(&self.chunk_id) {
+        if self.chunk_id == 0 || !ids.chunk_ids.contains(&self.chunk_id) {
             return Err(CoveError::BadSection(format!(
                 "ChunkVectorBinding {} references missing chunk_id {}",
                 self.binding_id, self.chunk_id
             )));
         }
-        if self.chunk_profile_id != 0 && !chunk_profile_ids.contains(&self.chunk_profile_id) {
+        if self.chunk_profile_id != 0 && !ids.chunk_profile_ids.contains(&self.chunk_profile_id) {
             return Err(CoveError::BadSection(format!(
                 "ChunkVectorBinding {} references missing chunk_profile_id {}",
                 self.binding_id, self.chunk_profile_id
@@ -4761,14 +5305,21 @@ impl ChunkVectorBindingV1 {
             ("source_value_hash_ref", self.source_value_hash_ref),
             ("chunk_text_hash_ref", self.chunk_text_hash_ref),
         ] {
-            if digest_ref != 0 && !digest_ref_ids.contains(&digest_ref) {
+            if digest_ref != 0 && !ids.digest_ref_ids.contains(&digest_ref) {
                 return Err(CoveError::BadSection(format!(
                     "ChunkVectorBinding {} references missing {label} {}",
                     self.binding_id, digest_ref
                 )));
             }
         }
-        if !vector_ref_ids.contains(&self.vector_ref) {
+        validate_model_input_digest_ref(
+            "ChunkVectorBinding",
+            self.binding_id,
+            self.model_input_digest_ref,
+            ids.digest_ref_ids,
+            ids.model_input_digest_refs,
+        )?;
+        if !ids.vector_ref_ids.contains(&self.vector_ref) {
             return Err(CoveError::BadSection(format!(
                 "ChunkVectorBinding {} references missing vector_ref {}",
                 self.binding_id, self.vector_ref
@@ -4792,61 +5343,65 @@ pub struct ObjectStateVectorBindingV1 {
     pub timestamp_us: i64,
     pub property_dependency_fingerprint_ref: u32,
     pub vector_ref: u64,
+    pub model_input_digest_ref: u32,
     pub flags: u32,
     pub checksum: u32,
 }
 
 impl ObjectStateVectorBindingV1 {
-    fn validate(
-        &self,
-        vector_space_ids: &BTreeSet<u32>,
-        composition_profile_ids: &BTreeSet<u32>,
-        source_binding_ids: &BTreeSet<u32>,
-        digest_ref_ids: &BTreeSet<u32>,
-        string_ref_ids: &BTreeSet<u32>,
-        vector_ref_ids: &BTreeSet<u64>,
-    ) -> Result<(), CoveError> {
+    fn validate(&self, ids: &VectorBindingValidationIds<'_>) -> Result<(), CoveError> {
         if self.binding_id == 0 {
             return Err(CoveError::BadSection(
                 "ObjectStateVectorBindingV1 binding_id must be non-zero".into(),
             ));
         }
-        if !vector_space_ids.contains(&self.vector_space_id) {
+        if !ids.vector_space_ids.contains(&self.vector_space_id) {
             return Err(CoveError::BadSection(format!(
                 "ObjectStateVectorBinding {} references missing vector_space_id {}",
                 self.binding_id, self.vector_space_id
             )));
         }
         if self.composition_profile_ref != 0
-            && !composition_profile_ids.contains(&self.composition_profile_ref)
+            && !ids
+                .composition_profile_ids
+                .contains(&self.composition_profile_ref)
         {
             return Err(CoveError::BadSection(format!(
                 "ObjectStateVectorBinding {} references missing composition_profile_ref {}",
                 self.binding_id, self.composition_profile_ref
             )));
         }
-        if self.file_ref != 0 && !source_binding_ids.contains(&self.file_ref) {
+        if self.file_ref != 0 && !ids.source_binding_ids.contains(&self.file_ref) {
             return Err(CoveError::BadSection(format!(
                 "ObjectStateVectorBinding {} references missing file_ref {}",
                 self.binding_id, self.file_ref
             )));
         }
-        if self.branch_ref != 0 && !string_ref_ids.contains(&self.branch_ref) {
+        if self.branch_ref != 0 && !ids.string_ref_ids.contains(&self.branch_ref) {
             return Err(CoveError::BadSection(format!(
                 "ObjectStateVectorBinding {} references missing branch_ref {}",
                 self.binding_id, self.branch_ref
             )));
         }
         if self.property_dependency_fingerprint_ref != 0
-            && !digest_ref_ids.contains(&self.property_dependency_fingerprint_ref)
+            && !ids
+                .digest_ref_ids
+                .contains(&self.property_dependency_fingerprint_ref)
         {
             return Err(CoveError::BadSection(format!(
                 "ObjectStateVectorBinding {} references missing property_dependency_fingerprint_ref {}",
                 self.binding_id, self.property_dependency_fingerprint_ref
             )));
         }
+        validate_model_input_digest_ref(
+            "ObjectStateVectorBinding",
+            self.binding_id,
+            self.model_input_digest_ref,
+            ids.digest_ref_ids,
+            ids.model_input_digest_refs,
+        )?;
         self.csn.checked_add(0).ok_or(CoveError::ArithOverflow)?;
-        if !vector_ref_ids.contains(&self.vector_ref) {
+        if !ids.vector_ref_ids.contains(&self.vector_ref) {
             return Err(CoveError::BadSection(format!(
                 "ObjectStateVectorBinding {} references missing vector_ref {}",
                 self.binding_id, self.vector_ref
@@ -4865,46 +5420,42 @@ pub struct TrainingSampleVectorBindingV1 {
     pub source_snapshot_ref: u32,
     pub sample_fingerprint_ref: u32,
     pub vector_ref: u64,
+    pub model_input_digest_ref: u32,
     pub flags: u32,
     pub checksum: u32,
 }
 
 impl TrainingSampleVectorBindingV1 {
-    fn validate(
-        &self,
-        vector_space_ids: &BTreeSet<u32>,
-        training_profile_ids: &BTreeSet<u32>,
-        training_sample_ids: &BTreeSet<u64>,
-        source_binding_ids: &BTreeSet<u32>,
-        digest_ref_ids: &BTreeSet<u32>,
-        vector_ref_ids: &BTreeSet<u64>,
-    ) -> Result<(), CoveError> {
+    fn validate(&self, ids: &VectorBindingValidationIds<'_>) -> Result<(), CoveError> {
         if self.binding_id == 0 {
             return Err(CoveError::BadSection(
                 "TrainingSampleVectorBindingV1 binding_id must be non-zero".into(),
             ));
         }
-        if !vector_space_ids.contains(&self.vector_space_id) {
+        if !ids.vector_space_ids.contains(&self.vector_space_id) {
             return Err(CoveError::BadSection(format!(
                 "TrainingSampleVectorBinding {} references missing vector_space_id {}",
                 self.binding_id, self.vector_space_id
             )));
         }
         if self.training_profile_ref != 0
-            && !training_profile_ids.contains(&self.training_profile_ref)
+            && !ids
+                .training_profile_ids
+                .contains(&self.training_profile_ref)
         {
             return Err(CoveError::BadSection(format!(
                 "TrainingSampleVectorBinding {} references missing training_profile_ref {}",
                 self.binding_id, self.training_profile_ref
             )));
         }
-        if self.sample_id == 0 || !training_sample_ids.contains(&self.sample_id) {
+        if self.sample_id == 0 || !ids.training_sample_ids.contains(&self.sample_id) {
             return Err(CoveError::BadSection(format!(
                 "TrainingSampleVectorBinding {} references missing sample_id {}",
                 self.binding_id, self.sample_id
             )));
         }
-        if self.source_snapshot_ref != 0 && !source_binding_ids.contains(&self.source_snapshot_ref)
+        if self.source_snapshot_ref != 0
+            && !ids.source_binding_ids.contains(&self.source_snapshot_ref)
         {
             return Err(CoveError::BadSection(format!(
                 "TrainingSampleVectorBinding {} references missing source_snapshot_ref {}",
@@ -4912,14 +5463,21 @@ impl TrainingSampleVectorBindingV1 {
             )));
         }
         if self.sample_fingerprint_ref != 0
-            && !digest_ref_ids.contains(&self.sample_fingerprint_ref)
+            && !ids.digest_ref_ids.contains(&self.sample_fingerprint_ref)
         {
             return Err(CoveError::BadSection(format!(
                 "TrainingSampleVectorBinding {} references missing sample_fingerprint_ref {}",
                 self.binding_id, self.sample_fingerprint_ref
             )));
         }
-        if !vector_ref_ids.contains(&self.vector_ref) {
+        validate_model_input_digest_ref(
+            "TrainingSampleVectorBinding",
+            self.binding_id,
+            self.model_input_digest_ref,
+            ids.digest_ref_ids,
+            ids.model_input_digest_refs,
+        )?;
+        if !ids.vector_ref_ids.contains(&self.vector_ref) {
             return Err(CoveError::BadSection(format!(
                 "TrainingSampleVectorBinding {} references missing vector_ref {}",
                 self.binding_id, self.vector_ref
@@ -4927,6 +5485,254 @@ impl TrainingSampleVectorBindingV1 {
         }
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssociationStateVectorBindingV1 {
+    pub binding_id: u64,
+    pub vector_space_id: u32,
+    pub composition_profile_ref: u32,
+    pub file_ref: u32,
+    pub association_type_id: u32,
+    pub association_key_ref: u32,
+    pub branch_ref: u32,
+    pub temporal_kind: u8,
+    pub csn: u64,
+    pub timestamp_us: i64,
+    pub property_dependency_fingerprint_ref: u32,
+    pub vector_ref: u64,
+    pub model_input_digest_ref: u32,
+    pub flags: u32,
+    pub checksum: u32,
+}
+
+impl AssociationStateVectorBindingV1 {
+    fn validate(&self, ids: &VectorBindingValidationIds<'_>) -> Result<(), CoveError> {
+        if self.binding_id == 0 {
+            return Err(CoveError::BadSection(
+                "AssociationStateVectorBindingV1 binding_id must be non-zero".into(),
+            ));
+        }
+        if !ids.vector_space_ids.contains(&self.vector_space_id) {
+            return Err(CoveError::BadSection(format!(
+                "AssociationStateVectorBinding {} references missing vector_space_id {}",
+                self.binding_id, self.vector_space_id
+            )));
+        }
+        if self.composition_profile_ref != 0
+            && !ids
+                .composition_profile_ids
+                .contains(&self.composition_profile_ref)
+        {
+            return Err(CoveError::BadSection(format!(
+                "AssociationStateVectorBinding {} references missing composition_profile_ref {}",
+                self.binding_id, self.composition_profile_ref
+            )));
+        }
+        if self.file_ref != 0 && !ids.source_binding_ids.contains(&self.file_ref) {
+            return Err(CoveError::BadSection(format!(
+                "AssociationStateVectorBinding {} references missing file_ref {}",
+                self.binding_id, self.file_ref
+            )));
+        }
+        for (label, string_ref) in [
+            ("association_key_ref", self.association_key_ref),
+            ("branch_ref", self.branch_ref),
+        ] {
+            if string_ref != 0 && !ids.string_ref_ids.contains(&string_ref) {
+                return Err(CoveError::BadSection(format!(
+                    "AssociationStateVectorBinding {} references missing {label} {}",
+                    self.binding_id, string_ref
+                )));
+            }
+        }
+        if self.property_dependency_fingerprint_ref != 0
+            && !ids
+                .digest_ref_ids
+                .contains(&self.property_dependency_fingerprint_ref)
+        {
+            return Err(CoveError::BadSection(format!(
+                "AssociationStateVectorBinding {} references missing property_dependency_fingerprint_ref {}",
+                self.binding_id, self.property_dependency_fingerprint_ref
+            )));
+        }
+        validate_model_input_digest_ref(
+            "AssociationStateVectorBinding",
+            self.binding_id,
+            self.model_input_digest_ref,
+            ids.digest_ref_ids,
+            ids.model_input_digest_refs,
+        )?;
+        self.csn.checked_add(0).ok_or(CoveError::ArithOverflow)?;
+        if !ids.vector_ref_ids.contains(&self.vector_ref) {
+            return Err(CoveError::BadSection(format!(
+                "AssociationStateVectorBinding {} references missing vector_ref {}",
+                self.binding_id, self.vector_ref
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssetVectorBindingV1 {
+    pub binding_id: u64,
+    pub vector_space_id: u32,
+    pub asset_ref: u64,
+    pub transform_ref: u32,
+    pub asset_digest_ref: u32,
+    pub vector_ref: u64,
+    pub model_input_digest_ref: u32,
+    pub flags: u32,
+    pub checksum: u32,
+}
+
+impl AssetVectorBindingV1 {
+    fn validate(
+        &self,
+        vector_space_ids: &BTreeSet<u32>,
+        asset_ref_ids: &BTreeSet<u64>,
+        transform_ids: &BTreeSet<u32>,
+        digest_ref_ids: &BTreeSet<u32>,
+        model_input_digest_refs: &BTreeSet<u32>,
+        vector_ref_ids: &BTreeSet<u64>,
+    ) -> Result<(), CoveError> {
+        if self.binding_id == 0 {
+            return Err(CoveError::BadSection(
+                "AssetVectorBindingV1 binding_id must be non-zero".into(),
+            ));
+        }
+        if !vector_space_ids.contains(&self.vector_space_id) {
+            return Err(CoveError::BadSection(format!(
+                "AssetVectorBinding {} references missing vector_space_id {}",
+                self.binding_id, self.vector_space_id
+            )));
+        }
+        if self.asset_ref == 0 || !asset_ref_ids.contains(&self.asset_ref) {
+            return Err(CoveError::BadSection(format!(
+                "AssetVectorBinding {} references missing asset_ref {}",
+                self.binding_id, self.asset_ref
+            )));
+        }
+        if self.transform_ref != 0 && !transform_ids.contains(&self.transform_ref) {
+            return Err(CoveError::BadSection(format!(
+                "AssetVectorBinding {} references missing transform_ref {}",
+                self.binding_id, self.transform_ref
+            )));
+        }
+        if self.asset_digest_ref != 0 && !digest_ref_ids.contains(&self.asset_digest_ref) {
+            return Err(CoveError::BadSection(format!(
+                "AssetVectorBinding {} references missing asset_digest_ref {}",
+                self.binding_id, self.asset_digest_ref
+            )));
+        }
+        validate_model_input_digest_ref(
+            "AssetVectorBinding",
+            self.binding_id,
+            self.model_input_digest_ref,
+            digest_ref_ids,
+            model_input_digest_refs,
+        )?;
+        if !vector_ref_ids.contains(&self.vector_ref) {
+            return Err(CoveError::BadSection(format!(
+                "AssetVectorBinding {} references missing vector_ref {}",
+                self.binding_id, self.vector_ref
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MultimodalSequenceVectorBindingV1 {
+    pub binding_id: u64,
+    pub vector_space_id: u32,
+    pub sequence_pack_id: u64,
+    pub sequence_profile_ref: u32,
+    pub source_snapshot_ref: u32,
+    pub vector_ref: u64,
+    pub model_input_digest_ref: u32,
+    pub flags: u32,
+    pub checksum: u32,
+}
+
+impl MultimodalSequenceVectorBindingV1 {
+    fn validate(&self, ids: &VectorBindingValidationIds<'_>) -> Result<(), CoveError> {
+        if self.binding_id == 0 {
+            return Err(CoveError::BadSection(
+                "MultimodalSequenceVectorBindingV1 binding_id must be non-zero".into(),
+            ));
+        }
+        if !ids.vector_space_ids.contains(&self.vector_space_id) {
+            return Err(CoveError::BadSection(format!(
+                "MultimodalSequenceVectorBinding {} references missing vector_space_id {}",
+                self.binding_id, self.vector_space_id
+            )));
+        }
+        if self.sequence_pack_id == 0
+            || !ids
+                .multimodal_sequence_pack_ids
+                .contains(&self.sequence_pack_id)
+        {
+            return Err(CoveError::BadSection(format!(
+                "MultimodalSequenceVectorBinding {} references missing sequence_pack_id {}",
+                self.binding_id, self.sequence_pack_id
+            )));
+        }
+        if self.sequence_profile_ref != 0
+            && !ids.payload_ref_ids.contains(&self.sequence_profile_ref)
+        {
+            return Err(CoveError::BadSection(format!(
+                "MultimodalSequenceVectorBinding {} references missing sequence_profile_ref {}",
+                self.binding_id, self.sequence_profile_ref
+            )));
+        }
+        if self.source_snapshot_ref != 0
+            && !ids.source_binding_ids.contains(&self.source_snapshot_ref)
+        {
+            return Err(CoveError::BadSection(format!(
+                "MultimodalSequenceVectorBinding {} references missing source_snapshot_ref {}",
+                self.binding_id, self.source_snapshot_ref
+            )));
+        }
+        validate_model_input_digest_ref(
+            "MultimodalSequenceVectorBinding",
+            self.binding_id,
+            self.model_input_digest_ref,
+            ids.digest_ref_ids,
+            ids.model_input_digest_refs,
+        )?;
+        if !ids.vector_ref_ids.contains(&self.vector_ref) {
+            return Err(CoveError::BadSection(format!(
+                "MultimodalSequenceVectorBinding {} references missing vector_ref {}",
+                self.binding_id, self.vector_ref
+            )));
+        }
+        Ok(())
+    }
+}
+
+fn validate_model_input_digest_ref(
+    label: &str,
+    binding_id: u64,
+    model_input_digest_ref: u32,
+    digest_ref_ids: &BTreeSet<u32>,
+    model_input_digest_refs: &BTreeSet<u32>,
+) -> Result<(), CoveError> {
+    if model_input_digest_ref == 0 {
+        return Ok(());
+    }
+    if !digest_ref_ids.contains(&model_input_digest_ref) {
+        return Err(CoveError::BadSection(format!(
+            "{label} {binding_id} references missing model_input_digest_ref {model_input_digest_ref}"
+        )));
+    }
+    if !model_input_digest_refs.contains(&model_input_digest_ref) {
+        return Err(CoveError::BadSection(format!(
+            "{label} {binding_id} model_input_digest_ref {model_input_digest_ref} must use ModelInputBytes digest domain"
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5572,6 +6378,23 @@ pub struct CoveVecFileCodeVectorBuild {
     pub vector_payload: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CoveVecFileCodeVectorBuildOptions {
+    pub index_kind: Option<u8>,
+    pub metric: u8,
+    pub quantization_kind: u8,
+}
+
+impl Default for CoveVecFileCodeVectorBuildOptions {
+    fn default() -> Self {
+        Self {
+            index_kind: None,
+            metric: 1,
+            quantization_kind: 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoveAiDescriptorBundleBuild {
     pub artifact_id: [u8; 16],
@@ -5596,6 +6419,608 @@ pub struct FileCodeEmbeddingV1 {
     pub vector_space_id: u32,
     pub dimension_count: u32,
     pub values: Vec<f32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoveAiAccessContext {
+    pub operation: String,
+    pub allow_payloads: bool,
+    pub require_privacy_summary: bool,
+    pub allow_external_payloads: bool,
+    pub visibility_scope_ref: u32,
+    pub redaction_scope_ref: u32,
+}
+
+impl CoveAiAccessContext {
+    pub fn for_operation(operation: impl Into<String>) -> Self {
+        Self {
+            operation: operation.into(),
+            allow_payloads: true,
+            require_privacy_summary: true,
+            allow_external_payloads: false,
+            visibility_scope_ref: 0,
+            redaction_scope_ref: 0,
+        }
+    }
+
+    pub fn descriptor_only(operation: impl Into<String>) -> Self {
+        Self {
+            operation: operation.into(),
+            allow_payloads: false,
+            require_privacy_summary: true,
+            allow_external_payloads: false,
+            visibility_scope_ref: 0,
+            redaction_scope_ref: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AiDisclosureDecision {
+    Allowed,
+    PayloadAccessDisabled,
+    MissingPrivacySummary,
+    PolicyProtected,
+    Revoked,
+    ExternalPayloadBlocked,
+}
+
+impl AiDisclosureDecision {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Allowed => "allowed",
+            Self::PayloadAccessDisabled => "payload_access_disabled",
+            Self::MissingPrivacySummary => "missing_privacy_summary",
+            Self::PolicyProtected => "policy_protected",
+            Self::Revoked => "revoked",
+            Self::ExternalPayloadBlocked => "external_payload_blocked",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoveAiPayloadLease<'a> {
+    pub payload_ref: u32,
+    pub media_type_ref: u32,
+    pub decoded_length: u64,
+    pub integrity_ref: u32,
+    pub disclosure: AiDisclosureDecision,
+    pub bytes: &'a [u8],
+}
+
+pub struct AiPayloadReader<'a> {
+    artifact_bytes: &'a [u8],
+    sidecar: &'a CoveAiFile,
+    context: CoveAiAccessContext,
+}
+
+impl<'a> AiPayloadReader<'a> {
+    pub fn new(
+        artifact_bytes: &'a [u8],
+        sidecar: &'a CoveAiFile,
+        context: CoveAiAccessContext,
+    ) -> Self {
+        Self {
+            artifact_bytes,
+            sidecar,
+            context,
+        }
+    }
+
+    pub fn disclosure_for_payload_ref(
+        &self,
+        payload_ref: u32,
+    ) -> Result<AiDisclosureDecision, CoveError> {
+        if !self.context.allow_payloads {
+            return Ok(AiDisclosureDecision::PayloadAccessDisabled);
+        }
+        if self.context.require_privacy_summary
+            && self.sidecar.payload_access
+                == AiPayloadAccessState::PolicyBlockedMissingPrivacySummary
+        {
+            return Ok(AiDisclosureDecision::MissingPrivacySummary);
+        }
+        let payload_ref = self
+            .sidecar
+            .descriptor_tables
+            .payload_ref(payload_ref)
+            .ok_or_else(|| {
+                CoveError::BadSection(format!("AI payload_ref {payload_ref} is missing"))
+            })?;
+        if payload_ref.flags & AI_FLAG_REVOKED != 0 {
+            return Ok(AiDisclosureDecision::Revoked);
+        }
+        if payload_ref.flags & AI_FLAG_POLICY_PROTECTED != 0 {
+            return Ok(AiDisclosureDecision::PolicyProtected);
+        }
+        if payload_ref.storage_kind == AiStorageKindV1::ExternalUri as u8
+            && !self.context.allow_external_payloads
+        {
+            return Ok(AiDisclosureDecision::ExternalPayloadBlocked);
+        }
+        Ok(AiDisclosureDecision::Allowed)
+    }
+
+    pub fn lease_payload_ref(&self, payload_ref: u32) -> Result<CoveAiPayloadLease<'a>, CoveError> {
+        let disclosure = self.disclosure_for_payload_ref(payload_ref)?;
+        if disclosure != AiDisclosureDecision::Allowed {
+            return Err(CoveError::BadSection(format!(
+                "AI payload_ref {payload_ref} disclosure is {}",
+                disclosure.as_str()
+            )));
+        }
+        let payload = self
+            .sidecar
+            .descriptor_tables
+            .payload_ref(payload_ref)
+            .ok_or_else(|| {
+                CoveError::BadSection(format!("AI payload_ref {payload_ref} is missing"))
+            })?;
+        if payload.integrity_ref != 0 {
+            exact_flat_verify_payload_integrity(
+                self.artifact_bytes,
+                self.sidecar,
+                payload.integrity_ref,
+            )?;
+        }
+        let bytes = exact_flat_payload_ref_bytes(self.artifact_bytes, self.sidecar, payload)?;
+        Ok(CoveAiPayloadLease {
+            payload_ref: payload.payload_ref,
+            media_type_ref: payload.media_type_ref,
+            decoded_length: payload.decoded_length,
+            integrity_ref: payload.integrity_ref,
+            disclosure,
+            bytes,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AiEmbeddingRequest {
+    pub file_code: Option<u32>,
+    pub vector_ref: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AiEmbeddingResult {
+    pub target_kind: String,
+    pub file_code: Option<u32>,
+    pub vector_ref: u64,
+    pub vector_space_id: u32,
+    pub dimension_count: u32,
+    pub element_type: u8,
+    pub values: Vec<f32>,
+    pub result_authority: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AiVectorSearchTargetKind {
+    All,
+    FileCode,
+    Chunk,
+    ObjectState,
+    AssociationState,
+    TrainingSample,
+    Asset,
+    MultimodalSequence,
+}
+
+impl AiVectorSearchTargetKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::FileCode => "file_code",
+            Self::Chunk => "chunk",
+            Self::ObjectState => "object_state",
+            Self::AssociationState => "association_state",
+            Self::TrainingSample => "training_sample",
+            Self::Asset => "asset",
+            Self::MultimodalSequence => "multimodal_sequence",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AiVectorIndexSelection {
+    Auto,
+    ExactFlat,
+    Hnsw,
+    IvfFlat,
+    IvfPq,
+    DiskAnn,
+    Vamana,
+}
+
+impl AiVectorIndexSelection {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::ExactFlat => "exact_flat",
+            Self::Hnsw => "hnsw",
+            Self::IvfFlat => "ivf_flat",
+            Self::IvfPq => "ivf_pq",
+            Self::DiskAnn => "diskann",
+            Self::Vamana => "vamana",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AiVectorSearchPlan {
+    pub query_file_code: Option<u32>,
+    pub query_vector_ref: Option<u64>,
+    pub query_values: Option<Vec<f32>>,
+    pub top_k: usize,
+    pub target_kind: AiVectorSearchTargetKind,
+    pub index: AiVectorIndexSelection,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AiVectorSearchResult {
+    pub target_kind: String,
+    pub binding_id: Option<u64>,
+    pub file_code: Option<u32>,
+    pub chunk_id: Option<u64>,
+    pub object_type_id: Option<u32>,
+    pub association_type_id: Option<u32>,
+    pub sample_id: Option<u64>,
+    pub asset_ref: Option<u64>,
+    pub multimodal_sequence_pack_id: Option<u64>,
+    pub vector_ref: u64,
+    pub vector_space_id: u32,
+    /// Larger is better. For distance metrics this is the negative distance.
+    pub score: f32,
+    pub exact: bool,
+    pub selected_index: String,
+    pub fallback_used: bool,
+    pub result_authority: String,
+}
+
+struct SelectedAiVectorIndex {
+    name: String,
+    index_kind: u8,
+    fallback_used: bool,
+    exact: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AiExportOptions {
+    pub include_payloads: bool,
+    pub format: String,
+    pub profile_filter: Option<u32>,
+    pub split_filter: Option<u32>,
+    pub epoch_plan_filter: Option<u64>,
+    pub policy_report: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AiExportReport {
+    pub records_considered: usize,
+    pub records_exported: usize,
+    pub payloads_read: usize,
+    pub payload_bytes_read: u64,
+    pub policy_withheld: usize,
+    pub diagnostics: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AiExplainReport {
+    pub artifact_kind: CoveAiArtifactKind,
+    pub artifact_id: [u8; 16],
+    pub payload_access: AiPayloadAccessState,
+    pub vector_space_count: usize,
+    pub vector_index_count: usize,
+    pub payload_ref_count: usize,
+    pub privacy_summary_count: usize,
+    pub stale_or_withheld: Vec<String>,
+    pub supported_indexes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AiDlpackDType {
+    pub code: u8,
+    pub bits: u8,
+    pub lanes: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AiDlpackDevice {
+    pub device_type: u8,
+    pub device_id: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AiTensorZeroCopyView<'a> {
+    pub tensor_layout_id: u32,
+    pub payload_ref: u32,
+    pub dtype: u8,
+    pub dlpack_dtype: AiDlpackDType,
+    pub dlpack_device: AiDlpackDevice,
+    pub shape: Vec<i64>,
+    pub strides: Option<Vec<i64>>,
+    pub byte_offset: usize,
+    pub data: &'a [u8],
+    pub result_authority: &'static str,
+}
+
+pub fn ai_tensor_zero_copy_view<'a>(
+    artifact_bytes: &'a [u8],
+    tensor_layout_id: u32,
+    payload_ref: u32,
+) -> Result<AiTensorZeroCopyView<'a>, CoveError> {
+    let sidecar = parse_ai_sidecar_with_payload_access(artifact_bytes)?;
+    let layout = sidecar
+        .descriptor_tables
+        .tensor_layouts
+        .iter()
+        .find(|layout| layout.tensor_layout_id == tensor_layout_id)
+        .ok_or_else(|| {
+            CoveError::BadSection(format!("AI tensor layout {tensor_layout_id} is missing"))
+        })?;
+    let access_context = CoveAiAccessContext::for_operation("tensor_zero_copy");
+    let payload_reader = AiPayloadReader::new(artifact_bytes, &sidecar, access_context);
+    let shape = ai_tensor_i64_vector_payload(
+        &payload_reader,
+        layout.shape_ref,
+        usize::from(layout.rank),
+        "tensor shape_ref",
+    )?;
+    let strides = if layout.stride_ref == 0 {
+        None
+    } else {
+        Some(ai_tensor_i64_vector_payload(
+            &payload_reader,
+            layout.stride_ref,
+            usize::from(layout.rank),
+            "tensor stride_ref",
+        )?)
+    };
+    payload_reader.lease_payload_ref(payload_ref)?;
+    let data_payload = sidecar
+        .descriptor_tables
+        .payload_ref(payload_ref)
+        .ok_or_else(|| CoveError::BadSection(format!("AI payload_ref {payload_ref} is missing")))?;
+    let data = exact_flat_payload_ref_bytes(artifact_bytes, &sidecar, data_payload)?;
+    ai_validate_tensor_zero_copy_layout(layout, &shape, strides.as_deref(), data)?;
+    let dtype = ai_tensor_dlpack_dtype(layout.dtype)?;
+    let byte_offset = ai_tensor_byte_offset(layout)?;
+    Ok(AiTensorZeroCopyView {
+        tensor_layout_id,
+        payload_ref,
+        dtype: layout.dtype,
+        dlpack_dtype: dtype,
+        dlpack_device: AiDlpackDevice {
+            device_type: layout.device_affinity_hint,
+            device_id: 0,
+        },
+        shape,
+        strides,
+        byte_offset,
+        data,
+        result_authority: "ValidatedAiPayloadLeaseTensorZeroCopy",
+    })
+}
+
+pub fn ai_explain_report(sidecar: &CoveAiFile) -> AiExplainReport {
+    let mut stale_or_withheld = Vec::new();
+    if sidecar.payload_access == AiPayloadAccessState::PolicyBlockedMissingPrivacySummary {
+        stale_or_withheld.push("payload_access_blocked_missing_privacy_summary".to_string());
+    }
+    let supported_indexes = sidecar
+        .descriptor_tables
+        .vector_indexes
+        .iter()
+        .map(|index| vector_index_kind_name(index.index_kind).to_string())
+        .collect();
+    AiExplainReport {
+        artifact_kind: sidecar.artifact_kind,
+        artifact_id: sidecar.header.artifact_id,
+        payload_access: sidecar.payload_access,
+        vector_space_count: sidecar.descriptor_tables.vector_spaces.len(),
+        vector_index_count: sidecar.descriptor_tables.vector_indexes.len(),
+        payload_ref_count: sidecar.descriptor_tables.payload_refs.len(),
+        privacy_summary_count: sidecar.descriptor_tables.privacy_summaries.len(),
+        stale_or_withheld,
+        supported_indexes,
+    }
+}
+
+fn ai_tensor_i64_vector_payload(
+    payload_reader: &AiPayloadReader<'_>,
+    payload_ref: u32,
+    expected_len: usize,
+    label: &str,
+) -> Result<Vec<i64>, CoveError> {
+    if payload_ref == 0 {
+        return Err(CoveError::BadSection(format!(
+            "{label} is required for tensor zero-copy"
+        )));
+    }
+    let lease = payload_reader.lease_payload_ref(payload_ref)?;
+    let expected_bytes = expected_len
+        .checked_mul(8)
+        .ok_or(CoveError::ArithOverflow)?;
+    if lease.bytes.len() != expected_bytes {
+        return Err(CoveError::BadSection(format!(
+            "{label} payload length {} does not match rank byte length {expected_bytes}",
+            lease.bytes.len()
+        )));
+    }
+    let mut values = Vec::with_capacity(expected_len);
+    for chunk in lease.bytes.chunks_exact(8) {
+        values.push(i64::from_le_bytes(chunk.try_into().unwrap()));
+    }
+    Ok(values)
+}
+
+fn ai_validate_tensor_zero_copy_layout(
+    layout: &TensorLayoutDescriptorV1,
+    shape: &[i64],
+    strides: Option<&[i64]>,
+    data: &[u8],
+) -> Result<(), CoveError> {
+    let rank = usize::from(layout.rank);
+    if shape.len() != rank || strides.is_some_and(|strides| strides.len() != rank) {
+        return Err(CoveError::BadSection(
+            "AI tensor shape/stride rank mismatch".into(),
+        ));
+    }
+    if layout.byte_order == 2 {
+        return Err(CoveError::BadSection(
+            "AI tensor zero-copy does not expose byte-swapped big-endian payloads".into(),
+        ));
+    }
+    if layout.quantization_profile_ref != 0 || layout.sparsity_profile_ref != 0 {
+        return Err(CoveError::BadSection(
+            "AI tensor zero-copy requires uncompressed dense tensor payloads".into(),
+        ));
+    }
+    let element_width = ai_tensor_element_width(layout.dtype)?;
+    let strides = match strides {
+        Some(strides) => strides.to_vec(),
+        None => ai_contiguous_strides(shape)?,
+    };
+    let storage_offset =
+        usize::try_from(layout.storage_offset_elements).map_err(|_| CoveError::ArithOverflow)?;
+    let max_element_offset = ai_tensor_max_element_offset(shape, &strides, storage_offset)?;
+    let required_bytes = max_element_offset
+        .checked_add(1)
+        .and_then(|elements| elements.checked_mul(element_width))
+        .ok_or(CoveError::ArithOverflow)?;
+    if required_bytes > data.len() {
+        return Err(CoveError::BadSection(format!(
+            "AI tensor payload length {} is shorter than required zero-copy byte length {required_bytes}",
+            data.len()
+        )));
+    }
+    let byte_offset = storage_offset
+        .checked_mul(element_width)
+        .ok_or(CoveError::ArithOverflow)?;
+    if byte_offset > data.len() {
+        return Err(CoveError::BadSection(
+            "AI tensor storage offset exceeds payload length".into(),
+        ));
+    }
+    if layout.memory_alignment_bytes > 1 {
+        let alignment =
+            usize::try_from(layout.memory_alignment_bytes).map_err(|_| CoveError::ArithOverflow)?;
+        if !(data.as_ptr().wrapping_add(byte_offset) as usize).is_multiple_of(alignment) {
+            return Err(CoveError::BadSection(format!(
+                "AI tensor payload is not aligned to {} bytes",
+                layout.memory_alignment_bytes
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn ai_tensor_byte_offset(layout: &TensorLayoutDescriptorV1) -> Result<usize, CoveError> {
+    let element_width = ai_tensor_element_width(layout.dtype)?;
+    usize::try_from(layout.storage_offset_elements)
+        .map_err(|_| CoveError::ArithOverflow)?
+        .checked_mul(element_width)
+        .ok_or(CoveError::ArithOverflow)
+}
+
+fn ai_contiguous_strides(shape: &[i64]) -> Result<Vec<i64>, CoveError> {
+    let mut strides = vec![0; shape.len()];
+    let mut stride = 1i64;
+    for index in (0..shape.len()).rev() {
+        let dim = shape[index];
+        if dim <= 0 {
+            return Err(CoveError::BadSection(
+                "AI tensor shape dimensions must be positive".into(),
+            ));
+        }
+        strides[index] = stride;
+        stride = stride.checked_mul(dim).ok_or(CoveError::ArithOverflow)?;
+    }
+    Ok(strides)
+}
+
+fn ai_tensor_max_element_offset(
+    shape: &[i64],
+    strides: &[i64],
+    storage_offset: usize,
+) -> Result<usize, CoveError> {
+    let mut max_offset = storage_offset;
+    for (dim, stride) in shape.iter().zip(strides) {
+        if *dim <= 0 {
+            return Err(CoveError::BadSection(
+                "AI tensor shape dimensions must be positive".into(),
+            ));
+        }
+        if *stride < 0 {
+            return Err(CoveError::BadSection(
+                "AI tensor zero-copy does not expose negative strides".into(),
+            ));
+        }
+        let dim_span = usize::try_from(dim - 1).map_err(|_| CoveError::ArithOverflow)?;
+        let stride = usize::try_from(*stride).map_err(|_| CoveError::ArithOverflow)?;
+        max_offset = max_offset
+            .checked_add(
+                dim_span
+                    .checked_mul(stride)
+                    .ok_or(CoveError::ArithOverflow)?,
+            )
+            .ok_or(CoveError::ArithOverflow)?;
+    }
+    Ok(max_offset)
+}
+
+fn ai_tensor_element_width(dtype: u8) -> Result<usize, CoveError> {
+    match dtype {
+        0 => Ok(4),  // Float32
+        1 => Ok(8),  // Float64
+        2 => Ok(2),  // Float16
+        3 => Ok(2),  // BFloat16
+        4 => Ok(1),  // Int8
+        5 => Ok(1),  // UInt8
+        6 => Ok(2),  // Int16
+        7 => Ok(2),  // UInt16
+        8 => Ok(4),  // Int32
+        9 => Ok(4),  // UInt32
+        10 => Ok(8), // Int64
+        11 => Ok(8), // UInt64
+        12 => Ok(1), // Bool
+        13 => Ok(2), // Fixed16
+        14 => Ok(4), // Fixed32
+        15 => Ok(8), // Fixed64
+        _ => Err(CoveError::BadSection(format!(
+            "AI tensor dtype {dtype} is not supported for zero-copy"
+        ))),
+    }
+}
+
+fn ai_tensor_dlpack_dtype(dtype: u8) -> Result<AiDlpackDType, CoveError> {
+    let (code, bits) = match dtype {
+        0 => (2, 32),
+        1 => (2, 64),
+        2 => (2, 16),
+        3 => (4, 16),
+        4 => (0, 8),
+        5 => (1, 8),
+        6 => (0, 16),
+        7 => (1, 16),
+        8 => (0, 32),
+        9 => (1, 32),
+        10 => (0, 64),
+        11 => (1, 64),
+        12 => (1, 1),
+        13 => (0, 16),
+        14 => (0, 32),
+        15 => (0, 64),
+        _ => {
+            return Err(CoveError::BadSection(format!(
+                "AI tensor dtype {dtype} is not supported for DLPack"
+            )));
+        }
+    };
+    Ok(AiDlpackDType {
+        code,
+        bits,
+        lanes: 1,
+    })
 }
 
 pub fn exact_flat_filecode_vector_search(
@@ -5678,6 +7103,896 @@ pub fn filecode_embedding(
     })
 }
 
+pub fn ai_embedding(
+    artifact_bytes: &[u8],
+    request: &AiEmbeddingRequest,
+) -> Result<AiEmbeddingResult, CoveError> {
+    let sidecar = parse_ai_sidecar_with_payload_access(artifact_bytes)?;
+    let (target_kind, file_code, vector_space, vector_entry) =
+        resolve_embedding_request(&sidecar, request)?;
+    let values = vector_entry_values_as_f32(artifact_bytes, &sidecar, vector_space, vector_entry)?;
+    Ok(AiEmbeddingResult {
+        target_kind: target_kind.to_string(),
+        file_code,
+        vector_ref: vector_entry.vector_ref,
+        vector_space_id: vector_space.vector_space_id,
+        dimension_count: vector_space.dimension_count,
+        element_type: vector_space.element_type,
+        values,
+        result_authority: "PersistedPayloadDigest".to_string(),
+    })
+}
+
+pub fn ai_vector_search(
+    artifact_bytes: &[u8],
+    plan: &AiVectorSearchPlan,
+) -> Result<Vec<AiVectorSearchResult>, CoveError> {
+    if plan.top_k == 0 {
+        return Ok(Vec::new());
+    }
+    let sidecar = parse_ai_sidecar_with_payload_access(artifact_bytes)?;
+    let (query_space, query_values) = resolve_vector_query(artifact_bytes, &sidecar, plan)?;
+    let selected_index = select_vector_index(&sidecar, query_space, plan.index);
+    let loaded_candidates =
+        load_vector_search_candidates(artifact_bytes, &sidecar, query_space, plan.target_kind)?;
+    let selected_candidate_indices = if selected_index.exact || selected_index.fallback_used {
+        (0..loaded_candidates.len()).collect::<Vec<_>>()
+    } else {
+        ann_candidate_indices(
+            &loaded_candidates,
+            query_space.metric,
+            &query_values,
+            plan.top_k,
+            selected_index.index_kind,
+        )?
+    };
+    let mut results = Vec::new();
+
+    for candidate_index in selected_candidate_indices {
+        let loaded = loaded_candidates.get(candidate_index).ok_or_else(|| {
+            CoveError::BadSection("AI ANN candidate index is out of range".into())
+        })?;
+        let score = exact_flat_metric_score(query_space.metric, &query_values, &loaded.values)?;
+        let candidate = &loaded.candidate;
+        results.push(AiVectorSearchResult {
+            target_kind: candidate.target_kind.to_string(),
+            binding_id: candidate.binding_id,
+            file_code: candidate.file_code,
+            chunk_id: candidate.chunk_id,
+            object_type_id: candidate.object_type_id,
+            association_type_id: candidate.association_type_id,
+            sample_id: candidate.sample_id,
+            asset_ref: candidate.asset_ref,
+            multimodal_sequence_pack_id: candidate.multimodal_sequence_pack_id,
+            vector_ref: candidate.vector_ref,
+            vector_space_id: query_space.vector_space_id,
+            score,
+            exact: selected_index.exact,
+            selected_index: selected_index.name.clone(),
+            fallback_used: selected_index.fallback_used,
+            result_authority: if selected_index.fallback_used {
+                "ExactFlatFallback".to_string()
+            } else if selected_index.exact {
+                "ExactOptimizedKernel".to_string()
+            } else {
+                "ApproximateInternalAnn".to_string()
+            },
+        });
+    }
+
+    results.sort_by(|left, right| {
+        right
+            .score
+            .total_cmp(&left.score)
+            .then_with(|| left.target_kind.cmp(&right.target_kind))
+            .then_with(|| left.vector_ref.cmp(&right.vector_ref))
+    });
+    results.truncate(plan.top_k.min(results.len()));
+    Ok(results)
+}
+
+fn parse_ai_sidecar_with_payload_access(artifact_bytes: &[u8]) -> Result<CoveAiFile, CoveError> {
+    let sidecar = CoveAiFile::parse(artifact_bytes)?;
+    if sidecar.payload_access != AiPayloadAccessState::StructurallyAllowed {
+        return Err(CoveError::BadSection(
+            "direct AI payload access is policy-blocked: missing AI_PRIVACY_SUMMARY".into(),
+        ));
+    }
+    Ok(sidecar)
+}
+
+fn resolve_embedding_request<'a>(
+    sidecar: &'a CoveAiFile,
+    request: &AiEmbeddingRequest,
+) -> Result<
+    (
+        &'static str,
+        Option<u32>,
+        &'a VectorSpaceDescriptorV1,
+        &'a VectorEntryV1,
+    ),
+    CoveError,
+> {
+    match (request.file_code, request.vector_ref) {
+        (Some(file_code), None) => {
+            let (binding, vector_space, vector_entry) =
+                runtime_filecode_binding_parts(sidecar, file_code)?;
+            Ok((
+                AiVectorSearchTargetKind::FileCode.as_str(),
+                Some(binding.file_code),
+                vector_space,
+                vector_entry,
+            ))
+        }
+        (None, Some(vector_ref)) => {
+            let vector_entry = vector_entry_by_ref(sidecar, vector_ref)?;
+            let vector_space = vector_space_for_entry(sidecar, vector_entry)?;
+            validate_runtime_vector_space(vector_space)?;
+            Ok(("vector_ref", None, vector_space, vector_entry))
+        }
+        (Some(_), Some(_)) => Err(CoveError::BadSection(
+            "AI embedding request must use either file_code or vector_ref, not both".into(),
+        )),
+        (None, None) => Err(CoveError::BadSection(
+            "AI embedding request requires file_code or vector_ref".into(),
+        )),
+    }
+}
+
+fn resolve_vector_query<'a>(
+    artifact_bytes: &[u8],
+    sidecar: &'a CoveAiFile,
+    plan: &AiVectorSearchPlan,
+) -> Result<(&'a VectorSpaceDescriptorV1, Vec<f32>), CoveError> {
+    let provided = usize::from(plan.query_file_code.is_some())
+        + usize::from(plan.query_vector_ref.is_some())
+        + usize::from(plan.query_values.is_some());
+    if provided != 1 {
+        return Err(CoveError::BadSection(
+            "AI vector search requires exactly one query: file_code, vector_ref, or query_values"
+                .into(),
+        ));
+    }
+    if let Some(file_code) = plan.query_file_code {
+        let (_binding, vector_space, vector_entry) =
+            runtime_filecode_binding_parts(sidecar, file_code)?;
+        let values =
+            vector_entry_values_as_f32(artifact_bytes, sidecar, vector_space, vector_entry)?;
+        return Ok((vector_space, values));
+    }
+    if let Some(vector_ref) = plan.query_vector_ref {
+        let vector_entry = vector_entry_by_ref(sidecar, vector_ref)?;
+        let vector_space = vector_space_for_entry(sidecar, vector_entry)?;
+        validate_runtime_vector_space(vector_space)?;
+        let values =
+            vector_entry_values_as_f32(artifact_bytes, sidecar, vector_space, vector_entry)?;
+        return Ok((vector_space, values));
+    }
+    let query_values = plan.query_values.clone().unwrap_or_default();
+    if query_values.is_empty() {
+        return Err(CoveError::BadSection(
+            "AI vector search query_values must be non-empty".into(),
+        ));
+    }
+    for value in &query_values {
+        if !value.is_finite() {
+            return Err(CoveError::BadSection(
+                "AI vector search query contains non-finite values".into(),
+            ));
+        }
+    }
+    let query_dimension =
+        u32::try_from(query_values.len()).map_err(|_| CoveError::ArithOverflow)?;
+    let matching_spaces = sidecar
+        .descriptor_tables
+        .vector_spaces
+        .iter()
+        .filter(|space| space.dimension_count == query_dimension)
+        .collect::<Vec<_>>();
+    let vector_space = match matching_spaces.as_slice() {
+        [space] => *space,
+        [] => {
+            return Err(CoveError::BadSection(format!(
+                "no COVE-AI vector space matches query dimension {query_dimension}"
+            )));
+        }
+        _ => {
+            return Err(CoveError::BadSection(format!(
+                "multiple COVE-AI vector spaces match query dimension {query_dimension}; vector search is ambiguous"
+            )));
+        }
+    };
+    validate_runtime_vector_space(vector_space)?;
+    Ok((vector_space, query_values))
+}
+
+#[derive(Debug, Clone)]
+struct VectorSearchCandidate {
+    target_kind: &'static str,
+    binding_id: Option<u64>,
+    file_code: Option<u32>,
+    chunk_id: Option<u64>,
+    object_type_id: Option<u32>,
+    association_type_id: Option<u32>,
+    sample_id: Option<u64>,
+    asset_ref: Option<u64>,
+    multimodal_sequence_pack_id: Option<u64>,
+    vector_ref: u64,
+}
+
+#[derive(Debug, Clone)]
+struct LoadedVectorSearchCandidate {
+    candidate: VectorSearchCandidate,
+    values: Vec<f32>,
+}
+
+fn vector_search_candidates(
+    sidecar: &CoveAiFile,
+    vector_space: &VectorSpaceDescriptorV1,
+    target_kind: AiVectorSearchTargetKind,
+) -> Vec<VectorSearchCandidate> {
+    let mut out = Vec::new();
+    if matches!(
+        target_kind,
+        AiVectorSearchTargetKind::All | AiVectorSearchTargetKind::FileCode
+    ) {
+        out.extend(
+            sidecar
+                .descriptor_tables
+                .filecode_vector_bindings
+                .iter()
+                .filter(|binding| binding.vector_space_id == vector_space.vector_space_id)
+                .map(|binding| VectorSearchCandidate {
+                    target_kind: AiVectorSearchTargetKind::FileCode.as_str(),
+                    binding_id: Some(binding.binding_id),
+                    file_code: Some(binding.file_code),
+                    chunk_id: None,
+                    object_type_id: None,
+                    association_type_id: None,
+                    sample_id: None,
+                    asset_ref: None,
+                    multimodal_sequence_pack_id: None,
+                    vector_ref: binding.vector_ref,
+                }),
+        );
+    }
+    if matches!(
+        target_kind,
+        AiVectorSearchTargetKind::All | AiVectorSearchTargetKind::Chunk
+    ) {
+        out.extend(
+            sidecar
+                .descriptor_tables
+                .chunk_vector_bindings
+                .iter()
+                .filter(|binding| binding.vector_space_id == vector_space.vector_space_id)
+                .map(|binding| VectorSearchCandidate {
+                    target_kind: AiVectorSearchTargetKind::Chunk.as_str(),
+                    binding_id: Some(binding.binding_id),
+                    file_code: None,
+                    chunk_id: Some(binding.chunk_id),
+                    object_type_id: None,
+                    association_type_id: None,
+                    sample_id: None,
+                    asset_ref: None,
+                    multimodal_sequence_pack_id: None,
+                    vector_ref: binding.vector_ref,
+                }),
+        );
+    }
+    if matches!(
+        target_kind,
+        AiVectorSearchTargetKind::All | AiVectorSearchTargetKind::ObjectState
+    ) {
+        out.extend(
+            sidecar
+                .descriptor_tables
+                .object_state_vector_bindings
+                .iter()
+                .filter(|binding| binding.vector_space_id == vector_space.vector_space_id)
+                .map(|binding| VectorSearchCandidate {
+                    target_kind: AiVectorSearchTargetKind::ObjectState.as_str(),
+                    binding_id: Some(binding.binding_id),
+                    file_code: None,
+                    chunk_id: None,
+                    object_type_id: Some(binding.object_type_id),
+                    association_type_id: None,
+                    sample_id: None,
+                    asset_ref: None,
+                    multimodal_sequence_pack_id: None,
+                    vector_ref: binding.vector_ref,
+                }),
+        );
+    }
+    if matches!(
+        target_kind,
+        AiVectorSearchTargetKind::All | AiVectorSearchTargetKind::AssociationState
+    ) {
+        out.extend(
+            sidecar
+                .descriptor_tables
+                .association_state_vector_bindings
+                .iter()
+                .filter(|binding| binding.vector_space_id == vector_space.vector_space_id)
+                .map(|binding| VectorSearchCandidate {
+                    target_kind: AiVectorSearchTargetKind::AssociationState.as_str(),
+                    binding_id: Some(binding.binding_id),
+                    file_code: None,
+                    chunk_id: None,
+                    object_type_id: None,
+                    association_type_id: Some(binding.association_type_id),
+                    sample_id: None,
+                    asset_ref: None,
+                    multimodal_sequence_pack_id: None,
+                    vector_ref: binding.vector_ref,
+                }),
+        );
+    }
+    if matches!(
+        target_kind,
+        AiVectorSearchTargetKind::All | AiVectorSearchTargetKind::TrainingSample
+    ) {
+        out.extend(
+            sidecar
+                .descriptor_tables
+                .training_sample_vector_bindings
+                .iter()
+                .filter(|binding| binding.vector_space_id == vector_space.vector_space_id)
+                .map(|binding| VectorSearchCandidate {
+                    target_kind: AiVectorSearchTargetKind::TrainingSample.as_str(),
+                    binding_id: Some(binding.binding_id),
+                    file_code: None,
+                    chunk_id: None,
+                    object_type_id: None,
+                    association_type_id: None,
+                    sample_id: Some(binding.sample_id),
+                    asset_ref: None,
+                    multimodal_sequence_pack_id: None,
+                    vector_ref: binding.vector_ref,
+                }),
+        );
+    }
+    if matches!(
+        target_kind,
+        AiVectorSearchTargetKind::All | AiVectorSearchTargetKind::Asset
+    ) {
+        out.extend(
+            sidecar
+                .descriptor_tables
+                .asset_vector_bindings
+                .iter()
+                .filter(|binding| binding.vector_space_id == vector_space.vector_space_id)
+                .map(|binding| VectorSearchCandidate {
+                    target_kind: AiVectorSearchTargetKind::Asset.as_str(),
+                    binding_id: Some(binding.binding_id),
+                    file_code: None,
+                    chunk_id: None,
+                    object_type_id: None,
+                    association_type_id: None,
+                    sample_id: None,
+                    asset_ref: Some(binding.asset_ref),
+                    multimodal_sequence_pack_id: None,
+                    vector_ref: binding.vector_ref,
+                }),
+        );
+    }
+    if matches!(
+        target_kind,
+        AiVectorSearchTargetKind::All | AiVectorSearchTargetKind::MultimodalSequence
+    ) {
+        out.extend(
+            sidecar
+                .descriptor_tables
+                .multimodal_sequence_vector_bindings
+                .iter()
+                .filter(|binding| binding.vector_space_id == vector_space.vector_space_id)
+                .map(|binding| VectorSearchCandidate {
+                    target_kind: AiVectorSearchTargetKind::MultimodalSequence.as_str(),
+                    binding_id: Some(binding.binding_id),
+                    file_code: None,
+                    chunk_id: None,
+                    object_type_id: None,
+                    association_type_id: None,
+                    sample_id: None,
+                    asset_ref: None,
+                    multimodal_sequence_pack_id: Some(binding.sequence_pack_id),
+                    vector_ref: binding.vector_ref,
+                }),
+        );
+    }
+    out
+}
+
+fn load_vector_search_candidates(
+    artifact_bytes: &[u8],
+    sidecar: &CoveAiFile,
+    vector_space: &VectorSpaceDescriptorV1,
+    target_kind: AiVectorSearchTargetKind,
+) -> Result<Vec<LoadedVectorSearchCandidate>, CoveError> {
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    for candidate in vector_search_candidates(sidecar, vector_space, target_kind) {
+        if !seen.insert((candidate.vector_ref, candidate.target_kind.to_string())) {
+            continue;
+        }
+        let vector_entry = sidecar
+            .descriptor_tables
+            .vector_entries
+            .iter()
+            .find(|entry| entry.vector_ref == candidate.vector_ref)
+            .ok_or_else(|| {
+                CoveError::BadSection(format!(
+                    "AI vector binding references missing vector_ref {}",
+                    candidate.vector_ref
+                ))
+            })?;
+        let values =
+            vector_entry_values_as_f32(artifact_bytes, sidecar, vector_space, vector_entry)?;
+        out.push(LoadedVectorSearchCandidate { candidate, values });
+    }
+    Ok(out)
+}
+
+fn ann_candidate_indices(
+    candidates: &[LoadedVectorSearchCandidate],
+    metric: u8,
+    query: &[f32],
+    top_k: usize,
+    index_kind: u8,
+) -> Result<Vec<usize>, CoveError> {
+    if candidates.is_empty() || top_k == 0 {
+        return Ok(Vec::new());
+    }
+    let limit = ann_candidate_limit(top_k, candidates.len());
+    match index_kind {
+        1 => graph_ann_candidate_indices(candidates, metric, query, top_k, 16, limit, 4),
+        2 => ivf_flat_candidate_indices(candidates, metric, query, top_k, limit),
+        3 => ivf_pq_candidate_indices(candidates, metric, query, top_k, limit),
+        4 => graph_ann_candidate_indices(candidates, metric, query, top_k, 32, limit, 8),
+        5 => graph_ann_candidate_indices(candidates, metric, query, top_k, 24, limit, 6),
+        _ => Ok((0..candidates.len()).collect()),
+    }
+}
+
+fn ann_candidate_limit(top_k: usize, candidate_count: usize) -> usize {
+    candidate_count.min(top_k.saturating_mul(8).max(32).max(top_k))
+}
+
+fn graph_ann_candidate_indices(
+    candidates: &[LoadedVectorSearchCandidate],
+    metric: u8,
+    query: &[f32],
+    top_k: usize,
+    degree: usize,
+    limit: usize,
+    entry_count: usize,
+) -> Result<Vec<usize>, CoveError> {
+    if candidates.len() <= limit {
+        return Ok((0..candidates.len()).collect());
+    }
+    let query_scores = ann_query_scores(candidates, metric, query)?;
+    let graph = ann_neighbor_graph(candidates, metric, degree)?;
+    let mut entries = sampled_entry_points(&query_scores, entry_count.max(1));
+    if entries.is_empty() {
+        entries.push(0);
+    }
+
+    let ef = candidates
+        .len()
+        .min(limit.saturating_mul(2).max(top_k).max(degree));
+    let mut visited = BTreeSet::new();
+    let mut frontier = Vec::new();
+    for entry in entries {
+        if visited.insert(entry) {
+            frontier.push(entry);
+        }
+    }
+    let mut reached = Vec::new();
+    while !frontier.is_empty() && reached.len() < ef {
+        let best_pos = frontier
+            .iter()
+            .enumerate()
+            .max_by(|(_, left), (_, right)| {
+                query_scores[**left]
+                    .total_cmp(&query_scores[**right])
+                    .then_with(|| right.cmp(left))
+            })
+            .map(|(pos, _)| pos)
+            .unwrap_or(0);
+        let current = frontier.swap_remove(best_pos);
+        reached.push(current);
+        for neighbor in &graph[current] {
+            if visited.insert(*neighbor) {
+                frontier.push(*neighbor);
+            }
+        }
+    }
+    if reached.len() < top_k {
+        widen_ann_candidates(&mut reached, &query_scores, top_k);
+    }
+    sort_and_truncate_indices(&mut reached, &query_scores, limit);
+    Ok(reached)
+}
+
+fn ann_neighbor_graph(
+    candidates: &[LoadedVectorSearchCandidate],
+    metric: u8,
+    degree: usize,
+) -> Result<Vec<Vec<usize>>, CoveError> {
+    let degree = degree.max(1).min(candidates.len().saturating_sub(1).max(1));
+    let mut graph = Vec::with_capacity(candidates.len());
+    for (index, candidate) in candidates.iter().enumerate() {
+        let mut neighbors = Vec::with_capacity(candidates.len().saturating_sub(1));
+        for (other_index, other) in candidates.iter().enumerate() {
+            if index == other_index {
+                continue;
+            }
+            let score = exact_flat_metric_score(metric, &candidate.values, &other.values)?;
+            neighbors.push((other_index, score));
+        }
+        neighbors.sort_by(|left, right| {
+            right
+                .1
+                .total_cmp(&left.1)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        graph.push(
+            neighbors
+                .into_iter()
+                .take(degree)
+                .map(|(neighbor, _)| neighbor)
+                .collect(),
+        );
+    }
+    Ok(graph)
+}
+
+fn sampled_entry_points(query_scores: &[f32], entry_count: usize) -> Vec<usize> {
+    let mut sampled = Vec::new();
+    let stride = query_scores.len().saturating_div(entry_count.max(1)).max(1);
+    let mut index = 0usize;
+    while index < query_scores.len() {
+        sampled.push((index, query_scores[index]));
+        index = index.saturating_add(stride);
+    }
+    if sampled.last().map(|(idx, _)| *idx) != Some(query_scores.len().saturating_sub(1)) {
+        let last = query_scores.len().saturating_sub(1);
+        sampled.push((last, query_scores[last]));
+    }
+    sampled.sort_by(|left, right| {
+        right
+            .1
+            .total_cmp(&left.1)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    sampled
+        .into_iter()
+        .take(entry_count)
+        .map(|(index, _)| index)
+        .collect()
+}
+
+fn ivf_flat_candidate_indices(
+    candidates: &[LoadedVectorSearchCandidate],
+    metric: u8,
+    query: &[f32],
+    top_k: usize,
+    limit: usize,
+) -> Result<Vec<usize>, CoveError> {
+    if candidates.len() <= limit {
+        return Ok((0..candidates.len()).collect());
+    }
+    let (centroids, clusters) = ivf_build_clusters(candidates, metric)?;
+    let mut centroid_scores = centroids
+        .iter()
+        .enumerate()
+        .map(|(index, centroid)| (index, ann_metric_score(metric, query, centroid)))
+        .collect::<Vec<_>>();
+    centroid_scores.sort_by(|left, right| {
+        right
+            .1
+            .total_cmp(&left.1)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    let mut selected = Vec::new();
+    let min_probe_count = floor_sqrt_usize(centroids.len()).max(1);
+    for (probe_index, (cluster_index, _)) in centroid_scores.iter().enumerate() {
+        if probe_index >= min_probe_count && selected.len() >= top_k.max(1) {
+            break;
+        }
+        selected.extend(clusters[*cluster_index].iter().copied());
+        if selected.len() >= limit {
+            break;
+        }
+    }
+    let query_scores = ann_query_scores(candidates, metric, query)?;
+    if selected.len() < top_k {
+        widen_ann_candidates(&mut selected, &query_scores, top_k);
+    }
+    sort_and_truncate_indices(&mut selected, &query_scores, limit);
+    Ok(selected)
+}
+
+fn ivf_pq_candidate_indices(
+    candidates: &[LoadedVectorSearchCandidate],
+    metric: u8,
+    query: &[f32],
+    top_k: usize,
+    limit: usize,
+) -> Result<Vec<usize>, CoveError> {
+    let coarse_limit = candidates.len().min(limit.saturating_mul(2).max(top_k));
+    let mut coarse = ivf_flat_candidate_indices(candidates, metric, query, top_k, coarse_limit)?;
+    let ranges = per_dimension_ranges(candidates, query);
+    let mut approx_scores = coarse
+        .iter()
+        .map(|index| {
+            (
+                *index,
+                product_quantized_metric_score(metric, query, &candidates[*index].values, &ranges),
+            )
+        })
+        .collect::<Vec<_>>();
+    approx_scores.sort_by(|left, right| {
+        right
+            .1
+            .total_cmp(&left.1)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    coarse = approx_scores
+        .into_iter()
+        .take(limit.max(top_k))
+        .map(|(index, _)| index)
+        .collect();
+    if coarse.len() < top_k {
+        let exact_scores = ann_query_scores(candidates, metric, query)?;
+        widen_ann_candidates(&mut coarse, &exact_scores, top_k);
+    }
+    Ok(coarse)
+}
+
+type IvfCentroids = Vec<Vec<f32>>;
+type IvfClusterMembers = Vec<Vec<usize>>;
+
+fn ivf_build_clusters(
+    candidates: &[LoadedVectorSearchCandidate],
+    metric: u8,
+) -> Result<(IvfCentroids, IvfClusterMembers), CoveError> {
+    let cluster_count = floor_sqrt_usize(candidates.len()).clamp(1, 64);
+    let dimension = candidates
+        .first()
+        .map(|candidate| candidate.values.len())
+        .unwrap_or(0);
+    let mut centroids = (0..cluster_count)
+        .map(|cluster| {
+            let index = cluster
+                .saturating_mul(candidates.len())
+                .checked_div(cluster_count)
+                .unwrap_or(0)
+                .min(candidates.len().saturating_sub(1));
+            candidates[index].values.clone()
+        })
+        .collect::<Vec<_>>();
+    let mut assignments = vec![0usize; candidates.len()];
+    for _ in 0..2 {
+        for (candidate_index, candidate) in candidates.iter().enumerate() {
+            assignments[candidate_index] = nearest_centroid(metric, &candidate.values, &centroids)?;
+        }
+        let mut sums = vec![vec![0.0f64; dimension]; cluster_count];
+        let mut counts = vec![0usize; cluster_count];
+        for (candidate_index, candidate) in candidates.iter().enumerate() {
+            let cluster = assignments[candidate_index];
+            counts[cluster] += 1;
+            for (lane, value) in candidate.values.iter().enumerate() {
+                sums[cluster][lane] += f64::from(*value);
+            }
+        }
+        for cluster in 0..cluster_count {
+            if counts[cluster] == 0 {
+                continue;
+            }
+            let divisor = counts[cluster] as f64;
+            for lane in 0..dimension {
+                centroids[cluster][lane] = (sums[cluster][lane] / divisor) as f32;
+            }
+        }
+    }
+    let mut clusters = vec![Vec::new(); cluster_count];
+    for (candidate_index, cluster) in assignments.into_iter().enumerate() {
+        clusters[cluster].push(candidate_index);
+    }
+    Ok((centroids, clusters))
+}
+
+fn nearest_centroid(
+    metric: u8,
+    values: &[f32],
+    centroids: &[Vec<f32>],
+) -> Result<usize, CoveError> {
+    centroids
+        .iter()
+        .enumerate()
+        .map(|(index, centroid)| Ok((index, exact_flat_metric_score(metric, values, centroid)?)))
+        .collect::<Result<Vec<_>, CoveError>>()?
+        .into_iter()
+        .max_by(|left, right| {
+            left.1
+                .total_cmp(&right.1)
+                .then_with(|| right.0.cmp(&left.0))
+        })
+        .map(|(index, _)| index)
+        .ok_or_else(|| CoveError::BadSection("AI IVF index has no centroids".into()))
+}
+
+fn ann_query_scores(
+    candidates: &[LoadedVectorSearchCandidate],
+    metric: u8,
+    query: &[f32],
+) -> Result<Vec<f32>, CoveError> {
+    candidates
+        .iter()
+        .map(|candidate| exact_flat_metric_score(metric, query, &candidate.values))
+        .collect()
+}
+
+fn widen_ann_candidates(indices: &mut Vec<usize>, scores: &[f32], target_len: usize) {
+    let mut seen = indices.iter().copied().collect::<BTreeSet<_>>();
+    let mut remaining = scores
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !seen.contains(index))
+        .map(|(index, score)| (index, *score))
+        .collect::<Vec<_>>();
+    remaining.sort_by(|left, right| {
+        right
+            .1
+            .total_cmp(&left.1)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    for (index, _) in remaining {
+        if indices.len() >= target_len {
+            break;
+        }
+        if seen.insert(index) {
+            indices.push(index);
+        }
+    }
+}
+
+fn sort_and_truncate_indices(indices: &mut Vec<usize>, scores: &[f32], limit: usize) {
+    let mut seen = BTreeSet::new();
+    indices.retain(|index| seen.insert(*index));
+    indices.sort_by(|left, right| {
+        scores[*right]
+            .total_cmp(&scores[*left])
+            .then_with(|| left.cmp(right))
+    });
+    indices.truncate(limit.min(indices.len()));
+}
+
+fn per_dimension_ranges(
+    candidates: &[LoadedVectorSearchCandidate],
+    query: &[f32],
+) -> Vec<(f32, f32)> {
+    let mut ranges = query
+        .iter()
+        .map(|value| (*value, *value))
+        .collect::<Vec<_>>();
+    for candidate in candidates {
+        for (lane, value) in candidate.values.iter().enumerate() {
+            ranges[lane].0 = ranges[lane].0.min(*value);
+            ranges[lane].1 = ranges[lane].1.max(*value);
+        }
+    }
+    ranges
+}
+
+fn product_quantized_metric_score(
+    metric: u8,
+    query: &[f32],
+    vector: &[f32],
+    ranges: &[(f32, f32)],
+) -> f32 {
+    let quantized_query = quantized_reconstruction(query, ranges);
+    let quantized_vector = quantized_reconstruction(vector, ranges);
+    ann_metric_score(metric, &quantized_query, &quantized_vector)
+}
+
+fn quantized_reconstruction(values: &[f32], ranges: &[(f32, f32)]) -> Vec<f32> {
+    values
+        .iter()
+        .zip(ranges)
+        .map(|(value, (min, max))| {
+            let span = max - min;
+            if span <= f32::EPSILON {
+                return *value;
+            }
+            let bucket = (((*value - *min) / span) * 15.0).round().clamp(0.0, 15.0);
+            *min + (bucket / 15.0) * span
+        })
+        .collect()
+}
+
+fn ann_metric_score(metric: u8, left: &[f32], right: &[f32]) -> f32 {
+    exact_flat_metric_score(metric, left, right).unwrap_or(f32::NEG_INFINITY)
+}
+
+fn floor_sqrt_usize(value: usize) -> usize {
+    if value <= 1 {
+        return value;
+    }
+    let mut root = 1usize;
+    while root
+        .saturating_add(1)
+        .saturating_mul(root.saturating_add(1))
+        <= value
+    {
+        root += 1;
+    }
+    root
+}
+
+fn select_vector_index(
+    sidecar: &CoveAiFile,
+    vector_space: &VectorSpaceDescriptorV1,
+    requested: AiVectorIndexSelection,
+) -> SelectedAiVectorIndex {
+    if requested == AiVectorIndexSelection::ExactFlat {
+        return SelectedAiVectorIndex {
+            name: requested.as_str().to_string(),
+            index_kind: 0,
+            fallback_used: false,
+            exact: true,
+        };
+    }
+    let requested_name = requested.as_str();
+    let matching = sidecar
+        .descriptor_tables
+        .vector_indexes
+        .iter()
+        .find(|index| {
+            index.vector_space_id == vector_space.vector_space_id
+                && (requested == AiVectorIndexSelection::Auto
+                    || vector_index_kind_name(index.index_kind) == requested_name)
+        });
+    match matching {
+        Some(index) if index.exactness_kind == 0 && index.false_negative_policy == 0 => {
+            SelectedAiVectorIndex {
+                name: vector_index_kind_name(index.index_kind).to_string(),
+                index_kind: index.index_kind,
+                fallback_used: false,
+                exact: true,
+            }
+        }
+        Some(index) if index.index_kind != 0 => SelectedAiVectorIndex {
+            name: vector_index_kind_name(index.index_kind).to_string(),
+            index_kind: index.index_kind,
+            fallback_used: false,
+            exact: false,
+        },
+        Some(index) => SelectedAiVectorIndex {
+            name: format!(
+                "{}_candidate_metadata_exact_flat_fallback",
+                vector_index_kind_name(index.index_kind)
+            ),
+            index_kind: 0,
+            fallback_used: true,
+            exact: true,
+        },
+        None if requested == AiVectorIndexSelection::Auto => SelectedAiVectorIndex {
+            name: AiVectorIndexSelection::ExactFlat.as_str().to_string(),
+            index_kind: 0,
+            fallback_used: false,
+            exact: true,
+        },
+        None => SelectedAiVectorIndex {
+            name: format!("{requested_name}_unavailable_exact_flat_fallback"),
+            index_kind: 0,
+            fallback_used: true,
+            exact: true,
+        },
+    }
+}
+
 fn exact_flat_filecode_binding_parts(
     sidecar: &CoveAiFile,
     file_code: u32,
@@ -5720,6 +8035,62 @@ fn exact_flat_filecode_binding_parts(
             ))
         })?;
     exact_flat_validate_vector_space(vector_space)?;
+    let vector_entry = sidecar
+        .descriptor_tables
+        .vector_entries
+        .iter()
+        .find(|entry| entry.vector_ref == binding.vector_ref)
+        .ok_or_else(|| {
+            CoveError::BadSection(format!(
+                "FileCodeVectorBinding {} references missing vector_ref {}",
+                binding.binding_id, binding.vector_ref
+            ))
+        })?;
+    Ok((binding, vector_space, vector_entry))
+}
+
+fn runtime_filecode_binding_parts(
+    sidecar: &CoveAiFile,
+    file_code: u32,
+) -> Result<
+    (
+        &FileCodeVectorBindingV1,
+        &VectorSpaceDescriptorV1,
+        &VectorEntryV1,
+    ),
+    CoveError,
+> {
+    let matching_bindings = sidecar
+        .descriptor_tables
+        .filecode_vector_bindings
+        .iter()
+        .filter(|binding| binding.file_code == file_code)
+        .collect::<Vec<_>>();
+    let binding = match matching_bindings.as_slice() {
+        [binding] => *binding,
+        [] => {
+            return Err(CoveError::BadSection(format!(
+                "query FileCode {file_code} is not present in COVE-AI FileCode vector bindings"
+            )));
+        }
+        _ => {
+            return Err(CoveError::BadSection(format!(
+                "query FileCode {file_code} has multiple COVE-AI FileCode vector bindings"
+            )));
+        }
+    };
+    let vector_space = sidecar
+        .descriptor_tables
+        .vector_spaces
+        .iter()
+        .find(|space| space.vector_space_id == binding.vector_space_id)
+        .ok_or_else(|| {
+            CoveError::BadSection(format!(
+                "FileCodeVectorBinding {} references missing vector_space_id {}",
+                binding.binding_id, binding.vector_space_id
+            ))
+        })?;
+    validate_runtime_vector_space(vector_space)?;
     let vector_entry = sidecar
         .descriptor_tables
         .vector_entries
@@ -5792,6 +8163,41 @@ fn exact_flat_filecode_vector_search_in_space(
 pub fn write_covev_filecode_vectors(
     build: &CoveVecFileCodeVectorBuild,
 ) -> Result<Vec<u8>, CoveError> {
+    write_covev_filecode_vectors_with_options(build, CoveVecFileCodeVectorBuildOptions::default())
+}
+
+pub fn write_covev_filecode_vectors_with_index(
+    build: &CoveVecFileCodeVectorBuild,
+    index_kind: u8,
+) -> Result<Vec<u8>, CoveError> {
+    write_covev_filecode_vectors_with_options(
+        build,
+        CoveVecFileCodeVectorBuildOptions {
+            index_kind: Some(index_kind),
+            ..CoveVecFileCodeVectorBuildOptions::default()
+        },
+    )
+}
+
+pub fn write_covev_filecode_vectors_with_options(
+    build: &CoveVecFileCodeVectorBuild,
+    options: CoveVecFileCodeVectorBuildOptions,
+) -> Result<Vec<u8>, CoveError> {
+    validate_ai_vector_metric(options.metric, "COVE-VEC build metric")?;
+    validate_ai_quantization_kind(
+        options.quantization_kind,
+        "COVE-VEC build quantization_kind",
+    )?;
+    if let Some(index_kind) = options.index_kind {
+        validate_ai_vector_index_kind(index_kind, "COVE-VEC build index_kind")?;
+    }
+    write_covev_filecode_vectors_inner(build, options)
+}
+
+fn write_covev_filecode_vectors_inner(
+    build: &CoveVecFileCodeVectorBuild,
+    options: CoveVecFileCodeVectorBuildOptions,
+) -> Result<Vec<u8>, CoveError> {
     if build.dimension_count == 0 {
         return Err(CoveError::BadSection(
             "COVE-VEC build requires non-zero dimension_count".into(),
@@ -5811,14 +8217,13 @@ pub fn write_covev_filecode_vectors(
         }
     }
 
-    let row_width = u64::from(build.dimension_count)
+    let source_row_width = u64::from(build.dimension_count)
         .checked_mul(4)
         .ok_or(CoveError::ArithOverflow)?;
-    let row_width_u32 = u32::try_from(row_width).map_err(|_| CoveError::ArithOverflow)?;
-    let expected_payload_len = row_width
+    let expected_source_payload_len = source_row_width
         .checked_mul(u64::try_from(build.file_codes.len()).map_err(|_| CoveError::ArithOverflow)?)
         .ok_or(CoveError::ArithOverflow)?;
-    if build.vector_payload.len() as u64 != expected_payload_len {
+    if build.vector_payload.len() as u64 != expected_source_payload_len {
         return Err(CoveError::BadSection(format!(
             "COVE-VEC payload length {} does not match {} FileCodes * {} dimensions * 4 bytes",
             build.vector_payload.len(),
@@ -5826,11 +8231,24 @@ pub fn write_covev_filecode_vectors(
             build.dimension_count
         )));
     }
+    let (stored_element_type, stored_payload) =
+        covev_stored_vector_payload(build.dimension_count, &build.vector_payload, options)?;
+    let row_width = u64::from(build.dimension_count)
+        .checked_mul(element_width_bytes(stored_element_type).ok_or_else(|| {
+            CoveError::BadSection(format!(
+                "COVE-VEC build unsupported stored element_type {stored_element_type}"
+            ))
+        })?)
+        .ok_or(CoveError::ArithOverflow)?;
+    let row_width_u32 = u32::try_from(row_width).map_err(|_| CoveError::ArithOverflow)?;
+    let expected_payload_len = row_width
+        .checked_mul(u64::try_from(build.file_codes.len()).map_err(|_| CoveError::ArithOverflow)?)
+        .ok_or(CoveError::ArithOverflow)?;
 
-    let vector_payload_crc32c = checksum::crc32c(&build.vector_payload);
+    let vector_payload_crc32c = checksum::crc32c(&stored_payload);
     let digest_offset =
-        u64::try_from(build.vector_payload.len()).map_err(|_| CoveError::ArithOverflow)?;
-    let mut payload_bytes = build.vector_payload.clone();
+        u64::try_from(stored_payload.len()).map_err(|_| CoveError::ArithOverflow)?;
+    let mut payload_bytes = stored_payload;
     payload_bytes.extend_from_slice(&vector_payload_crc32c.to_le_bytes());
 
     let reference_tables = encode_records([
@@ -5911,10 +8329,10 @@ pub fn write_covev_filecode_vectors(
         tokenizer_profile_ref: 0,
         chunk_profile_ref: 0,
         dimension_count: build.dimension_count,
-        element_type: 0,
-        metric: 1,
+        element_type: stored_element_type,
+        metric: options.metric,
         normalization_policy: 0,
-        quantization_policy: 0,
+        quantization_policy: options.quantization_kind,
         deterministic: 1,
         approximate: 0,
         reproducibility_class: 1,
@@ -5929,9 +8347,9 @@ pub fn write_covev_filecode_vectors(
             vector_space_id: 1,
             vector_count: build.file_codes.len() as u64,
             dimension_count: build.dimension_count,
-            element_type: 0,
+            element_type: stored_element_type,
             compression_codec: CompressionCodec::None as u8,
-            quantization_kind: 0,
+            quantization_kind: options.quantization_kind,
             layout_kind: 0,
             tensor_layout_ref: 0,
             memory_alignment_bytes: 4,
@@ -5978,12 +8396,13 @@ pub fn write_covev_filecode_vectors(
             reserved0: 0,
             canonical_value_hash_ref: 0,
             vector_ref,
+            model_input_digest_ref: 0,
             flags: 0,
             checksum: 0,
         })?);
     }
 
-    let sections = vec![
+    let mut sections = vec![
         coveai_payload_section(
             1,
             SectionKind::AiPayloadBytes,
@@ -6033,6 +8452,34 @@ pub fn write_covev_filecode_vectors(
             encode_records(filecode_bindings)?,
         ),
     ];
+    if let Some(index_kind) = options.index_kind {
+        let exactness_kind = if index_kind == 0 { 0 } else { 1 };
+        sections.push(coveai_binary_section(
+            9,
+            SectionKind::AiVectorIndex,
+            PrimaryProfile::CoveVec,
+            encode_records([encode_vector_index(VectorIndexDescriptorV1 {
+                vector_index_id: 1,
+                vector_space_id: 1,
+                stored_vector_space_id: 1,
+                search_vector_space_id: 1,
+                index_kind,
+                exactness_kind,
+                false_negative_policy: 0,
+                metric: options.metric,
+                score_space_authority: 0,
+                dimension_count: build.dimension_count,
+                indexed_binding_kind: 1,
+                temporal_scope_ref: 0,
+                visibility_scope_ref: 0,
+                redaction_scope_ref: 0,
+                dequantization_profile_ref: 0,
+                quantization_error_profile_ref: 0,
+                payload_ref: 0,
+                checksum: 0,
+            })?])?,
+        ));
+    }
 
     let bytes = write_coveai_artifact(
         CoveAiArtifactKind::CoveVec,
@@ -6042,6 +8489,78 @@ pub fn write_covev_filecode_vectors(
     )?;
     CoveAiFile::parse(&bytes)?;
     Ok(bytes)
+}
+
+fn covev_stored_vector_payload(
+    dimension_count: u32,
+    source_f32_payload: &[u8],
+    options: CoveVecFileCodeVectorBuildOptions,
+) -> Result<(u8, Vec<u8>), CoveError> {
+    let values = source_f32_payload
+        .chunks_exact(4)
+        .map(|chunk| {
+            let value =
+                f32::from_le_bytes(chunk.try_into().map_err(|_| CoveError::BufferTooShort)?);
+            if !value.is_finite() {
+                return Err(CoveError::BadSection(
+                    "COVE-VEC build source payload contains non-finite Float32 values".into(),
+                ));
+            }
+            Ok(value)
+        })
+        .collect::<Result<Vec<_>, CoveError>>()?;
+    match options.quantization_kind {
+        0 => Ok((0, source_f32_payload.to_vec())),
+        1 => {
+            let mut out = Vec::with_capacity(values.len());
+            for value in values {
+                let quantized = (value * 127.0).round().clamp(-128.0, 127.0) as i8;
+                out.push(quantized as u8);
+            }
+            Ok((3, out))
+        }
+        2 => {
+            let mut out = Vec::with_capacity(values.len());
+            for value in values {
+                let quantized = ((value + 1.0) * 127.5).round().clamp(0.0, 255.0) as u8;
+                out.push(quantized);
+            }
+            Ok((4, out))
+        }
+        3 => {
+            let dimension =
+                usize::try_from(dimension_count).map_err(|_| CoveError::ArithOverflow)?;
+            if dimension == 0 || values.len() % dimension != 0 {
+                return Err(CoveError::BadSection(
+                    "COVE-VEC build PQ source payload is not a whole number of vectors".into(),
+                ));
+            }
+            let mut ranges = vec![(f32::INFINITY, f32::NEG_INFINITY); dimension];
+            for vector in values.chunks_exact(dimension) {
+                for (lane, value) in vector.iter().enumerate() {
+                    ranges[lane].0 = ranges[lane].0.min(*value);
+                    ranges[lane].1 = ranges[lane].1.max(*value);
+                }
+            }
+            let mut out = Vec::with_capacity(values.len());
+            for vector in values.chunks_exact(dimension) {
+                for (lane, value) in vector.iter().enumerate() {
+                    let (min, max) = ranges[lane];
+                    let span = max - min;
+                    let code = if span <= f32::EPSILON {
+                        0
+                    } else {
+                        (((*value - min) / span) * 255.0).round().clamp(0.0, 255.0) as u8
+                    };
+                    out.push(code);
+                }
+            }
+            Ok((4, out))
+        }
+        other => Err(CoveError::BadSection(format!(
+            "COVE-VEC build unsupported quantization_kind {other}"
+        ))),
+    }
 }
 
 fn exact_flat_parse_covev_with_payload_access(
@@ -6083,6 +8602,253 @@ fn exact_flat_validate_vector_space(
         )));
     }
     Ok(())
+}
+
+fn validate_runtime_vector_space(vector_space: &VectorSpaceDescriptorV1) -> Result<(), CoveError> {
+    if vector_space.approximate != 0 {
+        return Err(CoveError::BadSection(format!(
+            "AI runtime vector search requires a directly comparable vector space, got approximate {}",
+            vector_space.approximate
+        )));
+    }
+    if !matches!(vector_space.metric, 0..=3) {
+        return Err(CoveError::BadSection(format!(
+            "AI runtime vector search does not support vector metric {}",
+            vector_space.metric
+        )));
+    }
+    if !matches!(vector_space.element_type, 0..=4 | 6) {
+        return Err(CoveError::BadSection(format!(
+            "AI runtime vector search does not support vector element_type {}",
+            vector_space.element_type
+        )));
+    }
+    Ok(())
+}
+
+fn vector_entry_by_ref(sidecar: &CoveAiFile, vector_ref: u64) -> Result<&VectorEntryV1, CoveError> {
+    sidecar
+        .descriptor_tables
+        .vector_entries
+        .iter()
+        .find(|entry| entry.vector_ref == vector_ref)
+        .ok_or_else(|| {
+            CoveError::BadSection(format!(
+                "AI vector_ref {vector_ref} is not present in vector directory"
+            ))
+        })
+}
+
+fn vector_space_for_entry<'a>(
+    sidecar: &'a CoveAiFile,
+    vector_entry: &VectorEntryV1,
+) -> Result<&'a VectorSpaceDescriptorV1, CoveError> {
+    let block = sidecar
+        .descriptor_tables
+        .vector_block(vector_entry.block_id)
+        .ok_or_else(|| {
+            CoveError::BadSection(format!(
+                "VectorEntry {} references missing block_id {}",
+                vector_entry.vector_ref, vector_entry.block_id
+            ))
+        })?;
+    sidecar
+        .descriptor_tables
+        .vector_spaces
+        .iter()
+        .find(|space| space.vector_space_id == block.vector_space_id)
+        .ok_or_else(|| {
+            CoveError::BadSection(format!(
+                "VectorPayloadBlock {} references missing vector_space_id {}",
+                block.block_id, block.vector_space_id
+            ))
+        })
+}
+
+fn vector_entry_values_as_f32(
+    artifact_bytes: &[u8],
+    sidecar: &CoveAiFile,
+    vector_space: &VectorSpaceDescriptorV1,
+    vector_entry: &VectorEntryV1,
+) -> Result<Vec<f32>, CoveError> {
+    validate_runtime_vector_space(vector_space)?;
+    let block = sidecar
+        .descriptor_tables
+        .vector_block(vector_entry.block_id)
+        .ok_or_else(|| {
+            CoveError::BadSection(format!(
+                "VectorEntry {} references missing block_id {}",
+                vector_entry.vector_ref, vector_entry.block_id
+            ))
+        })?;
+    if block.vector_space_id != vector_space.vector_space_id {
+        return Err(CoveError::BadSection(format!(
+            "VectorEntry {} block vector_space_id {} does not match selected vector_space_id {}",
+            vector_entry.vector_ref, block.vector_space_id, vector_space.vector_space_id
+        )));
+    }
+    if block.dimension_count != vector_space.dimension_count
+        || block.element_type != vector_space.element_type
+    {
+        return Err(CoveError::BadSection(format!(
+            "VectorPayloadBlock {} does not match selected vector-space dimension/element type",
+            block.block_id
+        )));
+    }
+    if block.compression_codec != CompressionCodec::None as u8 || block.layout_kind != 0 {
+        return Err(CoveError::BadSection(format!(
+            "VectorPayloadBlock {} is not an uncompressed dense row-major block",
+            block.block_id
+        )));
+    }
+
+    let row_width = block.dense_vector_width().ok_or_else(|| {
+        CoveError::BadSection(format!(
+            "VectorPayloadBlock {} has unsupported dense vector width",
+            block.block_id
+        ))
+    })?;
+    let block_payload_len = if block.payload_length == 0 {
+        row_width
+            .checked_mul(block.vector_count)
+            .ok_or(CoveError::ArithOverflow)?
+    } else {
+        block.payload_length
+    };
+    let payload_ref = sidecar
+        .descriptor_tables
+        .payload_ref(block.payload_ref)
+        .ok_or_else(|| {
+            CoveError::BadSection(format!(
+                "VectorPayloadBlock {} references missing payload_ref {}",
+                block.block_id, block.payload_ref
+            ))
+        })?;
+    if payload_ref.integrity_ref != 0 {
+        exact_flat_verify_payload_integrity(artifact_bytes, sidecar, payload_ref.integrity_ref)?;
+    }
+    if block.integrity_ref != 0 {
+        exact_flat_verify_payload_integrity(artifact_bytes, sidecar, block.integrity_ref)?;
+    }
+    if vector_entry.integrity_ref != 0 {
+        exact_flat_verify_payload_integrity(artifact_bytes, sidecar, vector_entry.integrity_ref)?;
+    }
+
+    let payload_bytes = exact_flat_payload_ref_bytes(artifact_bytes, sidecar, payload_ref)?;
+    let block_payload = checked_slice(payload_bytes, block.payload_offset, block_payload_len)?;
+    let (entry_offset, entry_length) = if vector_entry.payload_length == 0 {
+        (
+            vector_entry
+                .vector_ordinal
+                .checked_mul(row_width)
+                .ok_or(CoveError::ArithOverflow)?,
+            row_width,
+        )
+    } else {
+        (
+            vector_entry.payload_offset,
+            u64::from(vector_entry.payload_length),
+        )
+    };
+    if entry_length != row_width {
+        return Err(CoveError::BadSection(format!(
+            "VectorEntry {} payload_length {} does not match dense row width {}",
+            vector_entry.vector_ref, entry_length, row_width
+        )));
+    }
+    let vector_bytes = checked_slice(block_payload, entry_offset, entry_length)?;
+    decode_dense_vector_as_f32(vector_space, vector_entry.vector_ref, vector_bytes)
+}
+
+fn decode_dense_vector_as_f32(
+    vector_space: &VectorSpaceDescriptorV1,
+    vector_ref: u64,
+    vector_bytes: &[u8],
+) -> Result<Vec<f32>, CoveError> {
+    let mut values = Vec::with_capacity(vector_space.dimension_count as usize);
+    match vector_space.element_type {
+        0 => {
+            for chunk in vector_bytes.chunks_exact(4) {
+                values.push(f32::from_le_bytes(
+                    chunk.try_into().map_err(|_| CoveError::BufferTooShort)?,
+                ));
+            }
+        }
+        1 => {
+            for chunk in vector_bytes.chunks_exact(2) {
+                let bits =
+                    u16::from_le_bytes(chunk.try_into().map_err(|_| CoveError::BufferTooShort)?);
+                values.push(f16_to_f32(bits));
+            }
+        }
+        2 => {
+            for chunk in vector_bytes.chunks_exact(2) {
+                let bits =
+                    u16::from_le_bytes(chunk.try_into().map_err(|_| CoveError::BufferTooShort)?);
+                values.push(f32::from_bits(u32::from(bits) << 16));
+            }
+        }
+        3 => values.extend(vector_bytes.iter().map(|value| (*value as i8) as f32)),
+        4 => values.extend(vector_bytes.iter().map(|value| f32::from(*value))),
+        6 => {
+            for chunk in vector_bytes.chunks_exact(8) {
+                let value =
+                    f64::from_le_bytes(chunk.try_into().map_err(|_| CoveError::BufferTooShort)?);
+                if !value.is_finite() || value > f64::from(f32::MAX) || value < f64::from(f32::MIN)
+                {
+                    return Err(CoveError::BadSection(format!(
+                        "VectorEntry {vector_ref} contains Float64 values outside finite Float32 runtime range"
+                    )));
+                }
+                values.push(value as f32);
+            }
+        }
+        _ => {
+            return Err(CoveError::BadSection(format!(
+                "AI runtime vector search does not support element_type {}",
+                vector_space.element_type
+            )));
+        }
+    }
+    if values.len() != vector_space.dimension_count as usize {
+        return Err(CoveError::BadSection(format!(
+            "VectorEntry {vector_ref} decoded dimension {} does not match vector space dimension {}",
+            values.len(),
+            vector_space.dimension_count
+        )));
+    }
+    if values.iter().any(|value| !value.is_finite()) {
+        return Err(CoveError::BadSection(format!(
+            "VectorEntry {vector_ref} contains non-finite values"
+        )));
+    }
+    Ok(values)
+}
+
+fn f16_to_f32(bits: u16) -> f32 {
+    let sign = (u32::from(bits & 0x8000)) << 16;
+    let exp = (bits & 0x7c00) >> 10;
+    let frac = u32::from(bits & 0x03ff);
+    let out = if exp == 0 {
+        if frac == 0 {
+            sign
+        } else {
+            let mut mantissa = frac;
+            let mut exponent = -14i32;
+            while mantissa & 0x0400 == 0 {
+                mantissa <<= 1;
+                exponent -= 1;
+            }
+            mantissa &= 0x03ff;
+            let exp_bits = u32::try_from(exponent + 127).unwrap_or(0) << 23;
+            sign | exp_bits | (mantissa << 13)
+        }
+    } else if exp == 0x1f {
+        sign | 0x7f80_0000 | (frac << 13)
+    } else {
+        sign | ((u32::from(exp) + 112) << 23) | (frac << 13)
+    };
+    f32::from_bits(out)
 }
 
 fn exact_flat_vector_entry_f32(
@@ -6745,6 +9511,15 @@ pub fn write_coveai_descriptor_bundle(
     for record in &tables.training_sample_vector_bindings {
         vector_binding_records.push(encode_training_sample_vector_binding(record.clone())?);
     }
+    for record in &tables.association_state_vector_bindings {
+        vector_binding_records.push(encode_association_state_vector_binding(record.clone())?);
+    }
+    for record in &tables.asset_vector_bindings {
+        vector_binding_records.push(encode_asset_vector_binding(record.clone())?);
+    }
+    for record in &tables.multimodal_sequence_vector_bindings {
+        vector_binding_records.push(encode_multimodal_sequence_vector_binding(record.clone())?);
+    }
     push_section(
         &mut sections,
         &mut next_section_id,
@@ -6888,13 +9663,23 @@ fn encode_ai_record(
     flags: u32,
     payload: Vec<u8>,
 ) -> Result<Vec<u8>, CoveError> {
+    encode_ai_record_with_version(record_kind, 1, local_id, flags, payload)
+}
+
+fn encode_ai_record_with_version(
+    record_kind: u16,
+    record_version: u16,
+    local_id: u64,
+    flags: u32,
+    payload: Vec<u8>,
+) -> Result<Vec<u8>, CoveError> {
     let record_len = AI_RECORD_HEADER_LEN
         .checked_add(payload.len())
         .ok_or(CoveError::ArithOverflow)?;
     let record_len_u32 = u32::try_from(record_len).map_err(|_| CoveError::ArithOverflow)?;
     let mut out = vec![0u8; record_len];
     put_u16(&mut out, 0, record_kind);
-    put_u16(&mut out, 2, 1);
+    put_u16(&mut out, 2, record_version);
     put_u32(&mut out, 4, record_len_u32);
     put_u64(&mut out, 8, local_id);
     put_u32(&mut out, 16, flags);
@@ -7754,7 +10539,12 @@ fn encode_vector_space_compatibility(
 }
 
 fn encode_filecode_vector_binding(record: FileCodeVectorBindingV1) -> Result<Vec<u8>, CoveError> {
-    let mut payload = vec![0u8; 80];
+    let record_version = if record.model_input_digest_ref != 0 {
+        2
+    } else {
+        1
+    };
+    let mut payload = vec![0u8; if record_version == 2 { 84 } else { 80 }];
     put_u64(&mut payload, 0, record.binding_id);
     put_u32(&mut payload, 8, record.vector_space_id);
     put_u32(&mut payload, 12, record.slot_policy_ref);
@@ -7771,10 +10561,18 @@ fn encode_filecode_vector_binding(record: FileCodeVectorBindingV1) -> Result<Vec
     put_u32(&mut payload, 56, record.reserved0);
     put_u32(&mut payload, 60, record.canonical_value_hash_ref);
     put_u64(&mut payload, 64, record.vector_ref);
-    put_u32(&mut payload, 72, record.flags);
-    let payload = with_payload_crc32c(payload, 76)?;
-    encode_ai_record(
+    let checksum_offset = if record_version == 2 {
+        put_u32(&mut payload, 72, record.model_input_digest_ref);
+        put_u32(&mut payload, 76, record.flags);
+        80
+    } else {
+        put_u32(&mut payload, 72, record.flags);
+        76
+    };
+    let payload = with_payload_crc32c(payload, checksum_offset)?;
+    encode_ai_record_with_version(
         1,
+        record_version,
         record.binding_id,
         AI_FLAG_PAYLOAD_CRC32C_PRESENT,
         payload,
@@ -7782,7 +10580,12 @@ fn encode_filecode_vector_binding(record: FileCodeVectorBindingV1) -> Result<Vec
 }
 
 fn encode_chunk_vector_binding(record: ChunkVectorBindingV1) -> Result<Vec<u8>, CoveError> {
-    let mut payload = vec![0u8; 48];
+    let record_version = if record.model_input_digest_ref != 0 {
+        2
+    } else {
+        1
+    };
+    let mut payload = vec![0u8; if record_version == 2 { 52 } else { 48 }];
     put_u64(&mut payload, 0, record.binding_id);
     put_u32(&mut payload, 8, record.vector_space_id);
     put_u64(&mut payload, 12, record.chunk_id);
@@ -7790,10 +10593,18 @@ fn encode_chunk_vector_binding(record: ChunkVectorBindingV1) -> Result<Vec<u8>, 
     put_u32(&mut payload, 24, record.source_value_hash_ref);
     put_u32(&mut payload, 28, record.chunk_text_hash_ref);
     put_u64(&mut payload, 32, record.vector_ref);
-    put_u32(&mut payload, 40, record.flags);
-    let payload = with_payload_crc32c(payload, 44)?;
-    encode_ai_record(
+    let checksum_offset = if record_version == 2 {
+        put_u32(&mut payload, 40, record.model_input_digest_ref);
+        put_u32(&mut payload, 44, record.flags);
+        48
+    } else {
+        put_u32(&mut payload, 40, record.flags);
+        44
+    };
+    let payload = with_payload_crc32c(payload, checksum_offset)?;
+    encode_ai_record_with_version(
         2,
+        record_version,
         record.binding_id,
         AI_FLAG_PAYLOAD_CRC32C_PRESENT,
         payload,
@@ -7803,7 +10614,12 @@ fn encode_chunk_vector_binding(record: ChunkVectorBindingV1) -> Result<Vec<u8>, 
 fn encode_object_state_vector_binding(
     record: ObjectStateVectorBindingV1,
 ) -> Result<Vec<u8>, CoveError> {
-    let mut payload = vec![0u8; 69];
+    let record_version = if record.model_input_digest_ref != 0 {
+        2
+    } else {
+        1
+    };
+    let mut payload = vec![0u8; if record_version == 2 { 73 } else { 69 }];
     put_u64(&mut payload, 0, record.binding_id);
     put_u32(&mut payload, 8, record.vector_space_id);
     put_u32(&mut payload, 12, record.composition_profile_ref);
@@ -7816,10 +10632,18 @@ fn encode_object_state_vector_binding(
     put_i64(&mut payload, 41, record.timestamp_us);
     put_u32(&mut payload, 49, record.property_dependency_fingerprint_ref);
     put_u64(&mut payload, 53, record.vector_ref);
-    put_u32(&mut payload, 61, record.flags);
-    let payload = with_payload_crc32c(payload, 65)?;
-    encode_ai_record(
+    let checksum_offset = if record_version == 2 {
+        put_u32(&mut payload, 61, record.model_input_digest_ref);
+        put_u32(&mut payload, 65, record.flags);
+        69
+    } else {
+        put_u32(&mut payload, 61, record.flags);
+        65
+    };
+    let payload = with_payload_crc32c(payload, checksum_offset)?;
+    encode_ai_record_with_version(
         3,
+        record_version,
         record.binding_id,
         AI_FLAG_PAYLOAD_CRC32C_PRESENT,
         payload,
@@ -7829,7 +10653,12 @@ fn encode_object_state_vector_binding(
 fn encode_training_sample_vector_binding(
     record: TrainingSampleVectorBindingV1,
 ) -> Result<Vec<u8>, CoveError> {
-    let mut payload = vec![0u8; 48];
+    let record_version = if record.model_input_digest_ref != 0 {
+        2
+    } else {
+        1
+    };
+    let mut payload = vec![0u8; if record_version == 2 { 52 } else { 48 }];
     put_u64(&mut payload, 0, record.binding_id);
     put_u32(&mut payload, 8, record.vector_space_id);
     put_u32(&mut payload, 12, record.training_profile_ref);
@@ -7837,10 +10666,121 @@ fn encode_training_sample_vector_binding(
     put_u32(&mut payload, 24, record.source_snapshot_ref);
     put_u32(&mut payload, 28, record.sample_fingerprint_ref);
     put_u64(&mut payload, 32, record.vector_ref);
-    put_u32(&mut payload, 40, record.flags);
-    let payload = with_payload_crc32c(payload, 44)?;
-    encode_ai_record(
+    let checksum_offset = if record_version == 2 {
+        put_u32(&mut payload, 40, record.model_input_digest_ref);
+        put_u32(&mut payload, 44, record.flags);
+        48
+    } else {
+        put_u32(&mut payload, 40, record.flags);
+        44
+    };
+    let payload = with_payload_crc32c(payload, checksum_offset)?;
+    encode_ai_record_with_version(
         4,
+        record_version,
+        record.binding_id,
+        AI_FLAG_PAYLOAD_CRC32C_PRESENT,
+        payload,
+    )
+}
+
+fn encode_association_state_vector_binding(
+    record: AssociationStateVectorBindingV1,
+) -> Result<Vec<u8>, CoveError> {
+    let record_version = if record.model_input_digest_ref != 0 {
+        2
+    } else {
+        1
+    };
+    let mut payload = vec![0u8; if record_version == 2 { 73 } else { 69 }];
+    put_u64(&mut payload, 0, record.binding_id);
+    put_u32(&mut payload, 8, record.vector_space_id);
+    put_u32(&mut payload, 12, record.composition_profile_ref);
+    put_u32(&mut payload, 16, record.file_ref);
+    put_u32(&mut payload, 20, record.association_type_id);
+    put_u32(&mut payload, 24, record.association_key_ref);
+    put_u32(&mut payload, 28, record.branch_ref);
+    put_u8(&mut payload, 32, record.temporal_kind);
+    put_u64(&mut payload, 33, record.csn);
+    put_i64(&mut payload, 41, record.timestamp_us);
+    put_u32(&mut payload, 49, record.property_dependency_fingerprint_ref);
+    put_u64(&mut payload, 53, record.vector_ref);
+    let checksum_offset = if record_version == 2 {
+        put_u32(&mut payload, 61, record.model_input_digest_ref);
+        put_u32(&mut payload, 65, record.flags);
+        69
+    } else {
+        put_u32(&mut payload, 61, record.flags);
+        65
+    };
+    let payload = with_payload_crc32c(payload, checksum_offset)?;
+    encode_ai_record_with_version(
+        5,
+        record_version,
+        record.binding_id,
+        AI_FLAG_PAYLOAD_CRC32C_PRESENT,
+        payload,
+    )
+}
+
+fn encode_asset_vector_binding(record: AssetVectorBindingV1) -> Result<Vec<u8>, CoveError> {
+    let record_version = if record.model_input_digest_ref != 0 {
+        2
+    } else {
+        1
+    };
+    let mut payload = vec![0u8; if record_version == 2 { 48 } else { 44 }];
+    put_u64(&mut payload, 0, record.binding_id);
+    put_u32(&mut payload, 8, record.vector_space_id);
+    put_u64(&mut payload, 12, record.asset_ref);
+    put_u32(&mut payload, 20, record.transform_ref);
+    put_u32(&mut payload, 24, record.asset_digest_ref);
+    put_u64(&mut payload, 28, record.vector_ref);
+    let checksum_offset = if record_version == 2 {
+        put_u32(&mut payload, 36, record.model_input_digest_ref);
+        put_u32(&mut payload, 40, record.flags);
+        44
+    } else {
+        put_u32(&mut payload, 36, record.flags);
+        40
+    };
+    let payload = with_payload_crc32c(payload, checksum_offset)?;
+    encode_ai_record_with_version(
+        6,
+        record_version,
+        record.binding_id,
+        AI_FLAG_PAYLOAD_CRC32C_PRESENT,
+        payload,
+    )
+}
+
+fn encode_multimodal_sequence_vector_binding(
+    record: MultimodalSequenceVectorBindingV1,
+) -> Result<Vec<u8>, CoveError> {
+    let record_version = if record.model_input_digest_ref != 0 {
+        2
+    } else {
+        1
+    };
+    let mut payload = vec![0u8; if record_version == 2 { 48 } else { 44 }];
+    put_u64(&mut payload, 0, record.binding_id);
+    put_u32(&mut payload, 8, record.vector_space_id);
+    put_u64(&mut payload, 12, record.sequence_pack_id);
+    put_u32(&mut payload, 20, record.sequence_profile_ref);
+    put_u32(&mut payload, 24, record.source_snapshot_ref);
+    put_u64(&mut payload, 28, record.vector_ref);
+    let checksum_offset = if record_version == 2 {
+        put_u32(&mut payload, 36, record.model_input_digest_ref);
+        put_u32(&mut payload, 40, record.flags);
+        44
+    } else {
+        put_u32(&mut payload, 36, record.flags);
+        40
+    };
+    let payload = with_payload_crc32c(payload, checksum_offset)?;
+    encode_ai_record_with_version(
+        7,
+        record_version,
         record.binding_id,
         AI_FLAG_PAYLOAD_CRC32C_PRESENT,
         payload,
@@ -8144,6 +11084,12 @@ fn parse_known_record(
     payload: &[u8],
     tables: &mut AiDescriptorTablesV1,
 ) -> Result<(), CoveError> {
+    if !ai_record_version_supported(section_kind, header.record_kind, header.record_version) {
+        return Err(CoveError::BadSection(format!(
+            "unsupported COVE-AI record_version {} for record kind {} in section kind {}",
+            header.record_version, header.record_kind, section_kind
+        )));
+    }
     match (section_kind, header.record_kind) {
         (k, 1) if k == SectionKind::AiCompanionArtifactRef as u32 => {
             tables
@@ -8287,22 +11233,49 @@ fn parse_known_record(
         (k, 1) if k == SectionKind::AiVectorBinding as u32 => {
             tables
                 .filecode_vector_bindings
-                .push(parse_filecode_vector_binding(payload)?);
+                .push(parse_filecode_vector_binding(
+                    payload,
+                    header.record_version,
+                )?);
         }
         (k, 2) if k == SectionKind::AiVectorBinding as u32 => {
             tables
                 .chunk_vector_bindings
-                .push(parse_chunk_vector_binding(payload)?);
+                .push(parse_chunk_vector_binding(payload, header.record_version)?);
         }
         (k, 3) if k == SectionKind::AiVectorBinding as u32 => {
             tables
                 .object_state_vector_bindings
-                .push(parse_object_state_vector_binding(payload)?);
+                .push(parse_object_state_vector_binding(
+                    payload,
+                    header.record_version,
+                )?);
         }
         (k, 4) if k == SectionKind::AiVectorBinding as u32 => {
             tables
                 .training_sample_vector_bindings
-                .push(parse_training_sample_vector_binding(payload)?);
+                .push(parse_training_sample_vector_binding(
+                    payload,
+                    header.record_version,
+                )?);
+        }
+        (k, 5) if k == SectionKind::AiVectorBinding as u32 => {
+            tables
+                .association_state_vector_bindings
+                .push(parse_association_state_vector_binding(
+                    payload,
+                    header.record_version,
+                )?);
+        }
+        (k, 6) if k == SectionKind::AiVectorBinding as u32 => {
+            tables
+                .asset_vector_bindings
+                .push(parse_asset_vector_binding(payload, header.record_version)?);
+        }
+        (k, 7) if k == SectionKind::AiVectorBinding as u32 => {
+            tables.multimodal_sequence_vector_bindings.push(
+                parse_multimodal_sequence_vector_binding(payload, header.record_version)?,
+            );
         }
         (k, 1) if k == SectionKind::AiVectorPayloadBlock as u32 => {
             tables
@@ -8339,6 +11312,13 @@ fn parse_known_record(
         _ => {}
     }
     Ok(())
+}
+
+fn ai_record_version_supported(section_kind: u32, record_kind: u16, record_version: u16) -> bool {
+    record_version == 1
+        || (record_version == 2
+            && section_kind == SectionKind::AiVectorBinding as u32
+            && matches!(record_kind, 1..=7))
 }
 
 macro_rules! exact_len {
@@ -9119,9 +12099,27 @@ fn parse_vector_space_compatibility(
     })
 }
 
-fn parse_filecode_vector_binding(payload: &[u8]) -> Result<FileCodeVectorBindingV1, CoveError> {
-    exact_len!(payload, 80, "FileCodeVectorBindingV1");
-    verify_payload_crc(payload, 76)?;
+fn parse_filecode_vector_binding(
+    payload: &[u8],
+    record_version: u16,
+) -> Result<FileCodeVectorBindingV1, CoveError> {
+    let (expected_len, checksum_offset) = match record_version {
+        1 => (80, 76),
+        2 => (84, 80),
+        _ => unreachable!("record version was checked before vector binding parse"),
+    };
+    exact_len!(payload, expected_len, "FileCodeVectorBinding");
+    verify_payload_crc(payload, checksum_offset)?;
+    let model_input_digest_ref = if record_version == 2 {
+        read_u32(payload, 72)?
+    } else {
+        0
+    };
+    reject_zero_v2_model_input_digest_ref(
+        record_version,
+        "FileCodeVectorBinding",
+        model_input_digest_ref,
+    )?;
     Ok(FileCodeVectorBindingV1 {
         binding_id: read_u64(payload, 0)?,
         vector_space_id: read_u32(payload, 8)?,
@@ -9139,14 +12137,33 @@ fn parse_filecode_vector_binding(payload: &[u8]) -> Result<FileCodeVectorBinding
         reserved0: read_u32(payload, 56)?,
         canonical_value_hash_ref: read_u32(payload, 60)?,
         vector_ref: read_u64(payload, 64)?,
-        flags: read_u32(payload, 72)?,
-        checksum: read_u32(payload, 76)?,
+        model_input_digest_ref,
+        flags: read_u32(payload, if record_version == 2 { 76 } else { 72 })?,
+        checksum: read_u32(payload, checksum_offset)?,
     })
 }
 
-fn parse_chunk_vector_binding(payload: &[u8]) -> Result<ChunkVectorBindingV1, CoveError> {
-    exact_len!(payload, 48, "ChunkVectorBindingV1");
-    verify_payload_crc(payload, 44)?;
+fn parse_chunk_vector_binding(
+    payload: &[u8],
+    record_version: u16,
+) -> Result<ChunkVectorBindingV1, CoveError> {
+    let (expected_len, checksum_offset) = match record_version {
+        1 => (48, 44),
+        2 => (52, 48),
+        _ => unreachable!("record version was checked before vector binding parse"),
+    };
+    exact_len!(payload, expected_len, "ChunkVectorBinding");
+    verify_payload_crc(payload, checksum_offset)?;
+    let model_input_digest_ref = if record_version == 2 {
+        read_u32(payload, 40)?
+    } else {
+        0
+    };
+    reject_zero_v2_model_input_digest_ref(
+        record_version,
+        "ChunkVectorBinding",
+        model_input_digest_ref,
+    )?;
     Ok(ChunkVectorBindingV1 {
         binding_id: read_u64(payload, 0)?,
         vector_space_id: read_u32(payload, 8)?,
@@ -9155,16 +12172,33 @@ fn parse_chunk_vector_binding(payload: &[u8]) -> Result<ChunkVectorBindingV1, Co
         source_value_hash_ref: read_u32(payload, 24)?,
         chunk_text_hash_ref: read_u32(payload, 28)?,
         vector_ref: read_u64(payload, 32)?,
-        flags: read_u32(payload, 40)?,
-        checksum: read_u32(payload, 44)?,
+        model_input_digest_ref,
+        flags: read_u32(payload, if record_version == 2 { 44 } else { 40 })?,
+        checksum: read_u32(payload, checksum_offset)?,
     })
 }
 
 fn parse_object_state_vector_binding(
     payload: &[u8],
+    record_version: u16,
 ) -> Result<ObjectStateVectorBindingV1, CoveError> {
-    exact_len!(payload, 69, "ObjectStateVectorBindingV1");
-    verify_payload_crc(payload, 65)?;
+    let (expected_len, checksum_offset) = match record_version {
+        1 => (69, 65),
+        2 => (73, 69),
+        _ => unreachable!("record version was checked before vector binding parse"),
+    };
+    exact_len!(payload, expected_len, "ObjectStateVectorBinding");
+    verify_payload_crc(payload, checksum_offset)?;
+    let model_input_digest_ref = if record_version == 2 {
+        read_u32(payload, 61)?
+    } else {
+        0
+    };
+    reject_zero_v2_model_input_digest_ref(
+        record_version,
+        "ObjectStateVectorBinding",
+        model_input_digest_ref,
+    )?;
     Ok(ObjectStateVectorBindingV1 {
         binding_id: read_u64(payload, 0)?,
         vector_space_id: read_u32(payload, 8)?,
@@ -9178,16 +12212,33 @@ fn parse_object_state_vector_binding(
         timestamp_us: read_i64(payload, 41)?,
         property_dependency_fingerprint_ref: read_u32(payload, 49)?,
         vector_ref: read_u64(payload, 53)?,
-        flags: read_u32(payload, 61)?,
-        checksum: read_u32(payload, 65)?,
+        model_input_digest_ref,
+        flags: read_u32(payload, if record_version == 2 { 65 } else { 61 })?,
+        checksum: read_u32(payload, checksum_offset)?,
     })
 }
 
 fn parse_training_sample_vector_binding(
     payload: &[u8],
+    record_version: u16,
 ) -> Result<TrainingSampleVectorBindingV1, CoveError> {
-    exact_len!(payload, 48, "TrainingSampleVectorBindingV1");
-    verify_payload_crc(payload, 44)?;
+    let (expected_len, checksum_offset) = match record_version {
+        1 => (48, 44),
+        2 => (52, 48),
+        _ => unreachable!("record version was checked before vector binding parse"),
+    };
+    exact_len!(payload, expected_len, "TrainingSampleVectorBinding");
+    verify_payload_crc(payload, checksum_offset)?;
+    let model_input_digest_ref = if record_version == 2 {
+        read_u32(payload, 40)?
+    } else {
+        0
+    };
+    reject_zero_v2_model_input_digest_ref(
+        record_version,
+        "TrainingSampleVectorBinding",
+        model_input_digest_ref,
+    )?;
     Ok(TrainingSampleVectorBindingV1 {
         binding_id: read_u64(payload, 0)?,
         vector_space_id: read_u32(payload, 8)?,
@@ -9196,9 +12247,131 @@ fn parse_training_sample_vector_binding(
         source_snapshot_ref: read_u32(payload, 24)?,
         sample_fingerprint_ref: read_u32(payload, 28)?,
         vector_ref: read_u64(payload, 32)?,
-        flags: read_u32(payload, 40)?,
-        checksum: read_u32(payload, 44)?,
+        model_input_digest_ref,
+        flags: read_u32(payload, if record_version == 2 { 44 } else { 40 })?,
+        checksum: read_u32(payload, checksum_offset)?,
     })
+}
+
+fn parse_association_state_vector_binding(
+    payload: &[u8],
+    record_version: u16,
+) -> Result<AssociationStateVectorBindingV1, CoveError> {
+    let (expected_len, checksum_offset) = match record_version {
+        1 => (69, 65),
+        2 => (73, 69),
+        _ => unreachable!("record version was checked before vector binding parse"),
+    };
+    exact_len!(payload, expected_len, "AssociationStateVectorBinding");
+    verify_payload_crc(payload, checksum_offset)?;
+    let model_input_digest_ref = if record_version == 2 {
+        read_u32(payload, 61)?
+    } else {
+        0
+    };
+    reject_zero_v2_model_input_digest_ref(
+        record_version,
+        "AssociationStateVectorBinding",
+        model_input_digest_ref,
+    )?;
+    Ok(AssociationStateVectorBindingV1 {
+        binding_id: read_u64(payload, 0)?,
+        vector_space_id: read_u32(payload, 8)?,
+        composition_profile_ref: read_u32(payload, 12)?,
+        file_ref: read_u32(payload, 16)?,
+        association_type_id: read_u32(payload, 20)?,
+        association_key_ref: read_u32(payload, 24)?,
+        branch_ref: read_u32(payload, 28)?,
+        temporal_kind: read_u8(payload, 32)?,
+        csn: read_u64(payload, 33)?,
+        timestamp_us: read_i64(payload, 41)?,
+        property_dependency_fingerprint_ref: read_u32(payload, 49)?,
+        vector_ref: read_u64(payload, 53)?,
+        model_input_digest_ref,
+        flags: read_u32(payload, if record_version == 2 { 65 } else { 61 })?,
+        checksum: read_u32(payload, checksum_offset)?,
+    })
+}
+
+fn parse_asset_vector_binding(
+    payload: &[u8],
+    record_version: u16,
+) -> Result<AssetVectorBindingV1, CoveError> {
+    let (expected_len, checksum_offset) = match record_version {
+        1 => (44, 40),
+        2 => (48, 44),
+        _ => unreachable!("record version was checked before vector binding parse"),
+    };
+    exact_len!(payload, expected_len, "AssetVectorBinding");
+    verify_payload_crc(payload, checksum_offset)?;
+    let model_input_digest_ref = if record_version == 2 {
+        read_u32(payload, 36)?
+    } else {
+        0
+    };
+    reject_zero_v2_model_input_digest_ref(
+        record_version,
+        "AssetVectorBinding",
+        model_input_digest_ref,
+    )?;
+    Ok(AssetVectorBindingV1 {
+        binding_id: read_u64(payload, 0)?,
+        vector_space_id: read_u32(payload, 8)?,
+        asset_ref: read_u64(payload, 12)?,
+        transform_ref: read_u32(payload, 20)?,
+        asset_digest_ref: read_u32(payload, 24)?,
+        vector_ref: read_u64(payload, 28)?,
+        model_input_digest_ref,
+        flags: read_u32(payload, if record_version == 2 { 40 } else { 36 })?,
+        checksum: read_u32(payload, checksum_offset)?,
+    })
+}
+
+fn parse_multimodal_sequence_vector_binding(
+    payload: &[u8],
+    record_version: u16,
+) -> Result<MultimodalSequenceVectorBindingV1, CoveError> {
+    let (expected_len, checksum_offset) = match record_version {
+        1 => (44, 40),
+        2 => (48, 44),
+        _ => unreachable!("record version was checked before vector binding parse"),
+    };
+    exact_len!(payload, expected_len, "MultimodalSequenceVectorBinding");
+    verify_payload_crc(payload, checksum_offset)?;
+    let model_input_digest_ref = if record_version == 2 {
+        read_u32(payload, 36)?
+    } else {
+        0
+    };
+    reject_zero_v2_model_input_digest_ref(
+        record_version,
+        "MultimodalSequenceVectorBinding",
+        model_input_digest_ref,
+    )?;
+    Ok(MultimodalSequenceVectorBindingV1 {
+        binding_id: read_u64(payload, 0)?,
+        vector_space_id: read_u32(payload, 8)?,
+        sequence_pack_id: read_u64(payload, 12)?,
+        sequence_profile_ref: read_u32(payload, 20)?,
+        source_snapshot_ref: read_u32(payload, 24)?,
+        vector_ref: read_u64(payload, 28)?,
+        model_input_digest_ref,
+        flags: read_u32(payload, if record_version == 2 { 40 } else { 36 })?,
+        checksum: read_u32(payload, checksum_offset)?,
+    })
+}
+
+fn reject_zero_v2_model_input_digest_ref(
+    record_version: u16,
+    label: &str,
+    model_input_digest_ref: u32,
+) -> Result<(), CoveError> {
+    if record_version == 2 && model_input_digest_ref == 0 {
+        return Err(CoveError::BadSection(format!(
+            "{label}V2 requires non-zero model_input_digest_ref"
+        )));
+    }
+    Ok(())
 }
 
 fn parse_vector_payload_block(payload: &[u8]) -> Result<VectorPayloadBlockHeaderV1, CoveError> {
@@ -9329,74 +12502,6 @@ fn parse_vector_index(payload: &[u8]) -> Result<VectorIndexDescriptorV1, CoveErr
     })
 }
 
-fn validate_cached_payload_range(
-    label: &str,
-    id: u32,
-    payload_ref: &AiPayloadRefEntryV1,
-    cached_offset: u64,
-    cached_length: u64,
-) -> Result<(), CoveError> {
-    match AiStorageKindV1::from_u8(payload_ref.storage_kind)
-        .ok_or_else(|| CoveError::BadSection("unknown AI payload storage_kind".into()))?
-    {
-        AiStorageKindV1::ArtifactAbsolute => {
-            if cached_length != 0 {
-                if cached_offset != payload_ref.payload_offset
-                    || cached_length != payload_ref.payload_length
-                {
-                    return Err(CoveError::BadSection(format!(
-                        "{label} {id} cached payload range does not match payload_ref"
-                    )));
-                }
-            } else if cached_offset != 0 {
-                return Err(CoveError::BadSection(format!(
-                    "{label} {id} has zero cached payload length but non-zero offset"
-                )));
-            }
-        }
-        _ => {
-            if cached_offset != 0 || cached_length != 0 {
-                return Err(CoveError::BadSection(format!(
-                    "{label} {id} must not cache artifact offsets for non-ArtifactAbsolute payload refs"
-                )));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn validate_unique<I>(values: I, label: &str) -> Result<(), CoveError>
-where
-    I: IntoIterator<Item = u32>,
-{
-    let mut seen = BTreeSet::new();
-    for value in values {
-        if value == 0 {
-            return Err(CoveError::BadSection(format!("{label} must be non-zero")));
-        }
-        if !seen.insert(value) {
-            return Err(CoveError::BadSection(format!("duplicate {label} {value}")));
-        }
-    }
-    Ok(())
-}
-
-fn validate_unique_u64<I>(values: I, label: &str) -> Result<(), CoveError>
-where
-    I: IntoIterator<Item = u64>,
-{
-    let mut seen = BTreeSet::new();
-    for value in values {
-        if value == 0 {
-            return Err(CoveError::BadSection(format!("{label} must be non-zero")));
-        }
-        if !seen.insert(value) {
-            return Err(CoveError::BadSection(format!("duplicate {label} {value}")));
-        }
-    }
-    Ok(())
-}
-
 fn section_by_id(sections: &[CoveAiSection], section_id: u32) -> Option<&CoveAiSection> {
     sections
         .iter()
@@ -9424,4095 +12529,30 @@ fn element_width_bytes(element_type: u8) -> Option<u64> {
         0 => Some(4),
         1 | 2 => Some(2),
         3 | 4 => Some(1),
+        6 => Some(8),
         5 => None,
         _ => None,
     }
 }
 
-fn validate_ai_vector_element_type(value: u8, label: &str) -> Result<(), CoveError> {
-    if value <= 5 || value == 255 {
-        return Ok(());
+fn vector_index_kind_name(value: u8) -> &'static str {
+    match value {
+        0 => "exact_flat",
+        1 => "hnsw",
+        2 => "ivf_flat",
+        3 => "ivf_pq",
+        4 => "diskann",
+        5 => "vamana",
+        6 => "pq",
+        7 => "scalar_quantized",
+        8 => "extension_candidate",
+        255 => "extension",
+        _ => "unknown",
     }
-    Err(CoveError::BadSection(format!(
-        "{label} has unsupported value {value}"
-    )))
-}
-
-fn validate_ai_vector_metric(value: u8, label: &str) -> Result<(), CoveError> {
-    if value <= 4 || value == 255 {
-        return Ok(());
-    }
-    Err(CoveError::BadSection(format!(
-        "{label} has unsupported value {value}"
-    )))
-}
-
-fn validate_ai_vector_index_kind(value: u8, label: &str) -> Result<(), CoveError> {
-    if value <= 8 || value == 255 {
-        return Ok(());
-    }
-    Err(CoveError::BadSection(format!(
-        "{label} has unsupported value {value}"
-    )))
-}
-
-fn validate_ai_vector_index_exactness(value: u8, label: &str) -> Result<(), CoveError> {
-    if value <= 3 || value == 255 {
-        return Ok(());
-    }
-    Err(CoveError::BadSection(format!(
-        "{label} has unsupported value {value}"
-    )))
-}
-
-fn validate_ai_vector_false_negative_policy(value: u8, label: &str) -> Result<(), CoveError> {
-    if value <= 3 || value == 255 {
-        return Ok(());
-    }
-    Err(CoveError::BadSection(format!(
-        "{label} has unsupported value {value}"
-    )))
-}
-
-fn validate_ai_vector_score_space_authority(value: u8, label: &str) -> Result<(), CoveError> {
-    if value <= 5 || value == 255 {
-        return Ok(());
-    }
-    Err(CoveError::BadSection(format!(
-        "{label} has unsupported value {value}"
-    )))
-}
-
-fn validate_ai_vector_indexed_binding_kind(value: u8, label: &str) -> Result<(), CoveError> {
-    if value <= 4 || value == 255 {
-        return Ok(());
-    }
-    Err(CoveError::BadSection(format!(
-        "{label} has unsupported value {value}"
-    )))
-}
-
-fn validate_ai_vector_compatibility_kind(value: u8, label: &str) -> Result<(), CoveError> {
-    if value <= 4 || value == 255 {
-        return Ok(());
-    }
-    Err(CoveError::BadSection(format!(
-        "{label} has unsupported value {value}"
-    )))
-}
-
-fn validate_ai_vector_compatibility_authority(value: u8, label: &str) -> Result<(), CoveError> {
-    if value <= 5 || value == 255 {
-        return Ok(());
-    }
-    Err(CoveError::BadSection(format!(
-        "{label} has unsupported value {value}"
-    )))
-}
-
-fn validate_ai_normalization_policy(value: u8, label: &str) -> Result<(), CoveError> {
-    if value <= 3 || value == 255 {
-        return Ok(());
-    }
-    Err(CoveError::BadSection(format!(
-        "{label} has unsupported value {value}"
-    )))
-}
-
-fn validate_ai_quantization_kind(value: u8, label: &str) -> Result<(), CoveError> {
-    if value <= 3 || value == 255 {
-        return Ok(());
-    }
-    Err(CoveError::BadSection(format!(
-        "{label} has unsupported value {value}"
-    )))
-}
-
-fn validate_ai_compression_codec(value: u8, label: &str) -> Result<(), CoveError> {
-    if value <= 2 || value == 255 {
-        return Ok(());
-    }
-    Err(CoveError::BadSection(format!(
-        "{label} has unsupported value {value}"
-    )))
-}
-
-fn validate_ai_layout_kind(value: u8, label: &str) -> Result<(), CoveError> {
-    if value <= 3 || value == 255 {
-        return Ok(());
-    }
-    Err(CoveError::BadSection(format!(
-        "{label} has unsupported value {value}"
-    )))
-}
-
-fn validate_ai_chunk_boundary_kind(value: u8, label: &str) -> Result<(), CoveError> {
-    if value <= 7 || value == 255 {
-        return Ok(());
-    }
-    Err(CoveError::BadSection(format!(
-        "{label} has unsupported value {value}"
-    )))
-}
-
-fn validate_ai_chunk_overlap_policy(value: u8, label: &str) -> Result<(), CoveError> {
-    if value <= 3 || value == 255 {
-        return Ok(());
-    }
-    Err(CoveError::BadSection(format!(
-        "{label} has unsupported value {value}"
-    )))
-}
-
-fn validate_ai_chunk_parent_policy(value: u8, label: &str) -> Result<(), CoveError> {
-    if value <= 3 || value == 255 {
-        return Ok(());
-    }
-    Err(CoveError::BadSection(format!(
-        "{label} has unsupported value {value}"
-    )))
-}
-
-fn validate_ai_digest_domain(value: u8, label: &str) -> Result<(), CoveError> {
-    if value <= 7 || value == 255 {
-        return Ok(());
-    }
-    Err(CoveError::BadSection(format!(
-        "{label} has unsupported value {value}"
-    )))
-}
-
-fn validate_ai_privacy_state(value: u8, label: &str) -> Result<(), CoveError> {
-    if value <= 15 || value == 255 {
-        return Ok(());
-    }
-    Err(CoveError::BadSection(format!(
-        "{label} has unsupported value {value}"
-    )))
-}
-
-fn validate_ai_reproducibility_class(value: u8, label: &str) -> Result<(), CoveError> {
-    if value <= 5 || value == 255 {
-        return Ok(());
-    }
-    Err(CoveError::BadSection(format!(
-        "{label} has unsupported value {value}"
-    )))
-}
-
-fn validate_ai_result_authority(value: u8, label: &str) -> Result<(), CoveError> {
-    if value <= 3 || value == 255 {
-        return Ok(());
-    }
-    Err(CoveError::BadSection(format!(
-        "{label} has unsupported value {value}"
-    )))
-}
-
-fn validate_ai_vector_composition_method(value: u8, label: &str) -> Result<(), CoveError> {
-    if value <= 7 || value == 255 {
-        return Ok(());
-    }
-    Err(CoveError::BadSection(format!(
-        "{label} has unsupported value {value}"
-    )))
-}
-
-fn validate_ai_vector_composition_missing_policy(value: u8, label: &str) -> Result<(), CoveError> {
-    if value <= 7 || value == 255 {
-        return Ok(());
-    }
-    Err(CoveError::BadSection(format!(
-        "{label} has unsupported value {value}"
-    )))
-}
-
-fn validate_ai_vector_redaction_behavior(value: u8, label: &str) -> Result<(), CoveError> {
-    if value <= 3 || value == 255 {
-        return Ok(());
-    }
-    Err(CoveError::BadSection(format!(
-        "{label} has unsupported value {value}"
-    )))
-}
-
-fn validate_ai_vector_component_missing_behavior(value: u8, label: &str) -> Result<(), CoveError> {
-    if value <= 3 || value == 255 {
-        return Ok(());
-    }
-    Err(CoveError::BadSection(format!(
-        "{label} has unsupported value {value}"
-    )))
-}
-
-fn validate_ai_vector_arithmetic_kind(value: u8, label: &str) -> Result<(), CoveError> {
-    if value <= 7 || value == 255 {
-        return Ok(());
-    }
-    Err(CoveError::BadSection(format!(
-        "{label} has unsupported value {value}"
-    )))
-}
-
-fn validate_ai_vector_accumulator_kind(value: u8, label: &str) -> Result<(), CoveError> {
-    if value <= 7 || value == 255 {
-        return Ok(());
-    }
-    Err(CoveError::BadSection(format!(
-        "{label} has unsupported value {value}"
-    )))
-}
-
-fn validate_ai_vector_rounding_mode(value: u8, label: &str) -> Result<(), CoveError> {
-    if value <= 7 || value == 255 {
-        return Ok(());
-    }
-    Err(CoveError::BadSection(format!(
-        "{label} has unsupported value {value}"
-    )))
-}
-
-fn validate_ai_vector_overflow_policy(value: u8, label: &str) -> Result<(), CoveError> {
-    if value <= 3 || value == 255 {
-        return Ok(());
-    }
-    Err(CoveError::BadSection(format!(
-        "{label} has unsupported value {value}"
-    )))
-}
-
-fn validate_ai_vector_component_order(value: u8, label: &str) -> Result<(), CoveError> {
-    if value <= 3 || value == 255 {
-        return Ok(());
-    }
-    Err(CoveError::BadSection(format!(
-        "{label} has unsupported value {value}"
-    )))
-}
-
-fn validate_ai_tensor_dtype(value: u8, label: &str) -> Result<(), CoveError> {
-    if value <= 15 || value == 255 {
-        return Ok(());
-    }
-    Err(CoveError::BadSection(format!(
-        "{label} has unsupported value {value}"
-    )))
-}
-
-fn validate_ai_byte_order(value: u8, label: &str) -> Result<(), CoveError> {
-    if value <= 2 || value == 255 {
-        return Ok(());
-    }
-    Err(CoveError::BadSection(format!(
-        "{label} has unsupported value {value}"
-    )))
-}
-
-fn validate_ai_device_kind(value: u8, label: &str) -> Result<(), CoveError> {
-    if value <= 7 || value == 255 {
-        return Ok(());
-    }
-    Err(CoveError::BadSection(format!(
-        "{label} has unsupported value {value}"
-    )))
-}
-
-fn validate_ai_asset_kind(value: u8, label: &str) -> Result<(), CoveError> {
-    if value <= 6 || value == 255 {
-        return Ok(());
-    }
-    Err(CoveError::BadSection(format!(
-        "{label} has unsupported value {value}"
-    )))
-}
-
-fn validate_ai_modality(value: u8, label: &str) -> Result<(), CoveError> {
-    if value <= 7 || value == 255 {
-        return Ok(());
-    }
-    Err(CoveError::BadSection(format!(
-        "{label} has unsupported value {value}"
-    )))
-}
-
-fn validate_ai_role(value: u8, label: &str) -> Result<(), CoveError> {
-    if value <= 6 || value == 255 {
-        return Ok(());
-    }
-    Err(CoveError::BadSection(format!(
-        "{label} has unsupported value {value}"
-    )))
-}
-
-fn validate_ai_multimodal_element_kind(value: u8, label: &str) -> Result<(), CoveError> {
-    if value <= 15 || value == 255 {
-        return Ok(());
-    }
-    Err(CoveError::BadSection(format!(
-        "{label} has unsupported value {value}"
-    )))
-}
-
-fn validate_ai_generator_kind(value: u8, label: &str) -> Result<(), CoveError> {
-    if value <= 4 || value == 255 {
-        return Ok(());
-    }
-    Err(CoveError::BadSection(format!(
-        "{label} has unsupported value {value}"
-    )))
-}
-
-fn validate_ai_review_kind(value: u8, label: &str) -> Result<(), CoveError> {
-    if value <= 15 || value == 255 {
-        return Ok(());
-    }
-    Err(CoveError::BadSection(format!(
-        "{label} has unsupported value {value}"
-    )))
-}
-
-fn validate_ai_split_method(value: u8, label: &str) -> Result<(), CoveError> {
-    if value <= 15 || value == 255 {
-        return Ok(());
-    }
-    Err(CoveError::BadSection(format!(
-        "{label} has unsupported value {value}"
-    )))
-}
-
-fn validate_ai_similarity_kind(value: u8, label: &str) -> Result<(), CoveError> {
-    if value <= 15 || value == 255 {
-        return Ok(());
-    }
-    Err(CoveError::BadSection(format!(
-        "{label} has unsupported value {value}"
-    )))
-}
-
-fn validate_ai_dedup_authority(value: u8, label: &str) -> Result<(), CoveError> {
-    if value <= 5 || value == 255 {
-        return Ok(());
-    }
-    Err(CoveError::BadSection(format!(
-        "{label} has unsupported value {value}"
-    )))
-}
-
-fn validate_ai_permutation_kind(value: u8, label: &str) -> Result<(), CoveError> {
-    if value <= 15 || value == 255 {
-        return Ok(());
-    }
-    Err(CoveError::BadSection(format!(
-        "{label} has unsupported value {value}"
-    )))
-}
-
-fn validate_bool_byte(value: u8, label: &str) -> Result<(), CoveError> {
-    if value > 1 {
-        return Err(CoveError::BadSection(format!(
-            "{label} must be 0 or 1, got {value}"
-        )));
-    }
-    Ok(())
-}
-
-fn validate_power_of_two_alignment(value: u32, label: &str) -> Result<(), CoveError> {
-    if value != 0 && !value.is_power_of_two() {
-        return Err(CoveError::BadSection(format!(
-            "{label} must be zero or a power of two, got {value}"
-        )));
-    }
-    Ok(())
-}
-
-fn validate_token_range(
-    label: &str,
-    id: u64,
-    token_offset: u64,
-    token_count: u32,
-    block: &TokenBlockHeaderV1,
-) -> Result<(), CoveError> {
-    let end = token_offset
-        .checked_add(u64::from(token_count))
-        .ok_or(CoveError::ArithOverflow)?;
-    if end > block.token_count {
-        return Err(CoveError::BadSection(format!(
-            "{label} {id} token range exceeds token_block_ref {} token_count",
-            block.token_block_id
-        )));
-    }
-    Ok(())
-}
-
-fn verify_payload_crc(payload: &[u8], checksum_offset: usize) -> Result<(), CoveError> {
-    if checksum_offset + 4 > payload.len() {
-        return Err(CoveError::BufferTooShort);
-    }
-    let expected = read_u32(payload, checksum_offset)?;
-    verify_crc32c(payload, checksum_offset, expected)
-}
-
-fn verify_crc32c(bytes: &[u8], checksum_offset: usize, expected: u32) -> Result<(), CoveError> {
-    if checksum_offset + 4 > bytes.len() {
-        return Err(CoveError::BufferTooShort);
-    }
-    let mut for_crc = bytes.to_vec();
-    for_crc[checksum_offset..checksum_offset + 4].fill(0);
-    if checksum::crc32c(&for_crc) != expected {
-        return Err(CoveError::ChecksumMismatch);
-    }
-    Ok(())
-}
-
-fn checked_slice(data: &[u8], offset: u64, length: u64) -> Result<&[u8], CoveError> {
-    let end = checked_range(offset, length, data.len() as u64)?;
-    Ok(&data[offset as usize..end as usize])
-}
-
-fn checked_range(offset: u64, length: u64, bound: u64) -> Result<u64, CoveError> {
-    let end = offset.checked_add(length).ok_or(CoveError::ArithOverflow)?;
-    if end > bound {
-        return Err(CoveError::OffsetRange);
-    }
-    Ok(end)
-}
-
-fn range_contains(outer_offset: u64, outer_len: u64, inner_offset: u64, inner_len: u64) -> bool {
-    let Some(outer_end) = outer_offset.checked_add(outer_len) else {
-        return false;
-    };
-    let Some(inner_end) = inner_offset.checked_add(inner_len) else {
-        return false;
-    };
-    inner_offset >= outer_offset && inner_end <= outer_end
-}
-
-fn read_u8(bytes: &[u8], offset: usize) -> Result<u8, CoveError> {
-    bytes.get(offset).copied().ok_or(CoveError::BufferTooShort)
-}
-
-fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, CoveError> {
-    let end = offset.checked_add(2).ok_or(CoveError::ArithOverflow)?;
-    let slice = bytes.get(offset..end).ok_or(CoveError::BufferTooShort)?;
-    Ok(u16::from_le_bytes(slice.try_into().unwrap()))
-}
-
-fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, CoveError> {
-    let end = offset.checked_add(4).ok_or(CoveError::ArithOverflow)?;
-    let slice = bytes.get(offset..end).ok_or(CoveError::BufferTooShort)?;
-    Ok(u32::from_le_bytes(slice.try_into().unwrap()))
-}
-
-fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, CoveError> {
-    let end = offset.checked_add(8).ok_or(CoveError::ArithOverflow)?;
-    let slice = bytes.get(offset..end).ok_or(CoveError::BufferTooShort)?;
-    Ok(u64::from_le_bytes(slice.try_into().unwrap()))
-}
-
-fn read_i64(bytes: &[u8], offset: usize) -> Result<i64, CoveError> {
-    let end = offset.checked_add(8).ok_or(CoveError::ArithOverflow)?;
-    let slice = bytes.get(offset..end).ok_or(CoveError::BufferTooShort)?;
-    Ok(i64::from_le_bytes(slice.try_into().unwrap()))
-}
-
-fn read_array<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N], CoveError> {
-    let end = offset.checked_add(N).ok_or(CoveError::ArithOverflow)?;
-    let slice = bytes.get(offset..end).ok_or(CoveError::BufferTooShort)?;
-    Ok(slice.try_into().unwrap())
-}
-
-fn put_u8(bytes: &mut [u8], offset: usize, value: u8) {
-    bytes[offset] = value;
-}
-
-fn put_u16(bytes: &mut [u8], offset: usize, value: u16) {
-    bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
-}
-
-fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
-    bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
-}
-
-fn put_u64(bytes: &mut [u8], offset: usize, value: u64) {
-    bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
-}
-
-fn put_i64(bytes: &mut [u8], offset: usize, value: i64) {
-    bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+mod fixtures;
 
-    fn f32_payload(values: &[f32]) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(values.len() * 4);
-        for value in values {
-            bytes.extend_from_slice(&value.to_le_bytes());
-        }
-        bytes
-    }
-
-    fn test_vector_space(vector_space_id: u32) -> VectorSpaceDescriptorV1 {
-        VectorSpaceDescriptorV1 {
-            vector_space_id,
-            vector_space_name_ref: 0,
-            vector_space_fingerprint_ref: 0,
-            embedding_namespace_ref: 0,
-            embedding_model_ref: 0,
-            embedding_model_version_ref: 0,
-            embedding_model_digest_ref: 0,
-            embedding_pipeline_ref: 0,
-            tokenizer_profile_ref: 0,
-            chunk_profile_ref: 0,
-            dimension_count: 3,
-            element_type: 0,
-            metric: 1,
-            normalization_policy: 0,
-            quantization_policy: 0,
-            deterministic: 1,
-            approximate: 0,
-            reproducibility_class: 1,
-            reserved: 0,
-            flags: 0,
-            checksum: 0,
-        }
-    }
-
-    fn test_vector_space_compatibility() -> VectorSpaceCompatibilityDescriptorV1 {
-        VectorSpaceCompatibilityDescriptorV1 {
-            compatibility_id: 1,
-            left_vector_space_id: 1,
-            right_vector_space_id: 2,
-            compatibility_kind: 1,
-            compatibility_authority: 0,
-            metric: 1,
-            normalization_policy: 0,
-            transform_ref: 0,
-            numeric_transform_error_ppm: 0,
-            ranking_eval_ref: 0,
-            calibration_dataset_ref: 0,
-            evidence_ref: 0,
-            flags: 0,
-            checksum: 0,
-        }
-    }
-
-    fn vector_descriptor_tables_with_payload() -> (AiDescriptorTablesV1, Vec<CoveAiWritableSection>)
-    {
-        let mut tables = AiDescriptorTablesV1::default();
-        tables.payload_refs.push(AiPayloadRefEntryV1 {
-            payload_ref: 1,
-            storage_kind: AiStorageKindV1::SectionDecodedRelative as u8,
-            media_type_ref: 0,
-            section_id: 1,
-            uri_ref: 0,
-            payload_offset: 0,
-            section_payload_offset: 0,
-            payload_length: 36,
-            decoded_length: 36,
-            integrity_ref: 0,
-            flags: 0,
-            crc32c: 0,
-        });
-        tables.payload_refs.push(AiPayloadRefEntryV1 {
-            payload_ref: 2,
-            storage_kind: AiStorageKindV1::SectionDecodedRelative as u8,
-            media_type_ref: 0,
-            section_id: 1,
-            uri_ref: 0,
-            payload_offset: 0,
-            section_payload_offset: 0,
-            payload_length: 4,
-            decoded_length: 4,
-            integrity_ref: 0,
-            flags: 0,
-            crc32c: 0,
-        });
-        tables.digests.push(AiDigestEntryV1 {
-            digest_ref: 1,
-            digest_algorithm: 1,
-            digest_len: 4,
-            digest_payload_ref: 2,
-            domain_hint: 1,
-            flags: 0,
-            crc32c: 0,
-        });
-        tables.vector_spaces.push(test_vector_space(1));
-        tables.vector_spaces.push(test_vector_space(2));
-        tables
-            .vector_payload_blocks
-            .push(VectorPayloadBlockHeaderV1 {
-                block_id: 1,
-                vector_space_id: 1,
-                vector_count: 3,
-                dimension_count: 3,
-                element_type: 0,
-                compression_codec: 0,
-                quantization_kind: 0,
-                layout_kind: 0,
-                tensor_layout_ref: 0,
-                memory_alignment_bytes: 0,
-                payload_stride_ref: 0,
-                device_transfer_hint_ref: 0,
-                payload_ref: 1,
-                payload_offset: 0,
-                payload_length: 0,
-                integrity_ref: 0,
-                checksum: 0,
-            });
-        for vector_ref in 1..=3 {
-            tables.vector_entries.push(VectorEntryV1 {
-                vector_ref,
-                block_id: 1,
-                vector_ordinal: vector_ref - 1,
-                payload_offset: 0,
-                payload_length: 0,
-                integrity_ref: 0,
-                flags: 0,
-                checksum: 0,
-            });
-        }
-        let sections = vec![coveai_payload_section(
-            1,
-            SectionKind::AiPayloadBytes,
-            PrimaryProfile::CoveVec,
-            f32_payload(&[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.25, 0.5, 0.75]),
-        )];
-        (tables, sections)
-    }
-
-    fn vector_composition_tables() -> (AiDescriptorTablesV1, Vec<CoveAiWritableSection>) {
-        let (mut tables, payload_sections) = vector_descriptor_tables_with_payload();
-        tables
-            .vector_arithmetic_profiles
-            .push(VectorArithmeticProfileV1 {
-                arithmetic_profile_id: 1,
-                profile_name_ref: 0,
-                arithmetic_kind: 0,
-                input_quantization_kind: 0,
-                accumulator_kind: 0,
-                rounding_mode: 0,
-                overflow_policy: 0,
-                component_order: 0,
-                weight_scale: 1_000_000,
-                output_quantization_kind: 0,
-                output_element_type: 0,
-                normalization_policy: 0,
-                flags: 0,
-                checksum: 0,
-            });
-        tables
-            .vector_composition_components
-            .push(VectorCompositionComponentV1 {
-                component_id: 1,
-                slot_policy_ref: 0,
-                source_vector_space_id: 1,
-                weight_ppm: 1_000_000,
-                required: 1,
-                redaction_behavior: 0,
-                missing_behavior: 0,
-                reserved: 0,
-                flags: 0,
-                checksum: 0,
-            });
-        tables
-            .vector_composition_profiles
-            .push(VectorCompositionProfileV1 {
-                composition_profile_id: 1,
-                composition_name_ref: 0,
-                output_vector_space_id: 1,
-                arithmetic_profile_ref: 1,
-                method: 1,
-                missing_policy: 0,
-                normalize_inputs: 1,
-                normalize_output: 1,
-                result_authority: 0,
-                reproducibility_class: 0,
-                first_component_ref: 1,
-                component_count: 1,
-                template_ref: 0,
-                flags: 0,
-                checksum: 0,
-            });
-        (tables, payload_sections)
-    }
-
-    #[test]
-    fn writes_and_parses_empty_coveai_artifact() {
-        let bytes =
-            write_coveai_artifact(CoveAiArtifactKind::CoveAiBundle, [7u8; 16], 123, &[]).unwrap();
-        let parsed = CoveAiFile::parse(&bytes).unwrap();
-        assert_eq!(parsed.artifact_kind, CoveAiArtifactKind::CoveAiBundle);
-        assert_eq!(parsed.header.artifact_id, [7u8; 16]);
-        assert_eq!(parsed.sections.len(), 0);
-    }
-
-    #[test]
-    fn rejects_duplicate_section_id() {
-        let sections = [
-            CoveAiWritableSection {
-                section_id: 1,
-                section_kind: SectionKind::AiPayloadBytes as u32,
-                profile_kind: 16,
-                payload_encoding: AiPayloadEncodingV1::OpaqueBytes,
-                requiredness_scope: AiRequirednessScopeV1::AdvisoryOnly,
-                source_binding_ref: 0,
-                required_ai_features: 0,
-                optional_ai_features: 0,
-                feature_binding_ref: 0,
-                payload: vec![1, 2, 3],
-            },
-            CoveAiWritableSection {
-                section_id: 1,
-                section_kind: SectionKind::AiPayloadBytes as u32,
-                profile_kind: 16,
-                payload_encoding: AiPayloadEncodingV1::OpaqueBytes,
-                requiredness_scope: AiRequirednessScopeV1::AdvisoryOnly,
-                source_binding_ref: 0,
-                required_ai_features: 0,
-                optional_ai_features: 0,
-                feature_binding_ref: 0,
-                payload: vec![4, 5, 6],
-            },
-        ];
-        let bytes =
-            write_coveai_artifact(CoveAiArtifactKind::CoveAiBundle, [0; 16], 0, &sections).unwrap();
-        assert!(CoveAiFile::parse(&bytes).is_err());
-    }
-
-    #[test]
-    fn descriptor_bundle_serializes_digest_bound_companion_ref() {
-        let uri = b"vectors.covev";
-        let digest = [0xAB; 32];
-        let mut payload = Vec::new();
-        payload.extend_from_slice(uri);
-        payload.extend_from_slice(&digest);
-
-        let mut tables = AiDescriptorTablesV1::default();
-        tables.strings.push(AiStringEntryV1 {
-            string_ref: 1,
-            utf8_byte_length: uri.len() as u32,
-            payload_ref: 1,
-            flags: 0,
-            crc32c: 0,
-        });
-        tables.digests.push(AiDigestEntryV1 {
-            digest_ref: 1,
-            digest_algorithm: 1,
-            digest_len: digest.len() as u16,
-            digest_payload_ref: 2,
-            domain_hint: 1,
-            flags: 0,
-            crc32c: 0,
-        });
-        tables.payload_refs.push(AiPayloadRefEntryV1 {
-            payload_ref: 1,
-            storage_kind: AiStorageKindV1::SectionDecodedRelative as u8,
-            media_type_ref: 0,
-            section_id: 1,
-            uri_ref: 0,
-            payload_offset: 0,
-            section_payload_offset: 0,
-            payload_length: uri.len() as u64,
-            decoded_length: uri.len() as u64,
-            integrity_ref: 0,
-            flags: 0,
-            crc32c: 0,
-        });
-        tables.payload_refs.push(AiPayloadRefEntryV1 {
-            payload_ref: 2,
-            storage_kind: AiStorageKindV1::SectionDecodedRelative as u8,
-            media_type_ref: 0,
-            section_id: 1,
-            uri_ref: 0,
-            payload_offset: 0,
-            section_payload_offset: uri.len() as u64,
-            payload_length: digest.len() as u64,
-            decoded_length: digest.len() as u64,
-            integrity_ref: 0,
-            flags: 0,
-            crc32c: 0,
-        });
-        tables.companion_artifacts.push(AiCompanionArtifactRefV1 {
-            artifact_ref: 1,
-            artifact_kind: AI_COMPANION_ARTIFACT_KIND_CVV2,
-            artifact_id: [9; 16],
-            uri_ref: 1,
-            artifact_digest_ref: 1,
-            source_binding_ref: 0,
-            required_ai_features: AI_FEATURE_VECTOR,
-            optional_ai_features: 0,
-            flags: 0,
-            crc32c: 0,
-        });
-
-        let bytes = write_coveai_descriptor_bundle(&CoveAiDescriptorBundleBuild {
-            artifact_id: [21u8; 16],
-            created_at_us: 908,
-            payload_sections: vec![coveai_payload_section(
-                1,
-                SectionKind::AiPayloadBytes,
-                PrimaryProfile::CoveAiShared,
-                payload,
-            )],
-            descriptor_tables: tables,
-        })
-        .unwrap();
-        let parsed = CoveAiFile::parse(&bytes).unwrap();
-        assert_eq!(parsed.descriptor_tables.companion_artifacts.len(), 1);
-        assert_eq!(
-            parsed.descriptor_tables.companion_artifacts[0].artifact_kind,
-            AI_COMPANION_ARTIFACT_KIND_CVV2
-        );
-        assert_eq!(parsed.descriptor_tables.strings.len(), 1);
-        assert_eq!(parsed.descriptor_tables.digests.len(), 1);
-    }
-
-    #[test]
-    fn rejects_companion_ref_missing_artifact_digest() {
-        let uri = b"vectors.covev";
-        let sections = vec![
-            coveai_payload_section(
-                1,
-                SectionKind::AiPayloadBytes,
-                PrimaryProfile::CoveAiShared,
-                uri.to_vec(),
-            ),
-            coveai_binary_section(
-                2,
-                SectionKind::AiReferenceTables,
-                PrimaryProfile::CoveAiShared,
-                encode_records([
-                    encode_string_entry(AiStringEntryV1 {
-                        string_ref: 1,
-                        utf8_byte_length: uri.len() as u32,
-                        payload_ref: 1,
-                        flags: 0,
-                        crc32c: 0,
-                    })
-                    .unwrap(),
-                    encode_payload_ref_entry(AiPayloadRefEntryV1 {
-                        payload_ref: 1,
-                        storage_kind: AiStorageKindV1::SectionDecodedRelative as u8,
-                        media_type_ref: 0,
-                        section_id: 1,
-                        uri_ref: 0,
-                        payload_offset: 0,
-                        section_payload_offset: 0,
-                        payload_length: uri.len() as u64,
-                        decoded_length: uri.len() as u64,
-                        integrity_ref: 0,
-                        flags: 0,
-                        crc32c: 0,
-                    })
-                    .unwrap(),
-                ])
-                .unwrap(),
-            ),
-            coveai_binary_section(
-                3,
-                SectionKind::AiCompanionArtifactRef,
-                PrimaryProfile::CoveAiShared,
-                encode_records([encode_companion_artifact_ref(AiCompanionArtifactRefV1 {
-                    artifact_ref: 1,
-                    artifact_kind: AI_COMPANION_ARTIFACT_KIND_CVV2,
-                    artifact_id: [9; 16],
-                    uri_ref: 1,
-                    artifact_digest_ref: 99,
-                    source_binding_ref: 0,
-                    required_ai_features: AI_FEATURE_VECTOR,
-                    optional_ai_features: 0,
-                    flags: 0,
-                    crc32c: 0,
-                })
-                .unwrap()])
-                .unwrap(),
-            ),
-        ];
-        let bytes =
-            write_coveai_artifact(CoveAiArtifactKind::CoveAiBundle, [22u8; 16], 909, &sections)
-                .unwrap();
-        assert!(matches!(
-            CoveAiFile::parse(&bytes),
-            Err(CoveError::BadSection(message))
-                if message.contains("missing artifact_digest_ref")
-        ));
-    }
-
-    #[test]
-    fn descriptor_bundle_serializes_source_binding() {
-        let mut tables = AiDescriptorTablesV1::default();
-        tables.source_bindings.push(AiSourceBindingV1 {
-            source_binding_id: 1,
-            source_kind: AI_SOURCE_KIND_COVE_FILE,
-            source_artifact_ref: 0,
-            source_file_digest_ref: 0,
-            covm_snapshot_ref: 0,
-            schema_fingerprint_ref: 0,
-            dictionary_digest_ref: 0,
-            map_fingerprint_ref: 0,
-            policy_context_ref: 0,
-            visibility_scope_ref: 0,
-            redaction_scope_ref: 0,
-            branch_ref: 0,
-            as_of_csn: 42,
-            flags: 0,
-            crc32c: 0,
-        });
-
-        let bytes = write_coveai_descriptor_bundle(&CoveAiDescriptorBundleBuild {
-            artifact_id: [23u8; 16],
-            created_at_us: 910,
-            payload_sections: Vec::new(),
-            descriptor_tables: tables,
-        })
-        .unwrap();
-        let parsed = CoveAiFile::parse(&bytes).unwrap();
-        assert_eq!(parsed.descriptor_tables.source_bindings.len(), 1);
-        assert_eq!(parsed.descriptor_tables.source_bindings[0].as_of_csn, 42);
-    }
-
-    #[test]
-    fn descriptor_bundle_rejects_source_binding_missing_digest_ref() {
-        let mut tables = AiDescriptorTablesV1::default();
-        tables.source_bindings.push(AiSourceBindingV1 {
-            source_binding_id: 1,
-            source_kind: AI_SOURCE_KIND_COVE_FILE,
-            source_artifact_ref: 0,
-            source_file_digest_ref: 99,
-            covm_snapshot_ref: 0,
-            schema_fingerprint_ref: 0,
-            dictionary_digest_ref: 0,
-            map_fingerprint_ref: 0,
-            policy_context_ref: 0,
-            visibility_scope_ref: 0,
-            redaction_scope_ref: 0,
-            branch_ref: 0,
-            as_of_csn: 0,
-            flags: 0,
-            crc32c: 0,
-        });
-
-        assert!(matches!(
-            write_coveai_descriptor_bundle(&CoveAiDescriptorBundleBuild {
-                artifact_id: [24u8; 16],
-                created_at_us: 911,
-                payload_sections: Vec::new(),
-                descriptor_tables: tables,
-            }),
-            Err(CoveError::BadSection(message))
-                if message.contains("missing source_file_digest_ref")
-        ));
-    }
-
-    #[test]
-    fn descriptor_bundle_serializes_policy_ref_and_source_policy_ref() {
-        let authority = b"visibility-policy";
-        let mut tables = AiDescriptorTablesV1::default();
-        tables.strings.push(AiStringEntryV1 {
-            string_ref: 1,
-            utf8_byte_length: authority.len() as u32,
-            payload_ref: 1,
-            flags: 0,
-            crc32c: 0,
-        });
-        tables.payload_refs.push(AiPayloadRefEntryV1 {
-            payload_ref: 1,
-            storage_kind: AiStorageKindV1::SectionDecodedRelative as u8,
-            media_type_ref: 0,
-            section_id: 1,
-            uri_ref: 0,
-            payload_offset: 0,
-            section_payload_offset: 0,
-            payload_length: authority.len() as u64,
-            decoded_length: authority.len() as u64,
-            integrity_ref: 0,
-            flags: 0,
-            crc32c: 0,
-        });
-        tables.policies.push(AiPolicyRefEntryV1 {
-            policy_ref: 1,
-            policy_kind: AI_POLICY_KIND_VISIBILITY,
-            authority_ref: 1,
-            payload_ref: 0,
-            digest_ref: 0,
-            flags: 0,
-            crc32c: 0,
-        });
-        tables.source_bindings.push(AiSourceBindingV1 {
-            source_binding_id: 1,
-            source_kind: AI_SOURCE_KIND_COVE_FILE,
-            source_artifact_ref: 0,
-            source_file_digest_ref: 0,
-            covm_snapshot_ref: 0,
-            schema_fingerprint_ref: 0,
-            dictionary_digest_ref: 0,
-            map_fingerprint_ref: 0,
-            policy_context_ref: 1,
-            visibility_scope_ref: 1,
-            redaction_scope_ref: 0,
-            branch_ref: 0,
-            as_of_csn: 0,
-            flags: 0,
-            crc32c: 0,
-        });
-
-        let bytes = write_coveai_descriptor_bundle(&CoveAiDescriptorBundleBuild {
-            artifact_id: [25u8; 16],
-            created_at_us: 912,
-            payload_sections: vec![coveai_payload_section(
-                1,
-                SectionKind::AiPayloadBytes,
-                PrimaryProfile::CoveAiShared,
-                authority.to_vec(),
-            )],
-            descriptor_tables: tables,
-        })
-        .unwrap();
-        let parsed = CoveAiFile::parse(&bytes).unwrap();
-        assert_eq!(parsed.descriptor_tables.policies.len(), 1);
-        assert_eq!(
-            parsed.descriptor_tables.source_bindings[0].visibility_scope_ref,
-            1
-        );
-    }
-
-    #[test]
-    fn descriptor_bundle_rejects_policy_payload_without_digest() {
-        let policy_payload = b"policy";
-        let mut tables = AiDescriptorTablesV1::default();
-        tables.payload_refs.push(AiPayloadRefEntryV1 {
-            payload_ref: 1,
-            storage_kind: AiStorageKindV1::SectionDecodedRelative as u8,
-            media_type_ref: 0,
-            section_id: 1,
-            uri_ref: 0,
-            payload_offset: 0,
-            section_payload_offset: 0,
-            payload_length: policy_payload.len() as u64,
-            decoded_length: policy_payload.len() as u64,
-            integrity_ref: 0,
-            flags: 0,
-            crc32c: 0,
-        });
-        tables.policies.push(AiPolicyRefEntryV1 {
-            policy_ref: 1,
-            policy_kind: AI_POLICY_KIND_VISIBILITY,
-            authority_ref: 0,
-            payload_ref: 1,
-            digest_ref: 0,
-            flags: 0,
-            crc32c: 0,
-        });
-
-        assert!(matches!(
-            write_coveai_descriptor_bundle(&CoveAiDescriptorBundleBuild {
-                artifact_id: [26u8; 16],
-                created_at_us: 913,
-                payload_sections: vec![coveai_payload_section(
-                    1,
-                    SectionKind::AiPayloadBytes,
-                    PrimaryProfile::CoveAiShared,
-                    policy_payload.to_vec(),
-                )],
-                descriptor_tables: tables,
-            }),
-            Err(CoveError::BadSection(message))
-                if message.contains("payload_ref requires digest_ref")
-        ));
-    }
-
-    #[test]
-    fn descriptor_bundle_serializes_privacy_summary_refs() {
-        let mut tables = AiDescriptorTablesV1::default();
-        tables.payload_refs.push(AiPayloadRefEntryV1 {
-            payload_ref: 1,
-            storage_kind: AiStorageKindV1::SectionDecodedRelative as u8,
-            media_type_ref: 0,
-            section_id: 1,
-            uri_ref: 0,
-            payload_offset: 0,
-            section_payload_offset: 0,
-            payload_length: 1,
-            decoded_length: 1,
-            integrity_ref: 0,
-            flags: 0,
-            crc32c: 0,
-        });
-        tables.policies.push(AiPolicyRefEntryV1 {
-            policy_ref: 1,
-            policy_kind: AI_POLICY_KIND_VISIBILITY,
-            authority_ref: 0,
-            payload_ref: 0,
-            digest_ref: 0,
-            flags: 0,
-            crc32c: 0,
-        });
-        tables.privacy_summaries.push(AiPrivacySummaryEntryV1 {
-            privacy_summary_ref: 1,
-            source_binding_ref: 0,
-            sensitivity_mask: 1,
-            sensitivity_bits_ref: 1,
-            policy_ref: 1,
-            visibility_scope_ref: 1,
-            redaction_scope_ref: 0,
-            retention_state: 1,
-            disclosure_state: 1,
-            flags: 0,
-            crc32c: 0,
-        });
-
-        let bytes = write_coveai_descriptor_bundle(&CoveAiDescriptorBundleBuild {
-            artifact_id: [38u8; 16],
-            created_at_us: 925,
-            payload_sections: vec![coveai_payload_section(
-                1,
-                SectionKind::AiPayloadBytes,
-                PrimaryProfile::CoveAiShared,
-                vec![1],
-            )],
-            descriptor_tables: tables,
-        })
-        .unwrap();
-        let parsed = CoveAiFile::parse(&bytes).unwrap();
-        assert_eq!(parsed.descriptor_tables.privacy_summaries.len(), 1);
-        assert_eq!(
-            parsed.descriptor_tables.privacy_summaries[0].visibility_scope_ref,
-            1
-        );
-    }
-
-    #[test]
-    fn descriptor_bundle_rejects_privacy_summary_missing_visibility_policy() {
-        let mut tables = AiDescriptorTablesV1::default();
-        tables.privacy_summaries.push(AiPrivacySummaryEntryV1 {
-            privacy_summary_ref: 1,
-            source_binding_ref: 0,
-            sensitivity_mask: 0,
-            sensitivity_bits_ref: 0,
-            policy_ref: 0,
-            visibility_scope_ref: 99,
-            redaction_scope_ref: 0,
-            retention_state: 0,
-            disclosure_state: 0,
-            flags: 0,
-            crc32c: 0,
-        });
-
-        assert!(matches!(
-            write_coveai_descriptor_bundle(&CoveAiDescriptorBundleBuild {
-                artifact_id: [39u8; 16],
-                created_at_us: 926,
-                payload_sections: Vec::new(),
-                descriptor_tables: tables,
-            }),
-            Err(CoveError::BadSection(message))
-                if message.contains("missing visibility_scope_ref 99")
-        ));
-    }
-
-    #[test]
-    fn descriptor_bundle_rejects_payload_integrity_digest_length_mismatch() {
-        let mut payload = vec![0xAA; 4];
-        payload.extend_from_slice(&[0xBB; 32]);
-        let mut tables = AiDescriptorTablesV1::default();
-        tables.payload_refs.push(AiPayloadRefEntryV1 {
-            payload_ref: 1,
-            storage_kind: AiStorageKindV1::SectionDecodedRelative as u8,
-            media_type_ref: 0,
-            section_id: 1,
-            uri_ref: 0,
-            payload_offset: 0,
-            section_payload_offset: 0,
-            payload_length: 4,
-            decoded_length: 4,
-            integrity_ref: 0,
-            flags: 0,
-            crc32c: 0,
-        });
-        tables.payload_refs.push(AiPayloadRefEntryV1 {
-            payload_ref: 2,
-            storage_kind: AiStorageKindV1::SectionDecodedRelative as u8,
-            media_type_ref: 0,
-            section_id: 1,
-            uri_ref: 0,
-            payload_offset: 0,
-            section_payload_offset: 4,
-            payload_length: 32,
-            decoded_length: 32,
-            integrity_ref: 0,
-            flags: 0,
-            crc32c: 0,
-        });
-        tables.digests.push(AiDigestEntryV1 {
-            digest_ref: 1,
-            digest_algorithm: 1,
-            digest_len: 32,
-            digest_payload_ref: 2,
-            domain_hint: 6,
-            flags: 0,
-            crc32c: 0,
-        });
-        tables.payload_integrity.push(AiPayloadIntegrityV1 {
-            integrity_ref: 1,
-            payload_ref: 1,
-            digest_domain: 6,
-            reserved0: 0,
-            digest_algorithm: 1,
-            digest_len: 16,
-            digest_ref: 1,
-            payload_crc32c: 0,
-            flags: 0,
-        });
-
-        assert!(matches!(
-            write_coveai_descriptor_bundle(&CoveAiDescriptorBundleBuild {
-                artifact_id: [36u8; 16],
-                created_at_us: 923,
-                payload_sections: vec![coveai_payload_section(
-                    1,
-                    SectionKind::AiPayloadBytes,
-                    PrimaryProfile::CoveAiShared,
-                    payload,
-                )],
-                descriptor_tables: tables,
-            }),
-            Err(CoveError::BadSection(message))
-                if message.contains("digest algorithm/length mismatch")
-        ));
-    }
-
-    #[test]
-    fn descriptor_bundle_rejects_payload_integrity_digest_payload_cycle() {
-        let mut payload = vec![0xAA; 4];
-        payload.extend_from_slice(&[0xBB; 32]);
-        let mut tables = AiDescriptorTablesV1::default();
-        tables.payload_refs.push(AiPayloadRefEntryV1 {
-            payload_ref: 1,
-            storage_kind: AiStorageKindV1::SectionDecodedRelative as u8,
-            media_type_ref: 0,
-            section_id: 1,
-            uri_ref: 0,
-            payload_offset: 0,
-            section_payload_offset: 0,
-            payload_length: 4,
-            decoded_length: 4,
-            integrity_ref: 0,
-            flags: 0,
-            crc32c: 0,
-        });
-        tables.payload_refs.push(AiPayloadRefEntryV1 {
-            payload_ref: 2,
-            storage_kind: AiStorageKindV1::SectionDecodedRelative as u8,
-            media_type_ref: 0,
-            section_id: 1,
-            uri_ref: 0,
-            payload_offset: 0,
-            section_payload_offset: 4,
-            payload_length: 32,
-            decoded_length: 32,
-            integrity_ref: 1,
-            flags: 0,
-            crc32c: 0,
-        });
-        tables.digests.push(AiDigestEntryV1 {
-            digest_ref: 1,
-            digest_algorithm: 1,
-            digest_len: 32,
-            digest_payload_ref: 2,
-            domain_hint: 6,
-            flags: 0,
-            crc32c: 0,
-        });
-        tables.payload_integrity.push(AiPayloadIntegrityV1 {
-            integrity_ref: 1,
-            payload_ref: 1,
-            digest_domain: 6,
-            reserved0: 0,
-            digest_algorithm: 1,
-            digest_len: 32,
-            digest_ref: 1,
-            payload_crc32c: 0,
-            flags: 0,
-        });
-
-        assert!(matches!(
-            write_coveai_descriptor_bundle(&CoveAiDescriptorBundleBuild {
-                artifact_id: [37u8; 16],
-                created_at_us: 924,
-                payload_sections: vec![coveai_payload_section(
-                    1,
-                    SectionKind::AiPayloadBytes,
-                    PrimaryProfile::CoveAiShared,
-                    payload,
-                )],
-                descriptor_tables: tables,
-            }),
-            Err(CoveError::BadSection(message))
-                if message.contains("cyclic digest payload integrity")
-        ));
-    }
-
-    #[test]
-    fn descriptor_bundle_serializes_source_span_and_transform() {
-        let mut tables = AiDescriptorTablesV1::default();
-        tables.source_spans.push(AiSourceSpanEntryV1 {
-            source_span_ref: 1,
-            source_binding_ref: 0,
-            source_kind: AI_SOURCE_KIND_COVE_FILE,
-            source_row_ref: 7,
-            source_object_ref: 0,
-            byte_start: 11,
-            byte_length: 5,
-            token_start: 0,
-            token_count: 0,
-            evidence_ref: 0,
-            flags: 0,
-            crc32c: 0,
-        });
-        tables.transforms.push(AiTransformEntryV1 {
-            transform_ref: 1,
-            transform_kind: AI_TRANSFORM_KIND_TEXT_NORMALIZATION,
-            function_or_template_ref: 0,
-            input_digest_ref: 0,
-            output_digest_ref: 0,
-            parameter_payload_ref: 0,
-            transform_digest_ref: 0,
-            flags: 0,
-            crc32c: 0,
-        });
-
-        let bytes = write_coveai_descriptor_bundle(&CoveAiDescriptorBundleBuild {
-            artifact_id: [27u8; 16],
-            created_at_us: 914,
-            payload_sections: Vec::new(),
-            descriptor_tables: tables,
-        })
-        .unwrap();
-        let parsed = CoveAiFile::parse(&bytes).unwrap();
-        assert_eq!(parsed.descriptor_tables.source_spans.len(), 1);
-        assert_eq!(parsed.descriptor_tables.transforms.len(), 1);
-        assert_eq!(parsed.descriptor_tables.source_spans[0].byte_start, 11);
-    }
-
-    #[test]
-    fn descriptor_bundle_rejects_transform_missing_parameter_payload() {
-        let mut tables = AiDescriptorTablesV1::default();
-        tables.transforms.push(AiTransformEntryV1 {
-            transform_ref: 1,
-            transform_kind: AI_TRANSFORM_KIND_TEXT_NORMALIZATION,
-            function_or_template_ref: 0,
-            input_digest_ref: 0,
-            output_digest_ref: 0,
-            parameter_payload_ref: 99,
-            transform_digest_ref: 0,
-            flags: 0,
-            crc32c: 0,
-        });
-
-        assert!(matches!(
-            write_coveai_descriptor_bundle(&CoveAiDescriptorBundleBuild {
-                artifact_id: [28u8; 16],
-                created_at_us: 915,
-                payload_sections: Vec::new(),
-                descriptor_tables: tables,
-            }),
-            Err(CoveError::BadSection(message))
-                if message.contains("missing parameter_payload_ref")
-        ));
-    }
-
-    #[test]
-    fn descriptor_bundle_serializes_ai_section_feature_binding() {
-        let mut tables = AiDescriptorTablesV1::default();
-        tables
-            .section_feature_bindings
-            .push(AiSectionFeatureBindingV1 {
-                binding_ref: 1,
-                section_id: 1,
-                scope: FeatureScopeV2::OperationRequired as u8,
-                profile_kind: PrimaryProfile::CoveVec as u8,
-                operation_kind: OperationKindV2::AiEmbedding as u16,
-                required_ai_features: AI_FEATURE_VECTOR,
-                optional_ai_features: 0,
-                target_local_ref: 0,
-                flags: 0,
-                crc32c: 0,
-            });
-
-        let bytes = write_coveai_descriptor_bundle(&CoveAiDescriptorBundleBuild {
-            artifact_id: [29u8; 16],
-            created_at_us: 916,
-            payload_sections: vec![coveai_payload_section(
-                1,
-                SectionKind::AiPayloadBytes,
-                PrimaryProfile::CoveVec,
-                vec![0],
-            )],
-            descriptor_tables: tables,
-        })
-        .unwrap();
-        let parsed = CoveAiFile::parse(&bytes).unwrap();
-        assert_eq!(parsed.descriptor_tables.section_feature_bindings.len(), 1);
-        assert_eq!(
-            parsed.descriptor_tables.section_feature_bindings[0].operation_kind,
-            OperationKindV2::AiEmbedding as u16
-        );
-    }
-
-    #[test]
-    fn descriptor_bundle_rejects_ai_section_feature_binding_self_target() {
-        let mut tables = AiDescriptorTablesV1::default();
-        tables
-            .section_feature_bindings
-            .push(AiSectionFeatureBindingV1 {
-                binding_ref: 1,
-                section_id: 1_000,
-                scope: FeatureScopeV2::OperationRequired as u8,
-                profile_kind: PrimaryProfile::CoveVec as u8,
-                operation_kind: OperationKindV2::AiEmbedding as u16,
-                required_ai_features: AI_FEATURE_VECTOR,
-                optional_ai_features: 0,
-                target_local_ref: 0,
-                flags: 0,
-                crc32c: 0,
-            });
-
-        assert!(matches!(
-            write_coveai_descriptor_bundle(&CoveAiDescriptorBundleBuild {
-                artifact_id: [30u8; 16],
-                created_at_us: 917,
-                payload_sections: Vec::new(),
-                descriptor_tables: tables,
-            }),
-            Err(CoveError::BadSection(message))
-                if message.contains("must not target AI_SECTION_FEATURE_BINDING")
-        ));
-    }
-
-    #[test]
-    fn descriptor_bundle_serializes_vector_compatibility_and_composition() {
-        let (mut tables, payload_sections) = vector_descriptor_tables_with_payload();
-        tables
-            .vector_space_compatibilities
-            .push(VectorSpaceCompatibilityDescriptorV1 {
-                compatibility_id: 1,
-                left_vector_space_id: 1,
-                right_vector_space_id: 2,
-                compatibility_kind: 1,
-                compatibility_authority: 0,
-                metric: 1,
-                normalization_policy: 0,
-                transform_ref: 0,
-                numeric_transform_error_ppm: 0,
-                ranking_eval_ref: 0,
-                calibration_dataset_ref: 0,
-                evidence_ref: 0,
-                flags: 0,
-                checksum: 0,
-            });
-        tables
-            .vector_arithmetic_profiles
-            .push(VectorArithmeticProfileV1 {
-                arithmetic_profile_id: 1,
-                profile_name_ref: 0,
-                arithmetic_kind: 0,
-                input_quantization_kind: 0,
-                accumulator_kind: 0,
-                rounding_mode: 0,
-                overflow_policy: 0,
-                component_order: 0,
-                weight_scale: 1_000_000,
-                output_quantization_kind: 0,
-                output_element_type: 0,
-                normalization_policy: 0,
-                flags: 0,
-                checksum: 0,
-            });
-        tables
-            .vector_composition_components
-            .push(VectorCompositionComponentV1 {
-                component_id: 1,
-                slot_policy_ref: 0,
-                source_vector_space_id: 1,
-                weight_ppm: 1_000_000,
-                required: 1,
-                redaction_behavior: 0,
-                missing_behavior: 0,
-                reserved: 0,
-                flags: 0,
-                checksum: 0,
-            });
-        tables
-            .vector_composition_profiles
-            .push(VectorCompositionProfileV1 {
-                composition_profile_id: 1,
-                composition_name_ref: 0,
-                output_vector_space_id: 1,
-                arithmetic_profile_ref: 1,
-                method: 1,
-                missing_policy: 0,
-                normalize_inputs: 1,
-                normalize_output: 1,
-                result_authority: 0,
-                reproducibility_class: 0,
-                first_component_ref: 1,
-                component_count: 1,
-                template_ref: 0,
-                flags: 0,
-                checksum: 0,
-            });
-
-        let bytes = write_coveai_descriptor_bundle(&CoveAiDescriptorBundleBuild {
-            artifact_id: [31u8; 16],
-            created_at_us: 918,
-            payload_sections,
-            descriptor_tables: tables,
-        })
-        .unwrap();
-        let parsed = CoveAiFile::parse(&bytes).unwrap();
-        assert_eq!(
-            parsed.descriptor_tables.vector_space_compatibilities.len(),
-            1
-        );
-        assert_eq!(parsed.descriptor_tables.vector_arithmetic_profiles.len(), 1);
-        assert_eq!(
-            parsed.descriptor_tables.vector_composition_components.len(),
-            1
-        );
-        assert_eq!(
-            parsed.descriptor_tables.vector_composition_profiles.len(),
-            1
-        );
-    }
-
-    #[test]
-    fn descriptor_bundle_rejects_vector_compatibility_bad_kind() {
-        let (mut tables, payload_sections) = vector_descriptor_tables_with_payload();
-        let mut compatibility = test_vector_space_compatibility();
-        compatibility.compatibility_kind = 42;
-        tables.vector_space_compatibilities.push(compatibility);
-
-        assert!(matches!(
-            write_coveai_descriptor_bundle(&CoveAiDescriptorBundleBuild {
-                artifact_id: [46u8; 16],
-                created_at_us: 933,
-                payload_sections,
-                descriptor_tables: tables,
-            }),
-            Err(CoveError::BadSection(message))
-                if message.contains("VectorSpaceCompatibility compatibility_kind")
-        ));
-    }
-
-    #[test]
-    fn descriptor_bundle_rejects_vector_compatibility_bad_authority() {
-        let (mut tables, payload_sections) = vector_descriptor_tables_with_payload();
-        let mut compatibility = test_vector_space_compatibility();
-        compatibility.compatibility_authority = 42;
-        tables.vector_space_compatibilities.push(compatibility);
-
-        assert!(matches!(
-            write_coveai_descriptor_bundle(&CoveAiDescriptorBundleBuild {
-                artifact_id: [47u8; 16],
-                created_at_us: 934,
-                payload_sections,
-                descriptor_tables: tables,
-            }),
-            Err(CoveError::BadSection(message))
-                if message.contains("VectorSpaceCompatibility compatibility_authority")
-        ));
-    }
-
-    #[test]
-    fn descriptor_bundle_rejects_vector_compatibility_excessive_numeric_error() {
-        let (mut tables, payload_sections) = vector_descriptor_tables_with_payload();
-        let mut compatibility = test_vector_space_compatibility();
-        compatibility.numeric_transform_error_ppm = 1_000_001;
-        tables.vector_space_compatibilities.push(compatibility);
-
-        assert!(matches!(
-            write_coveai_descriptor_bundle(&CoveAiDescriptorBundleBuild {
-                artifact_id: [48u8; 16],
-                created_at_us: 935,
-                payload_sections,
-                descriptor_tables: tables,
-            }),
-            Err(CoveError::BadSection(message))
-                if message.contains("numeric_transform_error_ppm exceeds 1_000_000")
-        ));
-    }
-
-    #[test]
-    fn descriptor_bundle_rejects_vector_compatibility_missing_evidence_ref() {
-        let (mut tables, payload_sections) = vector_descriptor_tables_with_payload();
-        let mut compatibility = test_vector_space_compatibility();
-        compatibility.evidence_ref = 99;
-        tables.vector_space_compatibilities.push(compatibility);
-
-        assert!(matches!(
-            write_coveai_descriptor_bundle(&CoveAiDescriptorBundleBuild {
-                artifact_id: [49u8; 16],
-                created_at_us: 936,
-                payload_sections,
-                descriptor_tables: tables,
-            }),
-            Err(CoveError::BadSection(message)) if message.contains("missing evidence_ref 99")
-        ));
-    }
-
-    #[test]
-    fn descriptor_bundle_rejects_vector_composition_bad_method() {
-        let (mut tables, payload_sections) = vector_composition_tables();
-        tables.vector_composition_profiles[0].method = 42;
-
-        assert!(matches!(
-            write_coveai_descriptor_bundle(&CoveAiDescriptorBundleBuild {
-                artifact_id: [41u8; 16],
-                created_at_us: 928,
-                payload_sections,
-                descriptor_tables: tables,
-            }),
-            Err(CoveError::BadSection(message))
-                if message.contains("VectorCompositionProfile method")
-        ));
-    }
-
-    #[test]
-    fn descriptor_bundle_rejects_vector_composition_missing_template_ref() {
-        let (mut tables, payload_sections) = vector_composition_tables();
-        tables.vector_composition_profiles[0].template_ref = 99;
-
-        assert!(matches!(
-            write_coveai_descriptor_bundle(&CoveAiDescriptorBundleBuild {
-                artifact_id: [42u8; 16],
-                created_at_us: 929,
-                payload_sections,
-                descriptor_tables: tables,
-            }),
-            Err(CoveError::BadSection(message)) if message.contains("missing template_ref 99")
-        ));
-    }
-
-    #[test]
-    fn descriptor_bundle_rejects_canonical_composition_without_arithmetic_profile() {
-        let (mut tables, payload_sections) = vector_composition_tables();
-        tables.vector_composition_profiles[0].result_authority = 2;
-        tables.vector_composition_profiles[0].arithmetic_profile_ref = 0;
-
-        assert!(matches!(
-            write_coveai_descriptor_bundle(&CoveAiDescriptorBundleBuild {
-                artifact_id: [43u8; 16],
-                created_at_us: 930,
-                payload_sections,
-                descriptor_tables: tables,
-            }),
-            Err(CoveError::BadSection(message))
-                if message.contains("CanonicalFixedPointRecompute requires arithmetic_profile_ref")
-        ));
-    }
-
-    #[test]
-    fn descriptor_bundle_rejects_vector_component_bad_redaction_behavior() {
-        let (mut tables, payload_sections) = vector_composition_tables();
-        tables.vector_composition_components[0].redaction_behavior = 42;
-
-        assert!(matches!(
-            write_coveai_descriptor_bundle(&CoveAiDescriptorBundleBuild {
-                artifact_id: [44u8; 16],
-                created_at_us: 931,
-                payload_sections,
-                descriptor_tables: tables,
-            }),
-            Err(CoveError::BadSection(message))
-                if message.contains("VectorCompositionComponent redaction_behavior")
-        ));
-    }
-
-    #[test]
-    fn descriptor_bundle_rejects_vector_arithmetic_bad_rounding_mode() {
-        let (mut tables, payload_sections) = vector_composition_tables();
-        tables.vector_arithmetic_profiles[0].rounding_mode = 42;
-
-        assert!(matches!(
-            write_coveai_descriptor_bundle(&CoveAiDescriptorBundleBuild {
-                artifact_id: [45u8; 16],
-                created_at_us: 932,
-                payload_sections,
-                descriptor_tables: tables,
-            }),
-            Err(CoveError::BadSection(message))
-                if message.contains("VectorArithmeticProfile rounding_mode")
-        ));
-    }
-
-    #[test]
-    fn descriptor_bundle_serializes_chunk_object_and_training_vector_bindings() {
-        let (mut tables, payload_sections) = vector_descriptor_tables_with_payload();
-        tables.chunk_profiles.push(ChunkProfileV1 {
-            chunk_profile_id: 1,
-            profile_name_ref: 0,
-            chunker_namespace_ref: 0,
-            chunker_name_ref: 0,
-            chunker_version_major: 1,
-            chunker_version_minor: 0,
-            tokenizer_profile_ref: 0,
-            boundary_kind: 1,
-            overlap_policy: 0,
-            parent_policy: 0,
-            normalization_policy: 0,
-            target_tokens: 0,
-            min_tokens: 0,
-            max_tokens: 0,
-            overlap_tokens: 0,
-            max_bytes: 4096,
-            locale_ref: 0,
-            flags: 0,
-            checksum: 0,
-        });
-        let mut chunk = test_text_chunk(1, 0, 0, 0, 12, 12, 1);
-        chunk.source_ref = 0;
-        tables.text_chunks.push(chunk);
-        tables.training_profiles.push(test_training_profile());
-        tables
-            .training_samples
-            .push(test_training_sample(1, 1, 0, 0));
-        tables
-            .vector_composition_components
-            .push(VectorCompositionComponentV1 {
-                component_id: 1,
-                slot_policy_ref: 0,
-                source_vector_space_id: 1,
-                weight_ppm: 1_000_000,
-                required: 1,
-                redaction_behavior: 0,
-                missing_behavior: 0,
-                reserved: 0,
-                flags: 0,
-                checksum: 0,
-            });
-        tables
-            .vector_composition_profiles
-            .push(VectorCompositionProfileV1 {
-                composition_profile_id: 1,
-                composition_name_ref: 0,
-                output_vector_space_id: 1,
-                arithmetic_profile_ref: 0,
-                method: 1,
-                missing_policy: 0,
-                normalize_inputs: 1,
-                normalize_output: 1,
-                result_authority: 0,
-                reproducibility_class: 0,
-                first_component_ref: 1,
-                component_count: 1,
-                template_ref: 0,
-                flags: 0,
-                checksum: 0,
-            });
-        tables.chunk_vector_bindings.push(ChunkVectorBindingV1 {
-            binding_id: 10,
-            vector_space_id: 1,
-            chunk_id: 1,
-            chunk_profile_id: 1,
-            source_value_hash_ref: 0,
-            chunk_text_hash_ref: 0,
-            vector_ref: 1,
-            flags: 0,
-            checksum: 0,
-        });
-        tables
-            .object_state_vector_bindings
-            .push(ObjectStateVectorBindingV1 {
-                binding_id: 20,
-                vector_space_id: 1,
-                composition_profile_ref: 1,
-                file_ref: 0,
-                object_type_id: 7,
-                goid_ref: 0,
-                branch_ref: 0,
-                temporal_kind: 0,
-                csn: 123,
-                timestamp_us: 456,
-                property_dependency_fingerprint_ref: 0,
-                vector_ref: 2,
-                flags: 0,
-                checksum: 0,
-            });
-        tables
-            .training_sample_vector_bindings
-            .push(TrainingSampleVectorBindingV1 {
-                binding_id: 30,
-                vector_space_id: 1,
-                training_profile_ref: 1,
-                sample_id: 1,
-                source_snapshot_ref: 0,
-                sample_fingerprint_ref: 0,
-                vector_ref: 3,
-                flags: 0,
-                checksum: 0,
-            });
-
-        let bytes = write_coveai_descriptor_bundle(&CoveAiDescriptorBundleBuild {
-            artifact_id: [32u8; 16],
-            created_at_us: 919,
-            payload_sections,
-            descriptor_tables: tables,
-        })
-        .unwrap();
-        let parsed = CoveAiFile::parse(&bytes).unwrap();
-        assert_eq!(parsed.descriptor_tables.chunk_vector_bindings.len(), 1);
-        assert_eq!(
-            parsed.descriptor_tables.object_state_vector_bindings.len(),
-            1
-        );
-        assert_eq!(
-            parsed
-                .descriptor_tables
-                .training_sample_vector_bindings
-                .len(),
-            1
-        );
-    }
-
-    #[test]
-    fn descriptor_bundle_rejects_chunk_vector_binding_missing_vector_ref() {
-        let (mut tables, payload_sections) = vector_descriptor_tables_with_payload();
-        tables.chunk_profiles.push(ChunkProfileV1 {
-            chunk_profile_id: 1,
-            profile_name_ref: 0,
-            chunker_namespace_ref: 0,
-            chunker_name_ref: 0,
-            chunker_version_major: 1,
-            chunker_version_minor: 0,
-            tokenizer_profile_ref: 0,
-            boundary_kind: 1,
-            overlap_policy: 0,
-            parent_policy: 0,
-            normalization_policy: 0,
-            target_tokens: 0,
-            min_tokens: 0,
-            max_tokens: 0,
-            overlap_tokens: 0,
-            max_bytes: 4096,
-            locale_ref: 0,
-            flags: 0,
-            checksum: 0,
-        });
-        let mut chunk = test_text_chunk(1, 0, 0, 0, 12, 12, 1);
-        chunk.source_ref = 0;
-        tables.text_chunks.push(chunk);
-        tables.chunk_vector_bindings.push(ChunkVectorBindingV1 {
-            binding_id: 10,
-            vector_space_id: 1,
-            chunk_id: 1,
-            chunk_profile_id: 1,
-            source_value_hash_ref: 0,
-            chunk_text_hash_ref: 0,
-            vector_ref: 99,
-            flags: 0,
-            checksum: 0,
-        });
-
-        assert!(matches!(
-            write_coveai_descriptor_bundle(&CoveAiDescriptorBundleBuild {
-                artifact_id: [33u8; 16],
-                created_at_us: 920,
-                payload_sections,
-                descriptor_tables: tables,
-            }),
-            Err(CoveError::BadSection(message)) if message.contains("missing vector_ref 99")
-        ));
-    }
-
-    #[test]
-    fn descriptor_bundle_rejects_vector_payload_block_dimension_mismatch() {
-        let (mut tables, payload_sections) = vector_descriptor_tables_with_payload();
-        tables.vector_payload_blocks[0].dimension_count = 4;
-
-        assert!(matches!(
-            write_coveai_descriptor_bundle(&CoveAiDescriptorBundleBuild {
-                artifact_id: [34u8; 16],
-                created_at_us: 921,
-                payload_sections,
-                descriptor_tables: tables,
-            }),
-            Err(CoveError::BadSection(message))
-                if message.contains("dimension_count does not match vector_space_id")
-        ));
-    }
-
-    #[test]
-    fn descriptor_bundle_rejects_vector_payload_block_missing_stride_ref() {
-        let (mut tables, payload_sections) = vector_descriptor_tables_with_payload();
-        tables.vector_payload_blocks[0].payload_stride_ref = 99;
-
-        assert!(matches!(
-            write_coveai_descriptor_bundle(&CoveAiDescriptorBundleBuild {
-                artifact_id: [35u8; 16],
-                created_at_us: 922,
-                payload_sections,
-                descriptor_tables: tables,
-            }),
-            Err(CoveError::BadSection(message))
-                if message.contains("missing payload_stride_ref 99")
-        ));
-    }
-
-    #[test]
-    fn descriptor_bundle_rejects_vector_entry_dense_length_mismatch() {
-        let (mut tables, payload_sections) = vector_descriptor_tables_with_payload();
-        tables.vector_entries[0].payload_length = 8;
-
-        assert!(matches!(
-            write_coveai_descriptor_bundle(&CoveAiDescriptorBundleBuild {
-                artifact_id: [41u8; 16],
-                created_at_us: 928,
-                payload_sections,
-                descriptor_tables: tables,
-            }),
-            Err(CoveError::BadSection(message))
-                if message.contains("payload_length does not match dense vector width")
-        ));
-    }
-
-    #[test]
-    fn descriptor_bundle_rejects_vector_entry_derived_range_out_of_block() {
-        let (mut tables, payload_sections) = vector_descriptor_tables_with_payload();
-        tables.vector_payload_blocks[0].vector_count = 4;
-        tables.vector_entries.push(VectorEntryV1 {
-            vector_ref: 4,
-            block_id: 1,
-            vector_ordinal: 3,
-            payload_offset: 0,
-            payload_length: 0,
-            integrity_ref: 0,
-            flags: 0,
-            checksum: 0,
-        });
-
-        assert!(matches!(
-            write_coveai_descriptor_bundle(&CoveAiDescriptorBundleBuild {
-                artifact_id: [42u8; 16],
-                created_at_us: 929,
-                payload_sections,
-                descriptor_tables: tables,
-            }),
-            Err(CoveError::BadSection(message))
-                if message.contains("derived payload range exceeds")
-        ));
-    }
-
-    #[test]
-    fn writes_and_parses_filecode_vector_sidecar() {
-        let mut vector_payload = Vec::new();
-        for value in [1.0f32, 0.0, 0.5, 0.25, 0.75, 1.0] {
-            vector_payload.extend_from_slice(&value.to_le_bytes());
-        }
-        let bytes = write_covev_filecode_vectors(&CoveVecFileCodeVectorBuild {
-            artifact_id: [3u8; 16],
-            created_at_us: 456,
-            dimension_count: 3,
-            file_codes: vec![10, 20],
-            vector_payload,
-        })
-        .unwrap();
-
-        let parsed = CoveAiFile::parse(&bytes).unwrap();
-        assert_eq!(parsed.artifact_kind, CoveAiArtifactKind::CoveVec);
-        assert_eq!(
-            parsed.payload_access,
-            AiPayloadAccessState::StructurallyAllowed
-        );
-        assert_eq!(parsed.descriptor_tables.payload_refs.len(), 2);
-        assert_eq!(parsed.descriptor_tables.payload_integrity.len(), 1);
-        assert_eq!(parsed.descriptor_tables.privacy_summaries.len(), 1);
-        assert_eq!(parsed.descriptor_tables.vector_spaces.len(), 1);
-        assert_eq!(parsed.descriptor_tables.vector_payload_blocks.len(), 1);
-        assert_eq!(parsed.descriptor_tables.vector_entries.len(), 2);
-        assert_eq!(parsed.descriptor_tables.filecode_vector_bindings.len(), 2);
-        assert_eq!(
-            parsed.descriptor_tables.filecode_vector_bindings[1].file_code,
-            20
-        );
-    }
-
-    #[test]
-    fn exact_flat_filecode_vector_search_returns_nearest_filecodes() {
-        let bytes = write_covev_filecode_vectors(&CoveVecFileCodeVectorBuild {
-            artifact_id: [18u8; 16],
-            created_at_us: 905,
-            dimension_count: 3,
-            file_codes: vec![10, 20, 30],
-            vector_payload: f32_payload(&[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, -1.0, 0.0, 0.0]),
-        })
-        .unwrap();
-
-        let results = exact_flat_filecode_vector_search(&bytes, &[0.9, 0.1, 0.0], 2).unwrap();
-        assert_eq!(results.len(), 2);
-        assert_eq!(results[0].file_code, 10);
-        assert_eq!(results[0].vector_ref, 1);
-        assert_eq!(results[1].file_code, 20);
-        assert!(results[0].score > results[1].score);
-    }
-
-    #[test]
-    fn exact_flat_filecode_vector_search_by_file_code_uses_stored_query_vector() {
-        let bytes = write_covev_filecode_vectors(&CoveVecFileCodeVectorBuild {
-            artifact_id: [21u8; 16],
-            created_at_us: 908,
-            dimension_count: 3,
-            file_codes: vec![10, 20, 30],
-            vector_payload: f32_payload(&[1.0, 0.0, 0.0, 0.8, 0.2, 0.0, -1.0, 0.0, 0.0]),
-        })
-        .unwrap();
-
-        let results = exact_flat_filecode_vector_search_by_file_code(&bytes, 10, 3).unwrap();
-        assert_eq!(results.len(), 3);
-        assert_eq!(results[0].file_code, 10);
-        assert_eq!(results[1].file_code, 20);
-        assert_eq!(results[2].file_code, 30);
-        assert!(matches!(
-            exact_flat_filecode_vector_search_by_file_code(&bytes, 99, 1),
-            Err(CoveError::BadSection(message)) if message.contains("query FileCode 99")
-        ));
-    }
-
-    #[test]
-    fn filecode_embedding_returns_validated_stored_vector() {
-        let bytes = write_covev_filecode_vectors(&CoveVecFileCodeVectorBuild {
-            artifact_id: [22u8; 16],
-            created_at_us: 909,
-            dimension_count: 3,
-            file_codes: vec![10, 20],
-            vector_payload: f32_payload(&[1.0, 0.0, 0.0, 0.25, 0.5, 0.75]),
-        })
-        .unwrap();
-
-        let embedding = filecode_embedding(&bytes, 20).unwrap();
-        assert_eq!(embedding.file_code, 20);
-        assert_eq!(embedding.vector_ref, 2);
-        assert_eq!(embedding.vector_space_id, 1);
-        assert_eq!(embedding.dimension_count, 3);
-        assert_eq!(embedding.values, vec![0.25, 0.5, 0.75]);
-    }
-
-    #[test]
-    fn rejects_exact_flat_filecode_vector_search_dimension_mismatch() {
-        let bytes = write_covev_filecode_vectors(&CoveVecFileCodeVectorBuild {
-            artifact_id: [19u8; 16],
-            created_at_us: 906,
-            dimension_count: 3,
-            file_codes: vec![10],
-            vector_payload: f32_payload(&[1.0, 0.0, 0.0]),
-        })
-        .unwrap();
-
-        assert!(matches!(
-            exact_flat_filecode_vector_search(&bytes, &[1.0, 0.0], 1),
-            Err(CoveError::BadSection(message))
-                if message.contains("no COVE-VEC vector space matches query dimension")
-        ));
-    }
-
-    #[test]
-    fn rejects_exact_flat_filecode_vector_search_when_payload_policy_blocked() {
-        let sections = [coveai_payload_section(
-            1,
-            SectionKind::AiPayloadBytes,
-            PrimaryProfile::CoveVec,
-            f32_payload(&[1.0]),
-        )];
-        let bytes =
-            write_coveai_artifact(CoveAiArtifactKind::CoveVec, [20u8; 16], 907, &sections).unwrap();
-
-        assert!(matches!(
-            exact_flat_filecode_vector_search(&bytes, &[1.0], 1),
-            Err(CoveError::BadSection(message)) if message.contains("policy-blocked")
-        ));
-    }
-
-    #[test]
-    fn parses_exact_flat_vector_index_descriptor() {
-        let sections = vector_index_sections(test_vector_index(0, 0));
-        let bytes =
-            write_coveai_artifact(CoveAiArtifactKind::CoveVec, [16u8; 16], 904, &sections).unwrap();
-        let parsed = CoveAiFile::parse(&bytes).unwrap();
-        assert_eq!(parsed.descriptor_tables.vector_spaces.len(), 1);
-        assert_eq!(parsed.descriptor_tables.vector_indexes.len(), 1);
-    }
-
-    #[test]
-    fn rejects_ann_vector_index_claiming_exactness() {
-        let sections = vector_index_sections(test_vector_index(1, 0));
-        let bytes =
-            write_coveai_artifact(CoveAiArtifactKind::CoveVec, [17u8; 16], 904, &sections).unwrap();
-        assert!(matches!(
-            CoveAiFile::parse(&bytes),
-            Err(CoveError::BadSection(message)) if message.contains("must not claim exactness")
-        ));
-    }
-
-    #[test]
-    fn rejects_vector_index_unsupported_index_kind() {
-        let sections = vector_index_sections(test_vector_index(42, 1));
-        let bytes =
-            write_coveai_artifact(CoveAiArtifactKind::CoveVec, [17u8; 16], 904, &sections).unwrap();
-        assert!(matches!(
-            CoveAiFile::parse(&bytes),
-            Err(CoveError::BadSection(message)) if message.contains("VectorIndex index_kind")
-        ));
-    }
-
-    #[test]
-    fn rejects_vector_index_exact_false_negative_policy() {
-        let mut index = test_vector_index(0, 0);
-        index.false_negative_policy = 1;
-        let sections = vector_index_sections(index);
-        let bytes =
-            write_coveai_artifact(CoveAiArtifactKind::CoveVec, [17u8; 16], 904, &sections).unwrap();
-        assert!(matches!(
-            CoveAiFile::parse(&bytes),
-            Err(CoveError::BadSection(message))
-                if message.contains("exact index must not declare false negatives")
-        ));
-    }
-
-    #[test]
-    fn rejects_vector_index_unsupported_score_space_authority() {
-        let mut index = test_vector_index(0, 0);
-        index.score_space_authority = 42;
-        let sections = vector_index_sections(index);
-        let bytes =
-            write_coveai_artifact(CoveAiArtifactKind::CoveVec, [17u8; 16], 904, &sections).unwrap();
-        assert!(matches!(
-            CoveAiFile::parse(&bytes),
-            Err(CoveError::BadSection(message))
-                if message.contains("VectorIndex score_space_authority")
-        ));
-    }
-
-    #[test]
-    fn rejects_vector_index_missing_visibility_scope_ref() {
-        let mut index = test_vector_index(0, 0);
-        index.visibility_scope_ref = 99;
-        let sections = vector_index_sections(index);
-        let bytes =
-            write_coveai_artifact(CoveAiArtifactKind::CoveVec, [17u8; 16], 904, &sections).unwrap();
-        assert!(matches!(
-            CoveAiFile::parse(&bytes),
-            Err(CoveError::BadSection(message))
-                if message.contains("missing visibility_scope_ref 99")
-        ));
-    }
-
-    #[test]
-    fn rejects_vector_index_missing_dequantization_profile_ref() {
-        let mut index = test_vector_index(0, 0);
-        index.dequantization_profile_ref = 99;
-        let sections = vector_index_sections(index);
-        let bytes =
-            write_coveai_artifact(CoveAiArtifactKind::CoveVec, [17u8; 16], 904, &sections).unwrap();
-        assert!(matches!(
-            CoveAiFile::parse(&bytes),
-            Err(CoveError::BadSection(message))
-                if message.contains("missing dequantization_profile_ref 99")
-        ));
-    }
-
-    #[test]
-    fn parses_chunk_profile_and_text_chunks() {
-        let sections = chunk_sections(vec![
-            test_text_chunk(1, 0, 2, 0, 5, 5, 1),
-            test_text_chunk(2, 1, 0, 5, 7, 7, 2),
-        ]);
-        let bytes =
-            write_coveai_artifact(CoveAiArtifactKind::CoveAiBundle, [4u8; 16], 789, &sections)
-                .unwrap();
-        let parsed = CoveAiFile::parse(&bytes).unwrap();
-        assert_eq!(parsed.descriptor_tables.chunk_profiles.len(), 1);
-        assert_eq!(parsed.descriptor_tables.text_chunks.len(), 2);
-        assert_eq!(parsed.descriptor_tables.text_chunks[1].previous_chunk_id, 1);
-    }
-
-    #[test]
-    fn rejects_chunk_profile_missing_profile_name_ref() {
-        let mut profile = test_chunk_profile();
-        profile.profile_name_ref = 99;
-        let sections =
-            chunk_sections_with_profile(profile, vec![test_text_chunk(1, 0, 0, 0, 5, 5, 1)]);
-        let bytes =
-            write_coveai_artifact(CoveAiArtifactKind::CoveAiBundle, [4u8; 16], 789, &sections)
-                .unwrap();
-        assert!(matches!(
-            CoveAiFile::parse(&bytes),
-            Err(CoveError::BadSection(message)) if message.contains("missing profile_name_ref 99")
-        ));
-    }
-
-    #[test]
-    fn rejects_chunk_profile_missing_tokenizer_profile_ref() {
-        let mut profile = test_chunk_profile();
-        profile.tokenizer_profile_ref = 99;
-        let sections =
-            chunk_sections_with_profile(profile, vec![test_text_chunk(1, 0, 0, 0, 5, 5, 1)]);
-        let bytes =
-            write_coveai_artifact(CoveAiArtifactKind::CoveAiBundle, [4u8; 16], 789, &sections)
-                .unwrap();
-        assert!(matches!(
-            CoveAiFile::parse(&bytes),
-            Err(CoveError::BadSection(message))
-                if message.contains("missing tokenizer_profile_ref 99")
-        ));
-    }
-
-    #[test]
-    fn rejects_chunk_profile_unsupported_boundary_kind() {
-        let mut profile = test_chunk_profile();
-        profile.boundary_kind = 42;
-        let sections =
-            chunk_sections_with_profile(profile, vec![test_text_chunk(1, 0, 0, 0, 5, 5, 1)]);
-        let bytes =
-            write_coveai_artifact(CoveAiArtifactKind::CoveAiBundle, [4u8; 16], 789, &sections)
-                .unwrap();
-        assert!(matches!(
-            CoveAiFile::parse(&bytes),
-            Err(CoveError::BadSection(message))
-                if message.contains("ChunkProfile boundary_kind")
-        ));
-    }
-
-    #[test]
-    fn rejects_chunk_profile_unsupported_normalization_policy() {
-        let mut profile = test_chunk_profile();
-        profile.normalization_policy = 42;
-        let sections =
-            chunk_sections_with_profile(profile, vec![test_text_chunk(1, 0, 0, 0, 5, 5, 1)]);
-        let bytes =
-            write_coveai_artifact(CoveAiArtifactKind::CoveAiBundle, [4u8; 16], 789, &sections)
-                .unwrap();
-        assert!(matches!(
-            CoveAiFile::parse(&bytes),
-            Err(CoveError::BadSection(message))
-                if message.contains("ChunkProfile normalization_policy")
-        ));
-    }
-
-    #[test]
-    fn rejects_chunk_profile_target_tokens_outside_bounds() {
-        let mut profile = test_chunk_profile();
-        profile.target_tokens = 16;
-        profile.max_tokens = 8;
-        let sections =
-            chunk_sections_with_profile(profile, vec![test_text_chunk(1, 0, 0, 0, 5, 5, 1)]);
-        let bytes =
-            write_coveai_artifact(CoveAiArtifactKind::CoveAiBundle, [4u8; 16], 789, &sections)
-                .unwrap();
-        assert!(matches!(
-            CoveAiFile::parse(&bytes),
-            Err(CoveError::BadSection(message)) if message.contains("target_tokens exceeds max_tokens")
-        ));
-    }
-
-    #[test]
-    fn rejects_text_chunk_missing_source_value_hash() {
-        let sections = chunk_sections(vec![test_text_chunk(1, 0, 0, 0, 5, 5, 0)]);
-        let bytes =
-            write_coveai_artifact(CoveAiArtifactKind::CoveAiBundle, [5u8; 16], 789, &sections)
-                .unwrap();
-        assert!(matches!(
-            CoveAiFile::parse(&bytes),
-            Err(CoveError::BadSection(message))
-                if message.contains("requires source_value_hash_ref")
-        ));
-    }
-
-    #[test]
-    fn rejects_text_chunk_missing_source_ref() {
-        let mut chunk = test_text_chunk(1, 0, 0, 0, 5, 5, 1);
-        chunk.source_ref = 99;
-        let sections = chunk_sections(vec![chunk]);
-        let bytes =
-            write_coveai_artifact(CoveAiArtifactKind::CoveAiBundle, [5u8; 16], 789, &sections)
-                .unwrap();
-        assert!(matches!(
-            CoveAiFile::parse(&bytes),
-            Err(CoveError::BadSection(message)) if message.contains("missing source_ref 99")
-        ));
-    }
-
-    #[test]
-    fn rejects_text_chunk_missing_source_value_hash_ref() {
-        let sections = chunk_sections(vec![test_text_chunk(1, 0, 0, 0, 5, 5, 99)]);
-        let bytes =
-            write_coveai_artifact(CoveAiArtifactKind::CoveAiBundle, [5u8; 16], 789, &sections)
-                .unwrap();
-        assert!(matches!(
-            CoveAiFile::parse(&bytes),
-            Err(CoveError::BadSection(message))
-                if message.contains("missing source_value_hash_ref 99")
-        ));
-    }
-
-    #[test]
-    fn rejects_text_chunk_missing_chunk_text_hash_ref() {
-        let mut chunk = test_text_chunk(1, 0, 0, 0, 5, 5, 1);
-        chunk.chunk_text_hash_ref = 99;
-        let sections = chunk_sections(vec![chunk]);
-        let bytes =
-            write_coveai_artifact(CoveAiArtifactKind::CoveAiBundle, [5u8; 16], 789, &sections)
-                .unwrap();
-        assert!(matches!(
-            CoveAiFile::parse(&bytes),
-            Err(CoveError::BadSection(message))
-                if message.contains("missing chunk_text_hash_ref 99")
-        ));
-    }
-
-    #[test]
-    fn rejects_text_chunk_missing_evidence_ref() {
-        let mut chunk = test_text_chunk(1, 0, 0, 0, 5, 5, 1);
-        chunk.evidence_ref = 99;
-        let sections = chunk_sections(vec![chunk]);
-        let bytes =
-            write_coveai_artifact(CoveAiArtifactKind::CoveAiBundle, [5u8; 16], 789, &sections)
-                .unwrap();
-        assert!(matches!(
-            CoveAiFile::parse(&bytes),
-            Err(CoveError::BadSection(message)) if message.contains("missing evidence_ref 99")
-        ));
-    }
-
-    #[test]
-    fn rejects_text_chunk_missing_policy_ref() {
-        let mut chunk = test_text_chunk(1, 0, 0, 0, 5, 5, 1);
-        chunk.policy_ref = 99;
-        let sections = chunk_sections(vec![chunk]);
-        let bytes =
-            write_coveai_artifact(CoveAiArtifactKind::CoveAiBundle, [5u8; 16], 789, &sections)
-                .unwrap();
-        assert!(matches!(
-            CoveAiFile::parse(&bytes),
-            Err(CoveError::BadSection(message)) if message.contains("missing policy_ref 99")
-        ));
-    }
-
-    #[test]
-    fn rejects_text_chunk_broken_neighbor_ref() {
-        let sections = chunk_sections(vec![
-            test_text_chunk(1, 0, 3, 0, 5, 5, 1),
-            test_text_chunk(2, 0, 0, 5, 7, 7, 2),
-        ]);
-        let bytes =
-            write_coveai_artifact(CoveAiArtifactKind::CoveAiBundle, [6u8; 16], 789, &sections)
-                .unwrap();
-        assert!(matches!(
-            CoveAiFile::parse(&bytes),
-            Err(CoveError::BadSection(message)) if message.contains("missing next_chunk_id")
-        ));
-    }
-
-    #[test]
-    fn parses_tokenizer_span_and_sequence_pack() {
-        let sections = token_sections(
-            test_tokenized_span(1, 0, 1, 2, 1, 0),
-            test_token_sequence_pack(1, 0, 4, 0),
-        );
-        let bytes =
-            write_coveai_artifact(CoveAiArtifactKind::CoveAiBundle, [7u8; 16], 890, &sections)
-                .unwrap();
-        let parsed = CoveAiFile::parse(&bytes).unwrap();
-        assert_eq!(
-            parsed.payload_access,
-            AiPayloadAccessState::StructurallyAllowed
-        );
-        assert_eq!(parsed.descriptor_tables.tokenizer_profiles.len(), 1);
-        assert_eq!(parsed.descriptor_tables.token_blocks.len(), 1);
-        assert_eq!(parsed.descriptor_tables.tokenized_spans.len(), 1);
-        assert_eq!(parsed.descriptor_tables.token_sequence_packs.len(), 1);
-    }
-
-    #[test]
-    fn rejects_tokenizer_profile_missing_namespace_ref() {
-        let mut profile = test_tokenizer_profile();
-        profile.tokenizer_namespace_ref = 99;
-        let sections = token_sections_with_profile(
-            profile,
-            test_tokenized_span(1, 0, 1, 2, 1, 0),
-            test_token_sequence_pack(1, 0, 4, 0),
-        );
-        let bytes =
-            write_coveai_artifact(CoveAiArtifactKind::CoveAiBundle, [7u8; 16], 890, &sections)
-                .unwrap();
-        assert!(matches!(
-            CoveAiFile::parse(&bytes),
-            Err(CoveError::BadSection(message))
-                if message.contains("missing tokenizer_namespace_ref 99")
-        ));
-    }
-
-    #[test]
-    fn rejects_tokenizer_profile_missing_vocab_digest_ref() {
-        let mut profile = test_tokenizer_profile();
-        profile.vocab_digest_ref = 99;
-        let sections = token_sections_with_profile(
-            profile,
-            test_tokenized_span(1, 0, 1, 2, 1, 0),
-            test_token_sequence_pack(1, 0, 4, 0),
-        );
-        let bytes =
-            write_coveai_artifact(CoveAiArtifactKind::CoveAiBundle, [7u8; 16], 890, &sections)
-                .unwrap();
-        assert!(matches!(
-            CoveAiFile::parse(&bytes),
-            Err(CoveError::BadSection(message)) if message.contains("missing vocab_digest_ref 99")
-        ));
-    }
-
-    #[test]
-    fn rejects_tokenizer_profile_missing_chat_template_ref() {
-        let mut profile = test_tokenizer_profile();
-        profile.chat_template_ref = 99;
-        let sections = token_sections_with_profile(
-            profile,
-            test_tokenized_span(1, 0, 1, 2, 1, 0),
-            test_token_sequence_pack(1, 0, 4, 0),
-        );
-        let bytes =
-            write_coveai_artifact(CoveAiArtifactKind::CoveAiBundle, [7u8; 16], 890, &sections)
-                .unwrap();
-        assert!(matches!(
-            CoveAiFile::parse(&bytes),
-            Err(CoveError::BadSection(message)) if message.contains("missing chat_template_ref 99")
-        ));
-    }
-
-    #[test]
-    fn rejects_tokenizer_profile_missing_truncation_policy_ref() {
-        let mut profile = test_tokenizer_profile();
-        profile.truncation_policy_ref = 99;
-        let sections = token_sections_with_profile(
-            profile,
-            test_tokenized_span(1, 0, 1, 2, 1, 0),
-            test_token_sequence_pack(1, 0, 4, 0),
-        );
-        let bytes =
-            write_coveai_artifact(CoveAiArtifactKind::CoveAiBundle, [7u8; 16], 890, &sections)
-                .unwrap();
-        assert!(matches!(
-            CoveAiFile::parse(&bytes),
-            Err(CoveError::BadSection(message))
-                if message.contains("missing truncation_policy_ref 99")
-        ));
-    }
-
-    #[test]
-    fn rejects_tokenizer_profile_special_token_outside_width() {
-        let mut profile = test_tokenizer_profile();
-        profile.eos_token_id = u32::from(u16::MAX) + 1;
-        let sections = token_sections_with_profile(
-            profile,
-            test_tokenized_span(1, 0, 1, 2, 1, 0),
-            test_token_sequence_pack(1, 0, 4, 0),
-        );
-        let bytes =
-            write_coveai_artifact(CoveAiArtifactKind::CoveAiBundle, [7u8; 16], 890, &sections)
-                .unwrap();
-        assert!(matches!(
-            CoveAiFile::parse(&bytes),
-            Err(CoveError::BadSection(message))
-                if message.contains("eos_token_id 65536 exceeds token_id_width 2")
-        ));
-    }
-
-    #[test]
-    fn rejects_tokenized_span_range_out_of_block() {
-        let sections = token_sections(
-            test_tokenized_span(1, 0, 3, 2, 1, 0),
-            test_token_sequence_pack(1, 0, 4, 0),
-        );
-        let bytes =
-            write_coveai_artifact(CoveAiArtifactKind::CoveAiBundle, [8u8; 16], 890, &sections)
-                .unwrap();
-        assert!(matches!(
-            CoveAiFile::parse(&bytes),
-            Err(CoveError::BadSection(message)) if message.contains("token range exceeds")
-        ));
-    }
-
-    #[test]
-    fn rejects_token_sequence_pack_missing_mask_payload_ref() {
-        let sections = token_sections(
-            test_tokenized_span(1, 0, 1, 2, 1, 0),
-            test_token_sequence_pack(1, 0, 4, 99),
-        );
-        let bytes =
-            write_coveai_artifact(CoveAiArtifactKind::CoveAiBundle, [9u8; 16], 890, &sections)
-                .unwrap();
-        assert!(matches!(
-            CoveAiFile::parse(&bytes),
-            Err(CoveError::BadSection(message)) if message.contains("missing loss_mask_ref")
-        ));
-    }
-
-    #[test]
-    fn rejects_tokenized_span_missing_source_hash_ref() {
-        let sections = token_sections(
-            test_tokenized_span(1, 0, 1, 2, 99, 0),
-            test_token_sequence_pack(1, 0, 4, 0),
-        );
-        let bytes =
-            write_coveai_artifact(CoveAiArtifactKind::CoveAiBundle, [9u8; 16], 890, &sections)
-                .unwrap();
-        assert!(matches!(
-            CoveAiFile::parse(&bytes),
-            Err(CoveError::BadSection(message))
-                if message.contains("missing source_value_hash_ref 99")
-        ));
-    }
-
-    #[test]
-    fn rejects_token_sequence_pack_missing_first_source_span_ref() {
-        let mut pack = test_token_sequence_pack(1, 0, 4, 0);
-        pack.source_span_count = 1;
-        pack.first_source_span_ref = 99;
-        let sections = token_sections(test_tokenized_span(1, 0, 1, 2, 1, 0), pack);
-        let bytes =
-            write_coveai_artifact(CoveAiArtifactKind::CoveAiBundle, [9u8; 16], 890, &sections)
-                .unwrap();
-        assert!(matches!(
-            CoveAiFile::parse(&bytes),
-            Err(CoveError::BadSection(message))
-                if message.contains("missing first_source_span_ref 99")
-        ));
-    }
-
-    #[test]
-    fn rejects_token_sequence_pack_missing_split_ref() {
-        let mut pack = test_token_sequence_pack(1, 0, 4, 0);
-        pack.split_ref = 77;
-        let sections = token_sections(test_tokenized_span(1, 0, 1, 2, 1, 0), pack);
-        let bytes =
-            write_coveai_artifact(CoveAiArtifactKind::CoveAiBundle, [9u8; 16], 890, &sections)
-                .unwrap();
-        assert!(matches!(
-            CoveAiFile::parse(&bytes),
-            Err(CoveError::BadSection(message)) if message.contains("missing split_ref 77")
-        ));
-    }
-
-    #[test]
-    fn rejects_token_sequence_pack_position_payload_too_short() {
-        let mut pack = test_token_sequence_pack(1, 0, 2, 0);
-        pack.position_ids_ref = 2;
-        let sections = token_sections(test_tokenized_span(1, 0, 1, 2, 1, 0), pack);
-        let bytes =
-            write_coveai_artifact(CoveAiArtifactKind::CoveAiBundle, [9u8; 16], 890, &sections)
-                .unwrap();
-        assert!(matches!(
-            CoveAiFile::parse(&bytes),
-            Err(CoveError::BadSection(message))
-                if message.contains("position_ids_ref decoded_length is shorter")
-        ));
-    }
-
-    #[test]
-    fn rejects_token_block_payload_too_short() {
-        let mut sections = token_sections(
-            test_tokenized_span(1, 0, 1, 2, 1, 0),
-            test_token_sequence_pack(1, 0, 4, 0),
-        );
-        sections
-            .iter_mut()
-            .find(|section| section.section_id == 10)
-            .unwrap()
-            .payload
-            .truncate(6);
-        sections
-            .iter_mut()
-            .find(|section| section.section_id == 11)
-            .unwrap()
-            .payload = encode_records([
-            encode_digest_entry(AiDigestEntryV1 {
-                digest_ref: 1,
-                digest_algorithm: 1,
-                digest_len: 4,
-                digest_payload_ref: 2,
-                domain_hint: 1,
-                flags: 0,
-                crc32c: 0,
-            })
-            .unwrap(),
-            encode_payload_ref_entry(AiPayloadRefEntryV1 {
-                payload_ref: 1,
-                storage_kind: AiStorageKindV1::SectionDecodedRelative as u8,
-                media_type_ref: 0,
-                section_id: 10,
-                uri_ref: 0,
-                payload_offset: 0,
-                section_payload_offset: 0,
-                payload_length: 6,
-                decoded_length: 6,
-                integrity_ref: 0,
-                flags: 0,
-                crc32c: 0,
-            })
-            .unwrap(),
-            encode_payload_ref_entry(AiPayloadRefEntryV1 {
-                payload_ref: 2,
-                storage_kind: AiStorageKindV1::SectionDecodedRelative as u8,
-                media_type_ref: 0,
-                section_id: 10,
-                uri_ref: 0,
-                payload_offset: 0,
-                section_payload_offset: 0,
-                payload_length: 4,
-                decoded_length: 4,
-                integrity_ref: 0,
-                flags: 0,
-                crc32c: 0,
-            })
-            .unwrap(),
-        ])
-        .unwrap();
-
-        let bytes =
-            write_coveai_artifact(CoveAiArtifactKind::CoveAiBundle, [40u8; 16], 927, &sections)
-                .unwrap();
-        assert!(matches!(
-            CoveAiFile::parse(&bytes),
-            Err(CoveError::BadSection(message))
-                if message.contains("payload decoded_length is shorter")
-        ));
-    }
-
-    #[test]
-    fn parses_training_profile_sample_split_and_epoch() {
-        let sections = training_sections(true, test_training_sample(1, 1, 1, 1));
-        let bytes =
-            write_coveai_artifact(CoveAiArtifactKind::CoveAiBundle, [10u8; 16], 901, &sections)
-                .unwrap();
-        let parsed = CoveAiFile::parse(&bytes).unwrap();
-        assert_eq!(parsed.descriptor_tables.training_profiles.len(), 1);
-        assert_eq!(parsed.descriptor_tables.dataset_splits.len(), 1);
-        assert_eq!(parsed.descriptor_tables.dedup_groups.len(), 1);
-        assert_eq!(parsed.descriptor_tables.training_epoch_plans.len(), 1);
-        assert_eq!(parsed.descriptor_tables.training_samples.len(), 1);
-    }
-
-    #[test]
-    fn rejects_training_sample_missing_profile() {
-        let sections = training_sections(false, test_training_sample(1, 99, 1, 1));
-        let bytes =
-            write_coveai_artifact(CoveAiArtifactKind::CoveAiBundle, [11u8; 16], 901, &sections)
-                .unwrap();
-        assert!(matches!(
-            CoveAiFile::parse(&bytes),
-            Err(CoveError::BadSection(message))
-                if message.contains("missing training_profile_id")
-        ));
-    }
-
-    #[test]
-    fn rejects_training_profile_missing_split_policy_ref() {
-        let mut profile = test_training_profile();
-        profile.split_policy_ref = 77;
-        let sections = training_sections_with_records(
-            Some(profile),
-            test_dataset_split(),
-            test_dedup_group(),
-            test_training_epoch_plan(),
-            test_training_sample(1, 1, 1, 1),
-        );
-        let bytes =
-            write_coveai_artifact(CoveAiArtifactKind::CoveAiBundle, [11u8; 16], 901, &sections)
-                .unwrap();
-        assert!(matches!(
-            CoveAiFile::parse(&bytes),
-            Err(CoveError::BadSection(message)) if message.contains("missing split_policy_ref 77")
-        ));
-    }
-
-    #[test]
-    fn rejects_training_sample_missing_input_ref() {
-        let mut sample = test_training_sample(1, 1, 1, 1);
-        sample.input_ref = 77;
-        let sections = training_sections(true, sample);
-        let bytes =
-            write_coveai_artifact(CoveAiArtifactKind::CoveAiBundle, [11u8; 16], 901, &sections)
-                .unwrap();
-        assert!(matches!(
-            CoveAiFile::parse(&bytes),
-            Err(CoveError::BadSection(message)) if message.contains("missing input_ref 77")
-        ));
-    }
-
-    #[test]
-    fn rejects_dataset_split_missing_filter_policy_ref() {
-        let mut split = test_dataset_split();
-        split.filter_policy_ref = 77;
-        let sections = training_sections_with_records(
-            Some(test_training_profile()),
-            split,
-            test_dedup_group(),
-            test_training_epoch_plan(),
-            test_training_sample(1, 1, 1, 1),
-        );
-        let bytes =
-            write_coveai_artifact(CoveAiArtifactKind::CoveAiBundle, [11u8; 16], 901, &sections)
-                .unwrap();
-        assert!(matches!(
-            CoveAiFile::parse(&bytes),
-            Err(CoveError::BadSection(message)) if message.contains("missing filter_policy_ref 77")
-        ));
-    }
-
-    #[test]
-    fn rejects_dedup_group_bad_authority() {
-        let mut dedup = test_dedup_group();
-        dedup.dedup_authority = 42;
-        let sections = training_sections_with_records(
-            Some(test_training_profile()),
-            test_dataset_split(),
-            dedup,
-            test_training_epoch_plan(),
-            test_training_sample(1, 1, 1, 1),
-        );
-        let bytes =
-            write_coveai_artifact(CoveAiArtifactKind::CoveAiBundle, [11u8; 16], 901, &sections)
-                .unwrap();
-        assert!(matches!(
-            CoveAiFile::parse(&bytes),
-            Err(CoveError::BadSection(message)) if message.contains("DedupGroup dedup_authority")
-        ));
-    }
-
-    #[test]
-    fn rejects_training_label_missing_policy_ref() {
-        let mut label = test_training_label();
-        label.policy_ref = 77;
-        let sections = provenance_sections_with_label_pair(
-            Some(test_model_actor()),
-            test_decoding_profile(),
-            test_human_review(),
-            test_generator_provenance(1, 1),
-            label,
-            test_preference_pair(),
-        );
-        let bytes =
-            write_coveai_artifact(CoveAiArtifactKind::CoveAiBundle, [12u8; 16], 902, &sections)
-                .unwrap();
-        assert!(matches!(
-            CoveAiFile::parse(&bytes),
-            Err(CoveError::BadSection(message)) if message.contains("missing policy_ref 77")
-        ));
-    }
-
-    #[test]
-    fn rejects_preference_pair_missing_evidence_ref() {
-        let mut pair = test_preference_pair();
-        pair.evidence_ref = 77;
-        let sections = provenance_sections_with_label_pair(
-            Some(test_model_actor()),
-            test_decoding_profile(),
-            test_human_review(),
-            test_generator_provenance(1, 1),
-            test_training_label(),
-            pair,
-        );
-        let bytes =
-            write_coveai_artifact(CoveAiArtifactKind::CoveAiBundle, [12u8; 16], 902, &sections)
-                .unwrap();
-        assert!(matches!(
-            CoveAiFile::parse(&bytes),
-            Err(CoveError::BadSection(message)) if message.contains("missing evidence_ref 77")
-        ));
-    }
-
-    #[test]
-    fn parses_generator_provenance_labels_and_preferences() {
-        let sections = provenance_sections(true, test_generator_provenance(1, 1));
-        let bytes =
-            write_coveai_artifact(CoveAiArtifactKind::CoveAiBundle, [12u8; 16], 902, &sections)
-                .unwrap();
-        let parsed = CoveAiFile::parse(&bytes).unwrap();
-        assert_eq!(parsed.descriptor_tables.model_actors.len(), 1);
-        assert_eq!(
-            parsed.descriptor_tables.generation_decoding_profiles.len(),
-            1
-        );
-        assert_eq!(parsed.descriptor_tables.human_reviews.len(), 1);
-        assert_eq!(parsed.descriptor_tables.generator_provenance.len(), 1);
-        assert_eq!(parsed.descriptor_tables.training_labels.len(), 1);
-        assert_eq!(parsed.descriptor_tables.preference_pairs.len(), 1);
-    }
-
-    #[test]
-    fn rejects_model_generator_missing_actor() {
-        let sections = provenance_sections(false, test_generator_provenance(1, 99));
-        let bytes =
-            write_coveai_artifact(CoveAiArtifactKind::CoveAiBundle, [13u8; 16], 902, &sections)
-                .unwrap();
-        assert!(matches!(
-            CoveAiFile::parse(&bytes),
-            Err(CoveError::BadSection(message)) if message.contains("missing model_actor_ref")
-        ));
-    }
-
-    #[test]
-    fn rejects_model_actor_missing_checkpoint_digest_ref() {
-        let mut actor = test_model_actor();
-        actor.model_checkpoint_digest_ref = 77;
-        let sections = provenance_sections_with_records(
-            Some(actor),
-            test_decoding_profile(),
-            test_human_review(),
-            test_generator_provenance(1, 1),
-        );
-        let bytes =
-            write_coveai_artifact(CoveAiArtifactKind::CoveAiBundle, [13u8; 16], 902, &sections)
-                .unwrap();
-        assert!(matches!(
-            CoveAiFile::parse(&bytes),
-            Err(CoveError::BadSection(message))
-                if message.contains("missing model_checkpoint_digest_ref 77")
-        ));
-    }
-
-    #[test]
-    fn rejects_decoding_profile_missing_safety_policy_ref() {
-        let mut decoding = test_decoding_profile();
-        decoding.safety_policy_ref = 77;
-        let sections = provenance_sections_with_records(
-            Some(test_model_actor()),
-            decoding,
-            test_human_review(),
-            test_generator_provenance(1, 1),
-        );
-        let bytes =
-            write_coveai_artifact(CoveAiArtifactKind::CoveAiBundle, [13u8; 16], 902, &sections)
-                .unwrap();
-        assert!(matches!(
-            CoveAiFile::parse(&bytes),
-            Err(CoveError::BadSection(message))
-                if message.contains("missing safety_policy_ref 77")
-        ));
-    }
-
-    #[test]
-    fn rejects_human_review_missing_notes_ref() {
-        let mut review = test_human_review();
-        review.notes_ref = 77;
-        let sections = provenance_sections_with_records(
-            Some(test_model_actor()),
-            test_decoding_profile(),
-            review,
-            test_generator_provenance(1, 1),
-        );
-        let bytes =
-            write_coveai_artifact(CoveAiArtifactKind::CoveAiBundle, [13u8; 16], 902, &sections)
-                .unwrap();
-        assert!(matches!(
-            CoveAiFile::parse(&bytes),
-            Err(CoveError::BadSection(message)) if message.contains("missing notes_ref 77")
-        ));
-    }
-
-    #[test]
-    fn rejects_generator_provenance_missing_prompt_template_ref() {
-        let mut generator = test_generator_provenance(1, 1);
-        generator.prompt_template_ref = 77;
-        let sections = provenance_sections_with_records(
-            Some(test_model_actor()),
-            test_decoding_profile(),
-            test_human_review(),
-            generator,
-        );
-        let bytes =
-            write_coveai_artifact(CoveAiArtifactKind::CoveAiBundle, [13u8; 16], 902, &sections)
-                .unwrap();
-        assert!(matches!(
-            CoveAiFile::parse(&bytes),
-            Err(CoveError::BadSection(message))
-                if message.contains("missing prompt_template_ref 77")
-        ));
-    }
-
-    #[test]
-    fn rejects_generator_provenance_bad_reproducibility_class() {
-        let mut generator = test_generator_provenance(1, 1);
-        generator.reproducibility_class = 42;
-        let sections = provenance_sections_with_records(
-            Some(test_model_actor()),
-            test_decoding_profile(),
-            test_human_review(),
-            generator,
-        );
-        let bytes =
-            write_coveai_artifact(CoveAiArtifactKind::CoveAiBundle, [13u8; 16], 902, &sections)
-                .unwrap();
-        assert!(matches!(
-            CoveAiFile::parse(&bytes),
-            Err(CoveError::BadSection(message))
-                if message.contains("GeneratorProvenance reproducibility_class")
-        ));
-    }
-
-    #[test]
-    fn parses_tensor_asset_and_multimodal_sequence() {
-        let sections = phase7_sections(
-            true,
-            test_multimodal_pack(1, 1),
-            vec![test_multimodal_element(1, 1, 0, 1, 1)],
-        );
-        let bytes =
-            write_coveai_artifact(CoveAiArtifactKind::CoveAiBundle, [14u8; 16], 903, &sections)
-                .unwrap();
-        let parsed = CoveAiFile::parse(&bytes).unwrap();
-        assert_eq!(parsed.descriptor_tables.tensor_layouts.len(), 1);
-        assert_eq!(parsed.descriptor_tables.device_transfer_hints.len(), 1);
-        assert_eq!(parsed.descriptor_tables.assets.len(), 1);
-        assert_eq!(parsed.descriptor_tables.multimodal_sequence_packs.len(), 1);
-        assert_eq!(
-            parsed.descriptor_tables.multimodal_sequence_elements.len(),
-            1
-        );
-    }
-
-    #[test]
-    fn rejects_tensor_layout_missing_shape_ref() {
-        let mut tensor_layout = test_tensor_layout();
-        tensor_layout.shape_ref = 99;
-        let sections = phase7_sections_with_tensor(
-            tensor_layout,
-            test_device_transfer_hint(),
-            true,
-            test_multimodal_pack(1, 1),
-            vec![test_multimodal_element(1, 1, 0, 1, 1)],
-        );
-        let bytes =
-            write_coveai_artifact(CoveAiArtifactKind::CoveAiBundle, [15u8; 16], 903, &sections)
-                .unwrap();
-        assert!(matches!(
-            CoveAiFile::parse(&bytes),
-            Err(CoveError::BadSection(message)) if message.contains("missing shape_ref 99")
-        ));
-    }
-
-    #[test]
-    fn rejects_tensor_layout_unsupported_dtype() {
-        let mut tensor_layout = test_tensor_layout();
-        tensor_layout.dtype = 42;
-        let sections = phase7_sections_with_tensor(
-            tensor_layout,
-            test_device_transfer_hint(),
-            true,
-            test_multimodal_pack(1, 1),
-            vec![test_multimodal_element(1, 1, 0, 1, 1)],
-        );
-        let bytes =
-            write_coveai_artifact(CoveAiArtifactKind::CoveAiBundle, [15u8; 16], 903, &sections)
-                .unwrap();
-        assert!(matches!(
-            CoveAiFile::parse(&bytes),
-            Err(CoveError::BadSection(message)) if message.contains("TensorLayout dtype")
-        ));
-    }
-
-    #[test]
-    fn rejects_device_transfer_missing_runtime_binding() {
-        let mut transfer_hint = test_device_transfer_hint();
-        transfer_hint.runtime_registry_binding_ref = 77;
-        let sections = phase7_sections_with_tensor(
-            test_tensor_layout(),
-            transfer_hint,
-            true,
-            test_multimodal_pack(1, 1),
-            vec![test_multimodal_element(1, 1, 0, 1, 1)],
-        );
-        let bytes =
-            write_coveai_artifact(CoveAiArtifactKind::CoveAiBundle, [15u8; 16], 903, &sections)
-                .unwrap();
-        assert!(matches!(
-            CoveAiFile::parse(&bytes),
-            Err(CoveError::BadSection(message)) if message.contains("missing runtime_registry_binding_ref 77")
-        ));
-    }
-
-    #[test]
-    fn rejects_uri_asset_without_uri_ref() {
-        let mut asset = test_asset_ref();
-        asset.asset_kind = 0;
-        asset.uri_ref = 0;
-        let sections = phase7_sections_with_asset(
-            asset,
-            test_multimodal_pack(1, 1),
-            vec![test_multimodal_element(1, 1, 0, 1, 1)],
-        );
-        let bytes =
-            write_coveai_artifact(CoveAiArtifactKind::CoveAiBundle, [15u8; 16], 903, &sections)
-                .unwrap();
-        assert!(matches!(
-            CoveAiFile::parse(&bytes),
-            Err(CoveError::BadSection(message)) if message.contains("URI asset requires uri_ref")
-        ));
-    }
-
-    #[test]
-    fn rejects_asset_missing_policy_ref() {
-        let mut asset = test_asset_ref();
-        asset.policy_ref = 77;
-        let sections = phase7_sections_with_asset(
-            asset,
-            test_multimodal_pack(1, 1),
-            vec![test_multimodal_element(1, 1, 0, 1, 1)],
-        );
-        let bytes =
-            write_coveai_artifact(CoveAiArtifactKind::CoveAiBundle, [15u8; 16], 903, &sections)
-                .unwrap();
-        assert!(matches!(
-            CoveAiFile::parse(&bytes),
-            Err(CoveError::BadSection(message)) if message.contains("missing policy_ref 77")
-        ));
-    }
-
-    #[test]
-    fn rejects_multimodal_element_unsupported_role() {
-        let mut element = test_multimodal_element(1, 1, 0, 1, 1);
-        element.role = 42;
-        let sections = phase7_sections(true, test_multimodal_pack(1, 1), vec![element]);
-        let bytes =
-            write_coveai_artifact(CoveAiArtifactKind::CoveAiBundle, [15u8; 16], 903, &sections)
-                .unwrap();
-        assert!(matches!(
-            CoveAiFile::parse(&bytes),
-            Err(CoveError::BadSection(message)) if message.contains("MultimodalSequenceElement role")
-        ));
-    }
-
-    #[test]
-    fn rejects_multimodal_element_missing_policy_ref() {
-        let mut element = test_multimodal_element(1, 1, 0, 1, 1);
-        element.policy_ref = 77;
-        let sections = phase7_sections(true, test_multimodal_pack(1, 1), vec![element]);
-        let bytes =
-            write_coveai_artifact(CoveAiArtifactKind::CoveAiBundle, [15u8; 16], 903, &sections)
-                .unwrap();
-        assert!(matches!(
-            CoveAiFile::parse(&bytes),
-            Err(CoveError::BadSection(message)) if message.contains("missing policy_ref 77")
-        ));
-    }
-
-    #[test]
-    fn rejects_multimodal_pack_missing_evidence_ref() {
-        let mut pack = test_multimodal_pack(1, 1);
-        pack.evidence_ref = 88;
-        let sections = phase7_sections(true, pack, vec![test_multimodal_element(1, 1, 0, 1, 1)]);
-        let bytes =
-            write_coveai_artifact(CoveAiArtifactKind::CoveAiBundle, [15u8; 16], 903, &sections)
-                .unwrap();
-        assert!(matches!(
-            CoveAiFile::parse(&bytes),
-            Err(CoveError::BadSection(message)) if message.contains("missing evidence_ref 88")
-        ));
-    }
-
-    #[test]
-    fn rejects_multimodal_element_missing_asset_ref() {
-        let sections = phase7_sections(
-            false,
-            test_multimodal_pack(1, 1),
-            vec![test_multimodal_element(1, 1, 0, 99, 1)],
-        );
-        let bytes =
-            write_coveai_artifact(CoveAiArtifactKind::CoveAiBundle, [15u8; 16], 903, &sections)
-                .unwrap();
-        assert!(matches!(
-            CoveAiFile::parse(&bytes),
-            Err(CoveError::BadSection(message)) if message.contains("missing asset_ref")
-        ));
-    }
-
-    fn test_chunk_profile() -> ChunkProfileV1 {
-        ChunkProfileV1 {
-            chunk_profile_id: 1,
-            profile_name_ref: 0,
-            chunker_namespace_ref: 0,
-            chunker_name_ref: 0,
-            chunker_version_major: 1,
-            chunker_version_minor: 0,
-            tokenizer_profile_ref: 0,
-            boundary_kind: 1,
-            overlap_policy: 0,
-            parent_policy: 0,
-            normalization_policy: 0,
-            target_tokens: 0,
-            min_tokens: 0,
-            max_tokens: 0,
-            overlap_tokens: 0,
-            max_bytes: 4096,
-            locale_ref: 0,
-            flags: 0,
-            checksum: 0,
-        }
-    }
-
-    fn chunk_sections(text_chunks: Vec<TextChunkEntryV1>) -> Vec<CoveAiWritableSection> {
-        chunk_sections_with_profile(test_chunk_profile(), text_chunks)
-    }
-
-    fn chunk_sections_with_profile(
-        chunk_profile: ChunkProfileV1,
-        text_chunks: Vec<TextChunkEntryV1>,
-    ) -> Vec<CoveAiWritableSection> {
-        vec![
-            coveai_binary_section(
-                1,
-                SectionKind::AiChunkProfile,
-                PrimaryProfile::CoveChunk,
-                encode_records([encode_chunk_profile(chunk_profile).unwrap()]).unwrap(),
-            ),
-            coveai_payload_section(
-                3,
-                SectionKind::AiPayloadBytes,
-                PrimaryProfile::CoveChunk,
-                vec![1, 2, 3, 4, 5, 6, 7, 8],
-            ),
-            coveai_binary_section(
-                4,
-                SectionKind::AiReferenceTables,
-                PrimaryProfile::CoveAiShared,
-                encode_records([
-                    encode_digest_entry(AiDigestEntryV1 {
-                        digest_ref: 1,
-                        digest_algorithm: 1,
-                        digest_len: 4,
-                        digest_payload_ref: 1,
-                        domain_hint: 1,
-                        flags: 0,
-                        crc32c: 0,
-                    })
-                    .unwrap(),
-                    encode_digest_entry(AiDigestEntryV1 {
-                        digest_ref: 2,
-                        digest_algorithm: 1,
-                        digest_len: 4,
-                        digest_payload_ref: 2,
-                        domain_hint: 1,
-                        flags: 0,
-                        crc32c: 0,
-                    })
-                    .unwrap(),
-                    encode_payload_ref_entry(AiPayloadRefEntryV1 {
-                        payload_ref: 1,
-                        storage_kind: AiStorageKindV1::SectionDecodedRelative as u8,
-                        media_type_ref: 0,
-                        section_id: 3,
-                        uri_ref: 0,
-                        payload_offset: 0,
-                        section_payload_offset: 0,
-                        payload_length: 4,
-                        decoded_length: 4,
-                        integrity_ref: 0,
-                        flags: 0,
-                        crc32c: 0,
-                    })
-                    .unwrap(),
-                    encode_payload_ref_entry(AiPayloadRefEntryV1 {
-                        payload_ref: 2,
-                        storage_kind: AiStorageKindV1::SectionDecodedRelative as u8,
-                        media_type_ref: 0,
-                        section_id: 3,
-                        uri_ref: 0,
-                        payload_offset: 0,
-                        section_payload_offset: 4,
-                        payload_length: 4,
-                        decoded_length: 4,
-                        integrity_ref: 0,
-                        flags: 0,
-                        crc32c: 0,
-                    })
-                    .unwrap(),
-                ])
-                .unwrap(),
-            ),
-            coveai_binary_section(
-                5,
-                SectionKind::AiSourceBinding,
-                PrimaryProfile::CoveAiShared,
-                encode_records([encode_source_binding(AiSourceBindingV1 {
-                    source_binding_id: 1,
-                    source_kind: AI_SOURCE_KIND_COVE_FILE,
-                    source_artifact_ref: 0,
-                    source_file_digest_ref: 0,
-                    covm_snapshot_ref: 0,
-                    schema_fingerprint_ref: 0,
-                    dictionary_digest_ref: 0,
-                    map_fingerprint_ref: 0,
-                    policy_context_ref: 0,
-                    visibility_scope_ref: 0,
-                    redaction_scope_ref: 0,
-                    branch_ref: 0,
-                    as_of_csn: 0,
-                    flags: 0,
-                    crc32c: 0,
-                })
-                .unwrap()])
-                .unwrap(),
-            ),
-            coveai_binary_section(
-                2,
-                SectionKind::AiTextChunkIndex,
-                PrimaryProfile::CoveChunk,
-                encode_records(
-                    text_chunks
-                        .into_iter()
-                        .map(|chunk| encode_text_chunk_entry(chunk).unwrap()),
-                )
-                .unwrap(),
-            ),
-        ]
-    }
-
-    fn test_text_chunk(
-        chunk_id: u64,
-        previous_chunk_id: u64,
-        next_chunk_id: u64,
-        byte_start: u64,
-        byte_length: u64,
-        unicode_scalar_length: u64,
-        source_value_hash_ref: u32,
-    ) -> TextChunkEntryV1 {
-        TextChunkEntryV1 {
-            chunk_id,
-            source_ref: 1,
-            table_id: 0,
-            column_id: 0,
-            object_type_id: 0,
-            property_id: 0,
-            association_type_id: 0,
-            path_ref: 0,
-            source_row_ref: 0,
-            source_object_ref: 0,
-            source_value_hash_ref,
-            byte_start,
-            byte_length,
-            unicode_scalar_start: byte_start,
-            unicode_scalar_length,
-            token_start: 0,
-            token_count: 0,
-            parent_chunk_id: 0,
-            first_child_ref: 0,
-            child_count: 0,
-            previous_chunk_id,
-            next_chunk_id,
-            chunk_text_hash_ref: 0,
-            evidence_ref: 0,
-            policy_ref: 0,
-            flags: 0,
-            checksum: 0,
-        }
-    }
-
-    fn vector_index_sections(index: VectorIndexDescriptorV1) -> Vec<CoveAiWritableSection> {
-        vec![
-            coveai_binary_section(
-                50,
-                SectionKind::AiVectorSpace,
-                PrimaryProfile::CoveVec,
-                encode_records([encode_vector_space(VectorSpaceDescriptorV1 {
-                    vector_space_id: 1,
-                    vector_space_name_ref: 0,
-                    vector_space_fingerprint_ref: 0,
-                    embedding_namespace_ref: 0,
-                    embedding_model_ref: 0,
-                    embedding_model_version_ref: 0,
-                    embedding_model_digest_ref: 0,
-                    embedding_pipeline_ref: 0,
-                    tokenizer_profile_ref: 0,
-                    chunk_profile_ref: 0,
-                    dimension_count: 3,
-                    element_type: 0,
-                    metric: 1,
-                    normalization_policy: 0,
-                    quantization_policy: 0,
-                    deterministic: 1,
-                    approximate: 0,
-                    reproducibility_class: 1,
-                    reserved: 0,
-                    flags: 0,
-                    checksum: 0,
-                })
-                .unwrap()])
-                .unwrap(),
-            ),
-            coveai_binary_section(
-                51,
-                SectionKind::AiVectorIndex,
-                PrimaryProfile::CoveVec,
-                encode_records([encode_vector_index(index).unwrap()]).unwrap(),
-            ),
-        ]
-    }
-
-    fn test_vector_index(index_kind: u8, exactness_kind: u8) -> VectorIndexDescriptorV1 {
-        VectorIndexDescriptorV1 {
-            vector_index_id: 1,
-            vector_space_id: 1,
-            stored_vector_space_id: 1,
-            search_vector_space_id: 1,
-            index_kind,
-            exactness_kind,
-            false_negative_policy: 0,
-            metric: 1,
-            score_space_authority: 0,
-            dimension_count: 3,
-            indexed_binding_kind: 1,
-            temporal_scope_ref: 0,
-            visibility_scope_ref: 0,
-            redaction_scope_ref: 0,
-            dequantization_profile_ref: 0,
-            quantization_error_profile_ref: 0,
-            payload_ref: 0,
-            checksum: 0,
-        }
-    }
-
-    fn token_sections(
-        tokenized_span: TokenizedSpanV1,
-        sequence_pack: TokenSequencePackV1,
-    ) -> Vec<CoveAiWritableSection> {
-        token_sections_with_profile(test_tokenizer_profile(), tokenized_span, sequence_pack)
-    }
-
-    fn token_sections_with_profile(
-        tokenizer_profile: TokenizerProfileV1,
-        tokenized_span: TokenizedSpanV1,
-        sequence_pack: TokenSequencePackV1,
-    ) -> Vec<CoveAiWritableSection> {
-        vec![
-            coveai_payload_section(
-                10,
-                SectionKind::AiPayloadBytes,
-                PrimaryProfile::CoveTok,
-                vec![1, 0, 2, 0, 3, 0, 4, 0],
-            ),
-            coveai_binary_section(
-                11,
-                SectionKind::AiReferenceTables,
-                PrimaryProfile::CoveAiShared,
-                encode_records([
-                    encode_digest_entry(AiDigestEntryV1 {
-                        digest_ref: 1,
-                        digest_algorithm: 1,
-                        digest_len: 4,
-                        digest_payload_ref: 2,
-                        domain_hint: 1,
-                        flags: 0,
-                        crc32c: 0,
-                    })
-                    .unwrap(),
-                    encode_payload_ref_entry(AiPayloadRefEntryV1 {
-                        payload_ref: 1,
-                        storage_kind: AiStorageKindV1::SectionDecodedRelative as u8,
-                        media_type_ref: 0,
-                        section_id: 10,
-                        uri_ref: 0,
-                        payload_offset: 0,
-                        section_payload_offset: 0,
-                        payload_length: 8,
-                        decoded_length: 8,
-                        integrity_ref: 0,
-                        flags: 0,
-                        crc32c: 0,
-                    })
-                    .unwrap(),
-                    encode_payload_ref_entry(AiPayloadRefEntryV1 {
-                        payload_ref: 2,
-                        storage_kind: AiStorageKindV1::SectionDecodedRelative as u8,
-                        media_type_ref: 0,
-                        section_id: 10,
-                        uri_ref: 0,
-                        payload_offset: 0,
-                        section_payload_offset: 0,
-                        payload_length: 4,
-                        decoded_length: 4,
-                        integrity_ref: 0,
-                        flags: 0,
-                        crc32c: 0,
-                    })
-                    .unwrap(),
-                ])
-                .unwrap(),
-            ),
-            coveai_binary_section(
-                12,
-                SectionKind::AiPrivacySummary,
-                PrimaryProfile::CoveAiShared,
-                encode_records([encode_privacy_summary(AiPrivacySummaryEntryV1 {
-                    privacy_summary_ref: 1,
-                    source_binding_ref: 0,
-                    sensitivity_mask: 0,
-                    sensitivity_bits_ref: 0,
-                    policy_ref: 0,
-                    visibility_scope_ref: 0,
-                    redaction_scope_ref: 0,
-                    retention_state: 0,
-                    disclosure_state: 0,
-                    flags: 0,
-                    crc32c: 0,
-                })
-                .unwrap()])
-                .unwrap(),
-            ),
-            coveai_binary_section(
-                13,
-                SectionKind::AiTokenizerProfile,
-                PrimaryProfile::CoveTok,
-                encode_records([encode_tokenizer_profile(tokenizer_profile).unwrap()]).unwrap(),
-            ),
-            coveai_binary_section(
-                14,
-                SectionKind::AiTokenBlock,
-                PrimaryProfile::CoveTok,
-                encode_records([encode_token_block(TokenBlockHeaderV1 {
-                    token_block_id: 1,
-                    tokenizer_profile_id: 1,
-                    token_count: 4,
-                    token_id_width: 2,
-                    compression_codec: CompressionCodec::None as u8,
-                    layout_kind: 0,
-                    payload_ref: 1,
-                    payload_offset: 0,
-                    payload_length: 0,
-                    integrity_ref: 0,
-                    checksum: 0,
-                })
-                .unwrap()])
-                .unwrap(),
-            ),
-            coveai_binary_section(
-                15,
-                SectionKind::AiTokenizedSpan,
-                PrimaryProfile::CoveTok,
-                encode_records([encode_tokenized_span(tokenized_span).unwrap()]).unwrap(),
-            ),
-            coveai_binary_section(
-                16,
-                SectionKind::AiTokenSequencePack,
-                PrimaryProfile::CoveTok,
-                encode_records([encode_token_sequence_pack(sequence_pack).unwrap()]).unwrap(),
-            ),
-        ]
-    }
-
-    fn test_tokenizer_profile() -> TokenizerProfileV1 {
-        TokenizerProfileV1 {
-            tokenizer_profile_id: 1,
-            tokenizer_namespace_ref: 0,
-            tokenizer_name_ref: 0,
-            tokenizer_version_major: 1,
-            tokenizer_version_minor: 0,
-            vocab_digest_ref: 1,
-            merges_digest_ref: 0,
-            pre_tokenizer_digest_ref: 0,
-            normalizer_digest_ref: 0,
-            byte_encoder_digest_ref: 0,
-            special_tokens_digest_ref: 0,
-            added_tokens_digest_ref: 0,
-            chat_template_ref: 0,
-            unicode_version_ref: 0,
-            truncation_policy_ref: 0,
-            padding_policy_ref: 0,
-            model_max_sequence_length: 4096,
-            token_id_width: 2,
-            byte_alignment_available: 0,
-            reversible: 1,
-            deterministic: 1,
-            bos_token_id: 0,
-            eos_token_id: 0,
-            pad_token_id: 0,
-            unk_token_id: 0,
-            flags: 0,
-            checksum: 0,
-        }
-    }
-
-    fn test_tokenized_span(
-        tokenized_span_id: u64,
-        chunk_id: u64,
-        token_offset: u64,
-        token_count: u32,
-        source_value_hash_ref: u32,
-        byte_alignment_ref: u32,
-    ) -> TokenizedSpanV1 {
-        TokenizedSpanV1 {
-            tokenized_span_id,
-            chunk_id,
-            tokenizer_profile_id: 1,
-            token_block_ref: 1,
-            token_offset,
-            token_count,
-            byte_alignment_ref,
-            source_value_hash_ref,
-            flags: 0,
-            checksum: 0,
-        }
-    }
-
-    fn test_token_sequence_pack(
-        sequence_pack_id: u64,
-        token_offset: u64,
-        token_count: u32,
-        loss_mask_ref: u32,
-    ) -> TokenSequencePackV1 {
-        TokenSequencePackV1 {
-            sequence_pack_id,
-            tokenizer_profile_id: 1,
-            training_profile_ref: 0,
-            token_block_ref: 1,
-            token_offset,
-            token_count,
-            source_span_count: 0,
-            first_source_span_ref: 0,
-            loss_mask_ref,
-            attention_mask_ref: 0,
-            position_ids_ref: 0,
-            labels_ref: 0,
-            split_ref: 0,
-            sample_weight_ppm: 1_000_000,
-            flags: 0,
-            checksum: 0,
-        }
-    }
-
-    fn training_sections(
-        include_profile: bool,
-        sample: TrainingSampleEntryV1,
-    ) -> Vec<CoveAiWritableSection> {
-        training_sections_with_records(
-            include_profile.then(test_training_profile),
-            test_dataset_split(),
-            test_dedup_group(),
-            test_training_epoch_plan(),
-            sample,
-        )
-    }
-
-    fn training_sections_with_records(
-        profile: Option<TrainingProfileV1>,
-        split: DatasetSplitV1,
-        dedup_group: DedupGroupV1,
-        epoch_plan: TrainingEpochPlanV1,
-        sample: TrainingSampleEntryV1,
-    ) -> Vec<CoveAiWritableSection> {
-        let mut sections = Vec::new();
-        if let Some(profile) = profile {
-            sections.push(coveai_binary_section(
-                20,
-                SectionKind::AiTrainingProfile,
-                PrimaryProfile::CoveTrain,
-                encode_records([encode_training_profile(profile).unwrap()]).unwrap(),
-            ));
-        }
-        sections.push(coveai_binary_section(
-            21,
-            SectionKind::AiTrainingSplitDedupEpoch,
-            PrimaryProfile::CoveTrain,
-            encode_records([
-                encode_dataset_split(split).unwrap(),
-                encode_dedup_group(dedup_group).unwrap(),
-                encode_training_epoch_plan(epoch_plan).unwrap(),
-            ])
-            .unwrap(),
-        ));
-        sections.push(coveai_binary_section(
-            22,
-            SectionKind::AiTrainingSampleIndex,
-            PrimaryProfile::CoveTrain,
-            encode_records([encode_training_sample_entry(sample).unwrap()]).unwrap(),
-        ));
-        sections
-    }
-
-    fn test_training_profile() -> TrainingProfileV1 {
-        TrainingProfileV1 {
-            training_profile_id: 1,
-            profile_name_ref: 0,
-            task_family: 1,
-            modality_mask: 1,
-            source_snapshot_ref: 0,
-            map_profile_ref: 0,
-            chunk_profile_ref: 0,
-            tokenizer_profile_ref: 0,
-            vector_space_ref: 0,
-            multimodal_sequence_profile_ref: 0,
-            split_policy_ref: 0,
-            sampling_policy_ref: 0,
-            dedup_policy_ref: 0,
-            quality_policy_ref: 0,
-            license_policy_ref: 0,
-            redaction_policy_ref: 0,
-            default_generator_provenance_ref: 0,
-            reproducibility_class: 1,
-            flags: 0,
-            checksum: 0,
-        }
-    }
-
-    fn test_training_sample(
-        sample_id: u64,
-        training_profile_id: u32,
-        split_ref: u32,
-        dedup_group_ref: u32,
-    ) -> TrainingSampleEntryV1 {
-        TrainingSampleEntryV1 {
-            sample_id,
-            training_profile_id,
-            example_kind: 1,
-            split_ref,
-            source_ref: 0,
-            evidence_ref: 0,
-            input_ref: 0,
-            target_ref: 0,
-            label_ref: 0,
-            metadata_ref: 0,
-            token_sequence_pack_ref: 0,
-            multimodal_sequence_pack_ref: 0,
-            vector_ref: 0,
-            quality_score_ppm: 900_000,
-            sample_weight_ppm: 1_000_000,
-            dedup_group_ref,
-            license_ref: 0,
-            policy_ref: 0,
-            teacher_model_ref: 0,
-            generator_provenance_ref: 0,
-            judge_generator_provenance_ref: 0,
-            label_generator_provenance_ref: 0,
-            flags: 0,
-            checksum: 0,
-        }
-    }
-
-    fn test_dataset_split() -> DatasetSplitV1 {
-        DatasetSplitV1 {
-            split_id: 1,
-            split_name_ref: 0,
-            split_method: 1,
-            source_snapshot_ref: 0,
-            filter_policy_ref: 0,
-            seed: 42,
-            hash_function_ref: 0,
-            stratification_path_ref: 0,
-            grouping_ref: 0,
-            ordering_policy_ref: 0,
-            dedup_policy_ref: 0,
-            sample_count: 1,
-            first_sample_ref: 1,
-            flags: 0,
-            checksum: 0,
-        }
-    }
-
-    fn test_dedup_group() -> DedupGroupV1 {
-        DedupGroupV1 {
-            dedup_group_id: 1,
-            dedup_policy_ref: 0,
-            canonical_member_sample_id: 1,
-            similarity_kind: 0,
-            dedup_authority: 0,
-            confidence_ppm: 1_000_000,
-            first_member_ref: 1,
-            member_count: 1,
-            flags: 0,
-            checksum: 0,
-        }
-    }
-
-    fn test_training_epoch_plan() -> TrainingEpochPlanV1 {
-        TrainingEpochPlanV1 {
-            epoch_plan_id: 1,
-            training_profile_id: 1,
-            split_ref: 1,
-            seed: 42,
-            permutation_kind: 0,
-            rng_algorithm_ref: 0,
-            permutation_function_ref: 0,
-            shard_count: 0,
-            first_shard_ref: 0,
-            shard_ref_count: 0,
-            flags: 0,
-            checksum: 0,
-        }
-    }
-
-    fn provenance_sections(
-        include_model_actor: bool,
-        generator: GeneratorProvenanceV1,
-    ) -> Vec<CoveAiWritableSection> {
-        provenance_sections_with_records(
-            include_model_actor.then(test_model_actor),
-            test_decoding_profile(),
-            test_human_review(),
-            generator,
-        )
-    }
-
-    fn provenance_sections_with_records(
-        model_actor: Option<ModelActorDescriptorV1>,
-        decoding: GenerationDecodingProfileV1,
-        human_review: HumanReviewEntryV1,
-        generator: GeneratorProvenanceV1,
-    ) -> Vec<CoveAiWritableSection> {
-        provenance_sections_with_label_pair(
-            model_actor,
-            decoding,
-            human_review,
-            generator,
-            test_training_label(),
-            test_preference_pair(),
-        )
-    }
-
-    fn provenance_sections_with_label_pair(
-        model_actor: Option<ModelActorDescriptorV1>,
-        decoding: GenerationDecodingProfileV1,
-        human_review: HumanReviewEntryV1,
-        generator: GeneratorProvenanceV1,
-        label: TrainingLabelEntryV1,
-        pair: PreferencePairEntryV1,
-    ) -> Vec<CoveAiWritableSection> {
-        let mut generator_records = Vec::new();
-        if let Some(model_actor) = model_actor {
-            generator_records.push(encode_model_actor(model_actor).unwrap());
-        }
-        generator_records.push(encode_generation_decoding_profile(decoding).unwrap());
-        generator_records.push(encode_human_review(human_review).unwrap());
-        generator_records.push(encode_generator_provenance(generator).unwrap());
-        vec![
-            coveai_binary_section(
-                30,
-                SectionKind::AiGeneratorProvenance,
-                PrimaryProfile::CoveTrain,
-                encode_records(generator_records).unwrap(),
-            ),
-            coveai_binary_section(
-                31,
-                SectionKind::AiLabelPreference,
-                PrimaryProfile::CoveTrain,
-                encode_records([
-                    encode_training_label_entry(label).unwrap(),
-                    encode_preference_pair_entry(pair).unwrap(),
-                ])
-                .unwrap(),
-            ),
-        ]
-    }
-
-    fn test_model_actor() -> ModelActorDescriptorV1 {
-        ModelActorDescriptorV1 {
-            model_actor_id: 1,
-            model_namespace_ref: 0,
-            model_name_ref: 0,
-            model_version_ref: 0,
-            model_checkpoint_digest_ref: 0,
-            provider_ref: 0,
-            endpoint_ref: 0,
-            endpoint_version_ref: 0,
-            model_family_ref: 0,
-            modality_mask: 1,
-            license_ref: 0,
-            policy_ref: 0,
-            flags: 0,
-            checksum: 0,
-        }
-    }
-
-    fn test_decoding_profile() -> GenerationDecodingProfileV1 {
-        GenerationDecodingProfileV1 {
-            decoding_profile_id: 1,
-            temperature_micros: 0,
-            top_p_micros: 1_000_000,
-            top_k: 0,
-            seed: 42,
-            max_output_tokens: 128,
-            stop_sequence_ref: 0,
-            safety_policy_ref: 0,
-            deterministic_claim: 0,
-            flags: 0,
-            checksum: 0,
-        }
-    }
-
-    fn test_human_review() -> HumanReviewEntryV1 {
-        HumanReviewEntryV1 {
-            human_review_id: 1,
-            review_kind: 1,
-            reviewer_role_ref: 0,
-            review_time_us: 123,
-            rating_ppm: 1_000_000,
-            notes_ref: 0,
-            policy_ref: 0,
-            flags: 0,
-            checksum: 0,
-        }
-    }
-
-    fn test_generator_provenance(
-        generator_provenance_id: u64,
-        model_actor_ref: u32,
-    ) -> GeneratorProvenanceV1 {
-        GeneratorProvenanceV1 {
-            generator_provenance_id,
-            generator_kind: 1,
-            model_actor_ref,
-            prompt_template_ref: 0,
-            decoding_profile_ref: 1,
-            toolchain_ref: 0,
-            source_input_ref: 0,
-            source_context_ref: 0,
-            source_sample_ref: 0,
-            parent_generator_provenance_ref: 0,
-            generation_time_us: 123,
-            confidence_ppm: 900_000,
-            human_review_ref: 1,
-            policy_ref: 0,
-            reproducibility_class: 1,
-            flags: 0,
-            checksum: 0,
-        }
-    }
-
-    fn test_training_label() -> TrainingLabelEntryV1 {
-        TrainingLabelEntryV1 {
-            label_id: 1,
-            label_kind: 1,
-            label_authority: 3,
-            label_payload_ref: 0,
-            generator_provenance_ref: 1,
-            human_review_ref: 1,
-            confidence_ppm: 900_000,
-            evidence_ref: 0,
-            policy_ref: 0,
-            flags: 0,
-            checksum: 0,
-        }
-    }
-
-    fn test_preference_pair() -> PreferencePairEntryV1 {
-        PreferencePairEntryV1 {
-            preference_pair_id: 1,
-            prompt_ref: 0,
-            chosen_ref: 0,
-            rejected_ref: 0,
-            judge_generator_provenance_ref: 1,
-            human_review_ref: 1,
-            preference_strength_ppm: 700_000,
-            confidence_ppm: 900_000,
-            evidence_ref: 0,
-            policy_ref: 0,
-            flags: 0,
-            checksum: 0,
-        }
-    }
-
-    fn phase7_sections(
-        include_asset: bool,
-        pack: MultimodalSequencePackV1,
-        elements: Vec<MultimodalSequenceElementV1>,
-    ) -> Vec<CoveAiWritableSection> {
-        phase7_sections_with_tensor(
-            test_tensor_layout(),
-            test_device_transfer_hint(),
-            include_asset,
-            pack,
-            elements,
-        )
-    }
-
-    fn phase7_sections_with_tensor(
-        tensor_layout: TensorLayoutDescriptorV1,
-        transfer_hint: DeviceTransferHintV1,
-        include_asset: bool,
-        pack: MultimodalSequencePackV1,
-        elements: Vec<MultimodalSequenceElementV1>,
-    ) -> Vec<CoveAiWritableSection> {
-        let mut sections = vec![coveai_binary_section(
-            40,
-            SectionKind::AiTensorLayout,
-            PrimaryProfile::CoveMmseq,
-            encode_records([
-                encode_tensor_layout(tensor_layout).unwrap(),
-                encode_device_transfer_hint(transfer_hint).unwrap(),
-            ])
-            .unwrap(),
-        )];
-        if include_asset {
-            sections.push(coveai_binary_section(
-                41,
-                SectionKind::AiAssetManifest,
-                PrimaryProfile::CoveMmseq,
-                encode_records([encode_ai_asset_ref(test_asset_ref()).unwrap()]).unwrap(),
-            ));
-        }
-        sections.push(coveai_binary_section(
-            42,
-            SectionKind::AiMultimodalSequence,
-            PrimaryProfile::CoveMmseq,
-            encode_records(
-                std::iter::once(encode_multimodal_sequence_pack(pack).unwrap()).chain(
-                    elements
-                        .into_iter()
-                        .map(|element| encode_multimodal_sequence_element(element).unwrap()),
-                ),
-            )
-            .unwrap(),
-        ));
-        sections
-    }
-
-    fn phase7_sections_with_asset(
-        asset: AiAssetRefV1,
-        pack: MultimodalSequencePackV1,
-        elements: Vec<MultimodalSequenceElementV1>,
-    ) -> Vec<CoveAiWritableSection> {
-        let mut sections = phase7_sections_with_tensor(
-            test_tensor_layout(),
-            test_device_transfer_hint(),
-            false,
-            pack,
-            elements,
-        );
-        sections.insert(
-            1,
-            coveai_binary_section(
-                41,
-                SectionKind::AiAssetManifest,
-                PrimaryProfile::CoveMmseq,
-                encode_records([encode_ai_asset_ref(asset).unwrap()]).unwrap(),
-            ),
-        );
-        sections
-    }
-
-    fn test_tensor_layout() -> TensorLayoutDescriptorV1 {
-        TensorLayoutDescriptorV1 {
-            tensor_layout_id: 1,
-            layout_name_ref: 0,
-            rank: 2,
-            dtype: 0,
-            byte_order: 1,
-            shape_ref: 0,
-            stride_ref: 0,
-            storage_offset_elements: 0,
-            layout_kind: 0,
-            memory_alignment_bytes: 64,
-            preferred_page_alignment_bytes: 4096,
-            tile_shape_ref: 0,
-            block_shape_ref: 0,
-            quantization_profile_ref: 0,
-            sparsity_profile_ref: 0,
-            framework_compatibility_ref: 0,
-            device_affinity_hint: 0,
-            flags: 0,
-            checksum: 0,
-        }
-    }
-
-    fn test_device_transfer_hint() -> DeviceTransferHintV1 {
-        DeviceTransferHintV1 {
-            transfer_hint_id: 1,
-            target_kind: 0,
-            preferred_alignment_bytes: 64,
-            preferred_chunk_bytes: 4096,
-            pinned_memory_required: 0,
-            contiguous_required: 1,
-            zero_copy_possible: 1,
-            runtime_registry_binding_ref: 0,
-            flags: 0,
-            checksum: 0,
-        }
-    }
-
-    fn test_asset_ref() -> AiAssetRefV1 {
-        AiAssetRefV1 {
-            asset_ref_id: 1,
-            parent_asset_ref: 0,
-            asset_kind: 2,
-            uri_ref: 0,
-            embedded_section_ref: 0,
-            media_type_ref: 0,
-            byte_length: 0,
-            digest_ref: 0,
-            width: 64,
-            height: 64,
-            duration_us: 0,
-            sample_rate_hz: 0,
-            channel_count: 0,
-            decode_profile_ref: 0,
-            preprocessing_profile_ref: 0,
-            transform_profile_ref: 0,
-            transform_digest_ref: 0,
-            tensor_layout_ref: 1,
-            license_ref: 0,
-            policy_ref: 0,
-            flags: 0,
-            checksum: 0,
-        }
-    }
-
-    fn test_multimodal_pack(sequence_pack_id: u64, element_count: u32) -> MultimodalSequencePackV1 {
-        MultimodalSequencePackV1 {
-            sequence_pack_id,
-            training_profile_id: 0,
-            tokenizer_profile_id: 0,
-            sequence_profile_ref: 0,
-            element_count,
-            first_element_ref: if element_count == 0 { 0 } else { 1 },
-            split_ref: 0,
-            sample_weight_ppm: 1_000_000,
-            loss_mask_ref: 0,
-            attention_mask_ref: 0,
-            position_map_ref: 0,
-            label_ref: 0,
-            source_snapshot_ref: 0,
-            evidence_ref: 0,
-            generator_provenance_ref: 0,
-            flags: 0,
-            checksum: 0,
-        }
-    }
-
-    fn test_multimodal_element(
-        element_id: u64,
-        sequence_pack_id: u64,
-        ordinal: u32,
-        asset_ref: u64,
-        tensor_ref: u64,
-    ) -> MultimodalSequenceElementV1 {
-        MultimodalSequenceElementV1 {
-            element_id,
-            sequence_pack_id,
-            ordinal,
-            element_kind: 2,
-            modality: 2,
-            role: 1,
-            tokenized_span_ref: 0,
-            token_sequence_pack_ref: 0,
-            asset_ref,
-            tensor_ref,
-            vector_ref: 0,
-            byte_start: 0,
-            byte_length: 0,
-            time_start_us: 0,
-            time_duration_us: 0,
-            position_stream_ref: 0,
-            evidence_ref: 0,
-            policy_ref: 0,
-            flags: 0,
-            checksum: 0,
-        }
-    }
-}
+#[cfg(test)]
+mod tests;

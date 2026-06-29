@@ -44,7 +44,10 @@ surfaces:
 - **AI companion sidecars:** optional `.coveai` (`CVA2`) and `.covev`
   (`CVV2`) artifacts can carry chunk, token, vector, training, multimodal, and
   generator-provenance metadata for selected AI operations. Baseline COVE reads
-  do not depend on those sidecars.
+  do not depend on those sidecars. The training archive adoption layer positions
+  COVE-AI as the governed archive of record for SFT/RAG/training data, with
+  Python, Hugging Face, PyTorch, JSONL, Parquet, Arrow, and WebDataset interop
+  described in [`docs/ai-training-archive.md`](./docs/ai-training-archive.md).
 
 ## Current Status
 
@@ -126,9 +129,10 @@ mandatory feature pile:
   candidate generation, reviewed equivalences, redacted evidence, and replay
   checks support deterministic entity-resolution workflows.
 - **AI companion metadata:** COVE-AI validates optional `.coveai` and `.covev`
-  sidecars for provider-free AI workflows such as FileCode embeddings, exact
-  flat semantic search, chunk/token/training metadata, multimodal sequence
-  descriptors, and generator audit records.
+  sidecars for provider-free AI workflows such as FileCode embeddings,
+  exact/fallback-labeled vector search, chunk/token/training metadata,
+  multimodal sequence descriptors, generator audit records, and governed
+  training archive import/verify/stream/export workflows.
 - **Acceleration and planning:** COVE-COVERAGE, COVE-I, COVX, COVE-L, COVE-E,
   COVE-CACHE, COVE-R, range planning, and zero-copy maps help readers skip work
   safely when their contracts prove equivalence.
@@ -402,12 +406,15 @@ metadata is optional for ordinary reads.
 
 The current reference implementation is provider-free: it validates supplied
 sidecars and can build deterministic local `.covev` vectors, but it does not
-call network embedding, tokenizer, or model providers. Exact flat FileCode
-vector scan is implemented; unsupported ANN payloads are treated as descriptor
-metadata unless a future implementation adds them behind explicit support.
+call network embedding, tokenizer, or model providers. Exact flat vector scan
+is the semantic fallback, and Cove-owned in-process ANN candidate generation is
+available for supported HNSW, IVF-flat, IVF-PQ, DiskANN-style, and
+Vamana-style index requests with explicit approximation and fallback reporting.
 
 Start with [`docs/cove-ai.md`](./docs/cove-ai.md) for the public guide and
-[`spec/09-ai/`](./spec/09-ai/) for normative details.
+[`docs/ai-training-archive.md`](./docs/ai-training-archive.md) for the Python,
+import/export, trainer, and showcase workflows. Normative details live in
+[`spec/09-ai/`](./spec/09-ai/).
 
 ### Delta Snapshots
 
@@ -518,8 +525,9 @@ implement the baseline tabular archive path.
   projection-backed table/graph profiles, with materialized readback as the
   authority and proof-gated optimized execution.
 - **COVE-AI**: optional `.coveai` and `.covev` companion artifacts for
-  validated AI metadata, FileCode vectors, exact flat semantic search,
-  chunk/token/training/multimodal descriptors, and generator audit records.
+  validated AI metadata, FileCode vectors, exact and approximate vector search,
+  chunk/token/training/multimodal descriptors, generator audit records, and
+  governed training archive interop.
 - **COVE-CX**: registered codec-extension framework with stable COVE-owned v2
   bitstream identities for FSST-style UTF-8, ALP-style floats, and
   FastLanes-style integers, plus mandatory fallback-equivalence validation.
@@ -568,6 +576,10 @@ Important paths:
 - [`docs/cove-ai.md`](./docs/cove-ai.md): public guide for optional COVE-AI
   `.coveai` and `.covev` sidecars, CLI commands, CoveQL-AI methods, and
   conformance gates.
+- [`docs/ai-training-archive.md`](./docs/ai-training-archive.md): adoption
+  guide for COVE-AI as a governed training archive of record, including import
+  schemas, Python APIs, trainer examples, exports, policy diagnostics, and
+  benchmarks.
 - [`docs/proposals/coveql-object-query-language.md`](./docs/proposals/coveql-object-query-language.md):
   CoveQL/Object proposal and conformance decisions.
 - [`docs/proposals/coveql-query-profiles.md`](./docs/proposals/coveql-query-profiles.md):

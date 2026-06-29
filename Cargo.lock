@@ -671,6 +671,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
+name = "cove-ai-adapters"
+version = "0.1.0"
+dependencies = [
+ "arrow-array",
+ "arrow-ipc",
+ "arrow-schema",
+ "cove-core",
+ "parquet",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "cove-arrow"
 version = "0.1.0"
 dependencies = [
@@ -692,6 +705,7 @@ dependencies = [
  "arrow-array",
  "arrow-ipc",
  "arrow-schema",
+ "cove-ai-adapters",
  "cove-arrow",
  "cove-cache",
  "cove-cli",
@@ -720,6 +734,7 @@ version = "0.1.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
+ "cove-ai-adapters",
  "cove-cache",
  "cove-convert-parquet",
  "cove-core",
@@ -864,6 +879,7 @@ dependencies = [
 name = "cove-engine"
 version = "0.1.0"
 dependencies = [
+ "arrow-array",
  "cove-core",
  "cove-datafusion",
  "cove-runtime",
@@ -961,9 +977,7 @@ dependencies = [
 name = "cove-reader"
 version = "0.1.0"
 dependencies = [
- "arrow-array",
  "cove-core",
- "cove-datafusion",
 ]
 
 [[package]]

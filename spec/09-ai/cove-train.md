@@ -29,6 +29,11 @@ COVE-TRAIN payloads live in `AI_TRAINING_PROFILE`,
 - Preserve deterministic sample order when an epoch plan declares one.
 - Export policy-withheld samples as rejected/withheld diagnostics, not as
   silently skipped rows, when reproducibility or auditability is claimed.
+- JSON, JSONL, HF-style JSONL, Arrow IPC, Parquet, and WebDataset-style shard
+  exports MUST preserve the same sample ordering and policy-withheld
+  diagnostics. Arrow, Parquet, and WebDataset exports are interoperability
+  artifacts; they MUST NOT become sample truth authority and MUST carry enough
+  record metadata for audit back to the COVE-AI sidecar.
 
 ### 83.70.2 Profiles and Samples
 

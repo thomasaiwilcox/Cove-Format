@@ -38,10 +38,22 @@ avoided, tokenization cost avoided, chunk reuse ratio, training stream
 throughput, multimodal assembly latency, RAG retrieval latency, snapshot
 verification cost, tensor zero-copy/materialization rates, storage overhead,
 stale sidecar rejection, redaction leakage checks, split reproducibility, and
-generator filtering correctness. ANN benchmarks MUST report exactness,
-false-negative policy, quantization score-space declarations, post-filtered
-top-k incompleteness, and fallback-to-exact behavior when exact vectors are
-available and query policy permits it.
+generator filtering correctness. The provider-free reference harness currently
+generates a deterministic indexed `events-ai.covev` sidecar and reports vector
+build latency, sidecar parse latency, exact vector-search latency, internal ANN
+candidate-search latency, recall versus exact scan, exact-fallback rate,
+filtered top-k completeness, payload bytes read, and policy-withheld counts.
+It also includes an `ai-training-archive` group for the adoption workflow:
+JSONL import throughput, archive verification throughput, sample streaming
+throughput, export throughput, payload bytes read, policy-withheld counts,
+context/vector latency placeholders where the archive contains those records,
+and deterministic report schema checks. These benchmarks treat HF JSONL,
+Parquet, Arrow, WebDataset, and PyTorch/Hugging Face loaders as interop/export
+paths; COVE-AI remains the archive authority.
+ANN benchmarks MUST report exactness, false-negative policy, quantization
+score-space declarations, post-filtered top-k incompleteness, and
+fallback-to-exact behavior when exact vectors are available and query policy
+permits it.
 
 Benchmark artifacts follow COVE v2.0 feature-scope rules and extension fallback policy. The conformance command set remains:
 

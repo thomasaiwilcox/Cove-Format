@@ -32,19 +32,22 @@ The reference implementation exposes the provider-free COVE-AI reference
 surface through release-gated fixtures: registries, scoped requiredness
 integration, `.coveai`/`.covev` structural validation, common descriptor
 parsing, strict `MAP_AI_*` slot-policy validation, `inspect --ai` summaries,
-COVE-VEC FileCode vector sidecar writing, exact flat FileCode vector search,
-FileCode embedding lookup, descriptor-bundle writing for all modeled AI
-descriptor families, CoveQL-AI `.embedding(fileCode)`, `.similar(fileCode, k)`,
-advisory `.hybrid(fileCode, k)` / `.rerank(fileCode, k)`, and
-descriptor-backed `.chunks()`, `.tokens()`, `.context()`, `.asPromptContext()`,
-`.trainingSamples()`, `.split()`, `.pack()`, `.multimodal()`, and
-`.generatorAudit()` projections against supplied sidecars. Descriptor metadata
-is exact; protected payload text/assets remain withheld unless a
-profile-specific operation validates direct exposure.
+COVE-VEC vector sidecar writing, exact flat vector search over FileCode,
+chunk, object-state, and training-sample bindings, vector-index descriptor
+selection/fallback labels, internal HNSW, IVF-flat, IVF-PQ, DiskANN-style, and
+Vamana-style candidate generation, FileCode and vector-ref embedding lookup,
+COVM digest-bound AI sidecar references, descriptor-bundle writing for all modeled
+AI descriptor families, CoveQL-AI `.embedding()`, `.similar()`, advisory
+`.hybrid()` / `.rerank()`, and descriptor-backed `.chunks()`, `.tokens()`,
+`.context()`, `.asPromptContext()`, `.trainingSamples()`, `.split()`,
+`.pack()`, `.multimodal()`, and `.generatorAudit()` projections against
+supplied sidecars. Descriptor metadata is exact; payload text, tokens, vectors,
+assets, tensors, and training bytes are exposed only through policy-gated AI
+payload leases or validated source-bound reconstruction.
 
-Network embedding, tokenizer, or model providers and executable ANN index
-payloads are separate extension claims, not part of the provider-free reference
-surface.
+Network embedding, tokenizer, or model providers and persisted external ANN
+payload formats beyond Cove's provider-free candidate generators are separate
+extension claims.
 
 Level claims do not imply production lakehouse catalog integration. The reference implementation's lakehouse evidence is fixture-backed visibility and overlay validation; Iceberg, Delta, Hudi, Hive, Unity, or other catalog adapters must be named as separate engine/table-format claims.
 

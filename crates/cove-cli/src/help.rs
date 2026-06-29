@@ -10,6 +10,7 @@ pub(crate) enum HelpTopic {
     Convert,
     Map,
     Vec,
+    Ai,
     Train,
 }
 
@@ -29,6 +30,7 @@ pub(crate) fn usage(topic: HelpTopic) -> String {
         HelpTopic::Convert => convert_usage(),
         HelpTopic::Map => map_usage(),
         HelpTopic::Vec => vec_usage(),
+        HelpTopic::Ai => ai_usage(),
         HelpTopic::Train => train_usage(),
     }
     .into()
@@ -39,6 +41,7 @@ fn global_usage() -> &'static str {
   cove examples [--json]
   cove showcase customer360 --out <dir> [--profile quick|standard|publication] [--force] [--json]
   cove showcase proof-suite --out <dir> [--scenario customer360|claims|catalog|all] [--profile quick|standard|publication] [--force] [--json]
+  cove showcase ai-training --out <dir> [--profile quick|standard|publication] [--force] [--json]
   cove doctor [--json] <file>
   cove inspect [--queries] [--performance] [--ai] [--json] <file>
   cove inspect [--json] [--sections stats,dictionary,execution,indexes,optional] <file...>
@@ -47,8 +50,13 @@ fn global_usage() -> &'static str {
   cove query [options] --query-file <path|-> [file]
   cove convert <parquet|arrow|orc|csv|report> ...
   cove validate ...
-  cove vec build --out <vectors.covev> --dimension <n> --file-code <u32>... (--deterministic | --payload <f32le.bin>)
-  cove train export <training.coveai|training.covev> [--format json|jsonl] [--out <path>] [--profile <id>] [--split <id>]
+  cove vec build --out <vectors.covev> --dimension <n> --file-code <u32>... (--deterministic | --payload <f32le.bin>) [--index exact|hnsw|ivf-flat|ivf-pq|diskann|vamana]
+  cove ai import jsonl <input.jsonl> --out <training.coveai> --schema instruction|chat|pretrain|preference|rag [--dry-run] [--publish-covm]
+  cove ai verify <training.coveai|manifest.covm> [--policy-report] [--json]
+  cove ai stream <training.coveai|manifest.covm> --format jsonl|hf-jsonl|webdataset [--split train|validation|test] [--include-payloads]
+  cove ai diff <old.coveai> <new.coveai> [--keys sample_id] [--report diff.json]
+  cove ai export <chunks|tokens|vectors|training|multimodal|assets|tensors> <sidecar> [--include-payloads] [--format json|jsonl|hf-jsonl|arrow|parquet|webdataset]
+  cove train export <training.coveai|training.covev> [--include-payloads] [--format json|jsonl|hf-jsonl|arrow|parquet|webdataset] [--out <path>] [--profile <id>] [--split <id>] [--epoch-plan <id>]
   cove dump ...
   cove map <validate|preview|plan-keys|candidates|review|aliases|replay|convert|build|delta|publish|doctor|suggest|parity|explain|diff|project|test> ...
   cove export arrow [--query '<coveql>'] ...
@@ -64,10 +72,14 @@ Examples:
   cove examples
   cove showcase customer360 --profile quick --out examples/customer360 --force
   cove showcase proof-suite --scenario all --profile quick --out target/cove-proof-suite --force
+  cove showcase ai-training --profile quick --out target/cove-ai-training --force
   cove doctor people.cove
   cove inspect --queries --performance people.cove
   cove inspect --ai vectors.covev
   cove vec build --out vectors.covev --dimension 3 --file-code 1 --file-code 2 --deterministic
+  cove ai import jsonl samples.jsonl --out training.coveai --schema instruction --publish-covm
+  cove ai verify training.coveai --policy-report
+  cove ai export tokens vectors.covev --include-payloads --format jsonl
   cove train export training.coveai --format jsonl
   cove convert parquet source.parquet output.cove
   cove validate --semantic output.cove
@@ -84,7 +96,7 @@ Examples:
 }
 
 fn query_usage() -> &'static str {
-    "Usage:\n  cove query [options] [file.cove|manifest.covm] '<coveql>'\n  cove query [options] --query-file <path|-> [file.cove|manifest.covm]\n\nOutput options:\n  --format table|json|jsonl|csv\n  --take n\n  --max-cell-width n\n  --json-diagnostics\n\nExecution options:\n  --engine auto|materialized|physical|compare|kernel\n  --explain [public|developer|proof|coded|ai|forensic]\n  --perf-report\n  --strict-performance\n  --no-auto-sidecars\n  --batch-size n\n\nDelta snapshot options:\n  --dataset dir\n  --as-of-csn n\n  --as-of-commit-us n\n  --delta-plan\n  --delta-plan-json\n\nInputs and sidecars:\n  --mapping file.covemap\n  --external-table name=path.csv|json|jsonl\n  --member manifest-uri=path\n  --covi file.covi\n  --covx file.covx\n  --coverage-plan file\n  --coverage-proof file\n  --coverage-set file\n  --layout-plan file\n  --scan-split-index file\n  --page-cluster-directory file\n  --zero-copy-buffer-map file\n  --coverage-cache file\n  --cove-e file\n  --cove-ai file.covev\n\nGraph traversal:\n  --enable-graph-traversal\n  --max-graph-depth n\n  --max-graph-paths n\n  --max-graph-fanout n\n\nAuthority model:\n  Materialized CoveQL readback is the semantic authority. Auto, physical, kernel,\n  and sidecar-backed execution may accelerate a query only when validated metadata\n  proves equivalence; otherwise the CLI falls back or rejects when strict mode is set.\n\nExamples:\n  cove query events.cove 'table(events).where(score >= 20).select(id, score)'\n  cove query --format jsonl people.cove 'table(people).select(score, status).take(5)'\n  cove query dataset.covm --dataset bundle --as-of-csn 100 --delta-plan 'object(Thing).take(10)'\n  cove query --engine compare --perf-report events.cove 'table(events).where(score >= 20).select(id, score)'\n  cove query --external-table weights=weights.jsonl events.cove 'table(events) as e.join(table(weights) as w, on: e.id == w.id).select(id: e.id, score: e.score, weight: w.weight)'\n  cove query --cove-ai vectors.covev events.cove '# profiles: table, ai\\ntable(events).similar(fileCode: 10, k: 5)'\n  printf 'table(events).take(5)' | cove query --query-file - events.cove"
+    "Usage:\n  cove query [options] [file.cove|manifest.covm] '<coveql>'\n  cove query [options] --query-file <path|-> [file.cove|manifest.covm]\n\nOutput options:\n  --format table|json|jsonl|csv\n  --take n\n  --max-cell-width n\n  --json-diagnostics\n\nExecution options:\n  --engine auto|materialized|physical|compare|kernel\n  --explain [public|developer|proof|coded|ai|forensic]\n  --perf-report\n  --strict-performance\n  --no-auto-sidecars\n  --batch-size n\n\nDelta snapshot options:\n  --dataset dir\n  --as-of-csn n\n  --as-of-commit-us n\n  --delta-plan\n  --delta-plan-json\n\nInputs and sidecars:\n  --mapping file.covemap\n  --external-table name=path.csv|json|jsonl\n  --member manifest-uri=path\n  --covi file.covi\n  --covx file.covx\n  --coverage-plan file\n  --coverage-proof file\n  --coverage-set file\n  --layout-plan file\n  --scan-split-index file\n  --page-cluster-directory file\n  --zero-copy-buffer-map file\n  --coverage-cache file\n  --cove-e file\n  --cove-ai file.covev\n\nGraph traversal:\n  --enable-graph-traversal\n  --max-graph-depth n\n  --max-graph-paths n\n  --max-graph-fanout n\n\nAuthority model:\n  Materialized CoveQL readback is the semantic authority. Auto, physical, kernel,\n  and sidecar-backed execution may accelerate a query only when validated metadata\n  proves equivalence; otherwise the CLI falls back or rejects when strict mode is set.\n  With auto sidecars enabled, sibling .coveai/.covev files are discovered for\n  selected COVE-AI operations.\n\nExamples:\n  cove query events.cove 'table(events).where(score >= 20).select(id, score)'\n  cove query --format jsonl people.cove 'table(people).select(score, status).take(5)'\n  cove query dataset.covm --dataset bundle --as-of-csn 100 --delta-plan 'object(Thing).take(10)'\n  cove query --engine compare --perf-report events.cove 'table(events).where(score >= 20).select(id, score)'\n  cove query --external-table weights=weights.jsonl events.cove 'table(events) as e.join(table(weights) as w, on: e.id == w.id).select(id: e.id, score: e.score, weight: w.weight)'\n  cove query --cove-ai vectors.covev events.cove '# profiles: table, ai\\ntable(events).similar(fileCode: 10, k: 5)'\n  printf 'table(events).take(5)' | cove query --query-file - events.cove"
 }
 
 fn inspect_usage() -> &'static str {
@@ -96,7 +108,7 @@ fn optimize_usage() -> &'static str {
 }
 
 fn showcase_usage() -> &'static str {
-    "Usage:\n  cove showcase customer360 --out <dir> [--profile quick|standard|publication] [--force] [--json]\n  cove showcase proof-suite --out <dir> [--scenario customer360|claims|catalog|all] [--profile quick|standard|publication] [--force] [--json]\n\nBehavior:\n  Generates deterministic showcase data. Customer 360 remains the approachable\n  data-science demo and now includes a true messy-source map-build proof bundle.\n  The proof suite generates Customer 360, claims/events, and catalog/vendor\n  scenarios with source tables, COVE-MAP files, verified COVE-O bundles,\n  COVE-T projections, COVE-I sidecars, COVM manifests, parity reports, and\n  Parquet comparison baselines.\n\nProfiles:\n  quick        Tiny checked-in/demo-sized data.\n  standard     Larger local benchmark data written under target/.\n  publication  Largest deterministic public-report profile.\n\nExamples:\n  cove showcase customer360 --profile quick --out examples/customer360 --force\n  cove showcase proof-suite --scenario all --profile quick --out target/cove-proof-suite --force\n  cove showcase customer360 --profile standard --out target/customer360-standard --force\n  cove inspect --queries --performance target/customer360-standard/customers.cove"
+    "Usage:\n  cove showcase customer360 --out <dir> [--profile quick|standard|publication] [--force] [--json]\n  cove showcase proof-suite --out <dir> [--scenario customer360|claims|catalog|all] [--profile quick|standard|publication] [--force] [--json]\n  cove showcase ai-training --out <dir> [--profile quick|standard|publication] [--force] [--json]\n\nBehavior:\n  Generates deterministic showcase data. Customer 360 remains the approachable\n  data-science demo and now includes a true messy-source map-build proof bundle.\n  The proof suite generates Customer 360, claims/events, and catalog/vendor\n  scenarios with source tables, COVE-MAP files, verified COVE-O bundles,\n  COVE-T projections, COVE-I sidecars, COVM manifests, parity reports, and\n  Parquet comparison baselines. The AI training showcase generates a governed\n  COVE-AI archive, COVM manifest, verification report, and HF/Parquet/WebDataset\n  exports for trainer integration examples.\n\nProfiles:\n  quick        Tiny checked-in/demo-sized data.\n  standard     Larger local benchmark data written under target/.\n  publication  Largest deterministic public-report profile.\n\nExamples:\n  cove showcase customer360 --profile quick --out examples/customer360 --force\n  cove showcase proof-suite --scenario all --profile quick --out target/cove-proof-suite --force\n  cove showcase ai-training --profile quick --out target/cove-ai-training --force\n  cove showcase customer360 --profile standard --out target/customer360-standard --force\n  cove inspect --queries --performance target/customer360-standard/customers.cove"
 }
 
 fn sidecar_usage() -> &'static str {
@@ -112,11 +124,15 @@ fn convert_usage() -> &'static str {
 }
 
 fn vec_usage() -> &'static str {
-    "Usage:\n  cove vec build --out <vectors.covev> --dimension <n> --file-code <u32>... (--deterministic | --payload <f32le.bin>) [--artifact-id <32-hex>] [--created-at-us <n>]\n\nBehavior:\n  Builds a CVV2 sidecar with dense f32 little-endian vectors, FileCode bindings,\n  payload refs, payload integrity, privacy summary, vector-space, vector-block,\n  and vector-directory records. Core does not call network embedding providers.\n\nExamples:\n  cove vec build --out vectors.covev --dimension 3 --file-code 1 --file-code 2 --deterministic\n  cove vec build --out vectors.covev --dimension 384 --file-code 10 --payload embeddings.f32le"
+    "Usage:\n  cove vec build --out <vectors.covev> --dimension <n> --file-code <u32>... (--deterministic | --payload <f32le-source.bin>) [--index exact|hnsw|ivf-flat|ivf-pq|diskann|vamana] [--metric cosine|dot|l2|l1] [--quantization none|int8|uint8|pq] [--seed <n>] [--ef <n>] [--ef-search <n>] [--ef-construction <n>] [--probes <n>] [--lists <n>] [--shard-count <n>] [--integrity-report <path>] [--artifact-id <32-hex>] [--created-at-us <n>]\n\nBehavior:\n  Builds a CVV2 sidecar from deterministic or supplied f32 little-endian source vectors.\n  The stored vector payload is dense Float32 for --quantization none, or local Int8,\n  UInt8, or PQ-code bytes for quantized builds. The sidecar includes FileCode bindings,\n  payload refs, payload integrity, privacy summary, vector-space, vector-block,\n  vector-directory, and optional vector-index records. Build/index parameters are\n  recorded in the optional integrity report. Core does not call network embedding\n  providers.\n\nExamples:\n  cove vec build --out vectors.covev --dimension 3 --file-code 1 --file-code 2 --deterministic\n  cove vec build --out vectors.covev --dimension 384 --file-code 10 --payload embeddings.f32le --index hnsw --metric dot"
+}
+
+fn ai_usage() -> &'static str {
+    "Usage:\n  cove ai import jsonl <input.jsonl> --out <training.coveai> --schema instruction|chat|pretrain|preference|rag [--split-policy deterministic] [--split-column name] [--dry-run] [--publish-covm]\n  cove ai import parquet <input.parquet> --out <training.coveai> --schema instruction|chat|pretrain|preference|rag [import options]\n  cove ai import hf <local-dataset-dir> --out <training.coveai> --schema instruction|chat|pretrain|preference|rag [import options]\n  cove ai verify <sidecar|manifest.covm> [--dataset dir] [--policy-report] [--json]\n  cove ai stream <sidecar|manifest.covm> --format jsonl|hf-jsonl|arrow|parquet|webdataset [--split train|validation|test] [--include-payloads] [--out <path>]\n  cove ai diff <old.coveai> <new.coveai> [--keys sample_id] [--report diff.json]\n  cove ai export <chunks|tokens|vectors|training|multimodal|assets|tensors> <sidecar> [--include-payloads] [--format json|jsonl|hf-jsonl|arrow|parquet|webdataset] [--out <path>] [--policy-report]\n\nBehavior:\n  Import workflows turn JSONL, local Hugging Face JSONL directories, and Parquet\n  datasets into self-contained COVE-AI training archives with deterministic\n  splits, policy diagnostics, and optional digest-bound COVM publication.\n  Verify and stream validate archives before exposing payloads through policy-gated\n  AI payload leases. Existing descriptor export remains available for chunks,\n  tokens, vectors, training, multimodal, assets, and tensors.\n\nExamples:\n  cove ai import jsonl samples.jsonl --out training.coveai --schema instruction --publish-covm\n  cove ai import jsonl samples.jsonl --schema instruction --dry-run\n  cove ai verify training.coveai --policy-report --json\n  cove ai stream training.coveai --format hf-jsonl --split train --include-payloads\n  cove ai diff old.coveai new.coveai --keys sample_id --report diff.json\n  cove ai export vectors vectors.covev --format parquet --out vectors.parquet"
 }
 
 fn train_usage() -> &'static str {
-    "Usage:\n  cove train export <training.coveai|training.covev> [--format json|jsonl] [--out <path>] [--profile <id>] [--split <id>]\n\nBehavior:\n  Validates the COVE-AI/COVE-VEC sidecar and exports COVE-TRAIN descriptor metadata.\n  The command does not read AI_PAYLOAD_BYTES directly; payload access remains policy-gated.\n  JSON output includes profiles, splits, dedup groups, epoch plans, labels, and samples.\n  JSONL output emits one sample descriptor per line for streaming pipelines.\n\nExamples:\n  cove train export training.coveai\n  cove train export training.coveai --format jsonl --out samples.jsonl\n  cove train export training.coveai --profile 1 --split 2"
+    "Usage:\n  cove train export <training.coveai|training.covev> [--include-payloads] [--format json|jsonl|hf-jsonl|arrow|parquet|webdataset] [--out <path>] [--profile <id>] [--split <id>] [--epoch-plan <id>] [--policy-report]\n\nBehavior:\n  Validates the COVE-AI/COVE-VEC sidecar and exports COVE-TRAIN records. Payload access remains policy-gated and withheld samples/payloads are diagnostic rows rather than silent skips. Arrow and Parquet write native table artifacts; WebDataset writes a tar shard with metadata and JSON sample members.\n\nExamples:\n  cove train export training.coveai\n  cove train export training.coveai --include-payloads --format jsonl --out samples.jsonl\n  cove train export training.coveai --format arrow --out samples.arrow\n  cove train export training.coveai --format webdataset --out samples.tar\n  cove train export training.coveai --profile 1 --split 2 --epoch-plan 7"
 }
 
 fn map_usage() -> &'static str {
