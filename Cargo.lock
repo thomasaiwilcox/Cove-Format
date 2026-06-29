@@ -977,9 +977,7 @@ dependencies = [
 name = "cove-reader"
 version = "0.1.0"
 dependencies = [
- "arrow-array",
  "cove-core",
- "cove-datafusion",
 ]
 
 [[package]]
