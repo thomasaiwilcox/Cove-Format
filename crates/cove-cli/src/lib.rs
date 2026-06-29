@@ -95,7 +95,7 @@ enum Command {
     Validate {
         args: Vec<String>,
     },
-    VecCommand {
+    Vector {
         args: Vec<String>,
     },
     Train {
@@ -280,7 +280,7 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<(), String> {
         ),
         Command::Convert { format, args } => run_convert(format, args),
         Command::Validate { args } => run_validate(args),
-        Command::VecCommand { args } => run_vec(args),
+        Command::Vector { args } => run_vec(args),
         Command::Train { args } => run_train(args),
         Command::InspectDetailed { args } => run_inspect_detailed(args),
         Command::Dump { args } => cove_dump::run_cli(args),
@@ -394,7 +394,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, String>
         {
             Ok(Command::Help(HelpTopic::Vec))
         }
-        "vec" => Ok(Command::VecCommand { args }),
+        "vec" => Ok(Command::Vector { args }),
         "train"
             if args
                 .first()
@@ -1527,11 +1527,11 @@ fn training_export_jsonl(
     Ok(out)
 }
 
-fn filtered_training_samples<'a>(
-    sidecar: &'a CoveAiFile,
+fn filtered_training_samples(
+    sidecar: &CoveAiFile,
     profile_filter: Option<u32>,
     split_filter: Option<u32>,
-) -> Vec<&'a cove_core::artifact::coveai::TrainingSampleEntryV1> {
+) -> Vec<&cove_core::artifact::coveai::TrainingSampleEntryV1> {
     sidecar
         .descriptor_tables
         .training_samples

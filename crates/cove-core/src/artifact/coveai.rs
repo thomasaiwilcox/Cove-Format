@@ -1090,15 +1090,15 @@ impl AiDescriptorTablesV1 {
             )?;
         }
         for pack in &self.token_sequence_packs {
-            pack.validate(
-                self,
-                &tokenizer_profile_ids,
-                &token_block_ids,
-                &payload_ref_ids,
-                &training_profile_ids,
-                &split_ids,
-                &tokenized_span_ids,
-            )?;
+            pack.validate(TokenSequencePackValidateRefs {
+                tables: self,
+                tokenizer_profile_ids: &tokenizer_profile_ids,
+                token_block_ids: &token_block_ids,
+                payload_ref_ids: &payload_ref_ids,
+                training_profile_ids: &training_profile_ids,
+                split_ids: &split_ids,
+                tokenized_span_ids: &tokenized_span_ids,
+            })?;
         }
         for profile in &self.training_profiles {
             profile.validate(
@@ -1118,19 +1118,19 @@ impl AiDescriptorTablesV1 {
             dedup_group.validate(&policy_ref_ids, &training_sample_ids)?;
         }
         for sample in &self.training_samples {
-            sample.validate(
-                &training_profile_ids,
-                &split_ids,
-                &dedup_group_ids,
-                &token_sequence_pack_ids,
-                &multimodal_sequence_pack_ids,
-                &vector_ref_ids,
-                &training_label_ids,
-                &generator_provenance_ids,
-                &payload_ref_ids,
-                &policy_ref_ids,
-                &model_actor_ids,
-            )?;
+            sample.validate(TrainingSampleValidateRefs {
+                training_profile_ids: &training_profile_ids,
+                split_ids: &split_ids,
+                dedup_group_ids: &dedup_group_ids,
+                token_sequence_pack_ids: &token_sequence_pack_ids,
+                multimodal_sequence_pack_ids: &multimodal_sequence_pack_ids,
+                vector_ref_ids: &vector_ref_ids,
+                training_label_ids: &training_label_ids,
+                generator_provenance_ids: &generator_provenance_ids,
+                payload_ref_ids: &payload_ref_ids,
+                policy_ref_ids: &policy_ref_ids,
+                model_actor_ids: &model_actor_ids,
+            })?;
         }
         for epoch_plan in &self.training_epoch_plans {
             epoch_plan.validate(&training_profile_ids, &split_ids, &payload_ref_ids)?;
@@ -1161,15 +1161,15 @@ impl AiDescriptorTablesV1 {
             review.validate(&string_ref_ids, &payload_ref_ids, &policy_ref_ids)?;
         }
         for provenance in &self.generator_provenance {
-            provenance.validate(
-                &generator_provenance_ids,
-                &model_actor_ids,
-                &decoding_profile_ids,
-                &human_review_ids,
-                &payload_ref_ids,
-                &policy_ref_ids,
-                &training_sample_ids,
-            )?;
+            provenance.validate(GeneratorProvenanceValidateRefs {
+                generator_provenance_ids: &generator_provenance_ids,
+                model_actor_ids: &model_actor_ids,
+                decoding_profile_ids: &decoding_profile_ids,
+                human_review_ids: &human_review_ids,
+                payload_ref_ids: &payload_ref_ids,
+                policy_ref_ids: &policy_ref_ids,
+                training_sample_ids: &training_sample_ids,
+            })?;
         }
         for tensor_layout in &self.tensor_layouts {
             tensor_layout.validate(&string_ref_ids, &payload_ref_ids)?;
@@ -1178,15 +1178,15 @@ impl AiDescriptorTablesV1 {
             transfer_hint.validate(&string_ref_ids)?;
         }
         for asset in &self.assets {
-            asset.validate(
-                &asset_ref_ids,
-                &tensor_layout_ids,
-                &section_ids,
-                &string_ref_ids,
-                &digest_ref_ids,
-                &transform_ids,
-                &policy_ref_ids,
-            )?;
+            asset.validate(AiAssetRefValidateRefs {
+                asset_ref_ids: &asset_ref_ids,
+                tensor_layout_ids: &tensor_layout_ids,
+                section_ids: &section_ids,
+                string_ref_ids: &string_ref_ids,
+                digest_ref_ids: &digest_ref_ids,
+                transform_ids: &transform_ids,
+                policy_ref_ids: &policy_ref_ids,
+            })?;
         }
         self.validate_multimodal_sequences(
             &training_profile_ids,
@@ -2964,17 +2964,27 @@ pub struct TokenSequencePackV1 {
     pub checksum: u32,
 }
 
+struct TokenSequencePackValidateRefs<'a> {
+    tables: &'a AiDescriptorTablesV1,
+    tokenizer_profile_ids: &'a BTreeSet<u32>,
+    token_block_ids: &'a BTreeSet<u32>,
+    payload_ref_ids: &'a BTreeSet<u32>,
+    training_profile_ids: &'a BTreeSet<u32>,
+    split_ids: &'a BTreeSet<u32>,
+    tokenized_span_ids: &'a BTreeSet<u64>,
+}
+
 impl TokenSequencePackV1 {
-    fn validate(
-        &self,
-        tables: &AiDescriptorTablesV1,
-        tokenizer_profile_ids: &BTreeSet<u32>,
-        token_block_ids: &BTreeSet<u32>,
-        payload_ref_ids: &BTreeSet<u32>,
-        training_profile_ids: &BTreeSet<u32>,
-        split_ids: &BTreeSet<u32>,
-        tokenized_span_ids: &BTreeSet<u64>,
-    ) -> Result<(), CoveError> {
+    fn validate(&self, refs: TokenSequencePackValidateRefs<'_>) -> Result<(), CoveError> {
+        let TokenSequencePackValidateRefs {
+            tables,
+            tokenizer_profile_ids,
+            token_block_ids,
+            payload_ref_ids,
+            training_profile_ids,
+            split_ids,
+            tokenized_span_ids,
+        } = refs;
         if self.sequence_pack_id == 0 {
             return Err(CoveError::BadSection(
                 "TokenSequencePackV1 sequence_pack_id must be non-zero".into(),
@@ -3248,21 +3258,35 @@ pub struct TrainingSampleEntryV1 {
     pub checksum: u32,
 }
 
+struct TrainingSampleValidateRefs<'a> {
+    training_profile_ids: &'a BTreeSet<u32>,
+    split_ids: &'a BTreeSet<u32>,
+    dedup_group_ids: &'a BTreeSet<u64>,
+    token_sequence_pack_ids: &'a BTreeSet<u64>,
+    multimodal_sequence_pack_ids: &'a BTreeSet<u64>,
+    vector_ref_ids: &'a BTreeSet<u64>,
+    training_label_ids: &'a BTreeSet<u64>,
+    generator_provenance_ids: &'a BTreeSet<u64>,
+    payload_ref_ids: &'a BTreeSet<u32>,
+    policy_ref_ids: &'a BTreeSet<u32>,
+    model_actor_ids: &'a BTreeSet<u32>,
+}
+
 impl TrainingSampleEntryV1 {
-    fn validate(
-        &self,
-        training_profile_ids: &BTreeSet<u32>,
-        split_ids: &BTreeSet<u32>,
-        dedup_group_ids: &BTreeSet<u64>,
-        token_sequence_pack_ids: &BTreeSet<u64>,
-        multimodal_sequence_pack_ids: &BTreeSet<u64>,
-        vector_ref_ids: &BTreeSet<u64>,
-        training_label_ids: &BTreeSet<u64>,
-        generator_provenance_ids: &BTreeSet<u64>,
-        payload_ref_ids: &BTreeSet<u32>,
-        policy_ref_ids: &BTreeSet<u32>,
-        model_actor_ids: &BTreeSet<u32>,
-    ) -> Result<(), CoveError> {
+    fn validate(&self, refs: TrainingSampleValidateRefs<'_>) -> Result<(), CoveError> {
+        let TrainingSampleValidateRefs {
+            training_profile_ids,
+            split_ids,
+            dedup_group_ids,
+            token_sequence_pack_ids,
+            multimodal_sequence_pack_ids,
+            vector_ref_ids,
+            training_label_ids,
+            generator_provenance_ids,
+            payload_ref_ids,
+            policy_ref_ids,
+            model_actor_ids,
+        } = refs;
         if self.sample_id == 0 {
             return Err(CoveError::BadSection(
                 "TrainingSampleEntryV1 sample_id must be non-zero".into(),
@@ -3773,17 +3797,27 @@ pub struct GeneratorProvenanceV1 {
     pub checksum: u32,
 }
 
+struct GeneratorProvenanceValidateRefs<'a> {
+    generator_provenance_ids: &'a BTreeSet<u64>,
+    model_actor_ids: &'a BTreeSet<u32>,
+    decoding_profile_ids: &'a BTreeSet<u32>,
+    human_review_ids: &'a BTreeSet<u32>,
+    payload_ref_ids: &'a BTreeSet<u32>,
+    policy_ref_ids: &'a BTreeSet<u32>,
+    training_sample_ids: &'a BTreeSet<u64>,
+}
+
 impl GeneratorProvenanceV1 {
-    fn validate(
-        &self,
-        generator_provenance_ids: &BTreeSet<u64>,
-        model_actor_ids: &BTreeSet<u32>,
-        decoding_profile_ids: &BTreeSet<u32>,
-        human_review_ids: &BTreeSet<u32>,
-        payload_ref_ids: &BTreeSet<u32>,
-        policy_ref_ids: &BTreeSet<u32>,
-        training_sample_ids: &BTreeSet<u64>,
-    ) -> Result<(), CoveError> {
+    fn validate(&self, refs: GeneratorProvenanceValidateRefs<'_>) -> Result<(), CoveError> {
+        let GeneratorProvenanceValidateRefs {
+            generator_provenance_ids,
+            model_actor_ids,
+            decoding_profile_ids,
+            human_review_ids,
+            payload_ref_ids,
+            policy_ref_ids,
+            training_sample_ids,
+        } = refs;
         if self.generator_provenance_id == 0 {
             return Err(CoveError::BadSection(
                 "GeneratorProvenanceV1 generator_provenance_id must be non-zero".into(),
@@ -4241,17 +4275,27 @@ pub struct AiAssetRefV1 {
     pub checksum: u32,
 }
 
+struct AiAssetRefValidateRefs<'a> {
+    asset_ref_ids: &'a BTreeSet<u64>,
+    tensor_layout_ids: &'a BTreeSet<u32>,
+    section_ids: &'a BTreeSet<u32>,
+    string_ref_ids: &'a BTreeSet<u32>,
+    digest_ref_ids: &'a BTreeSet<u32>,
+    transform_ids: &'a BTreeSet<u32>,
+    policy_ref_ids: &'a BTreeSet<u32>,
+}
+
 impl AiAssetRefV1 {
-    fn validate(
-        &self,
-        asset_ref_ids: &BTreeSet<u64>,
-        tensor_layout_ids: &BTreeSet<u32>,
-        section_ids: &BTreeSet<u32>,
-        string_ref_ids: &BTreeSet<u32>,
-        digest_ref_ids: &BTreeSet<u32>,
-        transform_ids: &BTreeSet<u32>,
-        policy_ref_ids: &BTreeSet<u32>,
-    ) -> Result<(), CoveError> {
+    fn validate(&self, refs: AiAssetRefValidateRefs<'_>) -> Result<(), CoveError> {
+        let AiAssetRefValidateRefs {
+            asset_ref_ids,
+            tensor_layout_ids,
+            section_ids,
+            string_ref_ids,
+            digest_ref_ids,
+            transform_ids,
+            policy_ref_ids,
+        } = refs;
         if self.asset_ref_id == 0 {
             return Err(CoveError::BadSection(
                 "AiAssetRefV1 asset_ref_id must be non-zero".into(),
@@ -5634,14 +5678,14 @@ pub fn filecode_embedding(
     })
 }
 
-fn exact_flat_filecode_binding_parts<'a>(
-    sidecar: &'a CoveAiFile,
+fn exact_flat_filecode_binding_parts(
+    sidecar: &CoveAiFile,
     file_code: u32,
 ) -> Result<
     (
-        &'a FileCodeVectorBindingV1,
-        &'a VectorSpaceDescriptorV1,
-        &'a VectorEntryV1,
+        &FileCodeVectorBindingV1,
+        &VectorSpaceDescriptorV1,
+        &VectorEntryV1,
     ),
     CoveError,
 > {
@@ -5724,7 +5768,7 @@ fn exact_flat_filecode_vector_search_in_space(
                 ))
             })?;
         let vector =
-            exact_flat_vector_entry_f32(artifact_bytes, &sidecar, vector_space, vector_entry)?;
+            exact_flat_vector_entry_f32(artifact_bytes, sidecar, vector_space, vector_entry)?;
         let score = exact_flat_metric_score(vector_space.metric, query, &vector)?;
         results.push(ExactFlatFileCodeVectorSearchResult {
             file_code: binding.file_code,
