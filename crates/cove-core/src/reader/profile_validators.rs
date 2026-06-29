@@ -256,7 +256,37 @@ pub(super) fn validate_shared_semantics(
             | SectionKind::MapEvidenceIndex
             | SectionKind::MapConversionReport
             | SectionKind::MapProjectionCatalog
-            | SectionKind::MapResolutionCatalog => {
+            | SectionKind::MapResolutionCatalog
+            | SectionKind::MapAiProfileCatalog
+            | SectionKind::MapAiTemplateCatalog
+            | SectionKind::MapAiTrainingPolicyCatalog
+            | SectionKind::AiCompanionArtifactRef
+            | SectionKind::AiSourceBinding
+            | SectionKind::AiChunkProfile
+            | SectionKind::AiTextChunkIndex
+            | SectionKind::AiTokenizerProfile
+            | SectionKind::AiTokenBlock
+            | SectionKind::AiTokenizedSpan
+            | SectionKind::AiTokenSequencePack
+            | SectionKind::AiVectorSpace
+            | SectionKind::AiVectorBinding
+            | SectionKind::AiVectorPayloadBlock
+            | SectionKind::AiVectorComposition
+            | SectionKind::AiVectorIndex
+            | SectionKind::AiTensorLayout
+            | SectionKind::AiAssetManifest
+            | SectionKind::AiMultimodalSequence
+            | SectionKind::AiTrainingProfile
+            | SectionKind::AiTrainingSampleIndex
+            | SectionKind::AiTrainingSplitDedupEpoch
+            | SectionKind::AiLabelPreference
+            | SectionKind::AiGeneratorProvenance
+            | SectionKind::AiReferenceTables
+            | SectionKind::AiPayloadIntegrity
+            | SectionKind::AiPrivacySummary
+            | SectionKind::AiSectionFeatureBinding
+            | SectionKind::AiVectorDirectory
+            | SectionKind::AiPayloadBytes => {
                 if is_optional_advisory_section(kind)
                     && opts.optional_pushdown_policy == OptionalPushdownPolicy::FailOpen
                 {
@@ -672,6 +702,36 @@ pub(super) fn validate_cove_t_semantics_with_registered_page_scope(
             | SectionKind::MapConversionReport
             | SectionKind::MapProjectionCatalog
             | SectionKind::MapResolutionCatalog
+            | SectionKind::MapAiProfileCatalog
+            | SectionKind::MapAiTemplateCatalog
+            | SectionKind::MapAiTrainingPolicyCatalog
+            | SectionKind::AiCompanionArtifactRef
+            | SectionKind::AiSourceBinding
+            | SectionKind::AiChunkProfile
+            | SectionKind::AiTextChunkIndex
+            | SectionKind::AiTokenizerProfile
+            | SectionKind::AiTokenBlock
+            | SectionKind::AiTokenizedSpan
+            | SectionKind::AiTokenSequencePack
+            | SectionKind::AiVectorSpace
+            | SectionKind::AiVectorBinding
+            | SectionKind::AiVectorPayloadBlock
+            | SectionKind::AiVectorComposition
+            | SectionKind::AiVectorIndex
+            | SectionKind::AiTensorLayout
+            | SectionKind::AiAssetManifest
+            | SectionKind::AiMultimodalSequence
+            | SectionKind::AiTrainingProfile
+            | SectionKind::AiTrainingSampleIndex
+            | SectionKind::AiTrainingSplitDedupEpoch
+            | SectionKind::AiLabelPreference
+            | SectionKind::AiGeneratorProvenance
+            | SectionKind::AiReferenceTables
+            | SectionKind::AiPayloadIntegrity
+            | SectionKind::AiPrivacySummary
+            | SectionKind::AiSectionFeatureBinding
+            | SectionKind::AiVectorDirectory
+            | SectionKind::AiPayloadBytes
             | SectionKind::VendorExtension => {}
         }
     }
@@ -2741,7 +2801,10 @@ pub(super) fn validate_cove_map_semantics(
             | SectionKind::MapEvidenceIndex
             | SectionKind::MapConversionReport
             | SectionKind::MapProjectionCatalog
-            | SectionKind::MapResolutionCatalog => {
+            | SectionKind::MapResolutionCatalog
+            | SectionKind::MapAiProfileCatalog
+            | SectionKind::MapAiTemplateCatalog
+            | SectionKind::MapAiTrainingPolicyCatalog => {
                 let payload = compression::section_payload(data, entry)?;
                 parse_embedded_section(kind, &payload).map(|section| {
                     map_sections.push(section);

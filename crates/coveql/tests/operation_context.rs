@@ -17,7 +17,21 @@ use arrow_array::{
 };
 use arrow_schema::DataType;
 use cove_core::{
-    artifact::covm::{CovmFile, CovmFileEntryV1, CovmHeaderV1, CovmPostscriptV1},
+    artifact::{
+        coveai::{
+            write_coveai_descriptor_bundle, write_covev_filecode_vectors, AiAssetRefV1,
+            AiDescriptorTablesV1, AiDigestEntryV1, AiPayloadEncodingV1, AiPayloadRefEntryV1,
+            AiPrivacySummaryEntryV1, AiRequirednessScopeV1, AiStorageKindV1, ChunkProfileV1,
+            CoveAiDescriptorBundleBuild, CoveAiWritableSection, CoveVecFileCodeVectorBuild,
+            DatasetSplitV1, DedupGroupV1, DeviceTransferHintV1, GenerationDecodingProfileV1,
+            GeneratorProvenanceV1, HumanReviewEntryV1, ModelActorDescriptorV1,
+            MultimodalSequenceElementV1, MultimodalSequencePackV1, PreferencePairEntryV1,
+            TensorLayoutDescriptorV1, TextChunkEntryV1, TokenBlockHeaderV1, TokenSequencePackV1,
+            TokenizedSpanV1, TokenizerProfileV1, TrainingEpochPlanV1, TrainingLabelEntryV1,
+            TrainingProfileV1, TrainingSampleEntryV1,
+        },
+        covm::{CovmFile, CovmFileEntryV1, CovmHeaderV1, CovmPostscriptV1},
+    },
     canonical::CanonicalValue,
     checksum,
     collation::CollationKind,
@@ -86,8 +100,8 @@ use coveql::{
     AggregateDisclosurePolicy, AssociationEndpointRole, AstCompareOp, CoveQlExecutionResult,
     CoveQlOperationRequest, CoveQlOutputMode, CoveQlRetainedInput, CoveQlSelectedOperation,
     ExecutionOptions, ExplainDisclosurePolicy, ExplainMode, FallbackPolicy, FilterClassification,
-    KernelDecisionKind, KernelExecutionMode, KernelExecutionOptions, KernelFallbackReason,
-    LogicalPlanNodeKind, LogicalPredicateKind, MaterializedChangeDiffKind,
+    KernelDecisionKind, KernelExecutedQuery, KernelExecutionMode, KernelExecutionOptions,
+    KernelFallbackReason, LogicalPlanNodeKind, LogicalPredicateKind, MaterializedChangeDiffKind,
     MetadataDisclosurePolicy, OptionalMetadataKind, OptionalMetadataStatus, OutputGrain,
     ParseOptions, PhysicalPlanNodeKind, PhysicalPlanOptions, PhysicalPredicateFormKind,
     PhysicalRepresentationClass, PhysicalSidecarInputs, PhysicalSidecarStatus, PlanOptions,
@@ -471,9 +485,12 @@ fn conformance_profile_declares_full_coveql_surface_defaults() {
     assert!(core_contract
         .primary_profiles
         .contains(&coveql::CoveQlProfileId::Graph));
+    assert!(core_contract
+        .primary_profiles
+        .contains(&coveql::CoveQlProfileId::Ai));
 
     let contracts = coveql::builtin_coveql_profile_contracts();
-    assert_eq!(contracts.len(), 3);
+    assert_eq!(contracts.len(), 4);
     assert!(coveql::coveql_profile_contract(coveql::CoveQlProfileId::Object).implemented);
     let table_contract = coveql::coveql_profile_contract(coveql::CoveQlProfileId::Table);
     assert!(table_contract.implemented);
@@ -491,6 +508,12 @@ fn conformance_profile_declares_full_coveql_surface_defaults() {
     assert!(graph_contract
         .materialization_boundaries
         .contains(&"variable_length_traversal_requires_explicit_contract"));
+    let ai_contract = coveql::coveql_profile_contract(coveql::CoveQlProfileId::Ai);
+    assert!(ai_contract.implemented);
+    assert!(ai_contract.profile_methods.contains(&"similar"));
+    assert!(ai_contract.profile_methods.contains(&"asPromptContext"));
+    assert!(ai_contract.profile_methods.contains(&"generatorAudit"));
+    assert!(ai_contract.security_barriers.contains(&"payload_integrity"));
     let bridges = coveql::builtin_coveql_bridge_contracts()
         .iter()
         .map(|bridge| {
@@ -1360,6 +1383,33 @@ fn parser_accepts_table_and_graph_profile_constructs() {
 }
 
 #[test]
+fn parser_accepts_coveql_ai_profile_methods_and_explain_mode() {
+    let parsed = coveql::parse_query(
+        "# coveql: 0.1\n# profiles: table, ai\ntable(people).embedding(id).similar(query: \"alice\", k: 3).explain(ai)",
+        ParseOptions::default(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        parsed.profiles,
+        vec![coveql::CoveQlProfileId::Table, coveql::CoveQlProfileId::Ai]
+    );
+    assert!(matches!(parsed.root.node, coveql::AstRoot::Table(_)));
+    assert!(matches!(
+        parsed.methods[0].node,
+        coveql::AstMethod::ProfileCall { .. }
+    ));
+    assert!(matches!(
+        parsed.methods.last().map(|method| &method.node),
+        Some(coveql::AstMethod::Explain(ExplainMode::Ai))
+    ));
+    assert!(parsed
+        .to_canonical_query()
+        .contains("# profiles: table, ai"));
+    assert!(parsed.to_canonical_query().contains("explain(ai)"));
+}
+
+#[test]
 fn parser_rejects_invalid_path_start_and_canonicalizes_final_rows() {
     let err = coveql::parse_query(
         "path(table(orders).out(edge(CustomerPlacedOrder)))",
@@ -1524,6 +1574,961 @@ fn registered_materialized_table_authority_executes_without_projection_catalog()
             "row_count": 2,
         })
     );
+}
+
+#[test]
+fn coveql_ai_methods_select_operation_scoped_feature_use_and_plan_nodes() {
+    let mut resolve_options = ResolveOptions::default();
+    resolve_options.table_authorities.insert(
+        "people".into(),
+        registered_people_table_authority(
+            coveql::TableSurfaceAuthorityKind::MaterializedTable,
+            coveql::TableExecutionAuthority::MaterializedRows {
+                rows: people_rows(&[("a", true), ("b", false)]),
+            },
+        ),
+    );
+
+    let physical = parse_resolve_plan_and_build_physical_plan(
+        &minimal_object_file(),
+        "# profiles: table, ai\ntable(people).embedding(id).similar(query: \"alice\", k: 3).select(id)",
+        ParseOptions::default(),
+        resolve_options,
+        PlanOptions::default(),
+        PhysicalPlanOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+
+    assert!(matches!(
+        physical
+            .planned
+            .resolved
+            .operation_context
+            .request
+            .selected_operation,
+        CoveQlSelectedOperation::Ai {
+            operation: coveql::CoveQlAiOperation::SemanticSearch,
+            ..
+        }
+    ));
+    assert!(physical
+        .planned
+        .resolved
+        .operation_context
+        .selected_feature_uses
+        .iter()
+        .any(|feature_use| feature_use.requested_operation
+            == Some(cove_core::feature_binding::OperationKindV2::AiSemanticSearch)));
+    assert_eq!(
+        physical.planned.resolved.method_chain.ai_operations.len(),
+        2
+    );
+    assert!(physical.planned.logical_plan.nodes.iter().any(|node| {
+        matches!(
+            &node.kind,
+            LogicalPlanNodeKind::AiOperation {
+                operations,
+                sidecar_required: true,
+                ..
+            } if operations
+                .iter()
+                .any(|operation| operation.operation == coveql::CoveQlAiOperation::SemanticSearch)
+        )
+    }));
+    assert!(physical.physical_plan.nodes.iter().any(|node| {
+        matches!(
+            &node.kind,
+            PhysicalPlanNodeKind::AiSidecarOperation {
+                operations,
+                sidecar_required: true,
+                ..
+            } if operations.contains(&coveql::CoveQlAiOperation::SemanticSearch)
+        )
+    }));
+}
+
+#[test]
+fn coveql_ai_similar_executes_exact_flat_filecode_sidecar() {
+    let mut vector_payload = Vec::new();
+    for value in [1.0f32, 0.0, 0.0, 0.8, 0.2, 0.0, -1.0, 0.0, 0.0] {
+        vector_payload.extend_from_slice(&value.to_le_bytes());
+    }
+    let covev = write_covev_filecode_vectors(&CoveVecFileCodeVectorBuild {
+        artifact_id: [42u8; 16],
+        created_at_us: 1_000,
+        dimension_count: 3,
+        file_codes: vec![10, 20, 30],
+        vector_payload,
+    })
+    .unwrap();
+
+    let mut resolve_options = ResolveOptions::default();
+    resolve_options.table_authorities.insert(
+        "people".into(),
+        registered_people_table_authority(
+            coveql::TableSurfaceAuthorityKind::MaterializedTable,
+            coveql::TableExecutionAuthority::MaterializedRows {
+                rows: people_rows(&[("a", true), ("b", false)]),
+            },
+        ),
+    );
+    let mut physical_options = PhysicalPlanOptions::default();
+    physical_options.sidecars.cove_ai_artifact_bytes = Some(covev);
+
+    let executed = parse_resolve_plan_build_physical_and_execute_query(
+        &minimal_object_file(),
+        "# profiles: table, ai\ntable(people).similar(fileCode: 10, k: 2)",
+        ParseOptions::default(),
+        resolve_options,
+        PlanOptions::default(),
+        physical_options,
+        ExecutionOptions::default(),
+        KernelExecutionOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        executed.kernel_report.decision.kind,
+        KernelDecisionKind::Applied
+    );
+    let CoveQlExecutionResult::JsonRows(rows) = executed.executed.result else {
+        panic!("expected JSON rows from CoveQL-AI semantic search");
+    };
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["file_code"], json!(10));
+    assert_eq!(rows[0]["rank"], json!(1));
+    assert_eq!(rows[0]["exact"], json!(true));
+    assert_eq!(rows[1]["file_code"], json!(20));
+    assert!(executed
+        .executed
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "W_AI_EXACT_FLAT_VECTOR_SCAN_EXECUTED"));
+}
+
+#[test]
+fn coveql_ai_hybrid_and_rerank_execute_advisory_vector_scan() {
+    let mut vector_payload = Vec::new();
+    for value in [1.0f32, 0.0, 0.0, 0.8, 0.2, 0.0] {
+        vector_payload.extend_from_slice(&value.to_le_bytes());
+    }
+    let covev = write_covev_filecode_vectors(&CoveVecFileCodeVectorBuild {
+        artifact_id: [45u8; 16],
+        created_at_us: 1_003,
+        dimension_count: 3,
+        file_codes: vec![10, 20],
+        vector_payload,
+    })
+    .unwrap();
+
+    for method in ["hybrid", "rerank"] {
+        let mut resolve_options = ResolveOptions::default();
+        resolve_options.table_authorities.insert(
+            "people".into(),
+            registered_people_table_authority(
+                coveql::TableSurfaceAuthorityKind::MaterializedTable,
+                coveql::TableExecutionAuthority::MaterializedRows {
+                    rows: people_rows(&[("a", true)]),
+                },
+            ),
+        );
+        let mut physical_options = PhysicalPlanOptions::default();
+        physical_options.sidecars.cove_ai_artifact_bytes = Some(covev.clone());
+
+        let executed = parse_resolve_plan_build_physical_and_execute_query(
+            &minimal_object_file(),
+            &format!("# profiles: table, ai\ntable(people).{method}(fileCode: 10, k: 2)"),
+            ParseOptions::default(),
+            resolve_options,
+            PlanOptions::default(),
+            physical_options,
+            ExecutionOptions::default(),
+            KernelExecutionOptions::default(),
+            validation_options(),
+        )
+        .unwrap();
+
+        let CoveQlExecutionResult::JsonRows(rows) = executed.executed.result else {
+            panic!("expected JSON rows from CoveQL-AI {method}");
+        };
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["method"], json!(method));
+        assert_eq!(rows[0]["exact"], json!(false));
+        assert_eq!(rows[0]["vector_exact"], json!(true));
+        assert_eq!(rows[0]["result_authority"], json!("RuntimeAdvisory"));
+        assert_eq!(
+            rows[0]["advisory_reason"],
+            json!("no_persisted_hybrid_or_rerank_authority")
+        );
+        assert!(executed
+            .executed
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "W_AI_ADVISORY_VECTOR_SCAN_EXECUTED"));
+    }
+}
+
+#[test]
+fn coveql_ai_embedding_executes_filecode_vector_lookup() {
+    let mut vector_payload = Vec::new();
+    for value in [1.0f32, 0.0, 0.0, 0.25, 0.5, 0.75] {
+        vector_payload.extend_from_slice(&value.to_le_bytes());
+    }
+    let covev = write_covev_filecode_vectors(&CoveVecFileCodeVectorBuild {
+        artifact_id: [43u8; 16],
+        created_at_us: 1_001,
+        dimension_count: 3,
+        file_codes: vec![10, 20],
+        vector_payload,
+    })
+    .unwrap();
+
+    let mut resolve_options = ResolveOptions::default();
+    resolve_options.table_authorities.insert(
+        "people".into(),
+        registered_people_table_authority(
+            coveql::TableSurfaceAuthorityKind::MaterializedTable,
+            coveql::TableExecutionAuthority::MaterializedRows {
+                rows: people_rows(&[("a", true)]),
+            },
+        ),
+    );
+    let mut physical_options = PhysicalPlanOptions::default();
+    physical_options.sidecars.cove_ai_artifact_bytes = Some(covev);
+
+    let executed = parse_resolve_plan_build_physical_and_execute_query(
+        &minimal_object_file(),
+        "# profiles: table, ai\ntable(people).embedding(fileCode: 20)",
+        ParseOptions::default(),
+        resolve_options,
+        PlanOptions::default(),
+        physical_options,
+        ExecutionOptions::default(),
+        KernelExecutionOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        executed.kernel_report.decision.kind,
+        KernelDecisionKind::Applied
+    );
+    let CoveQlExecutionResult::JsonRows(rows) = executed.executed.result else {
+        panic!("expected JSON rows from CoveQL-AI embedding lookup");
+    };
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["file_code"], json!(20));
+    assert_eq!(rows[0]["vector_ref"], json!(2));
+    assert_eq!(rows[0]["dimension_count"], json!(3));
+    assert_eq!(rows[0]["embedding"], json!([0.25, 0.5, 0.75]));
+    assert!(executed
+        .executed
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "W_AI_FILECODE_EMBEDDING_EXECUTED"));
+}
+
+#[test]
+fn coveql_ai_chunks_and_context_execute_descriptor_metadata() {
+    let coveai = coveql_ai_descriptor_sidecar();
+
+    let chunks = execute_ai_descriptor_query(
+        coveai.clone(),
+        "# profiles: table, ai\ntable(people).chunks()",
+    );
+    assert_eq!(
+        chunks.kernel_report.decision.kind,
+        KernelDecisionKind::Applied
+    );
+    let CoveQlExecutionResult::JsonRows(rows) = chunks.executed.result else {
+        panic!("expected JSON rows from CoveQL-AI chunks");
+    };
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["record_kind"], json!("text_chunk"));
+    assert_eq!(rows[0]["chunk_id"], json!(1));
+    assert_eq!(rows[0]["byte_start"], json!(4));
+    assert_eq!(rows[0]["byte_length"], json!(12));
+    assert_eq!(rows[0]["text"], Value::Null);
+    assert_eq!(rows[0]["text_withheld"], json!(true));
+    assert!(chunks
+        .executed
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "W_AI_CHUNK_METADATA_EXECUTED"));
+
+    let context =
+        execute_ai_descriptor_query(coveai, "# profiles: table, ai\ntable(people).context()");
+    let CoveQlExecutionResult::JsonRows(rows) = context.executed.result else {
+        panic!("expected JSON rows from CoveQL-AI context");
+    };
+    assert_eq!(rows[0]["record_kind"], json!("rag_context_chunk"));
+    assert_eq!(rows[0]["prompt_context"], Value::Null);
+    assert_eq!(
+        rows[0]["redaction_report"]["neighbor_chunks_withheld"],
+        json!(true)
+    );
+    assert!(context
+        .executed
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "W_AI_RAG_CONTEXT_METADATA_EXECUTED"));
+}
+
+#[test]
+fn coveql_ai_token_training_pack_and_multimodal_execute_descriptor_metadata() {
+    let coveai = coveql_ai_descriptor_sidecar();
+
+    let tokens = execute_ai_descriptor_query(
+        coveai.clone(),
+        "# profiles: table, ai\ntable(people).tokens()",
+    );
+    let CoveQlExecutionResult::JsonRows(rows) = tokens.executed.result else {
+        panic!("expected JSON rows from CoveQL-AI tokens");
+    };
+    let record_kinds = rows
+        .iter()
+        .map(|row| row["record_kind"].as_str().unwrap().to_string())
+        .collect::<BTreeSet<_>>();
+    assert!(record_kinds.contains("token_block"));
+    assert!(record_kinds.contains("tokenized_span"));
+    assert!(record_kinds.contains("token_sequence_pack"));
+    assert!(rows
+        .iter()
+        .all(|row| row["payload_withheld"] == json!(true)));
+    assert!(tokens
+        .executed
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "W_AI_TOKEN_METADATA_EXECUTED"));
+
+    let samples = execute_ai_descriptor_query(
+        coveai.clone(),
+        "# profiles: table, ai\ntable(people).trainingSamples()",
+    );
+    let CoveQlExecutionResult::JsonRows(rows) = samples.executed.result else {
+        panic!("expected JSON rows from CoveQL-AI training samples");
+    };
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["record_kind"], json!("training_sample"));
+    assert_eq!(rows[0]["sample_id"], json!(1));
+    assert_eq!(rows[0]["policy_withheld"], json!(true));
+    assert!(samples
+        .executed
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "W_AI_TRAINING_SAMPLE_METADATA_EXECUTED"));
+
+    let pack = execute_ai_descriptor_query(
+        coveai.clone(),
+        "# profiles: table, ai\ntable(people).trainingSamples().split().pack()",
+    );
+    let CoveQlExecutionResult::JsonRows(rows) = pack.executed.result else {
+        panic!("expected JSON rows from CoveQL-AI pack");
+    };
+    assert!(rows
+        .iter()
+        .any(|row| row["record_kind"] == json!("token_sequence_pack")));
+    assert!(rows
+        .iter()
+        .any(|row| row["record_kind"] == json!("multimodal_sequence_pack")));
+    assert!(pack
+        .executed
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "W_AI_TRAINING_PACK_METADATA_EXECUTED"));
+
+    let multimodal = execute_ai_descriptor_query(
+        coveai.clone(),
+        "# profiles: table, ai\ntable(people).multimodal()",
+    );
+    let CoveQlExecutionResult::JsonRows(rows) = multimodal.executed.result else {
+        panic!("expected JSON rows from CoveQL-AI multimodal");
+    };
+    assert!(rows.iter().any(
+        |row| row["record_kind"] == json!("multimodal_sequence_element")
+            && row["asset_ref"] == json!(1)
+            && row["tensor_ref"] == json!(1)
+    ));
+    assert!(multimodal
+        .executed
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "W_AI_MULTIMODAL_METADATA_EXECUTED"));
+
+    let generator = execute_ai_descriptor_query(
+        coveai,
+        "# profiles: table, ai\ntable(people).generatorAudit()",
+    );
+    let CoveQlExecutionResult::JsonRows(rows) = generator.executed.result else {
+        panic!("expected JSON rows from CoveQL-AI generator audit");
+    };
+    let record_kinds = rows
+        .iter()
+        .map(|row| row["record_kind"].as_str().unwrap().to_string())
+        .collect::<BTreeSet<_>>();
+    assert!(record_kinds.contains("model_actor"));
+    assert!(record_kinds.contains("generation_decoding_profile"));
+    assert!(record_kinds.contains("human_review"));
+    assert!(record_kinds.contains("generator_provenance"));
+    assert!(record_kinds.contains("training_label"));
+    assert!(record_kinds.contains("preference_pair"));
+    assert!(rows.iter().any(|row| {
+        row["record_kind"] == json!("generator_provenance")
+            && row["external_audit_only_unless_deterministic_regeneration_proven"] == json!(true)
+    }));
+    assert!(generator
+        .executed
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "W_AI_GENERATOR_AUDIT_METADATA_EXECUTED"));
+}
+
+fn execute_ai_descriptor_query(coveai: Vec<u8>, query: &str) -> KernelExecutedQuery {
+    let mut resolve_options = ResolveOptions::default();
+    resolve_options.table_authorities.insert(
+        "people".into(),
+        registered_people_table_authority(
+            coveql::TableSurfaceAuthorityKind::MaterializedTable,
+            coveql::TableExecutionAuthority::MaterializedRows {
+                rows: people_rows(&[("a", true)]),
+            },
+        ),
+    );
+    let mut physical_options = PhysicalPlanOptions::default();
+    physical_options.sidecars.cove_ai_artifact_bytes = Some(coveai);
+
+    parse_resolve_plan_build_physical_and_execute_query(
+        &minimal_object_file(),
+        query,
+        ParseOptions::default(),
+        resolve_options,
+        PlanOptions::default(),
+        physical_options,
+        ExecutionOptions::default(),
+        KernelExecutionOptions::default(),
+        validation_options(),
+    )
+    .unwrap()
+}
+
+fn coveql_ai_descriptor_sidecar() -> Vec<u8> {
+    let mut tables = AiDescriptorTablesV1::default();
+    tables.digests.push(AiDigestEntryV1 {
+        digest_ref: 1,
+        digest_algorithm: 1,
+        digest_len: 4,
+        digest_payload_ref: 2,
+        domain_hint: 1,
+        flags: 0,
+        crc32c: 0,
+    });
+    tables.digests.push(AiDigestEntryV1 {
+        digest_ref: 2,
+        digest_algorithm: 1,
+        digest_len: 4,
+        digest_payload_ref: 2,
+        domain_hint: 1,
+        flags: 0,
+        crc32c: 0,
+    });
+    tables.payload_refs.push(AiPayloadRefEntryV1 {
+        payload_ref: 1,
+        storage_kind: AiStorageKindV1::SectionDecodedRelative as u8,
+        media_type_ref: 0,
+        section_id: 10,
+        uri_ref: 0,
+        payload_offset: 0,
+        section_payload_offset: 0,
+        payload_length: 8,
+        decoded_length: 8,
+        integrity_ref: 0,
+        flags: 0,
+        crc32c: 0,
+    });
+    tables.payload_refs.push(AiPayloadRefEntryV1 {
+        payload_ref: 2,
+        storage_kind: AiStorageKindV1::SectionDecodedRelative as u8,
+        media_type_ref: 0,
+        section_id: 10,
+        uri_ref: 0,
+        payload_offset: 0,
+        section_payload_offset: 0,
+        payload_length: 4,
+        decoded_length: 4,
+        integrity_ref: 0,
+        flags: 0,
+        crc32c: 0,
+    });
+    tables.privacy_summaries.push(AiPrivacySummaryEntryV1 {
+        privacy_summary_ref: 1,
+        source_binding_ref: 0,
+        sensitivity_mask: 0,
+        sensitivity_bits_ref: 0,
+        policy_ref: 0,
+        visibility_scope_ref: 0,
+        redaction_scope_ref: 0,
+        retention_state: 0,
+        disclosure_state: 0,
+        flags: 0,
+        crc32c: 0,
+    });
+    tables.chunk_profiles.push(ChunkProfileV1 {
+        chunk_profile_id: 1,
+        profile_name_ref: 0,
+        chunker_namespace_ref: 0,
+        chunker_name_ref: 0,
+        chunker_version_major: 1,
+        chunker_version_minor: 0,
+        tokenizer_profile_ref: 1,
+        boundary_kind: 1,
+        overlap_policy: 0,
+        parent_policy: 0,
+        normalization_policy: 0,
+        target_tokens: 128,
+        min_tokens: 1,
+        max_tokens: 256,
+        overlap_tokens: 0,
+        max_bytes: 4096,
+        locale_ref: 0,
+        flags: 0,
+        checksum: 0,
+    });
+    tables.text_chunks.push(TextChunkEntryV1 {
+        chunk_id: 1,
+        source_ref: 0,
+        table_id: 1,
+        column_id: 2,
+        object_type_id: 3,
+        property_id: 4,
+        association_type_id: 0,
+        path_ref: 0,
+        source_row_ref: 7,
+        source_object_ref: 8,
+        source_value_hash_ref: 1,
+        byte_start: 4,
+        byte_length: 12,
+        unicode_scalar_start: 4,
+        unicode_scalar_length: 12,
+        token_start: 0,
+        token_count: 4,
+        parent_chunk_id: 0,
+        first_child_ref: 0,
+        child_count: 0,
+        previous_chunk_id: 0,
+        next_chunk_id: 0,
+        chunk_text_hash_ref: 2,
+        evidence_ref: 0,
+        policy_ref: 0,
+        flags: 0,
+        checksum: 0,
+    });
+    tables.tokenizer_profiles.push(TokenizerProfileV1 {
+        tokenizer_profile_id: 1,
+        tokenizer_namespace_ref: 0,
+        tokenizer_name_ref: 0,
+        tokenizer_version_major: 1,
+        tokenizer_version_minor: 0,
+        vocab_digest_ref: 0,
+        merges_digest_ref: 0,
+        pre_tokenizer_digest_ref: 0,
+        normalizer_digest_ref: 0,
+        byte_encoder_digest_ref: 0,
+        special_tokens_digest_ref: 0,
+        added_tokens_digest_ref: 0,
+        chat_template_ref: 0,
+        unicode_version_ref: 0,
+        truncation_policy_ref: 0,
+        padding_policy_ref: 0,
+        model_max_sequence_length: 4096,
+        token_id_width: 2,
+        byte_alignment_available: 0,
+        reversible: 1,
+        deterministic: 1,
+        bos_token_id: 0,
+        eos_token_id: 0,
+        pad_token_id: 0,
+        unk_token_id: 0,
+        flags: 0,
+        checksum: 0,
+    });
+    tables.token_blocks.push(TokenBlockHeaderV1 {
+        token_block_id: 1,
+        tokenizer_profile_id: 1,
+        token_count: 4,
+        token_id_width: 2,
+        compression_codec: CompressionCodec::None as u8,
+        layout_kind: 0,
+        payload_ref: 1,
+        payload_offset: 0,
+        payload_length: 0,
+        integrity_ref: 0,
+        checksum: 0,
+    });
+    tables.tokenized_spans.push(TokenizedSpanV1 {
+        tokenized_span_id: 1,
+        chunk_id: 1,
+        tokenizer_profile_id: 1,
+        token_block_ref: 1,
+        token_offset: 0,
+        token_count: 4,
+        byte_alignment_ref: 0,
+        source_value_hash_ref: 1,
+        flags: 0,
+        checksum: 0,
+    });
+    tables.token_sequence_packs.push(TokenSequencePackV1 {
+        sequence_pack_id: 1,
+        tokenizer_profile_id: 1,
+        training_profile_ref: 1,
+        token_block_ref: 1,
+        token_offset: 0,
+        token_count: 4,
+        source_span_count: 0,
+        first_source_span_ref: 0,
+        loss_mask_ref: 0,
+        attention_mask_ref: 0,
+        position_ids_ref: 0,
+        labels_ref: 0,
+        split_ref: 1,
+        sample_weight_ppm: 1_000_000,
+        flags: 0,
+        checksum: 0,
+    });
+    tables.training_profiles.push(TrainingProfileV1 {
+        training_profile_id: 1,
+        profile_name_ref: 0,
+        task_family: 1,
+        modality_mask: 3,
+        source_snapshot_ref: 0,
+        map_profile_ref: 0,
+        chunk_profile_ref: 1,
+        tokenizer_profile_ref: 1,
+        vector_space_ref: 0,
+        multimodal_sequence_profile_ref: 0,
+        split_policy_ref: 0,
+        sampling_policy_ref: 0,
+        dedup_policy_ref: 0,
+        quality_policy_ref: 0,
+        license_policy_ref: 0,
+        redaction_policy_ref: 0,
+        default_generator_provenance_ref: 0,
+        reproducibility_class: 1,
+        flags: 0,
+        checksum: 0,
+    });
+    tables.dataset_splits.push(DatasetSplitV1 {
+        split_id: 1,
+        split_name_ref: 0,
+        split_method: 1,
+        source_snapshot_ref: 0,
+        filter_policy_ref: 0,
+        seed: 42,
+        hash_function_ref: 0,
+        stratification_path_ref: 0,
+        grouping_ref: 0,
+        ordering_policy_ref: 0,
+        dedup_policy_ref: 0,
+        sample_count: 1,
+        first_sample_ref: 1,
+        flags: 0,
+        checksum: 0,
+    });
+    tables.dedup_groups.push(DedupGroupV1 {
+        dedup_group_id: 1,
+        dedup_policy_ref: 0,
+        canonical_member_sample_id: 1,
+        similarity_kind: 0,
+        dedup_authority: 0,
+        confidence_ppm: 1_000_000,
+        first_member_ref: 1,
+        member_count: 1,
+        flags: 0,
+        checksum: 0,
+    });
+    tables.training_epoch_plans.push(TrainingEpochPlanV1 {
+        epoch_plan_id: 1,
+        training_profile_id: 1,
+        split_ref: 1,
+        seed: 42,
+        permutation_kind: 0,
+        rng_algorithm_ref: 0,
+        permutation_function_ref: 0,
+        shard_count: 0,
+        first_shard_ref: 0,
+        shard_ref_count: 0,
+        flags: 0,
+        checksum: 0,
+    });
+    tables.training_samples.push(TrainingSampleEntryV1 {
+        sample_id: 1,
+        training_profile_id: 1,
+        example_kind: 1,
+        split_ref: 1,
+        source_ref: 0,
+        evidence_ref: 0,
+        input_ref: 0,
+        target_ref: 0,
+        label_ref: 0,
+        metadata_ref: 0,
+        token_sequence_pack_ref: 1,
+        multimodal_sequence_pack_ref: 1,
+        vector_ref: 0,
+        quality_score_ppm: 900_000,
+        sample_weight_ppm: 1_000_000,
+        dedup_group_ref: 1,
+        license_ref: 0,
+        policy_ref: 0,
+        teacher_model_ref: 0,
+        generator_provenance_ref: 0,
+        judge_generator_provenance_ref: 0,
+        label_generator_provenance_ref: 0,
+        flags: 0,
+        checksum: 0,
+    });
+    tables.model_actors.push(ModelActorDescriptorV1 {
+        model_actor_id: 1,
+        model_namespace_ref: 0,
+        model_name_ref: 0,
+        model_version_ref: 0,
+        model_checkpoint_digest_ref: 0,
+        provider_ref: 0,
+        endpoint_ref: 0,
+        endpoint_version_ref: 0,
+        model_family_ref: 0,
+        modality_mask: 3,
+        license_ref: 0,
+        policy_ref: 0,
+        flags: 0,
+        checksum: 0,
+    });
+    tables
+        .generation_decoding_profiles
+        .push(GenerationDecodingProfileV1 {
+            decoding_profile_id: 1,
+            temperature_micros: 0,
+            top_p_micros: 1_000_000,
+            top_k: 0,
+            seed: 42,
+            max_output_tokens: 128,
+            stop_sequence_ref: 0,
+            safety_policy_ref: 0,
+            deterministic_claim: 0,
+            flags: 0,
+            checksum: 0,
+        });
+    tables.human_reviews.push(HumanReviewEntryV1 {
+        human_review_id: 1,
+        review_kind: 1,
+        reviewer_role_ref: 0,
+        review_time_us: 1_234,
+        rating_ppm: 900_000,
+        notes_ref: 0,
+        policy_ref: 0,
+        flags: 0,
+        checksum: 0,
+    });
+    tables.generator_provenance.push(GeneratorProvenanceV1 {
+        generator_provenance_id: 1,
+        generator_kind: 1,
+        model_actor_ref: 1,
+        prompt_template_ref: 0,
+        decoding_profile_ref: 1,
+        toolchain_ref: 0,
+        source_input_ref: 0,
+        source_context_ref: 0,
+        source_sample_ref: 1,
+        parent_generator_provenance_ref: 0,
+        generation_time_us: 1_235,
+        confidence_ppm: 800_000,
+        human_review_ref: 1,
+        policy_ref: 0,
+        reproducibility_class: 2,
+        flags: 0,
+        checksum: 0,
+    });
+    tables.training_labels.push(TrainingLabelEntryV1 {
+        label_id: 1,
+        label_kind: 1,
+        label_authority: 3,
+        label_payload_ref: 0,
+        generator_provenance_ref: 1,
+        human_review_ref: 1,
+        confidence_ppm: 850_000,
+        evidence_ref: 0,
+        policy_ref: 0,
+        flags: 0,
+        checksum: 0,
+    });
+    tables.preference_pairs.push(PreferencePairEntryV1 {
+        preference_pair_id: 1,
+        prompt_ref: 0,
+        chosen_ref: 0,
+        rejected_ref: 0,
+        judge_generator_provenance_ref: 1,
+        human_review_ref: 1,
+        preference_strength_ppm: 750_000,
+        confidence_ppm: 850_000,
+        evidence_ref: 0,
+        policy_ref: 0,
+        flags: 0,
+        checksum: 0,
+    });
+    tables.tensor_layouts.push(TensorLayoutDescriptorV1 {
+        tensor_layout_id: 1,
+        layout_name_ref: 0,
+        rank: 2,
+        dtype: 0,
+        byte_order: 1,
+        shape_ref: 0,
+        stride_ref: 0,
+        storage_offset_elements: 0,
+        layout_kind: 0,
+        memory_alignment_bytes: 64,
+        preferred_page_alignment_bytes: 4096,
+        tile_shape_ref: 0,
+        block_shape_ref: 0,
+        quantization_profile_ref: 0,
+        sparsity_profile_ref: 0,
+        framework_compatibility_ref: 0,
+        device_affinity_hint: 0,
+        flags: 0,
+        checksum: 0,
+    });
+    tables.device_transfer_hints.push(DeviceTransferHintV1 {
+        transfer_hint_id: 1,
+        target_kind: 0,
+        preferred_alignment_bytes: 64,
+        preferred_chunk_bytes: 4096,
+        pinned_memory_required: 0,
+        contiguous_required: 1,
+        zero_copy_possible: 1,
+        runtime_registry_binding_ref: 0,
+        flags: 0,
+        checksum: 0,
+    });
+    tables.assets.push(AiAssetRefV1 {
+        asset_ref_id: 1,
+        parent_asset_ref: 0,
+        asset_kind: 2,
+        uri_ref: 0,
+        embedded_section_ref: 0,
+        media_type_ref: 0,
+        byte_length: 0,
+        digest_ref: 0,
+        width: 64,
+        height: 64,
+        duration_us: 0,
+        sample_rate_hz: 0,
+        channel_count: 0,
+        decode_profile_ref: 0,
+        preprocessing_profile_ref: 0,
+        transform_profile_ref: 0,
+        transform_digest_ref: 0,
+        tensor_layout_ref: 1,
+        license_ref: 0,
+        policy_ref: 0,
+        flags: 0,
+        checksum: 0,
+    });
+    tables
+        .multimodal_sequence_packs
+        .push(MultimodalSequencePackV1 {
+            sequence_pack_id: 1,
+            training_profile_id: 1,
+            tokenizer_profile_id: 1,
+            sequence_profile_ref: 0,
+            element_count: 1,
+            first_element_ref: 1,
+            split_ref: 1,
+            sample_weight_ppm: 1_000_000,
+            loss_mask_ref: 0,
+            attention_mask_ref: 0,
+            position_map_ref: 0,
+            label_ref: 0,
+            source_snapshot_ref: 0,
+            evidence_ref: 0,
+            generator_provenance_ref: 0,
+            flags: 0,
+            checksum: 0,
+        });
+    tables
+        .multimodal_sequence_elements
+        .push(MultimodalSequenceElementV1 {
+            element_id: 1,
+            sequence_pack_id: 1,
+            ordinal: 0,
+            element_kind: 2,
+            modality: 2,
+            role: 1,
+            tokenized_span_ref: 1,
+            token_sequence_pack_ref: 1,
+            asset_ref: 1,
+            tensor_ref: 1,
+            vector_ref: 0,
+            byte_start: 0,
+            byte_length: 0,
+            time_start_us: 0,
+            time_duration_us: 0,
+            position_stream_ref: 0,
+            evidence_ref: 0,
+            policy_ref: 0,
+            flags: 0,
+            checksum: 0,
+        });
+
+    let payload_sections = vec![CoveAiWritableSection {
+        section_id: 10,
+        section_kind: SectionKind::AiPayloadBytes as u32,
+        profile_kind: PrimaryProfile::CoveTok as u8,
+        payload_encoding: AiPayloadEncodingV1::OpaqueBytes,
+        requiredness_scope: AiRequirednessScopeV1::AdvisoryOnly,
+        source_binding_ref: 0,
+        required_ai_features: 0,
+        optional_ai_features: 0,
+        feature_binding_ref: 0,
+        payload: vec![1, 0, 2, 0, 3, 0, 4, 0],
+    }];
+    write_coveai_descriptor_bundle(&CoveAiDescriptorBundleBuild {
+        artifact_id: [44u8; 16],
+        created_at_us: 1_002,
+        payload_sections,
+        descriptor_tables: tables,
+    })
+    .unwrap()
+}
+
+#[test]
+fn coveql_ai_similar_requires_sidecar_for_physical_execution() {
+    let mut resolve_options = ResolveOptions::default();
+    resolve_options.table_authorities.insert(
+        "people".into(),
+        registered_people_table_authority(
+            coveql::TableSurfaceAuthorityKind::MaterializedTable,
+            coveql::TableExecutionAuthority::MaterializedRows {
+                rows: people_rows(&[("a", true)]),
+            },
+        ),
+    );
+
+    let err = parse_resolve_plan_build_physical_and_execute_query(
+        &minimal_object_file(),
+        "# profiles: table, ai\ntable(people).similar(fileCode: 10, k: 2)",
+        ParseOptions::default(),
+        resolve_options,
+        PlanOptions::default(),
+        PhysicalPlanOptions::default(),
+        ExecutionOptions::default(),
+        KernelExecutionOptions::default(),
+        validation_options(),
+    )
+    .unwrap_err();
+
+    assert!(err
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "E_AI_SIDECAR_REQUIRED"));
 }
 
 #[test]
@@ -2680,6 +3685,22 @@ fn resolver_rejects_unknown_or_undeclared_profile_constructs_with_stable_diagnos
     )
     .unwrap_err();
     assert_eq!(ambiguous.diagnostics[0].code, "E_AMBIGUOUS_PROFILE");
+
+    let ai_without_profile = parse_and_resolve_query(
+        &minimal_object_file(),
+        "table(people).embedding(id)",
+        ParseOptions::default(),
+        ResolveOptions::default(),
+        validation_options(),
+    )
+    .unwrap_err();
+    assert_eq!(
+        ai_without_profile.diagnostics[0].code,
+        "E_UNSUPPORTED_PROFILE_METHOD"
+    );
+    assert!(ai_without_profile.diagnostics[0]
+        .message
+        .contains("ai profile"));
 }
 
 fn minimal_object_file() -> Vec<u8> {

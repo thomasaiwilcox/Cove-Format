@@ -24,6 +24,8 @@ pub struct PhysicalSidecarInputs {
     pub coverage_cache_bytes: Option<Vec<u8>>,
     #[serde(skip)]
     pub cove_e_artifact_bytes: Option<Vec<u8>>,
+    #[serde(skip)]
+    pub cove_ai_artifact_bytes: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

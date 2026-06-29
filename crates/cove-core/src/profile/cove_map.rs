@@ -476,6 +476,97 @@ pub struct MapProjectionCatalog {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MapAiProfileCatalog {
+    pub mapping_id: String,
+    pub mapping_version: String,
+    pub profiles: Vec<MapAiProfileV1>,
+    pub slot_policies: Vec<MapAiSlotPolicyV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MapAiProfileV1 {
+    pub profile_id: String,
+    pub profile_name: Option<String>,
+    pub active: bool,
+    pub default_decision: String,
+    pub default_granularity: String,
+    pub default_role: String,
+    pub default_sensitivity: String,
+    pub slot_policy_ids: Vec<String>,
+    pub template_ids: Vec<String>,
+    pub composition_ids: Vec<String>,
+    pub training_policy_ids: Vec<String>,
+    pub flags: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MapAiSlotPolicyV1 {
+    pub slot_policy_id: String,
+    pub source_id: Option<String>,
+    pub table_id: Option<u32>,
+    pub column_id: Option<u32>,
+    pub source_column: Option<String>,
+    pub object_type: Option<String>,
+    pub property_id: Option<String>,
+    pub association_type: Option<String>,
+    pub path: String,
+    pub role: String,
+    pub decision: String,
+    pub granularity: String,
+    pub sensitivity: String,
+    pub vector_space_id: Option<String>,
+    pub template_id: Option<String>,
+    pub chunk_profile_id: Option<String>,
+    pub tokenizer_profile_id: Option<String>,
+    pub training_policy_id: Option<String>,
+    pub composition_weight_ppm: Option<u32>,
+    pub min_distinct_count: Option<u32>,
+    pub max_distinct_count: Option<u32>,
+    pub max_value_bytes: Option<u32>,
+    pub evidence_policy_id: Option<String>,
+    pub license_policy_id: Option<String>,
+    pub redaction_policy_id: Option<String>,
+    pub flags: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MapAiTemplateCatalog {
+    pub mapping_id: String,
+    pub mapping_version: String,
+    pub templates: Vec<AiVectorTemplateV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AiVectorTemplateV1 {
+    pub template_id: String,
+    pub template_kind: String,
+    pub template_text: String,
+    pub locale: Option<String>,
+    pub deterministic: bool,
+    pub template_fingerprint: Option<String>,
+    pub flags: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MapAiTrainingPolicyCatalog {
+    pub mapping_id: String,
+    pub mapping_version: String,
+    pub training_policies: Vec<MapAiTrainingPolicyV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MapAiTrainingPolicyV1 {
+    pub training_policy_id: String,
+    pub sample_policy: String,
+    pub label_policy: String,
+    pub split_policy: String,
+    pub weighting_policy: String,
+    pub dedup_policy: String,
+    pub quality_policy: String,
+    pub flags: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum EmbeddedMapSection {
     SourceCatalog(MapSourceCatalog),
@@ -488,6 +579,9 @@ pub enum EmbeddedMapSection {
     EvidenceIndex(MapEvidenceIndex),
     ConversionReport(MapConversionReport),
     ProjectionCatalog(MapProjectionCatalog),
+    AiProfileCatalog(MapAiProfileCatalog),
+    AiTemplateCatalog(MapAiTemplateCatalog),
+    AiTrainingPolicyCatalog(MapAiTrainingPolicyCatalog),
 }
 
 mod embedded;
@@ -831,6 +925,86 @@ mod tests {
         ]
     }
 
+    fn valid_ai_sections() -> Vec<EmbeddedMapSection> {
+        let mut sections = valid_sections();
+        replace_row_rule(
+            &mut sections,
+            row_rule_with_operation(
+                "PatchProperty",
+                "Object",
+                vec!["object", "property", "evidence"],
+                None,
+                true,
+                false,
+            ),
+        );
+        sections.push(parse_json(
+            SectionKind::MapAiTemplateCatalog,
+            json!({
+                "mapping_id": "customer-map",
+                "mapping_version": "2026.05",
+                "templates": [{
+                    "template_id": "product_name_template",
+                    "template_kind": "Vectorization",
+                    "template_text": "Product name: {value}",
+                    "deterministic": true,
+                    "template_fingerprint": "sha256:66642c510c3b29a7bac97c2bcdc64aa9da4e67576cd388d092b06b80f21ddc10"
+                }]
+            }),
+        ));
+        sections.push(parse_json(
+            SectionKind::MapAiTrainingPolicyCatalog,
+            json!({
+                "mapping_id": "customer-map",
+                "mapping_version": "2026.05",
+                "training_policies": [{
+                    "training_policy_id": "sample_policy",
+                    "sample_policy": "curated",
+                    "label_policy": "none",
+                    "split_policy": "deterministic",
+                    "weighting_policy": "uniform",
+                    "dedup_policy": "source_hash",
+                    "quality_policy": "required"
+                }]
+            }),
+        ));
+        sections.push(parse_json(
+            SectionKind::MapAiProfileCatalog,
+            json!({
+                "mapping_id": "customer-map",
+                "mapping_version": "2026.05",
+                "profiles": [{
+                    "profile_id": "customer_ai_v1",
+                    "profile_name": "Customer AI v1",
+                    "active": true,
+                    "default_decision": "Ignore",
+                    "default_granularity": "SlotValue",
+                    "default_role": "Unknown",
+                    "default_sensitivity": "Internal",
+                    "slot_policy_ids": ["customer_name_ai"],
+                    "template_ids": ["product_name_template"],
+                    "training_policy_ids": ["sample_policy"]
+                }],
+                "slot_policies": [{
+                    "slot_policy_id": "customer_name_ai",
+                    "source_id": "crm.customers",
+                    "source_column": "name",
+                    "object_type": "Customer",
+                    "property_id": "name",
+                    "path": "Customer.name",
+                    "role": "Title",
+                    "decision": "VectorizeSlotValues",
+                    "granularity": "SlotValue",
+                    "sensitivity": "Internal",
+                    "template_id": "product_name_template",
+                    "training_policy_id": "sample_policy",
+                    "composition_weight_ppm": 500000
+                }]
+            }),
+        ));
+        sections
+    }
+
     #[test]
     fn map_source_catalog_parse_rejects_missing_mapping_id() {
         assert_eq!(
@@ -1157,6 +1331,176 @@ mod tests {
     #[test]
     fn embedded_map_validation_accepts_consistent_sections() {
         assert_eq!(validate_embedded_sections(&valid_sections()), Ok(()));
+    }
+
+    #[test]
+    fn map_ai_validation_accepts_slot_policy_with_template_and_training_refs() {
+        assert_eq!(validate_embedded_sections(&valid_ai_sections()), Ok(()));
+    }
+
+    #[test]
+    fn map_ai_training_policy_parse_rejects_invalid_sample_policy() {
+        assert_eq!(
+            parse_json_result(
+                SectionKind::MapAiTrainingPolicyCatalog,
+                json!({
+                    "mapping_id": "customer-map",
+                    "mapping_version": "2026.05",
+                    "training_policies": [{
+                        "training_policy_id": "bad_sample_policy",
+                        "sample_policy": "export_everything"
+                    }]
+                }),
+            ),
+            Err(CoveError::MapInvalid)
+        );
+    }
+
+    #[test]
+    fn map_ai_training_policy_parse_rejects_invalid_dedup_policy() {
+        assert_eq!(
+            parse_json_result(
+                SectionKind::MapAiTrainingPolicyCatalog,
+                json!({
+                    "mapping_id": "customer-map",
+                    "mapping_version": "2026.05",
+                    "training_policies": [{
+                        "training_policy_id": "bad_dedup_policy",
+                        "dedup_policy": "hope"
+                    }]
+                }),
+            ),
+            Err(CoveError::MapInvalid)
+        );
+    }
+
+    #[test]
+    fn map_ai_validation_rejects_duplicate_slot_path_in_active_profile() {
+        let mut sections = valid_sections();
+        sections.push(parse_json(
+            SectionKind::MapAiProfileCatalog,
+            json!({
+                "mapping_id": "customer-map",
+                "mapping_version": "2026.05",
+                "profiles": [{
+                    "profile_id": "customer_ai_v1",
+                    "active": true,
+                    "slot_policy_ids": ["name_slot_a", "name_slot_b"]
+                }],
+                "slot_policies": [
+                    {
+                        "slot_policy_id": "name_slot_a",
+                        "path": "Customer.name",
+                        "role": "Title",
+                        "decision": "VectorizeSlotValues",
+                        "granularity": "SlotValue",
+                        "sensitivity": "Internal"
+                    },
+                    {
+                        "slot_policy_id": "name_slot_b",
+                        "path": "Customer.name",
+                        "role": "Title",
+                        "decision": "Tokenize",
+                        "granularity": "SlotValue",
+                        "sensitivity": "Internal"
+                    }
+                ]
+            }),
+        ));
+        assert_eq!(
+            validate_embedded_sections(&sections),
+            Err(CoveError::MapInvalid)
+        );
+    }
+
+    #[test]
+    fn map_ai_validation_rejects_forbidden_slot_conflict_across_active_profiles() {
+        let mut sections = valid_sections();
+        sections.push(parse_json(
+            SectionKind::MapAiProfileCatalog,
+            json!({
+                "mapping_id": "customer-map",
+                "mapping_version": "2026.05",
+                "profiles": [
+                    {
+                        "profile_id": "privacy_ai_v1",
+                        "active": true,
+                        "slot_policy_ids": ["private_note_forbidden"]
+                    },
+                    {
+                        "profile_id": "search_ai_v1",
+                        "active": true,
+                        "slot_policy_ids": ["private_note_vector"]
+                    }
+                ],
+                "slot_policies": [
+                    {
+                        "slot_policy_id": "private_note_forbidden",
+                        "path": "Customer.private_note",
+                        "role": "PolicyProtected",
+                        "decision": "Forbidden",
+                        "granularity": "SlotValue",
+                        "sensitivity": "Forbidden"
+                    },
+                    {
+                        "slot_policy_id": "private_note_vector",
+                        "path": "Customer.private_note",
+                        "role": "NaturalLanguageLong",
+                        "decision": "VectorizeSlotValues",
+                        "granularity": "SlotValue",
+                        "sensitivity": "Sensitive"
+                    }
+                ]
+            }),
+        ));
+        assert_eq!(
+            validate_embedded_sections(&sections),
+            Err(CoveError::MapInvalid)
+        );
+    }
+
+    #[test]
+    fn map_ai_validation_rejects_referenced_template_without_fingerprint() {
+        let mut sections = valid_sections();
+        sections.push(parse_json(
+            SectionKind::MapAiTemplateCatalog,
+            json!({
+                "mapping_id": "customer-map",
+                "mapping_version": "2026.05",
+                "templates": [{
+                    "template_id": "missing_fingerprint_template",
+                    "template_kind": "Vectorization",
+                    "template_text": "Name: {value}",
+                    "deterministic": true
+                }]
+            }),
+        ));
+        sections.push(parse_json(
+            SectionKind::MapAiProfileCatalog,
+            json!({
+                "mapping_id": "customer-map",
+                "mapping_version": "2026.05",
+                "profiles": [{
+                    "profile_id": "customer_ai_v1",
+                    "active": true,
+                    "slot_policy_ids": ["name_slot"],
+                    "template_ids": ["missing_fingerprint_template"]
+                }],
+                "slot_policies": [{
+                    "slot_policy_id": "name_slot",
+                    "path": "Customer.name",
+                    "role": "Title",
+                    "decision": "VectorizeSlotValues",
+                    "granularity": "SlotValue",
+                    "sensitivity": "Internal",
+                    "template_id": "missing_fingerprint_template"
+                }]
+            }),
+        ));
+        assert_eq!(
+            validate_embedded_sections(&sections),
+            Err(CoveError::MapInvalid)
+        );
     }
 
     #[test]

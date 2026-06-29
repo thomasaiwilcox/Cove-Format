@@ -41,6 +41,10 @@ surfaces:
   catalogs, curated aliases, reviewed decisions, candidate evidence, replay
   verification, and resolver-aware projections without allowing silent fuzzy
   auto-merge.
+- **AI companion sidecars:** optional `.coveai` (`CVA2`) and `.covev`
+  (`CVV2`) artifacts can carry chunk, token, vector, training, multimodal, and
+  generator-provenance metadata for selected AI operations. Baseline COVE reads
+  do not depend on those sidecars.
 
 ## Current Status
 
@@ -121,6 +125,10 @@ mandatory feature pile:
 - **Resolver-backed mapping:** COVE-MAP resolver catalogs, alias import,
   candidate generation, reviewed equivalences, redacted evidence, and replay
   checks support deterministic entity-resolution workflows.
+- **AI companion metadata:** COVE-AI validates optional `.coveai` and `.covev`
+  sidecars for provider-free AI workflows such as FileCode embeddings, exact
+  flat semantic search, chunk/token/training metadata, multimodal sequence
+  descriptors, and generator audit records.
 - **Acceleration and planning:** COVE-COVERAGE, COVE-I, COVX, COVE-L, COVE-E,
   COVE-CACHE, COVE-R, range planning, and zero-copy maps help readers skip work
   safely when their contracts prove equivalence.
@@ -293,6 +301,9 @@ The public utility surface is grouped under the single `cove` binary:
   maintenance, and compatibility materialization.
 - `cove sidecar inspect ...` and `cove sidecar build ...` expose expert COVE-I,
   COVX, COVM, COVE-COVERAGE, COVE-L, COVE-CACHE, and COVE-R sidecar tooling.
+- `cove inspect --ai`, `cove vec build`, `cove train export`, and
+  `cove query --cove-ai ...` expose the optional COVE-AI companion sidecar
+  workflow.
 - `cove export arrow`, `cove perf explain-pruning`, `cove perf plan-cost`,
   `cove digest verify`, `cove profile`, and `cove canonicalise` provide
   integration, planning, integrity, profile, and canonical-value utilities.
@@ -375,6 +386,28 @@ projection semantics.
 CoveQL is the optional read/query layer over that semantic surface. It is
 described above because it is a companion to COVE-O and COVE-MAP rather than a
 requirement for basic COVE file interoperability.
+
+### AI Companion Sidecars
+
+COVE-AI is an optional sidecar layer for AI-oriented metadata. It adds `.coveai`
+and `.covev` companion artifacts for chunk boundaries, tokenization metadata,
+FileCode vectors, exact flat vector search, training sample descriptors,
+multimodal sequence descriptors, tensor/asset references, and generator
+provenance.
+
+COVE-AI does not alter baseline COVE truth. Ordinary COVE-T scans, COVE-O
+object reconstruction, and COVE-MAP readback must continue to work without AI
+support. A selected AI operation can require a sidecar, but unsupported AI
+metadata is optional for ordinary reads.
+
+The current reference implementation is provider-free: it validates supplied
+sidecars and can build deterministic local `.covev` vectors, but it does not
+call network embedding, tokenizer, or model providers. Exact flat FileCode
+vector scan is implemented; unsupported ANN payloads are treated as descriptor
+metadata unless a future implementation adds them behind explicit support.
+
+Start with [`docs/cove-ai.md`](./docs/cove-ai.md) for the public guide and
+[`spec/09-ai/`](./spec/09-ai/) for normative details.
 
 ### Delta Snapshots
 
@@ -484,6 +517,9 @@ implement the baseline tabular archive path.
 - **CoveQL**: optional semantic query layer over COVE-O/COVE-MAP and
   projection-backed table/graph profiles, with materialized readback as the
   authority and proof-gated optimized execution.
+- **COVE-AI**: optional `.coveai` and `.covev` companion artifacts for
+  validated AI metadata, FileCode vectors, exact flat semantic search,
+  chunk/token/training/multimodal descriptors, and generator audit records.
 - **COVE-CX**: registered codec-extension framework with stable COVE-owned v2
   bitstream identities for FSST-style UTF-8, ALP-style floats, and
   FastLanes-style integers, plus mandatory fallback-equivalence validation.
@@ -529,6 +565,9 @@ Important paths:
 - [`docs/covemap-json-schema-v1.md`](./docs/covemap-json-schema-v1.md):
   reference companion schema for COVE-MAP JSON payloads, including resolver
   catalog and projection fields.
+- [`docs/cove-ai.md`](./docs/cove-ai.md): public guide for optional COVE-AI
+  `.coveai` and `.covev` sidecars, CLI commands, CoveQL-AI methods, and
+  conformance gates.
 - [`docs/proposals/coveql-object-query-language.md`](./docs/proposals/coveql-object-query-language.md):
   CoveQL/Object proposal and conformance decisions.
 - [`docs/proposals/coveql-query-profiles.md`](./docs/proposals/coveql-query-profiles.md):

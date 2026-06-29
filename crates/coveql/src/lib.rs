@@ -214,6 +214,7 @@ pub const COVEQL_BRIDGE_CONTRACT_VERSION: &str = "0.1";
 pub const COVEQL_OBJECT_PROFILE_VERSION: &str = "0.1";
 pub const COVEQL_TABLE_PROFILE_VERSION: &str = "0.1";
 pub const COVEQL_GRAPH_PROFILE_VERSION: &str = "0.1";
+pub const COVEQL_AI_PROFILE_VERSION: &str = "0.1";
 pub const PROJECTION_DEPENDENCY_CONTRACT_VERSION: &str = "0.3";
 pub const PREDICATE_NORMAL_FORM_VERSION: &str = "0.1";
 pub const CODED_OPERATOR_CONTRACT_VERSION: &str = "0.1";
@@ -229,6 +230,7 @@ pub enum CoveQlProfileId {
     Object,
     Table,
     Graph,
+    Ai,
 }
 
 impl CoveQlProfileId {
@@ -237,6 +239,7 @@ impl CoveQlProfileId {
             Self::Object => "object",
             Self::Table => "table",
             Self::Graph => "graph",
+            Self::Ai => "ai",
         }
     }
 
@@ -245,6 +248,7 @@ impl CoveQlProfileId {
             "object" => Some(Self::Object),
             "table" => Some(Self::Table),
             "graph" => Some(Self::Graph),
+            "ai" | "coveql-ai" | "coveql_ai" => Some(Self::Ai),
             _ => None,
         }
     }
@@ -337,6 +341,7 @@ pub const COVEQL_CORE_CONTRACT: CoveQlCoreContract = CoveQlCoreContract {
         CoveQlProfileId::Object,
         CoveQlProfileId::Table,
         CoveQlProfileId::Graph,
+        CoveQlProfileId::Ai,
     ],
     common_roots: &[CoveQlRootKind::Projection, CoveQlRootKind::Evidence],
 };
@@ -586,10 +591,122 @@ pub const COVEQL_GRAPH_PROFILE_CONTRACT: CoveQlProfileContract = CoveQlProfileCo
     explain_fields: &["profiles", "root", "grain", "diagnostics"],
 };
 
+pub const COVEQL_AI_PROFILE_CONTRACT: CoveQlProfileContract = CoveQlProfileContract {
+    profile_id: CoveQlProfileId::Ai,
+    profile_version: COVEQL_AI_PROFILE_VERSION,
+    implemented: true,
+    supported_roots: &[
+        CoveQlRootKind::Object,
+        CoveQlRootKind::Association,
+        CoveQlRootKind::Projection,
+        CoveQlRootKind::Evidence,
+        CoveQlRootKind::Table,
+        CoveQlRootKind::Node,
+        CoveQlRootKind::Edge,
+        CoveQlRootKind::Path,
+    ],
+    input_grains: &[
+        CoveQlInputGrain::ObjectState,
+        CoveQlInputGrain::AssociationState,
+        CoveQlInputGrain::ProjectionRow,
+        CoveQlInputGrain::EvidenceRow,
+        CoveQlInputGrain::TableRow,
+        CoveQlInputGrain::NodeState,
+        CoveQlInputGrain::EdgeState,
+        CoveQlInputGrain::PathBinding,
+    ],
+    root_authority: &[
+        "validated_host_coveql_profile",
+        "validated_cove_ai_sidecar_or_embedded_ai_sections",
+    ],
+    identity_model: &[
+        "host_grain_identity",
+        "ai_reference_table_ids",
+        "digest_bound_source_binding",
+    ],
+    canonical_order: &[
+        "host_profile_canonical_order",
+        "ai_result_score_then_evidence_identity_when_authoritative",
+    ],
+    temporal_capabilities: &["inherits_host_temporal_context"],
+    evidence_targets: &[
+        "chunk",
+        "token",
+        "vector",
+        "training_sample",
+        "multimodal_sequence",
+        "generator_provenance",
+    ],
+    relationship_capabilities: &[
+        "sidecar_filecode_binding",
+        "chunk_to_source_binding",
+        "token_to_source_binding",
+        "sample_to_source_binding",
+    ],
+    profile_methods: &[
+        "similar",
+        "embedding",
+        "chunks",
+        "tokens",
+        "context",
+        "hybrid",
+        "trainingSamples",
+        "split",
+        "pack",
+        "multimodal",
+        "asPromptContext",
+        "rerank",
+        "generatorAudit",
+    ],
+    bridge_requirements: &[
+        "validated_ai_reference_spaces",
+        "digest_bound_source_binding",
+        "privacy_and_redaction_policy_match",
+    ],
+    aggregate_rules: &[
+        "ai_operations_preserve_host_visible_grain",
+        "runtime_scores_are_advisory_unless_persisted_or_fixed_point_deterministic",
+    ],
+    null_missing_nan_rules: &[
+        "missing_ai_sidecar_is_structured_rejection_for_selected_ai_operation",
+        "withheld_policy_results_are_diagnostic_rows_not_silent_skips",
+    ],
+    security_barriers: &[
+        "visibility",
+        "redaction",
+        "privacy_summary",
+        "payload_integrity",
+        "source_binding_freshness",
+    ],
+    materialization_boundaries: &[
+        "direct_payload_bytes",
+        "external_model_api",
+        "runtime_float_composition",
+        "prompt_context_export",
+    ],
+    output_modes: &["json_rows", "arrow_record_batch", "explain_json"],
+    fingerprint_fields: &[
+        "profile_id",
+        "profile_version",
+        "host_root",
+        "ai_operation",
+        "sidecar_binding",
+    ],
+    explain_fields: &[
+        "ai_operation",
+        "sidecar_required",
+        "policy_scope",
+        "authority",
+        "redaction",
+        "fallback",
+    ],
+};
+
 pub const COVEQL_BUILTIN_PROFILE_CONTRACTS: &[CoveQlProfileContract] = &[
     COVEQL_OBJECT_PROFILE_CONTRACT,
     COVEQL_TABLE_PROFILE_CONTRACT,
     COVEQL_GRAPH_PROFILE_CONTRACT,
+    COVEQL_AI_PROFILE_CONTRACT,
 ];
 
 pub const COVEQL_COMMON_BRIDGE_CONTRACTS: &[CoveQlBridgeContract] = &[
@@ -654,6 +771,7 @@ pub fn coveql_profile_contract(profile: CoveQlProfileId) -> &'static CoveQlProfi
         CoveQlProfileId::Object => &COVEQL_OBJECT_PROFILE_CONTRACT,
         CoveQlProfileId::Table => &COVEQL_TABLE_PROFILE_CONTRACT,
         CoveQlProfileId::Graph => &COVEQL_GRAPH_PROFILE_CONTRACT,
+        CoveQlProfileId::Ai => &COVEQL_AI_PROFILE_CONTRACT,
     }
 }
 
@@ -671,6 +789,7 @@ pub struct CoveQlConformanceProfile {
     pub object_profile_version: &'static str,
     pub table_profile_version: &'static str,
     pub graph_profile_version: &'static str,
+    pub ai_profile_version: &'static str,
     pub projection_dependency_contract_version: &'static str,
     pub predicate_normal_form_version: &'static str,
     pub coded_operator_contract_version: &'static str,
@@ -716,6 +835,7 @@ pub const COVEQL_CONFORMANCE_PROFILE: CoveQlConformanceProfile = CoveQlConforman
     object_profile_version: COVEQL_OBJECT_PROFILE_VERSION,
     table_profile_version: COVEQL_TABLE_PROFILE_VERSION,
     graph_profile_version: COVEQL_GRAPH_PROFILE_VERSION,
+    ai_profile_version: COVEQL_AI_PROFILE_VERSION,
     projection_dependency_contract_version: PROJECTION_DEPENDENCY_CONTRACT_VERSION,
     predicate_normal_form_version: PREDICATE_NORMAL_FORM_VERSION,
     coded_operator_contract_version: CODED_OPERATOR_CONTRACT_VERSION,
@@ -1082,10 +1202,58 @@ pub enum CoveQlSelectedOperation {
     ArrowExport {
         zero_copy_requested: bool,
     },
+    Ai {
+        root: CoveQlExplainTarget,
+        operation: CoveQlAiOperation,
+    },
     Explain {
         target: CoveQlExplainTarget,
         mode: ExplainMode,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CoveQlAiOperation {
+    Inspect,
+    ChunkProjection,
+    TokenProjection,
+    Embedding,
+    SemanticSearch,
+    RagContext,
+    TrainingSampleExport,
+    MultimodalSequenceRead,
+    GeneratorAudit,
+}
+
+impl CoveQlAiOperation {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Inspect => "ai_inspect",
+            Self::ChunkProjection => "ai_chunk_projection",
+            Self::TokenProjection => "ai_token_projection",
+            Self::Embedding => "ai_embedding",
+            Self::SemanticSearch => "ai_semantic_search",
+            Self::RagContext => "ai_rag_context",
+            Self::TrainingSampleExport => "ai_training_sample_export",
+            Self::MultimodalSequenceRead => "ai_multimodal_sequence_read",
+            Self::GeneratorAudit => "ai_generator_audit",
+        }
+    }
+
+    pub fn operation_kind(self) -> OperationKindV2 {
+        match self {
+            Self::Inspect => OperationKindV2::AiInspect,
+            Self::ChunkProjection => OperationKindV2::AiChunkProjection,
+            Self::TokenProjection => OperationKindV2::AiTokenProjection,
+            Self::Embedding => OperationKindV2::AiEmbedding,
+            Self::SemanticSearch => OperationKindV2::AiSemanticSearch,
+            Self::RagContext => OperationKindV2::AiRagContext,
+            Self::TrainingSampleExport => OperationKindV2::AiTrainingSampleExport,
+            Self::MultimodalSequenceRead => OperationKindV2::AiMultimodalSequenceRead,
+            Self::GeneratorAudit => OperationKindV2::AiGeneratorAudit,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1122,6 +1290,7 @@ pub enum ExplainMode {
     Developer,
     Proof,
     Coded,
+    Ai,
     Forensic,
 }
 
@@ -2650,6 +2819,10 @@ fn append_operation_feature_uses(
                 push_zero_copy(out);
             }
         }
+        CoveQlSelectedOperation::Ai { root, operation } => {
+            append_explain_target_feature_uses(root, out);
+            push_ai(*operation, out);
+        }
         CoveQlSelectedOperation::Explain { target, .. } => {
             append_explain_target_feature_uses(target, out);
             append_explain_mapping_feature_uses(target, out);
@@ -2761,6 +2934,14 @@ fn push_zero_copy(out: &mut Vec<FeatureUseRequestV2>) {
     );
 }
 
+fn push_ai(operation: CoveQlAiOperation, out: &mut Vec<FeatureUseRequestV2>) {
+    push_profile_and_operation(
+        out_profile(PrimaryProfile::CoveQlAi),
+        operation.operation_kind(),
+        out,
+    );
+}
+
 fn push_profile_and_operation(
     profile: u8,
     operation: OperationKindV2,
@@ -2862,6 +3043,7 @@ fn enforce_security_gates(
             ExplainMode::Developer
                 | ExplainMode::Proof
                 | ExplainMode::Coded
+                | ExplainMode::Ai
                 | ExplainMode::Forensic
         ) && !protected_allowed
         {
@@ -3181,6 +3363,13 @@ fn zero_copy_requested(request: &CoveQlOperationRequest) -> bool {
         } => true,
         CoveQlSelectedOperation::Explain {
             target:
+                CoveQlExplainTarget::ArrowExport {
+                    zero_copy_requested: true,
+                },
+            ..
+        } => true,
+        CoveQlSelectedOperation::Ai {
+            root:
                 CoveQlExplainTarget::ArrowExport {
                     zero_copy_requested: true,
                 },
@@ -3931,6 +4120,7 @@ fn selected_operation_name(operation: &CoveQlSelectedOperation) -> &'static str 
         CoveQlSelectedOperation::Evidence => "evidence",
         CoveQlSelectedOperation::IndexOnlyAnswer => "index_only_answer",
         CoveQlSelectedOperation::ArrowExport { .. } => "arrow_export",
+        CoveQlSelectedOperation::Ai { operation, .. } => operation.as_str(),
         CoveQlSelectedOperation::Explain { .. } => "explain",
     }
 }

@@ -104,6 +104,7 @@ impl Default for ResolveOptions {
                 crate::CoveQlProfileId::Object,
                 crate::CoveQlProfileId::Table,
                 crate::CoveQlProfileId::Graph,
+                crate::CoveQlProfileId::Ai,
             ],
         }
     }
@@ -1016,6 +1017,7 @@ fn render_explain_mode(mode: crate::ExplainMode) -> &'static str {
         crate::ExplainMode::Developer => "developer",
         crate::ExplainMode::Proof => "proof",
         crate::ExplainMode::Coded => "coded",
+        crate::ExplainMode::Ai => "ai",
         crate::ExplainMode::Forensic => "forensic",
     }
 }
@@ -1332,6 +1334,7 @@ pub struct ResolvedMethodChain {
     pub windows: Vec<ResolvedWindowSpec>,
     pub traversals: Vec<ResolvedGraphTraversal>,
     pub graph_algorithms: Vec<ResolvedGraphAlgorithm>,
+    pub ai_operations: Vec<ResolvedAiOperation>,
     pub order_by: Option<ResolvedOrderClause>,
     pub group_by: Option<Vec<ResolvedExpr>>,
     pub take: Option<u64>,
@@ -1339,6 +1342,29 @@ pub struct ResolvedMethodChain {
     pub explain: Option<crate::ExplainMode>,
     pub history: Option<AstHistoryMode>,
     pub changes: Option<ResolvedChanges>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedAiOperation {
+    pub operation: crate::CoveQlAiOperation,
+    pub method_name: String,
+    pub args: Vec<ResolvedAiArgument>,
+    pub sidecar_required: bool,
+    pub authority: String,
+    pub policy_scope: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedAiArgument {
+    pub name: Option<String>,
+    pub value: ResolvedAiArgumentValue,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "value")]
+pub enum ResolvedAiArgumentValue {
+    Expr(ResolvedExpr),
+    Predicate(ResolvedPredicate),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

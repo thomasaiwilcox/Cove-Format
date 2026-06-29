@@ -10,6 +10,10 @@ artifacts/
 perf.data*
 flamegraph.svg
 
+# Internal planning/proposal drafts
+docs/implementation-plans/
+docs/proposals/
+
 # Rust/Cargo byproducts
 **/*.rs.bk
 *.pdb

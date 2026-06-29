@@ -20,9 +20,9 @@ use crate::{
     },
     physical_sidecars::{PhysicalSidecarInputs, PhysicalSidecarStatus, PhysicalSidecarValidation},
     AssociationDirectionPlan, AssociationOptimizationReport, AstAggregateName, AstChangeMode,
-    AstHistoryMode, BuildLogicalPlanError, CoveQlOutputMode, DiagnosticSeverity, EvidenceGrainKind,
-    EvidenceOptimizationReport, EvidenceTargetIndexKind, MetadataDisclosurePolicy, ParseOptions,
-    PlanOptions, PlannedQuery, ResolveOptions,
+    AstHistoryMode, BuildLogicalPlanError, CoveQlAiOperation, CoveQlOutputMode, DiagnosticSeverity,
+    EvidenceGrainKind, EvidenceOptimizationReport, EvidenceTargetIndexKind,
+    MetadataDisclosurePolicy, ParseOptions, PlanOptions, PlannedQuery, ResolveOptions,
 };
 
 pub type PhysicalPlanFingerprint = String;
@@ -273,6 +273,11 @@ pub enum PhysicalPlanNodeKind {
         count_fast_path_candidates: usize,
         count_fast_path_exact: bool,
         hidden_entry_filtering_required: bool,
+    },
+    AiSidecarOperation {
+        operations: Vec<CoveQlAiOperation>,
+        sidecar_required: bool,
+        authority: String,
     },
     ApplyVisibilityAndRedaction {
         visibility_policy: String,
@@ -923,6 +928,29 @@ fn build_nodes(
                 &["materialized_object_states"],
                 &["evidence_rows"],
                 "evidence reads happen after visibility and redaction unless proven safe",
+            ),
+        );
+    }
+    if !planned.resolved.method_chain.ai_operations.is_empty() {
+        nodes.push(
+            PhysicalPlanNodeKind::AiSidecarOperation {
+                operations: planned
+                    .resolved
+                    .method_chain
+                    .ai_operations
+                    .iter()
+                    .map(|operation| operation.operation)
+                    .collect(),
+                sidecar_required: true,
+                authority:
+                    "validated COVE-AI sidecar required; runtime-only AI results are advisory"
+                        .into(),
+            },
+            contract(
+                "AI sidecar operation",
+                &["visible_host_grain", "validated_ai_sidecar"],
+                &["ai_operation_rows_or_diagnostics"],
+                "selected AI operations reject or report policy-withheld diagnostics when sidecar binding, privacy, redaction, freshness, or integrity proof is absent",
             ),
         );
     }

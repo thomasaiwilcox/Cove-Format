@@ -33,6 +33,12 @@ pub const MAGIC_COVEDELTA: [u8; 4] = *b"CVD2";
 /// Magic bytes at the end of a COVE-I v2 secondary-index artifact (`b"CVI2"`).
 pub const MAGIC_COVI: [u8; 4] = *b"CVI2";
 
+/// Magic bytes at the end of a COVE-AI v1 companion artifact (`b"CVA2"`).
+pub const MAGIC_COVEAI: [u8; 4] = *b"CVA2";
+
+/// Magic bytes at the end of a COVE-VEC v1 companion artifact (`b"CVV2"`).
+pub const MAGIC_COVEV: [u8; 4] = *b"CVV2";
+
 // ── File-level constants ──────────────────────────────────────────────────────
 
 /// Required value of `header_len` for COVE v2.
@@ -121,6 +127,32 @@ pub const FEATURE_SECONDARY_INDEX_ARTIFACT: u64 = 0x0000_0040_0000_0000;
 pub const FEATURE_INDEX_ONLY_CAPABILITY: u64 = 0x0000_0080_0000_0000;
 pub const FEATURE_COVERAGE_CACHE_HINTS: u64 = 0x0000_0100_0000_0000;
 
+// ── COVE-AI feature bits (extended global feature word 1 / sidecar-local word) ─
+
+/// Extended global feature word index used by embedded COVE-AI feature bits.
+///
+/// These bits are intentionally not added to [`KNOWN_FEATURE_BITS_MASK`].
+/// Embedded `.cove` AI requirements must be scoped through
+/// `EXTENDED_FEATURE_SET`, `SECTION_FEATURE_BINDING`, profile capability
+/// matrices, or operation bindings.
+pub const AI_GLOBAL_FEATURE_WORD_INDEX: u32 = 1;
+
+pub const AI_FEATURE_MAP_AI_POLICY: u64 = 1 << 0;
+pub const AI_FEATURE_CHUNK: u64 = 1 << 1;
+pub const AI_FEATURE_TOKEN: u64 = 1 << 2;
+pub const AI_FEATURE_VECTOR: u64 = 1 << 3;
+pub const AI_FEATURE_VECTOR_INDEX: u64 = 1 << 4;
+pub const AI_FEATURE_TENSOR_LAYOUT: u64 = 1 << 5;
+pub const AI_FEATURE_ASSET_REF: u64 = 1 << 6;
+pub const AI_FEATURE_MMSEQ: u64 = 1 << 7;
+pub const AI_FEATURE_TRAIN: u64 = 1 << 8;
+pub const AI_FEATURE_GENERATOR_PROVENANCE: u64 = 1 << 9;
+pub const AI_FEATURE_COVEQL_AI: u64 = 1 << 10;
+pub const AI_FEATURE_CANONICAL_FIXED_POINT_VECTOR: u64 = 1 << 11;
+pub const AI_FEATURE_EXTERNAL_ASSET_DIGEST_REQUIRED: u64 = 1 << 12;
+pub const AI_FEATURE_PRIVACY_SUMMARY: u64 = 1 << 13;
+pub const AI_FEATURE_VECTOR_SPACE_COMPATIBILITY: u64 = 1 << 14;
+
 /// Bitmask of all low-word feature bits defined in COVE v2.0 (Section 11).
 ///
 /// Any required feature bit that is NOT in this mask is unknown to this
@@ -199,6 +231,22 @@ pub enum PrimaryProfile {
     CoverageMetadata = 10,
     /// COVE-I secondary index carrier.
     SecondaryIndex = 11,
+    /// COVE-AI shared AI metadata carrier.
+    CoveAiShared = 16,
+    /// COVE-MAP-AI semantic slot and AI policy carrier.
+    CoveMapAi = 17,
+    /// COVE-CHUNK text/document chunk metadata carrier.
+    CoveChunk = 18,
+    /// COVE-TOK tokenizer and token-cache carrier.
+    CoveTok = 19,
+    /// COVE-VEC vector metadata and payload carrier.
+    CoveVec = 20,
+    /// COVE-MMSEQ multimodal sequence carrier.
+    CoveMmseq = 21,
+    /// COVE-TRAIN training/evaluation sample carrier.
+    CoveTrain = 22,
+    /// CoveQL-AI operation profile carrier.
+    CoveQlAi = 23,
 }
 
 impl PrimaryProfile {
@@ -217,6 +265,14 @@ impl PrimaryProfile {
             9 => Some(Self::RuntimeCompatibility),
             10 => Some(Self::CoverageMetadata),
             11 => Some(Self::SecondaryIndex),
+            16 => Some(Self::CoveAiShared),
+            17 => Some(Self::CoveMapAi),
+            18 => Some(Self::CoveChunk),
+            19 => Some(Self::CoveTok),
+            20 => Some(Self::CoveVec),
+            21 => Some(Self::CoveMmseq),
+            22 => Some(Self::CoveTrain),
+            23 => Some(Self::CoveQlAi),
             _ => None,
         }
     }
@@ -332,6 +388,38 @@ pub enum SectionKind {
     MapConversionReport = 67,
     MapProjectionCatalog = 68,
     MapResolutionCatalog = 69,
+    MapAiProfileCatalog = 70,
+    MapAiTemplateCatalog = 71,
+    MapAiTrainingPolicyCatalog = 72,
+
+    // COVE-AI sections (profiles = 16..23)
+    AiCompanionArtifactRef = 99,
+    AiSourceBinding = 100,
+    AiChunkProfile = 101,
+    AiTextChunkIndex = 102,
+    AiTokenizerProfile = 103,
+    AiTokenBlock = 104,
+    AiTokenizedSpan = 105,
+    AiTokenSequencePack = 106,
+    AiVectorSpace = 107,
+    AiVectorBinding = 108,
+    AiVectorPayloadBlock = 109,
+    AiVectorComposition = 110,
+    AiVectorIndex = 111,
+    AiTensorLayout = 112,
+    AiAssetManifest = 113,
+    AiMultimodalSequence = 114,
+    AiTrainingProfile = 115,
+    AiTrainingSampleIndex = 116,
+    AiTrainingSplitDedupEpoch = 117,
+    AiLabelPreference = 118,
+    AiGeneratorProvenance = 119,
+    AiReferenceTables = 120,
+    AiPayloadIntegrity = 121,
+    AiPrivacySummary = 122,
+    AiSectionFeatureBinding = 123,
+    AiVectorDirectory = 124,
+    AiPayloadBytes = 125,
 
     // Vendor extension (shared)
     VendorExtension = 255,
@@ -399,6 +487,36 @@ impl SectionKind {
             67 => Some(Self::MapConversionReport),
             68 => Some(Self::MapProjectionCatalog),
             69 => Some(Self::MapResolutionCatalog),
+            70 => Some(Self::MapAiProfileCatalog),
+            71 => Some(Self::MapAiTemplateCatalog),
+            72 => Some(Self::MapAiTrainingPolicyCatalog),
+            99 => Some(Self::AiCompanionArtifactRef),
+            100 => Some(Self::AiSourceBinding),
+            101 => Some(Self::AiChunkProfile),
+            102 => Some(Self::AiTextChunkIndex),
+            103 => Some(Self::AiTokenizerProfile),
+            104 => Some(Self::AiTokenBlock),
+            105 => Some(Self::AiTokenizedSpan),
+            106 => Some(Self::AiTokenSequencePack),
+            107 => Some(Self::AiVectorSpace),
+            108 => Some(Self::AiVectorBinding),
+            109 => Some(Self::AiVectorPayloadBlock),
+            110 => Some(Self::AiVectorComposition),
+            111 => Some(Self::AiVectorIndex),
+            112 => Some(Self::AiTensorLayout),
+            113 => Some(Self::AiAssetManifest),
+            114 => Some(Self::AiMultimodalSequence),
+            115 => Some(Self::AiTrainingProfile),
+            116 => Some(Self::AiTrainingSampleIndex),
+            117 => Some(Self::AiTrainingSplitDedupEpoch),
+            118 => Some(Self::AiLabelPreference),
+            119 => Some(Self::AiGeneratorProvenance),
+            120 => Some(Self::AiReferenceTables),
+            121 => Some(Self::AiPayloadIntegrity),
+            122 => Some(Self::AiPrivacySummary),
+            123 => Some(Self::AiSectionFeatureBinding),
+            124 => Some(Self::AiVectorDirectory),
+            125 => Some(Self::AiPayloadBytes),
             255 => Some(Self::VendorExtension),
             _ => None,
         }
@@ -1003,7 +1121,7 @@ mod tests {
     #[test]
     fn section_kind_from_u16_unknown() {
         assert_eq!(SectionKind::from_u16(0), None);
-        assert_eq!(SectionKind::from_u16(100), None);
+        assert_eq!(SectionKind::from_u16(126), None);
     }
 
     // ── CompressionCodec ─────────────────────────────────────────────────────

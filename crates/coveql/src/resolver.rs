@@ -1,9 +1,10 @@
 use crate::{
-    ast::*, build_operation_context, parse_query, BranchContext, BranchSelector, CoveQlDiagnostic,
-    CoveQlExplainTarget, CoveQlOperationRequest, CoveQlOutputMode, CoveQlProfileId,
-    CoveQlSelectedOperation, DiagnosticSeverity, ExplainMode, MetadataDisclosurePolicy,
-    RedactionReference, RejectionKind, RejectionReport, ResourceUseEstimate, SecurityContext,
-    TemporalContext, TemporalMode, TemporalRole, TombstoneContext, VisibilityReference,
+    ast::*, build_operation_context, parse_query, BranchContext, BranchSelector, CoveQlAiOperation,
+    CoveQlDiagnostic, CoveQlExplainTarget, CoveQlOperationRequest, CoveQlOutputMode,
+    CoveQlProfileId, CoveQlSelectedOperation, DiagnosticSeverity, ExplainMode,
+    MetadataDisclosurePolicy, RedactionReference, RejectionKind, RejectionReport,
+    ResourceUseEstimate, SecurityContext, TemporalContext, TemporalMode, TemporalRole,
+    TombstoneContext, VisibilityReference,
 };
 use cove_core::{
     constants::CovePhysicalKind,
@@ -388,7 +389,13 @@ fn collect_chain_settings(
             .clone()
             .unwrap_or(default_output)
     };
-    let selected_operation = if let Some(mode) = explain {
+    let ai_operation = selected_ai_operation_for_methods(&parsed.methods, explain);
+    let selected_operation = if let Some(operation) = ai_operation {
+        CoveQlSelectedOperation::Ai {
+            root: target,
+            operation,
+        }
+    } else if let Some(mode) = explain {
         CoveQlSelectedOperation::Explain { target, mode }
     } else if let CoveQlOutputMode::ArrowRecordBatch {
         zero_copy_requested,
@@ -443,6 +450,19 @@ fn is_coveql_profile_method(name: &str) -> bool {
             | "clusteringCoefficient"
             | "community"
             | "spanningTree"
+            | "similar"
+            | "embedding"
+            | "chunks"
+            | "tokens"
+            | "context"
+            | "hybrid"
+            | "trainingSamples"
+            | "split"
+            | "pack"
+            | "multimodal"
+            | "asPromptContext"
+            | "rerank"
+            | "generatorAudit"
     )
 }
 
@@ -641,7 +661,12 @@ fn validate_profile_shell(
     if matches!(
         parsed.root.node,
         AstRoot::Projection(_) | AstRoot::Evidence(_)
-    ) && parsed.profiles.len() > 1
+    ) && parsed
+        .profiles
+        .iter()
+        .filter(|profile| is_host_profile(**profile))
+        .count()
+        > 1
     {
         return Err(profile_rejection(
             "E_AMBIGUOUS_PROFILE",
@@ -653,6 +678,7 @@ fn validate_profile_shell(
         CoveQlProfileId::Object => {}
         CoveQlProfileId::Table => {}
         CoveQlProfileId::Graph => {}
+        CoveQlProfileId::Ai => {}
     }
     if let Some(name) = first_unsupported_profile_method(parsed) {
         return Err(profile_rejection(
@@ -663,7 +689,29 @@ fn validate_profile_shell(
             resolve_options,
         ));
     }
+    if parsed_requires_ai_profile(parsed) && !parsed.profiles.contains(&CoveQlProfileId::Ai) {
+        return Err(profile_rejection(
+            "E_UNSUPPORTED_PROFILE_METHOD",
+            "CoveQL-AI methods require the active ai profile",
+            resolve_options,
+        ));
+    }
     Ok(())
+}
+
+fn is_host_profile(profile: CoveQlProfileId) -> bool {
+    matches!(
+        profile,
+        CoveQlProfileId::Object | CoveQlProfileId::Table | CoveQlProfileId::Graph
+    )
+}
+
+fn parsed_requires_ai_profile(parsed: &ParsedQuery) -> bool {
+    parsed.methods.iter().any(|method| match &method.node {
+        AstMethod::Explain(ExplainMode::Ai) => true,
+        AstMethod::ProfileCall { name, .. } => ai_operation_for_method(&name.name).is_some(),
+        _ => false,
+    })
 }
 
 fn first_unsupported_profile_method(parsed: &ParsedQuery) -> Option<&str> {
@@ -920,6 +968,86 @@ fn output_mode_for_root(root: &AstRoot) -> CoveQlOutputMode {
         AstRoot::Projection(_) => CoveQlOutputMode::ProjectionRows,
         AstRoot::Evidence(_) => CoveQlOutputMode::EvidenceRows,
         AstRoot::Node(_) | AstRoot::Edge(_) | AstRoot::Path(_) => CoveQlOutputMode::JsonRows,
+    }
+}
+
+fn selected_ai_operation_for_methods(
+    methods: &[Spanned<AstMethod>],
+    explain: Option<ExplainMode>,
+) -> Option<CoveQlAiOperation> {
+    if matches!(explain, Some(ExplainMode::Ai)) {
+        return Some(CoveQlAiOperation::Inspect);
+    }
+    methods
+        .iter()
+        .filter_map(|method| match &method.node {
+            AstMethod::ProfileCall { name, .. } => ai_operation_for_method(&name.name),
+            _ => None,
+        })
+        .max_by_key(|operation| ai_operation_priority(*operation))
+}
+
+fn ai_operation_for_method(name: &str) -> Option<CoveQlAiOperation> {
+    match name {
+        "chunks" => Some(CoveQlAiOperation::ChunkProjection),
+        "tokens" => Some(CoveQlAiOperation::TokenProjection),
+        "embedding" => Some(CoveQlAiOperation::Embedding),
+        "similar" | "hybrid" | "rerank" => Some(CoveQlAiOperation::SemanticSearch),
+        "context" | "asPromptContext" => Some(CoveQlAiOperation::RagContext),
+        "trainingSamples" | "split" | "pack" => Some(CoveQlAiOperation::TrainingSampleExport),
+        "multimodal" => Some(CoveQlAiOperation::MultimodalSequenceRead),
+        "generatorAudit" => Some(CoveQlAiOperation::GeneratorAudit),
+        _ => None,
+    }
+}
+
+fn ai_operation_priority(operation: CoveQlAiOperation) -> u8 {
+    match operation {
+        CoveQlAiOperation::Inspect => 0,
+        CoveQlAiOperation::ChunkProjection => 1,
+        CoveQlAiOperation::TokenProjection => 2,
+        CoveQlAiOperation::Embedding => 3,
+        CoveQlAiOperation::SemanticSearch => 4,
+        CoveQlAiOperation::RagContext => 5,
+        CoveQlAiOperation::TrainingSampleExport => 6,
+        CoveQlAiOperation::MultimodalSequenceRead => 7,
+        CoveQlAiOperation::GeneratorAudit => 8,
+    }
+}
+
+fn ai_authority(operation: CoveQlAiOperation) -> &'static str {
+    match operation {
+        CoveQlAiOperation::Embedding => {
+            "sidecar_vector_or_deterministic_runtime_embedding; runtime_float_composition_is_advisory"
+        }
+        CoveQlAiOperation::SemanticSearch => {
+            "validated_exact_flat_vector_scan_or_advisory_candidate_rerank"
+        }
+        CoveQlAiOperation::RagContext => "validated_chunk_source_binding_with_policy_scoped_context",
+        CoveQlAiOperation::TrainingSampleExport => {
+            "validated_training_policy_with_policy_withheld_diagnostics"
+        }
+        CoveQlAiOperation::MultimodalSequenceRead => {
+            "validated_multimodal_sequence_asset_tensor_policy"
+        }
+        CoveQlAiOperation::ChunkProjection => "validated_chunk_profile_and_source_hash_freshness",
+        CoveQlAiOperation::TokenProjection => {
+            "validated_tokenizer_profile_token_payload_and_source_hash_freshness"
+        }
+        CoveQlAiOperation::GeneratorAudit => "validated_generator_provenance_and_review_records",
+        CoveQlAiOperation::Inspect => "validated_ai_descriptor_summary",
+    }
+}
+
+fn ai_policy_scope(root: &ResolvedRoot) -> &'static str {
+    match root {
+        ResolvedRoot::Object(_) => "object_state_visibility_redaction",
+        ResolvedRoot::Association(_) => "association_state_visibility_redaction",
+        ResolvedRoot::Projection(_) => "projection_row_visibility_redaction",
+        ResolvedRoot::Evidence(_) => "evidence_row_visibility_redaction",
+        ResolvedRoot::Table(_) => "table_row_visibility_redaction",
+        ResolvedRoot::Node(_) => "graph_node_visibility_redaction",
+        ResolvedRoot::Edge(_) => "graph_edge_visibility_redaction",
     }
 }
 
@@ -1346,6 +1474,13 @@ impl Resolver {
                         .graph_algorithms
                         .push(self.resolve_graph_algorithm(&name.name, args, root)?);
                 }
+                AstMethod::ProfileCall { name, args }
+                    if ai_operation_for_method(&name.name).is_some() =>
+                {
+                    chain
+                        .ai_operations
+                        .push(self.resolve_ai_operation(&name.name, args, root)?);
+                }
                 AstMethod::ProfileCall { name, .. } => {
                     return Err(profile_rejection(
                         "E_UNSUPPORTED_PROFILE_METHOD",
@@ -1364,6 +1499,14 @@ impl Resolver {
             self.diagnostics.push(warning(
                 "W_DEFAULT_SELECT",
                 "query has no explicit select; Phase 1 records default output shape only",
+                "resolve",
+                &self.options.security,
+            ));
+        }
+        if !chain.ai_operations.is_empty() {
+            self.diagnostics.push(warning(
+                "W_AI_SIDECAR_REQUIRED",
+                "CoveQL-AI operation selected; payload access remains sidecar-gated until source binding, privacy, redaction, and integrity validate",
                 "resolve",
                 &self.options.security,
             ));
@@ -2216,6 +2359,38 @@ impl Resolver {
             distinct,
             contract,
         )
+    }
+
+    fn resolve_ai_operation(
+        &self,
+        name: &str,
+        args: &[AstProfileArgument],
+        root: &ResolvedRoot,
+    ) -> Result<ResolvedAiOperation, BuildResolvedQueryError> {
+        let operation = ai_operation_for_method(name).expect("guarded by caller");
+        let mut resolved_args = Vec::with_capacity(args.len());
+        for arg in args {
+            let value = match &arg.value {
+                AstProfileArgumentValue::Expr(expr) => {
+                    ResolvedAiArgumentValue::Expr(self.resolve_expr(expr, root)?)
+                }
+                AstProfileArgumentValue::Predicate(predicate) => {
+                    ResolvedAiArgumentValue::Predicate(self.resolve_predicate(predicate, root)?)
+                }
+            };
+            resolved_args.push(ResolvedAiArgument {
+                name: arg.name.as_ref().map(|name| name.name.clone()),
+                value,
+            });
+        }
+        Ok(ResolvedAiOperation {
+            operation,
+            method_name: name.into(),
+            args: resolved_args,
+            sidecar_required: true,
+            authority: ai_authority(operation).into(),
+            policy_scope: ai_policy_scope(root).into(),
+        })
     }
 
     fn resolve_graph_algorithm(

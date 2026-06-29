@@ -29,6 +29,9 @@ impl EmbeddedMapSection {
             Self::EvidenceIndex(section) => &section.mapping_id,
             Self::ConversionReport(section) => &section.mapping_id,
             Self::ProjectionCatalog(section) => &section.mapping_id,
+            Self::AiProfileCatalog(section) => &section.mapping_id,
+            Self::AiTemplateCatalog(section) => &section.mapping_id,
+            Self::AiTrainingPolicyCatalog(section) => &section.mapping_id,
         }
     }
 
@@ -44,6 +47,9 @@ impl EmbeddedMapSection {
             Self::EvidenceIndex(section) => &section.mapping_version,
             Self::ConversionReport(section) => &section.mapping_version,
             Self::ProjectionCatalog(section) => &section.mapping_version,
+            Self::AiProfileCatalog(section) => &section.mapping_version,
+            Self::AiTemplateCatalog(section) => &section.mapping_version,
+            Self::AiTrainingPolicyCatalog(section) => &section.mapping_version,
         }
     }
 }
@@ -82,6 +88,14 @@ pub(super) fn parse_embedded_section(
         SectionKind::MapProjectionCatalog => {
             MapProjectionCatalog::parse(bytes).map(EmbeddedMapSection::ProjectionCatalog)
         }
+        SectionKind::MapAiProfileCatalog => {
+            MapAiProfileCatalog::parse(bytes).map(EmbeddedMapSection::AiProfileCatalog)
+        }
+        SectionKind::MapAiTemplateCatalog => {
+            MapAiTemplateCatalog::parse(bytes).map(EmbeddedMapSection::AiTemplateCatalog)
+        }
+        SectionKind::MapAiTrainingPolicyCatalog => MapAiTrainingPolicyCatalog::parse(bytes)
+            .map(EmbeddedMapSection::AiTrainingPolicyCatalog),
         _ => Err(CoveError::MapInvalid),
     }
 }
@@ -107,6 +121,7 @@ pub(super) fn validate_embedded_sections(sections: &[EmbeddedMapSection]) -> Res
     let mut identity_rule_ids = BTreeSet::<String>::new();
     let mut resolver_object_types = BTreeMap::<String, String>::new();
     let mut referenced_resolvers = BTreeSet::<(String, String)>::new();
+    let mut identity_rule_object_types = BTreeMap::<String, String>::new();
     let mut do_not_merge = BTreeSet::<(String, String)>::new();
     let mut row_rules = BTreeMap::<String, MapRowSemanticRule>::new();
     let mut assertion_ids = BTreeSet::<String>::new();
@@ -115,6 +130,14 @@ pub(super) fn validate_embedded_sections(sections: &[EmbeddedMapSection]) -> Res
     let mut evidence_entries = Vec::<MapEvidenceEntry>::new();
     let mut observed_sources = Vec::<MapObservedSourceState>::new();
     let mut projections = Vec::<MapProjectionEntry>::new();
+    let mut source_columns = BTreeSet::<(String, String)>::new();
+    let mut object_types = BTreeSet::<String>::new();
+    let mut object_properties = BTreeSet::<(String, String)>::new();
+    let mut association_types = BTreeSet::<String>::new();
+    let mut ai_profiles = Vec::<MapAiProfileV1>::new();
+    let mut ai_slot_policies = Vec::<MapAiSlotPolicyV1>::new();
+    let mut ai_templates = Vec::<AiVectorTemplateV1>::new();
+    let mut ai_training_policy_ids = BTreeSet::<String>::new();
 
     for section in sections {
         match section {
@@ -177,6 +200,13 @@ pub(super) fn validate_embedded_sections(sections: &[EmbeddedMapSection]) -> Res
             }
             EmbeddedMapSection::IdentityRuleCatalog(catalog) => {
                 for rule in &catalog.identity_rules {
+                    object_types.insert(rule.object_type.clone());
+                    if identity_rule_object_types
+                        .insert(rule.rule_id.clone(), rule.object_type.clone())
+                        .is_some()
+                    {
+                        return Err(CoveError::MapInvalid);
+                    }
                     if !identity_rule_ids.insert(rule.rule_id.clone()) {
                         return Err(CoveError::MapInvalid);
                     }
@@ -205,6 +235,20 @@ pub(super) fn validate_embedded_sections(sections: &[EmbeddedMapSection]) -> Res
                         return Err(CoveError::MapInvalid);
                     }
                     referenced_function_ids.extend(rule.function_ids.iter().cloned());
+                    if let Some(object_type) =
+                        identity_rule_object_types.get(&rule.identity_rule_id)
+                    {
+                        object_types.insert(object_type.clone());
+                        for binding in &rule.property_bindings {
+                            source_columns
+                                .insert((rule.source_id.clone(), binding.source_column.clone()));
+                            object_properties
+                                .insert((object_type.clone(), binding.property_id.clone()));
+                        }
+                    }
+                    for binding in &rule.association_bindings {
+                        association_types.insert(binding.association_type.clone());
+                    }
                 }
             }
             EmbeddedMapSection::AssertionLog(log) => {
@@ -232,6 +276,34 @@ pub(super) fn validate_embedded_sections(sections: &[EmbeddedMapSection]) -> Res
             EmbeddedMapSection::ProjectionCatalog(catalog) => {
                 projections.extend(catalog.projections.iter().cloned());
             }
+            EmbeddedMapSection::AiProfileCatalog(catalog) => {
+                ai_profiles.extend(catalog.profiles.iter().cloned());
+                ai_slot_policies.extend(catalog.slot_policies.iter().cloned());
+            }
+            EmbeddedMapSection::AiTemplateCatalog(catalog) => {
+                ai_templates.extend(catalog.templates.iter().cloned());
+            }
+            EmbeddedMapSection::AiTrainingPolicyCatalog(catalog) => {
+                for policy in &catalog.training_policies {
+                    if !ai_training_policy_ids.insert(policy.training_policy_id.clone()) {
+                        return Err(CoveError::MapInvalid);
+                    }
+                }
+            }
+        }
+    }
+
+    for rule in row_rules.values() {
+        let Some(object_type) = identity_rule_object_types.get(&rule.identity_rule_id) else {
+            continue;
+        };
+        object_types.insert(object_type.clone());
+        for binding in &rule.property_bindings {
+            source_columns.insert((rule.source_id.clone(), binding.source_column.clone()));
+            object_properties.insert((object_type.clone(), binding.property_id.clone()));
+        }
+        for binding in &rule.association_bindings {
+            association_types.insert(binding.association_type.clone());
         }
     }
 
@@ -427,7 +499,474 @@ pub(super) fn validate_embedded_sections(sections: &[EmbeddedMapSection]) -> Res
         }
     }
 
+    validate_map_ai_sections(
+        &ai_profiles,
+        &ai_slot_policies,
+        &ai_templates,
+        &ai_training_policy_ids,
+        &sources,
+        &identity_rule_ids,
+        &row_rules,
+        &object_types,
+        &object_properties,
+        &association_types,
+        &source_columns,
+    )?;
+
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_map_ai_sections(
+    profiles: &[MapAiProfileV1],
+    slot_policies: &[MapAiSlotPolicyV1],
+    templates: &[AiVectorTemplateV1],
+    training_policy_ids: &BTreeSet<String>,
+    sources: &BTreeMap<String, MapSourceEntry>,
+    _identity_rule_ids: &BTreeSet<String>,
+    _row_rules: &BTreeMap<String, MapRowSemanticRule>,
+    object_types: &BTreeSet<String>,
+    object_properties: &BTreeSet<(String, String)>,
+    association_types: &BTreeSet<String>,
+    source_columns: &BTreeSet<(String, String)>,
+) -> Result<(), CoveError> {
+    if profiles.is_empty() && slot_policies.is_empty() && templates.is_empty() {
+        return Ok(());
+    }
+
+    let mut profile_ids = BTreeSet::new();
+    for profile in profiles {
+        if !profile_ids.insert(profile.profile_id.clone()) {
+            return Err(CoveError::MapInvalid);
+        }
+    }
+
+    let mut slots_by_id = BTreeMap::<String, &MapAiSlotPolicyV1>::new();
+    for slot in slot_policies {
+        if slots_by_id
+            .insert(slot.slot_policy_id.clone(), slot)
+            .is_some()
+        {
+            return Err(CoveError::MapInvalid);
+        }
+        validate_map_ai_slot_refs(
+            slot,
+            sources,
+            object_types,
+            object_properties,
+            association_types,
+            source_columns,
+        )?;
+    }
+
+    let mut templates_by_id = BTreeMap::<String, &AiVectorTemplateV1>::new();
+    for template in templates {
+        if templates_by_id
+            .insert(template.template_id.clone(), template)
+            .is_some()
+        {
+            return Err(CoveError::MapInvalid);
+        }
+    }
+
+    let mut forbidden_keys = BTreeSet::<String>::new();
+    let mut selected_keys = BTreeSet::<String>::new();
+    for profile in profiles.iter().filter(|profile| profile.active) {
+        let mut paths_in_profile = BTreeSet::<String>::new();
+        for slot_policy_id in &profile.slot_policy_ids {
+            let Some(slot) = slots_by_id.get(slot_policy_id).copied() else {
+                return Err(CoveError::MapInvalid);
+            };
+            let key = ai_slot_policy_key(slot);
+            if !paths_in_profile.insert(key.clone()) {
+                return Err(CoveError::MapInvalid);
+            }
+            if slot.decision == "Forbidden" {
+                if selected_keys.contains(&key) {
+                    return Err(CoveError::MapInvalid);
+                }
+                forbidden_keys.insert(key);
+            } else if slot.decision != "Ignore" {
+                if forbidden_keys.contains(&key) {
+                    return Err(CoveError::MapInvalid);
+                }
+                selected_keys.insert(key);
+            }
+        }
+
+        for template_id in &profile.template_ids {
+            let Some(template) = templates_by_id.get(template_id).copied() else {
+                return Err(CoveError::MapInvalid);
+            };
+            if template.template_fingerprint.is_none() {
+                return Err(CoveError::MapInvalid);
+            }
+        }
+        for training_policy_id in &profile.training_policy_ids {
+            if !training_policy_ids.contains(training_policy_id) {
+                return Err(CoveError::MapInvalid);
+            }
+        }
+    }
+
+    for slot in slot_policies {
+        if let Some(template_id) = &slot.template_id {
+            let Some(template) = templates_by_id.get(template_id).copied() else {
+                return Err(CoveError::MapInvalid);
+            };
+            if template.template_fingerprint.is_none() {
+                return Err(CoveError::MapInvalid);
+            }
+        }
+        if let Some(training_policy_id) = &slot.training_policy_id {
+            if !training_policy_ids.contains(training_policy_id) {
+                return Err(CoveError::MapInvalid);
+            }
+        }
+        if slot.decision == "Forbidden"
+            && (slot.vector_space_id.is_some()
+                || slot.template_id.is_some()
+                || slot.chunk_profile_id.is_some()
+                || slot.tokenizer_profile_id.is_some()
+                || slot.training_policy_id.is_some())
+        {
+            return Err(CoveError::MapInvalid);
+        }
+        if slot.sensitivity == "Forbidden" && slot.decision != "Forbidden" {
+            return Err(CoveError::MapInvalid);
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_map_ai_slot_refs(
+    slot: &MapAiSlotPolicyV1,
+    sources: &BTreeMap<String, MapSourceEntry>,
+    object_types: &BTreeSet<String>,
+    object_properties: &BTreeSet<(String, String)>,
+    association_types: &BTreeSet<String>,
+    source_columns: &BTreeSet<(String, String)>,
+) -> Result<(), CoveError> {
+    if let Some(source_id) = &slot.source_id {
+        if !sources.is_empty() && !sources.contains_key(source_id) {
+            return Err(CoveError::MapInvalid);
+        }
+    }
+    if let Some(source_column) = &slot.source_column {
+        let Some(source_id) = &slot.source_id else {
+            return Err(CoveError::MapInvalid);
+        };
+        if !source_columns.is_empty()
+            && !source_columns.contains(&(source_id.clone(), source_column.clone()))
+        {
+            return Err(CoveError::MapInvalid);
+        }
+    }
+    if slot.column_id.is_some() && slot.table_id.is_none() {
+        return Err(CoveError::MapInvalid);
+    }
+    if let Some(object_type) = &slot.object_type {
+        if !object_types.is_empty() && !object_types.contains(object_type) {
+            return Err(CoveError::MapInvalid);
+        }
+    }
+    if let Some(property_id) = &slot.property_id {
+        let Some(object_type) = &slot.object_type else {
+            return Err(CoveError::MapInvalid);
+        };
+        if !object_properties.is_empty()
+            && !object_properties.contains(&(object_type.clone(), property_id.clone()))
+        {
+            return Err(CoveError::MapInvalid);
+        }
+    }
+    if let Some(association_type) = &slot.association_type {
+        if !association_types.is_empty() && !association_types.contains(association_type) {
+            return Err(CoveError::MapInvalid);
+        }
+    }
+    Ok(())
+}
+
+fn ai_slot_policy_key(slot: &MapAiSlotPolicyV1) -> String {
+    format!(
+        "{}\x1f{}\x1f{}\x1f{}\x1f{}",
+        slot.source_id.as_deref().unwrap_or(""),
+        slot.object_type.as_deref().unwrap_or(""),
+        slot.association_type.as_deref().unwrap_or(""),
+        slot.property_id.as_deref().unwrap_or(""),
+        slot.path
+    )
+}
+
+fn validate_ai_path(path: &str) -> Result<(), CoveError> {
+    if path
+        .bytes()
+        .any(|byte| byte < 0x20 || byte == 0x7f || byte == b'\x1f')
+        || path.split('.').any(|part| part.trim().is_empty())
+    {
+        return Err(CoveError::MapInvalid);
+    }
+    Ok(())
+}
+
+fn validate_ai_slot_role(value: &str) -> Result<(), CoveError> {
+    if matches!(
+        value,
+        "Unknown"
+            | "NaturalLanguageLong"
+            | "NaturalLanguageShort"
+            | "Title"
+            | "Summary"
+            | "Label"
+            | "Category"
+            | "Tag"
+            | "Name"
+            | "Identifier"
+            | "Code"
+            | "Boolean"
+            | "Timestamp"
+            | "NumericMeasure"
+            | "Ordinal"
+            | "Geo"
+            | "Url"
+            | "Email"
+            | "OpaqueJson"
+            | "Binary"
+            | "ImageRef"
+            | "AudioRef"
+            | "VideoRef"
+            | "DocumentRef"
+            | "Redacted"
+            | "PolicyProtected"
+            | "Prompt"
+            | "Completion"
+            | "Instruction"
+            | "ToolCall"
+            | "ToolResult"
+            | "SafetyLabel"
+            | "PreferenceLabel"
+            | "QualityScore"
+            | "Extension"
+    ) {
+        Ok(())
+    } else {
+        Err(CoveError::MapInvalid)
+    }
+}
+
+fn validate_ai_slot_decision(value: &str) -> Result<(), CoveError> {
+    if matches!(
+        value,
+        "Ignore"
+            | "VectorizeDistinctValues"
+            | "VectorizeSlotValues"
+            | "ChunkThenVectorize"
+            | "Tokenize"
+            | "ChunkAndTokenize"
+            | "ComposeOnly"
+            | "LabelOnly"
+            | "SampleOnly"
+            | "VectorizeAndSample"
+            | "TokenizeAndSample"
+            | "PolicyDefined"
+            | "Forbidden"
+            | "Extension"
+    ) {
+        Ok(())
+    } else {
+        Err(CoveError::MapInvalid)
+    }
+}
+
+fn validate_ai_sensitivity(value: &str) -> Result<(), CoveError> {
+    if matches!(
+        value,
+        "Unknown"
+            | "Public"
+            | "Internal"
+            | "Confidential"
+            | "Sensitive"
+            | "PersonalData"
+            | "Secret"
+            | "Redacted"
+            | "PolicyProtected"
+            | "Forbidden"
+            | "Extension"
+    ) {
+        Ok(())
+    } else {
+        Err(CoveError::MapInvalid)
+    }
+}
+
+fn validate_ai_vector_granularity(value: &str) -> Result<(), CoveError> {
+    if matches!(
+        value,
+        "RawCanonicalValue"
+            | "SlotValue"
+            | "TextChunk"
+            | "TokenizedSpan"
+            | "RowProjection"
+            | "ObjectState"
+            | "AssociationState"
+            | "EvidenceSpan"
+            | "TrainingSample"
+            | "PromptContext"
+            | "MultimodalAsset"
+            | "MultimodalSequence"
+            | "Extension"
+    ) {
+        Ok(())
+    } else {
+        Err(CoveError::MapInvalid)
+    }
+}
+
+fn validate_ai_template_kind(value: &str) -> Result<(), CoveError> {
+    if matches!(
+        value,
+        "Vectorization" | "Chunking" | "PromptContext" | "TrainingSample" | "Label" | "Extension"
+    ) {
+        Ok(())
+    } else {
+        Err(CoveError::MapInvalid)
+    }
+}
+
+fn validate_ai_training_sample_policy(value: &str) -> Result<(), CoveError> {
+    if matches!(
+        value,
+        "disabled"
+            | "curated"
+            | "source_rows"
+            | "slot_values"
+            | "text_chunks"
+            | "token_sequences"
+            | "prompt_completion"
+            | "instruction_tuning"
+            | "preference_pairs"
+            | "labels"
+            | "policy_defined"
+            | "Extension"
+    ) {
+        Ok(())
+    } else {
+        Err(CoveError::MapInvalid)
+    }
+}
+
+fn validate_ai_training_label_policy(value: &str) -> Result<(), CoveError> {
+    if matches!(
+        value,
+        "none"
+            | "source_labels"
+            | "generated_labels"
+            | "human_reviewed"
+            | "preference"
+            | "safety"
+            | "quality_score"
+            | "policy_defined"
+            | "Extension"
+    ) {
+        Ok(())
+    } else {
+        Err(CoveError::MapInvalid)
+    }
+}
+
+fn validate_ai_training_split_policy(value: &str) -> Result<(), CoveError> {
+    if matches!(
+        value,
+        "none"
+            | "deterministic"
+            | "random"
+            | "hash"
+            | "temporal"
+            | "source_defined"
+            | "stratified"
+            | "policy_defined"
+            | "Extension"
+    ) {
+        Ok(())
+    } else {
+        Err(CoveError::MapInvalid)
+    }
+}
+
+fn validate_ai_training_weighting_policy(value: &str) -> Result<(), CoveError> {
+    if matches!(
+        value,
+        "uniform"
+            | "quality_weighted"
+            | "inverse_frequency"
+            | "source_weighted"
+            | "policy_defined"
+            | "Extension"
+    ) {
+        Ok(())
+    } else {
+        Err(CoveError::MapInvalid)
+    }
+}
+
+fn validate_ai_training_dedup_policy(value: &str) -> Result<(), CoveError> {
+    if matches!(
+        value,
+        "none"
+            | "source_hash"
+            | "text_hash"
+            | "embedding_similarity"
+            | "exact_payload"
+            | "policy_defined"
+            | "Extension"
+    ) {
+        Ok(())
+    } else {
+        Err(CoveError::MapInvalid)
+    }
+}
+
+fn validate_ai_training_quality_policy(value: &str) -> Result<(), CoveError> {
+    if matches!(
+        value,
+        "none"
+            | "required"
+            | "advisory"
+            | "threshold"
+            | "human_reviewed"
+            | "policy_defined"
+            | "Extension"
+    ) {
+        Ok(())
+    } else {
+        Err(CoveError::MapInvalid)
+    }
+}
+
+fn template_fingerprint_digest(
+    template_id: &str,
+    template_kind: &str,
+    template_text: &str,
+    locale: Option<&str>,
+    deterministic: bool,
+) -> Result<String, CoveError> {
+    let mut object = Map::new();
+    object.insert("template_id".into(), Value::String(template_id.to_string()));
+    object.insert(
+        "template_kind".into(),
+        Value::String(template_kind.to_string()),
+    );
+    object.insert(
+        "template_text".into(),
+        Value::String(template_text.to_string()),
+    );
+    if let Some(locale) = locale {
+        object.insert("locale".into(), Value::String(locale.to_string()));
+    }
+    object.insert("deterministic".into(), Value::Bool(deterministic));
+    sha256_digest_string(&canonical_json(&Value::Object(object))?)
 }
 
 fn validate_row_semantic_rule_shape(rule: &MapRowSemanticRule) -> Result<(), CoveError> {
@@ -2122,6 +2661,298 @@ impl MapProjectionCatalog {
     }
 }
 
+impl MapAiProfileCatalog {
+    pub fn parse(bytes: &[u8]) -> Result<Self, CoveError> {
+        let root = parse_root_for_section(SectionKind::MapAiProfileCatalog, bytes)?;
+        let object = as_object(&root)?;
+        let (mapping_id, mapping_version) = parse_mapping_identity(object)?;
+        let mut profiles = Vec::new();
+        let mut profile_ids = BTreeSet::new();
+        for value in optional_array(object, "profiles")?.into_iter().flatten() {
+            let profile = as_object(value)?;
+            validate_keys(
+                profile,
+                &[
+                    "profile_id",
+                    "profile_name",
+                    "active",
+                    "default_decision",
+                    "default_granularity",
+                    "default_role",
+                    "default_sensitivity",
+                    "slot_policy_ids",
+                    "template_ids",
+                    "composition_ids",
+                    "training_policy_ids",
+                    "flags",
+                ],
+            )?;
+            let profile_id = required_non_empty_str(profile, "profile_id")?;
+            if !profile_ids.insert(profile_id.clone()) {
+                return Err(CoveError::MapInvalid);
+            }
+            let default_decision = optional_non_empty_str(profile, "default_decision")?
+                .unwrap_or_else(|| "Ignore".to_string());
+            validate_ai_slot_decision(&default_decision)?;
+            let default_granularity = optional_non_empty_str(profile, "default_granularity")?
+                .unwrap_or_else(|| "SlotValue".to_string());
+            validate_ai_vector_granularity(&default_granularity)?;
+            let default_role = optional_non_empty_str(profile, "default_role")?
+                .unwrap_or_else(|| "Unknown".to_string());
+            validate_ai_slot_role(&default_role)?;
+            let default_sensitivity = optional_non_empty_str(profile, "default_sensitivity")?
+                .unwrap_or_else(|| "Unknown".to_string());
+            validate_ai_sensitivity(&default_sensitivity)?;
+            profiles.push(MapAiProfileV1 {
+                profile_id,
+                profile_name: optional_non_empty_str(profile, "profile_name")?,
+                active: optional_bool(profile, "active", true)?,
+                default_decision,
+                default_granularity,
+                default_role,
+                default_sensitivity,
+                slot_policy_ids: optional_string_list(profile, "slot_policy_ids")?,
+                template_ids: optional_string_list(profile, "template_ids")?,
+                composition_ids: optional_string_list(profile, "composition_ids")?,
+                training_policy_ids: optional_string_list(profile, "training_policy_ids")?,
+                flags: optional_u64(profile, "flags")?.unwrap_or(0),
+            });
+        }
+
+        let mut slot_policies = Vec::new();
+        let mut slot_policy_ids = BTreeSet::new();
+        for value in optional_array(object, "slot_policies")?
+            .into_iter()
+            .flatten()
+        {
+            let policy = as_object(value)?;
+            validate_keys(
+                policy,
+                &[
+                    "slot_policy_id",
+                    "source_id",
+                    "table_id",
+                    "column_id",
+                    "source_column",
+                    "object_type",
+                    "property_id",
+                    "association_type",
+                    "path",
+                    "role",
+                    "decision",
+                    "granularity",
+                    "sensitivity",
+                    "vector_space_id",
+                    "template_id",
+                    "chunk_profile_id",
+                    "tokenizer_profile_id",
+                    "training_policy_id",
+                    "composition_weight_ppm",
+                    "min_distinct_count",
+                    "max_distinct_count",
+                    "max_value_bytes",
+                    "evidence_policy_id",
+                    "license_policy_id",
+                    "redaction_policy_id",
+                    "flags",
+                ],
+            )?;
+            let slot_policy_id = required_non_empty_str(policy, "slot_policy_id")?;
+            if !slot_policy_ids.insert(slot_policy_id.clone()) {
+                return Err(CoveError::MapInvalid);
+            }
+            let path = required_non_empty_str(policy, "path")?;
+            validate_ai_path(&path)?;
+            let role = required_non_empty_str(policy, "role")?;
+            validate_ai_slot_role(&role)?;
+            let decision = required_non_empty_str(policy, "decision")?;
+            validate_ai_slot_decision(&decision)?;
+            let granularity = required_non_empty_str(policy, "granularity")?;
+            validate_ai_vector_granularity(&granularity)?;
+            let sensitivity = required_non_empty_str(policy, "sensitivity")?;
+            validate_ai_sensitivity(&sensitivity)?;
+            let min_distinct_count = optional_u32(policy, "min_distinct_count")?;
+            let max_distinct_count = optional_u32(policy, "max_distinct_count")?;
+            if min_distinct_count
+                .zip(max_distinct_count)
+                .is_some_and(|(min, max)| min > max)
+            {
+                return Err(CoveError::MapInvalid);
+            }
+            let composition_weight_ppm = optional_u32(policy, "composition_weight_ppm")?;
+            if composition_weight_ppm.is_some_and(|ppm| ppm > 1_000_000) {
+                return Err(CoveError::MapInvalid);
+            }
+            slot_policies.push(MapAiSlotPolicyV1 {
+                slot_policy_id,
+                source_id: optional_non_empty_str(policy, "source_id")?,
+                table_id: optional_u32(policy, "table_id")?,
+                column_id: optional_u32(policy, "column_id")?,
+                source_column: optional_non_empty_str(policy, "source_column")?,
+                object_type: optional_non_empty_str(policy, "object_type")?,
+                property_id: optional_non_empty_str(policy, "property_id")?,
+                association_type: optional_non_empty_str(policy, "association_type")?,
+                path,
+                role,
+                decision,
+                granularity,
+                sensitivity,
+                vector_space_id: optional_non_empty_str(policy, "vector_space_id")?,
+                template_id: optional_non_empty_str(policy, "template_id")?,
+                chunk_profile_id: optional_non_empty_str(policy, "chunk_profile_id")?,
+                tokenizer_profile_id: optional_non_empty_str(policy, "tokenizer_profile_id")?,
+                training_policy_id: optional_non_empty_str(policy, "training_policy_id")?,
+                composition_weight_ppm,
+                min_distinct_count,
+                max_distinct_count,
+                max_value_bytes: optional_u32(policy, "max_value_bytes")?,
+                evidence_policy_id: optional_non_empty_str(policy, "evidence_policy_id")?,
+                license_policy_id: optional_non_empty_str(policy, "license_policy_id")?,
+                redaction_policy_id: optional_non_empty_str(policy, "redaction_policy_id")?,
+                flags: optional_u64(policy, "flags")?.unwrap_or(0),
+            });
+        }
+
+        Ok(Self {
+            mapping_id,
+            mapping_version,
+            profiles,
+            slot_policies,
+        })
+    }
+}
+
+impl MapAiTemplateCatalog {
+    pub fn parse(bytes: &[u8]) -> Result<Self, CoveError> {
+        let root = parse_root_for_section(SectionKind::MapAiTemplateCatalog, bytes)?;
+        let object = as_object(&root)?;
+        let (mapping_id, mapping_version) = parse_mapping_identity(object)?;
+        let mut templates = Vec::new();
+        let mut template_ids = BTreeSet::new();
+        for value in optional_array(object, "templates")?.into_iter().flatten() {
+            let template = as_object(value)?;
+            validate_keys(
+                template,
+                &[
+                    "template_id",
+                    "template_kind",
+                    "template_text",
+                    "locale",
+                    "deterministic",
+                    "template_fingerprint",
+                    "flags",
+                ],
+            )?;
+            let template_id = required_non_empty_str(template, "template_id")?;
+            if !template_ids.insert(template_id.clone()) {
+                return Err(CoveError::MapInvalid);
+            }
+            let template_kind = required_non_empty_str(template, "template_kind")?;
+            validate_ai_template_kind(&template_kind)?;
+            let template_text = required_non_empty_str(template, "template_text")?;
+            let deterministic = optional_bool(template, "deterministic", true)?;
+            if !deterministic {
+                return Err(CoveError::MapInvalid);
+            }
+            let locale = optional_non_empty_str(template, "locale")?;
+            let template_fingerprint = optional_non_empty_str(template, "template_fingerprint")?;
+            if let Some(fingerprint) = &template_fingerprint {
+                validate_sha256_digest_string(fingerprint)?;
+                let expected = template_fingerprint_digest(
+                    &template_id,
+                    &template_kind,
+                    &template_text,
+                    locale.as_deref(),
+                    deterministic,
+                )?;
+                if fingerprint != &expected {
+                    return Err(CoveError::MapInvalid);
+                }
+            }
+            templates.push(AiVectorTemplateV1 {
+                template_id,
+                template_kind,
+                template_text,
+                locale,
+                deterministic,
+                template_fingerprint,
+                flags: optional_u64(template, "flags")?.unwrap_or(0),
+            });
+        }
+        Ok(Self {
+            mapping_id,
+            mapping_version,
+            templates,
+        })
+    }
+}
+
+impl MapAiTrainingPolicyCatalog {
+    pub fn parse(bytes: &[u8]) -> Result<Self, CoveError> {
+        let root = parse_root_for_section(SectionKind::MapAiTrainingPolicyCatalog, bytes)?;
+        let object = as_object(&root)?;
+        let (mapping_id, mapping_version) = parse_mapping_identity(object)?;
+        let mut training_policies = Vec::new();
+        let mut training_policy_ids = BTreeSet::new();
+        for value in optional_array(object, "training_policies")?
+            .into_iter()
+            .flatten()
+        {
+            let policy = as_object(value)?;
+            validate_keys(
+                policy,
+                &[
+                    "training_policy_id",
+                    "sample_policy",
+                    "label_policy",
+                    "split_policy",
+                    "weighting_policy",
+                    "dedup_policy",
+                    "quality_policy",
+                    "flags",
+                ],
+            )?;
+            let training_policy_id = required_non_empty_str(policy, "training_policy_id")?;
+            if !training_policy_ids.insert(training_policy_id.clone()) {
+                return Err(CoveError::MapInvalid);
+            }
+            let sample_policy = optional_non_empty_str(policy, "sample_policy")?
+                .unwrap_or_else(|| "disabled".to_string());
+            validate_ai_training_sample_policy(&sample_policy)?;
+            let label_policy = optional_non_empty_str(policy, "label_policy")?
+                .unwrap_or_else(|| "none".to_string());
+            validate_ai_training_label_policy(&label_policy)?;
+            let split_policy = optional_non_empty_str(policy, "split_policy")?
+                .unwrap_or_else(|| "none".to_string());
+            validate_ai_training_split_policy(&split_policy)?;
+            let weighting_policy = optional_non_empty_str(policy, "weighting_policy")?
+                .unwrap_or_else(|| "uniform".to_string());
+            validate_ai_training_weighting_policy(&weighting_policy)?;
+            let dedup_policy = optional_non_empty_str(policy, "dedup_policy")?
+                .unwrap_or_else(|| "none".to_string());
+            validate_ai_training_dedup_policy(&dedup_policy)?;
+            let quality_policy = optional_non_empty_str(policy, "quality_policy")?
+                .unwrap_or_else(|| "none".to_string());
+            validate_ai_training_quality_policy(&quality_policy)?;
+            training_policies.push(MapAiTrainingPolicyV1 {
+                training_policy_id,
+                sample_policy,
+                label_policy,
+                split_policy,
+                weighting_policy,
+                dedup_policy,
+                quality_policy,
+                flags: optional_u64(policy, "flags")?.unwrap_or(0),
+            });
+        }
+        Ok(Self {
+            mapping_id,
+            mapping_version,
+            training_policies,
+        })
+    }
+}
+
 fn parse_projection_anchor(
     entry: &Map<String, Value>,
 ) -> Result<Option<MapProjectionAnchor>, CoveError> {
@@ -2461,6 +3292,9 @@ fn section_kind_schema_name(kind: SectionKind) -> &'static str {
         SectionKind::MapEvidenceIndex => "MAP_EVIDENCE_INDEX",
         SectionKind::MapConversionReport => "MAP_CONVERSION_REPORT",
         SectionKind::MapProjectionCatalog => "MAP_PROJECTION_CATALOG",
+        SectionKind::MapAiProfileCatalog => "MAP_AI_PROFILE_CATALOG",
+        SectionKind::MapAiTemplateCatalog => "MAP_AI_TEMPLATE_CATALOG",
+        SectionKind::MapAiTrainingPolicyCatalog => "MAP_AI_TRAINING_POLICY_CATALOG",
         _ => "UNKNOWN",
     }
 }
@@ -2506,6 +3340,9 @@ fn is_allowed_root_key(kind: SectionKind, key: &str) -> bool {
                 | "governance"
         ),
         SectionKind::MapProjectionCatalog => key == "projections",
+        SectionKind::MapAiProfileCatalog => matches!(key, "profiles" | "slot_policies"),
+        SectionKind::MapAiTemplateCatalog => key == "templates",
+        SectionKind::MapAiTrainingPolicyCatalog => key == "training_policies",
         _ => false,
     }
 }
@@ -2778,11 +3615,29 @@ fn required_u32(object: &Map<String, Value>, key: &str) -> Result<u32, CoveError
         .ok_or(CoveError::MapInvalid)
 }
 
+fn optional_u32(object: &Map<String, Value>, key: &str) -> Result<Option<u32>, CoveError> {
+    match object.get(key) {
+        None => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .and_then(|value| u32::try_from(value).ok())
+            .map(Some)
+            .ok_or(CoveError::MapInvalid),
+    }
+}
+
 fn required_u64(object: &Map<String, Value>, key: &str) -> Result<u64, CoveError> {
     object
         .get(key)
         .and_then(Value::as_u64)
         .ok_or(CoveError::MapInvalid)
+}
+
+fn optional_u64(object: &Map<String, Value>, key: &str) -> Result<Option<u64>, CoveError> {
+    match object.get(key) {
+        None => Ok(None),
+        Some(value) => value.as_u64().map(Some).ok_or(CoveError::MapInvalid),
+    }
 }
 
 fn required_bool(object: &Map<String, Value>, key: &str) -> Result<bool, CoveError> {

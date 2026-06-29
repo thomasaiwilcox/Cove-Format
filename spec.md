@@ -23,6 +23,7 @@ map.
 | Layout and runtime | [`06-layout-runtime/layout-and-io.md`](./spec/06-layout-runtime/layout-and-io.md), [`06-layout-runtime/covx.md`](./spec/06-layout-runtime/covx.md), [`06-layout-runtime/covm-cache.md`](./spec/06-layout-runtime/covm-cache.md) |
 | Mapping | [`07-mapping/cove-map.md`](./spec/07-mapping/cove-map.md) |
 | Conformance | [`08-conformance/profile-capability.md`](./spec/08-conformance/profile-capability.md), [`08-conformance/writer-profiles.md`](./spec/08-conformance/writer-profiles.md), [`08-conformance/validation-model.md`](./spec/08-conformance/validation-model.md), [`08-conformance/conformance-suite.md`](./spec/08-conformance/conformance-suite.md), [`08-conformance/utilities-governance.md`](./spec/08-conformance/utilities-governance.md) |
+| AI extension | [`09-ai/cove-ai.md`](./spec/09-ai/cove-ai.md), [`09-ai/cove-map-ai.md`](./spec/09-ai/cove-map-ai.md), [`09-ai/cove-chunk.md`](./spec/09-ai/cove-chunk.md), [`09-ai/cove-tok.md`](./spec/09-ai/cove-tok.md), [`09-ai/cove-vec.md`](./spec/09-ai/cove-vec.md), [`09-ai/cove-mmseq.md`](./spec/09-ai/cove-mmseq.md), [`09-ai/cove-train.md`](./spec/09-ai/cove-train.md), [`09-ai/coveql-ai.md`](./spec/09-ai/coveql-ai.md) |
 
 ## Compatibility Notes
 

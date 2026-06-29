@@ -8,7 +8,9 @@
 //! * [`covm`] — Spec §69: cross-file manifest.
 //! * [`covemap`] — Spec §70: reusable COVE-MAP artifact.
 //! * [`covedelta`] — Spec §63.1: immutable COVE-O delta artifact envelope.
+//! * [`coveai`] — COVE-AI companion artifacts (`.coveai` / `.covev`).
 
+pub mod coveai;
 pub mod covedelta;
 pub mod covemap;
 pub mod covm;

@@ -68,6 +68,15 @@ fn rows() -> Vec<Row> {
             notes: "feature_binding.rs parses and serializes `SECTION_FEATURE_BINDING` headers, payload refs, local feature-word ranges, operation scoping, and rejects invalid refs/scopes plus global word-0 narrowing attempts",
         },
         Row {
+            section: "§83",
+            capability: "COVE-AI companion artifact framing and common descriptor tables",
+            modeled: "yes",
+            parsed: "yes",
+            validated: "yes",
+            written: "yes",
+            notes: "artifact/coveai.rs validates `CVA2`/`CVV2` tail discovery, postscript/header/directory CRCs, section bounds/non-overlap, `AiRecordHeaderV1`, reference tables, source binding, privacy summaries, payload refs, payload integrity, Phase 1 token/vector payload-carrier rules, COVE-CHUNK/TOK/VEC/TRAIN/MMSEQ descriptors, tensor/assets, generator provenance descriptors, vector composition/index descriptors, exact flat FileCode vector scan, FileCode embedding lookup, and descriptor-bundle writing for all modeled AI descriptor families; COVE-MAP parses and validates `MAP_AI_*` slot policy catalogs; CoveQL-AI parses/plans the AI profile and executes `.embedding(fileCode)`, `.similar(fileCode, k)`, advisory `.hybrid(fileCode, k)`/`.rerank(fileCode, k)`, `.chunks()`, `.tokens()`, `.context()`, `.asPromptContext()`, `.trainingSamples()`, `.split()`, `.pack()`, `.multimodal()`, and `.generatorAudit()` through supplied sidecars, with descriptor metadata exact and payload text/assets withheld unless a profile-specific operation validates direct exposure",
+        },
+        Row {
             section: "§8",
             capability: "Wire primitives",
             modeled: "yes",

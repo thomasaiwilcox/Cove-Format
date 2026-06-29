@@ -654,7 +654,10 @@ impl CovemapFile {
                 | SectionKind::MapEvidenceIndex
                 | SectionKind::MapConversionReport
                 | SectionKind::MapProjectionCatalog
-                | SectionKind::MapResolutionCatalog => {
+                | SectionKind::MapResolutionCatalog
+                | SectionKind::MapAiProfileCatalog
+                | SectionKind::MapAiTemplateCatalog
+                | SectionKind::MapAiTrainingPolicyCatalog => {
                     map_sections.push(parse_embedded_section(section_kind, &section.payload)?);
                 }
                 _ => return Err(CoveError::MapInvalid),

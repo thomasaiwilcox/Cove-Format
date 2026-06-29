@@ -207,6 +207,11 @@ pub enum LogicalPlanNodeKind {
     GraphAlgorithm {
         algorithms: Vec<ResolvedGraphAlgorithm>,
     },
+    AiOperation {
+        operations: Vec<crate::ResolvedAiOperation>,
+        sidecar_required: bool,
+        fallback_behavior: String,
+    },
     Aggregate {
         group_by: Vec<ResolvedExpr>,
         aggregates: Vec<ResolvedExpr>,
@@ -501,6 +506,14 @@ pub fn build_logical_plan(
     if !resolved.method_chain.graph_algorithms.is_empty() {
         nodes.push(LogicalPlanNodeKind::GraphAlgorithm {
             algorithms: resolved.method_chain.graph_algorithms.clone(),
+        });
+    }
+    if !resolved.method_chain.ai_operations.is_empty() {
+        nodes.push(LogicalPlanNodeKind::AiOperation {
+            operations: resolved.method_chain.ai_operations.clone(),
+            sidecar_required: true,
+            fallback_behavior:
+                "reject selected AI operation unless required AI sidecar sections validate".into(),
         });
     }
     if grouping_or_aggregates_present(&resolved) {
