@@ -6,22 +6,27 @@ mod output;
 mod sidecar;
 
 use std::{
+    collections::HashMap,
     fs,
     io::{self, Read},
     path::{Path, PathBuf},
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use arrow_array::{ArrayRef, RecordBatch, StringArray, UInt64Array};
+use arrow_schema::{DataType, Field, Schema};
 use cove_core::{
     artifact::{
         coveai::{
-            write_covev_filecode_vectors, CoveAiArtifactKind, CoveAiFile,
-            CoveVecFileCodeVectorBuild,
+            ai_explain_report, write_covev_filecode_vectors_with_options, AiPayloadReader,
+            CoveAiAccessContext, CoveAiArtifactKind, CoveAiFile, CoveVecFileCodeVectorBuild,
+            CoveVecFileCodeVectorBuildOptions,
         },
         covemap::CovemapFile,
-        covm::{CovmDeltaPruneRequest, CovmFile},
+        covm::{CovmAiSidecarExtensionV1, CovmDeltaPruneRequest, CovmFile},
     },
-    compression,
+    checksum, compression,
     constants::{SectionKind, MAGIC_COVEAI, MAGIC_COVEMAP, MAGIC_COVEV},
     profile::{
         cove_map::{parse_embedded_section, EmbeddedMapSection},
@@ -96,6 +101,9 @@ enum Command {
         args: Vec<String>,
     },
     Vector {
+        args: Vec<String>,
+    },
+    Ai {
         args: Vec<String>,
     },
     Train {
@@ -281,6 +289,7 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<(), String> {
         Command::Convert { format, args } => run_convert(format, args),
         Command::Validate { args } => run_validate(args),
         Command::Vector { args } => run_vec(args),
+        Command::Ai { args } => run_ai(args),
         Command::Train { args } => run_train(args),
         Command::InspectDetailed { args } => run_inspect_detailed(args),
         Command::Dump { args } => cove_dump::run_cli(args),
@@ -395,6 +404,13 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, String>
             Ok(Command::Help(HelpTopic::Vec))
         }
         "vec" => Ok(Command::Vector { args }),
+        "ai" if args
+            .first()
+            .is_some_and(|arg| arg == "-h" || arg == "--help") =>
+        {
+            Ok(Command::Help(HelpTopic::Ai))
+        }
+        "ai" => Ok(Command::Ai { args }),
         "train"
             if args
                 .first()
@@ -1205,6 +1221,12 @@ fn run_vec_build(args: Vec<String>) -> Result<(), String> {
     let mut payload_path: Option<PathBuf> = None;
     let mut artifact_id = [0u8; 16];
     let mut created_at_us: Option<i64> = None;
+    let mut index_kind = "exact".to_string();
+    let mut metric = "dot".to_string();
+    let mut quantization = "none".to_string();
+    let mut index_parameters: Vec<(String, String)> = Vec::new();
+    let mut deterministic_seed = 17u64;
+    let mut integrity_report: Option<PathBuf> = None;
 
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
@@ -1238,6 +1260,62 @@ fn run_vec_build(args: Vec<String>) -> Result<(), String> {
             "--created-at-us" => {
                 created_at_us = Some(parse_i64(iter.next().as_deref(), "--created-at-us")?);
             }
+            "--index" => {
+                index_kind = iter.next().ok_or_else(|| {
+                    "--index requires exact|hnsw|ivf-flat|ivf-pq|diskann|vamana".to_string()
+                })?;
+                if !matches!(
+                    index_kind.as_str(),
+                    "exact"
+                        | "exact-flat"
+                        | "exact_flat"
+                        | "hnsw"
+                        | "ivf-flat"
+                        | "ivf_pq"
+                        | "ivf-pq"
+                        | "diskann"
+                        | "vamana"
+                ) {
+                    return Err(
+                        "--index must be exact, hnsw, ivf-flat, ivf-pq, diskann, or vamana".into(),
+                    );
+                }
+            }
+            "--metric" => {
+                metric = iter
+                    .next()
+                    .ok_or_else(|| "--metric requires cosine|dot|l2|l1".to_string())?;
+                if !matches!(metric.as_str(), "cosine" | "dot" | "l2" | "l1") {
+                    return Err("--metric must be cosine, dot, l2, or l1".into());
+                }
+            }
+            "--quantization" => {
+                quantization = iter
+                    .next()
+                    .ok_or_else(|| "--quantization requires none|int8|uint8|pq".to_string())?;
+                if !matches!(quantization.as_str(), "none" | "int8" | "uint8" | "pq") {
+                    return Err("--quantization must be none, int8, uint8, or pq".into());
+                }
+            }
+            "--seed" => {
+                let value = parse_u64(iter.next().as_deref(), "--seed")?;
+                deterministic_seed = value;
+                index_parameters.push(("seed".into(), value.to_string()));
+            }
+            "--integrity-report" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| format!("{arg} requires a value"))?;
+                integrity_report = Some(PathBuf::from(value.clone()));
+                index_parameters.push(("integrity_report".into(), value));
+            }
+            "--ef" | "--ef-search" | "--ef-construction" | "--probes" | "--lists"
+            | "--shard-count" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| format!("{arg} requires a value"))?;
+                index_parameters.push((arg.trim_start_matches('-').to_string(), value));
+            }
             "-h" | "--help" => {
                 print_usage(HelpTopic::Vec);
                 return Ok(());
@@ -1262,22 +1340,42 @@ fn run_vec_build(args: Vec<String>) -> Result<(), String> {
     let vector_payload = if let Some(path) = payload_path {
         fs::read(&path).map_err(|error| format!("cannot read {}: {error}", path.display()))?
     } else {
-        deterministic_vector_payload(&file_codes, dimension_count)?
+        deterministic_vector_payload(&file_codes, dimension_count, deterministic_seed)?
     };
     let created_at_us = created_at_us.unwrap_or_else(current_time_us);
-    let bytes = write_covev_filecode_vectors(&CoveVecFileCodeVectorBuild {
-        artifact_id,
-        created_at_us,
-        dimension_count,
-        file_codes: file_codes.clone(),
-        vector_payload,
-    })
+    let bytes = write_covev_filecode_vectors_with_options(
+        &CoveVecFileCodeVectorBuild {
+            artifact_id,
+            created_at_us,
+            dimension_count,
+            file_codes: file_codes.clone(),
+            vector_payload,
+        },
+        CoveVecFileCodeVectorBuildOptions {
+            index_kind: Some(cove_vec_index_kind(index_kind.as_str())?),
+            metric: cove_vec_metric(metric.as_str())?,
+            quantization_kind: cove_vec_quantization_kind(quantization.as_str())?,
+        },
+    )
     .map_err(|error| format!("cannot build {}: {error}", out.display()))?;
     fs::write(&out, &bytes).map_err(|error| format!("cannot write {}: {error}", out.display()))?;
     let parsed = CoveAiFile::parse(&bytes)
         .map_err(|error| format!("built {} but validation failed: {error}", out.display()))?;
+    if let Some(report_path) = integrity_report {
+        let report = vec_build_integrity_report(
+            &out,
+            &bytes,
+            &parsed,
+            index_kind.as_str(),
+            metric.as_str(),
+            quantization.as_str(),
+            &index_parameters,
+        )?;
+        fs::write(&report_path, report)
+            .map_err(|error| format!("cannot write {}: {error}", report_path.display()))?;
+    }
     println!(
-        "Wrote {}: {} FileCode vectors, dimension {}, payload_access={:?}",
+        "Wrote {}: {} FileCode vectors, dimension {}, payload_access={:?}, index={}, metric={}, quantization={}, index_parameters={}",
         out.display(),
         parsed.descriptor_tables.filecode_vector_bindings.len(),
         parsed
@@ -1286,9 +1384,596 @@ fn run_vec_build(args: Vec<String>) -> Result<(), String> {
             .first()
             .map(|space| space.dimension_count)
             .unwrap_or(dimension_count),
-        parsed.payload_access
+        parsed.payload_access,
+        index_kind,
+        metric,
+        quantization,
+        index_parameters.len()
     );
     Ok(())
+}
+
+fn run_ai(mut args: Vec<String>) -> Result<(), String> {
+    if args.is_empty() {
+        return Err("missing ai subcommand; expected: cove ai export <kind> <sidecar>".into());
+    }
+    let subcommand = args.remove(0);
+    match subcommand.as_str() {
+        "export" => run_ai_export(args),
+        "-h" | "--help" => {
+            println!(
+                "Usage:\n  cove ai export <chunks|tokens|vectors|training|multimodal|assets|tensors> <sidecar> [--include-payloads] [--format json|jsonl|hf-jsonl|arrow|parquet|webdataset] [--out <path>] [--policy-report]"
+            );
+            Ok(())
+        }
+        other => Err(format!("unknown ai subcommand '{other}'")),
+    }
+}
+
+fn run_ai_export(args: Vec<String>) -> Result<(), String> {
+    let mut kind: Option<String> = None;
+    let mut input: Option<PathBuf> = None;
+    let mut out: Option<PathBuf> = None;
+    let mut format = "json".to_string();
+    let mut include_payloads = false;
+    let mut policy_report = false;
+
+    let mut iter = args.into_iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--include-payloads" => include_payloads = true,
+            "--policy-report" => policy_report = true,
+            "--format" => {
+                format = iter
+                    .next()
+                    .ok_or_else(|| "--format requires a value".to_string())?;
+                if !matches!(
+                    format.as_str(),
+                    "json" | "jsonl" | "hf-jsonl" | "arrow" | "parquet" | "webdataset"
+                ) {
+                    return Err(
+                        "--format must be json, jsonl, hf-jsonl, arrow, parquet, or webdataset"
+                            .into(),
+                    );
+                }
+            }
+            "--out" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--out requires a path".to_string())?;
+                out = Some(PathBuf::from(value));
+            }
+            "-h" | "--help" => {
+                println!(
+                    "Usage:\n  cove ai export <chunks|tokens|vectors|training|multimodal|assets|tensors> <sidecar> [--include-payloads] [--format json|jsonl|hf-jsonl|arrow|parquet|webdataset] [--out <path>] [--policy-report]"
+                );
+                return Ok(());
+            }
+            value if value.starts_with('-') => {
+                return Err(format!("unknown ai export argument '{value}'"));
+            }
+            value if kind.is_none() => kind = Some(value.to_string()),
+            value if input.is_none() => input = Some(PathBuf::from(value)),
+            _ => return Err("ai export accepts exactly one kind and one input sidecar".into()),
+        }
+    }
+
+    let kind = kind.ok_or_else(|| "ai export requires <kind>".to_string())?;
+    let input = input.ok_or_else(|| "ai export requires <sidecar>".to_string())?;
+    let bytes =
+        fs::read(&input).map_err(|error| format!("cannot read {}: {error}", input.display()))?;
+    let sidecar = CoveAiFile::parse(&bytes)
+        .map_err(|error| format!("{}: invalid COVE-AI sidecar: {error}", input.display()))?;
+    let reader = AiPayloadReader::new(
+        &bytes,
+        &sidecar,
+        if include_payloads {
+            CoveAiAccessContext::for_operation(format!("ai_export_{kind}"))
+        } else {
+            CoveAiAccessContext::descriptor_only(format!("ai_export_{kind}"))
+        },
+    );
+    let value = ai_export_json_value(
+        &input,
+        &kind,
+        &format,
+        include_payloads,
+        policy_report,
+        &sidecar,
+        &reader,
+    )?;
+    write_ai_export_output(&value, &format, out)
+}
+
+fn ai_export_jsonl(value: &serde_json::Value) -> String {
+    let mut out = String::new();
+    if let Some(records) = value.get("records").and_then(|records| records.as_array()) {
+        for record in records {
+            out.push_str(&serde_json::to_string(record).unwrap());
+            out.push('\n');
+        }
+    }
+    out
+}
+
+fn write_ai_export_output(
+    value: &serde_json::Value,
+    format: &str,
+    out: Option<PathBuf>,
+) -> Result<(), String> {
+    match format {
+        "json" => {
+            let text = serde_json::to_string_pretty(value).unwrap();
+            if let Some(out) = out {
+                fs::write(&out, text)
+                    .map_err(|error| format!("cannot write {}: {error}", out.display()))?;
+            } else {
+                println!("{text}");
+            }
+            Ok(())
+        }
+        "jsonl" | "hf-jsonl" => {
+            let text = ai_export_jsonl(value);
+            if let Some(out) = out {
+                fs::write(&out, text)
+                    .map_err(|error| format!("cannot write {}: {error}", out.display()))?;
+            } else {
+                print!("{text}");
+            }
+            Ok(())
+        }
+        "arrow" | "parquet" | "webdataset" => {
+            let out = out.ok_or_else(|| format!("ai export --format {format} requires --out"))?;
+            let bytes = match format {
+                "arrow" => {
+                    let batch = ai_export_record_batch(value)?;
+                    cove_datafusion::arrow_export_cli::write_ipc(&batch.schema(), &[batch])?
+                }
+                "parquet" => {
+                    let batch = ai_export_record_batch(value)?;
+                    write_ai_export_parquet(&batch)?
+                }
+                "webdataset" => write_ai_export_webdataset(value)?,
+                _ => unreachable!(),
+            };
+            cove_core::durable::durable_replace(&out, &bytes).map_err(|error| {
+                format!(
+                    "cannot durably publish {} AI export: {error}",
+                    out.display()
+                )
+            })?;
+            Ok(())
+        }
+        other => Err(format!("unsupported ai export format '{other}'")),
+    }
+}
+
+fn ai_export_record_batch(value: &serde_json::Value) -> Result<RecordBatch, String> {
+    let records = ai_export_records(value)?;
+    let ordinals = UInt64Array::from_iter_values(0..records.len() as u64);
+    let record_kinds = StringArray::from(
+        records
+            .iter()
+            .map(|record| {
+                record
+                    .get("record_kind")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("record")
+                    .to_string()
+            })
+            .collect::<Vec<_>>(),
+    );
+    let payload_access = StringArray::from(
+        records
+            .iter()
+            .map(ai_record_payload_access_summary)
+            .collect::<Vec<_>>(),
+    );
+    let record_json = StringArray::from(
+        records
+            .iter()
+            .map(|record| serde_json::to_string(record).unwrap())
+            .collect::<Vec<_>>(),
+    );
+    let mut metadata = HashMap::new();
+    for key in ["path", "kind", "format", "artifact_id", "payload_access"] {
+        if let Some(text) = value.get(key).and_then(|value| value.as_str()) {
+            metadata.insert(format!("cove.ai.{key}"), text.to_string());
+        }
+    }
+    for key in ["include_payloads", "policy_report"] {
+        if let Some(flag) = value.get(key).and_then(|value| value.as_bool()) {
+            metadata.insert(format!("cove.ai.{key}"), flag.to_string());
+        }
+    }
+    if let Some(diagnostics) = value.get("diagnostics") {
+        metadata.insert(
+            "cove.ai.diagnostics_json".to_string(),
+            serde_json::to_string(diagnostics).unwrap(),
+        );
+    }
+    let schema = Schema::new(vec![
+        Field::new("record_ordinal", DataType::UInt64, false),
+        Field::new("record_kind", DataType::Utf8, false),
+        Field::new("payload_access", DataType::Utf8, false),
+        Field::new("record_json", DataType::Utf8, false),
+    ])
+    .with_metadata(metadata);
+    RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(ordinals) as ArrayRef,
+            Arc::new(record_kinds) as ArrayRef,
+            Arc::new(payload_access) as ArrayRef,
+            Arc::new(record_json) as ArrayRef,
+        ],
+    )
+    .map_err(|error| format!("cannot build AI export Arrow batch: {error}"))
+}
+
+fn ai_export_records(value: &serde_json::Value) -> Result<&Vec<serde_json::Value>, String> {
+    value
+        .get("records")
+        .or_else(|| value.get("samples"))
+        .and_then(|records| records.as_array())
+        .ok_or_else(|| "AI export value missing records or samples array".to_string())
+}
+
+fn ai_record_payload_access_summary(record: &serde_json::Value) -> String {
+    let mut values = Vec::new();
+    collect_payload_access_values(record, &mut values);
+    values.sort();
+    values.dedup();
+    if values.is_empty() {
+        "none".to_string()
+    } else {
+        values.join(",")
+    }
+}
+
+fn collect_payload_access_values(value: &serde_json::Value, values: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Object(object) => {
+            if let Some(access) = object
+                .get("payload_access")
+                .and_then(|value| value.as_str())
+            {
+                values.push(access.to_string());
+            }
+            for child in object.values() {
+                collect_payload_access_values(child, values);
+            }
+        }
+        serde_json::Value::Array(array) => {
+            for child in array {
+                collect_payload_access_values(child, values);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn write_ai_export_parquet(batch: &RecordBatch) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    {
+        let mut writer = parquet::arrow::ArrowWriter::try_new(&mut bytes, batch.schema(), None)
+            .map_err(|error| format!("Parquet writer: {error}"))?;
+        writer
+            .write(batch)
+            .map_err(|error| format!("Parquet write: {error}"))?;
+        writer
+            .close()
+            .map_err(|error| format!("Parquet close: {error}"))?;
+    }
+    Ok(bytes)
+}
+
+fn write_ai_export_webdataset(value: &serde_json::Value) -> Result<Vec<u8>, String> {
+    let records = ai_export_records(value)?;
+    let mut out = Vec::new();
+    let mut metadata = value.clone();
+    if let Some(object) = metadata.as_object_mut() {
+        object.remove("records");
+        object.remove("samples");
+    }
+    write_tar_entry(
+        &mut out,
+        "metadata.json",
+        &serde_json::to_vec_pretty(&metadata).unwrap(),
+    )?;
+    for (index, record) in records.iter().enumerate() {
+        write_tar_entry(
+            &mut out,
+            &format!("{index:06}.json"),
+            serde_json::to_string(record).unwrap().as_bytes(),
+        )?;
+    }
+    out.extend_from_slice(&[0u8; 1024]);
+    Ok(out)
+}
+
+fn write_tar_entry(out: &mut Vec<u8>, name: &str, data: &[u8]) -> Result<(), String> {
+    let name_bytes = name.as_bytes();
+    if name_bytes.is_empty() || name_bytes.len() > 100 {
+        return Err(format!("WebDataset tar member name too long: {name}"));
+    }
+    let mut header = [0u8; 512];
+    header[..name_bytes.len()].copy_from_slice(name_bytes);
+    write_tar_octal(&mut header[100..108], 0o644);
+    write_tar_octal(&mut header[108..116], 0);
+    write_tar_octal(&mut header[116..124], 0);
+    write_tar_octal(&mut header[124..136], data.len() as u64);
+    write_tar_octal(&mut header[136..148], 0);
+    for byte in &mut header[148..156] {
+        *byte = b' ';
+    }
+    header[156] = b'0';
+    header[257..263].copy_from_slice(b"ustar\0");
+    header[263..265].copy_from_slice(b"00");
+    let checksum = header
+        .iter()
+        .fold(0u32, |sum, byte| sum.saturating_add(u32::from(*byte)));
+    let checksum_text = format!("{checksum:06o}\0 ");
+    header[148..156].copy_from_slice(checksum_text.as_bytes());
+    out.extend_from_slice(&header);
+    out.extend_from_slice(data);
+    let padding = (512 - (data.len() % 512)) % 512;
+    out.extend(std::iter::repeat(0u8).take(padding));
+    Ok(())
+}
+
+fn write_tar_octal(field: &mut [u8], value: u64) {
+    field.fill(0);
+    let digits = field.len().saturating_sub(1);
+    let text = format!("{value:0width$o}", width = digits);
+    let bytes = text.as_bytes();
+    let start = digits.saturating_sub(bytes.len());
+    field[start..start + bytes.len()].copy_from_slice(bytes);
+}
+
+fn ai_export_json_value(
+    input: &Path,
+    kind: &str,
+    format: &str,
+    include_payloads: bool,
+    policy_report: bool,
+    sidecar: &CoveAiFile,
+    reader: &AiPayloadReader<'_>,
+) -> Result<serde_json::Value, String> {
+    let records = match kind {
+        "chunks" => sidecar
+            .descriptor_tables
+            .text_chunks
+            .iter()
+            .map(|chunk| serde_json::json!({
+                "record_kind": "text_chunk",
+                "chunk_id": chunk.chunk_id,
+                "source_ref": chunk.source_ref,
+                "byte_start": chunk.byte_start,
+                "byte_length": chunk.byte_length,
+                "source_value_hash_ref": chunk.source_value_hash_ref,
+                "chunk_text_hash_ref": chunk.chunk_text_hash_ref,
+                "text_reconstruction": "requires_source_cove_value",
+            }))
+            .collect::<Vec<_>>(),
+        "tokens" => sidecar
+            .descriptor_tables
+            .token_blocks
+            .iter()
+            .map(|block| serde_json::json!({
+                "record_kind": "token_block",
+                "token_block_id": block.token_block_id,
+                "tokenizer_profile_id": block.tokenizer_profile_id,
+                "token_count": block.token_count,
+                "token_id_width": block.token_id_width,
+                "payload": cli_payload_ref_json(block.payload_ref, include_payloads, reader),
+            }))
+            .collect::<Vec<_>>(),
+        "vectors" => {
+            let mut records = sidecar
+                .descriptor_tables
+                .vector_entries
+                .iter()
+                .map(|entry| serde_json::json!({
+                    "record_kind": "vector_entry",
+                    "vector_ref": entry.vector_ref,
+                    "block_id": entry.block_id,
+                    "vector_ordinal": entry.vector_ordinal,
+                    "payload_offset": entry.payload_offset,
+                    "payload_length": entry.payload_length,
+                }))
+                .collect::<Vec<_>>();
+            records.extend(sidecar.descriptor_tables.filecode_vector_bindings.iter().map(|binding| serde_json::json!({
+                "record_kind": "filecode_vector_binding",
+                "binding_id": binding.binding_id,
+                "vector_space_id": binding.vector_space_id,
+                "file_code": binding.file_code,
+                "vector_ref": binding.vector_ref,
+                "model_input_digest_ref": binding.model_input_digest_ref,
+            })));
+            records.extend(sidecar.descriptor_tables.chunk_vector_bindings.iter().map(|binding| serde_json::json!({
+                "record_kind": "chunk_vector_binding",
+                "binding_id": binding.binding_id,
+                "vector_space_id": binding.vector_space_id,
+                "chunk_id": binding.chunk_id,
+                "vector_ref": binding.vector_ref,
+                "model_input_digest_ref": binding.model_input_digest_ref,
+            })));
+            records.extend(sidecar.descriptor_tables.object_state_vector_bindings.iter().map(|binding| serde_json::json!({
+                "record_kind": "object_state_vector_binding",
+                "binding_id": binding.binding_id,
+                "vector_space_id": binding.vector_space_id,
+                "object_type_id": binding.object_type_id,
+                "vector_ref": binding.vector_ref,
+                "model_input_digest_ref": binding.model_input_digest_ref,
+            })));
+            records.extend(sidecar.descriptor_tables.training_sample_vector_bindings.iter().map(|binding| serde_json::json!({
+                "record_kind": "training_sample_vector_binding",
+                "binding_id": binding.binding_id,
+                "vector_space_id": binding.vector_space_id,
+                "sample_id": binding.sample_id,
+                "vector_ref": binding.vector_ref,
+                "model_input_digest_ref": binding.model_input_digest_ref,
+            })));
+            records.extend(sidecar.descriptor_tables.association_state_vector_bindings.iter().map(|binding| serde_json::json!({
+                "record_kind": "association_state_vector_binding",
+                "binding_id": binding.binding_id,
+                "vector_space_id": binding.vector_space_id,
+                "association_type_id": binding.association_type_id,
+                "association_key_ref": binding.association_key_ref,
+                "vector_ref": binding.vector_ref,
+                "model_input_digest_ref": binding.model_input_digest_ref,
+            })));
+            records.extend(sidecar.descriptor_tables.asset_vector_bindings.iter().map(|binding| serde_json::json!({
+                "record_kind": "asset_vector_binding",
+                "binding_id": binding.binding_id,
+                "vector_space_id": binding.vector_space_id,
+                "asset_ref": binding.asset_ref,
+                "transform_ref": binding.transform_ref,
+                "vector_ref": binding.vector_ref,
+                "model_input_digest_ref": binding.model_input_digest_ref,
+            })));
+            records.extend(sidecar.descriptor_tables.multimodal_sequence_vector_bindings.iter().map(|binding| serde_json::json!({
+                "record_kind": "multimodal_sequence_vector_binding",
+                "binding_id": binding.binding_id,
+                "vector_space_id": binding.vector_space_id,
+                "sequence_pack_id": binding.sequence_pack_id,
+                "sequence_profile_ref": binding.sequence_profile_ref,
+                "vector_ref": binding.vector_ref,
+                "model_input_digest_ref": binding.model_input_digest_ref,
+            })));
+            records
+        },
+        "training" => filtered_training_samples(sidecar, None, None)
+            .into_iter()
+            .map(|sample| {
+                let mut value = training_sample_json(sample);
+                value["input"] = cli_payload_ref_json(sample.input_ref, include_payloads, reader);
+                value["target"] = cli_payload_ref_json(sample.target_ref, include_payloads, reader);
+                value["metadata"] = cli_payload_ref_json(sample.metadata_ref, include_payloads, reader);
+                value
+            })
+            .collect::<Vec<_>>(),
+        "multimodal" => sidecar
+            .descriptor_tables
+            .multimodal_sequence_elements
+            .iter()
+            .map(|element| serde_json::json!({
+                "record_kind": "multimodal_sequence_element",
+                "element_id": element.element_id,
+                "sequence_pack_id": element.sequence_pack_id,
+                "ordinal": element.ordinal,
+                "modality": element.modality,
+                "role": element.role,
+                "asset_ref": element.asset_ref,
+                "tensor_ref": element.tensor_ref,
+                "vector_ref": element.vector_ref,
+                "position_stream": cli_payload_ref_json(element.position_stream_ref, include_payloads, reader),
+                "evidence": cli_payload_ref_json(element.evidence_ref, include_payloads, reader),
+            }))
+            .collect::<Vec<_>>(),
+        "assets" => sidecar
+            .descriptor_tables
+            .assets
+            .iter()
+            .map(|asset| serde_json::json!({
+                "record_kind": "asset",
+                "asset_ref_id": asset.asset_ref_id,
+                "asset_kind": asset.asset_kind,
+                "uri_ref": asset.uri_ref,
+                "embedded_section_ref": asset.embedded_section_ref,
+                "media_type_ref": asset.media_type_ref,
+                "byte_length": asset.byte_length,
+                "digest_ref": asset.digest_ref,
+                "policy_ref": asset.policy_ref,
+            }))
+            .collect::<Vec<_>>(),
+        "tensors" => sidecar
+            .descriptor_tables
+            .tensor_layouts
+            .iter()
+            .map(|tensor| serde_json::json!({
+                "record_kind": "tensor_layout",
+                "tensor_layout_id": tensor.tensor_layout_id,
+                "dtype": tensor.dtype,
+                "rank": tensor.rank,
+                "shape_ref": tensor.shape_ref,
+                "stride_ref": tensor.stride_ref,
+                "shape": cli_payload_ref_json(tensor.shape_ref, include_payloads, reader),
+                "stride": cli_payload_ref_json(tensor.stride_ref, include_payloads, reader),
+            }))
+            .collect::<Vec<_>>(),
+        other => {
+            return Err(format!(
+                "unknown ai export kind '{other}'; expected chunks, tokens, vectors, training, multimodal, assets, or tensors"
+            ));
+        }
+    };
+
+    let mut diagnostics = Vec::new();
+    if include_payloads
+        && !matches!(
+            sidecar.payload_access,
+            cove_core::artifact::coveai::AiPayloadAccessState::StructurallyAllowed
+        )
+    {
+        diagnostics.push(serde_json::json!({
+            "code": "COVE_AI_PAYLOAD_POLICY_BLOCKED",
+            "message": "payload export requested but payload access is not structurally allowed",
+            "payload_access": format!("{:?}", sidecar.payload_access),
+        }));
+    }
+    Ok(serde_json::json!({
+        "path": input.display().to_string(),
+        "kind": kind,
+        "format": format,
+        "include_payloads": include_payloads,
+        "policy_report": policy_report,
+        "artifact_id": hex_bytes(&sidecar.header.artifact_id),
+        "payload_access": format!("{:?}", sidecar.payload_access),
+        "records": records,
+        "diagnostics": diagnostics,
+    }))
+}
+
+fn cli_payload_ref_json(
+    payload_ref: u32,
+    include_payloads: bool,
+    reader: &AiPayloadReader<'_>,
+) -> serde_json::Value {
+    if payload_ref == 0 {
+        return serde_json::json!({
+            "payload_ref": 0,
+            "payload_access": "not_declared",
+        });
+    }
+    if !include_payloads {
+        return serde_json::json!({
+            "payload_ref": payload_ref,
+            "payload_access": "not_requested",
+        });
+    }
+    match reader.lease_payload_ref(payload_ref) {
+        Ok(lease) => match std::str::from_utf8(lease.bytes) {
+            Ok(text) => serde_json::json!({
+                "payload_ref": payload_ref,
+                "payload_access": lease.disclosure.as_str(),
+                "decoded_length": lease.decoded_length,
+                "text": text,
+            }),
+            Err(_) => serde_json::json!({
+                "payload_ref": payload_ref,
+                "payload_access": lease.disclosure.as_str(),
+                "decoded_length": lease.decoded_length,
+                "bytes_hex": hex_bytes(lease.bytes),
+            }),
+        },
+        Err(error) => serde_json::json!({
+            "payload_ref": payload_ref,
+            "payload_access": "withheld",
+            "withholding_reason": error.to_string(),
+        }),
+    }
 }
 
 fn run_train(mut args: Vec<String>) -> Result<(), String> {
@@ -1318,16 +2003,27 @@ fn run_train_export(args: Vec<String>) -> Result<(), String> {
     let mut format = "json".to_string();
     let mut profile_filter: Option<u32> = None;
     let mut split_filter: Option<u32> = None;
+    let mut epoch_plan_filter: Option<u64> = None;
+    let mut include_payloads = false;
+    let mut policy_report = false;
 
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
+            "--include-payloads" => include_payloads = true,
+            "--policy-report" => policy_report = true,
             "--format" => {
                 format = iter
                     .next()
-                    .ok_or_else(|| "--format requires json or jsonl".to_string())?;
-                if !matches!(format.as_str(), "json" | "jsonl") {
-                    return Err("--format must be json or jsonl".into());
+                    .ok_or_else(|| "--format requires a value".to_string())?;
+                if !matches!(
+                    format.as_str(),
+                    "json" | "jsonl" | "hf-jsonl" | "arrow" | "parquet" | "webdataset"
+                ) {
+                    return Err(
+                        "--format must be json, jsonl, hf-jsonl, arrow, parquet, or webdataset"
+                            .into(),
+                    );
                 }
             }
             "--out" => {
@@ -1341,6 +2037,9 @@ fn run_train_export(args: Vec<String>) -> Result<(), String> {
             }
             "--split" => {
                 split_filter = Some(parse_u32_arg(iter.next().as_deref(), "--split")?);
+            }
+            "--epoch-plan" => {
+                epoch_plan_filter = Some(parse_u64(iter.next().as_deref(), "--epoch-plan")?);
             }
             "-h" | "--help" => {
                 print_usage(HelpTopic::Train);
@@ -1371,25 +2070,43 @@ fn run_train_export(args: Vec<String>) -> Result<(), String> {
     }
     let sidecar = CoveAiFile::parse(&bytes)
         .map_err(|error| format!("{}: invalid COVE-AI sidecar: {error}", input.display()))?;
+    let payload_reader = AiPayloadReader::new(
+        &bytes,
+        &sidecar,
+        if include_payloads {
+            CoveAiAccessContext::for_operation("train_export")
+        } else {
+            CoveAiAccessContext::descriptor_only("train_export")
+        },
+    );
 
-    let text = if format == "jsonl" {
-        training_export_jsonl(&sidecar, profile_filter, split_filter)?
+    if matches!(format.as_str(), "jsonl" | "hf-jsonl") {
+        let text = training_export_jsonl(
+            &sidecar,
+            profile_filter,
+            split_filter,
+            include_payloads,
+            &payload_reader,
+        )?;
+        if let Some(out) = out {
+            fs::write(&out, text)
+                .map_err(|error| format!("cannot write {}: {error}", out.display()))?;
+        } else {
+            print!("{text}");
+        }
     } else {
-        serde_json::to_string_pretty(&training_export_json(
+        let value = training_export_json(
             &input,
             &sidecar,
             profile_filter,
             split_filter,
-        ))
-        .unwrap()
-    };
-    if let Some(out) = out {
-        fs::write(&out, text)
-            .map_err(|error| format!("cannot write {}: {error}", out.display()))?;
-    } else if format == "jsonl" {
-        print!("{text}");
-    } else {
-        println!("{text}");
+            epoch_plan_filter,
+            include_payloads,
+            policy_report,
+            &payload_reader,
+            &format,
+        );
+        write_ai_export_output(&value, &format, out)?;
     }
     Ok(())
 }
@@ -1399,10 +2116,15 @@ fn training_export_json(
     sidecar: &CoveAiFile,
     profile_filter: Option<u32>,
     split_filter: Option<u32>,
+    epoch_plan_filter: Option<u64>,
+    include_payloads: bool,
+    policy_report: bool,
+    payload_reader: &AiPayloadReader<'_>,
+    format: &str,
 ) -> serde_json::Value {
     let samples = filtered_training_samples(sidecar, profile_filter, split_filter)
         .into_iter()
-        .map(training_sample_json)
+        .map(|sample| training_sample_json_with_payloads(sample, include_payloads, payload_reader))
         .collect::<Vec<_>>();
     let mut diagnostics = Vec::new();
     if !matches!(
@@ -1422,10 +2144,14 @@ fn training_export_json(
             CoveAiArtifactKind::CoveVec => "covev",
         },
         "artifact_id": hex_bytes(&sidecar.header.artifact_id),
+        "format": format,
+        "include_payloads": include_payloads,
+        "policy_report": policy_report,
         "payload_access": format!("{:?}", sidecar.payload_access),
         "filters": {
             "training_profile_id": profile_filter,
             "split_id": split_filter,
+            "epoch_plan_id": epoch_plan_filter,
         },
         "counts": {
             "training_profiles": sidecar.descriptor_tables.training_profiles.len(),
@@ -1484,7 +2210,9 @@ fn training_export_json(
             "member_count": group.member_count,
             "flags": group.flags,
         })).collect::<Vec<_>>(),
-        "training_epoch_plans": sidecar.descriptor_tables.training_epoch_plans.iter().map(|plan| serde_json::json!({
+        "training_epoch_plans": sidecar.descriptor_tables.training_epoch_plans.iter().filter(|plan| {
+            epoch_plan_filter.is_none_or(|epoch_plan_id| plan.epoch_plan_id == epoch_plan_id)
+        }).map(|plan| serde_json::json!({
             "epoch_plan_id": plan.epoch_plan_id,
             "training_profile_id": plan.training_profile_id,
             "split_ref": plan.split_ref,
@@ -1518,10 +2246,19 @@ fn training_export_jsonl(
     sidecar: &CoveAiFile,
     profile_filter: Option<u32>,
     split_filter: Option<u32>,
+    include_payloads: bool,
+    payload_reader: &AiPayloadReader<'_>,
 ) -> Result<String, String> {
     let mut out = String::new();
     for sample in filtered_training_samples(sidecar, profile_filter, split_filter) {
-        out.push_str(&serde_json::to_string(&training_sample_json(sample)).unwrap());
+        out.push_str(
+            &serde_json::to_string(&training_sample_json_with_payloads(
+                sample,
+                include_payloads,
+                payload_reader,
+            ))
+            .unwrap(),
+        );
         out.push('\n');
     }
     Ok(out)
@@ -1573,9 +2310,23 @@ fn training_sample_json(
     })
 }
 
+fn training_sample_json_with_payloads(
+    sample: &cove_core::artifact::coveai::TrainingSampleEntryV1,
+    include_payloads: bool,
+    payload_reader: &AiPayloadReader<'_>,
+) -> serde_json::Value {
+    let mut value = training_sample_json(sample);
+    value["input"] = cli_payload_ref_json(sample.input_ref, include_payloads, payload_reader);
+    value["target"] = cli_payload_ref_json(sample.target_ref, include_payloads, payload_reader);
+    value["metadata"] = cli_payload_ref_json(sample.metadata_ref, include_payloads, payload_reader);
+    value["evidence"] = cli_payload_ref_json(sample.evidence_ref, include_payloads, payload_reader);
+    value
+}
+
 fn deterministic_vector_payload(
     file_codes: &[u32],
     dimension_count: u32,
+    deterministic_seed: u64,
 ) -> Result<Vec<u8>, String> {
     let value_count = file_codes
         .len()
@@ -1594,12 +2345,98 @@ fn deterministic_vector_payload(
             let seed = u64::from(*file_code)
                 .wrapping_mul(1_000_003)
                 .wrapping_add(u64::from(dimension).wrapping_mul(97))
-                .wrapping_add(17);
+                .wrapping_add(deterministic_seed);
             let value = (seed % 10_000) as f32 / 10_000.0;
             payload.extend_from_slice(&value.to_le_bytes());
         }
     }
     Ok(payload)
+}
+
+fn vec_build_integrity_report(
+    out: &Path,
+    bytes: &[u8],
+    parsed: &CoveAiFile,
+    index_kind: &str,
+    metric: &str,
+    quantization: &str,
+    index_parameters: &[(String, String)],
+) -> Result<Vec<u8>, String> {
+    let payload_bytes = parsed
+        .descriptor_tables
+        .payload_refs
+        .iter()
+        .map(|payload| payload.payload_length)
+        .sum::<u64>();
+    let report = serde_json::json!({
+        "artifact": out.display().to_string(),
+        "artifact_bytes": bytes.len(),
+        "artifact_crc32c": checksum::crc32c(bytes),
+        "payload_ref_count": parsed.descriptor_tables.payload_refs.len(),
+        "payload_integrity_count": parsed.descriptor_tables.payload_integrity.len(),
+        "payload_bytes": payload_bytes,
+        "vector_spaces": parsed.descriptor_tables.vector_spaces.iter().map(|space| serde_json::json!({
+            "vector_space_id": space.vector_space_id,
+            "dimension_count": space.dimension_count,
+            "element_type": space.element_type,
+            "metric": space.metric,
+            "quantization_policy": space.quantization_policy,
+        })).collect::<Vec<_>>(),
+        "vector_indexes": parsed.descriptor_tables.vector_indexes.iter().map(|index| serde_json::json!({
+            "vector_index_id": index.vector_index_id,
+            "index_kind": index.index_kind,
+            "exactness_kind": index.exactness_kind,
+            "metric": index.metric,
+        })).collect::<Vec<_>>(),
+        "build": {
+            "index": index_kind,
+            "metric": metric,
+            "quantization": quantization,
+            "index_parameters": index_parameters.iter().map(|(name, value)| serde_json::json!({
+                "name": name,
+                "value": value,
+            })).collect::<Vec<_>>(),
+        }
+    });
+    serde_json::to_vec_pretty(&report).map_err(|error| error.to_string())
+}
+
+fn cove_vec_index_kind(value: &str) -> Result<u8, String> {
+    match value {
+        "exact" | "exact-flat" | "exact_flat" => Ok(0),
+        "hnsw" => Ok(1),
+        "ivf-flat" | "ivf_flat" => Ok(2),
+        "ivf-pq" | "ivf_pq" => Ok(3),
+        "diskann" => Ok(4),
+        "vamana" => Ok(5),
+        other => Err(format!(
+            "unsupported COVE-VEC index kind '{other}'; expected exact|hnsw|ivf-flat|ivf-pq|diskann|vamana"
+        )),
+    }
+}
+
+fn cove_vec_metric(value: &str) -> Result<u8, String> {
+    match value {
+        "cosine" => Ok(0),
+        "dot" => Ok(1),
+        "l2" => Ok(2),
+        "l1" => Ok(3),
+        other => Err(format!(
+            "unsupported COVE-VEC metric '{other}'; expected cosine|dot|l2|l1"
+        )),
+    }
+}
+
+fn cove_vec_quantization_kind(value: &str) -> Result<u8, String> {
+    match value {
+        "none" => Ok(0),
+        "int8" => Ok(1),
+        "uint8" => Ok(2),
+        "pq" => Ok(3),
+        other => Err(format!(
+            "unsupported COVE-VEC quantization '{other}'; expected none|int8|uint8|pq"
+        )),
+    }
 }
 
 fn run_inspect_detailed(args: Vec<String>) -> Result<(), String> {
@@ -2632,62 +3469,91 @@ fn run_ai_inspect(file: &Path, bytes: &[u8], json: bool) -> Result<(), String> {
     {
         let sidecar = CoveAiFile::parse(bytes)
             .map_err(|error| format!("{}: invalid COVE-AI sidecar: {error}", file.display()))?;
+        let explain = ai_explain_report(&sidecar);
         if json {
+            let version = serde_json::json!({
+                "major": sidecar.header.version_major,
+                "minor": sidecar.header.version_minor,
+            });
+            let runtime = serde_json::json!({
+                "payload_exposure_eligible": matches!(
+                    explain.payload_access,
+                    cove_core::artifact::coveai::AiPayloadAccessState::StructurallyAllowed
+                ),
+                "vector_space_count": explain.vector_space_count,
+                "vector_index_count": explain.vector_index_count,
+                "payload_ref_count": explain.payload_ref_count,
+                "privacy_summary_count": explain.privacy_summary_count,
+                "supported_indexes": explain.supported_indexes,
+                "stale_or_withheld": explain.stale_or_withheld,
+            });
+            let records = serde_json::json!({
+                "source_bindings": sidecar.descriptor_tables.source_bindings.len(),
+                "privacy_summaries": sidecar.descriptor_tables.privacy_summaries.len(),
+                "payload_refs": sidecar.descriptor_tables.payload_refs.len(),
+                "payload_integrity": sidecar.descriptor_tables.payload_integrity.len(),
+                "chunk_profiles": sidecar.descriptor_tables.chunk_profiles.len(),
+                "text_chunks": sidecar.descriptor_tables.text_chunks.len(),
+                "tokenizer_profiles": sidecar.descriptor_tables.tokenizer_profiles.len(),
+                "vector_spaces": sidecar.descriptor_tables.vector_spaces.len(),
+                "vector_payload_blocks": sidecar.descriptor_tables.vector_payload_blocks.len(),
+                "vector_entries": sidecar.descriptor_tables.vector_entries.len(),
+                "filecode_vector_bindings": sidecar.descriptor_tables.filecode_vector_bindings.len(),
+                "chunk_vector_bindings": sidecar.descriptor_tables.chunk_vector_bindings.len(),
+                "object_state_vector_bindings": sidecar.descriptor_tables.object_state_vector_bindings.len(),
+                "training_sample_vector_bindings": sidecar.descriptor_tables.training_sample_vector_bindings.len(),
+                "association_state_vector_bindings": sidecar.descriptor_tables.association_state_vector_bindings.len(),
+                "asset_vector_bindings": sidecar.descriptor_tables.asset_vector_bindings.len(),
+                "multimodal_sequence_vector_bindings": sidecar.descriptor_tables.multimodal_sequence_vector_bindings.len(),
+                "vector_indexes": sidecar.descriptor_tables.vector_indexes.len(),
+                "token_blocks": sidecar.descriptor_tables.token_blocks.len(),
+                "tokenized_spans": sidecar.descriptor_tables.tokenized_spans.len(),
+                "token_sequence_packs": sidecar.descriptor_tables.token_sequence_packs.len(),
+                "training_profiles": sidecar.descriptor_tables.training_profiles.len(),
+                "training_samples": sidecar.descriptor_tables.training_samples.len(),
+                "dataset_splits": sidecar.descriptor_tables.dataset_splits.len(),
+                "dedup_groups": sidecar.descriptor_tables.dedup_groups.len(),
+                "training_epoch_plans": sidecar.descriptor_tables.training_epoch_plans.len(),
+                "training_labels": sidecar.descriptor_tables.training_labels.len(),
+                "preference_pairs": sidecar.descriptor_tables.preference_pairs.len(),
+                "generator_provenance": sidecar.descriptor_tables.generator_provenance.len(),
+                "model_actors": sidecar.descriptor_tables.model_actors.len(),
+                "generation_decoding_profiles": sidecar.descriptor_tables.generation_decoding_profiles.len(),
+                "human_reviews": sidecar.descriptor_tables.human_reviews.len(),
+                "tensor_layouts": sidecar.descriptor_tables.tensor_layouts.len(),
+                "device_transfer_hints": sidecar.descriptor_tables.device_transfer_hints.len(),
+                "assets": sidecar.descriptor_tables.assets.len(),
+                "multimodal_sequence_packs": sidecar.descriptor_tables.multimodal_sequence_packs.len(),
+                "multimodal_sequence_elements": sidecar.descriptor_tables.multimodal_sequence_elements.len(),
+            });
+            let sections = sidecar
+                .sections
+                .iter()
+                .map(|section| {
+                    serde_json::json!({
+                        "section_id": section.entry.section_id,
+                        "section_kind": section.entry.section_kind,
+                        "offset": section.entry.offset,
+                        "length": section.entry.length,
+                        "profile": section.entry.profile_kind,
+                        "payload_encoding": section.entry.payload_encoding,
+                        "records": section.record_headers.len(),
+                    })
+                })
+                .collect::<Vec<_>>();
             let value = serde_json::json!({
                 "path": file.display().to_string(),
                 "artifact": match sidecar.artifact_kind {
                     CoveAiArtifactKind::CoveAiBundle => "coveai",
                     CoveAiArtifactKind::CoveVec => "covev",
                 },
-                "version": {
-                    "major": sidecar.header.version_major,
-                    "minor": sidecar.header.version_minor,
-                },
+                "version": version,
                 "artifact_id": hex_bytes(&sidecar.header.artifact_id),
                 "section_count": sidecar.sections.len(),
                 "payload_access": format!("{:?}", sidecar.payload_access),
-                "records": {
-                    "source_bindings": sidecar.descriptor_tables.source_bindings.len(),
-                    "privacy_summaries": sidecar.descriptor_tables.privacy_summaries.len(),
-                    "payload_refs": sidecar.descriptor_tables.payload_refs.len(),
-                    "payload_integrity": sidecar.descriptor_tables.payload_integrity.len(),
-                    "chunk_profiles": sidecar.descriptor_tables.chunk_profiles.len(),
-                    "text_chunks": sidecar.descriptor_tables.text_chunks.len(),
-                    "tokenizer_profiles": sidecar.descriptor_tables.tokenizer_profiles.len(),
-                    "vector_spaces": sidecar.descriptor_tables.vector_spaces.len(),
-                    "vector_payload_blocks": sidecar.descriptor_tables.vector_payload_blocks.len(),
-                    "vector_entries": sidecar.descriptor_tables.vector_entries.len(),
-                    "filecode_vector_bindings": sidecar.descriptor_tables.filecode_vector_bindings.len(),
-                    "vector_indexes": sidecar.descriptor_tables.vector_indexes.len(),
-                    "token_blocks": sidecar.descriptor_tables.token_blocks.len(),
-                    "tokenized_spans": sidecar.descriptor_tables.tokenized_spans.len(),
-                    "token_sequence_packs": sidecar.descriptor_tables.token_sequence_packs.len(),
-                    "training_profiles": sidecar.descriptor_tables.training_profiles.len(),
-                    "training_samples": sidecar.descriptor_tables.training_samples.len(),
-                    "dataset_splits": sidecar.descriptor_tables.dataset_splits.len(),
-                    "dedup_groups": sidecar.descriptor_tables.dedup_groups.len(),
-                    "training_epoch_plans": sidecar.descriptor_tables.training_epoch_plans.len(),
-                    "training_labels": sidecar.descriptor_tables.training_labels.len(),
-                    "preference_pairs": sidecar.descriptor_tables.preference_pairs.len(),
-                    "generator_provenance": sidecar.descriptor_tables.generator_provenance.len(),
-                    "model_actors": sidecar.descriptor_tables.model_actors.len(),
-                    "generation_decoding_profiles": sidecar.descriptor_tables.generation_decoding_profiles.len(),
-                    "human_reviews": sidecar.descriptor_tables.human_reviews.len(),
-                    "tensor_layouts": sidecar.descriptor_tables.tensor_layouts.len(),
-                    "device_transfer_hints": sidecar.descriptor_tables.device_transfer_hints.len(),
-                    "assets": sidecar.descriptor_tables.assets.len(),
-                    "multimodal_sequence_packs": sidecar.descriptor_tables.multimodal_sequence_packs.len(),
-                    "multimodal_sequence_elements": sidecar.descriptor_tables.multimodal_sequence_elements.len(),
-                },
-                "sections": sidecar.sections.iter().map(|section| serde_json::json!({
-                    "section_id": section.entry.section_id,
-                    "section_kind": section.entry.section_kind,
-                    "offset": section.entry.offset,
-                    "length": section.entry.length,
-                    "profile": section.entry.profile_kind,
-                    "payload_encoding": section.entry.payload_encoding,
-                    "records": section.record_headers.len(),
-                })).collect::<Vec<_>>(),
+                "runtime": runtime,
+                "records": records,
+                "sections": sections,
             });
             println!("{}", serde_json::to_string_pretty(&value).unwrap());
             return Ok(());
@@ -2703,6 +3569,26 @@ fn run_ai_inspect(file: &Path, bytes: &[u8], json: bool) -> Result<(), String> {
         println!("Artifact ID: {}", hex_bytes(&sidecar.header.artifact_id));
         println!("Sections: {}", sidecar.sections.len());
         println!("Payload access: {:?}", sidecar.payload_access);
+        println!(
+            "Runtime: payload_exposure_eligible={} vector_spaces={} vector_indexes={} payload_refs={} privacy_summaries={}",
+            matches!(
+                explain.payload_access,
+                cove_core::artifact::coveai::AiPayloadAccessState::StructurallyAllowed
+            ),
+            explain.vector_space_count,
+            explain.vector_index_count,
+            explain.payload_ref_count,
+            explain.privacy_summary_count
+        );
+        if !explain.supported_indexes.is_empty() {
+            println!(
+                "Supported index descriptors: {}",
+                explain.supported_indexes.join(", ")
+            );
+        }
+        if !explain.stale_or_withheld.is_empty() {
+            println!("Withheld/stale: {}", explain.stale_or_withheld.join(", "));
+        }
         println!("Records:");
         println!(
             "  source_bindings={} privacy_summaries={} payload_refs={} payload_integrity={}",
@@ -2712,7 +3598,7 @@ fn run_ai_inspect(file: &Path, bytes: &[u8], json: bool) -> Result<(), String> {
             sidecar.descriptor_tables.payload_integrity.len()
         );
         println!(
-            "  chunk_profiles={} text_chunks={} tokenizer_profiles={} token_blocks={} tokenized_spans={} token_sequence_packs={} training_profiles={} training_samples={} dataset_splits={} dedup_groups={} training_epoch_plans={} training_labels={} preference_pairs={} generator_provenance={} model_actors={} generation_decoding_profiles={} human_reviews={} tensor_layouts={} device_transfer_hints={} assets={} multimodal_sequence_packs={} multimodal_sequence_elements={} vector_spaces={} vector_blocks={} vector_entries={} filecode_bindings={} vector_indexes={}",
+            "  chunk_profiles={} text_chunks={} tokenizer_profiles={} token_blocks={} tokenized_spans={} token_sequence_packs={} training_profiles={} training_samples={} dataset_splits={} dedup_groups={} training_epoch_plans={} training_labels={} preference_pairs={} generator_provenance={} model_actors={} generation_decoding_profiles={} human_reviews={} tensor_layouts={} device_transfer_hints={} assets={} multimodal_sequence_packs={} multimodal_sequence_elements={} vector_spaces={} vector_blocks={} vector_entries={} filecode_bindings={} chunk_bindings={} object_bindings={} training_vector_bindings={} association_bindings={} asset_bindings={} multimodal_vector_bindings={} vector_indexes={}",
             sidecar.descriptor_tables.chunk_profiles.len(),
             sidecar.descriptor_tables.text_chunks.len(),
             sidecar.descriptor_tables.tokenizer_profiles.len(),
@@ -2739,6 +3625,12 @@ fn run_ai_inspect(file: &Path, bytes: &[u8], json: bool) -> Result<(), String> {
             sidecar.descriptor_tables.vector_payload_blocks.len(),
             sidecar.descriptor_tables.vector_entries.len(),
             sidecar.descriptor_tables.filecode_vector_bindings.len(),
+            sidecar.descriptor_tables.chunk_vector_bindings.len(),
+            sidecar.descriptor_tables.object_state_vector_bindings.len(),
+            sidecar.descriptor_tables.training_sample_vector_bindings.len(),
+            sidecar.descriptor_tables.association_state_vector_bindings.len(),
+            sidecar.descriptor_tables.asset_vector_bindings.len(),
+            sidecar.descriptor_tables.multimodal_sequence_vector_bindings.len(),
             sidecar.descriptor_tables.vector_indexes.len()
         );
         if !sidecar.sections.is_empty() {
@@ -3228,7 +4120,17 @@ fn run_query(file: Option<&Path>, query: &str, options: QueryCommandOptions) -> 
     if let Some(explain) = options.explain.as_deref() {
         execute_options.resolve_options.security.explain_policy = explain_policy_for_cli(explain);
     }
-    configure_execution_engine(&mut execute_options, &options)?;
+    let mut physical_sidecars = options.physical_sidecars.clone();
+    if !options.no_auto_sidecars && physical_sidecars.cove_ai_artifact.is_none() {
+        if let Some(input) = file {
+            physical_sidecars.cove_ai_artifact = discover_query_ai_sidecar(
+                input,
+                options.dataset.as_deref(),
+                query_selects_ai_operation(query, options.explain.as_deref()),
+            )?;
+        }
+    }
+    configure_execution_engine(&mut execute_options, &options, &physical_sidecars)?;
     let acceleration_bundle = if !options.no_auto_sidecars && !delta_manifest {
         file.map(|file| {
             discover_acceleration_bundle(
@@ -3245,14 +4147,14 @@ fn run_query(file: Option<&Path>, query: &str, options: QueryCommandOptions) -> 
     };
     if let Some(bundle) = &acceleration_bundle {
         if options.engine != QueryEngine::Materialized
-            && (bundle.has_usable_sidecars() || options.physical_sidecars.has_any())
+            && (bundle.has_usable_sidecars() || physical_sidecars.has_any())
         {
             execute_options = apply_acceleration_bundle(bundle, execute_options);
         }
         if options.strict_performance
             && options.engine != QueryEngine::Materialized
             && !bundle.has_usable_sidecars()
-            && !options.physical_sidecars.has_any()
+            && !physical_sidecars.has_any()
         {
             return Err(format!(
                 "strict performance requested, but no validated acceleration sidecars were found for {}",
@@ -3361,6 +4263,152 @@ fn execute_delta_object_surface_query(
         options.execution_options.clone(),
         options.validation_options.clone(),
     )
+}
+
+fn discover_query_ai_sidecar(
+    input: &Path,
+    dataset: Option<&Path>,
+    strict_stale: bool,
+) -> Result<Option<PathBuf>, String> {
+    if let Some(path) = discover_covm_referenced_ai_sidecar(input, dataset, strict_stale)? {
+        return Ok(Some(path));
+    }
+    let mut candidates = ai_sidecar_candidates(input);
+    if let Some(dataset) = dataset {
+        let file_name = input.file_name().and_then(|name| name.to_str());
+        if let Some(file_name) = file_name {
+            candidates.extend(ai_sidecar_candidates(&dataset.join(file_name)));
+        }
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for candidate in candidates {
+        if !seen.insert(candidate.clone()) || !candidate.is_file() {
+            continue;
+        }
+        let bytes = match fs::read(&candidate) {
+            Ok(bytes) => bytes,
+            Err(_) => continue,
+        };
+        if CoveAiFile::parse(&bytes).is_ok() {
+            return Ok(Some(candidate));
+        }
+    }
+    Ok(None)
+}
+
+fn discover_covm_referenced_ai_sidecar(
+    input: &Path,
+    dataset: Option<&Path>,
+    strict_stale: bool,
+) -> Result<Option<PathBuf>, String> {
+    let manifest_bytes = match fs::read(input) {
+        Ok(bytes) => bytes,
+        Err(_) => return Ok(None),
+    };
+    let manifest = match CovmFile::parse(&manifest_bytes)
+        .or_else(|_| CovmFile::parse_delta_aware(&manifest_bytes))
+    {
+        Ok(manifest) => manifest,
+        Err(_) => return Ok(None),
+    };
+    let extension = match CovmAiSidecarExtensionV1::find_in_covm_bytes(&manifest_bytes) {
+        Ok(Some(extension)) => extension,
+        Ok(None) => return Ok(None),
+        Err(error) if strict_stale => {
+            return Err(format!(
+                "COVM AI sidecar reference extension is invalid: {error}"
+            ));
+        }
+        Err(_) => return Ok(None),
+    };
+    if let Err(error) = extension.validate_against_manifest(&manifest) {
+        if strict_stale {
+            return Err(format!(
+                "COVM AI sidecar reference does not match manifest members: {error}"
+            ));
+        }
+        return Ok(None);
+    }
+    let mut last_error = None;
+    for reference in &extension.refs {
+        let path = resolve_covm_ai_sidecar_path(input, dataset, &reference.uri);
+        let sidecar_bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                last_error = Some(format!("cannot read {}: {error}", path.display()));
+                continue;
+            }
+        };
+        match reference.validate_sidecar_bytes(&sidecar_bytes) {
+            Ok(_) => return Ok(Some(path)),
+            Err(error) => {
+                last_error = Some(format!("{} is stale or invalid: {error}", path.display()));
+            }
+        }
+    }
+    if strict_stale && !extension.refs.is_empty() {
+        return Err(format!(
+            "no digest-valid COVM AI sidecar reference is available{}",
+            last_error
+                .as_deref()
+                .map(|error| format!(" ({error})"))
+                .unwrap_or_default()
+        ));
+    }
+    Ok(None)
+}
+
+fn resolve_covm_ai_sidecar_path(input: &Path, dataset: Option<&Path>, uri: &str) -> PathBuf {
+    let raw = PathBuf::from(uri);
+    if raw.is_absolute() {
+        return raw;
+    }
+    if let Some(dataset) = dataset {
+        let candidate = dataset.join(&raw);
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    input
+        .parent()
+        .map(|parent| parent.join(&raw))
+        .unwrap_or(raw)
+}
+
+fn ai_sidecar_candidates(input: &Path) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    candidates.push(input.with_extension("covev"));
+    candidates.push(input.with_extension("coveai"));
+    if let (Some(parent), Some(stem)) = (input.parent(), input.file_stem().and_then(|s| s.to_str()))
+    {
+        candidates.push(parent.join(format!("{stem}-ai.covev")));
+        candidates.push(parent.join(format!("{stem}-ai.coveai")));
+        candidates.push(parent.join(format!("{stem}.ai.covev")));
+        candidates.push(parent.join(format!("{stem}.ai.coveai")));
+    }
+    candidates
+}
+
+fn query_selects_ai_operation(query: &str, explain: Option<&str>) -> bool {
+    if matches!(explain, Some("ai")) {
+        return true;
+    }
+    const AI_METHODS: &[&str] = &[
+        ".embedding(",
+        ".similar(",
+        ".chunks(",
+        ".tokens(",
+        ".context(",
+        ".asPromptContext(",
+        ".trainingSamples(",
+        ".split(",
+        ".pack(",
+        ".multimodal(",
+        ".hybrid(",
+        ".rerank(",
+        ".generatorAudit(",
+    ];
+    AI_METHODS.iter().any(|method| query.contains(method))
 }
 
 fn execute_query_with_cli_fallback(
@@ -3510,11 +4558,12 @@ fn cli_graph_traversal_contract(options: &ExecuteArtifactOptions) -> GraphTraver
 fn configure_execution_engine(
     execute_options: &mut ExecuteArtifactOptions,
     options: &QueryCommandOptions,
+    physical_sidecars: &QueryPhysicalSidecarPaths,
 ) -> Result<(), String> {
     let physical_requested = matches!(
         options.engine,
         QueryEngine::Physical | QueryEngine::Compare | QueryEngine::Kernel
-    ) || options.physical_sidecars.has_any()
+    ) || physical_sidecars.has_any()
         || options.allow_index_only
         || options.allow_zero_copy;
     if !physical_requested {
@@ -3523,7 +4572,7 @@ fn configure_execution_engine(
     let physical_options = PhysicalPlanOptions {
         allow_index_only_answers: options.allow_index_only,
         allow_zero_copy_output: options.allow_zero_copy,
-        sidecars: physical_sidecars_from_paths(&options.physical_sidecars)?,
+        sidecars: physical_sidecars_from_paths(physical_sidecars)?,
         ..Default::default()
     };
 

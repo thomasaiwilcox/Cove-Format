@@ -9,16 +9,16 @@ use cove_cache::CoveCoverageCacheHeaderV2;
 use cove_core::{
     artifact::{
         coveai::{
-            write_coveai_artifact, write_coveai_descriptor_bundle, AiAssetRefV1,
-            AiDescriptorTablesV1, AiDigestEntryV1, AiPayloadEncodingV1, AiPayloadRefEntryV1,
-            AiPrivacySummaryEntryV1, AiRequirednessScopeV1, AiStorageKindV1, ChunkProfileV1,
-            CoveAiArtifactKind, CoveAiDescriptorBundleBuild, CoveAiWritableSection, DatasetSplitV1,
-            DedupGroupV1, DeviceTransferHintV1, GenerationDecodingProfileV1, GeneratorProvenanceV1,
-            HumanReviewEntryV1, ModelActorDescriptorV1, MultimodalSequenceElementV1,
-            MultimodalSequencePackV1, PreferencePairEntryV1, TensorLayoutDescriptorV1,
-            TextChunkEntryV1, TokenBlockHeaderV1, TokenSequencePackV1, TokenizedSpanV1,
-            TokenizerProfileV1, TrainingEpochPlanV1, TrainingLabelEntryV1, TrainingProfileV1,
-            TrainingSampleEntryV1,
+            write_coveai_artifact, write_coveai_descriptor_bundle, write_covev_filecode_vectors,
+            AiAssetRefV1, AiDescriptorTablesV1, AiDigestEntryV1, AiPayloadEncodingV1,
+            AiPayloadRefEntryV1, AiPrivacySummaryEntryV1, AiRequirednessScopeV1, AiStorageKindV1,
+            ChunkProfileV1, CoveAiArtifactKind, CoveAiDescriptorBundleBuild, CoveAiWritableSection,
+            CoveVecFileCodeVectorBuild, DatasetSplitV1, DedupGroupV1, DeviceTransferHintV1,
+            GenerationDecodingProfileV1, GeneratorProvenanceV1, HumanReviewEntryV1,
+            ModelActorDescriptorV1, MultimodalSequenceElementV1, MultimodalSequencePackV1,
+            PreferencePairEntryV1, TensorLayoutDescriptorV1, TextChunkEntryV1, TokenBlockHeaderV1,
+            TokenSequencePackV1, TokenizedSpanV1, TokenizerProfileV1, TrainingEpochPlanV1,
+            TrainingLabelEntryV1, TrainingProfileV1, TrainingSampleEntryV1,
         },
         covedelta::{
             CoveDeltaFile, CoveDeltaFooterV1, CoveDeltaHeaderV1, CoveDeltaPostscriptV1,
@@ -29,7 +29,10 @@ use cove_core::{
             CovemapFile, CovemapHeaderV1, CovemapPostscriptV1, CovemapSection,
             CovemapSectionEntryV1,
         },
-        covm::{CovmFile, CovmFileEntryV1, CovmHeaderV1, CovmPostscriptV1},
+        covm::{
+            CovmAiSidecarExtensionV1, CovmAiSidecarRefV1, CovmFile, CovmFileEntryV1, CovmHeaderV1,
+            CovmPostscriptV1,
+        },
         covx::CovxFile,
     },
     constants::{
@@ -1113,6 +1116,117 @@ fn query_covm_manifest_registers_cove_t_member_tables() {
 }
 
 #[test]
+fn query_covm_manifest_auto_discovers_digest_bound_ai_sidecar_ref() {
+    let member = cove_t_events_bytes();
+    let validated = validate_bytes(&member).unwrap();
+    let member_entry = CovmFileEntryV1 {
+        file_id: validated.header.file_id,
+        uri: "events.cove".into(),
+        file_len: validated.postscript.file_len,
+        footer_crc32c: validated.postscript.footer.crc32c,
+        digest_algorithm: DigestAlgorithm::Sha256 as u16,
+        digest: compute_digest(DigestAlgorithm::Sha256, &member).unwrap(),
+        row_count: 0,
+        segment_count: 0,
+        file_stats_ref: 0,
+        file_exact_set_ref: 0,
+        flags: 0,
+    };
+    let manifest = CovmFile {
+        header: CovmHeaderV1::new([0xCA; 16], 1, 1, 1_700_000_000_000_100),
+        files: vec![member_entry.clone()],
+        postscript: CovmPostscriptV1 {
+            header_offset: 0,
+            header_len: 0,
+            entries_offset: 0,
+            entries_len: 0,
+            file_len: 0,
+            flags: 0,
+            checksum: 0,
+        },
+    };
+    let mut vector_payload = Vec::new();
+    for value in [1.0f32, 0.0, 0.0] {
+        vector_payload.extend_from_slice(&value.to_le_bytes());
+    }
+    let sidecar = write_covev_filecode_vectors(&CoveVecFileCodeVectorBuild {
+        artifact_id: [0xCB; 16],
+        created_at_us: 1_700_000_000_000_101,
+        dimension_count: 3,
+        file_codes: vec![1],
+        vector_payload,
+    })
+    .unwrap();
+    let extension = CovmAiSidecarExtensionV1 {
+        flags: 0,
+        refs: vec![CovmAiSidecarRefV1::new(
+            member_entry.file_id,
+            CoveAiArtifactKind::CoveVec,
+            "dataset.covev".into(),
+            &sidecar,
+        )
+        .unwrap()],
+    };
+    let manifest_bytes = manifest
+        .serialize_with_extension_region(&extension.serialize().unwrap())
+        .unwrap();
+
+    let manifest_path = temp_file("dataset-ai.covm");
+    let member_path = temp_file("events.cove");
+    let sidecar_path = temp_file("dataset.covev");
+    fs::write(&manifest_path, manifest_bytes).unwrap();
+    fs::write(&member_path, member).unwrap();
+    fs::write(&sidecar_path, sidecar).unwrap();
+
+    let output = run_cove(&[
+        "query",
+        manifest_path.to_str().unwrap(),
+        "--dataset",
+        manifest_path.parent().unwrap().to_str().unwrap(),
+        "--format",
+        "json",
+        "# profiles: table, ai\ntable(events).embedding(fileCode: 1)",
+    ]);
+
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value[0]["file_code"], serde_json::json!(1));
+    assert_eq!(
+        value[0]["result_authority"],
+        serde_json::json!("PersistedPayloadDigest")
+    );
+
+    let mut stale_sidecar = fs::read(&sidecar_path).unwrap();
+    stale_sidecar[0] ^= 0xFF;
+    fs::write(&sidecar_path, stale_sidecar).unwrap();
+    let stale = run_cove(&[
+        "query",
+        manifest_path.to_str().unwrap(),
+        "--dataset",
+        manifest_path.parent().unwrap().to_str().unwrap(),
+        "--format",
+        "json",
+        "# profiles: table, ai\ntable(events).embedding(fileCode: 1)",
+    ]);
+    assert!(
+        !stale.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&stale.stdout),
+        String::from_utf8_lossy(&stale.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&stale.stderr).contains("no digest-valid COVM AI sidecar"),
+        "stderr={}",
+        String::from_utf8_lossy(&stale.stderr)
+    );
+}
+
+#[test]
 fn query_external_file_backed_tables_without_cove_artifact() {
     let csv = temp_file("external-people.csv");
     fs::write(&csv, "id,score,active\n1,10,true\n2,20,false\n3,30,true\n").unwrap();
@@ -1841,6 +1955,10 @@ fn vec_build_creates_valid_covev_sidecar() {
         "--file-code",
         "2",
         "--deterministic",
+        "--index",
+        "hnsw",
+        "--metric",
+        "dot",
         "--created-at-us",
         "123",
     ]);
@@ -1878,6 +1996,73 @@ fn vec_build_creates_valid_covev_sidecar() {
             .contains("vector_spaces=1 vector_blocks=1 vector_entries=2 filecode_bindings=2"),
         "stdout={inspect_stdout}"
     );
+    assert!(
+        inspect_stdout.contains("Runtime: payload_exposure_eligible=true"),
+        "stdout={inspect_stdout}"
+    );
+
+    let quantized_path = temp_file("vectors-int8.covev");
+    let integrity_report_path = temp_file("vectors-int8.integrity.json");
+    let quantized_build = run_cove(&[
+        "vec",
+        "build",
+        "--out",
+        quantized_path.to_str().unwrap(),
+        "--dimension",
+        "3",
+        "--file-code",
+        "1",
+        "--file-code",
+        "2",
+        "--deterministic",
+        "--index",
+        "ivf-flat",
+        "--metric",
+        "l2",
+        "--quantization",
+        "int8",
+        "--seed",
+        "99",
+        "--ef",
+        "32",
+        "--shard-count",
+        "2",
+        "--integrity-report",
+        integrity_report_path.to_str().unwrap(),
+    ]);
+    let quantized_stdout = String::from_utf8_lossy(&quantized_build.stdout);
+    assert!(
+        quantized_build.status.success(),
+        "stdout={quantized_stdout}\nstderr={}",
+        String::from_utf8_lossy(&quantized_build.stderr)
+    );
+    assert!(
+        quantized_stdout.contains("index=ivf-flat, metric=l2, quantization=int8"),
+        "stdout={quantized_stdout}"
+    );
+    let quantized_validate = run_cove(&["validate", quantized_path.to_str().unwrap()]);
+    assert!(
+        quantized_validate.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&quantized_validate.stderr)
+    );
+    let integrity_report: serde_json::Value =
+        serde_json::from_slice(&fs::read(&integrity_report_path).unwrap()).unwrap();
+    assert_eq!(integrity_report["build"]["metric"], serde_json::json!("l2"));
+    assert_eq!(
+        integrity_report["build"]["quantization"],
+        serde_json::json!("int8")
+    );
+    assert_eq!(
+        integrity_report["vector_spaces"][0]["element_type"],
+        serde_json::json!(3)
+    );
+    assert!(
+        integrity_report["payload_bytes"]
+            .as_u64()
+            .is_some_and(|bytes| bytes > 0),
+        "{integrity_report}"
+    );
 
     let embedding = run_cove(&[
         "query",
@@ -1900,6 +2085,51 @@ fn vec_build_creates_valid_covev_sidecar() {
     assert_eq!(embedding_json[0]["file_code"], serde_json::json!(1));
     assert!(embedding_json[0]["embedding"].is_array());
 
+    let embedding_by_ref = run_cove(&[
+        "query",
+        "--engine",
+        "physical",
+        "--format",
+        "json",
+        "--cove-ai",
+        path.to_str().unwrap(),
+        cove_path.to_str().unwrap(),
+        "# profiles: table, ai\ntable(events).embedding(vectorRef: 1)",
+    ]);
+    let embedding_by_ref_stdout = String::from_utf8_lossy(&embedding_by_ref.stdout);
+    assert!(
+        embedding_by_ref.status.success(),
+        "stdout={embedding_by_ref_stdout}\nstderr={}",
+        String::from_utf8_lossy(&embedding_by_ref.stderr)
+    );
+    let embedding_by_ref_json: serde_json::Value =
+        serde_json::from_str(&embedding_by_ref_stdout).unwrap();
+    assert_eq!(
+        embedding_by_ref_json[0]["target_kind"],
+        serde_json::json!("vector_ref")
+    );
+
+    let auto_sidecar_path = cove_path.with_extension("covev");
+    fs::copy(&path, &auto_sidecar_path).unwrap();
+    let auto_embedding = run_cove(&[
+        "query",
+        "--engine",
+        "physical",
+        "--format",
+        "json",
+        cove_path.to_str().unwrap(),
+        "# profiles: table, ai\ntable(events).embedding(fileCode: 1)",
+    ]);
+    let auto_embedding_stdout = String::from_utf8_lossy(&auto_embedding.stdout);
+    assert!(
+        auto_embedding.status.success(),
+        "stdout={auto_embedding_stdout}\nstderr={}",
+        String::from_utf8_lossy(&auto_embedding.stderr)
+    );
+    let auto_embedding_json: serde_json::Value =
+        serde_json::from_str(&auto_embedding_stdout).unwrap();
+    assert_eq!(auto_embedding_json[0]["file_code"], serde_json::json!(1));
+
     let similar = run_cove(&[
         "query",
         "--engine",
@@ -1920,6 +2150,38 @@ fn vec_build_creates_valid_covev_sidecar() {
     let similar_json: serde_json::Value = serde_json::from_str(&similar_stdout).unwrap();
     assert_eq!(similar_json[0]["query_file_code"], serde_json::json!(1));
     assert_eq!(similar_json[0]["rank"], serde_json::json!(1));
+
+    let similar_hnsw = run_cove(&[
+        "query",
+        "--engine",
+        "physical",
+        "--format",
+        "json",
+        "--cove-ai",
+        path.to_str().unwrap(),
+        cove_path.to_str().unwrap(),
+        "# profiles: table, ai\ntable(events).similar(fileCode: 1, k: 2, target: \"file_code\", index: \"hnsw\")",
+    ]);
+    let similar_hnsw_stdout = String::from_utf8_lossy(&similar_hnsw.stdout);
+    assert!(
+        similar_hnsw.status.success(),
+        "stdout={similar_hnsw_stdout}\nstderr={}",
+        String::from_utf8_lossy(&similar_hnsw.stderr)
+    );
+    let similar_hnsw_json: serde_json::Value = serde_json::from_str(&similar_hnsw_stdout).unwrap();
+    assert_eq!(
+        similar_hnsw_json[0]["requested_index"],
+        serde_json::json!("hnsw")
+    );
+    assert_eq!(
+        similar_hnsw_json[0]["fallback_used"],
+        serde_json::json!(false)
+    );
+    assert_eq!(similar_hnsw_json[0]["exact"], serde_json::json!(false));
+    assert_eq!(
+        similar_hnsw_json[0]["result_authority"],
+        serde_json::json!("ApproximateInternalAnn")
+    );
 
     for method in ["hybrid", "rerank"] {
         let output = run_cove(&[
@@ -1946,6 +2208,92 @@ fn vec_build_creates_valid_covev_sidecar() {
             serde_json::json!("RuntimeAdvisory")
         );
     }
+
+    let export = run_cove(&[
+        "ai",
+        "export",
+        "vectors",
+        path.to_str().unwrap(),
+        "--format",
+        "json",
+    ]);
+    let export_stdout = String::from_utf8_lossy(&export.stdout);
+    assert!(
+        export.status.success(),
+        "stdout={export_stdout}\nstderr={}",
+        String::from_utf8_lossy(&export.stderr)
+    );
+    let export_json: serde_json::Value = serde_json::from_str(&export_stdout).unwrap();
+    assert_eq!(export_json["kind"], serde_json::json!("vectors"));
+    assert!(export_json["records"].as_array().unwrap().len() >= 2);
+
+    let arrow_path = temp_file("vectors-ai-export.arrow");
+    let export_arrow = run_cove(&[
+        "ai",
+        "export",
+        "vectors",
+        path.to_str().unwrap(),
+        "--format",
+        "arrow",
+        "--out",
+        arrow_path.to_str().unwrap(),
+    ]);
+    assert!(
+        export_arrow.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&export_arrow.stdout),
+        String::from_utf8_lossy(&export_arrow.stderr)
+    );
+    assert!(
+        fs::read(&arrow_path).unwrap().starts_with(b"ARROW1"),
+        "AI Arrow export did not write an Arrow IPC file"
+    );
+
+    let parquet_path = temp_file("vectors-ai-export.parquet");
+    let export_parquet = run_cove(&[
+        "ai",
+        "export",
+        "vectors",
+        path.to_str().unwrap(),
+        "--format",
+        "parquet",
+        "--out",
+        parquet_path.to_str().unwrap(),
+    ]);
+    assert!(
+        export_parquet.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&export_parquet.stdout),
+        String::from_utf8_lossy(&export_parquet.stderr)
+    );
+    assert!(
+        fs::read(&parquet_path).unwrap().starts_with(b"PAR1"),
+        "AI Parquet export did not write a Parquet file"
+    );
+
+    let webdataset_path = temp_file("vectors-ai-export.tar");
+    let export_webdataset = run_cove(&[
+        "ai",
+        "export",
+        "vectors",
+        path.to_str().unwrap(),
+        "--format",
+        "webdataset",
+        "--out",
+        webdataset_path.to_str().unwrap(),
+    ]);
+    assert!(
+        export_webdataset.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&export_webdataset.stdout),
+        String::from_utf8_lossy(&export_webdataset.stderr)
+    );
+    let webdataset_bytes = fs::read(&webdataset_path).unwrap();
+    assert_eq!(
+        &webdataset_bytes[257..263],
+        b"ustar\0",
+        "AI WebDataset export did not write a ustar shard"
+    );
 }
 
 #[test]
@@ -2018,6 +2366,110 @@ fn query_coveql_ai_descriptor_methods_smoke() {
             "query={query} expected_kind={expected_kind} stdout={stdout}"
         );
     }
+
+    let train_export = run_cove(&[
+        "train",
+        "export",
+        sidecar_path.to_str().unwrap(),
+        "--include-payloads",
+        "--format",
+        "jsonl",
+    ]);
+    let train_export_stdout = String::from_utf8_lossy(&train_export.stdout);
+    assert!(
+        train_export.status.success(),
+        "stdout={train_export_stdout}\nstderr={}",
+        String::from_utf8_lossy(&train_export.stderr)
+    );
+    assert!(
+        train_export_stdout.contains("\"sample_id\":1"),
+        "stdout={train_export_stdout}"
+    );
+
+    let train_arrow_path = temp_file("training-export.arrow");
+    let train_export_arrow = run_cove(&[
+        "train",
+        "export",
+        sidecar_path.to_str().unwrap(),
+        "--format",
+        "arrow",
+        "--out",
+        train_arrow_path.to_str().unwrap(),
+    ]);
+    assert!(
+        train_export_arrow.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&train_export_arrow.stdout),
+        String::from_utf8_lossy(&train_export_arrow.stderr)
+    );
+    assert!(
+        fs::read(&train_arrow_path).unwrap().starts_with(b"ARROW1"),
+        "COVE-TRAIN Arrow export did not write an Arrow IPC file"
+    );
+
+    let train_parquet_path = temp_file("training-export.parquet");
+    let train_export_parquet = run_cove(&[
+        "train",
+        "export",
+        sidecar_path.to_str().unwrap(),
+        "--format",
+        "parquet",
+        "--out",
+        train_parquet_path.to_str().unwrap(),
+    ]);
+    assert!(
+        train_export_parquet.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&train_export_parquet.stdout),
+        String::from_utf8_lossy(&train_export_parquet.stderr)
+    );
+    assert!(
+        fs::read(&train_parquet_path).unwrap().starts_with(b"PAR1"),
+        "COVE-TRAIN Parquet export did not write a Parquet file"
+    );
+
+    let train_webdataset_path = temp_file("training-export.tar");
+    let train_export_webdataset = run_cove(&[
+        "train",
+        "export",
+        sidecar_path.to_str().unwrap(),
+        "--format",
+        "webdataset",
+        "--out",
+        train_webdataset_path.to_str().unwrap(),
+    ]);
+    assert!(
+        train_export_webdataset.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&train_export_webdataset.stdout),
+        String::from_utf8_lossy(&train_export_webdataset.stderr)
+    );
+    let train_webdataset_bytes = fs::read(&train_webdataset_path).unwrap();
+    assert_eq!(
+        &train_webdataset_bytes[257..263],
+        b"ustar\0",
+        "COVE-TRAIN WebDataset export did not write a ustar shard"
+    );
+
+    let ai_export = run_cove(&[
+        "ai",
+        "export",
+        "tokens",
+        sidecar_path.to_str().unwrap(),
+        "--include-payloads",
+        "--format",
+        "jsonl",
+    ]);
+    let ai_export_stdout = String::from_utf8_lossy(&ai_export.stdout);
+    assert!(
+        ai_export.status.success(),
+        "stdout={ai_export_stdout}\nstderr={}",
+        String::from_utf8_lossy(&ai_export.stderr)
+    );
+    assert!(
+        ai_export_stdout.contains("\"record_kind\":\"token_block\""),
+        "stdout={ai_export_stdout}"
+    );
 }
 
 #[test]

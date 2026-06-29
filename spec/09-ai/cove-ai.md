@@ -89,6 +89,7 @@ The same bit numbers are artifact-local AI feature bits inside `CVA2` and
 | 12 | `AI_FEATURE_EXTERNAL_ASSET_DIGEST_REQUIRED` | COVE-MMSEQ / COVE-TRAIN |
 | 13 | `AI_FEATURE_PRIVACY_SUMMARY` | COVE-AI Shared |
 | 14 | `AI_FEATURE_VECTOR_SPACE_COMPATIBILITY` | COVE-VEC |
+| 15 | `AI_FEATURE_MODEL_INPUT_IDENTITY` | COVE-VEC |
 
 Unknown optional AI bits are ignored for ordinary reads. Unknown required AI
 bits reject only the scope where they are required. Writers SHOULD bind
@@ -287,7 +288,10 @@ Artifact rules:
 - `.cove`, COVM, or catalog references to a COVE-AI companion artifact SHOULD
   use `AI_COMPANION_ARTIFACT_REF` or an equivalent COVM extension carrying
   `AiCompanionArtifactRefV1`; the sidecar reference MUST be digest-bound before
-  sidecar use is trusted.
+  sidecar use is trusted. The reference implementation's COVM `CAI1`
+  extension binds sidecar URI, source member file id, sidecar byte length, and
+  sidecar digest; ordinary non-AI COVM readers ignore the extension, while
+  selected AI operations reject stale referenced sidecars.
 - `source_binding_ref` binds every derived section to the source file,
   snapshot, dictionary, schema, mapping, visibility, and redaction context
   needed to check freshness.
@@ -657,12 +661,15 @@ struct AiSectionFeatureBindingV1 {
 
 Binary `AI_*` descriptor sections are arrays of length-delimited records using
 `AiRecordHeaderV1`. `record_len` includes the header and payload bytes.
-`record_version` MUST be 1 for V1 records. Records MUST be wholly contained in
-the section payload and MUST NOT overlap. `local_id` is unique within
+`record_version` MUST be 1 for V1 records. COVE-VEC vector-binding records
+`AI_VECTOR_BINDING` kinds 1 through 4 MAY use `record_version = 2` only for the
+append-only model-input identity layouts defined by COVE-VEC. Records MUST be
+wholly contained in the section payload and MUST NOT overlap. `local_id` is unique within
 `(section_kind, record_kind)` unless a section-specific rule uses a wider
 duplicate-ID scope. Unknown optional record kinds MAY be skipped after bounds
 and CRC validation. Unknown required record kinds reject only the selected
 section, profile, or operation whose requiredness scope intersects use.
+Known record kinds with unsupported `record_version` values MUST reject.
 
 `AI_PAYLOAD_BYTES` has no standard record-kind assignment. It is an opaque byte
 carrier addressed only through `AiPayloadRefEntryV1` records and descriptors
@@ -740,10 +747,10 @@ Minimum standard record-kind assignments are:
 | `AI_TOKEN_SEQUENCE_PACK` | 1 | `TokenSequencePackV1` |
 | `AI_VECTOR_SPACE` | 1 | `VectorSpaceDescriptorV1` |
 | `AI_VECTOR_SPACE` | 2 | `VectorSpaceCompatibilityDescriptorV1` |
-| `AI_VECTOR_BINDING` | 1 | `FileCodeVectorBindingV1` |
-| `AI_VECTOR_BINDING` | 2 | `ChunkVectorBindingV1` |
-| `AI_VECTOR_BINDING` | 3 | `ObjectStateVectorBindingV1` |
-| `AI_VECTOR_BINDING` | 4 | `TrainingSampleVectorBindingV1` |
+| `AI_VECTOR_BINDING` | 1 | `FileCodeVectorBindingV1` or `FileCodeVectorBindingV2` |
+| `AI_VECTOR_BINDING` | 2 | `ChunkVectorBindingV1` or `ChunkVectorBindingV2` |
+| `AI_VECTOR_BINDING` | 3 | `ObjectStateVectorBindingV1` or `ObjectStateVectorBindingV2` |
+| `AI_VECTOR_BINDING` | 4 | `TrainingSampleVectorBindingV1` or `TrainingSampleVectorBindingV2` |
 | `AI_VECTOR_PAYLOAD_BLOCK` | 1 | `VectorPayloadBlockHeaderV1` |
 | `AI_VECTOR_DIRECTORY` | 1 | `VectorEntryV1` |
 | `AI_VECTOR_COMPOSITION` | 1 | `VectorCompositionProfileV1` |
@@ -811,6 +818,24 @@ forbidden value MUST NOT be exposed through chunk text, token IDs, vector
 payloads, nearest-neighbor metadata, dedup metadata, multimodal elements, or
 training exports unless a trusted policy explicitly allows it.
 
+### 83.9.1 Export Interoperability
+
+COVE-AI export adapters MAY emit JSON, JSONL, HF-style JSONL, Arrow IPC,
+Parquet, WebDataset-like shards, DLPack views, or other model/runtime-facing
+artifacts. These exports are interoperability surfaces, not COVE truth
+authority. Every payload-aware export MUST read bytes through the shared
+COVE-AI payload lease path and MUST preserve withheld-policy diagnostics as
+records or report metadata.
+
+Arrow IPC and Parquet exports MUST carry stable record identity, record kind,
+payload-access summary, and enough serialized record metadata to audit each
+row back to the validated `.coveai` or `.covev` sidecar. WebDataset exports
+additionally MUST validate shard lifetime and policy scope. DLPack-style APIs
+MUST validate tensor lifetime, dtype, shape, stride, alignment, dense
+uncompressed layout, and policy scope before exposing bytes or zero-copy views;
+CLIs MAY defer direct DLPack file emission until they can preserve those
+lifetime guarantees.
+
 ### 83.10 Conformance and Benchmarks
 
 COVE-AI conformance tiers are defined in
@@ -832,3 +857,10 @@ multimodal assembly latency, RAG retrieval latency, snapshot verification cost,
 tensor zero-copy/materialization rates, storage overhead, stale sidecar
 rejection, redaction leakage checks, split reproducibility, and generator
 filtering correctness.
+
+The provider-free reference benchmark harness MUST include at least one
+deterministic COVE-AI vector sidecar case that reports vector build latency,
+sidecar parse latency, exact vector-search latency, internal ANN candidate
+search or exact-fallback latency, recall versus exact scan when an approximate
+implementation is enabled, fallback rate, filtered top-k completeness, payload
+bytes read, and policy-withheld counts.

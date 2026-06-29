@@ -21,14 +21,16 @@ use cove_core::{
         coveai::{
             write_coveai_descriptor_bundle, write_covev_filecode_vectors, AiAssetRefV1,
             AiDescriptorTablesV1, AiDigestEntryV1, AiPayloadEncodingV1, AiPayloadRefEntryV1,
-            AiPrivacySummaryEntryV1, AiRequirednessScopeV1, AiStorageKindV1, ChunkProfileV1,
-            CoveAiDescriptorBundleBuild, CoveAiWritableSection, CoveVecFileCodeVectorBuild,
-            DatasetSplitV1, DedupGroupV1, DeviceTransferHintV1, GenerationDecodingProfileV1,
-            GeneratorProvenanceV1, HumanReviewEntryV1, ModelActorDescriptorV1,
-            MultimodalSequenceElementV1, MultimodalSequencePackV1, PreferencePairEntryV1,
+            AiPrivacySummaryEntryV1, AiRequirednessScopeV1, AiStorageKindV1, AssetVectorBindingV1,
+            AssociationStateVectorBindingV1, ChunkProfileV1, CoveAiDescriptorBundleBuild,
+            CoveAiWritableSection, CoveVecFileCodeVectorBuild, DatasetSplitV1, DedupGroupV1,
+            DeviceTransferHintV1, GenerationDecodingProfileV1, GeneratorProvenanceV1,
+            HumanReviewEntryV1, ModelActorDescriptorV1, MultimodalSequenceElementV1,
+            MultimodalSequencePackV1, MultimodalSequenceVectorBindingV1, PreferencePairEntryV1,
             TensorLayoutDescriptorV1, TextChunkEntryV1, TokenBlockHeaderV1, TokenSequencePackV1,
             TokenizedSpanV1, TokenizerProfileV1, TrainingEpochPlanV1, TrainingLabelEntryV1,
-            TrainingProfileV1, TrainingSampleEntryV1,
+            TrainingProfileV1, TrainingSampleEntryV1, VectorEntryV1, VectorPayloadBlockHeaderV1,
+            VectorSpaceDescriptorV1,
         },
         covm::{CovmFile, CovmFileEntryV1, CovmHeaderV1, CovmPostscriptV1},
     },
@@ -56,7 +58,8 @@ use cove_core::{
         MissingValuePolicy, NullCodePolicy, ReverseLookupPolicy, StaleMappingPolicy,
     },
     profile::cove_o::{
-        read_object_surface_from_bytes, read_retained_object_temporal_segments, CoveRecordRefV1,
+        read_object_surface_from_bytes, read_retained_object_temporal_segments,
+        CoveObjectPropertyValue, CoveObjectState, CoveObjectTombstoneStatus, CoveRecordRefV1,
         ObjectTypeCatalog, ObjectTypeEntryV1, PropertyEntryV1, RecordKind, TemporalRowEntryV1,
         TemporalSegmentHeaderV1, TemporalSegmentIndex, TemporalSegmentIndexEntryV1,
         OBJECT_TYPE_FLAG_ASSOCIATION_OBJECT, OBJECT_TYPE_FLAG_ENTITY_OBJECT,
@@ -1709,6 +1712,257 @@ fn coveql_ai_similar_executes_exact_flat_filecode_sidecar() {
 }
 
 #[test]
+fn coveql_ai_similar_executes_asset_and_multimodal_vector_targets() {
+    let mut vector_payload = Vec::new();
+    for value in [1.0f32, 0.0, 0.0, 0.0, 1.0, 0.0] {
+        vector_payload.extend_from_slice(&value.to_le_bytes());
+    }
+    let mut tables = AiDescriptorTablesV1::default();
+    tables.payload_refs.push(AiPayloadRefEntryV1 {
+        payload_ref: 1,
+        storage_kind: AiStorageKindV1::SectionDecodedRelative as u8,
+        media_type_ref: 0,
+        section_id: 10,
+        uri_ref: 0,
+        payload_offset: 0,
+        section_payload_offset: 0,
+        payload_length: vector_payload.len() as u64,
+        decoded_length: vector_payload.len() as u64,
+        integrity_ref: 0,
+        flags: 0,
+        crc32c: 0,
+    });
+    tables.privacy_summaries.push(AiPrivacySummaryEntryV1 {
+        privacy_summary_ref: 1,
+        source_binding_ref: 0,
+        sensitivity_mask: 0,
+        sensitivity_bits_ref: 0,
+        policy_ref: 0,
+        visibility_scope_ref: 0,
+        redaction_scope_ref: 0,
+        retention_state: 0,
+        disclosure_state: 0,
+        flags: 0,
+        crc32c: 0,
+    });
+    tables.vector_spaces.push(VectorSpaceDescriptorV1 {
+        vector_space_id: 1,
+        vector_space_name_ref: 0,
+        vector_space_fingerprint_ref: 0,
+        embedding_namespace_ref: 0,
+        embedding_model_ref: 0,
+        embedding_model_version_ref: 0,
+        embedding_model_digest_ref: 0,
+        embedding_pipeline_ref: 0,
+        tokenizer_profile_ref: 0,
+        chunk_profile_ref: 0,
+        dimension_count: 3,
+        element_type: 0,
+        metric: 1,
+        normalization_policy: 0,
+        quantization_policy: 0,
+        deterministic: 1,
+        approximate: 0,
+        reproducibility_class: 1,
+        reserved: 0,
+        flags: 0,
+        checksum: 0,
+    });
+    tables
+        .vector_payload_blocks
+        .push(VectorPayloadBlockHeaderV1 {
+            block_id: 1,
+            vector_space_id: 1,
+            vector_count: 2,
+            dimension_count: 3,
+            element_type: 0,
+            compression_codec: 0,
+            quantization_kind: 0,
+            layout_kind: 0,
+            tensor_layout_ref: 0,
+            memory_alignment_bytes: 0,
+            payload_stride_ref: 0,
+            device_transfer_hint_ref: 0,
+            payload_ref: 1,
+            payload_offset: 0,
+            payload_length: 0,
+            integrity_ref: 0,
+            checksum: 0,
+        });
+    for vector_ref in 1..=2 {
+        tables.vector_entries.push(VectorEntryV1 {
+            vector_ref,
+            block_id: 1,
+            vector_ordinal: vector_ref - 1,
+            payload_offset: 0,
+            payload_length: 0,
+            integrity_ref: 0,
+            flags: 0,
+            checksum: 0,
+        });
+    }
+    tables.assets.push(AiAssetRefV1 {
+        asset_ref_id: 1,
+        parent_asset_ref: 0,
+        asset_kind: 2,
+        uri_ref: 0,
+        embedded_section_ref: 0,
+        media_type_ref: 0,
+        byte_length: 0,
+        digest_ref: 0,
+        width: 64,
+        height: 64,
+        duration_us: 0,
+        sample_rate_hz: 0,
+        channel_count: 0,
+        decode_profile_ref: 0,
+        preprocessing_profile_ref: 0,
+        transform_profile_ref: 0,
+        transform_digest_ref: 0,
+        tensor_layout_ref: 0,
+        license_ref: 0,
+        policy_ref: 0,
+        flags: 0,
+        checksum: 0,
+    });
+    tables.asset_vector_bindings.push(AssetVectorBindingV1 {
+        binding_id: 1,
+        vector_space_id: 1,
+        asset_ref: 1,
+        transform_ref: 0,
+        asset_digest_ref: 0,
+        vector_ref: 1,
+        model_input_digest_ref: 0,
+        flags: 0,
+        checksum: 0,
+    });
+    tables
+        .multimodal_sequence_packs
+        .push(MultimodalSequencePackV1 {
+            sequence_pack_id: 1,
+            training_profile_id: 0,
+            tokenizer_profile_id: 0,
+            sequence_profile_ref: 0,
+            element_count: 0,
+            first_element_ref: 0,
+            split_ref: 0,
+            sample_weight_ppm: 1_000_000,
+            loss_mask_ref: 0,
+            attention_mask_ref: 0,
+            position_map_ref: 0,
+            label_ref: 0,
+            source_snapshot_ref: 0,
+            evidence_ref: 0,
+            generator_provenance_ref: 0,
+            flags: 0,
+            checksum: 0,
+        });
+    tables
+        .multimodal_sequence_vector_bindings
+        .push(MultimodalSequenceVectorBindingV1 {
+            binding_id: 2,
+            vector_space_id: 1,
+            sequence_pack_id: 1,
+            sequence_profile_ref: 0,
+            source_snapshot_ref: 0,
+            vector_ref: 2,
+            model_input_digest_ref: 0,
+            flags: 0,
+            checksum: 0,
+        });
+    tables
+        .association_state_vector_bindings
+        .push(AssociationStateVectorBindingV1 {
+            binding_id: 3,
+            vector_space_id: 1,
+            composition_profile_ref: 0,
+            file_ref: 0,
+            association_type_id: 7,
+            association_key_ref: 0,
+            branch_ref: 0,
+            temporal_kind: 0,
+            csn: 0,
+            timestamp_us: 0,
+            property_dependency_fingerprint_ref: 0,
+            vector_ref: 1,
+            model_input_digest_ref: 0,
+            flags: 0,
+            checksum: 0,
+        });
+    let sidecar = write_coveai_descriptor_bundle(&CoveAiDescriptorBundleBuild {
+        artifact_id: [47u8; 16],
+        created_at_us: 1_004,
+        payload_sections: vec![CoveAiWritableSection {
+            section_id: 10,
+            section_kind: SectionKind::AiPayloadBytes as u32,
+            profile_kind: PrimaryProfile::CoveVec as u8,
+            payload_encoding: AiPayloadEncodingV1::OpaqueBytes,
+            requiredness_scope: AiRequirednessScopeV1::AdvisoryOnly,
+            source_binding_ref: 0,
+            required_ai_features: 0,
+            optional_ai_features: 0,
+            feature_binding_ref: 0,
+            payload: vector_payload,
+        }],
+        descriptor_tables: tables,
+    })
+    .unwrap();
+
+    for (target, vector_ref, target_kind, ref_column, ref_value) in [
+        ("asset", 1, "asset", "asset_ref", json!(1)),
+        (
+            "multimodal",
+            2,
+            "multimodal_sequence",
+            "multimodal_sequence_pack_id",
+            json!(1),
+        ),
+        (
+            "association",
+            1,
+            "association_state",
+            "association_type_id",
+            json!(7),
+        ),
+    ] {
+        let mut resolve_options = ResolveOptions::default();
+        resolve_options.table_authorities.insert(
+            "people".into(),
+            registered_people_table_authority(
+                coveql::TableSurfaceAuthorityKind::MaterializedTable,
+                coveql::TableExecutionAuthority::MaterializedRows {
+                    rows: people_rows(&[("a", true)]),
+                },
+            ),
+        );
+        let mut physical_options = PhysicalPlanOptions::default();
+        physical_options.sidecars.cove_ai_artifact_bytes = Some(sidecar.clone());
+
+        let executed = parse_resolve_plan_build_physical_and_execute_query(
+            &minimal_object_file(),
+            &format!(
+                "# profiles: table, ai\ntable(people).similar(vectorRef: {vector_ref}, k: 1, target: \"{target}\")"
+            ),
+            ParseOptions::default(),
+            resolve_options,
+            PlanOptions::default(),
+            physical_options,
+            ExecutionOptions::default(),
+            KernelExecutionOptions::default(),
+            validation_options(),
+        )
+        .unwrap();
+        let CoveQlExecutionResult::JsonRows(rows) = executed.executed.result else {
+            panic!("expected JSON rows from CoveQL-AI {target} search");
+        };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["target_kind"], json!(target_kind));
+        assert_eq!(rows[0][ref_column], ref_value);
+        assert_eq!(rows[0]["exact"], json!(true));
+    }
+}
+
+#[test]
 fn coveql_ai_hybrid_and_rerank_execute_advisory_vector_scan() {
     let mut vector_payload = Vec::new();
     for value in [1.0f32, 0.0, 0.0, 0.8, 0.2, 0.0] {
@@ -1877,6 +2131,54 @@ fn coveql_ai_chunks_and_context_execute_descriptor_metadata() {
 }
 
 #[test]
+fn coveql_ai_chunks_and_context_reconstruct_text_from_validated_source() {
+    let coveai = coveql_ai_source_bound_chunk_sidecar();
+    let source = cove_o_chunk_source_file();
+
+    let chunks = execute_ai_descriptor_query_on_source(
+        &source,
+        coveai.clone(),
+        "# profiles: table, ai\ntable(people).chunks(includePayloads: true)",
+    );
+    let CoveQlExecutionResult::JsonRows(rows) = chunks.executed.result else {
+        panic!("expected JSON rows from CoveQL-AI chunks");
+    };
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["record_kind"], json!("text_chunk"));
+    assert_eq!(rows[0]["text"], json!("chunk text"));
+    assert_eq!(rows[0]["text_withheld"], json!(false));
+    assert_eq!(
+        rows[0]["payload_access"],
+        json!("validated_source_value_reconstruction")
+    );
+    assert_eq!(
+        rows[0]["source_value_hash_status"],
+        json!("verified_sha256")
+    );
+    assert_eq!(rows[0]["chunk_text_hash_status"], json!("verified_sha256"));
+    assert_eq!(
+        rows[0]["result_authority"],
+        json!("ValidatedAiSourceValueReconstruction")
+    );
+
+    let context = execute_ai_descriptor_query_on_source(
+        &source,
+        coveai,
+        "# profiles: table, ai\ntable(people).context(includePayloads: true)",
+    );
+    let CoveQlExecutionResult::JsonRows(rows) = context.executed.result else {
+        panic!("expected JSON rows from CoveQL-AI context");
+    };
+    assert_eq!(rows[0]["record_kind"], json!("rag_context_chunk"));
+    assert_eq!(rows[0]["prompt_context"], json!("chunk text"));
+    assert_eq!(rows[0]["redaction_report"]["text_withheld"], json!(false));
+    assert_eq!(
+        rows[0]["redaction_report"]["neighbor_chunks_withheld"],
+        json!(true)
+    );
+}
+
+#[test]
 fn coveql_ai_token_training_pack_and_multimodal_execute_descriptor_metadata() {
     let coveai = coveql_ai_descriptor_sidecar();
 
@@ -1894,9 +2196,10 @@ fn coveql_ai_token_training_pack_and_multimodal_execute_descriptor_metadata() {
     assert!(record_kinds.contains("token_block"));
     assert!(record_kinds.contains("tokenized_span"));
     assert!(record_kinds.contains("token_sequence_pack"));
-    assert!(rows
-        .iter()
-        .all(|row| row["payload_withheld"] == json!(true)));
+    assert!(rows.iter().any(|row| {
+        row["record_kind"] == json!("token_block")
+            && row["token_payload"]["payload_access"] != Value::Null
+    }));
     assert!(tokens
         .executed
         .diagnostics
@@ -1913,7 +2216,8 @@ fn coveql_ai_token_training_pack_and_multimodal_execute_descriptor_metadata() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["record_kind"], json!("training_sample"));
     assert_eq!(rows[0]["sample_id"], json!(1));
-    assert_eq!(rows[0]["policy_withheld"], json!(true));
+    assert_eq!(rows[0]["policy_withheld"], json!(false));
+    assert!(rows[0]["input"]["payload_access"] != Value::Null);
     assert!(samples
         .executed
         .diagnostics
@@ -1985,7 +2289,48 @@ fn coveql_ai_token_training_pack_and_multimodal_execute_descriptor_metadata() {
         .any(|diagnostic| diagnostic.code == "W_AI_GENERATOR_AUDIT_METADATA_EXECUTED"));
 }
 
+#[test]
+fn coveql_ai_generator_audit_filters_descriptor_rows() {
+    let matched = execute_ai_descriptor_query(
+        coveql_ai_descriptor_sidecar(),
+        "# profiles: table, ai\ntable(people).generatorAudit(reproducibilityClass: 2, humanReviewStatus: \"reviewed\")",
+    );
+    let CoveQlExecutionResult::JsonRows(rows) = matched.executed.result else {
+        panic!("expected JSON rows from CoveQL-AI generator audit");
+    };
+    assert!(rows
+        .iter()
+        .any(|row| row["record_kind"] == json!("generator_provenance")));
+    assert!(rows
+        .iter()
+        .any(|row| row["record_kind"] == json!("model_actor")));
+    assert!(rows
+        .iter()
+        .any(|row| row["record_kind"] == json!("human_review")));
+    assert!(rows
+        .iter()
+        .all(|row| row["generator_filter_matched"] == json!(true)));
+
+    let unmatched = execute_ai_descriptor_query(
+        coveql_ai_descriptor_sidecar(),
+        "# profiles: table, ai\ntable(people).generatorAudit(reproducibilityClass: \"externalAuditOnly\")",
+    );
+    let CoveQlExecutionResult::JsonRows(rows) = unmatched.executed.result else {
+        panic!("expected JSON rows from CoveQL-AI generator audit");
+    };
+    assert!(rows.is_empty());
+}
+
 fn execute_ai_descriptor_query(coveai: Vec<u8>, query: &str) -> KernelExecutedQuery {
+    let source = minimal_object_file();
+    execute_ai_descriptor_query_on_source(&source, coveai, query)
+}
+
+fn execute_ai_descriptor_query_on_source(
+    source: &[u8],
+    coveai: Vec<u8>,
+    query: &str,
+) -> KernelExecutedQuery {
     let mut resolve_options = ResolveOptions::default();
     resolve_options.table_authorities.insert(
         "people".into(),
@@ -2000,7 +2345,7 @@ fn execute_ai_descriptor_query(coveai: Vec<u8>, query: &str) -> KernelExecutedQu
     physical_options.sidecars.cove_ai_artifact_bytes = Some(coveai);
 
     parse_resolve_plan_build_physical_and_execute_query(
-        &minimal_object_file(),
+        source,
         query,
         ParseOptions::default(),
         resolve_options,
@@ -2010,6 +2355,188 @@ fn execute_ai_descriptor_query(coveai: Vec<u8>, query: &str) -> KernelExecutedQu
         KernelExecutionOptions::default(),
         validation_options(),
     )
+    .unwrap()
+}
+
+fn cove_o_chunk_source_file() -> Vec<u8> {
+    let object_type = ObjectTypeEntryV1 {
+        object_type_id: 1,
+        type_name: "Document".into(),
+        flags: OBJECT_TYPE_FLAG_ENTITY_OBJECT,
+        properties: vec![PropertyEntryV1 {
+            property_id: 2,
+            property_name: "body".into(),
+            logical_type: CoveLogicalType::Utf8,
+            physical_kind: CovePhysicalKind::VarBytes,
+            nullable: false,
+            collation_id: 0,
+            flags: 0,
+        }],
+    };
+    let state = CoveObjectState {
+        object_type_id: 1,
+        object_type_name: "Document".into(),
+        object_type_flags: OBJECT_TYPE_FLAG_ENTITY_OBJECT,
+        branch_key: 0,
+        goid: [0x41; 16],
+        latest_record_id: [0x42; 16],
+        latest_segment_id: 0,
+        latest_row_index: 0,
+        timestamp_us: 1_700_000_000_000_020,
+        csn: 1,
+        record_kind: RecordKind::Snapshot,
+        tombstone_status: CoveObjectTombstoneStatus::Live,
+        properties: vec![CoveObjectPropertyValue {
+            property_id: 2,
+            property_name: "body".into(),
+            logical_type: CoveLogicalType::Utf8,
+            physical_kind: CovePhysicalKind::VarBytes,
+            flags: 0,
+            value: json!("zero chunk text here"),
+            redacted: false,
+        }],
+        association: None,
+    };
+    cove_map::compact_cove_o_from_object_states(vec![object_type], &[state]).unwrap()
+}
+
+fn coveql_ai_source_bound_chunk_sidecar() -> Vec<u8> {
+    let source_text = b"zero chunk text here";
+    let chunk_text = b"chunk text";
+    let source_digest = compute_digest(DigestAlgorithm::Sha256, source_text).unwrap();
+    let chunk_digest = compute_digest(DigestAlgorithm::Sha256, chunk_text).unwrap();
+    let mut digest_payload = Vec::new();
+    digest_payload.extend_from_slice(&source_digest);
+    digest_payload.extend_from_slice(&chunk_digest);
+
+    let mut tables = AiDescriptorTablesV1::default();
+    tables.payload_refs.push(AiPayloadRefEntryV1 {
+        payload_ref: 1,
+        storage_kind: AiStorageKindV1::SectionDecodedRelative as u8,
+        media_type_ref: 0,
+        section_id: 10,
+        uri_ref: 0,
+        payload_offset: 0,
+        section_payload_offset: 0,
+        payload_length: 32,
+        decoded_length: 32,
+        integrity_ref: 0,
+        flags: 0,
+        crc32c: 0,
+    });
+    tables.payload_refs.push(AiPayloadRefEntryV1 {
+        payload_ref: 2,
+        storage_kind: AiStorageKindV1::SectionDecodedRelative as u8,
+        media_type_ref: 0,
+        section_id: 10,
+        uri_ref: 0,
+        payload_offset: 0,
+        section_payload_offset: 32,
+        payload_length: 32,
+        decoded_length: 32,
+        integrity_ref: 0,
+        flags: 0,
+        crc32c: 0,
+    });
+    tables.digests.push(AiDigestEntryV1 {
+        digest_ref: 1,
+        digest_algorithm: 1,
+        digest_len: 32,
+        digest_payload_ref: 1,
+        domain_hint: 4,
+        flags: 0,
+        crc32c: 0,
+    });
+    tables.digests.push(AiDigestEntryV1 {
+        digest_ref: 2,
+        digest_algorithm: 1,
+        digest_len: 32,
+        digest_payload_ref: 2,
+        domain_hint: 4,
+        flags: 0,
+        crc32c: 0,
+    });
+    tables.privacy_summaries.push(AiPrivacySummaryEntryV1 {
+        privacy_summary_ref: 1,
+        source_binding_ref: 0,
+        sensitivity_mask: 0,
+        sensitivity_bits_ref: 0,
+        policy_ref: 0,
+        visibility_scope_ref: 0,
+        redaction_scope_ref: 0,
+        retention_state: 0,
+        disclosure_state: 0,
+        flags: 0,
+        crc32c: 0,
+    });
+    tables.chunk_profiles.push(ChunkProfileV1 {
+        chunk_profile_id: 1,
+        profile_name_ref: 0,
+        chunker_namespace_ref: 0,
+        chunker_name_ref: 0,
+        chunker_version_major: 1,
+        chunker_version_minor: 0,
+        tokenizer_profile_ref: 0,
+        boundary_kind: 1,
+        overlap_policy: 0,
+        parent_policy: 0,
+        normalization_policy: 0,
+        target_tokens: 16,
+        min_tokens: 1,
+        max_tokens: 32,
+        overlap_tokens: 0,
+        max_bytes: 128,
+        locale_ref: 0,
+        flags: 0,
+        checksum: 0,
+    });
+    tables.text_chunks.push(TextChunkEntryV1 {
+        chunk_id: 1,
+        source_ref: 0,
+        table_id: 0,
+        column_id: 0,
+        object_type_id: 1,
+        property_id: 2,
+        association_type_id: 0,
+        path_ref: 0,
+        source_row_ref: 0,
+        source_object_ref: 0,
+        source_value_hash_ref: 1,
+        byte_start: 5,
+        byte_length: 10,
+        unicode_scalar_start: 5,
+        unicode_scalar_length: 10,
+        token_start: 0,
+        token_count: 2,
+        parent_chunk_id: 0,
+        first_child_ref: 0,
+        child_count: 0,
+        previous_chunk_id: 0,
+        next_chunk_id: 0,
+        chunk_text_hash_ref: 2,
+        evidence_ref: 0,
+        policy_ref: 0,
+        flags: 0,
+        checksum: 0,
+    });
+
+    write_coveai_descriptor_bundle(&CoveAiDescriptorBundleBuild {
+        artifact_id: [45u8; 16],
+        created_at_us: 1_003,
+        payload_sections: vec![CoveAiWritableSection {
+            section_id: 10,
+            section_kind: SectionKind::AiPayloadBytes as u32,
+            profile_kind: PrimaryProfile::CoveAiShared as u8,
+            payload_encoding: AiPayloadEncodingV1::OpaqueBytes,
+            requiredness_scope: AiRequirednessScopeV1::AdvisoryOnly,
+            source_binding_ref: 0,
+            required_ai_features: 0,
+            optional_ai_features: 0,
+            feature_binding_ref: 0,
+            payload: digest_payload,
+        }],
+        descriptor_tables: tables,
+    })
     .unwrap()
 }
 

@@ -28,6 +28,14 @@ pub use cove_core::writer;
 pub use cove_core::zone_stats;
 pub use cove_core::CoveError;
 
+pub mod ai {
+    //! COVE-AI tensor interoperability helpers.
+
+    pub use cove_core::artifact::coveai::{
+        ai_tensor_zero_copy_view, AiDlpackDType, AiDlpackDevice, AiTensorZeroCopyView,
+    };
+}
+
 pub mod arrow;
 
 pub mod convert;

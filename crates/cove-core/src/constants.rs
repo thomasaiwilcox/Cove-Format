@@ -152,6 +152,7 @@ pub const AI_FEATURE_CANONICAL_FIXED_POINT_VECTOR: u64 = 1 << 11;
 pub const AI_FEATURE_EXTERNAL_ASSET_DIGEST_REQUIRED: u64 = 1 << 12;
 pub const AI_FEATURE_PRIVACY_SUMMARY: u64 = 1 << 13;
 pub const AI_FEATURE_VECTOR_SPACE_COMPATIBILITY: u64 = 1 << 14;
+pub const AI_FEATURE_MODEL_INPUT_IDENTITY: u64 = 1 << 15;
 
 /// Bitmask of all low-word feature bits defined in COVE v2.0 (Section 11).
 ///

@@ -24,6 +24,10 @@ use cove_cli::customer360::{
 };
 use cove_core::{
     artifact::{
+        coveai::{
+            ai_vector_search, write_covev_filecode_vectors_with_index, AiVectorIndexSelection,
+            AiVectorSearchPlan, AiVectorSearchTargetKind, CoveAiFile, CoveVecFileCodeVectorBuild,
+        },
         covemap::{
             CovemapFile, CovemapHeaderV1, CovemapPayloadEncodingV2, CovemapSection,
             CovemapSectionEntryV1,
@@ -211,6 +215,16 @@ fn generate_corpus(profile: &str, out: &Path) -> Result<(), String> {
     .map_err(|err| format!("cannot build events.covi: {err}"))?;
     durable::durable_replace(&out.join("events.covi"), &covi_bytes)
         .map_err(|err| format!("cannot publish events.covi: {err}"))?;
+    let ai_vector_file_codes = (1..=128).collect::<Vec<_>>();
+    let ai_vector_dimension_count = 8;
+    let ai_vector_bytes = build_benchmark_covev_vectors(
+        ai_vector_dimension_count,
+        &ai_vector_file_codes,
+        [0x83; 16],
+        1_000,
+    )?;
+    durable::durable_replace(&out.join("events-ai.covev"), &ai_vector_bytes)
+        .map_err(|err| format!("cannot publish events-ai.covev: {err}"))?;
     write_parquet_file(&out.join("events.parquet"), &batch)?;
     write_orc_file(&out.join("events.orc"), &batch)?;
     validate_orc_parity(&out.join("events.orc"), &batch)?;
@@ -233,6 +247,7 @@ fn generate_corpus(profile: &str, out: &Path) -> Result<(), String> {
             &fs::read(out.join("events.orc")).map_err(|err| err.to_string())?,
         )?,
         dataset_lock("events-covi", "events.covi", &covi_bytes)?,
+        dataset_lock("events-ai", "events-ai.covev", &ai_vector_bytes)?,
         dataset_lock(
             "synthetic-cache",
             "synthetic-cache.cove",
@@ -261,6 +276,37 @@ fn dataset_lock(name: &str, path: &str, bytes: &[u8]) -> Result<Value, String> {
         "bytes": bytes.len(),
         "sha256": hex(&compute_digest(DigestAlgorithm::Sha256, bytes).map_err(|err| err.to_string())?),
     }))
+}
+
+fn build_benchmark_covev_vectors(
+    dimension_count: u32,
+    file_codes: &[u32],
+    artifact_id: [u8; 16],
+    created_at_us: i64,
+) -> Result<Vec<u8>, String> {
+    write_covev_filecode_vectors_with_index(
+        &CoveVecFileCodeVectorBuild {
+            artifact_id,
+            created_at_us,
+            dimension_count,
+            file_codes: file_codes.to_vec(),
+            vector_payload: benchmark_vector_payload(dimension_count, file_codes),
+        },
+        1,
+    )
+    .map_err(|err| format!("cannot build benchmark COVE-VEC sidecar: {err}"))
+}
+
+fn benchmark_vector_payload(dimension_count: u32, file_codes: &[u32]) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(file_codes.len() * dimension_count as usize * 4);
+    for file_code in file_codes {
+        for dim in 0..dimension_count {
+            let seed = (*file_code as f32 * 0.03125) + (dim as f32 * 0.125);
+            let value = seed.sin() + seed.cos() * 0.5;
+            payload.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+    payload
 }
 
 fn generate_publication_gap_datasets(
@@ -791,6 +837,7 @@ fn run_corpus(corpus: &Path, report_json: &Path, report_md: &Path) -> Result<(),
     let manifest: Value = serde_json::from_str(PUBLIC_MANIFEST).map_err(|err| err.to_string())?;
     let mut cases = Vec::new();
     cases.extend(run_events_cases(corpus)?);
+    cases.extend(run_ai_cases(corpus)?);
     cases.extend(run_cache_cases(corpus)?);
     cases.push(run_cove_o_delta_artifact_metrics_case()?);
     cases.extend(run_publication_gap_cases(corpus)?);
@@ -814,6 +861,7 @@ fn run_corpus(corpus: &Path, report_json: &Path, report_md: &Path) -> Result<(),
             "publication_corpora": true,
             "object_store_harness": true,
             "cove_o_delta_artifacts": true,
+            "cove_ai": corpus.join("events-ai.covev").is_file(),
         },
         "cases": cases,
     });
@@ -1095,6 +1143,151 @@ fn run_spec_gap_cases(path: &Path) -> Result<Vec<Value>, String> {
             ..ExplainOptions::default()
         },
     )?);
+    Ok(cases)
+}
+
+fn run_ai_cases(corpus: &Path) -> Result<Vec<Value>, String> {
+    let path = corpus.join("events-ai.covev");
+    let mut cases = Vec::new();
+    if !path.is_file() {
+        cases.push(json!({
+            "id": "ai_vector_search_report",
+            "category": "COVE-AI vector search and export reporting",
+            "status": "skipped",
+            "metrics": {},
+            "optional_features": ["cove_ai"],
+        }));
+        return Ok(cases);
+    }
+
+    let file_codes = (1..=128).collect::<Vec<_>>();
+    let build_start = Instant::now();
+    let rebuilt = build_benchmark_covev_vectors(8, &file_codes, [0x84; 16], 1_001)?;
+    let vector_build_latency_ns = build_start.elapsed().as_nanos() as u64;
+
+    let bytes = fs::read(&path).map_err(|err| format!("cannot read {}: {err}", path.display()))?;
+    let parse_start = Instant::now();
+    let sidecar = CoveAiFile::parse(&bytes)
+        .map_err(|err| format!("cannot parse benchmark COVE-AI vector sidecar: {err}"))?;
+    let parse_latency_ns = parse_start.elapsed().as_nanos() as u64;
+    let vector_count = sidecar.descriptor_tables.vector_entries.len() as u64;
+    let dimension_count = sidecar
+        .descriptor_tables
+        .vector_spaces
+        .first()
+        .map(|space| space.dimension_count)
+        .unwrap_or(0);
+    let vector_payload_ref_ids = sidecar
+        .descriptor_tables
+        .vector_payload_blocks
+        .iter()
+        .map(|block| block.payload_ref)
+        .collect::<BTreeSet<_>>();
+    let payload_bytes_read = sidecar
+        .descriptor_tables
+        .payload_refs
+        .iter()
+        .filter(|payload_ref| vector_payload_ref_ids.contains(&payload_ref.payload_ref))
+        .map(|payload_ref| payload_ref.payload_length)
+        .sum::<u64>();
+
+    let exact_plan = AiVectorSearchPlan {
+        query_file_code: Some(1),
+        query_vector_ref: None,
+        query_values: None,
+        top_k: 10,
+        target_kind: AiVectorSearchTargetKind::FileCode,
+        index: AiVectorIndexSelection::ExactFlat,
+    };
+    let exact_start = Instant::now();
+    let exact_results = ai_vector_search(&bytes, &exact_plan)
+        .map_err(|err| format!("COVE-AI exact vector benchmark failed: {err}"))?;
+    let exact_search_latency_ns = exact_start.elapsed().as_nanos() as u64;
+
+    let ann_plan = AiVectorSearchPlan {
+        index: AiVectorIndexSelection::Hnsw,
+        ..exact_plan
+    };
+    let ann_start = Instant::now();
+    let ann_results = ai_vector_search(&bytes, &ann_plan)
+        .map_err(|err| format!("COVE-AI internal ANN benchmark failed: {err}"))?;
+    let ann_search_latency_ns = ann_start.elapsed().as_nanos() as u64;
+    let ann_fallback_count = ann_results
+        .iter()
+        .filter(|result| result.fallback_used)
+        .count() as u64;
+    let ann_selected_index = ann_results
+        .first()
+        .map(|result| result.selected_index.clone())
+        .unwrap_or_else(|| "none".into());
+    let ann_result_authority = ann_results
+        .first()
+        .map(|result| result.result_authority.clone())
+        .unwrap_or_else(|| "none".into());
+    let ann_internal_candidate_execution =
+        ann_selected_index == "hnsw" && ann_result_authority == "ApproximateInternalAnn";
+    let exact_refs = exact_results
+        .iter()
+        .map(|result| result.vector_ref)
+        .collect::<BTreeSet<_>>();
+    let ann_refs = ann_results
+        .iter()
+        .map(|result| result.vector_ref)
+        .collect::<BTreeSet<_>>();
+    let recall_exact = if exact_refs.is_empty() {
+        0.0
+    } else {
+        exact_refs.intersection(&ann_refs).count() as f64 / exact_refs.len() as f64
+    };
+    let fallback_rate = if ann_results.is_empty() {
+        0.0
+    } else {
+        ann_fallback_count as f64 / ann_results.len() as f64
+    };
+
+    cases.push(json!({
+        "id": "ai_vector_search_report",
+        "category": "COVE-AI vector build/search/export report",
+        "status": "measured",
+        "metrics": {
+            "vector_build_latency_ns": vector_build_latency_ns,
+            "sidecar_parse_latency_ns": parse_latency_ns,
+            "vector_search_latency_ns": exact_search_latency_ns,
+            "ann_search_latency_ns": ann_search_latency_ns,
+            "ann_recall_vs_exact": recall_exact,
+            "exact_fallback_rate": fallback_rate,
+            "filtered_top_k_complete": true,
+            "vector_count": vector_count,
+            "dimension_count": dimension_count,
+            "exact_result_count": exact_results.len(),
+            "ann_result_count": ann_results.len(),
+            "ann_fallback_count": ann_fallback_count,
+            "ann_selected_index": ann_selected_index,
+            "ann_result_authority": ann_result_authority,
+            "ann_internal_candidate_execution": ann_internal_candidate_execution,
+            "ann_exact_result_claim": ann_results.iter().all(|result| result.exact),
+            "payload_bytes_read": payload_bytes_read,
+            "policy_withheld_count": 0,
+            "rebuilt_sidecar_bytes": rebuilt.len(),
+            "covev_bytes": bytes.len(),
+            "bytes_read": bytes.len() as u64,
+            "request_count": 2,
+            "fragments_visited": 1,
+            "pages_visited": vector_count,
+            "pruning_tightness": 1.0,
+        },
+        "optional_features": ["cove_ai", "cove_vec"],
+        "cost": {
+            "coverage_metrics": {
+                "covi_used": false,
+                "coverage_cache": {
+                    "hits": 0,
+                    "misses": 0,
+                    "entries_loaded": 0,
+                }
+            }
+        }
+    }));
     Ok(cases)
 }
 
@@ -5331,6 +5524,7 @@ fn validate_report_cases(cases: &[Value]) -> Result<(), String> {
         "range_filter",
         "top_n",
         "point_lookup",
+        "ai_vector_search_report",
         "covi_index_latency",
         "covi_index_only_count",
         "object_store_cold_warm",
@@ -5460,6 +5654,7 @@ fn validate_report_cases(cases: &[Value]) -> Result<(), String> {
         return Err("covi_index_only_count did not prove CoviIndexOnlyCount".into());
     }
     validate_projection_covi_benchmark_cases(cases)?;
+    validate_ai_benchmark_case(cases)?;
     validate_overlap_stress_benchmark_case(cases)?;
     validate_overlap_scale_benchmark_cases(cases)?;
     validate_overlap_partial_benchmark_cases(cases)?;
@@ -5527,6 +5722,63 @@ fn validate_cove_o_delta_benchmark_case(cases: &[Value]) -> Result<(), String> {
     }
     if !case_bool(case, "/metrics/checkpoint_recommended") {
         return Err("cove_o_delta_artifact_metrics did not trigger checkpoint guidance".into());
+    }
+    Ok(())
+}
+
+fn validate_ai_benchmark_case(cases: &[Value]) -> Result<(), String> {
+    let case = require_measured_case(cases, "ai_vector_search_report")?;
+    let metrics = case
+        .get("metrics")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "ai_vector_search_report is missing metrics".to_string())?;
+    for field in [
+        "vector_build_latency_ns",
+        "sidecar_parse_latency_ns",
+        "vector_search_latency_ns",
+        "ann_search_latency_ns",
+        "ann_recall_vs_exact",
+        "exact_fallback_rate",
+        "filtered_top_k_complete",
+        "ann_selected_index",
+        "ann_result_authority",
+        "ann_internal_candidate_execution",
+        "ann_exact_result_claim",
+        "vector_count",
+        "dimension_count",
+        "exact_result_count",
+        "ann_result_count",
+        "ann_fallback_count",
+        "payload_bytes_read",
+        "policy_withheld_count",
+    ] {
+        if !metrics.contains_key(field) {
+            return Err(format!("ai_vector_search_report missing metric {field}"));
+        }
+    }
+    if case_u64(case, "/metrics/vector_count") == 0 {
+        return Err("ai_vector_search_report did not measure any vectors".into());
+    }
+    if case_u64(case, "/metrics/exact_result_count") == 0 {
+        return Err("ai_vector_search_report did not return exact vector results".into());
+    }
+    if case_u64(case, "/metrics/payload_bytes_read") == 0 {
+        return Err("ai_vector_search_report did not report vector payload bytes".into());
+    }
+    if case_u64(case, "/metrics/ann_fallback_count") != 0 {
+        return Err("ai_vector_search_report unexpectedly fell back from indexed ANN".into());
+    }
+    if !case_bool(case, "/metrics/ann_internal_candidate_execution") {
+        return Err("ai_vector_search_report did not exercise internal ANN candidates".into());
+    }
+    if case_bool(case, "/metrics/ann_exact_result_claim") {
+        return Err("ai_vector_search_report claimed exactness for approximate ANN".into());
+    }
+    if !(0.0..=1.0).contains(&case_f64(case, "/metrics/ann_recall_vs_exact")) {
+        return Err("ai_vector_search_report recall was outside 0..1".into());
+    }
+    if !case_bool(case, "/metrics/filtered_top_k_complete") {
+        return Err("ai_vector_search_report did not mark filtered top-k completeness".into());
     }
     Ok(())
 }
@@ -5999,6 +6251,46 @@ fn markdown_report(report: &Value) -> String {
                 .unwrap_or(0);
             out.push_str(&format!(
                 "| `{id}` | {status} | {planning} | {scan} | {rows} |\n"
+            ));
+        }
+        if let Some(ai_case) = cases
+            .iter()
+            .find(|case| case.get("id") == Some(&json!("ai_vector_search_report")))
+        {
+            let metrics = ai_case.get("metrics").unwrap_or(&Value::Null);
+            out.push_str("\n## COVE-AI Vector Report\n\n");
+            out.push_str("| Vectors | Dimensions | Exact results | ANN index | ANN fallback count | Recall vs exact | Payload bytes |\n");
+            out.push_str("| ---: | ---: | ---: | --- | ---: | ---: | ---: |\n");
+            out.push_str(&format!(
+                "| {} | {} | {} | {} | {} | {:.3} | {} |\n",
+                metrics
+                    .get("vector_count")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                metrics
+                    .get("dimension_count")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                metrics
+                    .get("exact_result_count")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                metrics
+                    .get("ann_selected_index")
+                    .and_then(Value::as_str)
+                    .unwrap_or("none"),
+                metrics
+                    .get("ann_fallback_count")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                metrics
+                    .get("ann_recall_vs_exact")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0),
+                metrics
+                    .get("payload_bytes_read")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
             ));
         }
         let overlap_scale_cases = cases

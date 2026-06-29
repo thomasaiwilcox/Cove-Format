@@ -15,9 +15,12 @@ COVE-AI adds two companion artifact forms:
 The reference implementation currently supports the provider-free COVE-AI
 surface. It validates sidecar framing, descriptor records, reference tables,
 payload references, privacy summaries, payload integrity, MAP-AI slot policy,
-and exact flat FileCode vector lookup/search. It does not call network
-embedding, tokenizer, or model providers. Writer/test commands either consume
-supplied local payloads or generate deterministic local vectors.
+policy-gated payload leases, source-bound chunk text reconstruction, COVM
+AI-sidecar references, and exact flat vector lookup/search across FileCode,
+chunk, object-state, association-state, training-sample, asset, and
+multimodal-sequence vector bindings. It does not call network embedding,
+tokenizer, or model providers. Writer/test commands either consume supplied
+local payloads or generate deterministic local vectors.
 
 ## Authority Model
 
@@ -52,16 +55,32 @@ The current reference implementation covers:
   payload, vector binding, vector composition, vector index, training sample,
   split, dedup, epoch, label, preference, generator provenance, tensor, asset,
   and multimodal sequence descriptors;
-- exact flat FileCode vector scan and FileCode embedding lookup over validated
-  `.covev` sidecars;
+- COVE-VEC V2 vector bindings with `AI_FEATURE_MODEL_INPUT_IDENTITY`, where a
+  `ModelInputBytes` digest proves that repeated semantic bindings used the same
+  exact model input and validates vector deduplication without reading
+  `AI_PAYLOAD_BYTES`;
+- shared runtime access APIs for `CoveAiAccessContext`,
+  `AiPayloadReader`/payload leases, vector search plans/results, export
+  reports, and AI explain summaries;
+- exact flat vector scan and embedding lookup over validated `.covev` sidecars
+  for FileCode, direct `vectorRef`, chunk, object-state, association-state,
+  training-sample, asset, and multimodal-sequence vector bindings, with
+  vector-index descriptor selection, exact/fallback labels, and internal HNSW,
+  IVF-flat, IVF-PQ, DiskANN-style, and Vamana-style candidate generation for
+  supported approximate ANN requests;
 - CoveQL-AI methods over supplied sidecars:
   `.embedding()`, `.similar()`, `.chunks()`, `.tokens()`, `.context()`,
   `.asPromptContext()`, `.trainingSamples()`, `.split()`, `.pack()`,
   `.multimodal()`, `.hybrid()`, `.rerank()`, and `.generatorAudit()`.
 
-Approximate nearest-neighbor index descriptors are parsed and validated, but
-unsupported ANN payloads are treated as candidate metadata. Exact flat scan is
-the supported search path in the current reference implementation.
+Approximate nearest-neighbor index descriptors are parsed, validated, and
+executed by Cove-owned in-process candidate generators. Approximate ANN results
+are exact-scored over the generated candidate set and reported with
+`ApproximateInternalAnn` authority; they do not claim complete nearest-neighbor
+exactness unless the descriptor proves it. Missing, stale, unsupported, or
+policy-blocked requested indexes fall back to exact flat scan when valid
+vectors exist and policy allows the query. The provider-free implementation
+does not call an external ANN service.
 
 ## CLI Workflows
 
@@ -81,8 +100,19 @@ cove vec build \
   --dimension 3 \
   --file-code 1 \
   --file-code 2 \
-  --deterministic
+  --deterministic \
+  --index hnsw \
+  --metric dot
 ```
+
+`cove vec build` consumes deterministic or supplied little-endian f32 source
+vectors. With `--quantization none` it stores dense Float32 payloads; with
+`--quantization int8`, `uint8`, or `pq` it stores local compact code bytes and
+emits matching COVE-VEC element-type and quantization descriptors. The selected
+metric is written into both the vector-space and vector-index descriptors.
+`--seed` makes deterministic vectors reproducible, and
+`--integrity-report <path>` writes a JSON summary of payload integrity,
+descriptor choices, and supplied index/sharding parameters.
 
 Query a COVE file with a supplied AI sidecar:
 
@@ -96,16 +126,43 @@ cove query --cove-ai target/vectors.covev examples/coveql/events.cove \
 table(events).similar(fileCode: 1, k: 2)'
 ```
 
+When auto sidecars are enabled, `cove query` also looks for validated sibling
+AI sidecars using `.covev`, `.coveai`, `-ai.covev`, `-ai.coveai`, `.ai.covev`,
+and `.ai.coveai` names beside the input file or supplied dataset directory.
+For COVM manifests, `cove query` first honors optional `CAI1` AI-sidecar
+reference blocks in the manifest extension region. Those references bind the
+sidecar URI to a source member file id plus sidecar length and digest; selected
+AI operations reject stale referenced sidecars, while ordinary non-AI COVM
+queries keep ignoring the optional block. Use `--no-auto-sidecars` to disable
+discovery. A discovered sidecar is used only after the `CVA2`/`CVV2` envelope
+parses successfully; selected AI operations still fail closed when no valid
+sidecar is available.
+
 Export COVE-TRAIN descriptor metadata from a training sidecar:
 
 ```bash
 cove train export training.coveai --format json
-cove train export training.coveai --format jsonl --out samples.jsonl
+cove train export training.coveai --include-payloads --format jsonl --out samples.jsonl
+cove train export training.coveai --format arrow --out samples.arrow
+cove train export training.coveai --format parquet --out samples.parquet
+cove train export training.coveai --format webdataset --out samples.tar
+cove ai export tokens training.coveai --include-payloads --format jsonl
+cove ai export vectors vectors.covev --format parquet --out vectors.parquet
+cove ai export training training.coveai --format webdataset --out training.tar
+cove ai export multimodal training.coveai --format json --policy-report
 ```
 
-The training export command validates the sidecar and emits descriptor
-metadata. It does not bypass AI payload policy or read protected payload bytes
-directly.
+The export commands support JSON, JSONL, HF-style JSONL, Arrow IPC, and Parquet
+record streams, plus WebDataset-style tar shards containing metadata and JSON
+record members. Arrow and Parquet exports use native table artifacts with
+stable record columns plus the full record payload as canonical JSON. The Rust
+API exposes `ai_tensor_zero_copy_view` for lifetime-checked, DLPack-style
+borrowed tensor views after dtype, shape, stride, alignment, dense-layout,
+payload-lease, and policy validation; the CLI still rejects direct DLPack file
+output. All payload bytes are exposed only through AI payload leases. Missing
+privacy summaries, revoked payload refs, protected payload refs, external
+payload refs, and stale policy state produce structured withheld diagnostics
+rather than best-effort disclosure.
 
 ## CoveQL-AI
 
@@ -118,10 +175,19 @@ requires one:
 table(events).similar(fileCode: 1, k: 5)
 ```
 
-Descriptor projection methods such as `.chunks()`, `.tokens()`,
-`.trainingSamples()`, `.multimodal()`, and `.generatorAudit()` return validated
-sidecar metadata with protected text/assets withheld unless a future
-profile-specific operation validates direct exposure.
+Projection methods such as `.tokens()`, `.trainingSamples()`,
+`.multimodal()`, and `.generatorAudit()` return validated sidecar records and
+lease-backed payload fields when the selected operation is allowed to expose
+payloads. `.generatorAudit()` supports filters over model namespace/name/
+version, provider, endpoint, decoding profile, human-review status, and
+reproducibility class. `.chunks()` and RAG context validate chunk spans,
+source-value hashes, chunk-text hashes, UTF-8 boundaries, and source COVE-O
+redaction state before reconstructing text from the source value. Parent,
+sibling, and neighboring chunk expansion remains withheld unless each expansion
+path has separately valid freshness and policy proof.
+
+COVE-CHUNK remains span-only: chunk records store source spans, hashes,
+navigation, evidence, and policy refs, not a second copy of chunk text.
 
 ## Conformance
 

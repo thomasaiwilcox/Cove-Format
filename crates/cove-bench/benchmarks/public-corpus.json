@@ -20,8 +20,15 @@
       "id": "events",
       "kind": "arrow-generated-cove-parquet",
       "seed": 1,
-      "artifacts": ["events.cove", "events.parquet", "events.orc", "events.covx", "events.covm", "events.covi"],
+      "artifacts": ["events.cove", "events.parquet", "events.orc", "events.covx", "events.covm", "events.covi", "events-ai.covev"],
       "columns": ["id", "amount", "bucket", "name", "active"]
+    },
+    {
+      "id": "events-ai",
+      "kind": "deterministic-cove-ai-vectors",
+      "seed": 30,
+      "artifacts": ["events-ai.covev"],
+      "purpose": "COVE-AI vector build, exact search, internal ANN candidate search, payload-byte, and report workload"
     },
     {
       "id": "synthetic-cache",
@@ -158,6 +165,7 @@
     "range_filter",
     "point_lookup",
     "top_n",
+    "ai_vector_search_report",
     "metadata_count_min_max",
     "object_store_cold_warm",
     "semantic_projection_object_store_compare",

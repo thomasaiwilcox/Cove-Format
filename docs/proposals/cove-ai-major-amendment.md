@@ -255,6 +255,7 @@ the `CVA2`/`CVV2` artifact namespace when used inside those sidecars. Embedded
 | 12 | `AI_FEATURE_EXTERNAL_ASSET_DIGEST_REQUIRED` | COVE-MMSEQ / COVE-TRAIN | Replayability depends on external asset digests. |
 | 13 | `AI_FEATURE_PRIVACY_SUMMARY` | COVE-AI | Planners rely on sensitivity summaries before loading payloads. |
 | 14 | `AI_FEATURE_VECTOR_SPACE_COMPATIBILITY` | COVE-VEC | Cross-vector-space comparison is allowed by descriptor. |
+| 15 | `AI_FEATURE_MODEL_INPUT_IDENTITY` | COVE-VEC | Vector bindings prove exact model-input identity and descriptor-level vector deduplication. |
 
 Rules:
 

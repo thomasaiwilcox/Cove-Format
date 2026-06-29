@@ -302,11 +302,16 @@ table(events).similar(fileCode: 1, k: 2)'
 Descriptor projection methods such as `.chunks()`, `.tokens()`,
 `.trainingSamples()`, `.multimodal()`, and `.generatorAudit()` require a
 supplied `.coveai` or `.covev` sidecar containing those descriptor families.
-The reference implementation validates descriptor metadata and withholds
-protected text/assets unless a policy-specific operation authorizes exposure.
+The reference implementation validates descriptor metadata and exposes
+payload-ref-backed fields only through policy-gated AI payload leases. Chunk
+text remains span-based and reconstructs from the source COVE value rather than
+from a copied sidecar text payload.
 
 For a fuller overview of `.coveai`, `.covev`, `cove train export`, and the
 CoveQL-AI method set, see [`docs/cove-ai.md`](./cove-ai.md).
+When querying a COVM manifest, `cove query` can also auto-discover digest-bound
+AI sidecar references published in the manifest extension region; stale
+referenced sidecars are rejected for selected AI operations.
 
 ## Delta Snapshots
 

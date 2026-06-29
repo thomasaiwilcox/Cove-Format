@@ -25,9 +25,12 @@
 
 use std::collections::BTreeSet;
 
-use super::covedelta::{
-    CoveDeltaFile, DeltaParentRefV1, COVEDELTA_OBJECT_TEMPORAL_SUPPORTED_REQUIRED_FEATURES,
-    DELTA_FLAG_SOURCE_PUBLISH_RANGE_PRESENT, DELTA_PARENT_REF_LINEAGE_PARENT, DELTA_REF_NONE,
+use super::{
+    coveai::{CoveAiArtifactKind, CoveAiFile},
+    covedelta::{
+        CoveDeltaFile, DeltaParentRefV1, COVEDELTA_OBJECT_TEMPORAL_SUPPORTED_REQUIRED_FEATURES,
+        DELTA_FLAG_SOURCE_PUBLISH_RANGE_PRESENT, DELTA_PARENT_REF_LINEAGE_PARENT, DELTA_REF_NONE,
+    },
 };
 use crate::checksum;
 use crate::constants::{DigestAlgorithm, MAGIC_COVM, POSTSCRIPT_VERSION_V1};
@@ -99,6 +102,11 @@ pub const DELTA_SUMMARY_TIME_COMMIT_RANGE_PRESENT: u32 = 0x0000_0001;
 pub const DELTA_SUMMARY_TIME_SOURCE_PUBLISH_RANGE_PRESENT: u32 = 0x0000_0002;
 pub const DELTA_SUMMARY_EXACTNESS_SOURCE_PUBLISH_CONSERVATIVE: u32 = 0x0000_0001;
 pub const DELTA_SUMMARY_EXACTNESS_SOURCE_PUBLISH_EXACT: u32 = 0x0000_0002;
+
+pub const COVM_AI_SIDECAR_EXTENSION_MAGIC: [u8; 4] = *b"CAI1";
+pub const COVM_AI_SIDECAR_EXTENSION_VERSION_MAJOR_V1: u16 = 1;
+pub const COVM_AI_SIDECAR_EXTENSION_VERSION_MINOR_V1: u16 = 0;
+pub const COVM_AI_SIDECAR_EXTENSION_HEADER_LEN: usize = 24;
 
 // ── CovmHeaderV1 ──────────────────────────────────────────────────────────────
 
@@ -464,6 +472,268 @@ impl CovmPostscriptV1 {
             flags,
             checksum: checksum_field,
         })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CovmAiSidecarRefV1 {
+    pub source_file_id: [u8; 16],
+    pub sidecar_kind: CoveAiArtifactKind,
+    pub flags: u8,
+    pub digest_algorithm: u16,
+    pub sidecar_file_len: u64,
+    pub digest: Vec<u8>,
+    pub uri: String,
+}
+
+impl CovmAiSidecarRefV1 {
+    pub fn new(
+        source_file_id: [u8; 16],
+        sidecar_kind: CoveAiArtifactKind,
+        uri: String,
+        sidecar_bytes: &[u8],
+    ) -> Result<Self, CoveError> {
+        let digest = compute_digest(DigestAlgorithm::Sha256, sidecar_bytes)?;
+        Ok(Self {
+            source_file_id,
+            sidecar_kind,
+            flags: 0,
+            digest_algorithm: DigestAlgorithm::Sha256 as u16,
+            sidecar_file_len: sidecar_bytes.len() as u64,
+            digest,
+            uri,
+        })
+    }
+
+    pub fn encoded_len(&self) -> usize {
+        16 + 1 + 1 + 2 + 8 + 2 + 2 + self.digest.len() + self.uri.len()
+    }
+
+    pub fn serialize(&self) -> Result<Vec<u8>, CoveError> {
+        if self.digest.len() > u16::MAX as usize {
+            return Err(CoveError::BadSection(
+                "COVM AI sidecar digest is too large".into(),
+            ));
+        }
+        if self.uri.len() > u16::MAX as usize {
+            return Err(CoveError::BadSection(
+                "COVM AI sidecar uri is too large".into(),
+            ));
+        }
+        let algorithm = covm_delta_required_digest_algorithm(
+            self.digest_algorithm,
+            "COVM AI sidecar digest_algorithm",
+        )?;
+        let expected_len = covm_delta_expected_digest_len(algorithm);
+        if self.digest.len() != expected_len {
+            return Err(CoveError::BadSection(format!(
+                "COVM AI sidecar digest length must be {expected_len}, got {}",
+                self.digest.len()
+            )));
+        }
+        let mut out = Vec::with_capacity(self.encoded_len());
+        out.extend_from_slice(&self.source_file_id);
+        out.push(match self.sidecar_kind {
+            CoveAiArtifactKind::CoveAiBundle => 1,
+            CoveAiArtifactKind::CoveVec => 2,
+        });
+        out.push(self.flags);
+        out.extend_from_slice(&self.digest_algorithm.to_le_bytes());
+        out.extend_from_slice(&self.sidecar_file_len.to_le_bytes());
+        out.extend_from_slice(&(self.digest.len() as u16).to_le_bytes());
+        out.extend_from_slice(&(self.uri.len() as u16).to_le_bytes());
+        out.extend_from_slice(&self.digest);
+        out.extend_from_slice(self.uri.as_bytes());
+        Ok(out)
+    }
+
+    pub fn parse(bytes: &[u8]) -> Result<(Self, usize), CoveError> {
+        let mut pos = 0usize;
+        let source_file_id = take_array::<16>(bytes, &mut pos)?;
+        let sidecar_kind_raw = *take_bytes(bytes, &mut pos, 1)?
+            .first()
+            .ok_or(CoveError::BufferTooShort)?;
+        let sidecar_kind = match sidecar_kind_raw {
+            1 => CoveAiArtifactKind::CoveAiBundle,
+            2 => CoveAiArtifactKind::CoveVec,
+            other => {
+                return Err(CoveError::BadSection(format!(
+                    "unknown COVM AI sidecar kind {other}"
+                )));
+            }
+        };
+        let flags = *take_bytes(bytes, &mut pos, 1)?
+            .first()
+            .ok_or(CoveError::BufferTooShort)?;
+        let digest_algorithm = take_u16(bytes, &mut pos)?;
+        let algorithm = covm_delta_required_digest_algorithm(
+            digest_algorithm,
+            "COVM AI sidecar digest_algorithm",
+        )?;
+        let sidecar_file_len = take_u64(bytes, &mut pos)?;
+        let digest_len = take_u16(bytes, &mut pos)? as usize;
+        let uri_len = take_u16(bytes, &mut pos)? as usize;
+        let expected_len = covm_delta_expected_digest_len(algorithm);
+        if digest_len != expected_len {
+            return Err(CoveError::BadSection(format!(
+                "COVM AI sidecar digest length must be {expected_len}, got {digest_len}"
+            )));
+        }
+        let digest = take_bytes(bytes, &mut pos, digest_len)?.to_vec();
+        let uri_bytes = take_bytes(bytes, &mut pos, uri_len)?;
+        let uri = std::str::from_utf8(uri_bytes)
+            .map_err(|_| CoveError::BadSection("COVM AI sidecar uri must be UTF-8".into()))?
+            .to_string();
+        if uri.is_empty() {
+            return Err(CoveError::BadSection(
+                "COVM AI sidecar uri must be non-empty".into(),
+            ));
+        }
+        Ok((
+            Self {
+                source_file_id,
+                sidecar_kind,
+                flags,
+                digest_algorithm,
+                sidecar_file_len,
+                digest,
+                uri,
+            },
+            pos,
+        ))
+    }
+
+    pub fn validate_source_member(&self, manifest: &CovmFile) -> Result<(), CoveError> {
+        if manifest
+            .files
+            .iter()
+            .any(|entry| entry.file_id == self.source_file_id)
+        {
+            Ok(())
+        } else {
+            Err(CoveError::SidecarStale)
+        }
+    }
+
+    pub fn validate_sidecar_bytes(&self, sidecar_bytes: &[u8]) -> Result<CoveAiFile, CoveError> {
+        if self.sidecar_file_len != sidecar_bytes.len() as u64 {
+            return Err(CoveError::SidecarStale);
+        }
+        let algorithm = covm_delta_required_digest_algorithm(
+            self.digest_algorithm,
+            "COVM AI sidecar digest_algorithm",
+        )?;
+        let digest = compute_digest(algorithm, sidecar_bytes)?;
+        if digest != self.digest {
+            return Err(CoveError::SidecarStale);
+        }
+        let sidecar = CoveAiFile::parse(sidecar_bytes)?;
+        if sidecar.artifact_kind != self.sidecar_kind {
+            return Err(CoveError::SidecarStale);
+        }
+        Ok(sidecar)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CovmAiSidecarExtensionV1 {
+    pub flags: u32,
+    pub refs: Vec<CovmAiSidecarRefV1>,
+}
+
+impl CovmAiSidecarExtensionV1 {
+    pub fn serialize(&self) -> Result<Vec<u8>, CoveError> {
+        if self.refs.len() > u32::MAX as usize {
+            return Err(CoveError::BadSection(
+                "too many COVM AI sidecar references".into(),
+            ));
+        }
+        let mut body = Vec::new();
+        let mut seen = BTreeSet::new();
+        for reference in &self.refs {
+            if !seen.insert((reference.source_file_id, reference.uri.clone())) {
+                return Err(CoveError::BadSection(
+                    "duplicate COVM AI sidecar reference".into(),
+                ));
+            }
+            body.extend_from_slice(&reference.serialize()?);
+        }
+        let extension_len = COVM_AI_SIDECAR_EXTENSION_HEADER_LEN
+            .checked_add(body.len())
+            .ok_or(CoveError::ArithOverflow)?;
+        let mut out = vec![0u8; COVM_AI_SIDECAR_EXTENSION_HEADER_LEN];
+        out[0..4].copy_from_slice(&COVM_AI_SIDECAR_EXTENSION_MAGIC);
+        out[4..6].copy_from_slice(&COVM_AI_SIDECAR_EXTENSION_VERSION_MAJOR_V1.to_le_bytes());
+        out[6..8].copy_from_slice(&COVM_AI_SIDECAR_EXTENSION_VERSION_MINOR_V1.to_le_bytes());
+        out[8..12].copy_from_slice(&self.flags.to_le_bytes());
+        out[12..16].copy_from_slice(&(self.refs.len() as u32).to_le_bytes());
+        out[16..20].copy_from_slice(&(extension_len as u32).to_le_bytes());
+        out.extend_from_slice(&body);
+        let crc = checksum::crc32c(&out);
+        out[20..24].copy_from_slice(&crc.to_le_bytes());
+        Ok(out)
+    }
+
+    pub fn parse(bytes: &[u8]) -> Result<Self, CoveError> {
+        if bytes.len() < COVM_AI_SIDECAR_EXTENSION_HEADER_LEN {
+            return Err(CoveError::BufferTooShort);
+        }
+        if bytes[0..4] != COVM_AI_SIDECAR_EXTENSION_MAGIC {
+            return Err(CoveError::BadMagic);
+        }
+        let version_major = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
+        let version_minor = u16::from_le_bytes(bytes[6..8].try_into().unwrap());
+        if version_major != COVM_AI_SIDECAR_EXTENSION_VERSION_MAJOR_V1 {
+            return Err(CoveError::BadVersion);
+        }
+        let flags = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+        let ref_count = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+        let extension_len = u32::from_le_bytes(bytes[16..20].try_into().unwrap()) as usize;
+        if extension_len < COVM_AI_SIDECAR_EXTENSION_HEADER_LEN || extension_len > bytes.len() {
+            return Err(CoveError::OffsetRange);
+        }
+        let checksum_field = u32::from_le_bytes(bytes[20..24].try_into().unwrap());
+        let mut for_crc = bytes[..extension_len].to_vec();
+        for_crc[20..24].fill(0);
+        if checksum::crc32c(&for_crc) != checksum_field {
+            return Err(CoveError::ChecksumMismatch);
+        }
+        let mut pos = COVM_AI_SIDECAR_EXTENSION_HEADER_LEN;
+        let mut refs = Vec::with_capacity(ref_count);
+        let mut seen = BTreeSet::new();
+        for _ in 0..ref_count {
+            let (reference, used) = CovmAiSidecarRefV1::parse(&bytes[pos..extension_len])?;
+            pos = pos.checked_add(used).ok_or(CoveError::ArithOverflow)?;
+            if !seen.insert((reference.source_file_id, reference.uri.clone())) {
+                return Err(CoveError::BadSection(
+                    "duplicate COVM AI sidecar reference".into(),
+                ));
+            }
+            refs.push(reference);
+        }
+        if pos != extension_len {
+            return Err(CoveError::BadSection(
+                "COVM AI sidecar extension has trailing bytes".into(),
+            ));
+        }
+        let _ = version_minor;
+        Ok(Self { flags, refs })
+    }
+
+    pub fn find_in_covm_bytes(file_data: &[u8]) -> Result<Option<Self>, CoveError> {
+        let postscript = CovmPostscriptV1::parse_from_tail(file_data)?;
+        let extension_region = covm_extension_region(file_data, &postscript)?;
+        let Some(offset) = find_subslice(extension_region, &COVM_AI_SIDECAR_EXTENSION_MAGIC) else {
+            return Ok(None);
+        };
+        Self::parse(&extension_region[offset..]).map(Some)
+    }
+
+    pub fn validate_against_manifest(&self, manifest: &CovmFile) -> Result<(), CoveError> {
+        for reference in &self.refs {
+            reference.validate_source_member(manifest)?;
+        }
+        Ok(())
     }
 }
 
@@ -2456,6 +2726,13 @@ impl CovmFile {
     }
 
     pub fn serialize(&self) -> Result<Vec<u8>, CoveError> {
+        self.serialize_with_extension_region(&[])
+    }
+
+    pub fn serialize_with_extension_region(
+        &self,
+        extension_region: &[u8],
+    ) -> Result<Vec<u8>, CoveError> {
         let mut header = self.header.clone();
         header.file_count = u32::try_from(self.files.len())
             .map_err(|_| CoveError::BadSection("too many COVM file entries".into()))?;
@@ -2471,7 +2748,11 @@ impl CovmFile {
         let entries_offset = header_len_u64;
         let entries_len = entries_bytes.len() as u64;
         let postscript_total = (COVM_POSTSCRIPT_LEN as u64) + (COVM_POSTSCRIPT_TAIL_SIZE as u64);
-        let file_len = entries_offset + entries_len + postscript_total;
+        let file_len = entries_offset
+            .checked_add(entries_len)
+            .and_then(|value| value.checked_add(extension_region.len() as u64))
+            .and_then(|value| value.checked_add(postscript_total))
+            .ok_or(CoveError::ArithOverflow)?;
 
         let postscript = CovmPostscriptV1 {
             header_offset,
@@ -2487,10 +2768,42 @@ impl CovmFile {
         let mut out = Vec::with_capacity(file_len as usize);
         out.extend_from_slice(&header_bytes);
         out.extend_from_slice(&entries_bytes);
+        out.extend_from_slice(extension_region);
         out.extend_from_slice(&tail);
         debug_assert_eq!(out.len() as u64, file_len);
         Ok(out)
     }
+}
+
+pub fn covm_extension_region<'a>(
+    file_data: &'a [u8],
+    postscript: &CovmPostscriptV1,
+) -> Result<&'a [u8], CoveError> {
+    let entries_start =
+        usize::try_from(postscript.entries_offset).map_err(|_| CoveError::OffsetRange)?;
+    let entries_len =
+        usize::try_from(postscript.entries_len).map_err(|_| CoveError::OffsetRange)?;
+    let entries_end = entries_start
+        .checked_add(entries_len)
+        .ok_or(CoveError::ArithOverflow)?;
+    let postscript_total = COVM_POSTSCRIPT_LEN as usize + COVM_POSTSCRIPT_TAIL_SIZE;
+    if file_data.len() < postscript_total {
+        return Err(CoveError::BufferTooShort);
+    }
+    let postscript_start = file_data.len() - postscript_total;
+    if entries_end > postscript_start {
+        return Err(CoveError::OffsetRange);
+    }
+    Ok(&file_data[entries_end..postscript_start])
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 fn put_u16(buf: &mut [u8], pos: &mut usize, value: u16) {
@@ -2608,6 +2921,7 @@ fn covm_delta_expected_digest_len(algorithm: DigestAlgorithm) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::artifact::coveai::{write_covev_filecode_vectors, CoveVecFileCodeVectorBuild};
 
     fn sample_entry(file_id: u8, uri: &str, digest_byte: u8, digest_len: usize) -> CovmFileEntryV1 {
         CovmFileEntryV1 {
@@ -2642,6 +2956,84 @@ mod tests {
                 checksum: 0,
             },
         }
+    }
+
+    fn sample_covev_sidecar_bytes() -> Vec<u8> {
+        let mut vector_payload = Vec::new();
+        vector_payload.extend_from_slice(&1.0f32.to_le_bytes());
+        vector_payload.extend_from_slice(&2.0f32.to_le_bytes());
+        write_covev_filecode_vectors(&CoveVecFileCodeVectorBuild {
+            artifact_id: [0xC7; 16],
+            created_at_us: 1_700_000_000_000_001,
+            dimension_count: 2,
+            file_codes: vec![7],
+            vector_payload,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn covm_ai_sidecar_extension_roundtrips_and_validates_digest_bound_ref() {
+        let manifest = sample_file();
+        let sidecar_bytes = sample_covev_sidecar_bytes();
+        let reference = CovmAiSidecarRefV1::new(
+            manifest.files[0].file_id,
+            CoveAiArtifactKind::CoveVec,
+            "a.covev".into(),
+            &sidecar_bytes,
+        )
+        .unwrap();
+        let extension = CovmAiSidecarExtensionV1 {
+            flags: 0,
+            refs: vec![reference],
+        };
+        let extension_bytes = extension.serialize().unwrap();
+        let manifest_bytes = manifest
+            .serialize_with_extension_region(&extension_bytes)
+            .unwrap();
+
+        let parsed_manifest = CovmFile::parse(&manifest_bytes).unwrap();
+        let parsed_extension = CovmAiSidecarExtensionV1::find_in_covm_bytes(&manifest_bytes)
+            .unwrap()
+            .unwrap();
+        parsed_extension
+            .validate_against_manifest(&parsed_manifest)
+            .unwrap();
+        let parsed_sidecar = parsed_extension.refs[0]
+            .validate_sidecar_bytes(&sidecar_bytes)
+            .unwrap();
+
+        assert_eq!(parsed_sidecar.artifact_kind, CoveAiArtifactKind::CoveVec);
+        assert_eq!(parsed_extension.refs[0].uri, "a.covev");
+    }
+
+    #[test]
+    fn covm_ai_sidecar_extension_rejects_stale_source_or_digest() {
+        let manifest = sample_file();
+        let sidecar_bytes = sample_covev_sidecar_bytes();
+        let mut reference = CovmAiSidecarRefV1::new(
+            [0xEE; 16],
+            CoveAiArtifactKind::CoveVec,
+            "a.covev".into(),
+            &sidecar_bytes,
+        )
+        .unwrap();
+        let extension = CovmAiSidecarExtensionV1 {
+            flags: 0,
+            refs: vec![reference.clone()],
+        };
+        assert_eq!(
+            extension.validate_against_manifest(&manifest),
+            Err(CoveError::SidecarStale)
+        );
+
+        reference.source_file_id = manifest.files[0].file_id;
+        let mut tampered = sidecar_bytes.clone();
+        tampered[0] ^= 0xFF;
+        assert_eq!(
+            reference.validate_sidecar_bytes(&tampered),
+            Err(CoveError::SidecarStale)
+        );
     }
 
     fn sample_delta_artifact_ref(

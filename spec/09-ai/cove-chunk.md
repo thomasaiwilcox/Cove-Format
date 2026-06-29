@@ -12,6 +12,12 @@ COVE-CHUNK payloads live in `AI_CHUNK_PROFILE` and `AI_TEXT_CHUNK_INDEX`
 sections. They MAY be stored in `.coveai`, embedded `.cove` sections, or
 another COVE-AI-compatible sidecar.
 
+COVE-CHUNK records are reusable span metadata. They identify source byte/token
+spans, navigation relationships, evidence, policies, and hashes; they MUST NOT
+duplicate source text payload. Chunk text is reconstructed from the declared
+source binding only after source freshness, visibility, redaction, and policy
+checks pass.
+
 ### 83.30.1 Reader Obligations
 
 - Validate every chunk byte span against the source value before exposing text.
@@ -95,6 +101,12 @@ struct TextChunkEntryV1 {
   alignment, neighboring context, or parent/child navigation.
 - Default context expansion MUST withhold neighboring or parent chunks when
   policy or freshness validation fails.
+- Runtime chunk-text exposure MUST reconstruct text from the bound source
+  value, not from `TextChunkEntryV1` itself. The operation MUST validate the
+  source COVE-O value is visible, byte spans are in range and UTF-8 aligned,
+  Unicode scalar offsets are consistent, `source_value_hash_ref` matches the
+  full source value when present, and `chunk_text_hash_ref` matches the exposed
+  byte span when present.
 
 COVE-CHUNK MAY support matched-span context expansion over matched chunks,
 parents, siblings, previous/next chunks, same heading, same object, same source

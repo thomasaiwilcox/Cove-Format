@@ -35,6 +35,7 @@ change ordinary COVE-T/O/MAP logical results.
 | 12 | AI_FEATURE_EXTERNAL_ASSET_DIGEST_REQUIRED | COVE-MMSEQ / COVE-TRAIN |
 | 13 | AI_FEATURE_PRIVACY_SUMMARY | COVE-AI |
 | 14 | AI_FEATURE_VECTOR_SPACE_COMPATIBILITY | COVE-VEC |
+| 15 | AI_FEATURE_MODEL_INPUT_IDENTITY | COVE-VEC |
 
 ```sh
 cargo run -p cove-conformance --bin gen-corpus -- --check
