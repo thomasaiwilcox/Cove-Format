@@ -6,6 +6,7 @@ description = "Lightweight engine facade for COVE runtime and DataFusion integra
 license = "MIT"
 
 [dependencies]
+arrow-array = "58"
 cove-core = { path = "../cove-core" }
 cove-datafusion = { path = "../cove-datafusion" }
 cove-runtime = { path = "../cove-runtime" }

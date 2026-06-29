@@ -2047,7 +2047,7 @@ fn write_tar_entry(out: &mut Vec<u8>, name: &str, data: &[u8]) -> Result<(), Str
     out.extend_from_slice(&header);
     out.extend_from_slice(data);
     let padding = (512 - (data.len() % 512)) % 512;
-    out.extend(std::iter::repeat(0u8).take(padding));
+    out.extend(std::iter::repeat_n(0u8, padding));
     Ok(())
 }
 
@@ -2424,33 +2424,46 @@ fn run_train_export(args: Vec<String>) -> Result<(), String> {
             print!("{text}");
         }
     } else {
-        let value = training_export_json(
-            &input,
-            &sidecar,
+        let value = training_export_json(TrainingExportJsonRequest {
+            input: &input,
+            sidecar: &sidecar,
             profile_filter,
             split_filter,
             epoch_plan_filter,
             include_payloads,
             policy_report,
-            &payload_reader,
-            &format,
-        );
+            payload_reader: &payload_reader,
+            format: &format,
+        });
         write_ai_export_output(&value, &format, out)?;
     }
     Ok(())
 }
 
-fn training_export_json(
-    input: &Path,
-    sidecar: &CoveAiFile,
+struct TrainingExportJsonRequest<'a, 'payload> {
+    input: &'a Path,
+    sidecar: &'a CoveAiFile,
     profile_filter: Option<u32>,
     split_filter: Option<u32>,
     epoch_plan_filter: Option<u64>,
     include_payloads: bool,
     policy_report: bool,
-    payload_reader: &AiPayloadReader<'_>,
-    format: &str,
-) -> serde_json::Value {
+    payload_reader: &'a AiPayloadReader<'payload>,
+    format: &'a str,
+}
+
+fn training_export_json(request: TrainingExportJsonRequest<'_, '_>) -> serde_json::Value {
+    let TrainingExportJsonRequest {
+        input,
+        sidecar,
+        profile_filter,
+        split_filter,
+        epoch_plan_filter,
+        include_payloads,
+        policy_report,
+        payload_reader,
+        format,
+    } = request;
     let samples = filtered_training_samples(sidecar, profile_filter, split_filter)
         .into_iter()
         .map(|sample| training_sample_json_with_payloads(sample, include_payloads, payload_reader))

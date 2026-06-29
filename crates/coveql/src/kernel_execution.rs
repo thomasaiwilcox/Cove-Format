@@ -1943,7 +1943,7 @@ fn ai_chunk_text_projection(
         let Some(text) = property.value.as_str() else {
             return Err("source property value is not UTF-8 text".into());
         };
-        if !values.iter().any(|value: &&str| *value == text) {
+        if !values.contains(&text) {
             values.push(text);
         }
     }

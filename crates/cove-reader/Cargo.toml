@@ -7,5 +7,9 @@ license = "MIT"
 
 [dependencies]
 cove-core = { path = "../cove-core" }
-cove-datafusion = { path = "../cove-datafusion" }
-arrow-array = "58"
+cove-datafusion = { path = "../cove-datafusion", optional = true }
+arrow-array = { version = "58", optional = true }
+
+[features]
+default = []
+datafusion = ["dep:arrow-array", "dep:cove-datafusion"]

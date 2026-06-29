@@ -550,14 +550,14 @@ pub fn import_parquet(
             input.display()
         )
     })?;
-    let mut reader = builder.build().map_err(|error| {
+    let reader = builder.build().map_err(|error| {
         format!(
             "cannot build Parquet row reader for {}: {error}",
             input.display()
         )
     })?;
     let mut rows = Vec::new();
-    while let Some(batch) = reader.next() {
+    for batch in reader {
         let batch = batch.map_err(|error| format!("Parquet batch read failed: {error}"))?;
         rows.extend(record_batch_to_json_rows(&batch)?);
     }
@@ -1787,7 +1787,7 @@ fn write_tar_entry(out: &mut Vec<u8>, name: &str, data: &[u8]) -> Result<(), Str
     out.extend_from_slice(&header);
     out.extend_from_slice(data);
     let padding = (512 - (data.len() % 512)) % 512;
-    out.extend(std::iter::repeat(0u8).take(padding));
+    out.extend(std::iter::repeat_n(0u8, padding));
     Ok(())
 }
 
