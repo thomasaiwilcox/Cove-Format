@@ -2473,6 +2473,194 @@ fn query_coveql_ai_descriptor_methods_smoke() {
 }
 
 #[test]
+fn ai_training_archive_adoption_workflows_smoke() {
+    let source = temp_file("training-adoption-source.jsonl");
+    let archive = temp_file("training-adoption.coveai");
+    let stream_out = temp_file("training-adoption-stream.jsonl");
+    let diff_report = temp_file("training-adoption-diff.json");
+    let showcase_dir = temp_file("ai-training-showcase");
+    fs::write(
+        &source,
+        serde_json::json!({
+            "sample_id": "adopt-1",
+            "instruction": "Explain COVE-AI training archives.",
+            "input": "policy aware import",
+            "output": "COVE-AI is the archive of record.",
+            "split": "train"
+        })
+        .to_string()
+            + "\n",
+    )
+    .unwrap();
+
+    let dry_run = run_cove(&[
+        "ai",
+        "import",
+        "jsonl",
+        source.to_str().unwrap(),
+        "--schema",
+        "instruction",
+        "--split-column",
+        "split",
+        "--dry-run",
+    ]);
+    let dry_run_stdout = String::from_utf8_lossy(&dry_run.stdout);
+    assert!(
+        dry_run.status.success(),
+        "stdout={dry_run_stdout}\nstderr={}",
+        String::from_utf8_lossy(&dry_run.stderr)
+    );
+    let dry_run_json: serde_json::Value = serde_json::from_str(&dry_run_stdout).unwrap();
+    assert_eq!(dry_run_json["sample_count"], serde_json::json!(1));
+
+    let import = run_cove(&[
+        "ai",
+        "import",
+        "jsonl",
+        source.to_str().unwrap(),
+        "--out",
+        archive.to_str().unwrap(),
+        "--schema",
+        "instruction",
+        "--split-column",
+        "split",
+        "--publish-covm",
+    ]);
+    let import_stdout = String::from_utf8_lossy(&import.stdout);
+    assert!(
+        import.status.success(),
+        "stdout={import_stdout}\nstderr={}",
+        String::from_utf8_lossy(&import.stderr)
+    );
+    assert!(archive.exists());
+    assert!(archive.with_extension("covm").exists());
+
+    let verify = run_cove(&["ai", "verify", archive.to_str().unwrap(), "--json"]);
+    let verify_stdout = String::from_utf8_lossy(&verify.stdout);
+    assert!(
+        verify.status.success(),
+        "stdout={verify_stdout}\nstderr={}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
+    let verify_json: serde_json::Value = serde_json::from_str(&verify_stdout).unwrap();
+    assert_eq!(verify_json["training_sample_count"], serde_json::json!(1));
+
+    let covm_archive = archive.with_extension("covm");
+    let verify_covm = run_cove(&[
+        "ai",
+        "verify",
+        covm_archive.to_str().unwrap(),
+        "--dataset",
+        archive.parent().unwrap().to_str().unwrap(),
+        "--json",
+    ]);
+    let verify_covm_stdout = String::from_utf8_lossy(&verify_covm.stdout);
+    assert!(
+        verify_covm.status.success(),
+        "stdout={verify_covm_stdout}\nstderr={}",
+        String::from_utf8_lossy(&verify_covm.stderr)
+    );
+    let verify_covm_json: serde_json::Value = serde_json::from_str(&verify_covm_stdout).unwrap();
+    assert_eq!(
+        verify_covm_json["training_sample_count"],
+        serde_json::json!(1)
+    );
+    fs::write(
+        &source,
+        fs::read_to_string(&source).unwrap()
+            + &serde_json::json!({
+                "sample_id": "adopt-2",
+                "instruction": "Mutate source",
+                "output": "stale",
+                "split": "train"
+            })
+            .to_string()
+            + "\n",
+    )
+    .unwrap();
+    let stale_covm = run_cove(&[
+        "ai",
+        "verify",
+        covm_archive.to_str().unwrap(),
+        "--dataset",
+        archive.parent().unwrap().to_str().unwrap(),
+        "--json",
+    ]);
+    assert!(
+        !stale_covm.status.success(),
+        "stale COVM AI source binding should fail verification"
+    );
+
+    let stream = run_cove(&[
+        "ai",
+        "stream",
+        archive.to_str().unwrap(),
+        "--format",
+        "hf-jsonl",
+        "--split",
+        "train",
+        "--include-payloads",
+        "--out",
+        stream_out.to_str().unwrap(),
+    ]);
+    assert!(
+        stream.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&stream.stdout),
+        String::from_utf8_lossy(&stream.stderr)
+    );
+    assert!(
+        fs::read_to_string(&stream_out)
+            .unwrap()
+            .contains("\"payload_access\":\"allowed\""),
+        "streamed archive should include policy-gated payloads"
+    );
+
+    let diff = run_cove(&[
+        "ai",
+        "diff",
+        archive.to_str().unwrap(),
+        archive.to_str().unwrap(),
+        "--keys",
+        "sample_id",
+        "--report",
+        diff_report.to_str().unwrap(),
+    ]);
+    assert!(
+        diff.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&diff.stdout),
+        String::from_utf8_lossy(&diff.stderr)
+    );
+    let diff_json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&diff_report).unwrap()).unwrap();
+    assert!(diff_json["added"].as_array().unwrap().is_empty());
+    assert!(diff_json["removed"].as_array().unwrap().is_empty());
+    assert!(diff_json["changed"].as_array().unwrap().is_empty());
+
+    let showcase = run_cove(&[
+        "showcase",
+        "ai-training",
+        "--profile",
+        "quick",
+        "--out",
+        showcase_dir.to_str().unwrap(),
+        "--force",
+        "--json",
+    ]);
+    let showcase_stdout = String::from_utf8_lossy(&showcase.stdout);
+    assert!(
+        showcase.status.success(),
+        "stdout={showcase_stdout}\nstderr={}",
+        String::from_utf8_lossy(&showcase.stderr)
+    );
+    assert!(showcase_dir.join("training.coveai").exists());
+    assert!(showcase_dir.join("training.hf.jsonl").exists());
+    assert!(showcase_dir.join("training.parquet").exists());
+    assert!(showcase_dir.join("training.tar").exists());
+}
+
+#[test]
 fn inspect_ai_reports_covemap_ai_policy() {
     let path = temp_file("policy.covemap");
     fs::write(&path, covemap_ai_policy_bytes()).unwrap();

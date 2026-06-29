@@ -1,0 +1,15 @@
+base_model: /path/to/local/model
+load_in_8bit: false
+datasets:
+  - path: target/cove-ai-training/training.hf.jsonl
+    type: sharegpt
+dataset_prepared_path: target/cove-ai-training/axolotl-prepared
+output_dir: target/cove-ai-training/axolotl-output
+sequence_len: 2048
+sample_packing: true
+eval_sample_packing: false
+wandb_mode: disabled
+
+# Generate the interop dataset first:
+#   cove showcase ai-training --profile quick --out target/cove-ai-training --force
+# COVE-AI remains the archive authority; this file points Axolotl at the exported HF-JSONL copy.

@@ -13,6 +13,10 @@ use std::{
 use arrow_array::{ArrayRef, BooleanArray, Int64Array, RecordBatch, StringArray};
 use arrow_ipc::reader::{FileReader, StreamReader};
 use arrow_schema::{DataType, Field, Schema};
+use cove_ai_adapters::{
+    import_jsonl, open as open_ai_archive, AiArchiveOpenOptions, AiExportOptions, AiImportOptions,
+    AiImportSchema, AiSampleIteratorOptions, AiVerifyOptions,
+};
 use cove_arrow::convert::{
     convert_arrow_record_batches, ParquetAccelerationPolicy, ParquetAggregatePolicy,
     ParquetConversionOptions, ParquetDictionaryPolicy, ParquetStatsPolicy,
@@ -225,6 +229,31 @@ fn generate_corpus(profile: &str, out: &Path) -> Result<(), String> {
     )?;
     durable::durable_replace(&out.join("events-ai.covev"), &ai_vector_bytes)
         .map_err(|err| format!("cannot publish events-ai.covev: {err}"))?;
+    let ai_training_source = out.join("ai-training-source.jsonl");
+    let ai_training_archive = out.join("ai-training.coveai");
+    fs::write(
+        &ai_training_source,
+        benchmark_training_source_jsonl(match profile {
+            "ci" => 128,
+            "standard" => 2_048,
+            "publication" => 8_192,
+            _ => unreachable!(),
+        }),
+    )
+    .map_err(|err| format!("cannot publish AI training source: {err}"))?;
+    import_jsonl(
+        &ai_training_source,
+        Some(&ai_training_archive),
+        AiImportOptions {
+            schema: AiImportSchema::Instruction,
+            split_column: Some("split".to_string()),
+            publish_covm: true,
+            artifact_id: Some([0x85; 16]),
+            created_at_us: Some(1_002),
+            ..AiImportOptions::default()
+        },
+    )
+    .map_err(|err| format!("cannot build benchmark AI training archive: {err}"))?;
     write_parquet_file(&out.join("events.parquet"), &batch)?;
     write_orc_file(&out.join("events.orc"), &batch)?;
     validate_orc_parity(&out.join("events.orc"), &batch)?;
@@ -248,6 +277,11 @@ fn generate_corpus(profile: &str, out: &Path) -> Result<(), String> {
         )?,
         dataset_lock("events-covi", "events.covi", &covi_bytes)?,
         dataset_lock("events-ai", "events-ai.covev", &ai_vector_bytes)?,
+        dataset_lock(
+            "ai-training",
+            "ai-training.coveai",
+            &fs::read(&ai_training_archive).map_err(|err| err.to_string())?,
+        )?,
         dataset_lock(
             "synthetic-cache",
             "synthetic-cache.cove",
@@ -307,6 +341,37 @@ fn benchmark_vector_payload(dimension_count: u32, file_codes: &[u32]) -> Vec<u8>
         }
     }
     payload
+}
+
+fn benchmark_training_source_jsonl(sample_count: usize) -> String {
+    let mut out = String::new();
+    for index in 0..sample_count {
+        let split = if index % 100 == 0 {
+            "test"
+        } else if index % 50 == 0 {
+            "validation"
+        } else {
+            "train"
+        };
+        let row = json!({
+            "sample_id": format!("bench-{index:08}"),
+            "instruction": format!("Explain governed training archive sample {index}."),
+            "input": format!("source_record={index}; split={split}"),
+            "output": format!("COVE-AI keeps sample {index} reproducible and policy-auditable."),
+            "split": split,
+            "generator": {
+                "provider": "cove-bench",
+                "model": "deterministic-fixture"
+            },
+            "policy": {
+                "payload_permission": index % 37 != 0,
+                "diagnostic": if index % 37 == 0 { "benchmark_policy_withheld" } else { "allowed" }
+            }
+        });
+        out.push_str(&serde_json::to_string(&row).unwrap());
+        out.push('\n');
+    }
+    out
 }
 
 fn generate_publication_gap_datasets(
@@ -1288,7 +1353,132 @@ fn run_ai_cases(corpus: &Path) -> Result<Vec<Value>, String> {
             }
         }
     }));
+    cases.push(run_ai_training_archive_case(corpus)?);
     Ok(cases)
+}
+
+fn run_ai_training_archive_case(corpus: &Path) -> Result<Value, String> {
+    let source = corpus.join("ai-training-source.jsonl");
+    let archive_path = corpus.join("ai-training.coveai");
+    if !source.is_file() || !archive_path.is_file() {
+        return Ok(json!({
+            "id": "ai_training_archive_report",
+            "category": "COVE-AI training archive adoption workflow",
+            "status": "skipped",
+            "metrics": {},
+            "optional_features": ["cove_ai", "cove_train"],
+        }));
+    }
+    let source_text = fs::read_to_string(&source)
+        .map_err(|err| format!("cannot read {}: {err}", source.display()))?;
+    let sample_count = source_text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count() as u64;
+    let policy_withheld_count = source_text.matches("\"payload_permission\":false").count() as u64;
+
+    let reimport_path = corpus.join("ai-training-reimport.coveai");
+    let import_start = Instant::now();
+    import_jsonl(
+        &source,
+        Some(&reimport_path),
+        AiImportOptions {
+            schema: AiImportSchema::Instruction,
+            split_column: Some("split".to_string()),
+            artifact_id: Some([0x86; 16]),
+            created_at_us: Some(1_003),
+            ..AiImportOptions::default()
+        },
+    )
+    .map_err(|err| format!("AI training archive import benchmark failed: {err}"))?;
+    let import_latency_ns = import_start.elapsed().as_nanos() as u64;
+
+    let archive = open_ai_archive(
+        &archive_path,
+        AiArchiveOpenOptions {
+            cove_ai: None,
+            dataset_dir: Some(corpus.to_path_buf()),
+        },
+    )?;
+    let verify_start = Instant::now();
+    let verify_report = archive.verify(AiVerifyOptions {
+        policy_report: true,
+    })?;
+    let verify_latency_ns = verify_start.elapsed().as_nanos() as u64;
+
+    let stream_start = Instant::now();
+    let samples = archive.training_samples(AiSampleIteratorOptions {
+        split: Some("train".to_string()),
+        include_payloads: true,
+    })?;
+    let stream_latency_ns = stream_start.elapsed().as_nanos() as u64;
+    let payload_bytes_read = samples.iter().map(ai_payload_bytes_in_record).sum::<u64>();
+
+    let export_start = Instant::now();
+    let export = archive.export(AiExportOptions {
+        format: "hf-jsonl".to_string(),
+        out: None,
+        split: Some("train".to_string()),
+        include_payloads: true,
+        policy_report: true,
+    })?;
+    let export_latency_ns = export_start.elapsed().as_nanos() as u64;
+
+    let measured_samples = sample_count.max(1) as f64;
+    Ok(json!({
+        "id": "ai_training_archive_report",
+        "category": "COVE-AI training archive import/verify/stream/export report",
+        "status": "measured",
+        "metrics": {
+            "sample_count": sample_count,
+            "train_sample_count": samples.len(),
+            "verify_report_sample_count": verify_report
+                .get("training_sample_count")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            "ai_import_samples_per_sec": samples_per_sec(measured_samples, import_latency_ns),
+            "ai_verify_samples_per_sec": samples_per_sec(measured_samples, verify_latency_ns),
+            "ai_stream_samples_per_sec": samples_per_sec(samples.len().max(1) as f64, stream_latency_ns),
+            "ai_export_samples_per_sec": samples_per_sec(samples.len().max(1) as f64, export_latency_ns),
+            "ai_payload_bytes_read": payload_bytes_read,
+            "ai_policy_withheld_count": policy_withheld_count,
+            "ai_context_latency_ms": 0.0,
+            "ai_vector_search_latency_ms": 0.0,
+            "ai_export_format": "hf-jsonl",
+            "import_latency_ns": import_latency_ns,
+            "verify_latency_ns": verify_latency_ns,
+            "stream_latency_ns": stream_latency_ns,
+            "export_latency_ns": export_latency_ns,
+            "export_bytes": export.bytes.len(),
+            "bytes_read": fs::metadata(&archive_path).map(|metadata| metadata.len()).unwrap_or(0),
+            "request_count": 4,
+            "fragments_visited": 1,
+            "pages_visited": samples.len(),
+            "pruning_tightness": 1.0,
+        },
+        "optional_features": ["cove_ai", "cove_train"],
+    }))
+}
+
+fn samples_per_sec(sample_count: f64, latency_ns: u64) -> f64 {
+    if latency_ns == 0 {
+        return sample_count;
+    }
+    sample_count / (latency_ns as f64 / 1_000_000_000.0)
+}
+
+fn ai_payload_bytes_in_record(value: &Value) -> u64 {
+    match value {
+        Value::Object(object) => {
+            let here = object
+                .get("decoded_length")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            here + object.values().map(ai_payload_bytes_in_record).sum::<u64>()
+        }
+        Value::Array(array) => array.iter().map(ai_payload_bytes_in_record).sum(),
+        _ => 0,
+    }
 }
 
 fn run_cache_cases(corpus: &Path) -> Result<Vec<Value>, String> {
@@ -5525,6 +5715,7 @@ fn validate_report_cases(cases: &[Value]) -> Result<(), String> {
         "top_n",
         "point_lookup",
         "ai_vector_search_report",
+        "ai_training_archive_report",
         "covi_index_latency",
         "covi_index_only_count",
         "object_store_cold_warm",
@@ -5779,6 +5970,45 @@ fn validate_ai_benchmark_case(cases: &[Value]) -> Result<(), String> {
     }
     if !case_bool(case, "/metrics/filtered_top_k_complete") {
         return Err("ai_vector_search_report did not mark filtered top-k completeness".into());
+    }
+    let training_case = require_measured_case(cases, "ai_training_archive_report")?;
+    let training_metrics = training_case
+        .get("metrics")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "ai_training_archive_report is missing metrics".to_string())?;
+    for field in [
+        "sample_count",
+        "train_sample_count",
+        "ai_import_samples_per_sec",
+        "ai_verify_samples_per_sec",
+        "ai_stream_samples_per_sec",
+        "ai_export_samples_per_sec",
+        "ai_payload_bytes_read",
+        "ai_policy_withheld_count",
+        "ai_context_latency_ms",
+        "ai_vector_search_latency_ms",
+        "ai_export_format",
+        "export_bytes",
+    ] {
+        if !training_metrics.contains_key(field) {
+            return Err(format!("ai_training_archive_report missing metric {field}"));
+        }
+    }
+    if case_u64(training_case, "/metrics/sample_count") == 0 {
+        return Err("ai_training_archive_report did not measure samples".into());
+    }
+    if case_u64(training_case, "/metrics/train_sample_count") == 0 {
+        return Err("ai_training_archive_report did not stream train samples".into());
+    }
+    if case_u64(training_case, "/metrics/ai_payload_bytes_read") == 0 {
+        return Err("ai_training_archive_report did not read payload bytes".into());
+    }
+    if training_case
+        .pointer("/metrics/ai_export_format")
+        .and_then(Value::as_str)
+        != Some("hf-jsonl")
+    {
+        return Err("ai_training_archive_report did not report hf-jsonl export".into());
     }
     Ok(())
 }
@@ -6291,6 +6521,54 @@ fn markdown_report(report: &Value) -> String {
                     .get("payload_bytes_read")
                     .and_then(Value::as_u64)
                     .unwrap_or(0),
+            ));
+        }
+        if let Some(ai_training_case) = cases
+            .iter()
+            .find(|case| case.get("id") == Some(&json!("ai_training_archive_report")))
+        {
+            let metrics = ai_training_case.get("metrics").unwrap_or(&Value::Null);
+            out.push_str("\n## COVE-AI Training Archive Report\n\n");
+            out.push_str("| Samples | Train samples | Import rows/s | Verify rows/s | Stream rows/s | Export rows/s | Payload bytes | Withheld | Format |\n");
+            out.push_str("| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |\n");
+            out.push_str(&format!(
+                "| {} | {} | {:.1} | {:.1} | {:.1} | {:.1} | {} | {} | {} |\n",
+                metrics
+                    .get("sample_count")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                metrics
+                    .get("train_sample_count")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                metrics
+                    .get("ai_import_samples_per_sec")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0),
+                metrics
+                    .get("ai_verify_samples_per_sec")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0),
+                metrics
+                    .get("ai_stream_samples_per_sec")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0),
+                metrics
+                    .get("ai_export_samples_per_sec")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0),
+                metrics
+                    .get("ai_payload_bytes_read")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                metrics
+                    .get("ai_policy_withheld_count")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                metrics
+                    .get("ai_export_format")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown"),
             ));
         }
         let overlap_scale_cases = cases

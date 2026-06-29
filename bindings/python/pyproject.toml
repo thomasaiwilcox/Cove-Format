@@ -1,0 +1,27 @@
+[build-system]
+requires = ["maturin>=1.5,<2"]
+build-backend = "maturin"
+
+[project]
+name = "cove-ai"
+version = "0.1.0"
+description = "Python access to COVE-AI governed training archives"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Rust",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = []
+
+[project.optional-dependencies]
+hf = ["datasets>=2"]
+torch = ["torch>=2"]
+webdataset = ["webdataset>=0.2"]
+
+[tool.maturin]
+module-name = "cove_ai._native"
+python-source = "python"
+features = ["pyo3/extension-module"]

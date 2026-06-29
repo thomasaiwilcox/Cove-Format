@@ -1,0 +1,16 @@
+[package]
+name = "cove-ai-python"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace]
+
+[lib]
+name = "cove_ai_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+cove-ai-adapters = { path = "../../crates/cove-ai-adapters" }
+pyo3 = { version = "0.21", features = ["abi3-py39"] }
+serde_json = { version = "1", features = ["preserve_order"] }

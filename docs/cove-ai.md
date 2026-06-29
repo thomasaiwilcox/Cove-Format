@@ -16,11 +16,18 @@ The reference implementation currently supports the provider-free COVE-AI
 surface. It validates sidecar framing, descriptor records, reference tables,
 payload references, privacy summaries, payload integrity, MAP-AI slot policy,
 policy-gated payload leases, source-bound chunk text reconstruction, COVM
-AI-sidecar references, and exact flat vector lookup/search across FileCode,
-chunk, object-state, association-state, training-sample, asset, and
-multimodal-sequence vector bindings. It does not call network embedding,
-tokenizer, or model providers. Writer/test commands either consume supplied
-local payloads or generate deterministic local vectors.
+AI-sidecar references, exact flat vector lookup/search, and Cove-owned
+approximate candidate generation across FileCode, chunk, object-state,
+association-state, training-sample, asset, and multimodal-sequence vector
+bindings. It does not call network embedding, tokenizer, ANN service, or model
+providers. Writer/test commands either consume supplied local payloads or
+generate deterministic local vectors.
+
+For training-data adoption, COVE-AI is positioned as the reproducible,
+policy-aware training archive that exports cleanly into the AI stack teams
+already use. See [COVE-AI Training Archive](./ai-training-archive.md) for the
+Python, Hugging Face, PyTorch, WebDataset, import, verify, stream, diff, and
+showcase workflows.
 
 ## Authority Model
 
@@ -71,7 +78,10 @@ The current reference implementation covers:
 - CoveQL-AI methods over supplied sidecars:
   `.embedding()`, `.similar()`, `.chunks()`, `.tokens()`, `.context()`,
   `.asPromptContext()`, `.trainingSamples()`, `.split()`, `.pack()`,
-  `.multimodal()`, `.hybrid()`, `.rerank()`, and `.generatorAudit()`.
+  `.multimodal()`, `.hybrid()`, `.rerank()`, and `.generatorAudit()`;
+- training archive adoption workflows through `cove-ai-adapters`,
+  `cove ai import`, `cove ai verify`, `cove ai stream`, `cove ai diff`,
+  `cove showcase ai-training`, and the `cove-ai` Python package.
 
 Approximate nearest-neighbor index descriptors are parsed, validated, and
 executed by Cove-owned in-process candidate generators. Approximate ANN results
@@ -124,6 +134,12 @@ table(events).embedding(fileCode: 1)'
 cove query --cove-ai target/vectors.covev examples/coveql/events.cove \
   '# profiles: table, ai
 table(events).similar(fileCode: 1, k: 2)'
+
+cove query --cove-ai target/vectors.covev \
+  --explain ai \
+  examples/coveql/events.cove \
+  '# profiles: table, ai
+table(events).similar(fileCode: 1, k: 2)'
 ```
 
 When auto sidecars are enabled, `cove query` also looks for validated sibling
@@ -164,6 +180,38 @@ privacy summaries, revoked payload refs, protected payload refs, external
 payload refs, and stale policy state produce structured withheld diagnostics
 rather than best-effort disclosure.
 
+Import and stream governed training archives:
+
+```bash
+cove ai import jsonl samples.jsonl \
+  --out training.coveai \
+  --schema instruction \
+  --split-policy deterministic \
+  --publish-covm
+
+cove ai verify training.coveai --policy-report --json
+
+cove ai stream training.coveai \
+  --format hf-jsonl \
+  --split train \
+  --include-payloads \
+  --out train.hf.jsonl
+
+cove showcase ai-training --profile quick --out target/cove-ai-training --force
+```
+
+The adoption APIs live in the `cove-ai-adapters` Rust crate and the
+`bindings/python` `cove-ai` package. They can open `.coveai`, `.covev`, and
+digest-bound `.covm` sidecar references; verify freshness and policy state;
+iterate training samples, chunks, tokens, and multimodal records; and export
+JSONL, HF-JSONL, Arrow, Parquet, and WebDataset-style shards.
+
+The detailed training archive guide is
+[`docs/ai-training-archive.md`](./ai-training-archive.md). It documents import
+schemas, split behavior, COVM source freshness checks, Python APIs, optional
+Hugging Face/PyTorch/WebDataset integrations, trainer examples, and benchmark
+report fields.
+
 ## CoveQL-AI
 
 CoveQL-AI is an operation profile, not a baseline query requirement. Queries
@@ -188,6 +236,11 @@ path has separately valid freshness and policy proof.
 
 COVE-CHUNK remains span-only: chunk records store source spans, hashes,
 navigation, evidence, and policy refs, not a second copy of chunk text.
+
+Use `cove query --explain ai` to return structured AI explain output for the
+selected operation, including sidecar freshness, vector-space identity, selected
+index, exactness or approximation, redaction decisions, fallback decisions, and
+withheld metadata.
 
 ## Conformance
 

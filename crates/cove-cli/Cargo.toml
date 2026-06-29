@@ -17,6 +17,7 @@ harness = false
 arrow-array = "58"
 arrow-schema = "58"
 cove-cache = { path = "../cove-cache" }
+cove-ai-adapters = { path = "../cove-ai-adapters" }
 cove-convert-parquet = { path = "../cove-convert-parquet" }
 cove-core = { path = "../cove-core" }
 cove-coverage = { path = "../cove-coverage" }

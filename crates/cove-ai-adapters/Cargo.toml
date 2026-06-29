@@ -1,0 +1,15 @@
+[package]
+name = "cove-ai-adapters"
+version = "0.1.0"
+edition = "2021"
+description = "COVE-AI training archive import, verification, streaming, and export adapters"
+license = "MIT"
+
+[dependencies]
+arrow-array = "58"
+arrow-ipc = "58"
+arrow-schema = "58"
+cove-core = { path = "../cove-core" }
+parquet = { version = "58", default-features = false, features = ["arrow"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }

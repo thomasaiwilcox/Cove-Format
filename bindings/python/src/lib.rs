@@ -1,0 +1,141 @@
+use std::path::PathBuf;
+
+use cove_ai_adapters::{
+    open as open_archive, write_export_file, AiArchiveOpenOptions, AiExportOptions,
+    AiSampleIteratorOptions, AiVerifyOptions,
+};
+use pyo3::{
+    exceptions::PyRuntimeError,
+    prelude::*,
+    types::{PyBytes, PyModule},
+};
+use serde_json::Value;
+
+#[pyclass(name = "TrainingArchive")]
+struct PyTrainingArchive {
+    path: String,
+    cove_ai: Option<String>,
+    dataset_dir: Option<String>,
+}
+
+#[pymethods]
+impl PyTrainingArchive {
+    fn verify(&self, py: Python<'_>, policy_report: Option<bool>) -> PyResult<PyObject> {
+        let archive = self.open_native()?;
+        let value = archive
+            .verify(AiVerifyOptions {
+                policy_report: policy_report.unwrap_or(true),
+            })
+            .map_err(py_error)?;
+        json_to_py(py, &value)
+    }
+
+    fn training_samples(
+        &self,
+        py: Python<'_>,
+        split: Option<String>,
+        include_payloads: Option<bool>,
+    ) -> PyResult<PyObject> {
+        let archive = self.open_native()?;
+        let rows = archive
+            .training_samples(AiSampleIteratorOptions {
+                split,
+                include_payloads: include_payloads.unwrap_or(false),
+            })
+            .map_err(py_error)?;
+        json_to_py(py, &Value::Array(rows))
+    }
+
+    fn chunks(&self, py: Python<'_>, include_text: Option<bool>) -> PyResult<PyObject> {
+        let archive = self.open_native()?;
+        let rows = archive
+            .chunks(include_text.unwrap_or(false))
+            .map_err(py_error)?;
+        json_to_py(py, &Value::Array(rows))
+    }
+
+    fn tokens(&self, py: Python<'_>, include_payloads: Option<bool>) -> PyResult<PyObject> {
+        let archive = self.open_native()?;
+        let rows = archive
+            .tokens(include_payloads.unwrap_or(false))
+            .map_err(py_error)?;
+        json_to_py(py, &Value::Array(rows))
+    }
+
+    fn multimodal(&self, py: Python<'_>, include_payloads: Option<bool>) -> PyResult<PyObject> {
+        let archive = self.open_native()?;
+        let rows = archive
+            .multimodal(include_payloads.unwrap_or(false))
+            .map_err(py_error)?;
+        json_to_py(py, &Value::Array(rows))
+    }
+
+    fn export(
+        &self,
+        py: Python<'_>,
+        format: Option<String>,
+        out: Option<String>,
+        split: Option<String>,
+        include_payloads: Option<bool>,
+    ) -> PyResult<PyObject> {
+        let archive = self.open_native()?;
+        let options = AiExportOptions {
+            format: format.unwrap_or_else(|| "jsonl".to_string()),
+            out: out.as_ref().map(PathBuf::from),
+            split,
+            include_payloads: include_payloads.unwrap_or(false),
+            policy_report: true,
+        };
+        let data = archive.export(options).map_err(py_error)?;
+        if let Some(out) = out {
+            write_export_file(data.clone(), Some(PathBuf::from(out))).map_err(py_error)?;
+        }
+        if data.media_type.starts_with("application/json")
+            || data.media_type == "application/x-ndjson"
+        {
+            Ok(String::from_utf8_lossy(&data.bytes).to_string().into_py(py))
+        } else {
+            Ok(PyBytes::new_bound(py, &data.bytes).into_py(py))
+        }
+    }
+}
+
+impl PyTrainingArchive {
+    fn open_native(&self) -> PyResult<cove_ai_adapters::AiTrainingArchive> {
+        open_archive(
+            &self.path,
+            AiArchiveOpenOptions {
+                cove_ai: self.cove_ai.as_ref().map(PathBuf::from),
+                dataset_dir: self.dataset_dir.as_ref().map(PathBuf::from),
+            },
+        )
+        .map_err(py_error)
+    }
+}
+
+#[pyfunction]
+#[pyo3(signature = (path, cove_ai=None, dataset_dir=None))]
+fn open(path: String, cove_ai: Option<String>, dataset_dir: Option<String>) -> PyTrainingArchive {
+    PyTrainingArchive {
+        path,
+        cove_ai,
+        dataset_dir,
+    }
+}
+
+#[pymodule]
+fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add_class::<PyTrainingArchive>()?;
+    module.add_function(wrap_pyfunction!(open, module)?)?;
+    Ok(())
+}
+
+fn json_to_py(py: Python<'_>, value: &Value) -> PyResult<PyObject> {
+    let json = PyModule::import_bound(py, "json")?;
+    let text = serde_json::to_string(value).map_err(py_error)?;
+    Ok(json.call_method1("loads", (text,))?.into_py(py))
+}
+
+fn py_error(error: impl ToString) -> PyErr {
+    PyRuntimeError::new_err(format!("COVE_AI_ERROR: {}", error.to_string()))
+}

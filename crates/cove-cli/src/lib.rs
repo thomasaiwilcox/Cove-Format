@@ -16,6 +16,11 @@ use std::{
 
 use arrow_array::{ArrayRef, RecordBatch, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
+use cove_ai_adapters::{
+    build_ai_training_showcase, diff_archives, import_hf_dir, import_jsonl, import_parquet,
+    open as open_ai_archive, stream_archive, write_export_file, AiArchiveOpenOptions,
+    AiExportOptions, AiImportOptions, AiImportSchema, AiSplitPolicy, AiVerifyOptions,
+};
 use cove_core::{
     artifact::{
         coveai::{
@@ -89,6 +94,12 @@ enum Command {
         out_dir: PathBuf,
         profile: Customer360Profile,
         scenario: ProofSuiteScenario,
+        force: bool,
+        json: bool,
+    },
+    ShowcaseAiTraining {
+        out_dir: PathBuf,
+        profile: Customer360Profile,
         force: bool,
         json: bool,
     },
@@ -257,6 +268,12 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<(), String> {
             force,
             json,
         } => run_showcase_proof_suite(&out_dir, profile, scenario, force, json),
+        Command::ShowcaseAiTraining {
+            out_dir,
+            profile,
+            force,
+            json,
+        } => run_showcase_ai_training(&out_dir, profile, force, json),
         Command::Query(command) => run_query(
             command.file.as_deref(),
             &command.query,
@@ -659,8 +676,11 @@ fn parse_showcase(mut args: Vec<String>) -> Result<Command, String> {
     if name == "proof-suite" {
         return parse_showcase_proof_suite(args);
     }
+    if name == "ai-training" {
+        return parse_showcase_ai_training(args);
+    }
     Err(format!(
-        "unknown showcase '{name}'; expected customer360 or proof-suite\n\n{}",
+        "unknown showcase '{name}'; expected customer360, proof-suite, or ai-training\n\n{}",
         usage(HelpTopic::Showcase)
     ))
 }
@@ -754,6 +774,49 @@ fn parse_showcase_proof_suite(args: Vec<String>) -> Result<Command, String> {
         out_dir,
         profile,
         scenario,
+        force,
+        json,
+    })
+}
+
+fn parse_showcase_ai_training(args: Vec<String>) -> Result<Command, String> {
+    let mut out_dir = None;
+    let mut profile = Customer360Profile::Quick;
+    let mut force = false;
+    let mut json = false;
+    let mut iter = args.into_iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--out" => {
+                out_dir =
+                    Some(PathBuf::from(iter.next().ok_or_else(|| {
+                        "--out requires a directory path".to_string()
+                    })?));
+            }
+            "--profile" => {
+                let value = iter.next().ok_or_else(|| {
+                    "--profile requires quick, standard, or publication".to_string()
+                })?;
+                profile = Customer360Profile::parse(&value)?;
+            }
+            "--force" => force = true,
+            "--json" => json = true,
+            "-h" | "--help" => return Ok(Command::Help(HelpTopic::Showcase)),
+            arg if arg.starts_with("--") => {
+                return Err(format!("unknown ai-training showcase option '{arg}'"))
+            }
+            _ => return Err("showcase ai-training does not accept positional arguments".into()),
+        }
+    }
+    let out_dir = out_dir.ok_or_else(|| {
+        format!(
+            "--out is required for showcase ai-training\n\n{}",
+            usage(HelpTopic::Showcase)
+        )
+    })?;
+    Ok(Command::ShowcaseAiTraining {
+        out_dir,
+        profile,
         force,
         json,
     })
@@ -1395,19 +1458,285 @@ fn run_vec_build(args: Vec<String>) -> Result<(), String> {
 
 fn run_ai(mut args: Vec<String>) -> Result<(), String> {
     if args.is_empty() {
-        return Err("missing ai subcommand; expected: cove ai export <kind> <sidecar>".into());
+        return Err(format!("missing ai subcommand\n\n{}", usage(HelpTopic::Ai)));
     }
     let subcommand = args.remove(0);
     match subcommand.as_str() {
         "export" => run_ai_export(args),
+        "import" => run_ai_import(args),
+        "verify" => run_ai_verify(args),
+        "stream" => run_ai_stream(args),
+        "diff" => run_ai_diff(args),
         "-h" | "--help" => {
-            println!(
-                "Usage:\n  cove ai export <chunks|tokens|vectors|training|multimodal|assets|tensors> <sidecar> [--include-payloads] [--format json|jsonl|hf-jsonl|arrow|parquet|webdataset] [--out <path>] [--policy-report]"
-            );
+            print_usage(HelpTopic::Ai);
             Ok(())
         }
-        other => Err(format!("unknown ai subcommand '{other}'")),
+        other => Err(format!(
+            "unknown ai subcommand '{other}'\n\n{}",
+            usage(HelpTopic::Ai)
+        )),
     }
+}
+
+fn run_ai_import(mut args: Vec<String>) -> Result<(), String> {
+    if args.is_empty() {
+        return Err(format!(
+            "missing ai import source kind\n\n{}",
+            usage(HelpTopic::Ai)
+        ));
+    }
+    let source_kind = args.remove(0);
+    let mut input: Option<PathBuf> = None;
+    let mut out: Option<PathBuf> = None;
+    let mut schema = AiImportSchema::Instruction;
+    let mut split_policy = AiSplitPolicy::Deterministic;
+    let mut split_column = None;
+    let mut dry_run = false;
+    let mut publish_covm = false;
+
+    let mut iter = args.into_iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--out" => {
+                out = Some(PathBuf::from(
+                    iter.next()
+                        .ok_or_else(|| "--out requires a path".to_string())?,
+                ));
+            }
+            "--schema" => {
+                schema = AiImportSchema::parse(
+                    &iter
+                        .next()
+                        .ok_or_else(|| "--schema requires a value".to_string())?,
+                )?;
+            }
+            "--split-policy" => {
+                split_policy = AiSplitPolicy::parse(
+                    &iter
+                        .next()
+                        .ok_or_else(|| "--split-policy requires a value".to_string())?,
+                )?;
+            }
+            "--split-column" => {
+                split_column = Some(
+                    iter.next()
+                        .ok_or_else(|| "--split-column requires a column name".to_string())?,
+                );
+            }
+            "--dry-run" => dry_run = true,
+            "--publish-covm" => publish_covm = true,
+            "-h" | "--help" => {
+                print_usage(HelpTopic::Ai);
+                return Ok(());
+            }
+            value if value.starts_with('-') => {
+                return Err(format!("unknown ai import argument '{value}'"));
+            }
+            value => {
+                if input.replace(PathBuf::from(value)).is_some() {
+                    return Err("ai import accepts exactly one input path".into());
+                }
+            }
+        }
+    }
+    let input = input.ok_or_else(|| "ai import requires an input path".to_string())?;
+    let options = AiImportOptions {
+        schema,
+        split_policy,
+        split_column,
+        dry_run,
+        publish_covm,
+        ..AiImportOptions::default()
+    };
+    let report = match source_kind.as_str() {
+        "jsonl" => import_jsonl(&input, out.as_deref(), options),
+        "parquet" => import_parquet(&input, out.as_deref(), options),
+        "hf" => import_hf_dir(&input, out.as_deref(), options),
+        other => Err(format!(
+            "unknown ai import kind '{other}'; expected jsonl, parquet, or hf"
+        )),
+    }?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report)
+            .map_err(|error| format!("cannot serialize AI import report: {error}"))?
+    );
+    Ok(())
+}
+
+fn run_ai_verify(args: Vec<String>) -> Result<(), String> {
+    let mut input = None;
+    let mut policy_report = false;
+    let mut json_output = false;
+    let mut dataset_dir: Option<PathBuf> = None;
+    let mut iter = args.into_iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--policy-report" => policy_report = true,
+            "--json" => json_output = true,
+            "--dataset" => {
+                dataset_dir =
+                    Some(PathBuf::from(iter.next().ok_or_else(|| {
+                        "--dataset requires a directory".to_string()
+                    })?));
+            }
+            "-h" | "--help" => {
+                print_usage(HelpTopic::Ai);
+                return Ok(());
+            }
+            value if value.starts_with('-') => {
+                return Err(format!("unknown ai verify argument '{value}'"));
+            }
+            value => {
+                if input.replace(PathBuf::from(value)).is_some() {
+                    return Err("ai verify accepts exactly one sidecar or manifest".into());
+                }
+            }
+        }
+    }
+    let input = input.ok_or_else(|| "ai verify requires a sidecar or manifest".to_string())?;
+    let archive = open_ai_archive(
+        &input,
+        AiArchiveOpenOptions {
+            cove_ai: None,
+            dataset_dir,
+        },
+    )?;
+    let report = archive.verify(AiVerifyOptions { policy_report })?;
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report)
+                .map_err(|error| format!("cannot serialize AI verify report: {error}"))?
+        );
+    } else {
+        println!("COVE-AI archive: {}", input.display());
+        println!(
+            "  samples: {}",
+            report
+                .get("training_sample_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+        );
+        println!(
+            "  payload_access: {}",
+            report
+                .get("payload_access")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown")
+        );
+        println!(
+            "  withheld diagnostics: {}",
+            report
+                .get("withheld_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+        );
+    }
+    Ok(())
+}
+
+fn run_ai_stream(args: Vec<String>) -> Result<(), String> {
+    let mut input = None;
+    let mut out = None;
+    let mut format = "jsonl".to_string();
+    let mut split = None;
+    let mut include_payloads = false;
+    let mut iter = args.into_iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--format" => {
+                format = iter
+                    .next()
+                    .ok_or_else(|| "--format requires a value".to_string())?;
+            }
+            "--split" => {
+                split =
+                    Some(iter.next().ok_or_else(|| {
+                        "--split requires train, validation, or test".to_string()
+                    })?);
+            }
+            "--include-payloads" => include_payloads = true,
+            "--out" => {
+                out = Some(PathBuf::from(
+                    iter.next()
+                        .ok_or_else(|| "--out requires a path".to_string())?,
+                ));
+            }
+            "-h" | "--help" => {
+                print_usage(HelpTopic::Ai);
+                return Ok(());
+            }
+            value if value.starts_with('-') => {
+                return Err(format!("unknown ai stream argument '{value}'"));
+            }
+            value => {
+                if input.replace(PathBuf::from(value)).is_some() {
+                    return Err("ai stream accepts exactly one sidecar or manifest".into());
+                }
+            }
+        }
+    }
+    let input = input.ok_or_else(|| "ai stream requires a sidecar or manifest".to_string())?;
+    if matches!(format.as_str(), "arrow" | "parquet" | "webdataset") && out.is_none() {
+        return Err(format!("ai stream --format {format} requires --out"));
+    }
+    let data = stream_archive(
+        &input,
+        AiExportOptions {
+            format,
+            out: out.clone(),
+            split,
+            include_payloads,
+            policy_report: true,
+        },
+    )?;
+    write_export_file(data, out)
+}
+
+fn run_ai_diff(args: Vec<String>) -> Result<(), String> {
+    let mut old = None;
+    let mut new = None;
+    let mut key_field = "sample_id".to_string();
+    let mut report_path = None;
+    let mut iter = args.into_iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--keys" => {
+                key_field = iter
+                    .next()
+                    .ok_or_else(|| "--keys requires a key field".to_string())?;
+            }
+            "--report" => {
+                report_path = Some(PathBuf::from(
+                    iter.next()
+                        .ok_or_else(|| "--report requires a path".to_string())?,
+                ));
+            }
+            "-h" | "--help" => {
+                print_usage(HelpTopic::Ai);
+                return Ok(());
+            }
+            value if value.starts_with('-') => {
+                return Err(format!("unknown ai diff argument '{value}'"));
+            }
+            value if old.is_none() => old = Some(PathBuf::from(value)),
+            value if new.is_none() => new = Some(PathBuf::from(value)),
+            _ => return Err("ai diff accepts exactly two sidecars".into()),
+        }
+    }
+    let old = old.ok_or_else(|| "ai diff requires <old.coveai>".to_string())?;
+    let new = new.ok_or_else(|| "ai diff requires <new.coveai>".to_string())?;
+    let report = diff_archives(&old, &new, &key_field)?;
+    let text = serde_json::to_string_pretty(&report)
+        .map_err(|error| format!("cannot serialize AI diff report: {error}"))?;
+    if let Some(report_path) = report_path {
+        fs::write(&report_path, text)
+            .map_err(|error| format!("cannot write {}: {error}", report_path.display()))?;
+    } else {
+        println!("{text}");
+    }
+    Ok(())
 }
 
 fn run_ai_export(args: Vec<String>) -> Result<(), String> {
@@ -3149,6 +3478,10 @@ fn run_examples(json: bool) -> Result<(), String> {
             "cove showcase proof-suite --scenario all --profile quick --out target/cove-proof-suite --force",
         ),
         (
+            "Generate the COVE-AI training archive showcase",
+            "cove showcase ai-training --profile quick --out target/cove-ai-training --force",
+        ),
+        (
             "Inspect canonical customer surfaces",
             "cove inspect --queries --performance examples/customer360/customers.cove",
         ),
@@ -3312,6 +3645,46 @@ fn run_showcase_proof_suite(
         );
         println!(
             "  cove map doctor --bundle-dir {}/catalog/map-build-bundle",
+            out_dir.display()
+        );
+    }
+    Ok(())
+}
+
+fn run_showcase_ai_training(
+    out_dir: &Path,
+    profile: Customer360Profile,
+    force: bool,
+    json: bool,
+) -> Result<(), String> {
+    let manifest = build_ai_training_showcase(out_dir, profile.as_str(), force)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&manifest).map_err(|error| format!(
+                "cannot serialize AI training showcase manifest: {error}"
+            ))?
+        );
+    } else {
+        println!(
+            "Generated COVE-AI training archive showcase ({}) at {}",
+            profile.as_str(),
+            out_dir.display()
+        );
+        println!("Archive: {}", out_dir.join("training.coveai").display());
+        println!("Manifest: {}", out_dir.join("training.covm").display());
+        println!("Try next:");
+        println!(
+            "  cove ai verify {} --policy-report",
+            out_dir.join("training.coveai").display()
+        );
+        println!(
+            "  cove ai stream {} --format hf-jsonl --split train",
+            out_dir.join("training.coveai").display()
+        );
+        println!(
+            "  python3 {}/load_archive.py {}/training.coveai",
+            out_dir.display(),
             out_dir.display()
         );
     }
