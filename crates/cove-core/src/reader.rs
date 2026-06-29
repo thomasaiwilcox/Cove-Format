@@ -464,6 +464,14 @@ fn validate_primary_profile_features(header: &CoveHeaderV1) -> Result<(), CoveEr
         PrimaryProfile::RuntimeCompatibility => FEATURE_RUNTIME_COMPATIBILITY_HINTS,
         PrimaryProfile::CoverageMetadata => FEATURE_COVERAGE_METADATA,
         PrimaryProfile::SecondaryIndex => FEATURE_SECONDARY_INDEX_ARTIFACT,
+        PrimaryProfile::CoveAiShared
+        | PrimaryProfile::CoveMapAi
+        | PrimaryProfile::CoveChunk
+        | PrimaryProfile::CoveTok
+        | PrimaryProfile::CoveVec
+        | PrimaryProfile::CoveMmseq
+        | PrimaryProfile::CoveTrain
+        | PrimaryProfile::CoveQlAi => return Ok(()),
     };
 
     if header.required_features & required_bit == 0 {

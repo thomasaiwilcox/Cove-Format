@@ -1,4 +1,5 @@
 use cove_core::{
+    artifact::coveai::{write_coveai_artifact, CoveAiArtifactKind},
     checksum, compression,
     constants::{
         CoveEncodingKind, CoveLogicalType, CovePhysicalKind, PrimaryProfile, SectionKind,
@@ -22,6 +23,18 @@ fn cove_command() -> std::process::Command {
         .current_dir(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.."))
         .args(["run", "-p", "cove-cli", "--quiet", "--"]);
     command
+}
+
+fn write_temp_file_with_ext(name: &str, ext: &str, bytes: &[u8]) -> std::path::PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "cove_validate_{name}_{}_{}.{}",
+        std::process::id(),
+        std::thread::current().name().unwrap_or("test"),
+        ext
+    ));
+    let mut file = std::fs::File::create(&path).unwrap();
+    file.write_all(bytes).unwrap();
+    path
 }
 
 fn write_temp_file(name: &str, bytes: &[u8]) -> std::path::PathBuf {
@@ -486,6 +499,19 @@ fn validate_corrupted_file() {
         "cove validate should return non-zero for a corrupt file"
     );
     // Cleanup is best-effort; if removal fails the test OS will clean up temp files.
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn validate_accepts_standalone_coveai_json() {
+    let bytes =
+        write_coveai_artifact(CoveAiArtifactKind::CoveAiBundle, [3u8; 16], 42, &[]).unwrap();
+    let path = write_temp_file_with_ext("coveai", "coveai", &bytes);
+    let output = run_validate_json_explain(&path, false);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+    assert!(stdout.contains("\"artifact\":\"coveai\""), "{stdout}");
+    assert!(stdout.contains("\"section_count\":0"), "{stdout}");
     let _ = std::fs::remove_file(&path);
 }
 

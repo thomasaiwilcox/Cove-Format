@@ -1,8 +1,8 @@
 use std::path::Path;
 
 use cove_core::{
-    artifact::{covedelta::CoveDeltaFile, covemap::CovemapFile},
-    constants::{MAGIC_COVE, MAGIC_COVEDELTA, MAGIC_COVEMAP},
+    artifact::{coveai::CoveAiFile, covedelta::CoveDeltaFile, covemap::CovemapFile},
+    constants::{MAGIC_COVE, MAGIC_COVEAI, MAGIC_COVEDELTA, MAGIC_COVEMAP, MAGIC_COVEV},
     feature_scope::FeatureUseRequestV2,
     reader::{self, ValidationOptions},
 };
@@ -82,6 +82,12 @@ fn validate_file_json(
 
     if data.len() >= 4 && data[data.len() - 4..] == MAGIC_COVEDELTA {
         return validate_covedelta_json(&path_str, &data, object_delta, explain);
+    }
+
+    if data.len() >= 4
+        && (data[data.len() - 4..] == MAGIC_COVEAI || data[data.len() - 4..] == MAGIC_COVEV)
+    {
+        return validate_coveai_json(&path_str, &data, explain);
     }
 
     match validate_cove_bytes(&data, opts, feature_use) {
@@ -283,6 +289,12 @@ fn validate_file_text(
         return validate_covedelta_file(&data, object_delta);
     }
 
+    if data.len() >= 4
+        && (data[data.len() - 4..] == MAGIC_COVEAI || data[data.len() - 4..] == MAGIC_COVEV)
+    {
+        return validate_coveai_file(&data);
+    }
+
     if data.len() < 4 || data[data.len() - 4..] != MAGIC_COVE {
         println!("INVALID");
         eprintln!("  [ERR] COVE_E_BAD_MAGIC: unrecognized trailing magic");
@@ -350,6 +362,93 @@ fn validate_covedelta_file(data: &[u8], object_delta: bool) -> bool {
                 "structural"
             };
             println!("OK [covedelta {mode}]");
+            true
+        }
+        Err(error) => {
+            println!("INVALID");
+            eprintln!("  [ERR] {error}");
+            false
+        }
+    }
+}
+
+fn validate_coveai_json(path_str: &str, data: &[u8], explain: bool) -> bool {
+    match CoveAiFile::parse(data) {
+        Ok(file) => {
+            print!(
+                "{{\"path\":{},\"ok\":true,\"artifact\":\"{}\",\"version_major\":{},\"version_minor\":{},\"section_count\":{},\"payload_access\":{}",
+                json_str(path_str),
+                match file.artifact_kind {
+                    cove_core::artifact::coveai::CoveAiArtifactKind::CoveAiBundle => "coveai",
+                    cove_core::artifact::coveai::CoveAiArtifactKind::CoveVec => "covev",
+                },
+                file.header.version_major,
+                file.header.version_minor,
+                file.sections.len(),
+                json_str(&format!("{:?}", file.payload_access))
+            );
+            if explain {
+                print!(
+                    ",\"records\":{{\"source_bindings\":{},\"payload_refs\":{},\"payload_integrity\":{},\"privacy_summaries\":{},\"vector_spaces\":{},\"vector_payload_blocks\":{},\"vector_entries\":{},\"filecode_vector_bindings\":{}}}",
+                    file.descriptor_tables.source_bindings.len(),
+                    file.descriptor_tables.payload_refs.len(),
+                    file.descriptor_tables.payload_integrity.len(),
+                    file.descriptor_tables.privacy_summaries.len(),
+                    file.descriptor_tables.vector_spaces.len(),
+                    file.descriptor_tables.vector_payload_blocks.len(),
+                    file.descriptor_tables.vector_entries.len(),
+                    file.descriptor_tables.filecode_vector_bindings.len()
+                );
+                print!(",\"sections\":[");
+                for (index, section) in file.sections.iter().enumerate() {
+                    if index > 0 {
+                        print!(",");
+                    }
+                    print!(
+                        "{{\"id\":{},\"kind\":{},\"offset\":{},\"length\":{},\"encoding\":{},\"profile\":{},\"records\":{}}}",
+                        section.entry.section_id,
+                        section.entry.section_kind,
+                        section.entry.offset,
+                        section.entry.length,
+                        section.entry.payload_encoding,
+                        section.entry.profile_kind,
+                        section.record_headers.len()
+                    );
+                }
+                print!("]");
+            }
+            print!("}}");
+            true
+        }
+        Err(error) => {
+            print!("{{\"path\":{},\"ok\":false", json_str(path_str));
+            if let Some(code) = error.spec_code() {
+                print!(",\"error_code\":{}", json_str(code));
+            }
+            print!(",\"error\":{}}}", json_str(&error.to_string()));
+            false
+        }
+    }
+}
+
+fn validate_coveai_file(data: &[u8]) -> bool {
+    match CoveAiFile::parse(data) {
+        Ok(file) => {
+            println!(
+                "OK [{} structural]",
+                match file.artifact_kind {
+                    cove_core::artifact::coveai::CoveAiArtifactKind::CoveAiBundle => "coveai",
+                    cove_core::artifact::coveai::CoveAiArtifactKind::CoveVec => "covev",
+                }
+            );
+            println!("  section_count   : {}", file.sections.len());
+            println!("  payload_access  : {:?}", file.payload_access);
+            println!(
+                "  records         : source_bindings={} payload_refs={} vectors={}",
+                file.descriptor_tables.source_bindings.len(),
+                file.descriptor_tables.payload_refs.len(),
+                file.descriptor_tables.vector_entries.len()
+            );
             true
         }
         Err(error) => {

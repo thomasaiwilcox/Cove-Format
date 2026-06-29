@@ -1,7 +1,7 @@
 # COVE Conformance Corpus
 
 This directory contains binary fixtures and a `manifest.jsonl` that maps each
-fixture to the Spec §1–§81 sections it exercises. The corpus includes complete
+fixture to the Spec §1–§83 sections it exercises. The corpus includes complete
 `.cove` files plus parser-focused payload and artifact fixtures for structures
 that are not always meaningful as standalone COVE files. Run the corpus with:
 
@@ -38,7 +38,8 @@ Each manifest line is one JSON object:
     `cove_o_temporal_segment_index`, `cove_o_temporal_bloom_index`,
     `extension_registry`, `extension_logical_type`, `extension_index_descriptor`,
     `durable_publish_case`, `sidecar_freshness_case`, `cove_map_convert_case`,
-    `cove_map_project_case`, and `arrow_view_materialization_case`
+    `cove_map_project_case`, `arrow_view_materialization_case`, `coveai`, and
+    `covev`
 - `expect`   — `"accept"` or `"reject"`
 - `error_code` — (preferred when `expect=reject`) stable Spec §76 error code
     Fixtures with `error_code` are automatically tagged as `§76` evidence by `gen-corpus`.
@@ -74,3 +75,18 @@ cargo run -p cove-conformance --bin gen-capability-matrix -- --check
 A capability should only be treated as release-grade when the relevant columns
 are `yes` and the corpus contains both positive and negative evidence where the
 spec defines failure behavior.
+
+## COVE-AI Fixtures
+
+The `ai/` directory contains provider-free COVE-AI companion fixtures:
+
+- `.coveai` (`CVA2`) accept fixtures for empty sidecars, descriptor bundles,
+  chunk descriptors, and digest-bound companion references;
+- `.covev` (`CVV2`) accept fixtures for FileCode vector sidecars;
+- a duplicate-section reject fixture for COVE-AI artifact framing.
+
+The generated capability matrix records COVE-AI as Spec §83 evidence. The
+binary corpus covers standalone sidecar acceptance/rejection, while granular
+policy, reference-space, payload-integrity, chunk, token, vector, training,
+generator, tensor, asset, multimodal, exact-search, and CoveQL-AI failure
+cases are covered by Rust unit and CLI smoke tests.

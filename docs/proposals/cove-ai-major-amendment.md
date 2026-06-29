@@ -181,6 +181,1146 @@ Add the following optional standards:
 
 All are optional. A baseline COVE reader may ignore them safely.
 
+## COVE-AI Integration Contract
+
+COVE-AI must use the existing COVE v2 scoping, sidecar, digest, redaction, and
+operation-requiredness machinery. It is not a parallel format with different
+validity rules.
+
+1. COVE-AI is a set of optional profiles. COVE-Core, COVE-T, COVE-O, and
+   materialized COVE-MAP truth remain readable without COVE-AI.
+2. Embedded COVE-AI sections in `.cove` use the global COVE section-kind
+   registry and the global feature-word model. Operation-required AI features
+   MUST be scoped through section entries, profile capability matrices, or
+   `SECTION_FEATURE_BINDING`, not through `.cove` header
+   `required_features` word 0.
+3. `CVA2` and `CVV2` artifacts MAY use an artifact-local COVE-AI feature
+   namespace in their own headers, postscripts, and section entries. Any `.cove`
+   reference to those artifacts must advertise the corresponding global optional
+   presence or capability feature and bind requiredness to the selected
+   operation.
+4. COVE-VEC owns vector spaces, vector payloads, vector bindings, composition
+   metadata, quantization metadata, and vector lineage. COVX/COVE-I-compatible
+   rules own index proof, false-negative policy, index-only capability, sidecar
+   validity, coverage/fallback semantics, and cross-file or dataset index
+   publication.
+5. Every payload-bearing AI section must bind to the source snapshot, schema,
+   dictionary or canonical value identity, semantic slot or object path,
+   model/tokenizer/chunker/vectorizer/template lineage, policy scope,
+   visibility scope, redaction scope, and digest lineage needed to validate
+   freshness.
+6. CRC32C validates transport integrity. Cryptographic digest references are
+   required for trust, payload-byte verification, reproducibility, replay, and
+   auditability claims.
+7. Direct readers of `CVA2` or `CVV2` artifacts MUST fail closed on policy until
+   source binding, visibility scope, redaction scope, policy scope, and
+   sensitivity summaries are validated or explicitly overridden by a trusted
+   caller policy.
+
+## Proposed Registry and Artifact Plan
+
+This proposal keeps the full COVE-AI scope, but stages implementation through
+stable profile boundaries. The registry details in this section are proposed
+allocations for review. Once accepted, they should be copied into the feature
+bit, section-kind, and artifact registries and backed by conformance fixtures.
+
+### Feature Bits
+
+COVE-AI uses two feature locations:
+
+- global COVE feature words for embedded `.cove` sections, COVM references,
+  profile capability matrices, and operation-required bindings;
+- an artifact-local COVE-AI feature namespace inside `CVA2` and `CVV2`
+  companion artifacts.
+
+The global COVE-AI feature word is `TBD_AI_GLOBAL_FEATURE_WORD`. The bit numbers
+below are local to that global word when used in `.cove` artifacts and local to
+the `CVA2`/`CVV2` artifact namespace when used inside those sidecars. Embedded
+`.cove` AI sections MUST NOT use artifact-local feature numbering.
+
+| Bit | Feature | Scope | Required when |
+| ---: | --- | --- | --- |
+| 0 | `AI_FEATURE_MAP_AI_POLICY` | COVE-MAP-AI | AI ingestion or AI query planning uses slot policy. |
+| 1 | `AI_FEATURE_CHUNK` | COVE-CHUNK | Stored chunk boundaries are required for the requested operation. |
+| 2 | `AI_FEATURE_TOKEN` | COVE-TOK | Stored token IDs, masks, labels, or sequence packs are required. |
+| 3 | `AI_FEATURE_VECTOR` | COVE-VEC | Stored vector payloads or vector bindings are required. |
+| 4 | `AI_FEATURE_VECTOR_INDEX` | COVE-VEC | A vector index is required by the requested operation. |
+| 5 | `AI_FEATURE_TENSOR_LAYOUT` | COVE-VEC / COVE-MMSEQ | Tensor layout or zero-copy export metadata is required. |
+| 6 | `AI_FEATURE_ASSET_REF` | COVE-MMSEQ / COVE-TRAIN | Digest-bound asset references are required. |
+| 7 | `AI_FEATURE_MMSEQ` | COVE-MMSEQ | Interleaved multimodal sequence reconstruction is required. |
+| 8 | `AI_FEATURE_TRAIN` | COVE-TRAIN | Training sample indexes or split metadata are required. |
+| 9 | `AI_FEATURE_GENERATOR_PROVENANCE` | COVE-TRAIN | Synthetic output, label, score, preference, or rewrite audit is required. |
+| 10 | `AI_FEATURE_COVEQL_AI` | CoveQL-AI | A stored operation profile requires CoveQL-AI semantics. |
+| 11 | `AI_FEATURE_CANONICAL_FIXED_POINT_VECTOR` | COVE-VEC | Canonical vector recomputation is claimed. |
+| 12 | `AI_FEATURE_EXTERNAL_ASSET_DIGEST_REQUIRED` | COVE-MMSEQ / COVE-TRAIN | Replayability depends on external asset digests. |
+| 13 | `AI_FEATURE_PRIVACY_SUMMARY` | COVE-AI | Planners rely on sensitivity summaries before loading payloads. |
+| 14 | `AI_FEATURE_VECTOR_SPACE_COMPATIBILITY` | COVE-VEC | Cross-vector-space comparison is allowed by descriptor. |
+
+Rules:
+
+- Writers MUST NOT place operation-only COVE-AI requirements in `.cove` header
+  `required_features` word 0. Unknown bits there are file-required and reject
+  before a reader can narrow the operation.
+- Embedded `.cove` AI sections use `EXTENDED_FEATURE_SET` and
+  `SECTION_FEATURE_BINDING` when an AI requirement is profile-, section-, page-,
+  or operation-scoped.
+- A global COVE-AI bit in `.cove` header `optional_features`, or in an
+  extended optional feature word, advertises presence or optional capability.
+  Unknown optional bits are ignored for ordinary COVE-T/O/MAP reads.
+- A global COVE-AI bit in an extended required feature word without a narrower
+  binding is `FileRequired`. Writers SHOULD avoid this for COVE-AI unless the
+  entire file is intentionally unreadable without that AI feature.
+- A COVE-AI bit in `CVA2`/`CVV2` `required_ai_features` is artifact-required:
+  a reader that opens the sidecar but does not support the bit rejects the
+  sidecar or the selected sidecar operation. It MUST NOT reject the referenced
+  `.cove` file solely because the sidecar is unsupported.
+- A COVE-AI bit in `CVA2`/`CVV2` `optional_ai_features` is sidecar-advisory or
+  sidecar-optional. Unsupported readers ignore the corresponding metadata unless
+  the requested AI operation requires it through a supported binding.
+- Writers MUST bind required COVE-AI features to the narrowest possible scope:
+  section, profile, artifact, or operation. They MUST NOT make an ordinary
+  COVE-T scan fail because an AI sidecar is unsupported.
+- Required COVE-AI features need accept and reject fixtures. Optional COVE-AI
+  features need inspect/report coverage proving safe fallback.
+
+| Location | Feature namespace | Requiredness rule |
+| --- | --- | --- |
+| `.cove` header word 0 | global COVE low word | File-required when in `required_features`; never use for operation-only AI requirements. |
+| `.cove` extended feature words | global COVE feature words | Scoped by `SECTION_FEATURE_BINDING`, profile capability matrices, section entries, or operation bindings. |
+| Embedded `.cove` AI section entries | global COVE feature words | Section-required unless narrowed by binary binding. |
+| COVM references to AI sidecars | global COVE feature words plus digest-bound artifact refs | Requiredness is selected snapshot or operation scoped. |
+| `CVA2`/`CVV2` headers/postscripts/sections | artifact-local COVE-AI feature namespace | Rejects sidecar use or selected AI operation, not ordinary `.cove` reads. |
+
+### Profile and Operation IDs
+
+COVE-AI profile IDs are proposed as continuations of the current v2 profile
+registry. They intentionally match the standards-suite part numbers for this
+amendment. If the registry later decouples profile IDs from part numbers, this
+table must be updated before acceptance.
+
+| Profile ID | Profile | Capability matrix name |
+| ---: | --- | --- |
+| 12-15 | Reserved | Reserved for current-suite continuation. |
+| 16 | COVE-AI Shared | `COVE_AI_SHARED` |
+| 17 | COVE-MAP-AI | `COVE_MAP_AI` |
+| 18 | COVE-CHUNK | `COVE_CHUNK` |
+| 19 | COVE-TOK | `COVE_TOK` |
+| 20 | COVE-VEC | `COVE_VEC` |
+| 21 | COVE-MMSEQ | `COVE_MMSEQ` |
+| 22 | COVE-TRAIN | `COVE_TRAIN` |
+| 23 | CoveQL-AI | `COVEQL_AI` |
+
+Unknown profile IDs in optional sections MUST NOT cause ordinary COVE-Core,
+COVE-T, COVE-O, or materialized COVE-MAP reads to reject. A reader that does
+not recognize a section profile MUST treat the section as an unknown optional
+section, preserve it for inspect/report when possible, and reject only if that
+section, profile, or operation is required for the selected operation. The same
+fallback rule applies to `profile_kind` inside `CVA2` and `CVV2` section
+entries.
+
+Proposed COVE-AI operation kinds extend `OperationKindV2`:
+
+| Operation kind | Operation |
+| ---: | --- |
+| 128 | `AiInspect` |
+| 129 | `AiChunkProjection` |
+| 130 | `AiTokenProjection` |
+| 131 | `AiEmbedding` |
+| 132 | `AiSemanticSearch` |
+| 133 | `AiRagContext` |
+| 134 | `AiTrainingSampleExport` |
+| 135 | `AiMultimodalSequenceRead` |
+| 136 | `AiGeneratorAudit` |
+
+### Section Kinds
+
+COVE-MAP-AI policy lives with COVE-MAP because it describes semantic intent.
+Large derived AI payloads normally live in COVE-AI bundle artifacts, `.covev`
+artifacts, COVX, or COVE-I-style sidecars. Embedded `.cove` sections are allowed
+for small, file-local metadata and test vectors, but large vectors and token
+blocks SHOULD use companion artifacts.
+
+Proposed standard section-kind assignments:
+
+| ID | Name | Profile | Payload |
+| ---: | --- | --- | --- |
+| 70 | `MAP_AI_PROFILE_CATALOG` | COVE-MAP-AI | `MapAiProfileV1`, `MapAiSlotPolicyV1`, and policy defaults. |
+| 71 | `MAP_AI_TEMPLATE_CATALOG` | COVE-MAP-AI | `AiVectorTemplateV1` and template fingerprints. |
+| 72 | `MAP_AI_TRAINING_POLICY_CATALOG` | COVE-MAP-AI | Slot-level sample, label, and split intent. |
+| 99 | `AI_COMPANION_ARTIFACT_REF` | COVE-AI | Digest-bound references to `CVA2` and `CVV2` companion artifacts. |
+| 100 | `AI_SOURCE_BINDING` | COVE-AI | Source file, COVM snapshot, schema, dictionary, mapping, policy, and digest bindings. |
+| 101 | `AI_CHUNK_PROFILE` | COVE-CHUNK | `ChunkProfileV1` records. |
+| 102 | `AI_TEXT_CHUNK_INDEX` | COVE-CHUNK | `TextChunkEntryV1` records and context links. |
+| 103 | `AI_TOKENIZER_PROFILE` | COVE-TOK | `TokenizerProfileV1` records and tokenizer digest references. |
+| 104 | `AI_TOKEN_BLOCK` | COVE-TOK | `TokenBlockHeaderV1` descriptor records; token bytes are referenced through `AI_PAYLOAD_REF_TABLE`. |
+| 105 | `AI_TOKENIZED_SPAN` | COVE-TOK | `TokenizedSpanV1` records and byte alignment references. |
+| 106 | `AI_TOKEN_SEQUENCE_PACK` | COVE-TOK | `TokenSequencePackV1` records, masks, labels, and positions. |
+| 107 | `AI_VECTOR_SPACE` | COVE-VEC | `VectorSpaceDescriptorV1` and `VectorSpaceCompatibilityDescriptorV1` records. |
+| 108 | `AI_VECTOR_BINDING` | COVE-VEC | FileCode, chunk, object, sample, asset, and sequence vector bindings. |
+| 109 | `AI_VECTOR_PAYLOAD_BLOCK` | COVE-VEC | `VectorPayloadBlockHeaderV1` descriptor records; vector bytes are referenced through `AI_PAYLOAD_REF_TABLE`. |
+| 110 | `AI_VECTOR_COMPOSITION` | COVE-VEC | Composition components and arithmetic profiles. |
+| 111 | `AI_VECTOR_INDEX` | COVE-VEC | `VectorIndexDescriptorV1` and index payload references. |
+| 112 | `AI_TENSOR_LAYOUT` | COVE-VEC / COVE-MMSEQ | Tensor layout and device-transfer descriptors. |
+| 113 | `AI_ASSET_MANIFEST` | COVE-MMSEQ / COVE-TRAIN | `AiAssetRefV1` records and asset policy. |
+| 114 | `AI_MULTIMODAL_SEQUENCE` | COVE-MMSEQ | Sequence packs and ordered sequence elements. |
+| 115 | `AI_TRAINING_PROFILE` | COVE-TRAIN | `TrainingProfileV1` records. |
+| 116 | `AI_TRAINING_SAMPLE_INDEX` | COVE-TRAIN | `TrainingSampleEntryV1` records. |
+| 117 | `AI_TRAINING_SPLIT_DEDUP_EPOCH` | COVE-TRAIN | Splits, dedup groups, and epoch plans. |
+| 118 | `AI_LABEL_PREFERENCE` | COVE-TRAIN | Labels, preference pairs, and human review links. |
+| 119 | `AI_GENERATOR_PROVENANCE` | COVE-TRAIN | Generator, model actor, decoding, and review records. |
+| 120 | `AI_REFERENCE_TABLES` | COVE-AI | String, digest, policy, payload, mask/label, source-span, transform, and extension reference tables. |
+| 121 | `AI_PAYLOAD_INTEGRITY` | COVE-AI | Cryptographic digest and CRC records for payload-byte verification and replay claims. |
+| 122 | `AI_PRIVACY_SUMMARY` | COVE-AI | Sensitivity summaries, disclosure bounds, retention/revocation status, and policy-load hints. |
+| 123 | `AI_SECTION_FEATURE_BINDING` | COVE-AI | Artifact-local profile, section, and operation requiredness bindings. |
+| 124 | `AI_VECTOR_DIRECTORY` | COVE-VEC | `VectorEntryV1` records resolving vector refs to payload blocks and byte ranges. |
+| 125 | `AI_PAYLOAD_BYTES` | COVE-AI | Opaque payload byte ranges referenced by `AI_PAYLOAD_REF_TABLE`. |
+
+Rules:
+
+- `MAP_AI_*` payloads use the COVE-MAP payload discipline: canonical JSON or
+  deterministic CBOR for reusable `.covemap` artifacts, with duplicate keys and
+  undeclared extension fields rejected.
+- `AI_*` payloads use length-delimited binary records by default. Canonical JSON
+  or deterministic CBOR MAY be used for fixtures, inspectable policy metadata,
+  or low-volume catalogs when the payload encoding declares it. `AI_PAYLOAD_BYTES`
+  is the Phase 1 exception: it is an opaque byte-carrier section and is never
+  parsed as a record array.
+- All descriptor section payloads MUST be covered by section payload CRC32C
+  before their records are used. Large payload-bearing sections MAY set section
+  `payload_crc32c = 0` only when every used payload range is covered by
+  validated block/range integrity records such as `AiPayloadIntegrityV1`. All
+  section and payload ranges MUST still be bounds-checked before use.
+- Unknown optional COVE-AI sections are skipped but remain visible to inspect
+  and report tools. Unknown required COVE-AI sections reject only the selected
+  AI operation.
+
+### Companion Artifacts
+
+COVE-AI supports two first-class companion artifact shapes:
+
+```text
+Extension: .coveai
+Magic: CVA2
+Profile: COVE-AI bundle
+Purpose: mixed chunks, tokens, vectors, training samples, multimodal sequences,
+         generator provenance, asset manifests, and tensor metadata.
+
+Extension: .covev
+Magic: CVV2
+Profile: COVE-VEC optimized vector artifact
+Purpose: large vector payloads, vector bindings, vector composition metadata,
+         vector indexes, tensor layouts, and device-transfer hints.
+```
+
+`.coveai` is the general bundle for implementations that want one AI sidecar per
+source snapshot. `.covev` is an optimized COVE-VEC carrier for large vector
+payloads or vector indexes. A writer MAY store COVE-VEC data in `.coveai`,
+`.covev`, COVX, or COVE-I-style artifacts, but every carrier MUST expose the
+same logical section kinds and validation rules.
+
+```rust
+struct CoveAiPostscriptV1 {
+    required_ai_features: u64,
+    optional_ai_features: u64,
+    file_len: u64,
+    header_offset: u64,
+    header_length: u64,
+    crc32c: u32,
+}
+
+struct CoveAiHeaderV1 {
+    magic: [u8; 4],        // "CVA2" or "CVV2"
+    header_len: u16,
+    version_major: u16,
+    version_minor: u16,
+    flags: u32,
+    artifact_id: [u8; 16],
+    required_ai_features: u64,
+    optional_ai_features: u64,
+    section_count: u32,
+    section_entry_len: u16,
+    reserved0: u16,
+    created_at_us: i64,
+    section_directory_crc32c: u32,
+    crc32c: u32,
+}
+// followed by:
+//   CoveAiSectionEntryV1[section_count]
+
+struct AiSourceBindingV1 {
+    source_binding_id: u32,
+    source_kind: u8,
+    source_artifact_ref: u32,
+    source_file_digest_ref: u32,
+    covm_snapshot_ref: u32,
+    schema_fingerprint_ref: u32,
+    dictionary_digest_ref: u32,
+    map_fingerprint_ref: u32,
+    policy_context_ref: u32,
+    visibility_scope_ref: u32,
+    redaction_scope_ref: u32,
+    branch_ref: u32,
+    as_of_csn: u64,
+    flags: u32,
+    crc32c: u32,
+}
+
+struct AiCompanionArtifactRefV1 {
+    artifact_ref: u32,
+    artifact_kind: u8,       // 1=CVA2, 2=CVV2
+    artifact_id: [u8; 16],
+    uri_ref: u32,
+    artifact_digest_ref: u32,
+    source_binding_ref: u32,
+    required_ai_features: u64,
+    optional_ai_features: u64,
+    flags: u32,
+    crc32c: u32,
+}
+
+struct CoveAiSectionEntryV1 {
+    section_id: u32,
+    section_kind: u32,
+    offset: u64,
+    length: u64,
+    uncompressed_length: u64,
+    compression: u8,
+    payload_encoding: u8,
+    requiredness_scope: u8,
+    profile_kind: u8,
+    source_binding_ref: u32,
+    required_ai_features: u64,
+    optional_ai_features: u64,
+    feature_binding_ref: u32,
+    payload_crc32c: u32,
+}
+
+enum AiPayloadEncodingV1 {
+    BinaryRecords = 1,
+    CanonicalJson = 2,
+    DeterministicCbor = 3,
+    OpaqueBytes = 4,
+    Extension = 255,
+}
+
+enum AiRequirednessScopeV1 {
+    ArtifactRequired = 0,
+    SectionRequired = 1,
+    ProfileRequired = 2,
+    OperationRequired = 3,
+    AdvisoryOnly = 4,
+    Extension = 255,
+}
+```
+
+Artifact rules:
+
+- All integer fields are little-endian. There is no byte-order negotiation.
+- COVE-AI companion artifacts use tail discovery. The final bytes are
+  postscript bytes, `postscript_version: u16`, `postscript_len: u16`, and magic
+  `CVA2` or `CVV2`.
+- For the first COVE-AI companion artifact profile, `postscript_version` MUST
+  be 1, `version_major` MUST be 1, and `version_minor` MUST be 0. Readers MUST
+  reject unsupported major versions and MAY accept supported minor versions
+  according to declared feature bits.
+- A `.cove`, `.covm`, or external catalog reference to a COVE-AI companion
+  artifact SHOULD use `AI_COMPANION_ARTIFACT_REF` or an equivalent COVM
+  extension carrying `AiCompanionArtifactRefV1`. The reference MUST be
+  digest-bound before sidecar use is trusted.
+- `AI_COMPANION_ARTIFACT_REF` is a descriptor section for `.cove`, COVM, or
+  catalog-side references to AI sidecars. A `CVA2` or `CVV2` sidecar does not
+  need to contain a self-reference unless a profile explicitly uses
+  self-description.
+- When `AI_COMPANION_ARTIFACT_REF` is embedded in `.cove`, its `uri_ref` and
+  `artifact_digest_ref` resolve through an embedded `AI_REFERENCE_TABLES`
+  section in the same `.cove` artifact. `source_binding_ref` resolves to an
+  `AiSourceBindingV1` record in an embedded `AI_SOURCE_BINDING` section, or is
+  zero when the sidecar supplies its own source binding. Other resolver sources
+  require an explicit required extension.
+- `postscript_len` is the byte length of `CoveAiPostscriptV1` only. It excludes
+  `postscript_version`, `postscript_len`, and trailing magic. The first profile
+  requires `postscript_len == 44`; readers MUST reject values below 44 or above
+  4096 unless a required extension defines a longer postscript.
+- The `required_ai_features` and `optional_ai_features` words in
+  `CoveAiPostscriptV1` and `CoveAiHeaderV1` MUST match exactly. A mismatch is
+  structural corruption and the artifact MUST be rejected. The postscript copy
+  exists only for tail-discovery bootstrap and early rejection.
+- `header_len` is the byte length of `CoveAiHeaderV1`; the first profile
+  requires `header_len == 70`.
+- `section_entry_len` is the byte length of `CoveAiSectionEntryV1`; the first
+  profile requires `section_entry_len == 64`.
+- `header_length` in the postscript MUST equal
+  `header_len + section_count * section_entry_len`. The header region begins at
+  `header_offset` and includes the fixed header plus section-entry array.
+- `file_len` MUST equal the actual artifact byte length. `header_offset +
+  header_length` MUST be within `file_len`.
+- COVE-AI headers and records are packed wire records. Readers MUST parse fields
+  explicitly and MUST NOT rely on native struct alignment or padding.
+- `VectorPayloadBlockHeaderV1.compression_codec`,
+  `TokenBlockHeaderV1.compression_codec`, and `CoveAiSectionEntryV1.compression`
+  use `AiCompressionCodecV1`, whose Phase 1 values match the COVE section
+  compression registry.
+- `AI_PAYLOAD_BYTES` sections MUST declare
+  `payload_encoding = AiPayloadEncodingV1::OpaqueBytes`.
+- `offset` and `length` are absolute byte offsets from the start of the
+  companion artifact.
+- Section ranges MUST be within `file_len` and MUST NOT overlap unless a
+  required extension explicitly permits overlap.
+- `section_id` is a unique section instance ID within the companion artifact.
+  Multiple sections may share one `section_kind`, but they MUST have distinct
+  `section_id` values.
+- `section_kind` uses the global COVE section-kind registry, widened to `u32` in
+  `CVA2`/`CVV2` for future growth. Standard COVE-AI section kinds are the
+  values listed above. Vendor or artifact-local section semantics require a
+  registered extension and cannot silently reuse standard values.
+- `source_binding_ref` binds every derived section to the source file, snapshot,
+  dictionary, schema, mapping, visibility, and redaction context needed to check
+  freshness.
+- If `source_binding_ref` in the section entry is non-zero, all records in the
+  section inherit that binding unless the section-specific schema permits a
+  record-level source-binding override. If it is zero for a payload-bearing
+  derived section, each record MUST carry or reference its own source binding.
+- `requiredness_scope` uses `AiRequirednessScopeV1`. Section-local
+  `required_ai_features` and `optional_ai_features` are interpreted under that
+  scope. `feature_binding_ref` references an optional AI feature-binding record
+  when section-local feature words are not sufficient for profile- or
+  operation-scoped requiredness.
+- `feature_binding_ref = 0` means no additional binding. A non-zero
+  `feature_binding_ref` MUST reference exactly one validated
+  `AiSectionFeatureBindingV1` record in `AI_SECTION_FEATURE_BINDING`.
+- A stale source file digest, schema fingerprint, dictionary digest, mapping
+  fingerprint, branch, CSN, visibility scope, or redaction scope makes the
+  affected section unusable for the requested operation.
+- `reserved0` and any future reserved bytes MUST be zero on write and validated
+  as zero on read.
+- `crc32c` fields use CRC32C. `CoveAiPostscriptV1.crc32c` covers the
+  postscript struct with its `crc32c` field treated as zero.
+  `CoveAiHeaderV1.crc32c` covers the header struct with its `crc32c` field
+  treated as zero. `CoveAiHeaderV1.section_directory_crc32c` covers the
+  `CoveAiSectionEntryV1[section_count]` bytes exactly as stored in the header
+  region. `CoveAiSectionEntryV1.payload_crc32c` covers the decoded section
+  payload bytes for descriptor sections and MAY be zero for large
+  payload-bearing sections that use block/range integrity. Record-level
+  `crc32c` fields cover the record bytes with the record checksum field treated
+  as zero. CRC32C is not a trust, replayability, or cryptographic identity
+  mechanism.
+- A companion artifact MUST be integrity-checkable without consulting external
+  services. External assets and model services may be referenced, but replay or
+  byte-reproducibility claims require digest-bound inputs.
+- Any section or payload block that claims `StoredPayloadVerifiable`,
+  trust-chain participation, replayability, or auditability MUST reference an
+  `AiPayloadIntegrityV1` record or another profile-defined cryptographic digest
+  record.
+
+### CVA2/CVV2 Validation Order
+
+A conforming COVE-AI sidecar reader SHOULD validate companion artifacts in this
+order:
+
+1. Read tail magic, `postscript_version`, and `postscript_len`.
+2. Validate postscript length, `file_len`, `header_offset`, `header_length`, and
+   postscript CRC32C.
+3. Validate header bounds, `header_len`, `section_count`, `section_entry_len`,
+   reserved fields, header CRC32C, and section-directory CRC32C.
+4. Require postscript and header feature words to match exactly.
+5. Validate section directory bounds, unique `section_id` values, non-overlap,
+   compression declarations, section-entry lengths, and descriptor section
+   payload CRC32C.
+6. Reject unknown artifact-required header AI feature bits.
+7. Validate `AI_SECTION_FEATURE_BINDING` before using scoped feature bindings.
+8. Build the sidecar feature-scope table from header words, section-local words,
+   and validated feature-binding records.
+9. Select the requested AI operation.
+10. Reject only unknown required AI features whose scope intersects the selected
+    sidecar operation.
+11. Validate `AI_SOURCE_BINDING`, `AI_REFERENCE_TABLES`, `AI_PRIVACY_SUMMARY`,
+    and policy context before exposing payload-bearing sections.
+
+`AI_SECTION_FEATURE_BINDING` MUST be parseable with COVE-AI Shared support
+alone. A section entry that references a non-existent or invalid
+`feature_binding_ref` is unsupported for the referenced scope.
+`AI_SECTION_FEATURE_BINDING` cannot itself depend on a feature binding that has
+not yet been validated. `ArtifactRequired` section-local bits reject sidecar use
+or the selected sidecar operation; they MUST NOT reject the referenced `.cove`
+file.
+
+Descriptor sections MUST validate section payload CRC32C before records are
+used. For operations that use large payload-bearing sections, readers MAY
+validate the referenced descriptor records first and then validate only the
+addressed payload block, vector range, or token range through
+`AiPayloadIntegrityV1`, unless the operation requests full-section validation.
+In Phase 1, `AI_VECTOR_PAYLOAD_BLOCK` and
+`AI_TOKEN_BLOCK` contain descriptor records only. Raw vector or token bytes MUST
+be referenced through `AI_PAYLOAD_REF_TABLE` and stored in `AI_PAYLOAD_BYTES`
+or another explicitly permitted payload carrier.
+
+`AI_PAYLOAD_BYTES` is never semantically meaningful on its own. Its bytes are an
+opaque carrier; meaning comes only from payload refs, integrity records,
+vector/token descriptors, source bindings, and policy context. Readers MUST NOT
+parse `AI_PAYLOAD_BYTES` as `AiRecordHeaderV1` records.
+
+`AI_PAYLOAD_BYTES` does not by itself authorize payload exposure. If an
+`AI_PAYLOAD_BYTES` section has `source_binding_ref = 0`, each referenced payload
+range inherits source binding, privacy, visibility, redaction, and policy
+context from the descriptor record and payload-ref chain that gives the byte
+range semantic meaning. If an `AI_PAYLOAD_BYTES` section has non-zero
+`source_binding_ref`, that binding is a section-level upper bound only. Readers
+MUST still validate the descriptor record, payload ref, integrity record, source
+binding, privacy summary, and policy context before exposing any byte range.
+
+Phase 1 descriptor sections:
+
+- `AI_COMPANION_ARTIFACT_REF`;
+- `AI_SOURCE_BINDING`;
+- `AI_REFERENCE_TABLES`;
+- `AI_PRIVACY_SUMMARY`;
+- `AI_PAYLOAD_INTEGRITY`;
+- `AI_SECTION_FEATURE_BINDING`;
+- `AI_TOKEN_BLOCK`;
+- `AI_VECTOR_SPACE`;
+- `AI_VECTOR_BINDING`;
+- `AI_VECTOR_PAYLOAD_BLOCK`;
+- `AI_VECTOR_DIRECTORY`;
+- `AI_VECTOR_COMPOSITION`;
+- `MAP_AI_PROFILE_CATALOG`;
+- `MAP_AI_TEMPLATE_CATALOG`;
+- `MAP_AI_TRAINING_POLICY_CATALOG`.
+
+Phase 1 large payload-bearing sections:
+
+- `AI_PAYLOAD_BYTES`.
+
+Only Phase 1 large payload-bearing sections may set
+`CoveAiSectionEntryV1.payload_crc32c == 0` when every used payload range is
+covered by validated `AiPayloadIntegrityV1` records.
+
+### Reference Spaces, Integrity, and Binary Records
+
+COVE-AI structs use local `_ref` fields. Unless a structure explicitly says
+otherwise, `0` means absent and non-zero references point into a declared
+COVE-AI reference space in `AI_REFERENCE_TABLES` or into the local record table
+of the section that owns the structure.
+
+For Phase 1, a `.cove`, `CVA2`, or `CVV2` artifact that carries standard
+COVE-AI records MUST contain at most one `AI_REFERENCE_TABLES` section unless a
+required extension defines reference-table partitioning. All `_ref` values in
+standard Phase 1 records resolve through that single table or through the local
+record table explicitly named by the field.
+
+Within one `AI_REFERENCE_TABLES` section, IDs MUST be unique per reference
+space. Duplicate `string_ref`, `digest_ref`, `payload_ref`, `policy_ref`,
+`source_span_ref`, or `transform_ref` values are structural corruption unless a
+required extension defines scoped duplicates.
+
+Standard COVE-AI reference spaces:
+
+| Space | Used by |
+| --- | --- |
+| `AI_STRING_TABLE` | Names, namespaces, versions, locale tags, text templates, endpoint names, prompt template IDs, and media types. |
+| `AI_DIGEST_TABLE` | Source file digests, dictionary digests, schema fingerprints, model/checkpoint digests, tokenizer material digests, payload digests, and transform digests. |
+| `AI_POLICY_TABLE` | Visibility, redaction, sensitivity, license, safety, retention, disclosure, and export policies. |
+| `AI_PAYLOAD_REF_TABLE` | Payload byte ranges, embedded blobs, masks, labels, prompt text, target text, metadata, and external payload handles. |
+| `AI_FUNCTION_OR_TEMPLATE_TABLE` | Chunkers, tokenizers, vectorizers, transforms, templates, normalization pipelines, scoring functions, and deterministic split functions. |
+| `AI_MASK_LABEL_TABLE` | Loss masks, attention masks, labels, position IDs, preference records, and quality-score payloads. |
+| `AI_SOURCE_SPAN_TABLE` | Source rows, object refs, source values, evidence spans, byte ranges, token ranges, and asset time ranges. |
+| `AI_TRANSFORM_TABLE` | Asset preprocessing, vector transforms, quantization transforms, calibration transforms, OCR/caption/transcript transforms, and image/audio/video normalization profiles. |
+| `AI_EXTENSION_TABLE` | Registered extension records and vendor payload references. |
+
+```rust
+enum AiReferenceSpaceKindV1 {
+    String = 1,
+    Digest = 2,
+    Policy = 3,
+    Payload = 4,
+    FunctionOrTemplate = 5,
+    MaskLabel = 6,
+    SourceSpan = 7,
+    Transform = 8,
+    Extension = 255,
+}
+
+struct AiPayloadIntegrityV1 {
+    integrity_ref: u32,
+    payload_ref: u32,
+    digest_domain: u8,
+    reserved0: u8,
+    digest_algorithm: u16,
+    digest_len: u16,
+    digest_ref: u32,
+    payload_crc32c: u32,
+    flags: u32,
+}
+
+enum AiDigestDomainV1 {
+    StoredCompressedBytes = 0,
+    DecodedSectionPayloadBytes = 1,
+    RecordPayloadBytes = 2,
+    CanonicalRecordBytes = 3,
+    ModelInputBytes = 4,
+    ExternalAssetBytes = 5,
+    VectorPayloadBytes = 6,
+    TokenPayloadBytes = 7,
+    Extension = 255,
+}
+
+struct AiSectionFeatureBindingV1 {
+    binding_ref: u32,
+    section_id: u32,
+    scope: u8,
+    profile_kind: u8,
+    operation_kind: u16,
+    required_ai_features: u64,
+    optional_ai_features: u64,
+    target_local_ref: u64,
+    flags: u32,
+    crc32c: u32,
+}
+```
+
+Future optional reference-directory record:
+
+```rust
+struct AiReferenceEntryV1 {
+    ref_id: u32,
+    ref_space: u8,
+    target_kind: u16,
+    reserved0: u8,
+    payload_ref: u32,
+    digest_ref: u32,
+    flags: u32,
+    crc32c: u32,
+}
+```
+
+`AiReferenceEntryV1` is an optional directory/index record over typed reference
+records. It is not required for Phase 1 and has no standard record-kind
+assignment in the MVP. Readers MUST use the typed reference records below for
+standard semantics.
+
+`AiRecordHeaderV1.crc32c`, when present on the containing record, covers the
+record bytes. `AiPayloadIntegrityV1.payload_crc32c`, when non-zero or flagged
+present, covers the referenced payload bytes in the declared
+`digest_domain`. `digest_ref` is the cryptographic identity used for trust,
+payload-byte verification, replay, and audit claims. Digest algorithms use the
+same registry as COVE-Core digest manifests. `digest_algorithm`, `digest_len`,
+and `digest_ref` MUST agree with the referenced `AiDigestEntryV1`; mismatch is
+structural corruption.
+
+A zero CRC32C field means "not present" only when the applicable flags or
+section rules permit absence. If `AI_FLAG_PAYLOAD_CRC32C_PRESENT` is set, the
+CRC field MUST be interpreted as present and validated even when its numeric
+value is zero.
+
+`digest_domain` declares exactly which bytes were digested. For compressed
+sections this distinguishes stored compressed bytes from decoded section payload
+bytes and canonical record bytes. Model-input and external-asset digest domains
+MUST include the declared transform or preprocessing profile in lineage.
+
+Digest payloads used to validate `AI_PAYLOAD_INTEGRITY` MUST be readable after
+bounds and CRC validation without requiring the same integrity record they are
+used to validate. Cyclic integrity dependencies are invalid. Digest payload
+bytes are opaque digest bytes; they MUST NOT be transformed, decoded as text, or
+normalized before comparison. `digest_len` MUST equal the actual digest byte
+length.
+
+`AI_SECTION_FEATURE_BINDING` is the artifact-local analogue of
+`SECTION_FEATURE_BINDING` for `CVA2`/`CVV2`. It cannot narrow artifact-required
+bits in `CoveAiHeaderV1.required_ai_features`; it can only bind section-local
+optional or required AI feature words to profile-, section-, or
+operation-scoped use inside the companion artifact.
+
+Unless a structure explicitly states otherwise, `payload_offset` in COVE-AI
+binary records is an absolute byte offset from the start of the containing
+`CVA2`/`CVV2` artifact. Offsets into decoded section payloads MUST be named
+`section_payload_offset`. The Phase 1 exception is
+`VectorEntryV1.payload_offset`, which COVE-VEC defines as an offset relative to
+the resolved block payload, not an artifact-absolute offset.
+
+Payload records with artifact-absolute `payload_offset` point to stored
+artifact bytes, not decoded bytes inside a compressed section. If payload bytes
+are inside a decoded compressed section, the record MUST use an
+`AiPayloadRefEntryV1` storage kind that declares section-relative decoded
+coordinates, and the coordinate field MUST be named `section_payload_offset`.
+For the Phase 1 MVP, raw vector and token bytes MUST be referenced through
+`AI_PAYLOAD_REF_TABLE`; `AI_VECTOR_PAYLOAD_BLOCK` and `AI_TOKEN_BLOCK` do not
+inline raw bytes after their descriptor record arrays. The ordinary carrier is
+an uncompressed `AI_PAYLOAD_BYTES` section addressed by `ArtifactAbsolute`
+payload refs. Compressed vector or token payloads MUST be addressed through
+`AI_PAYLOAD_REF_TABLE` with an explicit storage kind and digest domain.
+
+All fields named `checksum` in COVE-AI V1 records are CRC32C fields computed
+with the checksum field treated as zero, unless a profile-specific rule
+explicitly says otherwise. Future revisions SHOULD prefer the field name
+`crc32c`.
+
+Unless a record-specific flag registry says otherwise, all unassigned `flags`
+bits MUST be zero on write and MUST cause rejection when non-zero in a required
+record. Optional records with unknown non-zero flags MAY be skipped and
+reported.
+
+Common COVE-AI V1 flags:
+
+| Bit | Flag | Meaning |
+| ---: | --- | --- |
+| 0 | `AI_FLAG_REQUIRED_RECORD` | Unknown support rejects the selected section/profile/operation. |
+| 1 | `AI_FLAG_PAYLOAD_CRC32C_PRESENT` | `payload_crc32c` or an equivalent payload CRC field is present and must validate. |
+| 2 | `AI_FLAG_POLICY_PROTECTED` | Payload or metadata requires policy validation before exposure. |
+| 3 | `AI_FLAG_REVOKED` | Record or source binding is revoked for governed reads unless trusted policy overrides. |
+
+Common COVE-AI V1 flags apply to `AiRecordHeaderV1.flags` unless a section
+schema explicitly says they apply to a payload record's `flags` field. Payload
+record `flags` fields are record-specific. Unknown non-zero payload flags in
+required records reject unless the record schema declares them advisory.
+
+Minimal standard reference records:
+
+```rust
+struct AiStringEntryV1 {
+    string_ref: u32,
+    utf8_byte_length: u32,
+    payload_ref: u32,
+    flags: u32,
+    crc32c: u32,
+}
+
+struct AiDigestEntryV1 {
+    digest_ref: u32,
+    digest_algorithm: u16,
+    digest_len: u16,
+    digest_payload_ref: u32,
+    domain_hint: u8,
+    flags: u32,
+    crc32c: u32,
+}
+
+struct AiPayloadRefEntryV1 {
+    payload_ref: u32,
+    storage_kind: u8,
+    media_type_ref: u32,
+    section_id: u32,
+    uri_ref: u32,
+    payload_offset: u64,
+    section_payload_offset: u64,
+    payload_length: u64,
+    decoded_length: u64,
+    integrity_ref: u32,
+    flags: u32,
+    crc32c: u32,
+}
+
+struct AiPolicyRefEntryV1 {
+    policy_ref: u32,
+    policy_kind: u8,
+    authority_ref: u32,
+    payload_ref: u32,
+    digest_ref: u32,
+    flags: u32,
+    crc32c: u32,
+}
+
+struct AiSourceSpanEntryV1 {
+    source_span_ref: u32,
+    source_binding_ref: u32,
+    source_kind: u8,
+    source_row_ref: u64,
+    source_object_ref: u64,
+    byte_start: u64,
+    byte_length: u64,
+    token_start: u64,
+    token_count: u32,
+    evidence_ref: u32,
+    flags: u32,
+    crc32c: u32,
+}
+
+struct AiTransformEntryV1 {
+    transform_ref: u32,
+    transform_kind: u8,
+    function_or_template_ref: u32,
+    input_digest_ref: u32,
+    output_digest_ref: u32,
+    parameter_payload_ref: u32,
+    transform_digest_ref: u32,
+    flags: u32,
+    crc32c: u32,
+}
+
+struct AiPrivacySummaryEntryV1 {
+    privacy_summary_ref: u32,
+    source_binding_ref: u32,
+    sensitivity_mask: u32,
+    sensitivity_bits_ref: u32,
+    policy_ref: u32,
+    visibility_scope_ref: u32,
+    redaction_scope_ref: u32,
+    retention_state: u8,
+    disclosure_state: u8,
+    flags: u32,
+    crc32c: u32,
+}
+```
+
+`AiPrivacySummaryEntryV1` is valid only for its declared
+`source_binding_ref`, `policy_ref`, `visibility_scope_ref`, and
+`redaction_scope_ref`. A mismatch between the privacy summary and the selected
+source binding or policy context makes all payload-bearing records under that
+source binding policy-blocked.
+
+`AiPayloadRefEntryV1` storage-kind validation:
+
+- If `storage_kind = ArtifactAbsolute`, `payload_offset` and `payload_length`
+  are used; `section_id`, `section_payload_offset`, and `uri_ref` MUST be zero
+  unless a required extension says otherwise.
+- If `storage_kind = SectionDecodedRelative`, `section_id`,
+  `section_payload_offset`, and `payload_length` are used; `payload_offset` and
+  `uri_ref` MUST be zero.
+- If `storage_kind = ExternalUri`, `uri_ref` and `payload_length` are used when
+  known; artifact and section offsets MUST be zero.
+- If `storage_kind = EmbeddedSection`, `section_id` is used and the payload is
+  the entire decoded section unless offsets are explicitly allowed by the
+  section schema.
+
+For Phase 1 token and vector payloads, an `AiPayloadRefEntryV1` used by
+`TokenBlockHeaderV1.payload_ref` or `VectorPayloadBlockHeaderV1.payload_ref`
+MUST identify bytes contained in an `AI_PAYLOAD_BYTES` section, unless a
+required extension declares another payload carrier. It MUST NOT identify bytes
+inside `AI_TOKEN_BLOCK` or `AI_VECTOR_PAYLOAD_BLOCK`.
+
+For Phase 1 token and vector payload bytes, an `AiPayloadRefEntryV1` with
+`storage_kind = ArtifactAbsolute` MUST identify a byte range fully contained in
+exactly one `AI_PAYLOAD_BYTES` section. The containing `AI_PAYLOAD_BYTES`
+section MUST be uncompressed. If the range is outside all `AI_PAYLOAD_BYTES`
+sections, overlaps more than one `AI_PAYLOAD_BYTES` section, overflows its
+offset/length arithmetic, or points into a compressed `AI_PAYLOAD_BYTES`
+section, the payload ref is invalid.
+
+If a Phase 1 token or vector payload is stored in a compressed
+`AI_PAYLOAD_BYTES` section, the payload ref MUST use
+`storage_kind = SectionDecodedRelative`, `section_id` MUST identify that
+`AI_PAYLOAD_BYTES` section, and the decoded-section range MUST fit within the
+section's decoded payload length. `ArtifactAbsolute` refs into decoded bytes of
+a compressed `AI_PAYLOAD_BYTES` section are invalid.
+
+For Phase 1 token and vector payload blocks, `payload_ref` is the authoritative
+payload-range reference. `TokenBlockHeaderV1.payload_offset`,
+`TokenBlockHeaderV1.payload_length`,
+`VectorPayloadBlockHeaderV1.payload_offset`, and
+`VectorPayloadBlockHeaderV1.payload_length` are cached artifact-absolute
+coordinates only for resolved `ArtifactAbsolute` payload refs. If
+`payload_length != 0`, the cached range MUST exactly match the resolved
+`AiPayloadRefEntryV1.payload_offset` and `payload_length`. If
+`payload_length == 0`, cached `payload_offset` MUST also be zero and readers
+MUST use the resolved payload ref. If the resolved payload ref uses any storage
+kind other than `ArtifactAbsolute`, the cached block `payload_offset` and
+`payload_length` fields MUST both be zero. A mismatch is structural corruption.
+
+For `TokenBlockHeaderV1.integrity_ref` and
+`VectorPayloadBlockHeaderV1.integrity_ref`, the referenced
+`AiPayloadIntegrityV1.payload_ref` MUST equal the block's `payload_ref`, unless
+a required extension defines a covering-range integrity scheme. For
+`VectorEntryV1.integrity_ref != 0`, the referenced
+`AiPayloadIntegrityV1.payload_ref` MUST identify exactly the vector entry's
+resolved payload byte range, unless a required extension defines a
+covering-range, Merkle-style, or profile-equivalent integrity scheme. A
+per-vector integrity record that verifies a different byte range is structural
+corruption.
+
+Minimum standard record-kind assignments:
+
+| Section | Record kind | Meaning |
+| --- | ---: | --- |
+| `AI_REFERENCE_TABLES` | 1 | `AiStringEntryV1` |
+| `AI_REFERENCE_TABLES` | 2 | `AiDigestEntryV1` |
+| `AI_REFERENCE_TABLES` | 3 | `AiPayloadRefEntryV1` |
+| `AI_REFERENCE_TABLES` | 4 | `AiPolicyRefEntryV1` |
+| `AI_REFERENCE_TABLES` | 5 | `AiSourceSpanEntryV1` |
+| `AI_REFERENCE_TABLES` | 6 | `AiTransformEntryV1` |
+| `AI_COMPANION_ARTIFACT_REF` | 1 | `AiCompanionArtifactRefV1` |
+| `AI_SOURCE_BINDING` | 1 | `AiSourceBindingV1` |
+| `AI_PRIVACY_SUMMARY` | 1 | `AiPrivacySummaryEntryV1` |
+| `AI_PAYLOAD_INTEGRITY` | 1 | `AiPayloadIntegrityV1` |
+| `AI_SECTION_FEATURE_BINDING` | 1 | `AiSectionFeatureBindingV1` |
+| `AI_VECTOR_SPACE` | 1 | `VectorSpaceDescriptorV1` |
+| `AI_VECTOR_SPACE` | 2 | `VectorSpaceCompatibilityDescriptorV1` |
+| `AI_VECTOR_BINDING` | 1 | `FileCodeVectorBindingV1` |
+| `AI_VECTOR_BINDING` | 2 | `ChunkVectorBindingV1` |
+| `AI_VECTOR_BINDING` | 3 | `ObjectStateVectorBindingV1` |
+| `AI_VECTOR_BINDING` | 4 | `TrainingSampleVectorBindingV1` |
+| `AI_VECTOR_PAYLOAD_BLOCK` | 1 | `VectorPayloadBlockHeaderV1` |
+| `AI_VECTOR_DIRECTORY` | 1 | `VectorEntryV1` |
+| `AI_VECTOR_COMPOSITION` | 1 | `VectorCompositionProfileV1` |
+| `AI_VECTOR_COMPOSITION` | 2 | `VectorCompositionComponentV1` |
+| `AI_VECTOR_COMPOSITION` | 3 | `VectorArithmeticProfileV1` |
+
+`AI_PAYLOAD_BYTES` has no record-kind assignment in Phase 1. It is addressed
+only through `AiPayloadRefEntryV1` records and the descriptors that reference
+those payload refs.
+
+Phase 1 and near-Phase 1 field-reference resolution for COVE-AI Shared,
+COVE-TOK token blocks, and COVE-VEC value-vector records:
+
+| Struct | Field | Resolves to |
+| --- | --- | --- |
+| `AiCompanionArtifactRefV1` | `uri_ref` | `AI_STRING_TABLE` URI string. |
+| `AiCompanionArtifactRefV1` | `artifact_digest_ref` | `AI_DIGEST_TABLE`. |
+| `AiCompanionArtifactRefV1` | `source_binding_ref` | `AiSourceBindingV1.source_binding_id` in `AI_SOURCE_BINDING`, or `0` when the sidecar supplies its own binding. |
+| `AiSourceBindingV1` | `source_artifact_ref` | `AI_PAYLOAD_REF_TABLE` for an embedded/source artifact handle, or `AI_STRING_TABLE` URI when declared by source-kind rules. |
+| `AiSourceBindingV1` | `source_file_digest_ref`, `schema_fingerprint_ref`, `dictionary_digest_ref`, `map_fingerprint_ref` | `AI_DIGEST_TABLE`. |
+| `AiSourceBindingV1` | `policy_context_ref`, `visibility_scope_ref`, `redaction_scope_ref` | `AI_POLICY_TABLE`. |
+| `AiSourceBindingV1` | `branch_ref` | `AI_STRING_TABLE`, or `0` when not branch-scoped. |
+| `AiPayloadIntegrityV1` | `payload_ref` | `AI_PAYLOAD_REF_TABLE`. |
+| `AiPayloadIntegrityV1` | `digest_ref` | `AI_DIGEST_TABLE`. |
+| `VectorSpaceDescriptorV1` | `vector_space_name_ref`, `embedding_namespace_ref`, `embedding_model_ref`, `embedding_model_version_ref` | `AI_STRING_TABLE`. |
+| `VectorSpaceDescriptorV1` | `vector_space_fingerprint_ref`, `embedding_model_digest_ref` | `AI_DIGEST_TABLE`. |
+| `VectorSpaceDescriptorV1` | `embedding_pipeline_ref` | `AI_TRANSFORM_TABLE`; the transform entry MAY reference `AI_FUNCTION_OR_TEMPLATE_TABLE`. |
+| `VectorSpaceDescriptorV1` | `tokenizer_profile_ref` | `TokenizerProfileV1.tokenizer_profile_id` in `AI_TOKENIZER_PROFILE`, or `0`. |
+| `VectorSpaceDescriptorV1` | `chunk_profile_ref` | `ChunkProfileV1.chunk_profile_id` in `AI_CHUNK_PROFILE`, or `0`. |
+| `TokenBlockHeaderV1` | `tokenizer_profile_id` | `TokenizerProfileV1.tokenizer_profile_id` in `AI_TOKENIZER_PROFILE`. |
+| `TokenBlockHeaderV1` | `payload_ref` | `AI_PAYLOAD_REF_TABLE`. |
+| `TokenBlockHeaderV1` | `integrity_ref` | `AiPayloadIntegrityV1.integrity_ref` in `AI_PAYLOAD_INTEGRITY`, or `0`. |
+| `FileCodeVectorBindingV1` | `slot_policy_ref` | `MapAiSlotPolicyV1` record in `MAP_AI_PROFILE_CATALOG`, or `0`. |
+| `FileCodeVectorBindingV1` | `file_ref` | `AiSourceBindingV1.source_binding_id`, or `0` to inherit the containing section source binding. |
+| `FileCodeVectorBindingV1` | `dictionary_digest_ref`, `schema_fingerprint_ref`, `canonical_value_hash_ref` | `AI_DIGEST_TABLE`. |
+| `FileCodeVectorBindingV1` | `path_ref` | `AI_STRING_TABLE` canonical COVE-T/COVE-MAP path string unless a required path-record extension is declared. |
+| `FileCodeVectorBindingV1` | `vector_ref` | `VectorEntryV1.vector_ref` in `AI_VECTOR_DIRECTORY`. |
+| `VectorPayloadBlockHeaderV1` | `payload_ref` | `AI_PAYLOAD_REF_TABLE`. |
+| `VectorPayloadBlockHeaderV1` | `tensor_layout_ref` | `AI_TENSOR_LAYOUT` record, or `0`. |
+| `VectorPayloadBlockHeaderV1` | `payload_stride_ref` | `AI_TENSOR_LAYOUT`, `AI_PAYLOAD_REF_TABLE`, or `0` for the dense-row-major default declared by COVE-VEC. |
+| `VectorPayloadBlockHeaderV1` | `device_transfer_hint_ref` | `AI_TENSOR_LAYOUT` or profile-defined device-transfer descriptor, or `0`. |
+| `VectorPayloadBlockHeaderV1` | `integrity_ref` | `AiPayloadIntegrityV1.integrity_ref` in `AI_PAYLOAD_INTEGRITY`, or `0`. |
+| `VectorEntryV1` | `block_id` | `VectorPayloadBlockHeaderV1.block_id` in `AI_VECTOR_PAYLOAD_BLOCK`. |
+| `VectorEntryV1` | `integrity_ref` | `AiPayloadIntegrityV1.integrity_ref` in `AI_PAYLOAD_INTEGRITY`, or `0` to inherit block integrity. |
+
+Resolving a Phase 1 `_ref` field through any reference space other than the one
+declared above is structural corruption, even if the numeric ID exists in the
+wrong table. Extensions that change a field's reference space MUST be required
+features and MUST define reject/fallback behavior.
+
+Minimum enum assignments for Phase 1 interoperability:
+
+```rust
+enum AiTargetKindV1 {
+    Unknown = 0,
+    Utf8String = 1,
+    DigestBytes = 2,
+    EmbeddedPayloadBytes = 3,
+    ExternalUri = 4,
+    PolicyPayload = 5,
+    SourceSpan = 6,
+    TransformPayload = 7,
+    Extension = 255,
+}
+
+enum AiStorageKindV1 {
+    ArtifactAbsolute = 0,
+    SectionDecodedRelative = 1,
+    ExternalUri = 2,
+    EmbeddedSection = 3,
+    Extension = 255,
+}
+
+enum AiPolicyKindV1 {
+    Visibility = 0,
+    Redaction = 1,
+    Sensitivity = 2,
+    License = 3,
+    Retention = 4,
+    Disclosure = 5,
+    Safety = 6,
+    Extension = 255,
+}
+
+enum AiSourceKindV1 {
+    CoveFile = 0,
+    CovmSnapshot = 1,
+    CovemapArtifact = 2,
+    ExternalAsset = 3,
+    ExternalDataset = 4,
+    Extension = 255,
+}
+
+enum AiTransformKindV1 {
+    None = 0,
+    TextNormalization = 1,
+    Tokenizer = 2,
+    Chunker = 3,
+    Vectorizer = 4,
+    Quantization = 5,
+    ImagePreprocess = 6,
+    AudioPreprocess = 7,
+    VideoFrameExtraction = 8,
+    Ocr = 9,
+    Caption = 10,
+    Transcript = 11,
+    Extension = 255,
+}
+
+enum AiCompressionCodecV1 {
+    None = 0,
+    Lz4 = 1,
+    Zstd = 2,
+    Extension = 255,
+}
+
+enum AiVectorElementTypeV1 {
+    Float32 = 0,
+    Float16 = 1,
+    BFloat16 = 2,
+    Int8 = 3,
+    UInt8 = 4,
+    Binary = 5,
+    Extension = 255,
+}
+
+enum AiVectorMetricV1 {
+    Cosine = 0,
+    Dot = 1,
+    L2 = 2,
+    L1 = 3,
+    Hamming = 4,
+    Extension = 255,
+}
+
+enum AiNormalizationPolicyV1 {
+    None = 0,
+    UnitL2 = 1,
+    MeanCentered = 2,
+    ModelDefined = 3,
+    Extension = 255,
+}
+
+enum AiQuantizationKindV1 {
+    None = 0,
+    ScalarInt8 = 1,
+    Binary = 2,
+    ProductQuantized = 3,
+    Extension = 255,
+}
+
+enum AiLayoutKindV1 {
+    DenseRowMajor = 0,
+    DenseColumnMajor = 1,
+    SparseCsr = 2,
+    PackedBinary = 3,
+    Extension = 255,
+}
+
+enum AiAssetKindV1 {
+    Uri = 0,
+    EmbeddedBytes = 1,
+    Image = 2,
+    Audio = 3,
+    Video = 4,
+    Document = 5,
+    Tensor = 6,
+    Extension = 255,
+}
+
+enum AiModalityV1 {
+    Text = 0,
+    Token = 1,
+    Image = 2,
+    Audio = 3,
+    Video = 4,
+    Tensor = 5,
+    Tool = 6,
+    Control = 7,
+    Extension = 255,
+}
+
+enum AiRoleV1 {
+    Unknown = 0,
+    System = 1,
+    User = 2,
+    Assistant = 3,
+    Tool = 4,
+    Label = 5,
+    Control = 6,
+    Extension = 255,
+}
+
+enum GeneratorKindV1 {
+    Human = 0,
+    Model = 1,
+    Tool = 2,
+    Heuristic = 3,
+    ExternalBenchmark = 4,
+    Extension = 255,
+}
+
+enum TrainingLabelKindV1 {
+    Class = 0,
+    Text = 1,
+    NumericScore = 2,
+    Preference = 3,
+    Ranking = 4,
+    Span = 5,
+    Safety = 6,
+    Extension = 255,
+}
+```
+
+Phase 1 vector element byte widths:
+
+| Element type | Width |
+| --- | ---: |
+| `Float32` | 4 bytes |
+| `Float16` | 2 bytes |
+| `BFloat16` | 2 bytes |
+| `Int8` | 1 byte |
+| `UInt8` | 1 byte |
+| `Binary` | Bit-packed; byte width MUST be declared by payload or layout metadata. |
+
+Binary `AI_*` sections are arrays of length-delimited records.
+
+```rust
+struct AiRecordHeaderV1 {
+    record_kind: u16,
+    record_version: u16,
+    record_len: u32,
+    local_id: u64,
+    flags: u32,
+    crc32c: u32,
+}
+```
+
+Rules:
+
+- `record_len` includes the `AiRecordHeaderV1` bytes and the record payload.
+- For Phase 1 standard COVE-AI records, `record_version` MUST be 1. Readers
+  MUST reject unsupported record versions. A future minor-compatible record
+  extension must be gated by feature bits or flags and must preserve the
+  declared record length and required-field semantics.
+- Records MUST be wholly contained in the section payload and MUST NOT overlap.
+- `local_id` is unique within `(section_kind, record_kind)` unless the
+  section-specific rules state that duplicate IDs are invalid across a wider
+  scope.
+- Unknown optional record kinds MAY be skipped after bounds and CRC validation.
+- Unknown required record kinds reject only the section, profile, or operation
+  selected by feature binding.
+- All standard Phase 1 binary `AI_*` descriptor sections MUST use
+  `AiRecordHeaderV1`. `AI_PAYLOAD_BYTES` is an opaque byte-carrier section and
+  MUST NOT be parsed as records. Other headerless homogeneous fixed-array
+  sections are reserved for a future required extension.
+
+### Fallback and Operation Behavior
+
+| Operation | Missing or unsupported optional AI artifact | Stale or corrupt artifact | Required artifact missing or unsupported |
+| --- | --- | --- | --- |
+| Ordinary COVE-T scan | Ignore and continue. | Ignore and continue. | Must not occur for ordinary scan unless a non-AI required feature is involved. |
+| COVE-O reconstruction | Ignore and continue. | Ignore and continue. | Reject only if policy explicitly made the AI artifact part of the requested operation. |
+| COVE-MAP projection readback | Ignore AI metadata and use normal COVE-MAP rules. | Ignore AI metadata and report it. | Reject only AI-enhanced projection features. |
+| `.chunks()` | Recompute only if source text, chunk profile, and policy allow it; otherwise reject. | Reject stored chunks or recompute from source if allowed. | Reject with structured diagnostics. |
+| `.tokens()` / `.pack()` | Retokenize only if tokenizer material and policy allow it; otherwise reject. | Reject stored token blocks or retokenize if allowed. | Reject with structured diagnostics. |
+| `.embedding()` | Recompute only if vectorizer/profile is available and policy allows it; otherwise reject. | Reject stored vectors or recompute if allowed. | Reject with structured diagnostics. |
+| `.similar()` | Fall back from index to exact vector scan when vector payloads are valid; otherwise reject. | Ignore stale index; reject stale vector payloads unless recompute is allowed. | Reject with structured diagnostics. |
+| `.trainingSamples()` | Reject unless source data and deterministic policy can reconstruct samples. | Reject stored samples or reconstruct if allowed. | Reject with structured diagnostics. |
+| `.multimodal()` | Expose individual components only; do not claim sequence reconstruction. | Reject sequence pack; expose validated independent components if requested. | Reject with structured diagnostics. |
+
+All AI operation diagnostics SHOULD include the artifact ID, section kind,
+feature bit, source binding, freshness check that failed, fallback attempted,
+and policy reason if disclosure is allowed.
+
 ## Authority Model
 
 ### Authoritative Surfaces
@@ -241,7 +1381,7 @@ enum AiReproducibilityClassV1 {
     DescriptiveOnly = 0,
     SourceSnapshotReproducible = 1,
     PreprocessingReproducible = 2,
-    PayloadByteReproducible = 3,
+    StoredPayloadVerifiable = 3,
     CanonicalRecomputeReproducible = 4,
     ExternalAuditOnly = 5,
     Extension = 255,
@@ -253,20 +1393,27 @@ enum AiReproducibilityClassV1 {
 | `DescriptiveOnly` | Metadata describes what happened but does not support replay. |
 | `SourceSnapshotReproducible` | The same source COVE/COVM snapshot, CSN, branch, mapping version, and evidence can be selected again. |
 | `PreprocessingReproducible` | Chunking, tokenization, filtering, sample selection, and splits can be replayed from deterministic profiles. |
-| `PayloadByteReproducible` | Derived artifact bytes are stored and digest-verified. |
+| `StoredPayloadVerifiable` | Derived artifact bytes are stored and digest-verified; no independent recomputation claim is implied. |
 | `CanonicalRecomputeReproducible` | Independent implementations can recompute the same derived bytes under a strict canonical algorithm. |
 | `ExternalAuditOnly` | External model/API/tool provenance is recorded, but deterministic regeneration is not claimed. |
 
 COVE-AI metadata MUST NOT imply a stronger reproducibility class than its
 declared lineage supports.
 
+`AiReproducibilityClassV1` values are category identifiers, not a total numeric
+ordering. `ExternalAuditOnly` is not stronger than
+`CanonicalRecomputeReproducible`; it is a different claim class. Readers MUST
+NOT compare these enum values numerically to decide trust or reproducibility.
+
 External model/API outputs SHOULD normally be `ExternalAuditOnly` unless the
 model, weights, runtime, prompt, decoding, seed, toolchain, and deterministic
 generation algorithm are sufficiently specified.
 
-Runtime floating-point vector composition SHOULD normally be `RuntimeAdvisory`
-and MUST NOT claim `PayloadByteReproducible` unless the result is materialized
-and digested.
+Runtime floating-point vector composition SHOULD normally use
+`VectorResultAuthorityV1::RuntimeAdvisory`. `RuntimeAdvisory` is not a
+reproducibility class; it is the result-authority classification for a produced
+or composed vector. Such a result MUST NOT claim `StoredPayloadVerifiable`
+unless the result is materialized and digested.
 
 Canonical fixed-point vector composition MAY claim
 `CanonicalRecomputeReproducible` when all arithmetic rules are declared.
@@ -284,6 +1431,58 @@ It answers:
 - Should it be ignored or forbidden?
 - Is this a title, description, category, identifier, timestamp, label, prompt,
   completion, tool call, protected field, or safety label?
+
+### Artifact Placement
+
+COVE-MAP-AI policy is stored as COVE-MAP payload, not as vector payload. The
+authoritative reusable AI intent for a mapping version SHOULD live in the
+`.covemap` artifact that owns the semantic mapping, using `MAP_AI_*` sections.
+Embedded `MAP_AI_*` sections inside `.cove` outputs are file-local snapshots,
+conversion evidence, or inspectable policy summaries tied to that output.
+
+In embedded `.cove` section entries, `MAP_AI_*` sections use profile ID 17
+(`COVE-MAP-AI`) and follow the COVE-MAP payload discipline. In `.covemap`
+artifacts, `MAP_AI_*` section IDs 70-72 are COVE-MAP payload sections following
+the `.covemap` artifact's own section-entry grammar. Readers that do not
+recognize profile ID 17 MUST treat optional embedded `MAP_AI_*` sections as
+ignorable optional sections and preserve their presence in inspect/report output
+where possible. If an implementation validates profile IDs strictly and cannot
+accept profile ID 17 yet, it MUST NOT claim COVE-MAP-AI support.
+
+COVE-AI does not require full source-to-object mapping for plain COVE-T files.
+A writer MAY store a minimal `.covemap` artifact whose only purpose is AI slot
+policy over COVE-T table/column/path refs, or embed file-local optional
+`MAP_AI_*` sections when no reusable mapping definition exists. Such use does
+not imply support for COVE-MAP source-to-object conversion, identity resolution,
+or projection readback.
+
+Rules:
+
+- `MAP_AI_PROFILE_CATALOG` declares `MapAiProfileV1` and
+  `MapAiSlotPolicyV1` records.
+- `MAP_AI_TEMPLATE_CATALOG` declares templates and template fingerprints used
+  by vectorization, chunking, prompt context, or generated sample assembly.
+- `MAP_AI_TRAINING_POLICY_CATALOG` declares slot-level sample, label, split,
+  weighting, dedup, and quality intent.
+- Reusable `.covemap` payloads MUST follow the COVE-MAP v2 payload discipline:
+  declared schema ID, mapping ID, mapping version, canonical JSON or
+  deterministic CBOR, stable IDs, no duplicate keys, and no undeclared
+  extension fields.
+- A COVE-MAP-aware tool that does not implement COVE-MAP-AI MAY ignore optional
+  `MAP_AI_*` sections, but it MUST preserve their presence in inspect/report
+  output where possible.
+- A COVE-MAP-AI-aware tool MUST validate source refs, table/column refs,
+  object/property refs, association refs, path refs, policy refs, template refs,
+  vector-space refs, chunk-profile refs, tokenizer refs, and training-policy
+  refs before using a slot policy.
+- Within one active AI profile, duplicate slot policies for the same path are
+  invalid unless an explicit precedence rule is declared. Across multiple
+  active profiles, `Forbidden` fails closed unless the selected operation
+  supplies a trusted policy override whose authority and audit record are
+  declared.
+- `Forbidden` and redaction decisions fail closed. If a later AI sidecar
+  contains vectors, tokens, chunks, samples, sequence elements, or labels for a
+  forbidden slot, the affected AI operation MUST reject.
 
 ### Slot Roles
 
@@ -520,6 +1719,24 @@ chunks, section chunks, heading-aware chunks, fixed token windows, sliding token
 windows, semantic spans, document pages, OCR spans, transcript segments,
 parent/child context navigation, source-value binding, and evidence binding.
 
+COVE-CHUNK payloads live in `AI_CHUNK_PROFILE` and `AI_TEXT_CHUNK_INDEX`
+sections. They MAY be stored in `.coveai`, embedded `.cove` sections, or
+another COVE-AI-compatible sidecar. A stored chunk index is valid only for the
+source value hash, normalization policy, chunk profile, tokenizer profile when
+token windows are used, visibility scope, and redaction scope it declares.
+
+Reader obligations:
+
+- validate every chunk byte span against the source value before exposing text;
+- validate UTF-8 boundary alignment for text chunks;
+- reject or withhold parent, child, previous, next, and sibling navigation when
+  the referenced chunk is outside policy or fails validation;
+- expose chunk text only after redaction and visibility policy checks;
+- treat chunk hierarchy and neighboring-context expansion as retrieval
+  structure, not source document truth;
+- recompute chunks only when the source value, deterministic chunk profile, and
+  policy are all available.
+
 ```rust
 struct ChunkProfileV1 {
     chunk_profile_id: u32,
@@ -557,8 +1774,8 @@ struct TextChunkEntryV1 {
     source_value_hash_ref: u32,
     byte_start: u64,
     byte_length: u64,
-    char_start: u64,
-    char_length: u64,
+    unicode_scalar_start: u64,
+    unicode_scalar_length: u64,
     token_start: u64,
     token_count: u32,
     parent_chunk_id: u64,
@@ -577,6 +1794,10 @@ struct TextChunkEntryV1 {
 Rules:
 
 - byte spans over UTF-8 text MUST align to valid UTF-8 boundaries;
+- byte spans are authoritative for source binding; Unicode scalar offsets are
+  advisory navigation metadata over the declared normalized text form;
+- `unicode_scalar_start` and `unicode_scalar_length` count Unicode scalar
+  values, not UTF-16 code units or grapheme clusters;
 - a chunk entry MUST bind to a source value hash so stale chunk indexes can be
   detected after rewriting, remapping, redaction, or normalization changes;
 - chunk hierarchy is advisory for retrieval, but chunk boundaries MUST validate
@@ -597,6 +1818,42 @@ repeatedly tokenize the same source text. COVE-CHUNK is model-independent text
 segmentation; COVE-TOK is tokenizer/model-specific tokenization and sequence
 packing.
 
+COVE-TOK metadata lives in `AI_TOKENIZER_PROFILE`, `AI_TOKEN_BLOCK`,
+`AI_TOKENIZED_SPAN`, and `AI_TOKEN_SEQUENCE_PACK` sections. Persisted token
+bytes live in `AI_PAYLOAD_BYTES` and are referenced through
+`AI_PAYLOAD_REF_TABLE`. Token IDs are derived data and may leak source text, so
+token payloads are policy-protected surfaces even when the source text is not
+directly exposed.
+
+Required `.coveai` sections for the token-cache MVP:
+
+- `AI_REFERENCE_TABLES`;
+- `AI_SOURCE_BINDING`;
+- `AI_TOKENIZER_PROFILE`;
+- `AI_TOKEN_BLOCK`;
+- `AI_TOKENIZED_SPAN`;
+- `AI_PAYLOAD_BYTES` when token payload bytes are persisted in the artifact;
+- `AI_PAYLOAD_INTEGRITY` when any token block claims `StoredPayloadVerifiable`,
+  replayability, auditability, or trust-chain participation.
+
+Reader obligations:
+
+- validate tokenizer namespace, name, version, vocabulary digest, merges digest,
+  pre-tokenizer digest, normalizer digest, byte encoder/decoder digest,
+  added-token digest, special-token digest, chat template, Unicode version,
+  truncation/padding policy, token ID width, and reversibility flags before
+  reusing a token block;
+- support only declared `token_id_width` values of 1, 2, 4, or 8 bytes unless a
+  required extension defines another width;
+- bounds-check every token offset, token count, byte-alignment ref, mask ref,
+  label ref, and position-id ref before export;
+- reject loss masks, attention masks, labels, or position IDs that are shorter
+  than their scoped token range or reference tokens outside the sequence pack;
+- retokenize only when tokenizer material is available, deterministic, policy
+  permits it, and the operation does not require stored token bytes;
+- never reuse token IDs across tokenizer profiles unless a compatibility
+  descriptor explicitly proves equivalence.
+
 ```rust
 struct TokenizerProfileV1 {
     tokenizer_profile_id: u32,
@@ -606,8 +1863,16 @@ struct TokenizerProfileV1 {
     tokenizer_version_minor: u16,
     vocab_digest_ref: u32,
     merges_digest_ref: u32,
+    pre_tokenizer_digest_ref: u32,
     normalizer_digest_ref: u32,
+    byte_encoder_digest_ref: u32,
     special_tokens_digest_ref: u32,
+    added_tokens_digest_ref: u32,
+    chat_template_ref: u32,
+    unicode_version_ref: u32,
+    truncation_policy_ref: u32,
+    padding_policy_ref: u32,
+    model_max_sequence_length: u32,
     token_id_width: u8,
     byte_alignment_available: u8,
     reversible: u8,
@@ -627,8 +1892,10 @@ struct TokenBlockHeaderV1 {
     token_id_width: u8,
     compression_codec: u8,
     layout_kind: u8,
+    payload_ref: u32,
     payload_offset: u64,
     payload_length: u64,
+    integrity_ref: u32,
     checksum: u32,
 }
 
@@ -669,14 +1936,20 @@ A tokenizer cache MUST bind to tokenizer profile identity and digest material.
 It MUST NOT be reused across incompatible tokenizer profiles. If token IDs are
 exposed, redaction and policy checks MUST be applied first because token IDs may
 leak source text. Loss masks and labels MUST be unambiguously scoped to token
-positions.
+positions. A `TokenBlockHeaderV1` that claims `StoredPayloadVerifiable`,
+replayability, auditability, or trust-chain participation MUST set
+`integrity_ref` to a validated `AiPayloadIntegrityV1` record.
+`TokenBlockHeaderV1.payload_ref` MUST resolve to an `AiPayloadRefEntryV1`.
+For Phase 1 token payloads, that payload ref MUST point into an
+`AI_PAYLOAD_BYTES` section; token bytes MUST NOT be appended to
+`AI_TOKEN_BLOCK` after the descriptor records.
 
 ## COVE-VEC
 
 COVE-VEC stores vectors once per distinct semantic unit and lets rows, objects,
 chunks, samples, and multimodal assets reference them.
 
-Recommended artifact:
+Recommended optimized artifact:
 
 ```text
 Extension: .covev
@@ -687,12 +1960,65 @@ Profile: COVE-VEC
 COVE-VEC may also be embedded in COVX or COVE-I-style extension artifacts for
 implementations that do not initially want a separate file type.
 
+### Artifact Boundary
+
+`.covev` uses the `CoveAiPostscriptV1`, `CoveAiHeaderV1`,
+`AiSourceBindingV1`, and `CoveAiSectionEntryV1` envelope with magic `CVV2`.
+The same COVE-VEC logical sections MAY also appear in `.coveai` bundles, COVX,
+or COVE-I-style index artifacts, but `.covev` is the preferred carrier for
+large vector payloads and vector indexes.
+
+Required `.covev` sections for value-vector MVP:
+
+- `AI_REFERENCE_TABLES`;
+- `AI_SOURCE_BINDING`;
+- `AI_PRIVACY_SUMMARY`;
+- `AI_VECTOR_SPACE`;
+- `AI_VECTOR_BINDING`;
+- `AI_VECTOR_PAYLOAD_BLOCK`;
+- `AI_VECTOR_DIRECTORY`;
+- `AI_PAYLOAD_BYTES` when vector payload bytes are persisted in the artifact;
+- `AI_PAYLOAD_INTEGRITY` when any vector payload block claims
+  `StoredPayloadVerifiable`, replayability, auditability, or trust-chain
+  participation.
+
+A sidecar without `AI_PRIVACY_SUMMARY` MAY validate structurally, but a direct
+reader MUST treat payload-bearing sections as policy-blocked unless a trusted
+caller policy overrides the missing summary.
+
+Optional `.covev` sections:
+
+- `AI_VECTOR_COMPOSITION`;
+- `AI_VECTOR_INDEX`;
+- `AI_TENSOR_LAYOUT`;
+- `AI_ASSET_MANIFEST` when vectors bind to external assets.
+
+Reader obligations:
+
+- validate the source binding before reading vector bindings or payload bytes;
+- validate vector-space dimension, element type, metric, normalization policy,
+  quantization policy, model lineage, template fingerprint, and reproducibility
+  class before comparing vectors;
+- reject vector payload blocks whose byte length, stride, element type,
+  dimension count, compression, or quantization metadata does not match the
+  vector-space descriptor;
+- use FileCode as a lookup key only inside the validated file and dictionary
+  scope;
+- use canonical value hash, schema/path binding, dictionary digest, or an
+  explicit code-domain bridge across files, manifests, rewrites, or snapshots;
+- treat approximate vector indexes as candidate generators unless exactness is
+  proven for the requested metric, visibility scope, redaction scope, and query
+  class;
+- fall back from a stale or unsupported vector index to exact vector scan when
+  vector payloads are valid and the query permits it.
+
 ### Vector Space
 
 ```rust
 struct VectorSpaceDescriptorV1 {
     vector_space_id: u32,
     vector_space_name_ref: u32,
+    vector_space_fingerprint_ref: u32,
     embedding_namespace_ref: u32,
     embedding_model_ref: u32,
     embedding_model_version_ref: u32,
@@ -719,6 +2045,48 @@ compatibility descriptor explicitly permits it. Metric and normalization policy
 are part of vector-space identity. If query-time embedding is performed through
 an external service, the operation context MUST record service/model identity
 and whether the result is reproducible or audit-only.
+
+`vector_space_id` is a local descriptor ID. Cross-artifact identity uses
+`vector_space_fingerprint_ref`, which MUST digest the vector-space descriptor
+fields that affect vector interpretation: model lineage, template lineage,
+pipeline, tokenizer/chunker dependencies, dimension, element type, metric,
+normalization, and quantization. Compatibility descriptors have their own
+identity and are not included in the intrinsic vector-space fingerprint unless a
+specific compatibility profile explicitly says otherwise. Reusing a numeric
+`vector_space_id` with a different fingerprint is a validation error within one
+artifact and a mismatch across artifacts.
+
+```rust
+struct VectorSpaceCompatibilityDescriptorV1 {
+    compatibility_id: u32,
+    left_vector_space_id: u32,
+    right_vector_space_id: u32,
+    compatibility_kind: u8,
+    compatibility_authority: u8,
+    metric: u8,
+    normalization_policy: u8,
+    transform_ref: u32,
+    numeric_transform_error_ppm: u32,
+    ranking_eval_ref: u32,
+    calibration_dataset_ref: u32,
+    evidence_ref: u32,
+    flags: u32,
+    checksum: u32,
+}
+```
+
+A compatibility descriptor MAY permit comparison, projection, calibration, or
+declared transform between vector spaces. It MUST NOT silently make two vector
+spaces identical.
+
+For deterministic numeric transforms, `numeric_transform_error_ppm` may bound
+numeric error under the declared transform. For learned embedding compatibility,
+implementations SHOULD normally use `ranking_eval_ref`,
+`calibration_dataset_ref`, and an advisory or calibrated
+`compatibility_authority` instead of claiming numeric equivalence. If
+`transform_ref` is non-zero, the transform is required for the comparison and
+must be supported or the operation rejects. Explain output MUST disclose whether
+compatibility was exact, transformed, calibrated, evaluated, or advisory.
 
 ### Binding Kinds
 
@@ -758,7 +2126,8 @@ struct FileCodeVectorBindingV1 {
     property_id: u32,
     association_type_id: u32,
     path_ref: u32,
-    file_code: u64,
+    file_code: u32,
+    reserved0: u32,
     canonical_value_hash_ref: u32,
     vector_ref: u64,
     flags: u32,
@@ -770,6 +2139,10 @@ Inside one validated file/dictionary scope, `file_code` is the fast lookup key.
 Across files, datasets, manifests, or rewritten artifacts, readers MUST use
 dictionary digest, canonical value hash, schema/path binding, or an explicit
 code-domain bridge.
+
+`file_code` is the COVE v2 `FileCode` type and is therefore `u32`.
+`reserved0` MUST be zero. Future wider dictionary-code schemes require a
+required extension and MUST NOT be interpreted as ordinary v2 FileCodes.
 
 A raw FileCode from another file MUST NOT be used as a vector key unless the
 plan proves a shared code domain or validates an equivalent canonical binding.
@@ -838,8 +2211,21 @@ struct VectorPayloadBlockHeaderV1 {
     memory_alignment_bytes: u32,
     payload_stride_ref: u32,
     device_transfer_hint_ref: u32,
+    payload_ref: u32,
     payload_offset: u64,
     payload_length: u64,
+    integrity_ref: u32,
+    checksum: u32,
+}
+
+struct VectorEntryV1 {
+    vector_ref: u64,
+    block_id: u32,
+    vector_ordinal: u64,
+    payload_offset: u64,
+    payload_length: u32,
+    integrity_ref: u32,
+    flags: u32,
     checksum: u32,
 }
 ```
@@ -848,6 +2234,47 @@ Recommended logical exports include `FixedSizeList<Float32>`,
 `FixedSizeList<Float16>`, `FixedSizeBinary` for quantized vectors, Arrow
 extension types for tensor/quantized/PQ layouts, and DLPack-compatible export
 when tensor layout and lifetime allow.
+
+`payload_stride_ref` resolves through `AI_PAYLOAD_REF_TABLE`,
+`AI_TENSOR_LAYOUT`, or a profile-defined tensor layout record. It MUST NOT be a
+free-form implementation-local pointer.
+
+`VectorPayloadBlockHeaderV1.payload_ref` MUST resolve to an
+`AiPayloadRefEntryV1`. For Phase 1 vector payloads, that payload ref MUST
+point into an `AI_PAYLOAD_BYTES` section; vector bytes MUST NOT be appended to
+`AI_VECTOR_PAYLOAD_BLOCK` after the descriptor records.
+
+For `AiLayoutKindV1::DenseRowMajor` fixed-size vectors,
+`payload_stride_ref = 0` means tightly packed vectors with byte stride equal to
+`dimension_count * element_width`. A non-zero `payload_stride_ref` MUST
+reference a tensor/layout descriptor or payload descriptor that declares byte
+stride.
+
+A `VectorPayloadBlockHeaderV1` that claims `StoredPayloadVerifiable`,
+replayability, auditability, or trust-chain participation MUST set
+`integrity_ref` to a validated `AiPayloadIntegrityV1` record. CRC32C alone is
+insufficient for those claims.
+
+`vector_ref` values in vector bindings resolve through `AI_VECTOR_DIRECTORY`.
+`VectorEntryV1.payload_offset` and `payload_length` identify the vector's byte
+range within the resolved `VectorPayloadBlockHeaderV1.payload_ref` block
+payload. The vector range MUST be fully contained in the resolved block payload
+range. If `VectorEntryV1.payload_length != 0`, `payload_offset` is an explicit
+byte offset from the start of the resolved block payload. If
+`VectorEntryV1.payload_length == 0`, `payload_offset` MUST also be zero and the
+reader MAY derive the vector byte range only for fixed-stride dense vectors from
+`block_id`, `vector_ordinal`, vector element width, dimension count, and stride.
+Variable-size, sparse, quantized, external, or extension vector payloads MUST
+use explicit `payload_offset` and `payload_length`.
+
+If `VectorEntryV1.integrity_ref == 0`, the entry inherits the block integrity
+record from `VectorPayloadBlockHeaderV1.integrity_ref`. If
+`VectorEntryV1.integrity_ref != 0`, that integrity record verifies only that
+vector's resolved payload byte range under the common payload-integrity target
+matching rule and MUST be consistent with the block-level digest domain and
+vector-space descriptor. For fixed-size dense vectors,
+`VectorEntryV1.payload_length`, when explicit, MUST equal the declared vector
+byte width; it may be zero only under the derivation rule above.
 
 ### Vector Composition
 
@@ -965,14 +2392,22 @@ Recommended defaults:
 
 | Artifact | Default authority or reproducibility |
 | --- | --- |
-| Persisted value vectors | `PayloadByteReproducible` |
-| Persisted chunk vectors | `PayloadByteReproducible` |
-| Persisted object vectors | `PayloadByteReproducible` |
+| Persisted value vectors | `StoredPayloadVerifiable` |
+| Persisted chunk vectors | `StoredPayloadVerifiable` |
+| Persisted object vectors | `StoredPayloadVerifiable` |
 | Runtime-composed vectors | `RuntimeAdvisory` |
 | Canonical fixed-point composed vectors | `CanonicalRecomputeReproducible` |
 | ANN candidate rankings | `RuntimeAdvisory` unless exact index semantics are proven |
 
 ## Vector Indexes
+
+COVE-VEC defines vector index descriptors only to the extent needed to bind an
+index to vector spaces, payloads, quantization, visibility, redaction, and
+lineage. Generic proof semantics, false-negative policy, index-only capability,
+sidecar validity, coverage/fallback behavior, and dataset-level publication use
+the same obligations as COVX and COVE-I. A `.covev` artifact that contains ANN
+or secondary-index structures MUST satisfy those COVX/COVE-I-compatible
+obligations; it is not a second incompatible index standard.
 
 ```rust
 enum VectorIndexKindV1 {
@@ -991,19 +2426,29 @@ enum VectorIndexKindV1 {
 struct VectorIndexDescriptorV1 {
     vector_index_id: u32,
     vector_space_id: u32,
+    stored_vector_space_id: u32,
+    search_vector_space_id: u32,
     index_kind: u8,
     exactness_kind: u8,
     false_negative_policy: u8,
     metric: u8,
+    score_space_authority: u8,
     dimension_count: u32,
     indexed_binding_kind: u8,
     temporal_scope_ref: u32,
     visibility_scope_ref: u32,
     redaction_scope_ref: u32,
+    dequantization_profile_ref: u32,
+    quantization_error_profile_ref: u32,
     payload_ref: u32,
     checksum: u32,
 }
 ```
+
+`vector_space_id` is the logical query/result vector space advertised by the
+index. `stored_vector_space_id` is the space of vectors physically indexed.
+`search_vector_space_id` is the space in which distance or similarity scores
+are computed after any declared transform, quantization, or dequantization.
 
 Approximate vector indexes MAY return candidates. They MUST NOT claim complete
 nearest-neighbor results unless their descriptor proves exactness for the
@@ -1011,6 +2456,18 @@ requested metric and query class. A semantic search operation MUST disclose
 approximate/exact status in explain output. An index that may have false
 negatives MUST NOT be used as proof that no matching vector, object, or chunk
 exists unless the operation explicitly accepts approximate recall.
+
+Quantized or compressed indexes MUST declare whether scores are computed in the
+stored vector space, dequantized vector space, product-quantized approximate
+space, binary/Hamming space, or device-native compressed space. Exactness claims
+are valid only for the declared `search_vector_space_id`, metric,
+`score_space_authority`, dequantization profile, quantization error profile, and
+query class.
+
+If predicate, temporal, visibility, or redaction filters are applied after
+candidate generation, filtered top-k results MUST be marked possibly incomplete
+unless the candidate generator proves coverage for the filtered universe or the
+operation uses exact scan over the filtered vector set.
 
 ## Tensor and Vector Layouts
 
@@ -1070,6 +2527,7 @@ output buffer or reject the operation with diagnostics.
 ```rust
 struct AiAssetRefV1 {
     asset_ref_id: u64,
+    parent_asset_ref: u64,
     asset_kind: u8,
     uri_ref: u32,
     embedded_section_ref: u32,
@@ -1082,6 +2540,9 @@ struct AiAssetRefV1 {
     sample_rate_hz: u32,
     channel_count: u16,
     decode_profile_ref: u32,
+    preprocessing_profile_ref: u32,
+    transform_profile_ref: u32,
+    transform_digest_ref: u32,
     tensor_layout_ref: u32,
     license_ref: u32,
     policy_ref: u32,
@@ -1095,11 +2556,45 @@ reproducibility is claimed. A URI alone is not stable source identity. Derived
 captions, OCR text, transcripts, embeddings, and labels SHOULD bind back to the
 source asset digest and generator provenance where applicable.
 
+Asset preprocessing that affects model input MUST be declared. This includes
+EXIF orientation, color management, resize/crop/pad policy, video frame
+extraction, audio resampling, normalization, OCR, captioning, transcription, and
+model-specific image/audio/video preprocessing. Derived assets SHOULD set
+`parent_asset_ref`, `transform_profile_ref`, and `transform_digest_ref` so the
+derived-asset chain is auditable.
+
+`preprocessing_profile_ref` describes the model-input preprocessing applied when
+the asset is fed to a tokenizer, encoder, embedding model, or training sample.
+`transform_profile_ref` describes the derived-asset lineage from
+`parent_asset_ref` to this asset. They may reference the same transform only
+when the stored derived asset is exactly the model input.
+
 ## COVE-MMSEQ
 
 COVE-MMSEQ preserves the order and semantics of model-consumable multimodal
 sequences such as system text, user text, image, assistant text, audio clip,
 tool call, tool result, assistant text, and label.
+
+COVE-MMSEQ payloads live in `AI_MULTIMODAL_SEQUENCE`, `AI_ASSET_MANIFEST`,
+`AI_TOKEN_SEQUENCE_PACK`, `AI_TENSOR_LAYOUT`, and, when needed,
+`AI_GENERATOR_PROVENANCE` sections. The sequence pack is the model-consumable
+ordering surface; referenced text, tokens, assets, tensors, labels, and
+evidence remain separately validated surfaces.
+
+Reader obligations:
+
+- validate that element ordinals are unique and form the declared sequence
+  order;
+- validate every referenced token span, asset, tensor, vector, label, evidence,
+  and policy record before exposing the assembled sequence;
+- reject sequence reconstruction when an element is policy-blocked, stale,
+  missing, or unsupported and no declared fallback exists;
+- apply loss masks, attention masks, labels, role markers, and position maps to
+  unambiguous element or token ranges;
+- digest-bind external assets when replayability, auditability, or training
+  reproducibility is claimed;
+- allow non-MMSEQ-aware readers to expose validated independent components, but
+  not to claim model-consumable sequence reconstruction.
 
 ```rust
 struct MultimodalSequencePackV1 {
@@ -1189,6 +2684,27 @@ summarization, translation, code samples, multimodal examples, evaluation items,
 safety/red-team items, generated labels, human-reviewed labels, and synthetic
 teacher outputs.
 
+COVE-TRAIN payloads live in `AI_TRAINING_PROFILE`,
+`AI_TRAINING_SAMPLE_INDEX`, `AI_TRAINING_SPLIT_DEDUP_EPOCH`,
+`AI_LABEL_PREFERENCE`, `AI_GENERATOR_PROVENANCE`, and, for multimodal corpora,
+`AI_MULTIMODAL_SEQUENCE` sections.
+
+Reader obligations:
+
+- validate the source snapshot, mapping profile, chunk profile, tokenizer
+  profile, vector space, split policy, sampling policy, dedup policy, quality
+  policy, license policy, and redaction policy before exporting samples;
+- reject a training split that claims reproducibility but omits source snapshot,
+  hash function, seed, filters, grouping, ordering, or dedup behavior needed to
+  replay the split;
+- reject evaluation or holdout exports when a dedup group, source grouping, or
+  benchmark exclusion rule proves contamination under the declared policy;
+- validate sample weights, quality scores, labels, loss masks, attention masks,
+  preference pairs, and generator provenance before export;
+- preserve deterministic sample order when an epoch plan declares one;
+- export policy-withheld samples as rejected/withheld diagnostics, not as
+  silently skipped rows, when reproducibility or auditability is claimed.
+
 ```rust
 struct TrainingProfileV1 {
     training_profile_id: u32,
@@ -1244,7 +2760,7 @@ struct TrainingSampleEntryV1 {
     target_ref: u32,
     label_ref: u32,
     metadata_ref: u32,
-    token_sequence_pack_ref: u32,
+    token_sequence_pack_ref: u64,
     multimodal_sequence_pack_ref: u64,
     vector_ref: u64,
     quality_score_ppm: u32,
@@ -1268,14 +2784,28 @@ struct DatasetSplitV1 {
     split_id: u32,
     split_name_ref: u32,
     split_method: u8,
+    source_snapshot_ref: u32,
+    filter_policy_ref: u32,
     seed: u64,
     hash_function_ref: u32,
     stratification_path_ref: u32,
     grouping_ref: u32,
+    ordering_policy_ref: u32,
+    dedup_policy_ref: u32,
     sample_count: u64,
     first_sample_ref: u64,
     flags: u32,
     checksum: u32,
+}
+
+enum DedupAuthorityV1 {
+    Exact = 0,
+    Conservative = 1,
+    Advisory = 2,
+    Approximate = 3,
+    ModelScored = 4,
+    PolicyWithheld = 5,
+    Extension = 255,
 }
 
 struct DedupGroupV1 {
@@ -1283,6 +2813,7 @@ struct DedupGroupV1 {
     dedup_policy_ref: u32,
     canonical_member_sample_id: u64,
     similarity_kind: u8,
+    dedup_authority: u8,
     confidence_ppm: u32,
     first_member_ref: u32,
     member_count: u32,
@@ -1296,9 +2827,11 @@ struct TrainingEpochPlanV1 {
     split_ref: u32,
     seed: u64,
     permutation_kind: u8,
+    rng_algorithm_ref: u32,
+    permutation_function_ref: u32,
     shard_count: u32,
     first_shard_ref: u32,
-    shard_count_ref: u32,
+    shard_ref_count: u32,
     flags: u32,
     checksum: u32,
 }
@@ -1309,12 +2842,38 @@ policy, filters, grouping, dedup behavior, and ordering. Training/evaluation
 leakage controls SHOULD be represented through dedup groups, source grouping,
 benchmark exclusion lists, and policy metadata.
 
+A split or epoch plan seed is not sufficient on its own. Reproducible splits and
+epoch plans MUST declare the hash function, RNG algorithm, ordering policy,
+filter policy, dedup policy, grouping policy, and permutation function needed to
+produce the same sample membership and order.
+
+If `DatasetSplitV1.first_sample_ref` and `sample_count` are used as a contiguous
+range, the training sample index MUST be sorted by split and sample ordinal for
+that profile. Otherwise the split MUST use a split-membership payload referenced
+through `AI_SOURCE_SPAN_TABLE` or `AI_PAYLOAD_REF_TABLE`.
+
+Dedup groups may be exact, conservative, advisory, approximate, or model-scored.
+An approximate or advisory dedup group MAY guide sampling quality, but it MUST
+NOT be used as proof that evaluation contamination is impossible.
+
 ### Labels and Preferences
 
 ```rust
+enum TrainingLabelAuthorityV1 {
+    SourceCanonical = 0,
+    HumanAnnotation = 1,
+    HumanReviewedModelOutput = 2,
+    ModelGenerated = 3,
+    HeuristicGenerated = 4,
+    ExternalBenchmark = 5,
+    PolicyWithheld = 6,
+    Extension = 255,
+}
+
 struct TrainingLabelEntryV1 {
     label_id: u64,
     label_kind: u8,
+    label_authority: u8,
     label_payload_ref: u32,
     generator_provenance_ref: u64,
     human_review_ref: u32,
@@ -1340,6 +2899,11 @@ struct PreferencePairEntryV1 {
     checksum: u32,
 }
 ```
+
+A label may be non-authoritative relative to source COVE truth while still being
+the declared target label for a specific `TrainingProfileV1`.
+`label_authority` states why the training profile may use the label and how it
+should be audited.
 
 ## Synthetic Teacher and Generator Provenance
 
@@ -1419,12 +2983,38 @@ REQUIRED for every synthetic output, label, score, preference, or rewrite.
 External model APIs may be non-reproducible. In that case, the provenance record
 supports audit and filtering, but MUST NOT claim deterministic regeneration.
 
+When auditability is claimed, prompt templates, rendered prompts, source
+context, tool calls, tool outputs, decoding profiles, model actor descriptors,
+and generated outputs MUST be digest-bound through `AI_PAYLOAD_INTEGRITY`,
+`AI_DIGEST_TABLE`, or a profile-defined digest record. A model name or endpoint
+name without digest-bound prompt, context, tool-output, and decoding lineage is
+not sufficient for synthetic-data auditability.
+
 ## CoveQL-AI
 
 CoveQL-AI adds AI-native query methods over existing Cove roots, including
 `table(...)`, object roots, `association(...)`, `evidence(...)`,
 `projection(...)`, `chunk(...)`, `trainingSamples(...)`,
 `multimodalSequences(...)`, and `assets(...)`.
+
+CoveQL-AI is an operation profile, not a baseline query requirement. Stored
+CoveQL-AI operation profiles MAY be described by `AI_SOURCE_BINDING` plus
+profile-specific metadata, but query text and runtime parameters are not source
+truth unless a separate profile explicitly stores them as canonical values.
+
+Every CoveQL-AI operation context SHOULD record:
+
+- selected source file, COVM snapshot, branch, CSN, schema fingerprint,
+  dictionary digest, mapping fingerprint, visibility scope, and redaction scope;
+- AI profile, vector space, chunk profile, tokenizer profile, training profile,
+  sequence profile, and generator provenance records used;
+- query vector source: explicit vector bytes, stored vector ref, deterministic
+  vectorizer profile, or external runtime service;
+- vector result authority and reproducibility class;
+- exactness and approximation status for vector indexes, hybrid search,
+  rerankers, dedup filters, and sampled outputs;
+- fallback decisions, including ignored stale sidecars, recomputation, exact
+  scan fallback, withheld metadata, and rejected operations.
 
 Proposed methods:
 
@@ -1602,6 +3192,10 @@ COVE-AI must acknowledge AI-specific leakage risks:
 
 Rules:
 
+- a reader opening `CVA2` or `CVV2` directly MUST treat payload-bearing AI
+  sections as policy-blocked until `AI_SOURCE_BINDING`, visibility scope,
+  redaction scope, policy scope, and sensitivity summaries are validated or a
+  trusted caller policy explicitly overrides that fail-closed default;
 - a redacted value MUST NOT be exposed through chunk text, token IDs, vector
   payloads, nearest-neighbor metadata, dedup metadata, multimodal sequence
   elements, or training sample exports unless policy explicitly allows it;
@@ -1613,6 +3207,15 @@ Rules:
 - approximate, sampled, masked, or privacy-transformed AI metadata MUST be
   marked as approximate or policy-protected and MUST NOT be used as exact proof
   unless the proof remains valid under the declared transformation.
+
+Cove artifacts are immutable. If a source redaction, visibility rule,
+retention rule, consent state, or policy decision changes, old AI sidecars may
+remain physically present but become logically revoked for governed reads.
+COVM, external catalogs, governance manifests, or policy layers SHOULD be able
+to mark `CVA2`/`CVV2` artifacts and individual AI source bindings as revoked,
+superseded, expired, or quarantined. A reader that sees a revoked AI sidecar
+MUST NOT use it for AI operations unless an explicit trusted policy permits
+historical forensic access.
 
 ## Interoperability
 
@@ -1647,8 +3250,8 @@ alignment, and policy before exposing COVE buffers.
 
 | Tier | Name | Requirements |
 | --- | --- | --- |
-| COVE-AI-L0 | Ignore safely | Reader recognizes unknown optional AI profiles and ignores them safely. |
-| COVE-AI-L1 | Metadata | Reader validates COVE-MAP-AI slot policies and exposes them in inspect/explain. |
+| COVE-AI-L0 | Ignore safely | Reader recognizes optional AI profile presence, `AI_COMPANION_ARTIFACT_REF` sidecar references, and unknown optional AI sections, and ignores them safely for ordinary COVE-T/O/MAP reads. |
+| COVE-AI-L1 | Metadata | Reader validates `CVA2`/`CVV2` framing and validation order when opened, `AI_SOURCE_BINDING`, `AI_REFERENCE_TABLES`, `AI_PRIVACY_SUMMARY`, COVE-MAP-AI slot policies, and exposes them in inspect/explain. |
 | COVE-AI-L2 | Chunks | Reader validates COVE-CHUNK indexes and returns chunk/context projections. |
 | COVE-AI-L3 | Tokens | Reader validates tokenizer profiles, token blocks, tokenized spans, and sequence packs. |
 | COVE-AI-L4 | Value vectors | Reader validates COVE-VEC vector spaces, FileCode vector bindings, and vector payload blocks; supports `.embedding()` for distinct value/slot vectors. |
@@ -1661,12 +3264,105 @@ alignment, and policy before exposing COVE buffers.
 
 The conformance suite should include reject/fallback tests for:
 
+- writer or AI-profile validator accepts an operation-only AI feature bit in
+  `.cove` header `required_features` word 0 instead of scoped requiredness;
+- unknown optional profile ID in an optional embedded `.cove` AI section causes
+  ordinary COVE-T/O/MAP reads to reject;
+- unsupported `postscript_version`, `version_major`, or incompatible
+  `version_minor` is accepted without a feature-gated compatibility rule;
+- unknown optional COVE-AI section reported by inspect and ignored by ordinary
+  COVE-T scan;
+- unknown required COVE-AI section rejecting only the selected AI operation;
+- duplicate `section_id` values in one `CVA2`/`CVV2` artifact;
+- section-entry array mutation changes `section_kind`, `source_binding_ref`,
+  feature scope, offset, or length without changing section payload CRC;
+- `CoveAiPostscriptV1.required_ai_features` or `optional_ai_features` differs
+  from the corresponding `CoveAiHeaderV1` word;
+- postscript `header_length` does not equal
+  `header_len + section_count * section_entry_len`;
+- `file_len` does not match actual artifact length, or a section range extends
+  outside `file_len`;
+- `AI_SECTION_FEATURE_BINDING` depends on an unvalidated feature binding;
+- sidecar section-local feature bits are treated as `.cove` global feature
+  bits or vice versa;
+- `.cove` or COVM sidecar reference lacks digest-bound
+  `AI_COMPANION_ARTIFACT_REF` metadata under a strict sidecar policy;
+- embedded `.cove` `AI_COMPANION_ARTIFACT_REF` resolves refs without an embedded
+  `AI_REFERENCE_TABLES` section or required resolver extension;
+- malformed `CVA2` or `CVV2` postscript, header, section bounds, or checksum;
+- missing `AI_SOURCE_BINDING` for a derived payload section;
+- `_ref` field points outside its declared COVE-AI reference space;
+- Phase 1 `_ref` field resolves through the wrong reference space but happens
+  to find the same numeric ID;
+- mixed-record binary section omits `AiRecordHeaderV1`;
+- unknown required record kind is skipped instead of rejecting the selected
+  section/profile/operation;
+- `CVA2` or `CVV2` sidecar with valid CRC32C but missing cryptographic digest
+  while claiming `StoredPayloadVerifiable`;
+- payload integrity digest computed over stored compressed bytes but declared as
+  decoded section payload bytes;
+- `AiPayloadIntegrityV1.payload_crc32c` computed over the integrity record
+  instead of the declared payload domain;
+- digest payload needed to validate `AI_PAYLOAD_INTEGRITY` depends cyclically on
+  the same integrity record;
+- reference-table enum value outside the standard range is accepted without a
+  required extension;
+- non-zero unknown `flags` in a required record are ignored instead of rejected;
+- AI compression enum uses `Zstd = 1` and `Lz4 = 2` instead of the COVE section
+  compression ordering;
+- payload offset interpreted as section-relative when the record declares the
+  default artifact-absolute coordinate space;
+- absolute vector/token payload offset points into decoded bytes of a compressed
+  section instead of stored artifact bytes;
+- `AiPayloadRefEntryV1` uses fields that are invalid for its `storage_kind`;
+- `TokenBlockHeaderV1.payload_ref` resolves to one range, but the block
+  header's non-zero cached `payload_offset` or `payload_length` describes a
+  different range;
+- `VectorPayloadBlockHeaderV1.payload_ref` resolves to one range, but the
+  block header's non-zero cached `payload_offset` or `payload_length` describes
+  a different range;
+- Phase 1 vector or token payload ref uses `ArtifactAbsolute` but is not fully
+  contained in exactly one `AI_PAYLOAD_BYTES` section;
+- Phase 1 vector or token payload ref uses `ArtifactAbsolute` into a compressed
+  `AI_PAYLOAD_BYTES` section instead of `SectionDecodedRelative`;
+- `TokenBlockHeaderV1.integrity_ref` or
+  `VectorPayloadBlockHeaderV1.integrity_ref` points to an
+  `AiPayloadIntegrityV1` record whose `payload_ref` does not match the block
+  payload ref;
+- `VectorEntryV1.integrity_ref` points to an integrity record that verifies a
+  different byte range than the resolved vector entry payload range;
+- standard Phase 1 binary section omits `AiRecordHeaderV1`;
+- raw vector or token bytes are appended to `AI_VECTOR_PAYLOAD_BLOCK` or
+  `AI_TOKEN_BLOCK` and parsed as records because no `AI_PAYLOAD_BYTES` carrier
+  or payload ref is declared;
+- `AI_PAYLOAD_BYTES` is parsed as `AiRecordHeaderV1` records instead of treated
+  as an opaque payload carrier;
+- `AI_PAYLOAD_BYTES` declares `payload_encoding = BinaryRecords` instead of
+  `OpaqueBytes`;
+- duplicate reference IDs appear in one `AI_REFERENCE_TABLES` reference space;
+- direct `.covev` open exposes payload before validating policy scope;
+- direct `.covev` open exposes payload-bearing sections when
+  `AI_PRIVACY_SUMMARY` is absent and no trusted caller override exists;
 - stale `.covev` file digest;
+- source file digest matches but redaction scope, visibility scope, policy
+  scope, or sensitivity summary changed;
 - wrong dictionary digest, schema fingerprint, vector dimension, metric, or
   normalization policy;
+- `FileCodeVectorBindingV1.file_code` exceeds `u32::MAX` through an unsupported
+  wider-code extension or non-zero reserved widening field;
+- vector-space ID collision: same numeric `vector_space_id` but different
+  model, template, metric, normalization, quantization, or pipeline descriptor;
+- vector binding references a `vector_ref` with no matching `AI_VECTOR_DIRECTORY`
+  entry;
+- vector entry inherits block integrity incorrectly or declares per-vector
+  integrity inconsistent with the vector payload byte range;
 - template fingerprint mismatch;
 - tokenizer digest mismatch;
+- tokenizer profile matches vocab but not pre-tokenizer, byte encoder, added
+  token ordering, chat template, Unicode version, truncation, or padding policy;
 - chunk span not UTF-8 aligned;
+- chunk `unicode_scalar_start` valid only under UTF-16 code-unit semantics, not
+  declared Unicode scalar semantics;
 - chunk source hash mismatch;
 - tokenized span source hash mismatch;
 - FileCode reused across files without dictionary proof;
@@ -1675,15 +3371,56 @@ The conformance suite should include reject/fallback tests for:
 - redacted neighboring chunk included in context;
 - approximate index claimed as exact;
 - ANN index with false negatives used for proof exclusion;
+- `.similar()` claims exact filtered top-k after post-filtering approximate
+  global candidates;
+- quantized vector index claims exact cosine results without declaring
+  dequantization profile, quantization error profile, and score space authority;
 - training split missing seed/hash policy;
+- split reproducibility claimed while sample ordering depends on map/hash
+  iteration order;
 - evaluation split contaminated by dedup group overlap;
+- dedup group used as evaluation-contamination proof while dedup authority is
+  approximate, advisory, or model-scored;
 - external asset URI without digest when replayability is claimed;
+- asset digest binds compressed image bytes but the model input used undeclared
+  EXIF orientation, resize, crop, color, frame extraction, resampling, OCR,
+  caption, transcript, or model preprocessing transform;
 - generated label missing generator provenance when auditability is claimed;
+- model-generated label has model name but missing prompt, context, tool-output,
+  or decoding digest under an auditability claim;
 - teacher model name present but version/provenance missing under strict policy;
 - runtime floating-point composed vector claimed as digest-reproducible;
+- `ExternalAuditOnly` numerically compared as stronger than
+  `CanonicalRecomputeReproducible`;
 - tensor layout claims zero-copy but alignment/stride is invalid;
 - multimodal sequence element ordinal duplicate;
 - loss mask references invalid token range.
+
+## Positive Conformance Corpus
+
+Each COVE-AI profile should have at least one minimal accept fixture, one
+inspect/report fixture, and one operation fixture before an implementation
+claims the corresponding tier.
+
+| Profile | Minimal accept fixture | Operation fixture |
+| --- | --- | --- |
+| COVE-MAP-AI | `.covemap` with `MAP_AI_PROFILE_CATALOG` and one slot policy. | Inspect slot decisions and reject a forbidden-slot sidecar. |
+| COVE-AI Shared | `.cove` or COVM reference with `AI_COMPANION_ARTIFACT_REF`, one `AI_REFERENCE_TABLES` section, `AI_SOURCE_BINDING`, `AI_PRIVACY_SUMMARY`, `record_version = 1` records, and valid `CVA2`/`CVV2` validation order. | Ordinary COVE-T scan ignores optional AI sidecar; `cove inspect --ai` reports sidecar freshness. |
+| COVE-CHUNK | `.coveai` with one `ChunkProfileV1` and UTF-8-valid `TextChunkEntryV1`. | `.chunks()` returns source-bound chunks with redaction applied. |
+| COVE-TOK | `.coveai` with one tokenizer profile, token block descriptor, tokenized span, reference table, `AI_PAYLOAD_BYTES`, and payload integrity record. | `.tokens()` returns token IDs and validates masks/labels. |
+| COVE-VEC | `.covev` with source binding, privacy summary, vector space, FileCode vector binding, payload block descriptor, vector directory, one reference table, `AI_PAYLOAD_BYTES`, payload integrity record, and `record_version = 1` records. | `.embedding()` resolves one FileCode vector and rejects wrong dictionary digest. |
+| COVE-VEC index | `.covev` with exact flat index metadata. | `.similar()` labels exactness and falls back from stale approximate index. |
+| COVE-TRAIN | `.coveai` with training profile, deterministic split, sample, label, and epoch plan. | `.trainingSamples().split().pack()` preserves order, masks, labels, and evidence. |
+| COVE-MMSEQ | `.coveai` with asset manifest, sequence pack, ordered elements, and policy refs. | `.multimodal()` reconstructs element order and rejects duplicate ordinals. |
+| Generator provenance | Synthetic label or preference pair with model actor and decoding profile. | Filter samples by generator model/version and human-review status. |
+
+Release gates:
+
+```sh
+cargo run -p cove-conformance --bin gen-corpus -- --check
+cargo run -p cove-conformance --bin gen-capability-matrix -- --check
+cargo run -p cove-conformance --bin cove-conformance -- conformance/
+```
 
 ## Benchmarks
 
@@ -1712,13 +3449,18 @@ COVE-AI benchmark reporting should include:
 
 ### Phase 1: AI Slot Metadata and Dictionary Vectors
 
-Implement COVE-MAP-AI slot policy metadata, COVE-VEC vector space descriptors,
-`FileCodeVectorBindingV1`, `VectorPayloadBlockHeaderV1`,
+Implement the COVE-AI feature namespace, proposed section-kind registry entries,
+`CVA2`/`CVV2` companion artifact framing, `AI_SOURCE_BINDING`,
+`AI_REFERENCE_TABLES`, `AI_PAYLOAD_INTEGRITY`, `AI_PAYLOAD_BYTES`,
+COVE-MAP-AI slot policy
+metadata, COVE-VEC vector space descriptors, `FileCodeVectorBindingV1`,
+`VectorPayloadBlockHeaderV1`, `VectorEntryV1`,
 `VectorCompositionProfileV1`, `VectorResultAuthorityV1`, `cove inspect --ai`,
 `cove vec build`, and CoveQL-AI `.embedding()`.
 
 Deliverable: distinct logical values are vectorized once per semantic slot and
-reused by FileCode.
+reused by FileCode, with stale sidecars rejected and ordinary COVE-T scans
+unaffected by unsupported AI metadata.
 
 ### Phase 2: Chunking and RAG
 
@@ -1727,7 +3469,7 @@ CoveQL-AI `.similar()` over chunks, `.context()`, `.asPromptContext()`, and AI
 explain output.
 
 Deliverable: Cove becomes a self-verifying RAG archive with source-bound chunks
-and evidence-aware context.
+and evidence-aware context, including redaction-safe context expansion.
 
 ### Phase 3: Tokenization and Training Data
 
@@ -1737,7 +3479,7 @@ Implement `TokenizerProfileV1`, `TokenBlockHeaderV1`, `TokenizedSpanV1`,
 `.trainingSamples().split().pack()`.
 
 Deliverable: Cove stores reproducible tokenized training streams and sample
-splits.
+splits with validated masks, labels, order, and evidence.
 
 ### Phase 4: Synthetic Provenance
 
@@ -1827,10 +3569,11 @@ The amendment should open with:
 > chunker/vectorizer lineage, arithmetic profile, generator provenance, tensor
 > layout, and policy context needed to validate freshness and replay intent.
 >
-> Dynamically composed floating-point vectors are RuntimeAdvisory by default and
-> MUST NOT be treated as byte-reproducible cryptographic truth. Composed vectors
-> may become digest-verifiable only when materialized as payload bytes or
-> produced under a strict canonical deterministic arithmetic profile.
+> Dynamically composed floating-point vectors have
+> `VectorResultAuthorityV1::RuntimeAdvisory` by default and MUST NOT be treated
+> as byte-reproducible cryptographic truth. Composed vectors may become
+> digest-verifiable only when materialized as payload bytes or produced under a
+> strict canonical deterministic arithmetic profile.
 >
 > A conforming implementation MUST fail closed or fall back safely when an AI
 > artifact is stale, unsupported, corrupt, policy-blocked, hardware-incompatible,

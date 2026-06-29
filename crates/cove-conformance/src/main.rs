@@ -54,6 +54,7 @@ use cove_codec::{CodecExtensionDescriptorV2, RegisteredEncodingEnvelopeV2};
 use cove_core::{
     array::{CoveArrayValue, EncodedArray},
     artifact::{
+        coveai::CoveAiFile,
         covedelta::CoveDeltaFile,
         covedelta::{
             reconstruct_sparse_patch_state_table, CoveObjectDeltaStateHashPropertyV1,
@@ -232,6 +233,7 @@ fn validate_fixture(entry: &Entry, corpus: &Path, bytes: &[u8]) -> Result<(), Co
         "covemap" => CovemapFile::parse(bytes).and_then(|file| file.validate_map_sections()),
         "covx" => CovxFile::parse(bytes).map(|_| ()),
         "covm" => CovmFile::parse(bytes).map(|_| ()),
+        "coveai" | "covev" => CoveAiFile::parse(bytes).map(|_| ()),
         "covm_delta_chain_extension" => CovmDeltaChainExtensionV1::parse(bytes).map(|_| ()),
         "covm_delta_chain_summary" => CovmDeltaChainSummaryV1::parse(bytes).map(|_| ()),
         "covm_delta_chain_selection_case" => validate_covm_delta_chain_selection_fixture(bytes),

@@ -9,6 +9,8 @@ pub(crate) enum HelpTopic {
     Delta,
     Convert,
     Map,
+    Vec,
+    Train,
 }
 
 pub(crate) fn print_usage(topic: HelpTopic) {
@@ -26,6 +28,8 @@ pub(crate) fn usage(topic: HelpTopic) -> String {
         HelpTopic::Delta => delta_usage(),
         HelpTopic::Convert => convert_usage(),
         HelpTopic::Map => map_usage(),
+        HelpTopic::Vec => vec_usage(),
+        HelpTopic::Train => train_usage(),
     }
     .into()
 }
@@ -36,13 +40,15 @@ fn global_usage() -> &'static str {
   cove showcase customer360 --out <dir> [--profile quick|standard|publication] [--force] [--json]
   cove showcase proof-suite --out <dir> [--scenario customer360|claims|catalog|all] [--profile quick|standard|publication] [--force] [--json]
   cove doctor [--json] <file>
-  cove inspect [--queries] [--performance] [--json] <file>
+  cove inspect [--queries] [--performance] [--ai] [--json] <file>
   cove inspect [--json] [--sections stats,dictionary,execution,indexes,optional] <file...>
   cove optimize <file> [--out-dir dir] [--full] [--json]
-  cove query [--format table|json|jsonl|csv] [--take n] [--max-cell-width n] [--explain [public|developer|proof|coded|forensic]] [--engine auto|materialized|physical|compare|kernel] [--no-auto-sidecars] [--strict-performance] [--perf-report] [--batch-size n] [--external-table name=path.csv|json|jsonl] [--enable-graph-traversal] [--max-graph-depth n] [--max-graph-paths n] [--max-graph-fanout n] [--mapping file.covemap] [--member id=path] [--dataset dir] [--as-of-csn n|--as-of-commit-us n] [--delta-plan|--delta-plan-json] [--covi file] [--covx file] [--cove-e file] [file] '<coveql>'
+  cove query [--format table|json|jsonl|csv] [--take n] [--max-cell-width n] [--explain [public|developer|proof|coded|ai|forensic]] [--engine auto|materialized|physical|compare|kernel] [--no-auto-sidecars] [--strict-performance] [--perf-report] [--batch-size n] [--external-table name=path.csv|json|jsonl] [--enable-graph-traversal] [--max-graph-depth n] [--max-graph-paths n] [--max-graph-fanout n] [--mapping file.covemap] [--member id=path] [--dataset dir] [--as-of-csn n|--as-of-commit-us n] [--delta-plan|--delta-plan-json] [--covi file] [--covx file] [--cove-e file] [--cove-ai file.covev] [file] '<coveql>'
   cove query [options] --query-file <path|-> [file]
   cove convert <parquet|arrow|orc|csv|report> ...
   cove validate ...
+  cove vec build --out <vectors.covev> --dimension <n> --file-code <u32>... (--deterministic | --payload <f32le.bin>)
+  cove train export <training.coveai|training.covev> [--format json|jsonl] [--out <path>] [--profile <id>] [--split <id>]
   cove dump ...
   cove map <validate|preview|plan-keys|candidates|review|aliases|replay|convert|build|delta|publish|doctor|suggest|parity|explain|diff|project|test> ...
   cove export arrow [--query '<coveql>'] ...
@@ -60,6 +66,9 @@ Examples:
   cove showcase proof-suite --scenario all --profile quick --out target/cove-proof-suite --force
   cove doctor people.cove
   cove inspect --queries --performance people.cove
+  cove inspect --ai vectors.covev
+  cove vec build --out vectors.covev --dimension 3 --file-code 1 --file-code 2 --deterministic
+  cove train export training.coveai --format jsonl
   cove convert parquet source.parquet output.cove
   cove validate --semantic output.cove
   cove optimize output.cove
@@ -75,11 +84,11 @@ Examples:
 }
 
 fn query_usage() -> &'static str {
-    "Usage:\n  cove query [options] [file.cove|manifest.covm] '<coveql>'\n  cove query [options] --query-file <path|-> [file.cove|manifest.covm]\n\nOutput options:\n  --format table|json|jsonl|csv\n  --take n\n  --max-cell-width n\n  --json-diagnostics\n\nExecution options:\n  --engine auto|materialized|physical|compare|kernel\n  --explain [public|developer|proof|coded|forensic]\n  --perf-report\n  --strict-performance\n  --no-auto-sidecars\n  --batch-size n\n\nDelta snapshot options:\n  --dataset dir\n  --as-of-csn n\n  --as-of-commit-us n\n  --delta-plan\n  --delta-plan-json\n\nInputs and sidecars:\n  --mapping file.covemap\n  --external-table name=path.csv|json|jsonl\n  --member manifest-uri=path\n  --covi file.covi\n  --covx file.covx\n  --coverage-plan file\n  --coverage-proof file\n  --coverage-set file\n  --layout-plan file\n  --scan-split-index file\n  --page-cluster-directory file\n  --zero-copy-buffer-map file\n  --coverage-cache file\n  --cove-e file\n\nGraph traversal:\n  --enable-graph-traversal\n  --max-graph-depth n\n  --max-graph-paths n\n  --max-graph-fanout n\n\nAuthority model:\n  Materialized CoveQL readback is the semantic authority. Auto, physical, kernel,\n  and sidecar-backed execution may accelerate a query only when validated metadata\n  proves equivalence; otherwise the CLI falls back or rejects when strict mode is set.\n\nExamples:\n  cove query events.cove 'table(events).where(score >= 20).select(id, score)'\n  cove query --format jsonl people.cove 'table(people).select(score, status).take(5)'\n  cove query dataset.covm --dataset bundle --as-of-csn 100 --delta-plan 'object(Thing).take(10)'\n  cove query --engine compare --perf-report events.cove 'table(events).where(score >= 20).select(id, score)'\n  cove query --external-table weights=weights.jsonl events.cove 'table(events) as e.join(table(weights) as w, on: e.id == w.id).select(id: e.id, score: e.score, weight: w.weight)'\n  printf 'table(events).take(5)' | cove query --query-file - events.cove"
+    "Usage:\n  cove query [options] [file.cove|manifest.covm] '<coveql>'\n  cove query [options] --query-file <path|-> [file.cove|manifest.covm]\n\nOutput options:\n  --format table|json|jsonl|csv\n  --take n\n  --max-cell-width n\n  --json-diagnostics\n\nExecution options:\n  --engine auto|materialized|physical|compare|kernel\n  --explain [public|developer|proof|coded|ai|forensic]\n  --perf-report\n  --strict-performance\n  --no-auto-sidecars\n  --batch-size n\n\nDelta snapshot options:\n  --dataset dir\n  --as-of-csn n\n  --as-of-commit-us n\n  --delta-plan\n  --delta-plan-json\n\nInputs and sidecars:\n  --mapping file.covemap\n  --external-table name=path.csv|json|jsonl\n  --member manifest-uri=path\n  --covi file.covi\n  --covx file.covx\n  --coverage-plan file\n  --coverage-proof file\n  --coverage-set file\n  --layout-plan file\n  --scan-split-index file\n  --page-cluster-directory file\n  --zero-copy-buffer-map file\n  --coverage-cache file\n  --cove-e file\n  --cove-ai file.covev\n\nGraph traversal:\n  --enable-graph-traversal\n  --max-graph-depth n\n  --max-graph-paths n\n  --max-graph-fanout n\n\nAuthority model:\n  Materialized CoveQL readback is the semantic authority. Auto, physical, kernel,\n  and sidecar-backed execution may accelerate a query only when validated metadata\n  proves equivalence; otherwise the CLI falls back or rejects when strict mode is set.\n\nExamples:\n  cove query events.cove 'table(events).where(score >= 20).select(id, score)'\n  cove query --format jsonl people.cove 'table(people).select(score, status).take(5)'\n  cove query dataset.covm --dataset bundle --as-of-csn 100 --delta-plan 'object(Thing).take(10)'\n  cove query --engine compare --perf-report events.cove 'table(events).where(score >= 20).select(id, score)'\n  cove query --external-table weights=weights.jsonl events.cove 'table(events) as e.join(table(weights) as w, on: e.id == w.id).select(id: e.id, score: e.score, weight: w.weight)'\n  cove query --cove-ai vectors.covev events.cove '# profiles: table, ai\\ntable(events).similar(fileCode: 10, k: 5)'\n  printf 'table(events).take(5)' | cove query --query-file - events.cove"
 }
 
 fn inspect_usage() -> &'static str {
-    "Usage:\n  cove inspect [--queries] [--performance] [--json] <file>\n  cove inspect [--json] [--sections stats,dictionary,execution,indexes,optional] <file...>\n\nModes:\n  Beginner inspect detects query surfaces, artifact type, guidance, diagnostics,\n  and optional performance-sidecar status.\n  Detailed inspect delegates to the lower-level inspector when --sections is used\n  or when multiple files are supplied.\n\nExamples:\n  cove inspect --queries people.cove\n  cove inspect --queries --performance events.cove\n  cove inspect --json --sections stats,dictionary events.cove"
+    "Usage:\n  cove inspect [--queries] [--performance] [--ai] [--json] <file>\n  cove inspect [--json] [--sections stats,dictionary,execution,indexes,optional] <file...>\n\nModes:\n  Beginner inspect detects query surfaces, artifact type, guidance, diagnostics,\n  and optional performance-sidecar status.\n  AI inspect validates .coveai/.covev sidecars or reports embedded AI sections in .cove files.\n  Detailed inspect delegates to the lower-level inspector when --sections is used\n  or when multiple files are supplied.\n\nExamples:\n  cove inspect --queries people.cove\n  cove inspect --queries --performance events.cove\n  cove inspect --ai vectors.covev\n  cove inspect --json --sections stats,dictionary events.cove"
 }
 
 fn optimize_usage() -> &'static str {
@@ -100,6 +109,14 @@ fn delta_usage() -> &'static str {
 
 fn convert_usage() -> &'static str {
     "Usage:\n  cove convert parquet <source.parquet> <output.cove> [options]\n  cove convert arrow <source.arrow> <output.cove> [options]\n  cove convert orc <source.orc> <output.cove> [options]\n  cove convert csv <source.csv> <output.cove> [options]\n  cove convert report ...\n\nExamples:\n  cove convert parquet source.parquet output.cove --report report.json\n  cove convert csv source.csv output.cove --report -\n  cove convert report --direction cove-to-source --target-format csv --output output.csv input.cove"
+}
+
+fn vec_usage() -> &'static str {
+    "Usage:\n  cove vec build --out <vectors.covev> --dimension <n> --file-code <u32>... (--deterministic | --payload <f32le.bin>) [--artifact-id <32-hex>] [--created-at-us <n>]\n\nBehavior:\n  Builds a CVV2 sidecar with dense f32 little-endian vectors, FileCode bindings,\n  payload refs, payload integrity, privacy summary, vector-space, vector-block,\n  and vector-directory records. Core does not call network embedding providers.\n\nExamples:\n  cove vec build --out vectors.covev --dimension 3 --file-code 1 --file-code 2 --deterministic\n  cove vec build --out vectors.covev --dimension 384 --file-code 10 --payload embeddings.f32le"
+}
+
+fn train_usage() -> &'static str {
+    "Usage:\n  cove train export <training.coveai|training.covev> [--format json|jsonl] [--out <path>] [--profile <id>] [--split <id>]\n\nBehavior:\n  Validates the COVE-AI/COVE-VEC sidecar and exports COVE-TRAIN descriptor metadata.\n  The command does not read AI_PAYLOAD_BYTES directly; payload access remains policy-gated.\n  JSON output includes profiles, splits, dedup groups, epoch plans, labels, and samples.\n  JSONL output emits one sample descriptor per line for streaming pipelines.\n\nExamples:\n  cove train export training.coveai\n  cove train export training.coveai --format jsonl --out samples.jsonl\n  cove train export training.coveai --profile 1 --split 2"
 }
 
 fn map_usage() -> &'static str {

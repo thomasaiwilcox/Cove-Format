@@ -33,6 +33,16 @@ object/property deduplication offsets semantic evidence and bundle overhead.
 Current overlap result tables and interpretation are recorded in
 [`../performance/cove-o-overlap-benchmark-results.md`](../performance/cove-o-overlap-benchmark-results.md).
 
+COVE-AI benchmark reports SHOULD include vector dedup ratio, embedding cost
+avoided, tokenization cost avoided, chunk reuse ratio, training stream
+throughput, multimodal assembly latency, RAG retrieval latency, snapshot
+verification cost, tensor zero-copy/materialization rates, storage overhead,
+stale sidecar rejection, redaction leakage checks, split reproducibility, and
+generator filtering correctness. ANN benchmarks MUST report exactness,
+false-negative policy, quantization score-space declarations, post-filtered
+top-k incompleteness, and fallback-to-exact behavior when exact vectors are
+available and query policy permits it.
+
 Benchmark artifacts follow COVE v2.0 feature-scope rules and extension fallback policy. The conformance command set remains:
 
 ```sh

@@ -86,6 +86,9 @@ before attempting the full corpus.
 6. Add zone stats and proof-safe pruning only after decoded scans are correct.
 7. Add Arrow, Parquet, ORC, DataFusion, COVI, COVX, COVM, COVE-O, or COVE-MAP
    surfaces as explicit profile claims, not as hidden baseline dependencies.
+8. Add COVE-AI only as an optional sidecar profile after baseline COVE-T/O/MAP
+   behavior is stable. Ordinary reads must not require `.coveai` or `.covev`
+   support.
 
 ## Error Behavior
 
@@ -104,8 +107,36 @@ COVE implementations should make failure behavior boring and deterministic:
 A first independent implementation does not need to implement semantic mapping,
 object-temporal reconstruction, secondary index artifacts, runtime coverage
 caches, object-store planning, zero-copy Arrow views, registered codec plugins,
-Harbor integration, or DataFusion integration. Those are valuable profile
-claims after the reader kernel is correct.
+Harbor integration, COVE-AI companion sidecars, or DataFusion integration.
+Those are valuable profile claims after the reader kernel is correct.
+
+## Optional COVE-AI Support
+
+COVE-AI adds `.coveai` (`CVA2`) and `.covev` (`CVV2`) companion artifacts for
+chunk, token, vector, training, multimodal, asset, tensor, and generator
+provenance metadata. Implement it as a selected-operation capability, not as a
+baseline dependency.
+
+An implementation that claims COVE-AI support should:
+
+- parse and validate `CVA2`/`CVV2` framing, postscript/header fields, section
+  directory entries, section ranges, checksums, feature words, and
+  `AiRecordHeaderV1` records;
+- validate common descriptor tables such as `AI_REFERENCE_TABLES`,
+  `AI_SOURCE_BINDING`, `AI_PRIVACY_SUMMARY`, `AI_PAYLOAD_INTEGRITY`,
+  `AI_SECTION_FEATURE_BINDING`, and `AI_PAYLOAD_BYTES`;
+- treat direct AI payload access as policy-blocked until source binding,
+  privacy summary, visibility/redaction policy, and payload integrity validate;
+- reject unsupported required AI features only for the selected AI operation,
+  not for ordinary table/object/mapping reads;
+- avoid claiming network embedding, tokenizer, model, or ANN execution support
+  unless those providers or indexes are implemented and gated explicitly.
+
+The current reference implementation provides the provider-free COVE-AI
+surface, exact flat FileCode vector scan, COVE-MAP-AI policy validation, and
+CoveQL-AI descriptor/embedding/search methods. See
+[`docs/cove-ai.md`](./docs/cove-ai.md) for the public guide and
+[`spec/09-ai/`](./spec/09-ai/) for the normative wire details.
 
 ## Current Reference Boundaries
 

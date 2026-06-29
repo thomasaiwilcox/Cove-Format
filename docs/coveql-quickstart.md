@@ -263,6 +263,51 @@ be supplied with flags such as
 `--covi`, `--covx`, `--coverage-plan`, `--coverage-proof`, `--coverage-set`,
 `--layout-plan`, `--zero-copy-buffer-map`, and `--cove-e`.
 
+## AI Companion Sidecars
+
+COVE-AI sidecars are optional. They do not change ordinary COVE-T scans,
+COVE-O reconstruction, or COVE-MAP readback. A query only depends on AI
+metadata when it opts into the `ai` profile and selects a CoveQL-AI method.
+
+Build a deterministic local vector sidecar for the checked-in table sample:
+
+```bash
+cove vec build \
+  --out target/events-vectors.covev \
+  --dimension 3 \
+  --file-code 1 \
+  --file-code 2 \
+  --deterministic
+```
+
+Inspect and validate the sidecar:
+
+```bash
+cove inspect --ai target/events-vectors.covev
+cove validate target/events-vectors.covev
+```
+
+Use the sidecar with CoveQL-AI methods:
+
+```bash
+cove query --cove-ai target/events-vectors.covev examples/coveql/events.cove \
+  '# profiles: table, ai
+table(events).embedding(fileCode: 1)'
+
+cove query --cove-ai target/events-vectors.covev examples/coveql/events.cove \
+  '# profiles: table, ai
+table(events).similar(fileCode: 1, k: 2)'
+```
+
+Descriptor projection methods such as `.chunks()`, `.tokens()`,
+`.trainingSamples()`, `.multimodal()`, and `.generatorAudit()` require a
+supplied `.coveai` or `.covev` sidecar containing those descriptor families.
+The reference implementation validates descriptor metadata and withholds
+protected text/assets unless a policy-specific operation authorizes exposure.
+
+For a fuller overview of `.coveai`, `.covev`, `cove train export`, and the
+CoveQL-AI method set, see [`docs/cove-ai.md`](./cove-ai.md).
+
 ## Delta Snapshots
 
 Delta-bearing datasets are selected through COVM manifests. A selected snapshot
@@ -383,7 +428,8 @@ unless you explicitly request a higher mode such as `coded`.
   Run `inspect` to see available object types.
 - Sidecar guidance: files like COVE-MAP, COVE-I, COVE-L, and COVE-COVERAGE are
   metadata. Query the related row data file and pass sidecars with the relevant
-  option, such as `--mapping`.
+  option, such as `--mapping`. COVE-AI sidecars are supplied with `--cove-ai`
+  and only affect queries that opt into the `ai` profile.
 - Unsupported COVE-T values: beginner table readback decodes primitive safe
   values first. Nested or encoded values that need additional contracts fail
   closed with a diagnostic rather than exposing unsafe data.

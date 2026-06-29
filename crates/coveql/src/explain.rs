@@ -1493,6 +1493,10 @@ fn mode_policy_diagnostics(
 fn requested_mode(context: &OperationContext) -> ExplainMode {
     match &context.request.selected_operation {
         CoveQlSelectedOperation::Explain { mode, .. } => *mode,
+        CoveQlSelectedOperation::Ai {
+            operation: crate::CoveQlAiOperation::Inspect,
+            ..
+        } => ExplainMode::Ai,
         _ => ExplainMode::Public,
     }
 }
@@ -1681,6 +1685,20 @@ fn query_specific_profile_contract_json(
                 }).collect::<Vec<_>>()
             }))
         }
+        crate::CoveQlProfileId::Ai => {
+            if resolved.method_chain.ai_operations.is_empty() {
+                return None;
+            }
+            Some(json!({
+                "operations": &resolved.method_chain.ai_operations,
+                "selected_operation": match &resolved.operation_context.request.selected_operation {
+                    crate::CoveQlSelectedOperation::Ai { operation, .. } => operation.as_str(),
+                    _ => "host_readback",
+                },
+                "sidecar_required": true,
+                "fallback": "selected AI operations reject unless required AI sidecar sections validate",
+            }))
+        }
         crate::CoveQlProfileId::Object => None,
     }
 }
@@ -1756,6 +1774,7 @@ fn selected_operation_name(operation: &CoveQlSelectedOperation) -> &'static str 
         CoveQlSelectedOperation::Evidence => "evidence_read",
         CoveQlSelectedOperation::IndexOnlyAnswer => "index_only_answer",
         CoveQlSelectedOperation::ArrowExport { .. } => "arrow_export",
+        CoveQlSelectedOperation::Ai { operation, .. } => operation.as_str(),
         CoveQlSelectedOperation::Explain { target, .. } => match target {
             crate::CoveQlExplainTarget::Object => "explain_object",
             crate::CoveQlExplainTarget::Association => "explain_association",
@@ -1798,6 +1817,7 @@ fn explain_mode_name(mode: ExplainMode) -> &'static str {
         ExplainMode::Developer => "developer",
         ExplainMode::Proof => "proof",
         ExplainMode::Coded => "coded",
+        ExplainMode::Ai => "ai",
         ExplainMode::Forensic => "forensic",
     }
 }
@@ -1806,7 +1826,7 @@ fn explain_mode_policy_rank(mode: ExplainMode) -> u8 {
     match mode {
         ExplainMode::Public => 0,
         ExplainMode::Developer => 1,
-        ExplainMode::Proof | ExplainMode::Coded => 2,
+        ExplainMode::Proof | ExplainMode::Coded | ExplainMode::Ai => 2,
         ExplainMode::Forensic => 3,
     }
 }

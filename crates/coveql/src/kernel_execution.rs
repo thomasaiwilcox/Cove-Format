@@ -6,6 +6,10 @@ use std::{
 
 use cove_core::{
     array::{CoveArrayValue, EncodedArray},
+    artifact::coveai::{
+        exact_flat_filecode_vector_search_by_file_code, filecode_embedding, CoveAiFile,
+        ExactFlatFileCodeVectorSearchResult,
+    },
     canonical::CanonicalValue,
     collation::CollationKind,
     compression,
@@ -93,11 +97,12 @@ use crate::{
     },
     parse_resolve_plan_and_build_physical_plan, pushdown, AggregateDisclosurePolicy,
     AstAggregateName, AstCompareOp, AstNullOrdering, AstOrderDirection, BuildExecutionError,
-    CoveQlExecutionResult, ExecutedQuery, ExecutionAuthorityReport, ExecutionDiagnostic,
-    ExecutionOptions, ExecutionRowCounts, ManifestDatasetMember, MetadataDisclosurePolicy,
-    ParseOptions, PhysicalPlanOptions, PhysicalPlannedQuery, PlanOptions, ResolveOptions,
-    ResolvedExpr, ResolvedLiteral, ResolvedLiteralValue, ResolvedPath, ResolvedPredicate,
-    ResolvedRoot, ResolvedSystemField, TemporalMode, VisibilityPolicy,
+    CoveQlAiOperation, CoveQlExecutionResult, ExecutedQuery, ExecutionAuthorityReport,
+    ExecutionDiagnostic, ExecutionOptions, ExecutionRowCounts, ManifestDatasetMember,
+    MetadataDisclosurePolicy, ParseOptions, PhysicalPlanOptions, PhysicalPlannedQuery, PlanOptions,
+    ResolveOptions, ResolvedAiArgumentValue, ResolvedExpr, ResolvedLiteral, ResolvedLiteralValue,
+    ResolvedPath, ResolvedPredicate, ResolvedRoot, ResolvedSystemField, TemporalMode,
+    VisibilityPolicy,
 };
 
 #[derive(Debug, Clone)]
@@ -229,6 +234,36 @@ fn execute_physical_planned_query_inner(
         crate::CoveQlOutputMode::ExplainJson
     ) {
         return execute_physical_explain_only(physical, kernel_options);
+    }
+
+    if let Some((executed, kernel_report)) =
+        try_ai_semantic_search_executed_query(&physical, &execution_options, kernel_options.mode)?
+    {
+        return Ok(KernelExecutedQuery {
+            physical,
+            executed,
+            kernel_report,
+        });
+    }
+    if let Some((executed, kernel_report)) =
+        try_ai_embedding_executed_query(&physical, &execution_options, kernel_options.mode)?
+    {
+        return Ok(KernelExecutedQuery {
+            physical,
+            executed,
+            kernel_report,
+        });
+    }
+    if let Some((executed, kernel_report)) = try_ai_descriptor_metadata_executed_query(
+        &physical,
+        &execution_options,
+        kernel_options.mode,
+    )? {
+        return Ok(KernelExecutedQuery {
+            physical,
+            executed,
+            kernel_report,
+        });
     }
 
     match kernel_options.mode {
@@ -448,6 +483,36 @@ pub fn execute_physical_planned_query_retained(
         crate::CoveQlOutputMode::ExplainJson
     ) {
         return execute_physical_explain_only(physical, kernel_options);
+    }
+
+    if let Some((executed, kernel_report)) =
+        try_ai_semantic_search_executed_query(&physical, &execution_options, kernel_options.mode)?
+    {
+        return Ok(KernelExecutedQuery {
+            physical,
+            executed,
+            kernel_report,
+        });
+    }
+    if let Some((executed, kernel_report)) =
+        try_ai_embedding_executed_query(&physical, &execution_options, kernel_options.mode)?
+    {
+        return Ok(KernelExecutedQuery {
+            physical,
+            executed,
+            kernel_report,
+        });
+    }
+    if let Some((executed, kernel_report)) = try_ai_descriptor_metadata_executed_query(
+        &physical,
+        &execution_options,
+        kernel_options.mode,
+    )? {
+        return Ok(KernelExecutedQuery {
+            physical,
+            executed,
+            kernel_report,
+        });
     }
 
     if kernel_options.mode != KernelExecutionMode::ForceMaterialized {
@@ -1392,6 +1457,1260 @@ fn manifest_member_evidence_authority(
     } else {
         crate::EvidenceAuthority::Missing
     })
+}
+
+struct AiDescriptorMetadataExecution {
+    rows: Vec<Value>,
+    input_rows: usize,
+    warning_code: &'static str,
+    warning_message: &'static str,
+    authority_summary: &'static str,
+    pushdown_summary: &'static str,
+}
+
+fn try_ai_descriptor_metadata_executed_query(
+    physical: &PhysicalPlannedQuery,
+    execution_options: &ExecutionOptions,
+    mode: KernelExecutionMode,
+) -> Result<Option<(ExecutedQuery, KernelExecutionReport)>, BuildExecutionError> {
+    let Some(operation) = physical
+        .planned
+        .resolved
+        .method_chain
+        .ai_operations
+        .iter()
+        .rev()
+        .find(|operation| ai_descriptor_metadata_method(operation.method_name.as_str()))
+    else {
+        return Ok(None);
+    };
+    if mode == KernelExecutionMode::ForceMaterialized {
+        return Err(exec_error(
+            "E_AI_MATERIALIZED_UNSUPPORTED",
+            "CoveQL-AI descriptor metadata operations require a validated COVE-AI sidecar; materialized COVE-O readback has no equivalent AI descriptor baseline",
+            json!({ "method": operation.method_name }),
+        ));
+    }
+    if !matches!(
+        physical.planned.resolved.output_mode,
+        crate::CoveQlOutputMode::JsonRows
+    ) {
+        return Err(exec_error(
+            "E_AI_OUTPUT_UNSUPPORTED",
+            "CoveQL-AI descriptor metadata operations currently return JSON rows",
+            json!({ "output_mode": format!("{:?}", physical.planned.resolved.output_mode) }),
+        ));
+    }
+    if !operation.args.is_empty() {
+        return Err(exec_error(
+            "E_AI_ARGUMENT_UNSUPPORTED",
+            "CoveQL-AI descriptor metadata execution currently supports no runtime arguments",
+            json!({ "method": operation.method_name }),
+        ));
+    }
+    let Some(sidecar_bytes) = physical.sidecars.cove_ai_artifact_bytes.as_deref() else {
+        return Err(exec_error(
+            "E_AI_SIDECAR_REQUIRED",
+            "CoveQL-AI descriptor metadata execution requires a supplied COVE-AI/COVE-VEC sidecar",
+            json!({ "method": operation.method_name }),
+        ));
+    };
+    let started = Instant::now();
+    let sidecar = CoveAiFile::parse(sidecar_bytes).map_err(|error| {
+        exec_error(
+            "E_AI_SIDECAR_INVALID",
+            format!("COVE-AI sidecar validation failed: {error}"),
+            json!({ "method": operation.method_name }),
+        )
+    })?;
+    let execution = ai_descriptor_metadata_rows(operation.method_name.as_str(), &sidecar);
+    let result = CoveQlExecutionResult::JsonRows(execution.rows);
+    let output_rows = match &result {
+        CoveQlExecutionResult::JsonRows(rows) => rows.len(),
+        _ => 0,
+    };
+    let row_counts = ExecutionRowCounts {
+        input_rows: execution.input_rows,
+        filtered_rows: output_rows,
+        output_rows,
+    };
+    enforce_result_budgets(
+        &result,
+        &row_counts,
+        &physical.planned,
+        execution_options,
+        started,
+    )?;
+    let output_fingerprint = result_fingerprint(&result)?;
+
+    let mut diagnostics = execution_diagnostics_for_physical(physical);
+    diagnostics.push(exec_warning(
+        execution.warning_code,
+        execution.warning_message,
+        json!({
+            "method": operation.method_name,
+            "input_descriptor_rows": execution.input_rows,
+            "output_rows": output_rows,
+            "payload_access": ai_payload_access_label(&sidecar),
+            "text_or_asset_payloads_withheld": true,
+            "materialized_baseline_available": false,
+        }),
+    ));
+    if mode == KernelExecutionMode::CompareWithMaterialized {
+        diagnostics.push(exec_warning(
+            "W_AI_NO_MATERIALIZED_BASELINE",
+            "CoveQL-AI descriptor metadata execution has no materialized COVE-O baseline oracle; sidecar result was not fingerprint-compared",
+            json!({ "method": operation.method_name }),
+        ));
+    }
+    if let Some(warning) = zero_copy_owned_fallback_warning(&physical.planned) {
+        diagnostics.push(warning);
+    }
+
+    let mut kernel_report = KernelExecutionReport::applied(
+        mode,
+        KernelCounters {
+            rows_scanned: execution.input_rows,
+            rows_after_bitmap: execution.input_rows,
+            rows_after_selection_vector: output_rows,
+            output_rows,
+            bytes_touched_estimate: sidecar_bytes.len(),
+            dictionary_lookups_at_materialization: 0,
+            ..KernelCounters::default()
+        },
+    );
+    kernel_report.optimization_authority =
+        OptimizationAuthorityReport::authoritative(execution.authority_summary);
+    kernel_report.decision = KernelDecision::new(
+        KernelDecisionKind::Applied,
+        "CoveQL-AI descriptor metadata operation executed from a validated COVE-AI sidecar",
+        json!({
+            "method": operation.method_name,
+            "input_descriptor_rows": execution.input_rows,
+            "output_rows": output_rows,
+            "payload_access": ai_payload_access_label(&sidecar),
+            "fallback_boundary": Value::Null,
+            "materialized_baseline_available": false,
+        }),
+        false,
+    );
+    kernel_report.decisions = vec![kernel_report.decision.clone()];
+    kernel_report.kernel_fingerprint = Some(output_fingerprint.clone());
+    attach_phase8_plan_reports(&mut kernel_report, &physical.planned);
+
+    let executed = ExecutedQuery {
+        planned: physical.planned.clone(),
+        result,
+        diagnostics,
+        row_counts,
+        output_fingerprint,
+        pushdown_report: pushdown::PushdownReport::not_applicable(
+            &execution_options.pushdown,
+            execution.pushdown_summary,
+        ),
+        evidence_authority: None,
+        authority: ExecutionAuthorityReport::exact_kernel(execution.authority_summary, false),
+    };
+    Ok(Some((executed, kernel_report)))
+}
+
+fn ai_descriptor_metadata_method(method_name: &str) -> bool {
+    matches!(
+        method_name,
+        "chunks"
+            | "tokens"
+            | "context"
+            | "asPromptContext"
+            | "trainingSamples"
+            | "split"
+            | "pack"
+            | "multimodal"
+            | "generatorAudit"
+    )
+}
+
+fn ai_descriptor_metadata_rows(
+    method_name: &str,
+    sidecar: &CoveAiFile,
+) -> AiDescriptorMetadataExecution {
+    match method_name {
+        "chunks" => AiDescriptorMetadataExecution {
+            rows: ai_chunk_projection_rows(sidecar, false),
+            input_rows: sidecar.descriptor_tables.text_chunks.len(),
+            warning_code: "W_AI_CHUNK_METADATA_EXECUTED",
+            warning_message:
+                "CoveQL-AI .chunks() executed from validated COVE-CHUNK descriptor metadata",
+            authority_summary:
+                "COVE-AI chunk descriptor metadata was validated; chunk text payloads were withheld",
+            pushdown_summary:
+                "CoveQL-AI chunk projection reads validated COVE-CHUNK sidecar descriptors rather than COVE-O row pages",
+        },
+        "tokens" => AiDescriptorMetadataExecution {
+            rows: ai_token_projection_rows(sidecar),
+            input_rows: sidecar.descriptor_tables.token_blocks.len()
+                + sidecar.descriptor_tables.tokenized_spans.len()
+                + sidecar.descriptor_tables.token_sequence_packs.len(),
+            warning_code: "W_AI_TOKEN_METADATA_EXECUTED",
+            warning_message:
+                "CoveQL-AI .tokens() executed from validated COVE-TOK descriptor metadata",
+            authority_summary:
+                "COVE-AI token descriptor metadata was validated; token payload bytes were withheld",
+            pushdown_summary:
+                "CoveQL-AI token projection reads validated COVE-TOK sidecar descriptors rather than COVE-O row pages",
+        },
+        "context" | "asPromptContext" => AiDescriptorMetadataExecution {
+            rows: ai_chunk_projection_rows(sidecar, true),
+            input_rows: sidecar.descriptor_tables.text_chunks.len(),
+            warning_code: "W_AI_RAG_CONTEXT_METADATA_EXECUTED",
+            warning_message:
+                "CoveQL-AI RAG context executed from validated chunk descriptors with prompt text withheld",
+            authority_summary:
+                "COVE-AI RAG context descriptor metadata was validated; prompt text expansion was withheld by policy",
+            pushdown_summary:
+                "CoveQL-AI context projection reads validated chunk sidecar descriptors rather than COVE-O row pages",
+        },
+        "split" => AiDescriptorMetadataExecution {
+            rows: ai_training_split_rows(sidecar),
+            input_rows: sidecar.descriptor_tables.dataset_splits.len(),
+            warning_code: "W_AI_TRAINING_SPLIT_METADATA_EXECUTED",
+            warning_message:
+                "CoveQL-AI .split() executed from validated COVE-TRAIN split descriptors",
+            authority_summary:
+                "COVE-AI training split descriptors were validated; sample payloads were withheld",
+            pushdown_summary:
+                "CoveQL-AI split projection reads validated COVE-TRAIN sidecar descriptors rather than COVE-O row pages",
+        },
+        "pack" => AiDescriptorMetadataExecution {
+            rows: ai_training_pack_rows(sidecar),
+            input_rows: sidecar.descriptor_tables.token_sequence_packs.len()
+                + sidecar.descriptor_tables.multimodal_sequence_packs.len(),
+            warning_code: "W_AI_TRAINING_PACK_METADATA_EXECUTED",
+            warning_message:
+                "CoveQL-AI .pack() executed from validated token and multimodal pack descriptors",
+            authority_summary:
+                "COVE-AI training pack descriptors were validated; pack payloads were withheld",
+            pushdown_summary:
+                "CoveQL-AI pack projection reads validated COVE-AI sidecar descriptors rather than COVE-O row pages",
+        },
+        "multimodal" => AiDescriptorMetadataExecution {
+            rows: ai_multimodal_rows(sidecar),
+            input_rows: sidecar.descriptor_tables.multimodal_sequence_packs.len()
+                + sidecar.descriptor_tables.multimodal_sequence_elements.len(),
+            warning_code: "W_AI_MULTIMODAL_METADATA_EXECUTED",
+            warning_message:
+                "CoveQL-AI .multimodal() executed from validated COVE-MMSEQ descriptor metadata",
+            authority_summary:
+                "COVE-AI multimodal sequence descriptors were validated; asset and tensor payloads were withheld",
+            pushdown_summary:
+                "CoveQL-AI multimodal projection reads validated COVE-MMSEQ sidecar descriptors rather than COVE-O row pages",
+        },
+        "generatorAudit" => AiDescriptorMetadataExecution {
+            rows: ai_generator_audit_rows(sidecar),
+            input_rows: sidecar.descriptor_tables.generator_provenance.len()
+                + sidecar.descriptor_tables.model_actors.len()
+                + sidecar.descriptor_tables.generation_decoding_profiles.len()
+                + sidecar.descriptor_tables.human_reviews.len()
+                + sidecar.descriptor_tables.training_labels.len()
+                + sidecar.descriptor_tables.preference_pairs.len(),
+            warning_code: "W_AI_GENERATOR_AUDIT_METADATA_EXECUTED",
+            warning_message:
+                "CoveQL-AI .generatorAudit() executed from validated generator provenance descriptors",
+            authority_summary:
+                "COVE-AI generator provenance descriptors were validated; prompt/output payloads were withheld",
+            pushdown_summary:
+                "CoveQL-AI generator audit reads validated COVE-AI provenance descriptors rather than COVE-O row pages",
+        },
+        _ => AiDescriptorMetadataExecution {
+            rows: ai_training_sample_rows(sidecar),
+            input_rows: sidecar.descriptor_tables.training_samples.len(),
+            warning_code: "W_AI_TRAINING_SAMPLE_METADATA_EXECUTED",
+            warning_message:
+                "CoveQL-AI .trainingSamples() executed from validated COVE-TRAIN descriptor metadata",
+            authority_summary:
+                "COVE-AI training sample descriptors were validated; input/target payloads were withheld",
+            pushdown_summary:
+                "CoveQL-AI training sample projection reads validated COVE-TRAIN sidecar descriptors rather than COVE-O row pages",
+        },
+    }
+}
+
+fn ai_payload_access_label(sidecar: &CoveAiFile) -> &'static str {
+    match sidecar.payload_access {
+        cove_core::artifact::coveai::AiPayloadAccessState::StructurallyAllowed => {
+            "structurally_allowed"
+        }
+        cove_core::artifact::coveai::AiPayloadAccessState::PolicyBlockedMissingPrivacySummary => {
+            "policy_blocked_missing_privacy_summary"
+        }
+    }
+}
+
+fn ai_chunk_projection_rows(sidecar: &CoveAiFile, context_mode: bool) -> Vec<Value> {
+    sidecar
+        .descriptor_tables
+        .text_chunks
+        .iter()
+        .map(|chunk| {
+            let mut row = json!({
+                "record_kind": if context_mode { "rag_context_chunk" } else { "text_chunk" },
+                "chunk_id": chunk.chunk_id,
+                "source_ref": chunk.source_ref,
+                "table_id": chunk.table_id,
+                "column_id": chunk.column_id,
+                "object_type_id": chunk.object_type_id,
+                "property_id": chunk.property_id,
+                "association_type_id": chunk.association_type_id,
+                "path_ref": chunk.path_ref,
+                "source_row_ref": chunk.source_row_ref,
+                "source_object_ref": chunk.source_object_ref,
+                "source_value_hash_ref": chunk.source_value_hash_ref,
+                "byte_start": chunk.byte_start,
+                "byte_length": chunk.byte_length,
+                "unicode_scalar_start": chunk.unicode_scalar_start,
+                "unicode_scalar_length": chunk.unicode_scalar_length,
+                "token_start": chunk.token_start,
+                "token_count": chunk.token_count,
+                "parent_chunk_id": chunk.parent_chunk_id,
+                "previous_chunk_id": chunk.previous_chunk_id,
+                "next_chunk_id": chunk.next_chunk_id,
+                "chunk_text_hash_ref": chunk.chunk_text_hash_ref,
+                "evidence_ref": chunk.evidence_ref,
+                "policy_ref": chunk.policy_ref,
+                "descriptor_validated": true,
+                "exact": true,
+                "result_authority": "ValidatedAiDescriptorMetadata",
+                "text": Value::Null,
+                "text_withheld": true,
+                "withholding_reason": "descriptor_metadata_execution_does_not_expose_payload_text",
+            });
+            if context_mode {
+                row["prompt_context"] = Value::Null;
+                row["neighbor_expansion"] = json!("withheld_descriptor_metadata_only");
+                row["redaction_report"] = json!({
+                    "text_withheld": true,
+                    "neighbor_chunks_withheld": true,
+                    "reason": "policy_scoped_context_requires validated payload access and freshness checks",
+                });
+            }
+            row
+        })
+        .collect()
+}
+
+fn ai_token_projection_rows(sidecar: &CoveAiFile) -> Vec<Value> {
+    let mut rows = Vec::new();
+    for block in &sidecar.descriptor_tables.token_blocks {
+        rows.push(json!({
+            "record_kind": "token_block",
+            "token_block_id": block.token_block_id,
+            "tokenizer_profile_id": block.tokenizer_profile_id,
+            "token_count": block.token_count,
+            "token_id_width": block.token_id_width,
+            "compression_codec": block.compression_codec,
+            "layout_kind": block.layout_kind,
+            "payload_ref": block.payload_ref,
+            "payload_offset": block.payload_offset,
+            "payload_length": block.payload_length,
+            "integrity_ref": block.integrity_ref,
+            "descriptor_validated": true,
+            "token_payload": Value::Null,
+            "payload_withheld": true,
+            "withholding_reason": "descriptor_metadata_execution_does_not_expose_token_payload_bytes",
+            "exact": true,
+            "result_authority": "ValidatedAiDescriptorMetadata",
+        }));
+    }
+    for span in &sidecar.descriptor_tables.tokenized_spans {
+        rows.push(json!({
+            "record_kind": "tokenized_span",
+            "tokenized_span_id": span.tokenized_span_id,
+            "chunk_id": span.chunk_id,
+            "tokenizer_profile_id": span.tokenizer_profile_id,
+            "token_block_ref": span.token_block_ref,
+            "token_offset": span.token_offset,
+            "token_count": span.token_count,
+            "byte_alignment_ref": span.byte_alignment_ref,
+            "source_value_hash_ref": span.source_value_hash_ref,
+            "descriptor_validated": true,
+            "token_payload": Value::Null,
+            "payload_withheld": true,
+            "withholding_reason": "descriptor_metadata_execution_does_not_expose_token_payload_bytes",
+            "exact": true,
+            "result_authority": "ValidatedAiDescriptorMetadata",
+        }));
+    }
+    for pack in &sidecar.descriptor_tables.token_sequence_packs {
+        rows.push(json!({
+            "record_kind": "token_sequence_pack",
+            "sequence_pack_id": pack.sequence_pack_id,
+            "tokenizer_profile_id": pack.tokenizer_profile_id,
+            "training_profile_ref": pack.training_profile_ref,
+            "token_block_ref": pack.token_block_ref,
+            "token_offset": pack.token_offset,
+            "token_count": pack.token_count,
+            "source_span_count": pack.source_span_count,
+            "first_source_span_ref": pack.first_source_span_ref,
+            "loss_mask_ref": pack.loss_mask_ref,
+            "attention_mask_ref": pack.attention_mask_ref,
+            "position_ids_ref": pack.position_ids_ref,
+            "labels_ref": pack.labels_ref,
+            "split_ref": pack.split_ref,
+            "sample_weight_ppm": pack.sample_weight_ppm,
+            "descriptor_validated": true,
+            "token_payload": Value::Null,
+            "payload_withheld": true,
+            "withholding_reason": "descriptor_metadata_execution_does_not_expose_token_payload_bytes",
+            "exact": true,
+            "result_authority": "ValidatedAiDescriptorMetadata",
+        }));
+    }
+    rows
+}
+
+fn ai_training_sample_rows(sidecar: &CoveAiFile) -> Vec<Value> {
+    sidecar
+        .descriptor_tables
+        .training_samples
+        .iter()
+        .map(|sample| {
+            json!({
+                "record_kind": "training_sample",
+                "sample_id": sample.sample_id,
+                "training_profile_id": sample.training_profile_id,
+                "example_kind": sample.example_kind,
+                "split_ref": sample.split_ref,
+                "source_ref": sample.source_ref,
+                "evidence_ref": sample.evidence_ref,
+                "input_ref": sample.input_ref,
+                "target_ref": sample.target_ref,
+                "label_ref": sample.label_ref,
+                "metadata_ref": sample.metadata_ref,
+                "token_sequence_pack_ref": sample.token_sequence_pack_ref,
+                "multimodal_sequence_pack_ref": sample.multimodal_sequence_pack_ref,
+                "vector_ref": sample.vector_ref,
+                "quality_score_ppm": sample.quality_score_ppm,
+                "sample_weight_ppm": sample.sample_weight_ppm,
+                "dedup_group_ref": sample.dedup_group_ref,
+                "license_ref": sample.license_ref,
+                "policy_ref": sample.policy_ref,
+                "teacher_model_ref": sample.teacher_model_ref,
+                "generator_provenance_ref": sample.generator_provenance_ref,
+                "judge_generator_provenance_ref": sample.judge_generator_provenance_ref,
+                "label_generator_provenance_ref": sample.label_generator_provenance_ref,
+                "descriptor_validated": true,
+                "payload_withheld": true,
+                "policy_withheld": true,
+                "withholding_reason": "descriptor_metadata_execution_does_not_expose_training_payloads",
+                "exact": true,
+                "result_authority": "ValidatedAiDescriptorMetadata",
+            })
+        })
+        .collect()
+}
+
+fn ai_training_split_rows(sidecar: &CoveAiFile) -> Vec<Value> {
+    sidecar
+        .descriptor_tables
+        .dataset_splits
+        .iter()
+        .map(|split| {
+            let sample_count = sidecar
+                .descriptor_tables
+                .training_samples
+                .iter()
+                .filter(|sample| sample.split_ref == split.split_id)
+                .count();
+            json!({
+                "record_kind": "dataset_split",
+                "split_id": split.split_id,
+                "split_name_ref": split.split_name_ref,
+                "split_method": split.split_method,
+                "source_snapshot_ref": split.source_snapshot_ref,
+                "filter_policy_ref": split.filter_policy_ref,
+                "seed": split.seed,
+                "sample_count": sample_count,
+                "first_sample_ref": split.first_sample_ref,
+                "descriptor_validated": true,
+                "payload_withheld": true,
+                "withholding_reason": "descriptor_metadata_execution_does_not_expose_training_payloads",
+                "exact": true,
+                "result_authority": "ValidatedAiDescriptorMetadata",
+            })
+        })
+        .collect()
+}
+
+fn ai_training_pack_rows(sidecar: &CoveAiFile) -> Vec<Value> {
+    let mut rows = Vec::new();
+    for pack in &sidecar.descriptor_tables.token_sequence_packs {
+        rows.push(json!({
+            "record_kind": "token_sequence_pack",
+            "sequence_pack_id": pack.sequence_pack_id,
+            "tokenizer_profile_id": pack.tokenizer_profile_id,
+            "training_profile_ref": pack.training_profile_ref,
+            "token_block_ref": pack.token_block_ref,
+            "token_offset": pack.token_offset,
+            "token_count": pack.token_count,
+            "split_ref": pack.split_ref,
+            "sample_weight_ppm": pack.sample_weight_ppm,
+            "descriptor_validated": true,
+            "payload_withheld": true,
+            "withholding_reason": "descriptor_metadata_execution_does_not_expose_pack_payloads",
+            "exact": true,
+            "result_authority": "ValidatedAiDescriptorMetadata",
+        }));
+    }
+    for pack in &sidecar.descriptor_tables.multimodal_sequence_packs {
+        rows.push(json!({
+            "record_kind": "multimodal_sequence_pack",
+            "sequence_pack_id": pack.sequence_pack_id,
+            "training_profile_id": pack.training_profile_id,
+            "tokenizer_profile_id": pack.tokenizer_profile_id,
+            "sequence_profile_ref": pack.sequence_profile_ref,
+            "element_count": pack.element_count,
+            "first_element_ref": pack.first_element_ref,
+            "split_ref": pack.split_ref,
+            "sample_weight_ppm": pack.sample_weight_ppm,
+            "label_ref": pack.label_ref,
+            "evidence_ref": pack.evidence_ref,
+            "generator_provenance_ref": pack.generator_provenance_ref,
+            "descriptor_validated": true,
+            "payload_withheld": true,
+            "withholding_reason": "descriptor_metadata_execution_does_not_expose_pack_payloads",
+            "exact": true,
+            "result_authority": "ValidatedAiDescriptorMetadata",
+        }));
+    }
+    rows
+}
+
+fn ai_multimodal_rows(sidecar: &CoveAiFile) -> Vec<Value> {
+    let mut rows = Vec::new();
+    for pack in &sidecar.descriptor_tables.multimodal_sequence_packs {
+        rows.push(json!({
+            "record_kind": "multimodal_sequence_pack",
+            "sequence_pack_id": pack.sequence_pack_id,
+            "training_profile_id": pack.training_profile_id,
+            "tokenizer_profile_id": pack.tokenizer_profile_id,
+            "sequence_profile_ref": pack.sequence_profile_ref,
+            "element_count": pack.element_count,
+            "first_element_ref": pack.first_element_ref,
+            "split_ref": pack.split_ref,
+            "sample_weight_ppm": pack.sample_weight_ppm,
+            "loss_mask_ref": pack.loss_mask_ref,
+            "attention_mask_ref": pack.attention_mask_ref,
+            "position_map_ref": pack.position_map_ref,
+            "label_ref": pack.label_ref,
+            "source_snapshot_ref": pack.source_snapshot_ref,
+            "evidence_ref": pack.evidence_ref,
+            "generator_provenance_ref": pack.generator_provenance_ref,
+            "descriptor_validated": true,
+            "payload_withheld": true,
+            "withholding_reason": "descriptor_metadata_execution_does_not_expose_asset_or_tensor_payloads",
+            "exact": true,
+            "result_authority": "ValidatedAiDescriptorMetadata",
+        }));
+    }
+    for element in &sidecar.descriptor_tables.multimodal_sequence_elements {
+        rows.push(json!({
+            "record_kind": "multimodal_sequence_element",
+            "element_id": element.element_id,
+            "sequence_pack_id": element.sequence_pack_id,
+            "ordinal": element.ordinal,
+            "element_kind": element.element_kind,
+            "modality": element.modality,
+            "role": element.role,
+            "tokenized_span_ref": element.tokenized_span_ref,
+            "token_sequence_pack_ref": element.token_sequence_pack_ref,
+            "asset_ref": element.asset_ref,
+            "tensor_ref": element.tensor_ref,
+            "vector_ref": element.vector_ref,
+            "byte_start": element.byte_start,
+            "byte_length": element.byte_length,
+            "time_start_us": element.time_start_us,
+            "time_duration_us": element.time_duration_us,
+            "position_stream_ref": element.position_stream_ref,
+            "evidence_ref": element.evidence_ref,
+            "policy_ref": element.policy_ref,
+            "descriptor_validated": true,
+            "payload_withheld": true,
+            "withholding_reason": "descriptor_metadata_execution_does_not_expose_asset_or_tensor_payloads",
+            "exact": true,
+            "result_authority": "ValidatedAiDescriptorMetadata",
+        }));
+    }
+    rows
+}
+
+fn ai_generator_audit_rows(sidecar: &CoveAiFile) -> Vec<Value> {
+    let mut rows = Vec::new();
+    for actor in &sidecar.descriptor_tables.model_actors {
+        rows.push(json!({
+            "record_kind": "model_actor",
+            "model_actor_id": actor.model_actor_id,
+            "model_namespace_ref": actor.model_namespace_ref,
+            "model_name_ref": actor.model_name_ref,
+            "model_version_ref": actor.model_version_ref,
+            "model_checkpoint_digest_ref": actor.model_checkpoint_digest_ref,
+            "provider_ref": actor.provider_ref,
+            "endpoint_ref": actor.endpoint_ref,
+            "endpoint_version_ref": actor.endpoint_version_ref,
+            "model_family_ref": actor.model_family_ref,
+            "modality_mask": actor.modality_mask,
+            "license_ref": actor.license_ref,
+            "policy_ref": actor.policy_ref,
+            "descriptor_validated": true,
+            "payload_withheld": true,
+            "withholding_reason": "descriptor_metadata_execution_does_not_expose_model_provider_payloads",
+            "exact": true,
+            "result_authority": "ValidatedAiDescriptorMetadata",
+        }));
+    }
+    for profile in &sidecar.descriptor_tables.generation_decoding_profiles {
+        rows.push(json!({
+            "record_kind": "generation_decoding_profile",
+            "decoding_profile_id": profile.decoding_profile_id,
+            "temperature_micros": profile.temperature_micros,
+            "top_p_micros": profile.top_p_micros,
+            "top_k": profile.top_k,
+            "seed": profile.seed,
+            "max_output_tokens": profile.max_output_tokens,
+            "stop_sequence_ref": profile.stop_sequence_ref,
+            "safety_policy_ref": profile.safety_policy_ref,
+            "deterministic_claim": profile.deterministic_claim,
+            "descriptor_validated": true,
+            "payload_withheld": true,
+            "withholding_reason": "descriptor_metadata_execution_does_not_expose_prompt_or_output_payloads",
+            "exact": true,
+            "result_authority": "ValidatedAiDescriptorMetadata",
+        }));
+    }
+    for review in &sidecar.descriptor_tables.human_reviews {
+        rows.push(json!({
+            "record_kind": "human_review",
+            "human_review_id": review.human_review_id,
+            "review_kind": review.review_kind,
+            "reviewer_role_ref": review.reviewer_role_ref,
+            "review_time_us": review.review_time_us,
+            "rating_ppm": review.rating_ppm,
+            "notes_ref": review.notes_ref,
+            "policy_ref": review.policy_ref,
+            "descriptor_validated": true,
+            "payload_withheld": true,
+            "withholding_reason": "descriptor_metadata_execution_does_not_expose_review_notes_payloads",
+            "exact": true,
+            "result_authority": "ValidatedAiDescriptorMetadata",
+        }));
+    }
+    for provenance in &sidecar.descriptor_tables.generator_provenance {
+        rows.push(json!({
+            "record_kind": "generator_provenance",
+            "generator_provenance_id": provenance.generator_provenance_id,
+            "generator_kind": provenance.generator_kind,
+            "model_actor_ref": provenance.model_actor_ref,
+            "prompt_template_ref": provenance.prompt_template_ref,
+            "decoding_profile_ref": provenance.decoding_profile_ref,
+            "toolchain_ref": provenance.toolchain_ref,
+            "source_input_ref": provenance.source_input_ref,
+            "source_context_ref": provenance.source_context_ref,
+            "source_sample_ref": provenance.source_sample_ref,
+            "parent_generator_provenance_ref": provenance.parent_generator_provenance_ref,
+            "generation_time_us": provenance.generation_time_us,
+            "confidence_ppm": provenance.confidence_ppm,
+            "human_review_ref": provenance.human_review_ref,
+            "policy_ref": provenance.policy_ref,
+            "reproducibility_class": provenance.reproducibility_class,
+            "descriptor_validated": true,
+            "payload_withheld": true,
+            "external_audit_only_unless_deterministic_regeneration_proven": true,
+            "withholding_reason": "descriptor_metadata_execution_does_not_expose_prompt_or_output_payloads",
+            "exact": true,
+            "result_authority": "ValidatedAiDescriptorMetadata",
+        }));
+    }
+    for label in &sidecar.descriptor_tables.training_labels {
+        rows.push(json!({
+            "record_kind": "training_label",
+            "label_id": label.label_id,
+            "label_kind": label.label_kind,
+            "label_authority": label.label_authority,
+            "label_payload_ref": label.label_payload_ref,
+            "generator_provenance_ref": label.generator_provenance_ref,
+            "human_review_ref": label.human_review_ref,
+            "confidence_ppm": label.confidence_ppm,
+            "evidence_ref": label.evidence_ref,
+            "policy_ref": label.policy_ref,
+            "descriptor_validated": true,
+            "payload_withheld": true,
+            "withholding_reason": "descriptor_metadata_execution_does_not_expose_label_payloads",
+            "exact": true,
+            "result_authority": "ValidatedAiDescriptorMetadata",
+        }));
+    }
+    for pair in &sidecar.descriptor_tables.preference_pairs {
+        rows.push(json!({
+            "record_kind": "preference_pair",
+            "preference_pair_id": pair.preference_pair_id,
+            "prompt_ref": pair.prompt_ref,
+            "chosen_ref": pair.chosen_ref,
+            "rejected_ref": pair.rejected_ref,
+            "judge_generator_provenance_ref": pair.judge_generator_provenance_ref,
+            "human_review_ref": pair.human_review_ref,
+            "preference_strength_ppm": pair.preference_strength_ppm,
+            "confidence_ppm": pair.confidence_ppm,
+            "evidence_ref": pair.evidence_ref,
+            "policy_ref": pair.policy_ref,
+            "descriptor_validated": true,
+            "payload_withheld": true,
+            "withholding_reason": "descriptor_metadata_execution_does_not_expose_preference_payloads",
+            "exact": true,
+            "result_authority": "ValidatedAiDescriptorMetadata",
+        }));
+    }
+    rows
+}
+
+fn try_ai_embedding_executed_query(
+    physical: &PhysicalPlannedQuery,
+    execution_options: &ExecutionOptions,
+    mode: KernelExecutionMode,
+) -> Result<Option<(ExecutedQuery, KernelExecutionReport)>, BuildExecutionError> {
+    let Some(operation) = physical
+        .planned
+        .resolved
+        .method_chain
+        .ai_operations
+        .iter()
+        .find(|operation| operation.operation == CoveQlAiOperation::Embedding)
+    else {
+        return Ok(None);
+    };
+    if operation.method_name != "embedding" {
+        return Err(exec_error(
+            "E_AI_OPERATION_UNSUPPORTED",
+            "only .embedding(fileCode: <u32>) has an exact COVE-AI physical execution path",
+            json!({
+                "method": operation.method_name,
+                "operation": format!("{:?}", operation.operation),
+            }),
+        ));
+    }
+    if mode == KernelExecutionMode::ForceMaterialized {
+        return Err(exec_error(
+            "E_AI_MATERIALIZED_UNSUPPORTED",
+            "CoveQL-AI embedding lookup requires a validated COVE-AI sidecar; materialized COVE-O readback has no equivalent .embedding() baseline",
+            json!({ "method": operation.method_name }),
+        ));
+    }
+    if !matches!(
+        physical.planned.resolved.output_mode,
+        crate::CoveQlOutputMode::JsonRows
+    ) {
+        return Err(exec_error(
+            "E_AI_OUTPUT_UNSUPPORTED",
+            "CoveQL-AI embedding lookup currently returns JSON rows",
+            json!({ "output_mode": format!("{:?}", physical.planned.resolved.output_mode) }),
+        ));
+    }
+    let Some(sidecar_bytes) = physical.sidecars.cove_ai_artifact_bytes.as_deref() else {
+        return Err(exec_error(
+            "E_AI_SIDECAR_REQUIRED",
+            "CoveQL-AI .embedding() requires a supplied COVE-AI/COVE-VEC sidecar",
+            json!({ "method": operation.method_name }),
+        ));
+    };
+    let file_code = ai_single_filecode_arg(operation, ".embedding()")?;
+    let sidecar_summary = CoveAiFile::parse(sidecar_bytes).map_err(|error| {
+        exec_error(
+            "E_AI_SIDECAR_INVALID",
+            format!("COVE-AI sidecar validation failed: {error}"),
+            json!({ "method": operation.method_name }),
+        )
+    })?;
+    let binding_count = sidecar_summary
+        .descriptor_tables
+        .filecode_vector_bindings
+        .len();
+    let vector_space_count = sidecar_summary.descriptor_tables.vector_spaces.len();
+    let started = Instant::now();
+    let embedding = filecode_embedding(sidecar_bytes, file_code).map_err(|error| {
+        exec_error(
+            "E_AI_EMBEDDING_FAILED",
+            format!("COVE-AI exact FileCode embedding lookup failed: {error}"),
+            json!({
+                "method": operation.method_name,
+                "file_code": file_code,
+            }),
+        )
+    })?;
+    let result = CoveQlExecutionResult::JsonRows(vec![json!({
+        "file_code": embedding.file_code,
+        "vector_ref": embedding.vector_ref,
+        "vector_space_id": embedding.vector_space_id,
+        "dimension_count": embedding.dimension_count,
+        "embedding": embedding.values,
+        "exact": true,
+        "result_authority": "ExactOptimizedKernel",
+    })]);
+    let row_counts = ExecutionRowCounts {
+        input_rows: binding_count,
+        filtered_rows: 1,
+        output_rows: 1,
+    };
+    enforce_result_budgets(
+        &result,
+        &row_counts,
+        &physical.planned,
+        execution_options,
+        started,
+    )?;
+    let output_fingerprint = result_fingerprint(&result)?;
+
+    let mut diagnostics = execution_diagnostics_for_physical(physical);
+    diagnostics.push(exec_warning(
+        "W_AI_FILECODE_EMBEDDING_EXECUTED",
+        "CoveQL-AI .embedding() executed with validated COVE-VEC FileCode vector lookup",
+        json!({
+            "file_code": file_code,
+            "dimension_count": embedding.dimension_count,
+            "sidecar_vector_spaces": vector_space_count,
+            "sidecar_filecode_bindings": binding_count,
+            "result_authority": "ExactOptimizedKernel",
+            "materialized_baseline_available": false,
+        }),
+    ));
+    if mode == KernelExecutionMode::CompareWithMaterialized {
+        diagnostics.push(exec_warning(
+            "W_AI_NO_MATERIALIZED_BASELINE",
+            "CoveQL-AI .embedding() has no materialized COVE-O baseline oracle; exact sidecar result was not fingerprint-compared",
+            json!({ "file_code": file_code }),
+        ));
+    }
+    if let Some(warning) = zero_copy_owned_fallback_warning(&physical.planned) {
+        diagnostics.push(warning);
+    }
+
+    let mut kernel_report = KernelExecutionReport::applied(
+        mode,
+        KernelCounters {
+            rows_scanned: binding_count,
+            rows_after_bitmap: binding_count,
+            rows_after_selection_vector: 1,
+            output_rows: 1,
+            bytes_touched_estimate: sidecar_bytes.len(),
+            dictionary_lookups_at_materialization: 1,
+            ..KernelCounters::default()
+        },
+    );
+    kernel_report.optimization_authority = OptimizationAuthorityReport::authoritative(
+        "COVE-AI embedding lookup used validated COVE-VEC descriptor tables, payload integrity, privacy summary, and FileCode-local bindings",
+    );
+    kernel_report.decision = KernelDecision::new(
+        KernelDecisionKind::Applied,
+        "CoveQL-AI .embedding() FileCode vector lookup executed without materialized fallback",
+        json!({
+            "file_code": file_code,
+            "dimension_count": embedding.dimension_count,
+            "sidecar_filecode_bindings": binding_count,
+            "sidecar_vector_spaces": vector_space_count,
+            "result_authority": "ExactOptimizedKernel",
+            "fallback_boundary": Value::Null,
+            "materialized_baseline_available": false,
+        }),
+        false,
+    );
+    kernel_report.decisions = vec![kernel_report.decision.clone()];
+    kernel_report.kernel_fingerprint = Some(output_fingerprint.clone());
+    attach_phase8_plan_reports(&mut kernel_report, &physical.planned);
+
+    let executed = ExecutedQuery {
+        planned: physical.planned.clone(),
+        result,
+        diagnostics,
+        row_counts,
+        output_fingerprint,
+        pushdown_report: pushdown::PushdownReport::not_applicable(
+            &execution_options.pushdown,
+            "CoveQL-AI embedding lookup reads a validated COVE-VEC sidecar binding rather than COVE-O row pages",
+        ),
+        evidence_authority: None,
+        authority: ExecutionAuthorityReport::exact_kernel(
+            "CoveQL-AI FileCode embedding lookup returned a vector from a validated COVE-VEC sidecar",
+            false,
+        ),
+    };
+    Ok(Some((executed, kernel_report)))
+}
+
+fn try_ai_semantic_search_executed_query(
+    physical: &PhysicalPlannedQuery,
+    execution_options: &ExecutionOptions,
+    mode: KernelExecutionMode,
+) -> Result<Option<(ExecutedQuery, KernelExecutionReport)>, BuildExecutionError> {
+    let Some(operation) = physical
+        .planned
+        .resolved
+        .method_chain
+        .ai_operations
+        .iter()
+        .find(|operation| operation.operation == CoveQlAiOperation::SemanticSearch)
+    else {
+        return Ok(None);
+    };
+    let method_name = operation.method_name.as_str();
+    if !matches!(method_name, "similar" | "hybrid" | "rerank") {
+        return Err(exec_error(
+            "E_AI_OPERATION_UNSUPPORTED",
+            "CoveQL-AI semantic search physical execution supports .similar(), .hybrid(), and .rerank() with fileCode/k arguments",
+            json!({
+                "method": operation.method_name,
+                "operation": format!("{:?}", operation.operation),
+            }),
+        ));
+    }
+    let exact_semantic_authority = method_name == "similar";
+    let result_authority = if exact_semantic_authority {
+        "ExactOptimizedKernel"
+    } else {
+        "RuntimeAdvisory"
+    };
+    if mode == KernelExecutionMode::ForceMaterialized {
+        return Err(exec_error(
+            "E_AI_MATERIALIZED_UNSUPPORTED",
+            "CoveQL-AI semantic search requires a validated COVE-AI sidecar; materialized COVE-O readback has no equivalent AI semantic-search baseline",
+            json!({ "method": operation.method_name }),
+        ));
+    }
+    if !matches!(
+        physical.planned.resolved.output_mode,
+        crate::CoveQlOutputMode::JsonRows
+    ) {
+        return Err(exec_error(
+            "E_AI_OUTPUT_UNSUPPORTED",
+            "CoveQL-AI semantic search currently returns JSON rows",
+            json!({ "output_mode": format!("{:?}", physical.planned.resolved.output_mode) }),
+        ));
+    }
+    let Some(sidecar_bytes) = physical.sidecars.cove_ai_artifact_bytes.as_deref() else {
+        return Err(exec_error(
+            "E_AI_SIDECAR_REQUIRED",
+            "CoveQL-AI semantic search requires a supplied COVE-AI/COVE-VEC sidecar",
+            json!({ "method": operation.method_name }),
+        ));
+    };
+    let (query_file_code, top_k) = ai_similar_filecode_args(operation)?;
+    let sidecar_summary = CoveAiFile::parse(sidecar_bytes).map_err(|error| {
+        exec_error(
+            "E_AI_SIDECAR_INVALID",
+            format!("COVE-AI sidecar validation failed: {error}"),
+            json!({ "method": operation.method_name }),
+        )
+    })?;
+    let binding_count = sidecar_summary
+        .descriptor_tables
+        .filecode_vector_bindings
+        .len();
+    let vector_space_count = sidecar_summary.descriptor_tables.vector_spaces.len();
+    let started = Instant::now();
+    let results =
+        exact_flat_filecode_vector_search_by_file_code(sidecar_bytes, query_file_code, top_k)
+            .map_err(|error| {
+                exec_error(
+                    "E_AI_SEMANTIC_SEARCH_FAILED",
+                    format!("COVE-AI exact flat semantic search failed: {error}"),
+                    json!({
+                        "method": operation.method_name,
+                        "query_file_code": query_file_code,
+                        "top_k": top_k,
+                    }),
+                )
+            })?;
+    let rows = ai_semantic_search_rows(
+        method_name,
+        query_file_code,
+        &results,
+        exact_semantic_authority,
+        result_authority,
+    );
+    let result = CoveQlExecutionResult::JsonRows(rows);
+    let row_counts = ExecutionRowCounts {
+        input_rows: binding_count,
+        filtered_rows: results.len(),
+        output_rows: results.len(),
+    };
+    enforce_result_budgets(
+        &result,
+        &row_counts,
+        &physical.planned,
+        execution_options,
+        started,
+    )?;
+    let output_fingerprint = result_fingerprint(&result)?;
+
+    let mut diagnostics = execution_diagnostics_for_physical(physical);
+    diagnostics.push(exec_warning(
+        if exact_semantic_authority {
+            "W_AI_EXACT_FLAT_VECTOR_SCAN_EXECUTED"
+        } else {
+            "W_AI_ADVISORY_VECTOR_SCAN_EXECUTED"
+        },
+        if exact_semantic_authority {
+            "CoveQL-AI .similar() executed with exact flat COVE-VEC FileCode vector scan"
+        } else {
+            "CoveQL-AI semantic-search advisory method executed with exact flat vector scan but without persisted hybrid/rerank authority"
+        },
+        json!({
+            "method": method_name,
+            "query_file_code": query_file_code,
+            "top_k": top_k,
+            "result_count": results.len(),
+            "sidecar_vector_spaces": vector_space_count,
+            "sidecar_filecode_bindings": binding_count,
+            "vector_exact": true,
+            "semantic_exact": exact_semantic_authority,
+            "result_authority": result_authority,
+            "materialized_baseline_available": false,
+        }),
+    ));
+    if mode == KernelExecutionMode::CompareWithMaterialized {
+        diagnostics.push(exec_warning(
+            "W_AI_NO_MATERIALIZED_BASELINE",
+            "CoveQL-AI semantic search has no materialized COVE-O baseline oracle; sidecar result was not fingerprint-compared",
+            json!({ "method": method_name, "query_file_code": query_file_code }),
+        ));
+    }
+    if let Some(warning) = zero_copy_owned_fallback_warning(&physical.planned) {
+        diagnostics.push(warning);
+    }
+
+    let mut kernel_report = KernelExecutionReport::applied(
+        mode,
+        KernelCounters {
+            rows_scanned: binding_count,
+            rows_after_bitmap: binding_count,
+            rows_after_selection_vector: results.len(),
+            output_rows: results.len(),
+            bytes_touched_estimate: sidecar_bytes.len(),
+            dictionary_lookups_at_materialization: results.len(),
+            ..KernelCounters::default()
+        },
+    );
+    kernel_report.optimization_authority = OptimizationAuthorityReport::authoritative(
+        "COVE-AI exact flat vector scan used validated COVE-VEC descriptor tables, payload integrity, privacy summary, and FileCode-local bindings",
+    );
+    kernel_report.decision = KernelDecision::new(
+        KernelDecisionKind::Applied,
+        "CoveQL-AI semantic-search vector scan executed without materialized fallback",
+        json!({
+            "method": method_name,
+            "query_file_code": query_file_code,
+            "top_k": top_k,
+            "result_count": results.len(),
+            "sidecar_filecode_bindings": binding_count,
+            "sidecar_vector_spaces": vector_space_count,
+            "vector_exact": true,
+            "semantic_exact": exact_semantic_authority,
+            "result_authority": result_authority,
+            "fallback_boundary": Value::Null,
+            "materialized_baseline_available": false,
+        }),
+        false,
+    );
+    kernel_report.decisions = vec![kernel_report.decision.clone()];
+    kernel_report.kernel_fingerprint = Some(output_fingerprint.clone());
+    attach_phase8_plan_reports(&mut kernel_report, &physical.planned);
+
+    let executed = ExecutedQuery {
+        planned: physical.planned.clone(),
+        result,
+        diagnostics,
+        row_counts,
+        output_fingerprint,
+        pushdown_report: pushdown::PushdownReport::not_applicable(
+            &execution_options.pushdown,
+            "CoveQL-AI exact flat vector scan reads validated COVE-VEC sidecar bindings rather than COVE-O row pages",
+        ),
+        evidence_authority: None,
+        authority: ExecutionAuthorityReport::exact_kernel(
+            "CoveQL-AI exact flat vector scan produced ranked FileCode results from a validated COVE-VEC sidecar",
+            false,
+        ),
+    };
+    Ok(Some((executed, kernel_report)))
+}
+
+fn ai_similar_filecode_args(
+    operation: &crate::ResolvedAiOperation,
+) -> Result<(u32, usize), BuildExecutionError> {
+    let mut query_file_code = None;
+    let mut top_k = None;
+    let mut unnamed_integer_index = 0usize;
+    for arg in &operation.args {
+        let value = ai_argument_u64(&arg.value).ok_or_else(|| {
+            exec_error(
+                "E_AI_ARGUMENT_UNSUPPORTED",
+                ".similar() exact execution requires integer fileCode/queryFileCode and optional integer k",
+                json!({ "argument": arg.name.clone() }),
+            )
+        })?;
+        match arg.name.as_deref() {
+            Some("fileCode" | "file_code" | "queryFileCode" | "query_file_code" | "query") => {
+                query_file_code = Some(u32::try_from(value).map_err(|_| {
+                    exec_error(
+                        "E_AI_ARGUMENT_RANGE",
+                        ".similar() fileCode argument exceeds u32",
+                        json!({ "value": value }),
+                    )
+                })?);
+            }
+            Some("k" | "topK" | "top_k" | "limit") => {
+                top_k = Some(usize::try_from(value).map_err(|_| {
+                    exec_error(
+                        "E_AI_ARGUMENT_RANGE",
+                        ".similar() k argument exceeds usize",
+                        json!({ "value": value }),
+                    )
+                })?);
+            }
+            None if unnamed_integer_index == 0 => {
+                query_file_code = Some(u32::try_from(value).map_err(|_| {
+                    exec_error(
+                        "E_AI_ARGUMENT_RANGE",
+                        ".similar() fileCode argument exceeds u32",
+                        json!({ "value": value }),
+                    )
+                })?);
+                unnamed_integer_index += 1;
+            }
+            None if unnamed_integer_index == 1 => {
+                top_k = Some(usize::try_from(value).map_err(|_| {
+                    exec_error(
+                        "E_AI_ARGUMENT_RANGE",
+                        ".similar() k argument exceeds usize",
+                        json!({ "value": value }),
+                    )
+                })?);
+                unnamed_integer_index += 1;
+            }
+            Some(name) => {
+                return Err(exec_error(
+                    "E_AI_ARGUMENT_UNSUPPORTED",
+                    ".similar() exact execution supports fileCode/queryFileCode and k arguments",
+                    json!({ "argument": name }),
+                ));
+            }
+            None => {
+                return Err(exec_error(
+                    "E_AI_ARGUMENT_UNSUPPORTED",
+                    ".similar() exact execution supports at most two unnamed integer arguments: fileCode, k",
+                    json!({}),
+                ));
+            }
+        }
+    }
+    let Some(query_file_code) = query_file_code else {
+        return Err(exec_error(
+            "E_AI_ARGUMENT_REQUIRED",
+            ".similar() exact execution requires fileCode or queryFileCode",
+            json!({}),
+        ));
+    };
+    Ok((query_file_code, top_k.unwrap_or(10)))
+}
+
+fn ai_single_filecode_arg(
+    operation: &crate::ResolvedAiOperation,
+    method_label: &'static str,
+) -> Result<u32, BuildExecutionError> {
+    let mut file_code = None;
+    for arg in &operation.args {
+        let value = ai_argument_u64(&arg.value).ok_or_else(|| {
+            exec_error(
+                "E_AI_ARGUMENT_UNSUPPORTED",
+                format!("{method_label} exact execution requires an integer fileCode argument"),
+                json!({ "argument": arg.name.clone() }),
+            )
+        })?;
+        match arg.name.as_deref() {
+            Some("fileCode" | "file_code" | "queryFileCode" | "query_file_code" | "query")
+            | None
+                if file_code.is_none() =>
+            {
+                file_code = Some(u32::try_from(value).map_err(|_| {
+                    exec_error(
+                        "E_AI_ARGUMENT_RANGE",
+                        format!("{method_label} fileCode argument exceeds u32"),
+                        json!({ "value": value }),
+                    )
+                })?);
+            }
+            Some(name) => {
+                return Err(exec_error(
+                    "E_AI_ARGUMENT_UNSUPPORTED",
+                    format!("{method_label} exact execution supports only fileCode/queryFileCode"),
+                    json!({ "argument": name }),
+                ));
+            }
+            None => {
+                return Err(exec_error(
+                    "E_AI_ARGUMENT_UNSUPPORTED",
+                    format!("{method_label} exact execution supports one unnamed integer argument: fileCode"),
+                    json!({}),
+                ));
+            }
+        }
+    }
+    file_code.ok_or_else(|| {
+        exec_error(
+            "E_AI_ARGUMENT_REQUIRED",
+            format!("{method_label} exact execution requires fileCode or queryFileCode"),
+            json!({}),
+        )
+    })
+}
+
+fn ai_argument_u64(value: &ResolvedAiArgumentValue) -> Option<u64> {
+    let ResolvedAiArgumentValue::Expr(ResolvedExpr::Literal(literal)) = value else {
+        return None;
+    };
+    match &literal.typed_value {
+        ResolvedLiteralValue::UnsignedInteger(value) => Some(*value),
+        ResolvedLiteralValue::SignedInteger(value) if *value >= 0 => Some(*value as u64),
+        _ => None,
+    }
+}
+
+fn ai_semantic_search_rows(
+    method_name: &str,
+    query_file_code: u32,
+    results: &[ExactFlatFileCodeVectorSearchResult],
+    exact_semantic_authority: bool,
+    result_authority: &str,
+) -> Vec<Value> {
+    results
+        .iter()
+        .enumerate()
+        .map(|(index, result)| {
+            json!({
+                "method": method_name,
+                "rank": index + 1,
+                "query_file_code": query_file_code,
+                "file_code": result.file_code,
+                "vector_ref": result.vector_ref,
+                "vector_space_id": result.vector_space_id,
+                "score": result.score,
+                "exact": exact_semantic_authority,
+                "vector_exact": true,
+                "index_kind": "exact_flat_scan",
+                "result_authority": result_authority,
+                "advisory_reason": if exact_semantic_authority {
+                    Value::Null
+                } else {
+                    json!("no_persisted_hybrid_or_rerank_authority")
+                },
+            })
+        })
+        .collect()
 }
 
 fn try_covi_empty_lookup_executed_query(

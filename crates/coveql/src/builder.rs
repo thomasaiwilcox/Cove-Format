@@ -1120,6 +1120,10 @@ impl CoveQlQueryBuilder {
         self.explain(ExplainMode::Coded)
     }
 
+    pub fn explain_ai(self) -> Self {
+        self.explain(ExplainMode::Ai)
+    }
+
     pub fn explain_forensic(self) -> Self {
         self.explain(ExplainMode::Forensic)
     }
@@ -1497,6 +1501,7 @@ fn explain_mode_name(mode: ExplainMode) -> &'static str {
         ExplainMode::Developer => "developer",
         ExplainMode::Proof => "proof",
         ExplainMode::Coded => "coded",
+        ExplainMode::Ai => "ai",
         ExplainMode::Forensic => "forensic",
     }
 }

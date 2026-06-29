@@ -641,6 +641,14 @@ fn profile_feature_bit(profile: u8) -> u64 {
         Some(PrimaryProfile::RuntimeCompatibility) => FEATURE_RUNTIME_COMPATIBILITY_HINTS,
         Some(PrimaryProfile::CoverageMetadata) => FEATURE_COVERAGE_METADATA,
         Some(PrimaryProfile::SecondaryIndex) => FEATURE_SECONDARY_INDEX_ARTIFACT,
+        Some(PrimaryProfile::CoveAiShared)
+        | Some(PrimaryProfile::CoveMapAi)
+        | Some(PrimaryProfile::CoveChunk)
+        | Some(PrimaryProfile::CoveTok)
+        | Some(PrimaryProfile::CoveVec)
+        | Some(PrimaryProfile::CoveMmseq)
+        | Some(PrimaryProfile::CoveTrain)
+        | Some(PrimaryProfile::CoveQlAi) => 0,
     }
 }
 

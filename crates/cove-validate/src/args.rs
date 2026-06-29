@@ -4,7 +4,7 @@ use cove_core::{
     reader::{OptionalPushdownPolicy, ValidationOptions},
 };
 
-pub(crate) const USAGE: &str = "Usage: cove validate [--semantic] [--verify-digests] [--fail-open-optional-pushdown] [--object-delta] [--json] [--explain] [--requested-profile N] [--requested-operation NAME|N] [--needed-section ID] [--needed-page SECTION_ID:TARGET_REF] [--needed-column-page SECTION_ID:COLUMN_ID:MORSEL_ID] <file.cove|file.covemap|file.covedelta> [<file2> ...]";
+pub(crate) const USAGE: &str = "Usage: cove validate [--semantic] [--verify-digests] [--fail-open-optional-pushdown] [--object-delta] [--json] [--explain] [--requested-profile N] [--requested-operation NAME|N] [--needed-section ID] [--needed-page SECTION_ID:TARGET_REF] [--needed-column-page SECTION_ID:COLUMN_ID:MORSEL_ID] <file.cove|file.covemap|file.covedelta|file.coveai|file.covev> [<file2> ...]";
 
 #[derive(Clone)]
 pub(crate) struct CliArgs {
@@ -142,6 +142,15 @@ fn parse_operation_kind(value: &str) -> Result<OperationKindV2, String> {
         "coverage_planning" => Ok(OperationKindV2::CoveragePlanning),
         "zero_copy_export" => Ok(OperationKindV2::ZeroCopyExport),
         "runtime_adapter_selection" => Ok(OperationKindV2::RuntimeAdapterSelection),
+        "ai_inspect" => Ok(OperationKindV2::AiInspect),
+        "ai_chunk_projection" => Ok(OperationKindV2::AiChunkProjection),
+        "ai_token_projection" => Ok(OperationKindV2::AiTokenProjection),
+        "ai_embedding" => Ok(OperationKindV2::AiEmbedding),
+        "ai_semantic_search" => Ok(OperationKindV2::AiSemanticSearch),
+        "ai_rag_context" => Ok(OperationKindV2::AiRagContext),
+        "ai_training_sample_export" => Ok(OperationKindV2::AiTrainingSampleExport),
+        "ai_multimodal_sequence_read" => Ok(OperationKindV2::AiMultimodalSequenceRead),
+        "ai_generator_audit" => Ok(OperationKindV2::AiGeneratorAudit),
         "vendor_defined" => Ok(OperationKindV2::VendorDefined),
         _ => Err(format!("Unknown --requested-operation value: {value}")),
     }

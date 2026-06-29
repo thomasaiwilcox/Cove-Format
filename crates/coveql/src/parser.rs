@@ -1900,6 +1900,7 @@ fn explain_mode_from_str(value: &str) -> Option<ExplainMode> {
         "developer" => Some(ExplainMode::Developer),
         "proof" => Some(ExplainMode::Proof),
         "coded" => Some(ExplainMode::Coded),
+        "ai" => Some(ExplainMode::Ai),
         "forensic" => Some(ExplainMode::Forensic),
         _ => None,
     }

@@ -34,6 +34,15 @@ pub(crate) fn mapping_identity(file: &CovemapFile) -> Result<(String, String), S
             EmbeddedMapSection::ProjectionCatalog(section) => {
                 return Ok((section.mapping_id, section.mapping_version));
             }
+            EmbeddedMapSection::AiProfileCatalog(section) => {
+                return Ok((section.mapping_id, section.mapping_version));
+            }
+            EmbeddedMapSection::AiTemplateCatalog(section) => {
+                return Ok((section.mapping_id, section.mapping_version));
+            }
+            EmbeddedMapSection::AiTrainingPolicyCatalog(section) => {
+                return Ok((section.mapping_id, section.mapping_version));
+            }
             _ => {}
         }
     }

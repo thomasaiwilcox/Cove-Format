@@ -108,6 +108,7 @@ pub(super) fn section_entry_required_for_feature_use(
 pub(super) fn is_embedded_optional_profile_section(kind: SectionKind) -> bool {
     is_layout_section(kind)
         || is_coverage_section(kind)
+        || is_ai_section(kind)
         || matches!(
             kind,
             SectionKind::IndexOnlyCapability | SectionKind::RuntimeCompatibilityHints
@@ -176,6 +177,35 @@ fn allowed_profiles_for_section(section: SectionKind) -> &'static [u8] {
         | SectionKind::MapConversionReport
         | SectionKind::MapProjectionCatalog
         | SectionKind::MapResolutionCatalog => &[6],
+        SectionKind::MapAiProfileCatalog
+        | SectionKind::MapAiTemplateCatalog
+        | SectionKind::MapAiTrainingPolicyCatalog => &[17],
+        SectionKind::AiCompanionArtifactRef
+        | SectionKind::AiSourceBinding
+        | SectionKind::AiReferenceTables
+        | SectionKind::AiPayloadIntegrity
+        | SectionKind::AiPrivacySummary
+        | SectionKind::AiSectionFeatureBinding
+        | SectionKind::AiPayloadBytes => &[16],
+        SectionKind::AiChunkProfile | SectionKind::AiTextChunkIndex => &[18],
+        SectionKind::AiTokenizerProfile
+        | SectionKind::AiTokenBlock
+        | SectionKind::AiTokenizedSpan
+        | SectionKind::AiTokenSequencePack => &[19],
+        SectionKind::AiVectorSpace
+        | SectionKind::AiVectorBinding
+        | SectionKind::AiVectorPayloadBlock
+        | SectionKind::AiVectorComposition
+        | SectionKind::AiVectorIndex
+        | SectionKind::AiVectorDirectory => &[20],
+        SectionKind::AiTensorLayout => &[20, 21],
+        SectionKind::AiAssetManifest => &[21, 22],
+        SectionKind::AiMultimodalSequence => &[21],
+        SectionKind::AiTrainingProfile
+        | SectionKind::AiTrainingSampleIndex
+        | SectionKind::AiTrainingSplitDedupEpoch
+        | SectionKind::AiLabelPreference
+        | SectionKind::AiGeneratorProvenance => &[22],
     }
 }
 
@@ -206,6 +236,26 @@ fn operation_requires_section(operation: OperationKindV2, kind: SectionKind) -> 
         | OperationKindV2::ProjectionReadback
         | OperationKindV2::EvidenceReadback => is_map_section(kind),
         OperationKindV2::HarborMount => is_harbor_section(kind),
+        OperationKindV2::AiInspect => is_ai_section(kind),
+        OperationKindV2::AiChunkProjection | OperationKindV2::AiRagContext => {
+            is_ai_shared_section(kind) || is_chunk_section(kind) || is_vec_section(kind)
+        }
+        OperationKindV2::AiTokenProjection => is_ai_shared_section(kind) || is_token_section(kind),
+        OperationKindV2::AiEmbedding | OperationKindV2::AiSemanticSearch => {
+            is_ai_shared_section(kind) || is_map_ai_section(kind) || is_vec_section(kind)
+        }
+        OperationKindV2::AiTrainingSampleExport => {
+            is_ai_shared_section(kind) || is_token_section(kind) || is_train_section(kind)
+        }
+        OperationKindV2::AiMultimodalSequenceRead => {
+            is_ai_shared_section(kind)
+                || is_token_section(kind)
+                || is_mmseq_section(kind)
+                || is_train_section(kind)
+        }
+        OperationKindV2::AiGeneratorAudit => {
+            is_ai_shared_section(kind) || is_generator_section(kind)
+        }
         _ => false,
     }
 }
@@ -222,6 +272,14 @@ fn profile_requires_section(profile: u8, kind: SectionKind) -> bool {
         }
         Some(PrimaryProfile::CoverageMetadata) => is_coverage_section(kind),
         Some(PrimaryProfile::SecondaryIndex) => kind == SectionKind::IndexOnlyCapability,
+        Some(PrimaryProfile::CoveAiShared) => is_ai_shared_section(kind),
+        Some(PrimaryProfile::CoveMapAi) => is_map_ai_section(kind),
+        Some(PrimaryProfile::CoveChunk) => is_ai_shared_section(kind) || is_chunk_section(kind),
+        Some(PrimaryProfile::CoveTok) => is_ai_shared_section(kind) || is_token_section(kind),
+        Some(PrimaryProfile::CoveVec) => is_ai_shared_section(kind) || is_vec_section(kind),
+        Some(PrimaryProfile::CoveMmseq) => is_ai_shared_section(kind) || is_mmseq_section(kind),
+        Some(PrimaryProfile::CoveTrain) => is_ai_shared_section(kind) || is_train_section(kind),
+        Some(PrimaryProfile::CoveQlAi) => is_ai_section(kind),
         _ => false,
     }
 }
@@ -327,6 +385,93 @@ fn is_map_section(kind: SectionKind) -> bool {
             | SectionKind::MapProjectionCatalog
             | SectionKind::MapResolutionCatalog
     )
+}
+
+fn is_ai_section(kind: SectionKind) -> bool {
+    is_ai_shared_section(kind)
+        || is_map_ai_section(kind)
+        || is_chunk_section(kind)
+        || is_token_section(kind)
+        || is_vec_section(kind)
+        || is_mmseq_section(kind)
+        || is_train_section(kind)
+}
+
+fn is_ai_shared_section(kind: SectionKind) -> bool {
+    matches!(
+        kind,
+        SectionKind::AiCompanionArtifactRef
+            | SectionKind::AiSourceBinding
+            | SectionKind::AiReferenceTables
+            | SectionKind::AiPayloadIntegrity
+            | SectionKind::AiPrivacySummary
+            | SectionKind::AiSectionFeatureBinding
+            | SectionKind::AiPayloadBytes
+    )
+}
+
+fn is_map_ai_section(kind: SectionKind) -> bool {
+    matches!(
+        kind,
+        SectionKind::MapAiProfileCatalog
+            | SectionKind::MapAiTemplateCatalog
+            | SectionKind::MapAiTrainingPolicyCatalog
+    )
+}
+
+fn is_chunk_section(kind: SectionKind) -> bool {
+    matches!(
+        kind,
+        SectionKind::AiChunkProfile | SectionKind::AiTextChunkIndex
+    )
+}
+
+fn is_token_section(kind: SectionKind) -> bool {
+    matches!(
+        kind,
+        SectionKind::AiTokenizerProfile
+            | SectionKind::AiTokenBlock
+            | SectionKind::AiTokenizedSpan
+            | SectionKind::AiTokenSequencePack
+    )
+}
+
+fn is_vec_section(kind: SectionKind) -> bool {
+    matches!(
+        kind,
+        SectionKind::AiVectorSpace
+            | SectionKind::AiVectorBinding
+            | SectionKind::AiVectorPayloadBlock
+            | SectionKind::AiVectorComposition
+            | SectionKind::AiVectorIndex
+            | SectionKind::AiTensorLayout
+            | SectionKind::AiVectorDirectory
+    )
+}
+
+fn is_mmseq_section(kind: SectionKind) -> bool {
+    matches!(
+        kind,
+        SectionKind::AiAssetManifest
+            | SectionKind::AiMultimodalSequence
+            | SectionKind::AiTensorLayout
+    )
+}
+
+fn is_train_section(kind: SectionKind) -> bool {
+    matches!(
+        kind,
+        SectionKind::AiAssetManifest
+            | SectionKind::AiTrainingProfile
+            | SectionKind::AiTrainingSampleIndex
+            | SectionKind::AiTrainingSplitDedupEpoch
+            | SectionKind::AiLabelPreference
+            | SectionKind::AiGeneratorProvenance
+    )
+}
+
+fn is_generator_section(kind: SectionKind) -> bool {
+    kind == SectionKind::AiGeneratorProvenance || kind == SectionKind::AiLabelPreference
 }
 
 #[cfg(test)]
