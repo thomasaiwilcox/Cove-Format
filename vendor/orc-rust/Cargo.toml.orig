@@ -93,9 +93,6 @@ required-features = ["async"]
 # Some issue when publishing and path isn't specified, so adding here
 path = "./benches/arrow_reader.rs"
 
-[profile.bench]
-debug = true
-
 [[bin]]
 name = "orc"
 path = "src/bin/orc/main.rs"

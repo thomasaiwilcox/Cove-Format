@@ -12,5 +12,5 @@ crate-type = ["cdylib"]
 
 [dependencies]
 cove-ai-adapters = { path = "../../crates/cove-ai-adapters" }
-pyo3 = { version = "0.21", features = ["abi3-py39"] }
+pyo3 = { version = "0.29", features = ["abi3-py39"] }
 serde_json = { version = "1", features = ["preserve_order"] }

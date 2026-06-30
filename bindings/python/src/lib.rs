@@ -8,6 +8,7 @@ use pyo3::{
     exceptions::PyRuntimeError,
     prelude::*,
     types::{PyBytes, PyModule},
+    IntoPyObjectExt,
 };
 use serde_json::Value;
 
@@ -20,7 +21,7 @@ struct PyTrainingArchive {
 
 #[pymethods]
 impl PyTrainingArchive {
-    fn verify(&self, py: Python<'_>, policy_report: Option<bool>) -> PyResult<PyObject> {
+    fn verify(&self, py: Python<'_>, policy_report: Option<bool>) -> PyResult<Py<PyAny>> {
         let archive = self.open_native()?;
         let value = archive
             .verify(AiVerifyOptions {
@@ -35,7 +36,7 @@ impl PyTrainingArchive {
         py: Python<'_>,
         split: Option<String>,
         include_payloads: Option<bool>,
-    ) -> PyResult<PyObject> {
+    ) -> PyResult<Py<PyAny>> {
         let archive = self.open_native()?;
         let rows = archive
             .training_samples(AiSampleIteratorOptions {
@@ -46,7 +47,7 @@ impl PyTrainingArchive {
         json_to_py(py, &Value::Array(rows))
     }
 
-    fn chunks(&self, py: Python<'_>, include_text: Option<bool>) -> PyResult<PyObject> {
+    fn chunks(&self, py: Python<'_>, include_text: Option<bool>) -> PyResult<Py<PyAny>> {
         let archive = self.open_native()?;
         let rows = archive
             .chunks(include_text.unwrap_or(false))
@@ -54,7 +55,7 @@ impl PyTrainingArchive {
         json_to_py(py, &Value::Array(rows))
     }
 
-    fn tokens(&self, py: Python<'_>, include_payloads: Option<bool>) -> PyResult<PyObject> {
+    fn tokens(&self, py: Python<'_>, include_payloads: Option<bool>) -> PyResult<Py<PyAny>> {
         let archive = self.open_native()?;
         let rows = archive
             .tokens(include_payloads.unwrap_or(false))
@@ -62,7 +63,7 @@ impl PyTrainingArchive {
         json_to_py(py, &Value::Array(rows))
     }
 
-    fn multimodal(&self, py: Python<'_>, include_payloads: Option<bool>) -> PyResult<PyObject> {
+    fn multimodal(&self, py: Python<'_>, include_payloads: Option<bool>) -> PyResult<Py<PyAny>> {
         let archive = self.open_native()?;
         let rows = archive
             .multimodal(include_payloads.unwrap_or(false))
@@ -77,7 +78,7 @@ impl PyTrainingArchive {
         out: Option<String>,
         split: Option<String>,
         include_payloads: Option<bool>,
-    ) -> PyResult<PyObject> {
+    ) -> PyResult<Py<PyAny>> {
         let archive = self.open_native()?;
         let options = AiExportOptions {
             format: format.unwrap_or_else(|| "jsonl".to_string()),
@@ -93,9 +94,11 @@ impl PyTrainingArchive {
         if data.media_type.starts_with("application/json")
             || data.media_type == "application/x-ndjson"
         {
-            Ok(String::from_utf8_lossy(&data.bytes).to_string().into_py(py))
+            String::from_utf8_lossy(&data.bytes)
+                .to_string()
+                .into_py_any(py)
         } else {
-            Ok(PyBytes::new_bound(py, &data.bytes).into_py(py))
+            Ok(PyBytes::new(py, &data.bytes).into_any().unbind())
         }
     }
 }
@@ -130,10 +133,10 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
-fn json_to_py(py: Python<'_>, value: &Value) -> PyResult<PyObject> {
-    let json = PyModule::import_bound(py, "json")?;
+fn json_to_py(py: Python<'_>, value: &Value) -> PyResult<Py<PyAny>> {
+    let json = PyModule::import(py, "json")?;
     let text = serde_json::to_string(value).map_err(py_error)?;
-    Ok(json.call_method1("loads", (text,))?.into_py(py))
+    Ok(json.call_method1("loads", (text,))?.unbind())
 }
 
 fn py_error(error: impl ToString) -> PyErr {

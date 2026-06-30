@@ -8,5 +8,3 @@ license = "MIT"
 
 [dependencies]
 cove-core = { path = "../cove-core" }
-cove-datafusion = { path = "../cove-datafusion" }
-arrow-array = "58"
