@@ -11,6 +11,10 @@ use cove_core::{
     profile::cove_o::ObjectTypeCatalog,
     segment::TableSegmentIndexEntryV1,
     table::TableEntry,
+    wire::{
+        read_u16_le_checked as read_u16, read_u32_le_checked as read_u32,
+        read_u64_le_checked as read_u64, read_u8_checked as read_u8,
+    },
     CoveError,
 };
 
@@ -2241,35 +2245,6 @@ impl<'a> Cursor<'a> {
         let bytes = self.bytes(4)?;
         Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
     }
-}
-
-fn read_u8(bytes: &[u8], offset: usize) -> Result<u8, CoveError> {
-    if offset >= bytes.len() {
-        return Err(CoveError::BufferTooShort);
-    }
-    Ok(bytes[offset])
-}
-
-fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, CoveError> {
-    Ok(u16::from_le_bytes(read_array(bytes, offset)?))
-}
-
-fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, CoveError> {
-    Ok(u32::from_le_bytes(read_array(bytes, offset)?))
-}
-
-fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, CoveError> {
-    Ok(u64::from_le_bytes(read_array(bytes, offset)?))
-}
-
-fn read_array<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N], CoveError> {
-    let end = offset.checked_add(N).ok_or(CoveError::ArithOverflow)?;
-    if end > bytes.len() {
-        return Err(CoveError::BufferTooShort);
-    }
-    let mut out = [0u8; N];
-    out.copy_from_slice(&bytes[offset..end]);
-    Ok(out)
 }
 
 fn checked_end(offset: u64, length: u64) -> Result<u64, CoveError> {

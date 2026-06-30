@@ -1165,10 +1165,6 @@ fn arrow_null_buffer(
     Ok(validity_builder.finish())
 }
 
-fn read_u32_le(bytes: &[u8], offset: usize) -> Result<u32, CoveError> {
-    wire::read_u32_le_checked(bytes, offset)
-}
-
 #[inline]
 fn read_u32_len_prefixed_range(bytes: &[u8], offset: usize) -> Result<(usize, usize), CoveError> {
     let Some(data_start) = offset.checked_add(4) else {
@@ -1177,12 +1173,7 @@ fn read_u32_len_prefixed_range(bytes: &[u8], offset: usize) -> Result<(usize, us
     if data_start > bytes.len() {
         return Err(CoveError::OffsetRange);
     }
-    let len = u32::from_le_bytes([
-        bytes[offset],
-        bytes[offset + 1],
-        bytes[offset + 2],
-        bytes[offset + 3],
-    ]) as usize;
+    let len = wire::read_u32_le_checked(bytes, offset)? as usize;
     let Some(data_end) = data_start.checked_add(len) else {
         return Err(CoveError::ArithOverflow);
     };

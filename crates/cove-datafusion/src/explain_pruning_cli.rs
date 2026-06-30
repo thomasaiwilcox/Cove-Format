@@ -3,8 +3,9 @@ use std::path::PathBuf;
 use crate::explain::{
     explain_pruning, parse_filter_dsl, parse_projection_dsl, parse_topn_dsl, ExplainOptions,
 };
+use crate::DatafusionCliError;
 
-pub fn run(args: Vec<String>) -> Result<(), String> {
+pub fn run(args: Vec<String>) -> Result<(), DatafusionCliError> {
     let Some((input, options)) = parse_args(args)? else {
         print_usage();
         return Ok(());

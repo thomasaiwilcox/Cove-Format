@@ -3,14 +3,47 @@
 mod format;
 mod inspect;
 
-use std::path::Path;
+use std::{error::Error, fmt, path::Path};
 
 pub use inspect::InspectSections;
 
-pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<bool, String> {
-    let args = parse_args(args.into_iter().collect::<Vec<_>>())?;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InspectCliError {
+    message: String,
+}
+
+impl InspectCliError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for InspectCliError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl Error for InspectCliError {}
+
+impl From<String> for InspectCliError {
+    fn from(message: String) -> Self {
+        Self::new(message)
+    }
+}
+
+impl From<&str> for InspectCliError {
+    fn from(message: &str) -> Self {
+        Self::new(message)
+    }
+}
+
+pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<bool, InspectCliError> {
+    let args = parse_args(args.into_iter().collect::<Vec<_>>()).map_err(InspectCliError::from)?;
     if args.file_paths.is_empty() {
-        return Err(usage().into());
+        return Err(InspectCliError::from(usage()));
     }
 
     if args.json {
@@ -29,14 +62,16 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<bool, String> {
             if values.len() == 1 {
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&values[0])
-                        .map_err(|error| format!("cannot serialize JSON output: {error}"))?
+                    serde_json::to_string_pretty(&values[0]).map_err(|error| {
+                        InspectCliError::new(format!("cannot serialize JSON output: {error}"))
+                    })?
                 );
             } else {
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&values)
-                        .map_err(|error| format!("cannot serialize JSON output: {error}"))?
+                    serde_json::to_string_pretty(&values).map_err(|error| {
+                        InspectCliError::new(format!("cannot serialize JSON output: {error}"))
+                    })?
                 );
             }
         }
@@ -75,7 +110,8 @@ fn parse_args(raw_args: Vec<String>) -> Result<Args, String> {
                 let Some(raw_sections) = raw_args.get(index + 1) else {
                     return Err("--sections requires a comma-separated group list".into());
                 };
-                sections = inspect::InspectSections::parse(raw_sections)?;
+                sections = inspect::InspectSections::parse(raw_sections)
+                    .map_err(|error| error.to_string())?;
                 index += 1;
             }
             arg if arg.starts_with("--") => return Err(format!("unknown argument: {arg}")),

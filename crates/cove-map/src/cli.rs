@@ -46,6 +46,12 @@ impl From<&str> for MapCliError {
     }
 }
 
+impl From<MapApiError> for MapCliError {
+    fn from(error: MapApiError) -> Self {
+        Self::Command(error.to_string())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Command {
     Validate {

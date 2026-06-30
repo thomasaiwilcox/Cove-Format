@@ -6,6 +6,14 @@ use cove_core::{
 };
 use serde_json::Value;
 
+mod encoding;
+
+pub(crate) use encoding::{
+    append_property_value_bytes, file_dictionary_for_model, file_dictionary_index_bytes,
+    file_dictionary_key_for_property, nested_shapes_for_model, temporal_segment_index,
+    temporal_segment_payload, trust_manifest,
+};
+
 #[derive(Debug, Clone)]
 pub(crate) struct ObjectRow {
     pub(crate) goid: [u8; 16],

@@ -1,4 +1,4 @@
-use std::cmp::Ordering;
+use std::{cmp::Ordering, fmt};
 
 use cove_core::{
     collation::CollationKind,
@@ -71,6 +71,95 @@ pub(crate) enum KernelLiteral {
     F64(f64),
     String(String),
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KernelPredicateError {
+    CompareRequiresPathLiteral,
+    UnsafePath,
+    InRequiresDirectPath,
+    InUnsafePath,
+    InLiteralIncompatible,
+    InLiteralUnsupported,
+    InRequiresLiteral,
+    NullCheckRequiresDirectPath,
+    MaterializedResidual,
+    BoolRequiresBooleanPath,
+    StartsWithRequiresPathLiteral,
+    StartsWithRequiresStringPath,
+    StartsWithRequiresStringLiteral,
+    NullCheckFunctionRequiresDirectPath,
+    IdentityRequiresDirectPath,
+    IdentityRequiresBooleanPath,
+    IdentityCastRequiresPathAndTarget,
+    IdentityCastRequiresStringTarget,
+    IdentityCastRequiresBooleanPath,
+    IdentityCastTargetMismatch,
+    CoalesceRequiresArgument,
+    CoalesceLiteralUnsupported,
+    CoalesceTermUnsupported,
+}
+
+impl fmt::Display for KernelPredicateError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::CompareRequiresPathLiteral => {
+                "kernel compare predicates require path/literal operands"
+            }
+            Self::UnsafePath => "predicate path is not safe for kernel evaluation",
+            Self::InRequiresDirectPath => "kernel IN predicates require a direct path",
+            Self::InUnsafePath => "IN predicate path is not safe for kernel evaluation",
+            Self::InLiteralIncompatible => {
+                "kernel IN predicate literal is incompatible with the path type"
+            }
+            Self::InLiteralUnsupported => "kernel IN predicate literal is unsupported",
+            Self::InRequiresLiteral => "kernel IN predicates require at least one literal",
+            Self::NullCheckRequiresDirectPath => "kernel null checks require direct paths",
+            Self::MaterializedResidual => "predicate form remains materialized residual",
+            Self::BoolRequiresBooleanPath => "kernel boolean predicates require a boolean path",
+            Self::StartsWithRequiresPathLiteral => {
+                "startsWith kernel predicate requires path and literal arguments"
+            }
+            Self::StartsWithRequiresStringPath => {
+                "startsWith kernel predicate requires a string path"
+            }
+            Self::StartsWithRequiresStringLiteral => {
+                "startsWith kernel predicate requires a string literal prefix"
+            }
+            Self::NullCheckFunctionRequiresDirectPath => {
+                "null-check kernel predicate requires one direct path argument"
+            }
+            Self::IdentityRequiresDirectPath => {
+                "identity kernel predicate requires one direct path argument"
+            }
+            Self::IdentityRequiresBooleanPath => {
+                "identity kernel predicate requires a boolean path"
+            }
+            Self::IdentityCastRequiresPathAndTarget => {
+                "identity cast kernel predicate requires path and target type arguments"
+            }
+            Self::IdentityCastRequiresStringTarget => {
+                "identity cast kernel predicate requires a string target type"
+            }
+            Self::IdentityCastRequiresBooleanPath => {
+                "identity cast boolean predicate requires a boolean path"
+            }
+            Self::IdentityCastTargetMismatch => {
+                "identity cast kernel predicate target must match the path type"
+            }
+            Self::CoalesceRequiresArgument => {
+                "coalesce kernel predicate requires at least one argument"
+            }
+            Self::CoalesceLiteralUnsupported => {
+                "coalesce kernel predicate supports only boolean/null literals"
+            }
+            Self::CoalesceTermUnsupported => {
+                "coalesce kernel predicate supports only boolean paths and literals"
+            }
+        })
+    }
+}
+
+impl std::error::Error for KernelPredicateError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KernelTruth {
@@ -480,7 +569,7 @@ fn property_lane<'a>(
 
 pub(crate) fn compile_kernel_predicates(
     predicate: Option<&ResolvedPredicate>,
-) -> Result<Vec<KernelPredicate>, String> {
+) -> Result<Vec<KernelPredicate>, KernelPredicateError> {
     let Some(predicate) = predicate else {
         return Ok(Vec::new());
     };
@@ -492,7 +581,7 @@ pub(crate) fn compile_kernel_predicates(
 fn compile_predicate(
     predicate: &ResolvedPredicate,
     out: &mut Vec<KernelPredicate>,
-) -> Result<(), String> {
+) -> Result<(), KernelPredicateError> {
     match predicate {
         ResolvedPredicate::And(parts) => {
             for part in parts {
@@ -524,11 +613,10 @@ fn compile_predicate(
                 out.push(predicate);
                 return Ok(());
             }
-            let (path, op, literal) = path_literal_compare(left, *op, right).ok_or_else(|| {
-                "kernel compare predicates require path/literal operands".to_string()
-            })?;
+            let (path, op, literal) = path_literal_compare(left, *op, right)
+                .ok_or(KernelPredicateError::CompareRequiresPathLiteral)?;
             if !path_is_kernel_safe(path, op) {
-                return Err("predicate path is not safe for kernel evaluation".into());
+                return Err(KernelPredicateError::UnsafePath);
             }
             out.push(KernelPredicate::ComparePathLiteral {
                 path: path.clone(),
@@ -539,26 +627,22 @@ fn compile_predicate(
         }
         ResolvedPredicate::InList { expr, values } => {
             let ResolvedExpr::Path(path) = expr else {
-                return Err("kernel IN predicates require a direct path".into());
+                return Err(KernelPredicateError::InRequiresDirectPath);
             };
             if !path_is_kernel_safe(path, AstCompareOp::Eq) {
-                return Err("IN predicate path is not safe for kernel evaluation".into());
+                return Err(KernelPredicateError::InUnsafePath);
             }
             let literals = values
                 .iter()
                 .map(|value| {
                     if !path_literal_is_kernel_compatible(path, value) {
-                        return Err(
-                            "kernel IN predicate literal is incompatible with the path type"
-                                .to_string(),
-                        );
+                        return Err(KernelPredicateError::InLiteralIncompatible);
                     }
-                    kernel_literal(value)
-                        .ok_or_else(|| "kernel IN predicate literal is unsupported".to_string())
+                    kernel_literal(value).ok_or(KernelPredicateError::InLiteralUnsupported)
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             if literals.is_empty() {
-                return Err("kernel IN predicates require at least one literal".into());
+                return Err(KernelPredicateError::InRequiresLiteral);
             }
             out.push(KernelPredicate::InList {
                 path: path.clone(),
@@ -572,7 +656,7 @@ fn compile_predicate(
         }
         ResolvedPredicate::NullCheck { expr, negated } => {
             let ResolvedExpr::Path(path) = expr else {
-                return Err("kernel null checks require direct paths".into());
+                return Err(KernelPredicateError::NullCheckRequiresDirectPath);
             };
             out.push(KernelPredicate::NullCheck {
                 path: path.clone(),
@@ -593,11 +677,13 @@ fn compile_predicate(
             out.push(KernelPredicate::Or(parts));
             Ok(())
         }
-        ResolvedPredicate::Exists(_) => Err("predicate form remains materialized residual".into()),
+        ResolvedPredicate::Exists(_) => Err(KernelPredicateError::MaterializedResidual),
     }
 }
 
-fn compile_predicate_expr(predicate: &ResolvedPredicate) -> Result<KernelPredicate, String> {
+fn compile_predicate_expr(
+    predicate: &ResolvedPredicate,
+) -> Result<KernelPredicate, KernelPredicateError> {
     let mut predicates = Vec::new();
     compile_predicate(predicate, &mut predicates)?;
     Ok(if predicates.len() == 1 {
@@ -803,11 +889,11 @@ fn bool_expr_literal_compare(
     })
 }
 
-fn bool_expr_predicate(expr: &ResolvedExpr) -> Result<KernelPredicate, String> {
+fn bool_expr_predicate(expr: &ResolvedExpr) -> Result<KernelPredicate, KernelPredicateError> {
     match expr {
         ResolvedExpr::Path(path) => {
             if !matches!(path.logical_type.as_str(), "bool" | "boolean") {
-                return Err("kernel boolean predicates require a boolean path".into());
+                return Err(KernelPredicateError::BoolRequiresBooleanPath);
             }
             Ok(KernelPredicate::BoolPath { path: path.clone() })
         }
@@ -843,9 +929,9 @@ fn bool_expr_predicate(expr: &ResolvedExpr) -> Result<KernelPredicate, String> {
                 let terms = coalesce_bool_terms(args)?;
                 Ok(KernelPredicate::CoalesceBool { terms })
             }
-            _ => Err("predicate form remains materialized residual".into()),
+            _ => Err(KernelPredicateError::MaterializedResidual),
         },
-        _ => Err("predicate form remains materialized residual".into()),
+        _ => Err(KernelPredicateError::MaterializedResidual),
     }
 }
 
@@ -892,56 +978,58 @@ fn string_function_path_arg(expr: &ResolvedExpr) -> Option<(&str, &ResolvedPath)
     matches!(path.logical_type.as_str(), "utf8" | "string").then_some((function_id.as_str(), path))
 }
 
-fn starts_with_path_literal_args(args: &[ResolvedExpr]) -> Result<(&ResolvedPath, String), String> {
+fn starts_with_path_literal_args(
+    args: &[ResolvedExpr],
+) -> Result<(&ResolvedPath, String), KernelPredicateError> {
     let [ResolvedExpr::Path(path), ResolvedExpr::Literal(prefix)] = args else {
-        return Err("startsWith kernel predicate requires path and literal arguments".into());
+        return Err(KernelPredicateError::StartsWithRequiresPathLiteral);
     };
     if !matches!(path.logical_type.as_str(), "utf8" | "string" | "json") {
-        return Err("startsWith kernel predicate requires a string path".into());
+        return Err(KernelPredicateError::StartsWithRequiresStringPath);
     }
     let ResolvedLiteralValue::String(prefix) = &prefix.typed_value else {
-        return Err("startsWith kernel predicate requires a string literal prefix".into());
+        return Err(KernelPredicateError::StartsWithRequiresStringLiteral);
     };
     Ok((path, prefix.clone()))
 }
 
-fn null_check_path_arg(args: &[ResolvedExpr]) -> Result<&ResolvedPath, String> {
+fn null_check_path_arg(args: &[ResolvedExpr]) -> Result<&ResolvedPath, KernelPredicateError> {
     let [ResolvedExpr::Path(path)] = args else {
-        return Err("null-check kernel predicate requires one direct path argument".into());
+        return Err(KernelPredicateError::NullCheckFunctionRequiresDirectPath);
     };
     Ok(path)
 }
 
-fn identity_bool_path_arg(args: &[ResolvedExpr]) -> Result<&ResolvedPath, String> {
+fn identity_bool_path_arg(args: &[ResolvedExpr]) -> Result<&ResolvedPath, KernelPredicateError> {
     let [ResolvedExpr::Path(path)] = args else {
-        return Err("identity kernel predicate requires one direct path argument".into());
+        return Err(KernelPredicateError::IdentityRequiresDirectPath);
     };
     if !matches!(path.logical_type.as_str(), "bool" | "boolean") {
-        return Err("identity kernel predicate requires a boolean path".into());
+        return Err(KernelPredicateError::IdentityRequiresBooleanPath);
     }
     Ok(path)
 }
 
-fn identity_cast_bool_path_arg(args: &[ResolvedExpr]) -> Result<&ResolvedPath, String> {
+fn identity_cast_bool_path_arg(
+    args: &[ResolvedExpr],
+) -> Result<&ResolvedPath, KernelPredicateError> {
     let [ResolvedExpr::Path(path), ResolvedExpr::Literal(target)] = args else {
-        return Err(
-            "identity cast kernel predicate requires path and target type arguments".into(),
-        );
+        return Err(KernelPredicateError::IdentityCastRequiresPathAndTarget);
     };
     let ResolvedLiteralValue::String(target) = &target.typed_value else {
-        return Err("identity cast kernel predicate requires a string target type".into());
+        return Err(KernelPredicateError::IdentityCastRequiresStringTarget);
     };
     if !matches!(path.logical_type.as_str(), "bool" | "boolean") {
-        return Err("identity cast boolean predicate requires a boolean path".into());
+        return Err(KernelPredicateError::IdentityCastRequiresBooleanPath);
     }
     cast_target_is_identity(path, target)
         .then_some(path)
-        .ok_or_else(|| "identity cast kernel predicate target must match the path type".into())
+        .ok_or(KernelPredicateError::IdentityCastTargetMismatch)
 }
 
-fn coalesce_bool_terms(args: &[ResolvedExpr]) -> Result<Vec<KernelBoolTerm>, String> {
+fn coalesce_bool_terms(args: &[ResolvedExpr]) -> Result<Vec<KernelBoolTerm>, KernelPredicateError> {
     if args.is_empty() {
-        return Err("coalesce kernel predicate requires at least one argument".into());
+        return Err(KernelPredicateError::CoalesceRequiresArgument);
     }
     args.iter()
         .map(|arg| match arg {
@@ -953,9 +1041,9 @@ fn coalesce_bool_terms(args: &[ResolvedExpr]) -> Result<Vec<KernelBoolTerm>, Str
             ResolvedExpr::Literal(literal) => match &literal.typed_value {
                 ResolvedLiteralValue::Boolean(value) => Ok(KernelBoolTerm::Literal(Some(*value))),
                 ResolvedLiteralValue::Null => Ok(KernelBoolTerm::Literal(None)),
-                _ => Err("coalesce kernel predicate supports only boolean/null literals".into()),
+                _ => Err(KernelPredicateError::CoalesceLiteralUnsupported),
             },
-            _ => Err("coalesce kernel predicate supports only boolean paths and literals".into()),
+            _ => Err(KernelPredicateError::CoalesceTermUnsupported),
         })
         .collect()
 }

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, fmt};
 
 use arrow_array::{
     Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Decimal64Array,
@@ -10,6 +10,23 @@ use serde_json::{json, Value};
 
 use crate::materialized::{hex, ExecutionRow, MaterializedProjectionRow};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ArrowOutputError {
+    UnsupportedColumnType { data_type: String },
+}
+
+impl fmt::Display for ArrowOutputError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedColumnType { data_type } => {
+                write!(f, "unsupported Arrow output column type {data_type}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ArrowOutputError {}
+
 pub(crate) fn execution_rows_to_json(rows: &[ExecutionRow]) -> Vec<Value> {
     rows.iter().map(ExecutionRow::to_json).collect()
 }
@@ -17,7 +34,7 @@ pub(crate) fn execution_rows_to_json(rows: &[ExecutionRow]) -> Vec<Value> {
 pub(crate) fn record_batches_to_projection_rows(
     projection_id: &str,
     batches: &[RecordBatch],
-) -> Result<Vec<MaterializedProjectionRow>, String> {
+) -> Result<Vec<MaterializedProjectionRow>, ArrowOutputError> {
     let mut out = Vec::new();
     for batch in batches {
         for row_index in 0..batch.num_rows() {
@@ -35,7 +52,9 @@ pub(crate) fn record_batches_to_projection_rows(
     Ok(out)
 }
 
-pub(crate) fn record_batches_to_json_rows(batches: &[RecordBatch]) -> Result<Vec<Value>, String> {
+pub(crate) fn record_batches_to_json_rows(
+    batches: &[RecordBatch],
+) -> Result<Vec<Value>, ArrowOutputError> {
     let mut out = Vec::new();
     for batch in batches {
         for row_index in 0..batch.num_rows() {
@@ -52,7 +71,7 @@ pub(crate) fn record_batches_to_json_rows(batches: &[RecordBatch]) -> Result<Vec
     Ok(out)
 }
 
-fn array_value(array: &dyn Array, row: usize) -> Result<Value, String> {
+fn array_value(array: &dyn Array, row: usize) -> Result<Value, ArrowOutputError> {
     if array.is_null(row) {
         return Ok(Value::Null);
     }
@@ -88,8 +107,7 @@ fn array_value(array: &dyn Array, row: usize) -> Result<Value, String> {
     if let Some(array) = array.as_any().downcast_ref::<FixedSizeBinaryArray>() {
         return Ok(Value::String(hex(array.value(row))));
     }
-    Err(format!(
-        "unsupported Arrow output column type {:?}",
-        array.data_type()
-    ))
+    Err(ArrowOutputError::UnsupportedColumnType {
+        data_type: format!("{:?}", array.data_type()),
+    })
 }

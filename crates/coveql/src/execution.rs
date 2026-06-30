@@ -10,7 +10,7 @@ use std::{
 
 use arrow_array::{Array, RecordBatch};
 use arrow_data::ArrayData;
-use arrow_schema::DataType;
+use arrow_schema::{ArrowError, DataType};
 use cove_core::{
     profile::cove_o::{
         read_object_surface_from_bytes_with_pushdown_options, reconstruct_object_states,
@@ -775,6 +775,33 @@ impl fmt::Display for BuildExecutionError {
 }
 
 impl Error for BuildExecutionError {}
+
+#[derive(Debug)]
+enum ProjectionArrowPassthroughError {
+    Project(ArrowError),
+}
+
+impl fmt::Display for ProjectionArrowPassthroughError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Project(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl Error for ProjectionArrowPassthroughError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Project(err) => Some(err),
+        }
+    }
+}
+
+impl From<ArrowError> for ProjectionArrowPassthroughError {
+    fn from(err: ArrowError) -> Self {
+        Self::Project(err)
+    }
+}
 
 impl From<LogicalPlanDiagnostic> for ExecutionDiagnostic {
     fn from(diagnostic: LogicalPlanDiagnostic) -> Self {
@@ -2705,7 +2732,7 @@ fn projection_arrow_passthrough_batches(
     planned: &PlannedQuery,
     batches: &[RecordBatch],
     pushed_filters: &[ProjectionFilter],
-) -> Result<Option<Vec<RecordBatch>>, String> {
+) -> Result<Option<Vec<RecordBatch>>, ProjectionArrowPassthroughError> {
     if !projection_arrow_passthrough_shape(planned) {
         return Ok(None);
     }
@@ -2721,7 +2748,7 @@ fn projection_arrow_passthrough_batches(
     if let Some(indices) = final_projection {
         return batches
             .iter()
-            .map(|batch| batch.project(&indices).map_err(|err| err.to_string()))
+            .map(|batch| batch.project(&indices).map_err(Into::into))
             .collect::<Result<Vec<_>, _>>()
             .map(Some);
     }
@@ -6812,7 +6839,7 @@ pub(crate) fn result_json(result: &CoveQlExecutionResult) -> Result<Value, Build
         ),
         CoveQlExecutionResult::ArrowRecordBatches(batches) => Value::Array(
             record_batches_to_json_rows(batches)
-                .map_err(|err| exec_error("E_ARROW_OUTPUT", err, json!({})))?,
+                .map_err(|err| exec_error("E_ARROW_OUTPUT", err.to_string(), json!({})))?,
         ),
         CoveQlExecutionResult::JsonRows(rows) => Value::Array(rows.clone()),
         CoveQlExecutionResult::ExplainJson(value) => value.clone(),

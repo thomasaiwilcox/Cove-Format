@@ -1,5 +1,6 @@
 use std::{
-    fs,
+    error::Error,
+    fmt, fs,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -57,7 +58,40 @@ impl Default for ReverseOptions {
     }
 }
 
-pub fn run(args: Vec<String>) -> Result<(), String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConversionReportError {
+    message: String,
+}
+
+impl ConversionReportError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for ConversionReportError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl Error for ConversionReportError {}
+
+impl From<String> for ConversionReportError {
+    fn from(message: String) -> Self {
+        Self::new(message)
+    }
+}
+
+impl From<&str> for ConversionReportError {
+    fn from(message: &str) -> Self {
+        Self::new(message)
+    }
+}
+
+pub(crate) fn run(args: Vec<String>) -> Result<(), ConversionReportError> {
     let Some(parsed) = parse_args(args)? else {
         print_usage();
         return Ok(());

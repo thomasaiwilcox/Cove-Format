@@ -10,6 +10,7 @@ use crate::explain::{
     execute_planned_scan, parse_filter_dsl, parse_projection_dsl, plan_bytes, plan_local_file,
     ExplainOptions, FilterDsl, FilterOp,
 };
+use crate::DatafusionCliError;
 use arrow_ipc::writer::FileWriter;
 use arrow_json::writer::{LineDelimited, WriterBuilder};
 use arrow_schema::SchemaRef;
@@ -40,7 +41,7 @@ struct DeltaExportOptions {
     plan_json: bool,
 }
 
-pub fn run(args: Vec<String>) -> Result<(), String> {
+pub fn run(args: Vec<String>) -> Result<(), DatafusionCliError> {
     let Some(parsed) = parse_args(args)? else {
         print_usage();
         return Ok(());
@@ -453,7 +454,7 @@ fn direct_projection_decode_stats(rows: usize) -> serde_json::Value {
 pub fn write_ipc(
     schema: &arrow_schema::SchemaRef,
     batches: &[arrow_array::RecordBatch],
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, DatafusionCliError> {
     let mut bytes = Vec::new();
     {
         let mut writer =
@@ -470,7 +471,7 @@ pub fn write_ipc(
     Ok(bytes)
 }
 
-pub fn write_json(batches: &[arrow_array::RecordBatch]) -> Result<Vec<u8>, String> {
+pub fn write_json(batches: &[arrow_array::RecordBatch]) -> Result<Vec<u8>, DatafusionCliError> {
     let mut writer = WriterBuilder::new()
         .with_explicit_nulls(true)
         .build::<_, LineDelimited>(Vec::new());

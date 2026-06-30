@@ -351,7 +351,7 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<(), CliError> {
         Command::Ai { args } => run_ai(args),
         Command::Train { args } => run_train(args),
         Command::InspectDetailed { args } => run_inspect_detailed(args),
-        Command::Dump { args } => cove_dump::run_cli(args),
+        Command::Dump { args } => cove_dump::run_cli(args).map_err(|error| error.to_string()),
         Command::Map { args } => run_map(args),
         Command::Export { format, args } => run_export(format, args),
         Command::Perf { command, args } => run_perf(command, args),
@@ -1281,7 +1281,7 @@ fn run_convert(format: ConvertFormat, args: Vec<String>) -> Result<(), String> {
 }
 
 fn run_validate(args: Vec<String>) -> Result<(), String> {
-    if cove_validate::run_cli(args)? {
+    if cove_validate::run_cli(args).map_err(|error| error.to_string())? {
         Ok(())
     } else {
         Err("validation failed".into())
@@ -1898,7 +1898,8 @@ fn write_ai_export_output(
             let bytes = match format {
                 "arrow" => {
                     let batch = ai_export_record_batch(value)?;
-                    cove_datafusion::arrow_export_cli::write_ipc(&batch.schema(), &[batch])?
+                    cove_datafusion::arrow_export_cli::write_ipc(&batch.schema(), &[batch])
+                        .map_err(|error| error.to_string())?
                 }
                 "parquet" => {
                     let batch = ai_export_record_batch(value)?;
@@ -2808,7 +2809,7 @@ fn cove_vec_quantization_kind(value: &str) -> Result<u8, String> {
 }
 
 fn run_inspect_detailed(args: Vec<String>) -> Result<(), String> {
-    if cove_inspect::run_cli(args)? {
+    if cove_inspect::run_cli(args).map_err(|error| error.to_string())? {
         Ok(())
     } else {
         Err("inspection failed".into())
@@ -2820,7 +2821,9 @@ fn run_export(format: ExportFormat, args: Vec<String>) -> Result<(), String> {
         ExportFormat::Arrow if arrow_export_uses_coveql_query(&args) => {
             run_arrow_query_export(args)
         }
-        ExportFormat::Arrow => cove_datafusion::arrow_export_cli::run(args),
+        ExportFormat::Arrow => {
+            cove_datafusion::arrow_export_cli::run(args).map_err(|error| error.to_string())
+        }
     }
 }
 
@@ -2862,7 +2865,8 @@ fn run_arrow_query_export(args: Vec<String>) -> Result<(), String> {
             &command.input,
             dataset,
             command.delta_request,
-        )?;
+        )
+        .map_err(|error| error.to_string())?;
         let plan_json = cove_datafusion::delta_snapshot::delta_snapshot_plan_json(
             Some(&command.input),
             &snapshot.plan,
@@ -2887,7 +2891,8 @@ fn run_arrow_query_export(args: Vec<String>) -> Result<(), String> {
                 let surface =
                     cove_datafusion::delta_snapshot::read_validated_delta_object_surface(
                         &snapshot,
-                    )?;
+                    )
+                    .map_err(|error| error.to_string())?;
                 delta_execution = Some("direct_object_surface");
                 if command.perf_report {
                     eprintln!("delta_execution=direct_object_surface");
@@ -2931,10 +2936,12 @@ fn run_arrow_query_export(args: Vec<String>) -> Result<(), String> {
         .ok_or_else(|| "CoveQL export produced no Arrow batches".to_string())?;
     let output_bytes = match command.format {
         ArrowQueryExportOutputFormat::Ipc => {
-            cove_datafusion::arrow_export_cli::write_ipc(&schema, &batches)?
+            cove_datafusion::arrow_export_cli::write_ipc(&schema, &batches)
+                .map_err(|error| error.to_string())?
         }
         ArrowQueryExportOutputFormat::Json => {
-            cove_datafusion::arrow_export_cli::write_json(&batches)?
+            cove_datafusion::arrow_export_cli::write_json(&batches)
+                .map_err(|error| error.to_string())?
         }
     };
     cove_core::durable::durable_replace(&command.output, &output_bytes).map_err(|error| {
@@ -3292,7 +3299,8 @@ fn run_map_delta_build(args: Vec<String>) -> Result<(), String> {
     let dataset = dataset.ok_or_else(|| "map delta build requires --dataset <dir>".to_string())?;
     let out_dir = out_dir.ok_or_else(|| "map delta build requires --out-dir <dir>".to_string())?;
     let (_snapshot, materialized) =
-        cove_datafusion::delta_snapshot::materialize_delta_snapshot(&manifest, &dataset, request)?;
+        cove_datafusion::delta_snapshot::materialize_delta_snapshot(&manifest, &dataset, request)
+            .map_err(|error| error.to_string())?;
     let result = cove_map::build_from_cove_o_bytes(
         &format!("{}#delta-snapshot", manifest.display()),
         materialized.bytes,
@@ -3307,7 +3315,8 @@ fn run_map_delta_build(args: Vec<String>) -> Result<(), String> {
             publish_covm,
             reuse_cache: true,
         },
-    )?;
+    )
+    .map_err(|error| error.to_string())?;
     if json {
         print_json_pretty(&result.manifest)?;
     } else {
@@ -3345,9 +3354,11 @@ fn run_map_semantic_delta_build(
         &base_manifest,
         &dataset,
         CovmDeltaPruneRequest::default(),
-    )?;
+    )
+    .map_err(|error| error.to_string())?;
     let parent_surface =
-        cove_datafusion::delta_snapshot::read_validated_delta_object_surface(&snapshot)?;
+        cove_datafusion::delta_snapshot::read_validated_delta_object_surface(&snapshot)
+            .map_err(|error| error.to_string())?;
     let parent_object_states =
         cove_core::profile::cove_o::reconstruct_object_states(&parent_surface, &Default::default())
             .map_err(|error| {
@@ -3387,7 +3398,8 @@ fn run_map_semantic_delta_build(
             commit_time_start_us,
             source_publish_range_us,
         },
-    )?;
+    )
+    .map_err(|error| error.to_string())?;
     if json {
         print_json_pretty(&result.report)?;
     } else {
@@ -3406,13 +3418,17 @@ fn run_map_semantic_delta_build(
 
 fn run_perf(command: PerfCommand, args: Vec<String>) -> Result<(), String> {
     match command {
-        PerfCommand::ExplainPruning => cove_datafusion::explain_pruning_cli::run(args),
-        PerfCommand::PlanCost => cove_datafusion::plan_cost_cli::run(args),
+        PerfCommand::ExplainPruning => {
+            cove_datafusion::explain_pruning_cli::run(args).map_err(|error| error.to_string())
+        }
+        PerfCommand::PlanCost => {
+            cove_datafusion::plan_cost_cli::run(args).map_err(|error| error.to_string())
+        }
     }
 }
 
 fn run_profile(args: Vec<String>) -> Result<(), String> {
-    if cove_core::profile_cli::run(args)? {
+    if cove_core::profile_cli::run(args).map_err(|error| error.to_string())? {
         Ok(())
     } else {
         Err("profile command failed".into())
@@ -3420,7 +3436,7 @@ fn run_profile(args: Vec<String>) -> Result<(), String> {
 }
 
 fn run_canonicalise(args: Vec<String>) -> Result<(), String> {
-    if cove_core::canonicalise_cli::run(args)? {
+    if cove_core::canonicalise_cli::run(args).map_err(|error| error.to_string())? {
         Ok(())
     } else {
         Err("canonicalise command failed".into())
@@ -4460,7 +4476,8 @@ fn run_query(file: Option<&Path>, query: &str, options: QueryCommandOptions) -> 
             manifest,
             dataset,
             options.delta_request,
-        )?;
+        )
+        .map_err(|error| error.to_string())?;
         if options.strict_performance
             && snapshot
                 .plan
@@ -4492,7 +4509,8 @@ fn run_query(file: Option<&Path>, query: &str, options: QueryCommandOptions) -> 
                 delta_direct_surface = Some(
                     cove_datafusion::delta_snapshot::read_validated_delta_object_surface(
                         &snapshot,
-                    )?,
+                    )
+                    .map_err(|error| error.to_string())?,
                 );
                 bytes = snapshot.base.bytes.clone();
             }
@@ -4502,7 +4520,8 @@ fn run_query(file: Option<&Path>, query: &str, options: QueryCommandOptions) -> 
                 let materialized =
                     cove_datafusion::delta_snapshot::materialize_validated_delta_snapshot(
                         &snapshot,
-                    )?;
+                    )
+                    .map_err(|error| error.to_string())?;
                 bytes = materialized.bytes;
             }
         }
@@ -4614,9 +4633,8 @@ fn run_query(file: Option<&Path>, query: &str, options: QueryCommandOptions) -> 
                     ));
                 };
                 let materialized =
-                    cove_datafusion::delta_snapshot::materialize_validated_delta_snapshot(
-                        snapshot,
-                    )?;
+                    cove_datafusion::delta_snapshot::materialize_validated_delta_snapshot(snapshot)
+                        .map_err(|error| error.to_string())?;
                 bytes = materialized.bytes;
                 execute_query_with_cli_fallback(
                     &bytes,
@@ -4638,7 +4656,8 @@ fn run_query(file: Option<&Path>, query: &str, options: QueryCommandOptions) -> 
                 );
             };
             let materialized =
-                cove_datafusion::delta_snapshot::materialize_validated_delta_snapshot(snapshot)?;
+                cove_datafusion::delta_snapshot::materialize_validated_delta_snapshot(snapshot)
+                    .map_err(|error| error.to_string())?;
             bytes = materialized.bytes;
         }
         execute_query_with_cli_fallback(

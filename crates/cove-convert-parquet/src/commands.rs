@@ -155,8 +155,11 @@ pub fn run_csv(args: impl IntoIterator<Item = String>) -> Result<(), ConvertParq
 }
 
 pub fn run_report(args: impl IntoIterator<Item = String>) -> Result<(), ConvertParquetError> {
-    crate::conversion_report::run(args.into_iter().collect())
-        .map_err(|message| ConvertParquetError::Report { message })
+    crate::conversion_report::run(args.into_iter().collect()).map_err(|error| {
+        ConvertParquetError::Report {
+            message: error.to_string(),
+        }
+    })
 }
 
 fn parse_csv_options(args: Vec<String>) -> Result<(CsvReadOptions, Vec<String>), String> {
