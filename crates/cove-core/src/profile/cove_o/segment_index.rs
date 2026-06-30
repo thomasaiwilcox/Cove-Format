@@ -1,4 +1,8 @@
-use crate::{checksum, CoveError};
+use crate::{
+    checksum,
+    wire::{read_i64_le_checked, read_u32_le_checked, read_u64_le_checked},
+    CoveError,
+};
 
 use super::TEMPORAL_SEGMENT_INDEX_ENTRY_LEN;
 
@@ -33,8 +37,8 @@ impl TemporalSegmentIndex {
         if bytes.len() < 8 {
             return Err(CoveError::BufferTooShort);
         }
-        let entry_count = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
-        let flags = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+        let entry_count = read_u32_le_checked(bytes, 0)? as usize;
+        let flags = read_u32_le_checked(bytes, 4)?;
         let needed = 8usize
             .checked_add(
                 entry_count
@@ -87,24 +91,24 @@ impl TemporalSegmentIndexEntryV1 {
         if bytes.len() < TEMPORAL_SEGMENT_INDEX_ENTRY_LEN {
             return Err(CoveError::BufferTooShort);
         }
-        let segment_id = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
-        let object_type_id = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
-        let time_range_start_us = i64::from_le_bytes(bytes[8..16].try_into().unwrap());
-        let time_range_end_us = i64::from_le_bytes(bytes[16..24].try_into().unwrap());
-        let csn_min = u64::from_le_bytes(bytes[24..32].try_into().unwrap());
-        let csn_max = u64::from_le_bytes(bytes[32..40].try_into().unwrap());
-        let row_count = u32::from_le_bytes(bytes[40..44].try_into().unwrap());
-        let delta_count = u32::from_le_bytes(bytes[44..48].try_into().unwrap());
-        let snapshot_count = u32::from_le_bytes(bytes[48..52].try_into().unwrap());
-        let baseline_count = u32::from_le_bytes(bytes[52..56].try_into().unwrap());
-        let tombstone_count = u32::from_le_bytes(bytes[56..60].try_into().unwrap());
+        let segment_id = read_u32_le_checked(bytes, 0)?;
+        let object_type_id = read_u32_le_checked(bytes, 4)?;
+        let time_range_start_us = read_i64_le_checked(bytes, 8)?;
+        let time_range_end_us = read_i64_le_checked(bytes, 16)?;
+        let csn_min = read_u64_le_checked(bytes, 24)?;
+        let csn_max = read_u64_le_checked(bytes, 32)?;
+        let row_count = read_u32_le_checked(bytes, 40)?;
+        let delta_count = read_u32_le_checked(bytes, 44)?;
+        let snapshot_count = read_u32_le_checked(bytes, 48)?;
+        let baseline_count = read_u32_le_checked(bytes, 52)?;
+        let tombstone_count = read_u32_le_checked(bytes, 56)?;
         let mut min_goid = [0u8; 16];
         min_goid.copy_from_slice(&bytes[60..76]);
         let mut max_goid = [0u8; 16];
         max_goid.copy_from_slice(&bytes[76..92]);
-        let offset = u64::from_le_bytes(bytes[92..100].try_into().unwrap());
-        let length = u64::from_le_bytes(bytes[100..108].try_into().unwrap());
-        let checksum_field = u32::from_le_bytes(bytes[108..112].try_into().unwrap());
+        let offset = read_u64_le_checked(bytes, 92)?;
+        let length = read_u64_le_checked(bytes, 100)?;
+        let checksum_field = read_u32_le_checked(bytes, 108)?;
         let mut for_crc = [0u8; TEMPORAL_SEGMENT_INDEX_ENTRY_LEN];
         for_crc.copy_from_slice(&bytes[..TEMPORAL_SEGMENT_INDEX_ENTRY_LEN]);
         for_crc[108..112].fill(0);

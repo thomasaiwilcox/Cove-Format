@@ -8,7 +8,10 @@
 //! value bytes* (Spec §17), not raw FileCodes — this lets the same filter
 //! survive dictionary re-encoding and FileCode reassignment.
 
-use crate::CoveError;
+use crate::{
+    wire::{read_u32_le_checked, read_u64_le_checked},
+    CoveError,
+};
 
 use super::{checked_region, verify_checksum_field};
 
@@ -111,16 +114,16 @@ impl BloomIndexHeaderV1 {
         let hash_domain = BloomHashDomain::from_u8(bytes[9]).ok_or(CoveError::BadIndex)?;
         let algorithm = BloomAlgorithm::from_u8(bytes[10]).ok_or(CoveError::BadIndex)?;
         Ok(Self {
-            table_id: u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
-            column_id: u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+            table_id: read_u32_le_checked(bytes, 0)?,
+            column_id: read_u32_le_checked(bytes, 4)?,
             granularity,
             hash_domain,
             algorithm,
             flags: bytes[11],
-            target_fpr_ppm: u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
-            filter_count: u32::from_le_bytes(bytes[16..20].try_into().unwrap()),
-            data_offset: u64::from_le_bytes(bytes[20..28].try_into().unwrap()),
-            data_length: u64::from_le_bytes(bytes[28..36].try_into().unwrap()),
+            target_fpr_ppm: read_u32_le_checked(bytes, 12)?,
+            filter_count: read_u32_le_checked(bytes, 16)?,
+            data_offset: read_u64_le_checked(bytes, 20)?,
+            data_length: read_u64_le_checked(bytes, 28)?,
             checksum,
         })
     }

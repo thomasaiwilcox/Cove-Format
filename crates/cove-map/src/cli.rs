@@ -149,13 +149,13 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<(), String> {
         }
         Command::Preview { map } => {
             let file = parse_map(&map)?;
-            print_json(&preview(&file));
+            print_json(&preview(&file))?;
         }
         Command::PlanKeys { map, sources } => {
             let file = parse_map(&map)?;
             let inputs = read_source_inputs(&sources)?;
             validate_source_inputs(&file, &inputs.states)?;
-            print_json(&plan_keys(&file, &inputs.rows));
+            print_json(&plan_keys(&file, &inputs.rows))?;
         }
         Command::Candidates {
             map,
@@ -193,7 +193,7 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<(), String> {
                 &output,
                 &ReviewImportOptions { replace },
             )?;
-            print_json(&report);
+            print_json(&report)?;
         }
         Command::AliasesImport {
             map,
@@ -211,7 +211,7 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<(), String> {
                     resolver_id,
                 },
             )?;
-            print_json(&report);
+            print_json(&report)?;
         }
         Command::ReplayVerify { map, report } => {
             let file = parse_map(&map)?;
@@ -219,7 +219,7 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<(), String> {
                 .map_err(|err| format!("cannot read {}: {err}", report.display()))?;
             let report_json: serde_json::Value = serde_json::from_slice(&bytes)
                 .map_err(|err| format!("invalid replay report JSON: {err}"))?;
-            print_json(&verify_replay_report(&file, &report_json)?);
+            print_json(&verify_replay_report(&file, &report_json)?)?;
         }
         Command::Convert {
             map,
@@ -253,12 +253,12 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<(), String> {
         }
         Command::Explain { map, id } => {
             let file = parse_map(&map)?;
-            print_json(&explain(&file, &id)?);
+            print_json(&explain(&file, &id)?)?;
         }
         Command::Diff { left, right } => {
             let left = parse_map(&left)?;
             let right = parse_map(&right)?;
-            print_json(&diff_maps(&left, &right));
+            print_json(&diff_maps(&left, &right))?;
         }
         Command::Project {
             map,
@@ -323,7 +323,7 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<(), String> {
                 },
             )?;
             if json {
-                print_json(&result.manifest);
+                print_json(&result.manifest)?;
             } else {
                 print_build_summary(&result.manifest);
             }
@@ -336,7 +336,7 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<(), String> {
         } => {
             let report = publish_covm_from_bundle(&bundle_dir, &output, force)?;
             if json {
-                print_json(&report);
+                print_json(&report)?;
             } else {
                 println!("COVE-MAP publish: wrote {}", output.display());
             }
@@ -364,7 +364,7 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<(), String> {
                 }
             };
             if json {
-                print_json(&report);
+                print_json(&report)?;
             } else {
                 print_doctor_summary(&report);
             }
@@ -388,7 +388,7 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<(), String> {
         } => {
             let report = parity_from_paths(&map, &sources, &options)?;
             if json {
-                print_json(&report);
+                print_json(&report)?;
             } else {
                 print_parity_summary(&report);
             }
@@ -403,7 +403,7 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<(), String> {
         } => {
             let report = parity_from_cove_o_path(&object, &options)?;
             if json {
-                print_json(&report);
+                print_json(&report)?;
             } else {
                 print_parity_summary(&report);
             }
@@ -484,44 +484,32 @@ pub(crate) fn parse_args(
             right: one_path(&mut args, "diff <left.covemap> <right.covemap>")?,
         },
         "project" => {
-            let (output, format, projection_id, positional) =
-                parse_output_format_projection_and_positionals(args)?;
-            let mut positional = positional.into_iter();
+            let project = parse_project_args(args)?;
+            let mut positional = project.positional.into_iter();
             let map = positional
                 .next()
                 .ok_or_else(|| "project requires <mapping.covemap>".to_string())?;
             Command::Project {
                 map,
                 sources: positional.collect(),
-                output,
-                format: project_format(format)?,
-                projection_id,
+                output: project.output,
+                format: project_format(project.format)?,
+                projection_id: project.projection_id,
             }
         }
         "project-cove-o" => {
-            let (object, mapping, output, format, projection_id) = parse_project_cove_o_args(args)?;
+            let project = parse_project_cove_o_args(args)?;
             Command::ProjectCoveO {
-                object,
-                mapping,
-                output,
-                format,
-                projection_id,
+                object: project.object,
+                mapping: project.mapping,
+                output: project.output,
+                format: project.format,
+                projection_id: project.projection_id,
             }
         }
         "build" => {
-            let (
-                out_dir,
-                force,
-                json,
-                object_name,
-                projection_output,
-                evidence_encoding,
-                section_compression,
-                verify,
-                publish_covm,
-                positional,
-            ) = parse_build_args(args)?;
-            let mut positional = positional.into_iter();
+            let build = parse_build_args(args)?;
+            let mut positional = build.positional.into_iter();
             let map = positional
                 .next()
                 .ok_or_else(|| "build requires <mapping.covemap>".to_string())?;
@@ -532,15 +520,15 @@ pub(crate) fn parse_args(
             Command::Build {
                 map,
                 sources,
-                out_dir,
-                force,
-                json,
-                object_name,
-                projection_output,
-                evidence_encoding,
-                section_compression,
-                verify,
-                publish_covm,
+                out_dir: build.out_dir,
+                force: build.force,
+                json: build.json,
+                object_name: build.object_name,
+                projection_output: build.projection_output,
+                evidence_encoding: build.evidence_encoding,
+                section_compression: build.section_compression,
+                verify: build.verify,
+                publish_covm: build.publish_covm,
             }
         }
         "publish" => {
@@ -553,19 +541,19 @@ pub(crate) fn parse_args(
             }
         }
         "doctor" => {
-            let (bundle_dir, json, strict, positional) = parse_doctor_args(args)?;
-            let mut positional = positional.into_iter();
+            let doctor = parse_doctor_args(args)?;
+            let mut positional = doctor.positional.into_iter();
             let map = positional.next();
             let sources = positional.collect::<Vec<_>>();
-            if bundle_dir.is_none() && map.is_some() && sources.is_empty() {
+            if doctor.bundle_dir.is_none() && map.is_some() && sources.is_empty() {
                 return Err("doctor with a mapping requires at least one source path".into());
             }
             Command::Doctor {
-                bundle_dir,
+                bundle_dir: doctor.bundle_dir,
                 map,
                 sources,
-                json,
-                strict,
+                json: doctor.json,
+                strict: doctor.strict,
             }
         }
         "suggest" => {
@@ -580,8 +568,8 @@ pub(crate) fn parse_args(
             }
         }
         "parity" => {
-            let (json, options, positional) = parse_parity_args(args)?;
-            let mut positional = positional.into_iter();
+            let parity = parse_parity_args(args)?;
+            let mut positional = parity.positional.into_iter();
             let map = positional
                 .next()
                 .ok_or_else(|| "parity requires <mapping.covemap>".to_string())?;
@@ -592,19 +580,19 @@ pub(crate) fn parse_args(
             Command::Parity {
                 map,
                 sources,
-                options,
-                json,
+                options: parity.options,
+                json: parity.json,
             }
         }
         "parity-cove-o" => {
-            let (json, options, positional) = parse_parity_args(args)?;
-            if positional.len() != 1 {
+            let parity = parse_parity_args(args)?;
+            if parity.positional.len() != 1 {
                 return Err("parity-cove-o requires exactly one <object.cove>".into());
             }
             Command::ParityCoveO {
-                object: positional[0].clone(),
-                options,
-                json,
+                object: parity.positional[0].clone(),
+                options: parity.options,
+                json: parity.json,
             }
         }
         "test" => Command::Test {
@@ -835,24 +823,20 @@ fn parse_output_format_and_positionals(
     Ok((output, format, positional))
 }
 
-#[allow(clippy::type_complexity)]
-fn parse_build_args(
-    args: impl Iterator<Item = String>,
-) -> Result<
-    (
-        PathBuf,
-        bool,
-        bool,
-        Option<String>,
-        MapBuildProjectionOutput,
-        MapEvidenceEncoding,
-        MapBuildSectionCompression,
-        bool,
-        bool,
-        Vec<PathBuf>,
-    ),
-    String,
-> {
+struct BuildArgs {
+    out_dir: PathBuf,
+    force: bool,
+    json: bool,
+    object_name: Option<String>,
+    projection_output: MapBuildProjectionOutput,
+    evidence_encoding: MapEvidenceEncoding,
+    section_compression: MapBuildSectionCompression,
+    verify: bool,
+    publish_covm: bool,
+    positional: Vec<PathBuf>,
+}
+
+fn parse_build_args(args: impl Iterator<Item = String>) -> Result<BuildArgs, String> {
     let mut out_dir = None;
     let mut force = false;
     let mut json = false;
@@ -921,7 +905,7 @@ fn parse_build_args(
         }
     }
     let out_dir = out_dir.ok_or_else(|| "build requires --out-dir <dir>".to_string())?;
-    Ok((
+    Ok(BuildArgs {
         out_dir,
         force,
         json,
@@ -932,7 +916,7 @@ fn parse_build_args(
         verify,
         publish_covm,
         positional,
-    ))
+    })
 }
 
 fn parse_publish_args(
@@ -976,10 +960,14 @@ fn parse_publish_args(
     Ok((bundle_dir, output, force, json))
 }
 
-#[allow(clippy::type_complexity)]
-fn parse_doctor_args(
-    args: impl Iterator<Item = String>,
-) -> Result<(Option<PathBuf>, bool, bool, Vec<PathBuf>), String> {
+struct DoctorArgs {
+    bundle_dir: Option<PathBuf>,
+    json: bool,
+    strict: bool,
+    positional: Vec<PathBuf>,
+}
+
+fn parse_doctor_args(args: impl Iterator<Item = String>) -> Result<DoctorArgs, String> {
     let mut bundle_dir = None;
     let mut json = false;
     let mut strict = false;
@@ -1003,7 +991,12 @@ fn parse_doctor_args(
     if bundle_dir.is_some() && !positional.is_empty() {
         return Err("doctor accepts either --bundle-dir or positional mapping inputs".into());
     }
-    Ok((bundle_dir, json, strict, positional))
+    Ok(DoctorArgs {
+        bundle_dir,
+        json,
+        strict,
+        positional,
+    })
 }
 
 fn parse_suggest_args(
@@ -1030,10 +1023,13 @@ fn parse_suggest_args(
     Ok((json, output, sources))
 }
 
-#[allow(clippy::type_complexity)]
-fn parse_parity_args(
-    args: impl Iterator<Item = String>,
-) -> Result<(bool, ParityOptions, Vec<PathBuf>), String> {
+struct ParityArgs {
+    json: bool,
+    options: ParityOptions,
+    positional: Vec<PathBuf>,
+}
+
+fn parse_parity_args(args: impl Iterator<Item = String>) -> Result<ParityArgs, String> {
     let mut json = false;
     let mut projection_id = None;
     let mut expected = None;
@@ -1077,9 +1073,9 @@ fn parse_parity_args(
             _ => positional.push(PathBuf::from(arg)),
         }
     }
-    Ok((
+    Ok(ParityArgs {
         json,
-        ParityOptions {
+        options: ParityOptions {
             projection_id: projection_id
                 .ok_or_else(|| "parity requires --projection-id <id>".to_string())?,
             expected: expected.ok_or_else(|| "parity requires --expected <table>".to_string())?,
@@ -1087,22 +1083,20 @@ fn parse_parity_args(
             key,
         },
         positional,
-    ))
+    })
 }
 
-#[allow(clippy::type_complexity)]
+struct ProjectCoveOArgs {
+    object: PathBuf,
+    mapping: Option<PathBuf>,
+    output: Option<PathBuf>,
+    format: ProjectionFormat,
+    projection_id: Option<String>,
+}
+
 fn parse_project_cove_o_args(
     args: impl Iterator<Item = String>,
-) -> Result<
-    (
-        PathBuf,
-        Option<PathBuf>,
-        Option<PathBuf>,
-        ProjectionFormat,
-        Option<String>,
-    ),
-    String,
-> {
+) -> Result<ProjectCoveOArgs, String> {
     let mut output = None;
     let mut mapping = None;
     let mut format = ProjectionFormat::Json;
@@ -1148,13 +1142,23 @@ fn parse_project_cove_o_args(
     if positional.len() != 1 {
         return Err("project-cove-o requires exactly one <object.cove>".into());
     }
-    Ok((positional.remove(0), mapping, output, format, projection_id))
+    Ok(ProjectCoveOArgs {
+        object: positional.remove(0),
+        mapping,
+        output,
+        format,
+        projection_id,
+    })
 }
 
-#[allow(clippy::type_complexity)]
-fn parse_output_format_projection_and_positionals(
-    args: impl Iterator<Item = String>,
-) -> Result<(Option<PathBuf>, OutputFormat, Option<String>, Vec<PathBuf>), String> {
+struct ProjectArgs {
+    output: Option<PathBuf>,
+    format: OutputFormat,
+    projection_id: Option<String>,
+    positional: Vec<PathBuf>,
+}
+
+fn parse_project_args(args: impl Iterator<Item = String>) -> Result<ProjectArgs, String> {
     let mut output = None;
     let mut format = OutputFormat::Json;
     let mut projection_id = None;
@@ -1190,7 +1194,12 @@ fn parse_output_format_projection_and_positionals(
             positional.push(PathBuf::from(arg));
         }
     }
-    Ok((output, format, projection_id, positional))
+    Ok(ProjectArgs {
+        output,
+        format,
+        projection_id,
+        positional,
+    })
 }
 
 fn project_format(format: OutputFormat) -> Result<ProjectionFormat, String> {

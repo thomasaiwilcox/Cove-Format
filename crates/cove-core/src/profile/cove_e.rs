@@ -5,7 +5,11 @@
 //! only the on-disk descriptor contracts; whether an unknown or corrupt
 //! engine profile is fatal is operation-scoped and decided by the reader.
 
-use crate::{checksum, CoveError};
+use crate::{
+    checksum,
+    wire::{read_u16_le_checked, read_u32_le_checked, read_u64_le_checked},
+    CoveError,
+};
 
 pub const EXECUTION_CODE_DESCRIPTOR_LEN: usize = 28;
 pub const ENGINE_MOUNT_POLICY_LEN: usize = 32;
@@ -38,8 +42,8 @@ impl EngineProfileRegistry {
         if bytes.len() < 8 {
             return Err(CoveError::BufferTooShort);
         }
-        let profile_count = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
-        let flags = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+        let profile_count = read_u32_le_checked(bytes, 0)? as usize;
+        let flags = read_u32_le_checked(bytes, 4)?;
         let mut pos = 8usize;
         let mut profiles = Vec::with_capacity(profile_count);
         for _ in 0..profile_count {
@@ -79,29 +83,29 @@ impl EngineProfileEntryV1 {
         if bytes.len() < 4 + 2 {
             return Err(CoveError::BufferTooShort);
         }
-        let profile_id = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        let profile_id = read_u32_le_checked(bytes, 0)?;
         let mut pos = 4usize;
         let namespace = read_str(bytes, &mut pos, "engine profile namespace")?;
         let profile_name = read_str(bytes, &mut pos, "engine profile name")?;
         if bytes.len() < pos + 2 + 2 + 8 + 8 + 4 + 4 + 4 + 4 {
             return Err(CoveError::BufferTooShort);
         }
-        let version_major = u16::from_le_bytes(bytes[pos..pos + 2].try_into().unwrap());
+        let version_major = read_u16_le_checked(bytes, pos)?;
         pos += 2;
-        let version_minor = u16::from_le_bytes(bytes[pos..pos + 2].try_into().unwrap());
+        let version_minor = read_u16_le_checked(bytes, pos)?;
         pos += 2;
-        let required_features = u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap());
+        let required_features = read_u64_le_checked(bytes, pos)?;
         pos += 8;
-        let optional_features = u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap());
+        let optional_features = read_u64_le_checked(bytes, pos)?;
         pos += 8;
-        let execution_descriptor_ref = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+        let execution_descriptor_ref = read_u32_le_checked(bytes, pos)?;
         pos += 4;
-        let mount_policy_ref = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+        let mount_policy_ref = read_u32_le_checked(bytes, pos)?;
         pos += 4;
-        let private_payload_ref = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+        let private_payload_ref = read_u32_le_checked(bytes, pos)?;
         pos += 4;
         let checksum_pos = pos;
-        let checksum_field = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+        let checksum_field = read_u32_le_checked(bytes, pos)?;
         pos += 4;
 
         let mut for_crc = bytes[..pos].to_vec();
@@ -289,9 +293,9 @@ impl ExecutionCodeDescriptorV1 {
         if bytes.len() < EXECUTION_CODE_DESCRIPTOR_LEN {
             return Err(CoveError::BufferTooShort);
         }
-        let descriptor_id = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        let descriptor_id = read_u32_le_checked(bytes, 0)?;
         let code_kind = ExecutionCodeKind::from_u8(bytes[4]).ok_or(CoveError::BadEngineProfile)?;
-        let code_width_bits = u16::from_le_bytes(bytes[5..7].try_into().unwrap());
+        let code_width_bits = read_u16_le_checked(bytes, 5)?;
         let byte_order = bytes[7];
         let lifetime =
             ExecutionCodeLifetime::from_u8(bytes[8]).ok_or(CoveError::BadEngineProfile)?;
@@ -301,10 +305,10 @@ impl ExecutionCodeDescriptorV1 {
             ExecutionCodeCanonicality::from_u8(bytes[10]).ok_or(CoveError::BadEngineProfile)?;
         let null_code_policy =
             NullCodePolicy::from_u8(bytes[11]).ok_or(CoveError::BadEngineProfile)?;
-        let flags = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
-        let scope_ref = u32::from_le_bytes(bytes[16..20].try_into().unwrap());
-        let code_space_ref = u32::from_le_bytes(bytes[20..24].try_into().unwrap());
-        let checksum_field = u32::from_le_bytes(bytes[24..28].try_into().unwrap());
+        let flags = read_u32_le_checked(bytes, 12)?;
+        let scope_ref = read_u32_le_checked(bytes, 16)?;
+        let code_space_ref = read_u32_le_checked(bytes, 20)?;
+        let checksum_field = read_u32_le_checked(bytes, 24)?;
         let mut for_crc = [0u8; EXECUTION_CODE_DESCRIPTOR_LEN];
         for_crc.copy_from_slice(&bytes[..EXECUTION_CODE_DESCRIPTOR_LEN]);
         for_crc[24..28].fill(0);
@@ -393,18 +397,18 @@ impl ExecutionScopeDescriptorV1 {
         if bytes.len() < 4 + 2 + 2 + 2 {
             return Err(CoveError::BufferTooShort);
         }
-        let scope_id = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
-        let raw_scope_kind = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
+        let scope_id = read_u32_le_checked(bytes, 0)?;
+        let raw_scope_kind = read_u16_le_checked(bytes, 4)?;
         let scope_kind =
             ExecutionScopeKind::from_u16(raw_scope_kind).ok_or(CoveError::BadEngineProfile)?;
-        let flags = u16::from_le_bytes(bytes[6..8].try_into().unwrap());
+        let flags = read_u16_le_checked(bytes, 6)?;
         let mut pos = 8usize;
         let stable_id = read_bytes(bytes, &mut pos)?;
         let display_name = read_str(bytes, &mut pos, "execution scope display name")?;
         if bytes.len() < pos + 4 {
             return Err(CoveError::BufferTooShort);
         }
-        let private_payload_ref = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+        let private_payload_ref = read_u32_le_checked(bytes, pos)?;
         Ok(Self {
             scope_id,
             scope_kind,
@@ -442,18 +446,18 @@ impl CodeSpaceDescriptorV1 {
         if bytes.len() < 4 + 2 {
             return Err(CoveError::BufferTooShort);
         }
-        let code_space_id = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        let code_space_id = read_u32_le_checked(bytes, 0)?;
         let mut pos = 4usize;
         let namespace = read_str(bytes, &mut pos, "code-space namespace")?;
         let stable_id = read_bytes(bytes, &mut pos)?;
         if bytes.len() < pos + 8 + 4 + 4 {
             return Err(CoveError::BufferTooShort);
         }
-        let epoch = u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap());
+        let epoch = read_u64_le_checked(bytes, pos)?;
         pos += 8;
-        let flags = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+        let flags = read_u32_le_checked(bytes, pos)?;
         pos += 4;
-        let private_payload_ref = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+        let private_payload_ref = read_u32_le_checked(bytes, pos)?;
         Ok(Self {
             code_space_id,
             namespace,
@@ -584,7 +588,7 @@ impl EngineMountPolicyV1 {
         if bytes.len() < ENGINE_MOUNT_POLICY_LEN {
             return Err(CoveError::BufferTooShort);
         }
-        let policy_id = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        let policy_id = read_u32_le_checked(bytes, 0)?;
         let filecode_mapping_kind =
             FileCodeMappingKind::from_u8(bytes[4]).ok_or(CoveError::BadEngineProfile)?;
         let missing_value_policy =
@@ -593,12 +597,12 @@ impl EngineMountPolicyV1 {
             StaleMappingPolicy::from_u8(bytes[6]).ok_or(CoveError::BadEngineProfile)?;
         let reverse_lookup_policy =
             ReverseLookupPolicy::from_u8(bytes[7]).ok_or(CoveError::BadEngineProfile)?;
-        let flags = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
-        let dictionary_digest_ref = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
-        let code_space_ref = u32::from_le_bytes(bytes[16..20].try_into().unwrap());
-        let cache_key_ref = u32::from_le_bytes(bytes[20..24].try_into().unwrap());
-        let private_payload_ref = u32::from_le_bytes(bytes[24..28].try_into().unwrap());
-        let checksum_field = u32::from_le_bytes(bytes[28..32].try_into().unwrap());
+        let flags = read_u32_le_checked(bytes, 8)?;
+        let dictionary_digest_ref = read_u32_le_checked(bytes, 12)?;
+        let code_space_ref = read_u32_le_checked(bytes, 16)?;
+        let cache_key_ref = read_u32_le_checked(bytes, 20)?;
+        let private_payload_ref = read_u32_le_checked(bytes, 24)?;
+        let checksum_field = read_u32_le_checked(bytes, 28)?;
         let mut for_crc = [0u8; ENGINE_MOUNT_POLICY_LEN];
         for_crc.copy_from_slice(&bytes[..ENGINE_MOUNT_POLICY_LEN]);
         for_crc[28..32].fill(0);
@@ -647,10 +651,11 @@ fn read_str(bytes: &[u8], pos: &mut usize, what: &str) -> Result<String, CoveErr
 }
 
 fn read_bytes(bytes: &[u8], pos: &mut usize) -> Result<Vec<u8>, CoveError> {
-    if *pos + 2 > bytes.len() {
+    let len_end = pos.checked_add(2).ok_or(CoveError::ArithOverflow)?;
+    if len_end > bytes.len() {
         return Err(CoveError::BufferTooShort);
     }
-    let len = u16::from_le_bytes(bytes[*pos..*pos + 2].try_into().unwrap()) as usize;
+    let len = read_u16_le_checked(bytes, *pos)? as usize;
     *pos += 2;
     let end = pos.checked_add(len).ok_or(CoveError::ArithOverflow)?;
     if end > bytes.len() {

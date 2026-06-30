@@ -27,6 +27,7 @@
 
 use crate::checksum;
 use crate::error::CoveError;
+use crate::wire::{read_u16_le_checked, read_u32_le_checked, read_u64_le_checked};
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -84,15 +85,15 @@ impl ColumnDomainHeaderV1 {
             return Err(CoveError::BufferTooShort);
         }
         let bytes = &bytes[..COLUMN_DOMAIN_HEADER_LEN];
-        let table_or_object_id = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
-        let column_or_property_id = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
-        let logical_type = u16::from_le_bytes(bytes[8..10].try_into().unwrap());
-        let collation_id = u16::from_le_bytes(bytes[10..12].try_into().unwrap());
-        let domain_count = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
-        let sorted_file_codes_offset = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
-        let file_code_to_rank_offset = u64::from_le_bytes(bytes[24..32].try_into().unwrap());
-        let flags = u32::from_le_bytes(bytes[32..36].try_into().unwrap());
-        let checksum_field = u32::from_le_bytes(bytes[36..40].try_into().unwrap());
+        let table_or_object_id = read_u32_le_checked(bytes, 0)?;
+        let column_or_property_id = read_u32_le_checked(bytes, 4)?;
+        let logical_type = read_u16_le_checked(bytes, 8)?;
+        let collation_id = read_u16_le_checked(bytes, 10)?;
+        let domain_count = read_u32_le_checked(bytes, 12)?;
+        let sorted_file_codes_offset = read_u64_le_checked(bytes, 16)?;
+        let file_code_to_rank_offset = read_u64_le_checked(bytes, 24)?;
+        let flags = read_u32_le_checked(bytes, 32)?;
+        let checksum_field = read_u32_le_checked(bytes, 36)?;
 
         let mut for_crc = [0u8; COLUMN_DOMAIN_HEADER_LEN];
         for_crc.copy_from_slice(bytes);
@@ -152,7 +153,7 @@ impl ColumnDomain {
         let mut sorted_file_codes = Vec::with_capacity(header.domain_count as usize);
         for i in 0..header.domain_count as usize {
             let off = sfc_off + i * 4;
-            sorted_file_codes.push(u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap()));
+            sorted_file_codes.push(read_u32_le_checked(bytes, off)?);
         }
         // Logical sort order depends on the dictionary and collation, so the
         // structural parser can only reject duplicate FileCodes here.
@@ -179,9 +180,7 @@ impl ColumnDomain {
         let mut file_code_to_rank = Vec::with_capacity(rank_count);
         for i in 0..rank_count {
             let off = i * 4;
-            file_code_to_rank.push(u32::from_le_bytes(
-                rank_region[off..off + 4].try_into().unwrap(),
-            ));
+            file_code_to_rank.push(read_u32_le_checked(rank_region, off)?);
         }
 
         Ok(Self {

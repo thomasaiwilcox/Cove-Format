@@ -1170,7 +1170,7 @@ fn integer_literal_value(value: i128) -> ResolvedLiteralValue {
 }
 
 fn decode_hex_bytes(value: &str) -> Option<Vec<u8>> {
-    if value.len() % 2 != 0 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if !value.len().is_multiple_of(2) || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return None;
     }
     let mut out = Vec::with_capacity(value.len() / 2);
@@ -1198,8 +1198,12 @@ fn parse_uuid_literal(value: &str) -> Option<([u8; 16], String)> {
     if compact.len() != 32 {
         return None;
     }
-    let bytes = decode_hex_bytes(&compact)?;
-    let bytes: [u8; 16] = bytes.try_into().ok()?;
+    let decoded = decode_hex_bytes(&compact)?;
+    if decoded.len() != 16 {
+        return None;
+    }
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&decoded);
     Some((bytes, compact))
 }
 
@@ -2367,7 +2371,13 @@ impl Resolver {
         args: &[AstProfileArgument],
         root: &ResolvedRoot,
     ) -> Result<ResolvedAiOperation, BuildResolvedQueryError> {
-        let operation = ai_operation_for_method(name).expect("guarded by caller");
+        let Some(operation) = ai_operation_for_method(name) else {
+            return Err(profile_rejection(
+                "E_UNSUPPORTED_PROFILE_METHOD",
+                format!("unsupported CoveQL/AI method {name}"),
+                &self.options,
+            ));
+        };
         let mut resolved_args = Vec::with_capacity(args.len());
         for arg in args {
             let value = match &arg.value {
@@ -2406,7 +2416,13 @@ impl Resolver {
                 &self.options,
             ));
         }
-        let kind = graph_algorithm_kind(name).expect("guarded by caller");
+        let Some(kind) = graph_algorithm_kind(name) else {
+            return Err(profile_rejection(
+                "E_UNSUPPORTED_PROFILE_METHOD",
+                format!("unsupported CoveQL/Graph algorithm {name}"),
+                &self.options,
+            ));
+        };
         let mut relationship = None;
         let mut direction = AstAssociationDirection::Out;
         let mut weight = None;
@@ -2799,6 +2815,7 @@ impl Resolver {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn resolve_graph_traversal_expr(
         &self,
         relationship: &AstRelationshipExpr,
@@ -4810,15 +4827,9 @@ impl Resolver {
     ) -> Result<ResolvedEvidenceRoot, BuildResolvedQueryError> {
         let target = match &evidence.target {
             Some(target) => Some(self.resolve_evidence_target(target, contextual_root)?),
-            None => {
-                if let Some(root) = contextual_root {
-                    Some(contextual_evidence_target(root))
-                } else {
-                    None
-                }
-            }
+            None => contextual_root.map(contextual_evidence_target),
         };
-        let grain = evidence.grain.unwrap_or_else(|| match target {
+        let grain = evidence.grain.unwrap_or(match target {
             Some(ResolvedEvidenceTarget::AssociationType { .. }) => AstEvidenceGrain::Association,
             Some(ResolvedEvidenceTarget::Projection { .. }) => AstEvidenceGrain::Row,
             Some(ResolvedEvidenceTarget::TableRow { .. }) => AstEvidenceGrain::Row,

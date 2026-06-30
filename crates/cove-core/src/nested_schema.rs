@@ -12,6 +12,7 @@ use crate::{
     constants::{CoveLogicalType, CovePhysicalKind},
     table::{ColumnEntry, TableCatalog},
     types::{validate_logical_physical_pair_with_options, LogicalPhysicalOptions},
+    wire::{read_i16_le_checked, read_u16_le_checked, read_u32_le_checked},
     CoveError,
 };
 
@@ -75,30 +76,30 @@ impl NestedSchemaSectionV1 {
         if bytes[0..4] != NESTED_SCHEMA_MAGIC {
             return Err(CoveError::BadMagic);
         }
-        let version = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
+        let version = read_u16_le_checked(bytes, 4)?;
         if version != NESTED_SCHEMA_VERSION {
             return Err(CoveError::BadVersion);
         }
-        let header_len = u16::from_le_bytes(bytes[6..8].try_into().unwrap()) as usize;
+        let header_len = read_u16_le_checked(bytes, 6)? as usize;
         if header_len != NESTED_SCHEMA_HEADER_LEN {
             return Err(CoveError::BadSection(format!(
                 "NestedSchema header_len must be {NESTED_SCHEMA_HEADER_LEN}, got {header_len}"
             )));
         }
-        let entry_count = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
-        let reserved = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
+        let entry_count = read_u32_le_checked(bytes, 8)? as usize;
+        let reserved = read_u32_le_checked(bytes, 12)?;
         if reserved != 0 {
             return Err(CoveError::ReservedNotZero);
         }
         let mut pos = header_len;
         let mut entries = Vec::with_capacity(entry_count);
         for _ in 0..entry_count {
-            if bytes.len() < pos + 8 {
+            if pos.checked_add(8).ok_or(CoveError::ArithOverflow)? > bytes.len() {
                 return Err(CoveError::BufferTooShort);
             }
-            let table_id = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+            let table_id = read_u32_le_checked(bytes, pos)?;
             pos += 4;
-            let column_id = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+            let column_id = read_u32_le_checked(bytes, pos)?;
             pos += 4;
             let root = NestedSchemaNodeV1::read_from(bytes, &mut pos)?;
             entries.push(NestedSchemaEntryV1 {
@@ -229,10 +230,10 @@ impl NestedSchemaNodeV1 {
     }
 
     fn read_from(bytes: &[u8], pos: &mut usize) -> Result<Self, CoveError> {
-        if bytes.len() < *pos + 2 {
+        if pos.checked_add(2).ok_or(CoveError::ArithOverflow)? > bytes.len() {
             return Err(CoveError::BufferTooShort);
         }
-        let name_len = u16::from_le_bytes(bytes[*pos..*pos + 2].try_into().unwrap()) as usize;
+        let name_len = read_u16_le_checked(bytes, *pos)? as usize;
         *pos += 2;
         let name_end = (*pos)
             .checked_add(name_len)
@@ -244,10 +245,14 @@ impl NestedSchemaNodeV1 {
             .map_err(|_| CoveError::BadSchema("nested schema name is not valid UTF-8".into()))?
             .to_string();
         *pos = name_end;
-        if bytes.len() < *pos + 2 + 1 + 1 + 2 + 2 + 2 + 2 + 4 + 4 {
+        if pos
+            .checked_add(2 + 1 + 1 + 2 + 2 + 2 + 2 + 4 + 4)
+            .ok_or(CoveError::ArithOverflow)?
+            > bytes.len()
+        {
             return Err(CoveError::BufferTooShort);
         }
-        let logical_raw = u16::from_le_bytes(bytes[*pos..*pos + 2].try_into().unwrap());
+        let logical_raw = read_u16_le_checked(bytes, *pos)?;
         *pos += 2;
         let physical_raw = bytes[*pos];
         *pos += 1;
@@ -261,17 +266,17 @@ impl NestedSchemaNodeV1 {
             }
         };
         *pos += 1;
-        let precision = u16::from_le_bytes(bytes[*pos..*pos + 2].try_into().unwrap());
+        let precision = read_u16_le_checked(bytes, *pos)?;
         *pos += 2;
-        let scale = i16::from_le_bytes(bytes[*pos..*pos + 2].try_into().unwrap());
+        let scale = read_i16_le_checked(bytes, *pos)?;
         *pos += 2;
-        let collation_id = u16::from_le_bytes(bytes[*pos..*pos + 2].try_into().unwrap());
+        let collation_id = read_u16_le_checked(bytes, *pos)?;
         *pos += 2;
-        let child_count = u16::from_le_bytes(bytes[*pos..*pos + 2].try_into().unwrap()) as usize;
+        let child_count = read_u16_le_checked(bytes, *pos)? as usize;
         *pos += 2;
-        let flags = u32::from_le_bytes(bytes[*pos..*pos + 4].try_into().unwrap());
+        let flags = read_u32_le_checked(bytes, *pos)?;
         *pos += 4;
-        let fixed_size_list_len = u32::from_le_bytes(bytes[*pos..*pos + 4].try_into().unwrap());
+        let fixed_size_list_len = read_u32_le_checked(bytes, *pos)?;
         *pos += 4;
         let logical = CoveLogicalType::from_u16(logical_raw).ok_or_else(|| {
             CoveError::BadSchema(format!("unknown nested logical type {logical_raw}"))

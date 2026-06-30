@@ -1,9 +1,3 @@
-#![allow(
-    clippy::field_reassign_with_default,
-    clippy::too_many_arguments,
-    clippy::unnecessary_lazy_evaluations
-)]
-
 use super::materialize::{
     encoded_array_for_page, materialize_page_payload, materialize_page_payload_from_wire,
 };
@@ -25,8 +19,10 @@ fn try_apply_native_table_page_predicate_to_selection(
     selected: &mut SelectionMask,
     stats: &mut DecodeStats,
 ) -> Result<Option<()>, CoveError> {
-    let mut domain = NativeCodeDomain::default();
-    domain.table_id = Some(segment_ref.table_id);
+    let domain = NativeCodeDomain {
+        table_id: Some(segment_ref.table_id),
+        ..NativeCodeDomain::default()
+    };
     let lane =
         native_lane_from_column_page_payload(segment_column.directory(), page, payload, domain)?;
     stats.native_table_batches += 1;
@@ -59,7 +55,7 @@ fn apply_overlay_to_rows(
         let row = selected_rows[read];
         let absolute = morsel_row_start
             .checked_add(u64::from(row))
-            .ok_or_else(|| CoveError::ArithOverflow)?;
+            .ok_or(CoveError::ArithOverflow)?;
         if visibility.is_row_visible(absolute, state.table().row_count)? {
             selected_rows[write] = row;
             write += 1;
@@ -123,7 +119,7 @@ fn apply_covi_candidates_to_selection(
     let mut candidate_rows = Vec::new();
     let morsel_end = morsel_row_start
         .checked_add(u64::from(row_count))
-        .ok_or_else(|| CoveError::ArithOverflow)?;
+        .ok_or(CoveError::ArithOverflow)?;
     for candidate in candidates {
         if candidate.segment_id != segment_id || candidate.morsel_id != morsel_id {
             continue;
@@ -131,7 +127,7 @@ fn apply_covi_candidates_to_selection(
         let candidate_end = candidate
             .row_start
             .checked_add(candidate.row_count)
-            .ok_or_else(|| CoveError::ArithOverflow)?;
+            .ok_or(CoveError::ArithOverflow)?;
         let start = candidate.row_start.max(morsel_row_start);
         let end = candidate_end.min(morsel_end);
         if start >= end {
@@ -142,7 +138,7 @@ fn apply_covi_candidates_to_selection(
                 u32::try_from(
                     absolute
                         .checked_sub(morsel_row_start)
-                        .ok_or_else(|| CoveError::ArithOverflow)?,
+                        .ok_or(CoveError::ArithOverflow)?,
                 )
                 .map_err(|_| CoveError::ArithOverflow)?,
             );
@@ -174,6 +170,7 @@ fn apply_covi_candidates_to_selection(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn selected_rows_for_morsel(
     state: &DatasetState,
     segment_bytes: &[u8],
@@ -199,7 +196,7 @@ pub(super) fn selected_rows_for_morsel(
             segment_ref
                 .row_start
                 .checked_add(u64::from(morsel.first_row_in_segment))
-                .ok_or_else(|| CoveError::ArithOverflow)?,
+                .ok_or(CoveError::ArithOverflow)?,
             morsel.row_count,
             scratch,
             stats,
@@ -235,7 +232,7 @@ pub(super) fn selected_rows_for_morsel(
             segment_ref
                 .row_start
                 .checked_add(u64::from(morsel.first_row_in_segment))
-                .ok_or_else(|| CoveError::ArithOverflow)?,
+                .ok_or(CoveError::ArithOverflow)?,
             morsel.row_count,
             scratch,
             stats,
@@ -309,7 +306,7 @@ pub(super) fn selected_rows_for_morsel(
         stats.data_bytes_read = stats
             .data_bytes_read
             .checked_add(usize::try_from(page.page_length).map_err(|_| CoveError::OffsetRange)?)
-            .ok_or_else(|| CoveError::ArithOverflow)?;
+            .ok_or(CoveError::ArithOverflow)?;
         let applied = match try_apply_native_table_page_predicate_to_selection(
             predicate,
             segment_ref,
@@ -372,6 +369,7 @@ pub(super) fn selected_rows_for_morsel(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn selected_rows_for_morsel_metadata<R: CoveRangeReader + ?Sized>(
     state: &DatasetState,
     segment: &SegmentMetadata,
@@ -396,7 +394,7 @@ pub(super) async fn selected_rows_for_morsel_metadata<R: CoveRangeReader + ?Size
             segment_ref
                 .row_start
                 .checked_add(u64::from(morsel.first_row_in_segment))
-                .ok_or_else(|| CoveError::ArithOverflow)?,
+                .ok_or(CoveError::ArithOverflow)?,
             morsel.row_count,
             scratch,
             stats,
@@ -432,7 +430,7 @@ pub(super) async fn selected_rows_for_morsel_metadata<R: CoveRangeReader + ?Size
             segment_ref
                 .row_start
                 .checked_add(u64::from(morsel.first_row_in_segment))
-                .ok_or_else(|| CoveError::ArithOverflow)?,
+                .ok_or(CoveError::ArithOverflow)?,
             morsel.row_count,
             scratch,
             stats,
@@ -581,10 +579,10 @@ async fn read_page_wire<R: CoveRangeReader + ?Sized>(
     let start = segment_ref
         .offset
         .checked_add(page.page_offset)
-        .ok_or_else(|| CoveError::ArithOverflow)?;
+        .ok_or(CoveError::ArithOverflow)?;
     let end = start
         .checked_add(page.page_length)
-        .ok_or_else(|| CoveError::ArithOverflow)?;
+        .ok_or(CoveError::ArithOverflow)?;
     let ranges = std::iter::once(start..end).collect::<Vec<_>>();
     let hints = vec![state.range_cluster_hint(segment_ref.segment_id, page.morsel_id, start, end)];
     let coalesced_plan =
@@ -595,11 +593,11 @@ async fn read_page_wire<R: CoveRangeReader + ?Sized>(
     stats.range_bytes_requested = stats
         .range_bytes_requested
         .checked_add(range_stats.coalesced_bytes)
-        .ok_or_else(|| CoveError::ArithOverflow)?;
+        .ok_or(CoveError::ArithOverflow)?;
     stats.range_bytes_used = stats
         .range_bytes_used
         .checked_add(range_stats.original_bytes)
-        .ok_or_else(|| CoveError::ArithOverflow)?;
+        .ok_or(CoveError::ArithOverflow)?;
     if range_stats.coalesced_ranges < range_stats.original_ranges {
         stats.coalesced_range_requests += range_stats.coalesced_ranges;
     }
@@ -607,7 +605,7 @@ async fn read_page_wire<R: CoveRangeReader + ?Sized>(
     stats.data_bytes_read = stats
         .data_bytes_read
         .checked_add(wires.iter().map(RetainedBytes::len).sum::<usize>())
-        .ok_or_else(|| CoveError::ArithOverflow)?;
+        .ok_or(CoveError::ArithOverflow)?;
     Ok(wires.pop())
 }
 

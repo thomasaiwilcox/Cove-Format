@@ -924,7 +924,7 @@ fn run_inspect(path: &Path, json_out: bool) -> Result<(), String> {
     let object_validation = file.validate_object_delta();
     let value = covedelta_json(path, &file, object_validation.as_ref().ok());
     if json_out {
-        println!("{}", serde_json::to_string_pretty(&value).unwrap());
+        print_json_value(&value)?;
         return Ok(());
     }
 
@@ -1004,7 +1004,7 @@ fn run_validate(path: &Path, object_delta: bool, json_out: bool) -> Result<(), S
         Ok(bytes) => bytes,
         Err(error) => {
             if json_out {
-                print_validation_json(path, false, None, &format!("io: {error}"));
+                print_validation_json(path, false, None, &format!("io: {error}"))?;
                 return Err("validation failed".into());
             }
             return Err(format!("cannot read {}: {error}", path.display()));
@@ -1030,7 +1030,7 @@ fn run_validate(path: &Path, object_delta: bool, json_out: bool) -> Result<(), S
                     "section_count": file.sections.len(),
                     "parent_ref_count": file.parent_refs.len(),
                 });
-                println!("{}", serde_json::to_string_pretty(&value).unwrap());
+                print_json_value(&value)?;
             } else {
                 let mode = if object_delta {
                     "object-delta"
@@ -1043,7 +1043,7 @@ fn run_validate(path: &Path, object_delta: bool, json_out: bool) -> Result<(), S
         }
         Err(error) => {
             if json_out {
-                print_validation_json(path, false, error.spec_code(), &error.to_string());
+                print_validation_json(path, false, error.spec_code(), &error.to_string())?;
             } else {
                 eprintln!("{}: INVALID", path.display());
                 eprintln!("  [ERR] {error}");
@@ -1053,7 +1053,12 @@ fn run_validate(path: &Path, object_delta: bool, json_out: bool) -> Result<(), S
     }
 }
 
-fn print_validation_json(path: &Path, ok: bool, code: Option<&str>, error: &str) {
+fn print_validation_json(
+    path: &Path,
+    ok: bool,
+    code: Option<&str>,
+    error: &str,
+) -> Result<(), String> {
     let mut value = json!({
         "path": path.display().to_string(),
         "ok": ok,
@@ -1063,7 +1068,7 @@ fn print_validation_json(path: &Path, ok: bool, code: Option<&str>, error: &str)
     if let Some(code) = code {
         value["error_code"] = json!(code);
     }
-    println!("{}", serde_json::to_string_pretty(&value).unwrap());
+    print_json_value(&value)
 }
 
 fn run_dump(path: &Path, selector: DumpSelector, max_bytes: usize) -> Result<(), String> {
@@ -1122,7 +1127,7 @@ fn run_dump(path: &Path, selector: DumpSelector, max_bytes: usize) -> Result<(),
                 "evidence_patches": validation.evidence_patches.len(),
                 "projection_patches": validation.projection_patches.len(),
             });
-            println!("{}", serde_json::to_string_pretty(&value).unwrap());
+            print_json_value(&value)?;
         }
     }
     Ok(())
@@ -1156,7 +1161,7 @@ fn run_chain_inspect(command: ChainInspectCommand) -> Result<(), String> {
         } else {
             value["delta_chain"] = Value::Null;
         }
-        println!("{}", serde_json::to_string_pretty(&value).unwrap());
+        print_json_value(&value)?;
         return Ok(());
     }
 
@@ -1218,7 +1223,7 @@ fn run_chain_validate(command: ChainValidateCommand) -> Result<(), String> {
             "summary": summary.is_some(),
             "result_snapshot_id": hex16(&extension.result_snapshot_id),
         });
-        println!("{}", serde_json::to_string_pretty(&value).unwrap());
+        print_json_value(&value)?;
     } else {
         println!("Delta chain OK: {}", command.manifest.display());
         println!("  base: {}", base.path.display());
@@ -1278,7 +1283,7 @@ fn run_chain_plan(command: ChainPlanCommand) -> Result<(), String> {
             "metrics": read_amplification_json(metrics),
             "recommendations": recommendations.iter().map(|item| recommendation_name(*item)).collect::<Vec<_>>(),
         });
-        println!("{}", serde_json::to_string_pretty(&value).unwrap());
+        print_json_value(&value)?;
         return Ok(());
     }
     println!("Delta chain plan: {}", command.manifest.display());
@@ -1345,7 +1350,7 @@ fn run_chain_graph(command: ChainGraphCommand) -> Result<(), String> {
                     artifact_graph_json(&names, reference)
                 }).collect::<Vec<_>>(),
             });
-            println!("{}", serde_json::to_string_pretty(&value).unwrap());
+            print_json_value(&value)?;
         }
         GraphFormat::Dot => {
             println!("digraph cove_delta_chain {{");
@@ -1437,7 +1442,7 @@ fn run_reconstruct(command: ReconstructCommand) -> Result<(), String> {
             "state_count": materialized.state_count,
             "passthrough_base": materialized.passthrough_base,
         });
-        println!("{}", serde_json::to_string_pretty(&value).unwrap());
+        print_json_value(&value)?;
     } else {
         println!("Reconstructed delta snapshot: {}", command.out.display());
         println!("  manifest: {}", command.manifest.display());
@@ -1502,7 +1507,7 @@ fn run_compact(command: CompactCommand) -> Result<(), String> {
             "state_count": materialized.state_count,
             "passthrough_base": materialized.passthrough_base,
         });
-        println!("{}", serde_json::to_string_pretty(&value).unwrap());
+        print_json_value(&value)?;
     } else {
         println!("Compacted delta snapshot: {}", command.out.display());
         println!("  manifest: {}", command.manifest.display());
@@ -1562,7 +1567,7 @@ fn run_checkpoint(command: CheckpointCommand) -> Result<(), String> {
             "chain_ordinal": checkpoint_file.header.chain_ordinal,
             "bytes_written": checkpoint_bytes.len(),
         });
-        println!("{}", serde_json::to_string_pretty(&value).unwrap());
+        print_json_value(&value)?;
     } else {
         println!("Created checkpoint delta: {}", command.out.display());
         println!("  manifest: {}", command.manifest.display());
@@ -1684,7 +1689,7 @@ fn run_publish(command: PublishCommand) -> Result<(), String> {
             "chain_digest": hex_encode(&extension.chain_digest),
             "inline_summary": summary_bytes.is_some(),
         });
-        println!("{}", serde_json::to_string_pretty(&value).unwrap());
+        print_json_value(&value)?;
     } else {
         println!("Published delta manifest: {}", command.out.display());
         println!("  base: {}", command.base.display());
@@ -1711,7 +1716,7 @@ fn run_publish_atomic(delta: &Path, manifest: &Path, json_out: bool) -> Result<(
             "manifest": manifest.display().to_string(),
             "publish_order": ["delta", "manifest"],
         });
-        println!("{}", serde_json::to_string_pretty(&value).unwrap());
+        print_json_value(&value)?;
     } else {
         println!("Published delta then manifest:");
         println!("  delta: {}", delta.display());
@@ -2149,19 +2154,27 @@ fn covm_delta_extension_encoded_len(bytes: &[u8]) -> Result<usize, String> {
 }
 
 fn read_u16_at(bytes: &[u8], offset: usize) -> Result<u16, String> {
-    let end = offset + 2;
+    let end = offset
+        .checked_add(2)
+        .ok_or_else(|| "COVM delta-chain extension header is truncated".to_string())?;
     if end > bytes.len() {
         return Err("COVM delta-chain extension header is truncated".into());
     }
-    Ok(u16::from_le_bytes(bytes[offset..end].try_into().unwrap()))
+    let mut value = [0u8; 2];
+    value.copy_from_slice(&bytes[offset..end]);
+    Ok(u16::from_le_bytes(value))
 }
 
 fn read_u32_at(bytes: &[u8], offset: usize) -> Result<u32, String> {
-    let end = offset + 4;
+    let end = offset
+        .checked_add(4)
+        .ok_or_else(|| "COVM delta-chain extension header is truncated".to_string())?;
     if end > bytes.len() {
         return Err("COVM delta-chain extension header is truncated".into());
     }
-    Ok(u32::from_le_bytes(bytes[offset..end].try_into().unwrap()))
+    let mut value = [0u8; 4];
+    value.copy_from_slice(&bytes[offset..end]);
+    Ok(u32::from_le_bytes(value))
 }
 
 fn load_selected_artifacts(
@@ -2969,6 +2982,15 @@ fn dot_node_id(bytes: &[u8; 16]) -> String {
 
 fn dot_escape(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn print_json_value(value: &Value) -> Result<(), String> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(value)
+            .map_err(|error| format!("cannot serialize JSON output: {error}"))?
+    );
+    Ok(())
 }
 
 fn read_file(path: &Path) -> Result<Vec<u8>, String> {

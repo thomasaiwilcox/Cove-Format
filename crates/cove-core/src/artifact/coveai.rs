@@ -3356,7 +3356,12 @@ impl TokenBlockHeaderV1 {
                 self.token_block_id, self.payload_ref
             )));
         }
-        let payload_ref = tables.payload_ref(self.payload_ref).unwrap();
+        let payload_ref = tables.payload_ref(self.payload_ref).ok_or_else(|| {
+            CoveError::BadSection(format!(
+                "TokenBlockHeader {} references missing payload_ref {}",
+                self.token_block_id, self.payload_ref
+            ))
+        })?;
         payload_ref.validate_token_or_vector_payload_carrier(sections)?;
         validate_cached_payload_range(
             "TokenBlockHeader",
@@ -3384,7 +3389,12 @@ impl TokenBlockHeaderV1 {
                     self.token_block_id, self.integrity_ref
                 )));
             }
-            let integrity = tables.integrity_ref(self.integrity_ref).unwrap();
+            let integrity = tables.integrity_ref(self.integrity_ref).ok_or_else(|| {
+                CoveError::BadSection(format!(
+                    "TokenBlockHeader {} references missing integrity_ref {}",
+                    self.token_block_id, self.integrity_ref
+                ))
+            })?;
             if integrity.payload_ref != self.payload_ref {
                 return Err(CoveError::BadSection(format!(
                     "TokenBlockHeader {} integrity_ref payload_ref mismatch",
@@ -3471,7 +3481,12 @@ impl TokenizedSpanV1 {
             .token_blocks
             .iter()
             .find(|block| block.token_block_id == self.token_block_ref)
-            .unwrap();
+            .ok_or_else(|| {
+                CoveError::BadSection(format!(
+                    "TokenizedSpan {} references missing token_block_ref {}",
+                    self.tokenized_span_id, self.token_block_ref
+                ))
+            })?;
         validate_token_range(
             "TokenizedSpan",
             self.tokenized_span_id,
@@ -3604,7 +3619,12 @@ impl TokenSequencePackV1 {
             .token_blocks
             .iter()
             .find(|block| block.token_block_id == self.token_block_ref)
-            .unwrap();
+            .ok_or_else(|| {
+                CoveError::BadSection(format!(
+                    "TokenSequencePack {} references missing token_block_ref {}",
+                    self.sequence_pack_id, self.token_block_ref
+                ))
+            })?;
         validate_token_range(
             "TokenSequencePack",
             self.sequence_pack_id,
@@ -3631,7 +3651,12 @@ impl TokenSequencePackV1 {
             if payload_ref == 0 {
                 continue;
             }
-            let payload = tables.payload_ref(payload_ref).unwrap();
+            let payload = tables.payload_ref(payload_ref).ok_or_else(|| {
+                CoveError::BadSection(format!(
+                    "TokenSequencePack {} references missing {label} {}",
+                    self.sequence_pack_id, payload_ref
+                ))
+            })?;
             let expected_min_len = u64::from(self.token_count)
                 .checked_mul(width)
                 .ok_or(CoveError::ArithOverflow)?;
@@ -5889,7 +5914,12 @@ impl VectorPayloadBlockHeaderV1 {
                 self.block_id, self.device_transfer_hint_ref
             )));
         }
-        let payload_ref = tables.payload_ref(self.payload_ref).unwrap();
+        let payload_ref = tables.payload_ref(self.payload_ref).ok_or_else(|| {
+            CoveError::BadSection(format!(
+                "VectorPayloadBlock {} references missing payload_ref {}",
+                self.block_id, self.payload_ref
+            ))
+        })?;
         payload_ref.validate_token_or_vector_payload_carrier(sections)?;
         validate_cached_payload_range(
             "VectorPayloadBlock",
@@ -5905,7 +5935,12 @@ impl VectorPayloadBlockHeaderV1 {
                     self.block_id, self.integrity_ref
                 )));
             }
-            let integrity = tables.integrity_ref(self.integrity_ref).unwrap();
+            let integrity = tables.integrity_ref(self.integrity_ref).ok_or_else(|| {
+                CoveError::BadSection(format!(
+                    "VectorPayloadBlock {} references missing integrity_ref {}",
+                    self.block_id, self.integrity_ref
+                ))
+            })?;
             if integrity.payload_ref != self.payload_ref {
                 return Err(CoveError::BadSection(format!(
                     "VectorPayloadBlock {} integrity_ref payload_ref mismatch",
@@ -5947,7 +5982,12 @@ impl VectorEntryV1 {
                 self.vector_ref, self.block_id
             )));
         }
-        let block = tables.vector_block(self.block_id).unwrap();
+        let block = tables.vector_block(self.block_id).ok_or_else(|| {
+            CoveError::BadSection(format!(
+                "VectorEntry {} references missing block_id {}",
+                self.vector_ref, self.block_id
+            ))
+        })?;
         if self.vector_ordinal >= block.vector_count {
             return Err(CoveError::BadSection(format!(
                 "VectorEntry {} vector_ordinal exceeds block vector_count",
@@ -6882,7 +6922,7 @@ fn ai_tensor_i64_vector_payload(
     }
     let mut values = Vec::with_capacity(expected_len);
     for chunk in lease.bytes.chunks_exact(8) {
-        values.push(i64::from_le_bytes(chunk.try_into().unwrap()));
+        values.push(read_i64(chunk, 0)?);
     }
     Ok(values)
 }
@@ -8533,8 +8573,7 @@ fn covev_stored_vector_payload(
     let values = source_f32_payload
         .chunks_exact(4)
         .map(|chunk| {
-            let value =
-                f32::from_le_bytes(chunk.try_into().map_err(|_| CoveError::BufferTooShort)?);
+            let value = f32::from_bits(read_u32(chunk, 0)?);
             if !value.is_finite() {
                 return Err(CoveError::BadSection(
                     "COVE-VEC build source payload contains non-finite Float32 values".into(),
@@ -8803,22 +8842,18 @@ fn decode_dense_vector_as_f32(
     match vector_space.element_type {
         0 => {
             for chunk in vector_bytes.chunks_exact(4) {
-                values.push(f32::from_le_bytes(
-                    chunk.try_into().map_err(|_| CoveError::BufferTooShort)?,
-                ));
+                values.push(f32::from_bits(read_u32(chunk, 0)?));
             }
         }
         1 => {
             for chunk in vector_bytes.chunks_exact(2) {
-                let bits =
-                    u16::from_le_bytes(chunk.try_into().map_err(|_| CoveError::BufferTooShort)?);
+                let bits = read_u16(chunk, 0)?;
                 values.push(f16_to_f32(bits));
             }
         }
         2 => {
             for chunk in vector_bytes.chunks_exact(2) {
-                let bits =
-                    u16::from_le_bytes(chunk.try_into().map_err(|_| CoveError::BufferTooShort)?);
+                let bits = read_u16(chunk, 0)?;
                 values.push(f32::from_bits(u32::from(bits) << 16));
             }
         }
@@ -8826,8 +8861,7 @@ fn decode_dense_vector_as_f32(
         4 => values.extend(vector_bytes.iter().map(|value| f32::from(*value))),
         6 => {
             for chunk in vector_bytes.chunks_exact(8) {
-                let value =
-                    f64::from_le_bytes(chunk.try_into().map_err(|_| CoveError::BufferTooShort)?);
+                let value = f64::from_bits(read_u64(chunk, 0)?);
                 if !value.is_finite() || value > f64::from(f32::MAX) || value < f64::from(f32::MIN)
                 {
                     return Err(CoveError::BadSection(format!(
@@ -8981,7 +9015,7 @@ fn exact_flat_vector_entry_f32(
     let vector_bytes = checked_slice(block_payload, entry_offset, entry_length)?;
     let mut values = Vec::with_capacity(vector_space.dimension_count as usize);
     for chunk in vector_bytes.chunks_exact(4) {
-        let value = f32::from_le_bytes(chunk.try_into().map_err(|_| CoveError::BufferTooShort)?);
+        let value = f32::from_bits(read_u32(chunk, 0)?);
         if !value.is_finite() {
             return Err(CoveError::BadSection(format!(
                 "VectorEntry {} contains non-finite Float32 values",
@@ -13118,31 +13152,41 @@ fn read_u8(bytes: &[u8], offset: usize) -> Result<u8, CoveError> {
 fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, CoveError> {
     let end = offset.checked_add(2).ok_or(CoveError::ArithOverflow)?;
     let slice = bytes.get(offset..end).ok_or(CoveError::BufferTooShort)?;
-    Ok(u16::from_le_bytes(slice.try_into().unwrap()))
+    let mut out = [0u8; 2];
+    out.copy_from_slice(slice);
+    Ok(u16::from_le_bytes(out))
 }
 
 fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, CoveError> {
     let end = offset.checked_add(4).ok_or(CoveError::ArithOverflow)?;
     let slice = bytes.get(offset..end).ok_or(CoveError::BufferTooShort)?;
-    Ok(u32::from_le_bytes(slice.try_into().unwrap()))
+    let mut out = [0u8; 4];
+    out.copy_from_slice(slice);
+    Ok(u32::from_le_bytes(out))
 }
 
 fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, CoveError> {
     let end = offset.checked_add(8).ok_or(CoveError::ArithOverflow)?;
     let slice = bytes.get(offset..end).ok_or(CoveError::BufferTooShort)?;
-    Ok(u64::from_le_bytes(slice.try_into().unwrap()))
+    let mut out = [0u8; 8];
+    out.copy_from_slice(slice);
+    Ok(u64::from_le_bytes(out))
 }
 
 fn read_i64(bytes: &[u8], offset: usize) -> Result<i64, CoveError> {
     let end = offset.checked_add(8).ok_or(CoveError::ArithOverflow)?;
     let slice = bytes.get(offset..end).ok_or(CoveError::BufferTooShort)?;
-    Ok(i64::from_le_bytes(slice.try_into().unwrap()))
+    let mut out = [0u8; 8];
+    out.copy_from_slice(slice);
+    Ok(i64::from_le_bytes(out))
 }
 
 fn read_array<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N], CoveError> {
     let end = offset.checked_add(N).ok_or(CoveError::ArithOverflow)?;
     let slice = bytes.get(offset..end).ok_or(CoveError::BufferTooShort)?;
-    Ok(slice.try_into().unwrap())
+    let mut out = [0u8; N];
+    out.copy_from_slice(slice);
+    Ok(out)
 }
 
 fn put_u8(bytes: &mut [u8], offset: usize, value: u8) {

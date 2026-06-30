@@ -6,7 +6,7 @@
 //! (e.g. BitPacked) in real cascades; this module handles only the FoR
 //! transform so cascades can be composed without coupling.
 
-use crate::CoveError;
+use crate::{wire, CoveError};
 
 use super::Encoding;
 
@@ -21,16 +21,19 @@ impl ForPayload {
         if bytes.len() < 12 {
             return Err(CoveError::BufferTooShort);
         }
-        let reference = i64::from_le_bytes(bytes[0..8].try_into().unwrap());
-        let n = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
-        let need = 12 + n * 8;
+        let reference = wire::read_i64_le_checked(bytes, 0)?;
+        let n = wire::read_u32_le_checked(bytes, 8)? as usize;
+        let need = n
+            .checked_mul(8)
+            .and_then(|bytes| bytes.checked_add(12))
+            .ok_or(CoveError::ArithOverflow)?;
         if bytes.len() < need {
             return Err(CoveError::BufferTooShort);
         }
         let mut offsets = Vec::with_capacity(n);
         for i in 0..n {
             let off = 12 + i * 8;
-            offsets.push(i64::from_le_bytes(bytes[off..off + 8].try_into().unwrap()));
+            offsets.push(wire::read_i64_le_checked(bytes, off)?);
         }
         Ok(Self { reference, offsets })
     }

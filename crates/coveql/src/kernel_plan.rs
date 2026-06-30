@@ -318,7 +318,7 @@ pub(crate) fn compile_kernel_shape(
                 .method_chain
                 .select
                 .as_ref()
-                .map_or(true, |select| {
+                .is_none_or(|select| {
                     select
                         .iter()
                         .all(|item| native_projection_expr_is_exact(&item.expr))
@@ -420,7 +420,7 @@ pub(crate) fn diagnostic_kernel_shape_for_plan(
             .method_chain
             .select
             .as_ref()
-            .map_or(true, |select| {
+            .is_none_or(|select| {
                 select
                     .iter()
                     .all(|item| native_projection_expr_is_exact(&item.expr))
@@ -1151,7 +1151,7 @@ pub(crate) fn native_temporal_direct_projection_shape(planned: &crate::PlannedQu
         .method_chain
         .select
         .as_ref()
-        .map_or(true, |select| {
+        .is_none_or(|select| {
             select
                 .iter()
                 .all(|item| native_projection_expr_is_exact(&item.expr))
@@ -1200,7 +1200,7 @@ pub(crate) fn native_role_bound_direct_projection_shape(planned: &crate::Planned
         .method_chain
         .select
         .as_ref()
-        .map_or(true, |select| {
+        .is_none_or(|select| {
             select
                 .iter()
                 .all(|item| native_projection_expr_is_exact(&item.expr))
@@ -1250,7 +1250,7 @@ pub(crate) fn native_helper_exists_direct_projection_shape(planned: &crate::Plan
         .method_chain
         .select
         .as_ref()
-        .map_or(true, |select| {
+        .is_none_or(|select| {
             select
                 .iter()
                 .all(|item| native_projection_expr_is_exact(&item.expr))
@@ -1308,7 +1308,7 @@ pub(crate) fn native_evidence_exists_direct_projection_candidate_shape(
         .method_chain
         .select
         .as_ref()
-        .map_or(true, |select| {
+        .is_none_or(|select| {
             select
                 .iter()
                 .all(|item| native_projection_expr_is_exact(&item.expr))
@@ -1364,7 +1364,7 @@ pub(crate) fn native_projection_root_scan_shape(planned: &crate::PlannedQuery) -
         .method_chain
         .select
         .as_ref()
-        .map_or(true, |select| {
+        .is_none_or(|select| {
             select
                 .iter()
                 .all(|item| projection_root_expr_is_provider_exact(&item.expr))
@@ -1387,7 +1387,6 @@ fn projection_root_pagination_has_exact_declared_ordering(planned: &crate::Plann
     }
     contract.ordering.iter().all(|ordering| {
         let column = ordering
-            .trim()
             .split_whitespace()
             .next()
             .unwrap_or(ordering.as_str())
@@ -1471,7 +1470,7 @@ fn native_direct_root_scan_common(
         .method_chain
         .select
         .as_ref()
-        .map_or(true, |select| {
+        .is_none_or(|select| {
             select
                 .iter()
                 .all(|item| native_projection_expr_is_exact(&item.expr))
@@ -1678,9 +1677,7 @@ fn projection_root_predicate_is_exact(predicate: &ResolvedPredicate) -> bool {
                 return false;
             };
             projection_root_path_is_exact_for_compare(path, crate::AstCompareOp::Eq)
-                && values
-                    .iter()
-                    .all(|literal| projection_root_literal_is_filterable(literal))
+                && values.iter().all(projection_root_literal_is_filterable)
         }
         ResolvedPredicate::NullCheck { expr, .. } => {
             matches!(

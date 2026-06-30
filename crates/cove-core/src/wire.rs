@@ -90,6 +90,52 @@ pub fn read_u8_checked(bytes: &[u8], offset: usize) -> Result<u8, CoveError> {
     read_range_checked(bytes, offset, 1).map(|slice| slice[0])
 }
 
+/// Reads a fixed-size byte array at an offset.
+pub fn read_array_checked<const N: usize>(
+    bytes: &[u8],
+    offset: usize,
+) -> Result<[u8; N], CoveError> {
+    let raw = read_range_checked(bytes, offset, N)?;
+    let mut out = [0u8; N];
+    out.copy_from_slice(raw);
+    Ok(out)
+}
+
+/// Reads a little-endian `u16` at an offset.
+pub fn read_u16_le_checked(bytes: &[u8], offset: usize) -> Result<u16, CoveError> {
+    Ok(u16::from_le_bytes(read_array_checked(bytes, offset)?))
+}
+
+/// Reads a little-endian `i16` at an offset.
+pub fn read_i16_le_checked(bytes: &[u8], offset: usize) -> Result<i16, CoveError> {
+    Ok(i16::from_le_bytes(read_array_checked(bytes, offset)?))
+}
+
+/// Reads a little-endian `i32` at an offset.
+pub fn read_i32_le_checked(bytes: &[u8], offset: usize) -> Result<i32, CoveError> {
+    Ok(i32::from_le_bytes(read_array_checked(bytes, offset)?))
+}
+
+/// Reads a little-endian `u32` at an offset.
+pub fn read_u32_le_checked(bytes: &[u8], offset: usize) -> Result<u32, CoveError> {
+    Ok(u32::from_le_bytes(read_array_checked(bytes, offset)?))
+}
+
+/// Reads a little-endian `u64` at an offset.
+pub fn read_u64_le_checked(bytes: &[u8], offset: usize) -> Result<u64, CoveError> {
+    Ok(u64::from_le_bytes(read_array_checked(bytes, offset)?))
+}
+
+/// Reads a little-endian `i64` at an offset.
+pub fn read_i64_le_checked(bytes: &[u8], offset: usize) -> Result<i64, CoveError> {
+    Ok(i64::from_le_bytes(read_array_checked(bytes, offset)?))
+}
+
+/// Reads a little-endian `i128` at an offset.
+pub fn read_i128_le_checked(bytes: &[u8], offset: usize) -> Result<i128, CoveError> {
+    Ok(i128::from_le_bytes(read_array_checked(bytes, offset)?))
+}
+
 /// Parses a strict boolean byte where only `0` and `1` are valid.
 pub fn parse_bool_strict(byte: u8) -> Result<bool, CoveError> {
     match byte {

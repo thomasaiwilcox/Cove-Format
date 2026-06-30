@@ -3,7 +3,11 @@
 //! Maps each FileCode in the indexed scope to one or more row references.
 //! Used for primary-key style lookups and join build sides.
 
-use crate::{row_ref::RowRef, CoveError};
+use crate::{
+    row_ref::RowRef,
+    wire::{read_u32_le_checked, read_u64_le_checked},
+    CoveError,
+};
 
 use super::{checked_region, verify_checksum_field};
 
@@ -114,17 +118,17 @@ impl LookupIndexHeaderV1 {
         let bytes = &bytes[..LOOKUP_INDEX_HEADER_LEN];
         let checksum = verify_checksum_field(bytes, 52)?;
         Ok(Self {
-            table_id: u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
-            column_id: u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+            table_id: read_u32_le_checked(bytes, 0)?,
+            column_id: read_u32_le_checked(bytes, 4)?,
             key_kind: LookupKeyKind::from_u8(bytes[8]).ok_or(CoveError::BadIndex)?,
             index_kind: LookupIndexKind::from_u8(bytes[9]).ok_or(CoveError::BadIndex)?,
             uniqueness: LookupUniqueness::from_u8(bytes[10]).ok_or(CoveError::BadIndex)?,
             flags: bytes[11],
-            entry_count: u64::from_le_bytes(bytes[12..20].try_into().unwrap()),
-            entries_offset: u64::from_le_bytes(bytes[20..28].try_into().unwrap()),
-            entries_length: u64::from_le_bytes(bytes[28..36].try_into().unwrap()),
-            rowref_offset: u64::from_le_bytes(bytes[36..44].try_into().unwrap()),
-            rowref_length: u64::from_le_bytes(bytes[44..52].try_into().unwrap()),
+            entry_count: read_u64_le_checked(bytes, 12)?,
+            entries_offset: read_u64_le_checked(bytes, 20)?,
+            entries_length: read_u64_le_checked(bytes, 28)?,
+            rowref_offset: read_u64_le_checked(bytes, 36)?,
+            rowref_length: read_u64_le_checked(bytes, 44)?,
             checksum,
         })
     }
@@ -160,15 +164,15 @@ impl LookupIndex {
         let mut entries = Vec::with_capacity(header.entry_count as usize);
         let mut previous_key = None;
         for chunk in entries_bytes.chunks_exact(LOOKUP_INDEX_ENTRY_LEN) {
-            let key = u64::from_le_bytes(chunk[0..8].try_into().unwrap());
+            let key = read_u64_le_checked(chunk, 0)?;
             if let Some(previous) = previous_key {
                 if key <= previous {
                     return Err(CoveError::BadIndex);
                 }
             }
             previous_key = Some(key);
-            let rowref_start = u32::from_le_bytes(chunk[8..12].try_into().unwrap()) as usize;
-            let rowref_count = u32::from_le_bytes(chunk[12..16].try_into().unwrap()) as usize;
+            let rowref_start = read_u32_le_checked(chunk, 8)? as usize;
+            let rowref_count = read_u32_le_checked(chunk, 12)? as usize;
             let start = rowref_start
                 .checked_mul(RowRef::ENCODED_LEN)
                 .ok_or(CoveError::ArithOverflow)?;

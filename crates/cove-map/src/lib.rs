@@ -3754,7 +3754,8 @@ mod tests {
     use parquet::arrow::ArrowWriter;
 
     fn test_section(kind: SectionKind, value: Value) -> CovemapSection {
-        let payload = serde_json::to_vec_pretty(&covemap_payload_value(kind, value)).unwrap();
+        let payload = serde_json::to_vec_pretty(&covemap_payload_value(kind, value))
+            .expect("serializing serde_json::Value cannot fail");
         CovemapSection {
             entry: CovemapSectionEntryV1 {
                 section_id: kind as u32,
@@ -3774,7 +3775,8 @@ mod tests {
     fn mutate_section_payload(file: &mut CovemapFile, index: usize, edit: impl FnOnce(&mut Value)) {
         let mut payload: Value = serde_json::from_slice(&file.sections[index].payload).unwrap();
         edit(&mut payload);
-        let bytes = serde_json::to_vec_pretty(&payload).unwrap();
+        let bytes =
+            serde_json::to_vec_pretty(&payload).expect("serializing serde_json::Value cannot fail");
         file.sections[index].entry.length = bytes.len() as u64;
         file.sections[index].entry.uncompressed_length = bytes.len() as u64;
         file.sections[index].payload = bytes;
@@ -4233,7 +4235,7 @@ mod tests {
             Value::Bool(false) => out.extend_from_slice(b"false"),
             Value::Number(number) => out.extend_from_slice(number.to_string().as_bytes()),
             Value::String(value) => {
-                out.extend_from_slice(serde_json::to_string(value).unwrap().as_bytes());
+                out.extend_from_slice(Value::String(value.clone()).to_string().as_bytes());
             }
             Value::Array(values) => {
                 out.push(b'[');
@@ -4256,7 +4258,7 @@ mod tests {
                     if index > 0 {
                         out.push(b',');
                     }
-                    out.extend_from_slice(serde_json::to_string(key).unwrap().as_bytes());
+                    out.extend_from_slice(Value::String((*key).clone()).to_string().as_bytes());
                     out.push(b':');
                     write_test_canonical_json(object.get(*key).unwrap(), out);
                 }
@@ -9803,7 +9805,8 @@ uk-company:acme,Acme,Acme Holdings,curated,authoritative,{}
     #[test]
     fn build_cove_o_emits_valid_object_temporal_file() {
         fn section(kind: SectionKind, value: Value) -> CovemapSection {
-            let payload = serde_json::to_vec_pretty(&covemap_payload_value(kind, value)).unwrap();
+            let payload = serde_json::to_vec_pretty(&covemap_payload_value(kind, value))
+                .expect("serializing serde_json::Value cannot fail");
             CovemapSection {
                 entry: CovemapSectionEntryV1 {
                     section_id: kind as u32,

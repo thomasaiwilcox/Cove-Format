@@ -1,7 +1,5 @@
 //! DataFusion 53.x bounded file sink for direct COVE-T writes.
 
-#![allow(clippy::field_reassign_with_default)]
-
 use std::{any::Any, collections::BTreeMap, fmt, sync::Arc};
 
 use arrow_array::{Array, ArrayRef, BooleanArray, RecordBatch};
@@ -138,11 +136,13 @@ async fn write_cove_batches(
     batches: Vec<RecordBatch>,
     source_identifier: &str,
 ) -> Result<()> {
-    let mut conversion = ParquetConversionOptions::default();
-    conversion.table_name = "datafusion_write".into();
-    conversion.namespace = "datafusion".into();
-    conversion.source_identifier = Some(source_identifier.to_string());
-    conversion.source_digest = None;
+    let conversion = ParquetConversionOptions {
+        table_name: "datafusion_write".into(),
+        namespace: "datafusion".into(),
+        source_identifier: Some(source_identifier.to_string()),
+        source_digest: None,
+        ..ParquetConversionOptions::default()
+    };
     let fingerprint = format!(
         "arrow-schema-crc32c:{:08x}",
         checksum::crc32c(format!("{schema:?}").as_bytes())

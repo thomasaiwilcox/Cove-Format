@@ -3997,7 +3997,7 @@ mod tests {
                 Value::Number((kind as u16).into()),
             );
         }
-        serde_json::to_vec_pretty(&value).unwrap()
+        serde_json::to_vec_pretty(&value).expect("serializing serde_json::Value cannot fail")
     }
 
     fn resolution_catalog_payload(aliases: Vec<&str>) -> Value {

@@ -731,7 +731,7 @@ fn stats_only_numcode_bits(
             if scalar.bytes.len() != 8 {
                 return Err(CoveError::PageCorrupt);
             }
-            Ok(u64::from_le_bytes(scalar.bytes[..8].try_into().unwrap()))
+            Ok(wire::read_u64_le_checked(&scalar.bytes, 0)?)
         }
         (
             CoveLogicalType::UInt8
@@ -744,21 +744,19 @@ fn stats_only_numcode_bits(
             if scalar.bytes.len() != 8 {
                 return Err(CoveError::PageCorrupt);
             }
-            Ok(u64::from_le_bytes(scalar.bytes[..8].try_into().unwrap()))
+            Ok(wire::read_u64_le_checked(&scalar.bytes, 0)?)
         }
         (CoveLogicalType::Float32, StatKind::FixedBytes) => {
             if scalar.bytes.len() != 4 {
                 return Err(CoveError::PageCorrupt);
             }
-            Ok(u64::from(u32::from_le_bytes(
-                scalar.bytes[..4].try_into().unwrap(),
-            )))
+            Ok(u64::from(wire::read_u32_le_checked(&scalar.bytes, 0)?))
         }
         (CoveLogicalType::DateDays, StatKind::DateDays) => {
             if scalar.bytes.len() != 4 {
                 return Err(CoveError::PageCorrupt);
             }
-            let value = i32::from_le_bytes(scalar.bytes[..4].try_into().unwrap());
+            let value = wire::read_i32_le_checked(&scalar.bytes, 0)?;
             Ok(value as u64)
         }
         _ => Err(CoveError::PageCorrupt),
@@ -1014,7 +1012,7 @@ fn validate_filecodes(
 ) -> Result<(), CoveError> {
     require_len(values.len(), fixed_rows_len(row_count, 4)?)?;
     for chunk in values.chunks_exact(4) {
-        let code = u32::from_le_bytes(chunk.try_into().unwrap());
+        let code = wire::read_u32_le_checked(chunk, 0)?;
         validate_filecode_value(code, dictionary)?;
     }
     Ok(())
@@ -1042,7 +1040,7 @@ fn validate_numcode_values(
         return Ok(());
     }
     for chunk in values.chunks_exact(8) {
-        let code = u64::from_le_bytes(chunk.try_into().unwrap());
+        let code = wire::read_u64_le_checked(chunk, 0)?;
         validate_numcode(logical_type, CovePhysicalKind::NumCode, code)?;
     }
     Ok(())
@@ -1129,7 +1127,7 @@ fn validate_length_prefixed_u32_rows(
         if len_end > values.len() {
             return Err(CoveError::BufferTooShort);
         }
-        let len = u32::from_le_bytes(values[pos..len_end].try_into().unwrap()) as usize;
+        let len = wire::read_u32_le_checked(values, pos)? as usize;
         let value_end = len_end.checked_add(len).ok_or(CoveError::ArithOverflow)?;
         if value_end > values.len() {
             return Err(CoveError::BufferTooShort);

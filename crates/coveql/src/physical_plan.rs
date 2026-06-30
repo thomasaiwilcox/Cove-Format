@@ -847,7 +847,7 @@ fn build_nodes(
             ),
         );
     }
-    if planned.dependencies.association_type_ids.len() > 0
+    if !planned.dependencies.association_type_ids.is_empty()
         || matches!(
             planned.logical_plan.context.root_kind,
             LogicalRootKind::Association
@@ -969,7 +969,7 @@ fn build_nodes(
             ),
         );
     }
-    if planned.dependencies.evidence_fields.len() > 0
+    if !planned.dependencies.evidence_fields.is_empty()
         || matches!(
             planned.logical_plan.context.root_kind,
             LogicalRootKind::Evidence

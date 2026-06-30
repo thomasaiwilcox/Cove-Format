@@ -4,7 +4,10 @@
 //! `CoveTableRowRefV1` tuple: `(table_id, segment_id, morsel_id,
 //! row_in_morsel)`.
 
-use crate::CoveError;
+use crate::{
+    wire::{read_u16_le_checked, read_u32_le_checked},
+    CoveError,
+};
 
 /// A stable row reference (Spec §54.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -33,10 +36,10 @@ impl RowRef {
             return Err(CoveError::BufferTooShort);
         }
         Ok(Self {
-            table_id: u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
-            segment_id: u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
-            morsel_id: u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
-            row_in_morsel: u16::from_le_bytes(bytes[12..14].try_into().unwrap()),
+            table_id: read_u32_le_checked(bytes, 0)?,
+            segment_id: read_u32_le_checked(bytes, 4)?,
+            morsel_id: read_u32_le_checked(bytes, 8)?,
+            row_in_morsel: read_u16_le_checked(bytes, 12)?,
         })
     }
 }

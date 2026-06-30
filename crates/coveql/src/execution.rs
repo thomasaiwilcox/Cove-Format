@@ -805,6 +805,7 @@ pub fn parse_resolve_plan_and_execute_query(
     execute_planned_query(bytes, planned, execution_options)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn parse_resolve_plan_and_execute_query_on_object_surface(
     planning_bytes: &[u8],
     surface: &CoveObjectSurface,
@@ -2371,7 +2372,7 @@ fn property_diffs(
                 (Some((name, old_value)), Some((new_name, new_value))) => (old_value != new_value)
                     .then(|| MaterializedChangeDetail {
                         property_id,
-                        property_name: new_name.clone().if_empty_then(name.clone()),
+                        property_name: non_empty_property_name(new_name, name),
                         old_value: old_value.clone(),
                         new_value: new_value.clone(),
                         diff_kind: MaterializedChangeDiffKind::Changed,
@@ -2381,17 +2382,11 @@ fn property_diffs(
         .collect()
 }
 
-trait EmptyStringFallback {
-    fn if_empty_then(self, fallback: String) -> String;
-}
-
-impl EmptyStringFallback for String {
-    fn if_empty_then(self, fallback: String) -> String {
-        if self.is_empty() {
-            fallback
-        } else {
-            self
-        }
+fn non_empty_property_name(preferred: &str, fallback: &str) -> String {
+    if preferred.is_empty() {
+        fallback.to_string()
+    } else {
+        preferred.to_string()
     }
 }
 
@@ -3178,7 +3173,9 @@ fn execute_table_relation_root(
             }
             match lookup.cardinality {
                 TableLookupCardinality::One => {
-                    next_rows.push(matches.into_iter().next().expect("non-empty matches"));
+                    if let Some(row) = matches.into_iter().next() {
+                        next_rows.push(row);
+                    }
                 }
                 TableLookupCardinality::Many => {
                     next_rows.extend(matches);
@@ -3280,7 +3277,9 @@ fn apply_materialized_table_join(
             | TableJoinKind::Right
             | TableJoinKind::Full => {
                 if join.cardinality == TableLookupCardinality::One {
-                    out.push(matches.into_iter().next().expect("non-empty join matches"));
+                    if let Some(row) = matches.into_iter().next() {
+                        out.push(row);
+                    }
                 } else {
                     out.extend(matches);
                 }
@@ -3988,32 +3987,24 @@ fn execute_graph_traverse_surface_root(
             with_graph_path_state(namespace_graph_node_projection_row(row, root, true), &state)
         })
         .collect::<Vec<_>>();
+    let graph_context = GraphExecutionContext {
+        root,
+        visible_associations: &visible_associations,
+        by_type_and_goid: &by_type_and_goid,
+        object_goids: &object_goids,
+        visible_object_goids: &visible_object_goids,
+        planned,
+        options,
+        started,
+    };
     for traversal in &planned.resolved.method_chain.traversals {
-        rows = expand_graph_traversal_rows(
-            &rows,
-            traversal,
-            root,
-            &visible_associations,
-            &by_type_and_goid,
-            &object_goids,
-            &visible_object_goids,
-            planned,
-            options,
-            started,
-        )?;
+        rows = expand_graph_traversal_rows(&rows, traversal, &graph_context)?;
     }
     if !planned.resolved.method_chain.graph_algorithms.is_empty() {
         rows = apply_graph_algorithms(
             rows,
             &planned.resolved.method_chain.graph_algorithms,
-            root,
-            &visible_associations,
-            &by_type_and_goid,
-            &object_goids,
-            &visible_object_goids,
-            planned,
-            options,
-            started,
+            &graph_context,
         )?;
     }
     let rows = rows
@@ -4029,33 +4020,26 @@ fn execute_graph_traverse_surface_root(
     finish_materialized_rows_with_context(rows, planned, options, started, &context)
 }
 
+struct GraphExecutionContext<'a> {
+    root: &'a crate::ResolvedGraphNodeRoot,
+    visible_associations: &'a [MaterializedAssociationRow],
+    by_type_and_goid: &'a BTreeMap<(u32, String), MaterializedObjectRow>,
+    object_goids: &'a BTreeSet<String>,
+    visible_object_goids: &'a BTreeSet<String>,
+    planned: &'a PlannedQuery,
+    options: &'a ExecutionOptions,
+    started: Instant,
+}
+
 fn apply_graph_algorithms(
     rows: Vec<MaterializedProjectionRow>,
     algorithms: &[crate::ResolvedGraphAlgorithm],
-    root: &crate::ResolvedGraphNodeRoot,
-    visible_associations: &[MaterializedAssociationRow],
-    by_type_and_goid: &BTreeMap<(u32, String), MaterializedObjectRow>,
-    object_goids: &BTreeSet<String>,
-    visible_object_goids: &BTreeSet<String>,
-    planned: &PlannedQuery,
-    options: &ExecutionOptions,
-    started: Instant,
+    context: &GraphExecutionContext<'_>,
 ) -> Result<Vec<MaterializedProjectionRow>, BuildExecutionError> {
     let mut rows = rows;
     for algorithm in algorithms {
-        check_time(&options.resource_budget, started)?;
-        rows = apply_graph_algorithm(
-            rows,
-            algorithm,
-            root,
-            visible_associations,
-            by_type_and_goid,
-            object_goids,
-            visible_object_goids,
-            planned,
-            options,
-            started,
-        )?;
+        check_time(&context.options.resource_budget, context.started)?;
+        rows = apply_graph_algorithm(rows, algorithm, context)?;
     }
     Ok(rows)
 }
@@ -4063,14 +4047,7 @@ fn apply_graph_algorithms(
 fn apply_graph_algorithm(
     rows: Vec<MaterializedProjectionRow>,
     algorithm: &crate::ResolvedGraphAlgorithm,
-    root: &crate::ResolvedGraphNodeRoot,
-    visible_associations: &[MaterializedAssociationRow],
-    by_type_and_goid: &BTreeMap<(u32, String), MaterializedObjectRow>,
-    object_goids: &BTreeSet<String>,
-    visible_object_goids: &BTreeSet<String>,
-    planned: &PlannedQuery,
-    options: &ExecutionOptions,
-    started: Instant,
+    context: &GraphExecutionContext<'_>,
 ) -> Result<Vec<MaterializedProjectionRow>, BuildExecutionError> {
     match algorithm.kind {
         GraphAlgorithmKind::AllPaths | GraphAlgorithmKind::KShortestPaths => {
@@ -4108,9 +4085,15 @@ fn apply_graph_algorithm(
                         GraphTraversalDistinctPolicy::EndNode,
                     ],
                     max_depth: algorithm.contract.max_depth,
-                    max_fanout_per_node: options.resource_budget.maximum_graph_traversal_fanout,
+                    max_fanout_per_node: context
+                        .options
+                        .resource_budget
+                        .maximum_graph_traversal_fanout,
                     max_paths: algorithm.max_paths.unwrap_or(algorithm.contract.max_paths),
-                    max_frontier: options.resource_budget.maximum_graph_traversal_frontier,
+                    max_frontier: context
+                        .options
+                        .resource_budget
+                        .maximum_graph_traversal_frontier,
                     path_identity: vec![
                         "start_goid".into(),
                         "edge_goids".into(),
@@ -4121,33 +4104,22 @@ fn apply_graph_algorithm(
                     execution_authority: "materialized_graph_algorithm_oracle".into(),
                 }),
             };
-            return expand_graph_traversal_rows(
-                &rows,
-                &traversal,
-                root,
-                visible_associations,
-                by_type_and_goid,
-                object_goids,
-                visible_object_goids,
-                planned,
-                options,
-                started,
-            );
+            return expand_graph_traversal_rows(&rows, &traversal, context);
         }
         _ => {}
     }
 
     let adjacency = GraphAdjacency::from_visible_associations(
-        visible_associations,
+        context.visible_associations,
         algorithm.edge.as_ref(),
         algorithm.direction,
-        object_goids,
-        visible_object_goids,
-        planned,
+        context.object_goids,
+        context.visible_object_goids,
+        context.planned,
     );
     let start_nodes = rows
         .iter()
-        .filter_map(|row| graph_row_current_goid(row, root))
+        .filter_map(|row| graph_row_current_goid(row, context.root))
         .collect::<BTreeSet<_>>();
     let graph_nodes = graph_algorithm_nodes(&adjacency, &start_nodes);
     let component_ids = if matches!(
@@ -4183,10 +4155,10 @@ fn apply_graph_algorithm(
             &adjacency,
             &graph_nodes,
             algorithm,
-            visible_associations,
-            planned,
-            started,
-            options,
+            context.visible_associations,
+            context.planned,
+            context.started,
+            context.options,
         )?)
     } else {
         None
@@ -4203,7 +4175,7 @@ fn apply_graph_algorithm(
     };
     let mut out = Vec::with_capacity(rows.len());
     for mut row in rows {
-        let Some(start) = graph_row_current_goid(&row, root) else {
+        let Some(start) = graph_row_current_goid(&row, context.root) else {
             out.push(row);
             continue;
         };
@@ -4212,8 +4184,8 @@ fn apply_graph_algorithm(
             &start,
             algorithm.max_depth.unwrap_or(algorithm.contract.max_depth),
             algorithm.max_paths.unwrap_or(algorithm.contract.max_paths),
-            started,
-            options,
+            context.started,
+            context.options,
         )?;
         match algorithm.kind {
             GraphAlgorithmKind::Reachable => {
@@ -4226,7 +4198,7 @@ fn apply_graph_algorithm(
                 let distance = shortest_target_distance(
                     &reachable,
                     algorithm.target.as_ref(),
-                    by_type_and_goid,
+                    context.by_type_and_goid,
                 );
                 row.values.insert(
                     "shortest_distance".into(),
@@ -4286,8 +4258,8 @@ fn apply_graph_algorithm(
                         &start,
                         graph_nodes.len(),
                         algorithm,
-                        started,
-                        options,
+                        context.started,
+                        context.options,
                     )?,
                 };
                 row.values.insert("centrality".into(), json!(score));
@@ -4897,7 +4869,7 @@ fn graph_spanning_forest(
     options: &ExecutionOptions,
 ) -> Result<BTreeMap<String, (Option<String>, u32)>, BuildExecutionError> {
     match algorithm.variant.as_str() {
-        "dfs" => Ok(graph_search_spanning_forest(adjacency, &nodes, true)),
+        "dfs" => Ok(graph_search_spanning_forest(adjacency, nodes, true)),
         "min_weight" => graph_min_weight_spanning_forest(
             nodes,
             algorithm,
@@ -5171,38 +5143,61 @@ impl GraphPathState {
 fn expand_graph_traversal_rows(
     rows: &[MaterializedProjectionRow],
     traversal: &crate::ResolvedGraphTraversal,
-    root: &crate::ResolvedGraphNodeRoot,
-    visible_associations: &[MaterializedAssociationRow],
-    by_type_and_goid: &BTreeMap<(u32, String), MaterializedObjectRow>,
-    object_goids: &BTreeSet<String>,
-    visible_object_goids: &BTreeSet<String>,
-    planned: &PlannedQuery,
-    options: &ExecutionOptions,
-    started: Instant,
+    context: &GraphExecutionContext<'_>,
 ) -> Result<Vec<MaterializedProjectionRow>, BuildExecutionError> {
     let fanout_limit = traversal
         .contract
         .as_ref()
         .map(|contract| contract.max_fanout_per_node)
-        .unwrap_or(options.resource_budget.maximum_graph_traversal_fanout)
-        .min(options.resource_budget.maximum_graph_traversal_fanout);
+        .unwrap_or(
+            context
+                .options
+                .resource_budget
+                .maximum_graph_traversal_fanout,
+        )
+        .min(
+            context
+                .options
+                .resource_budget
+                .maximum_graph_traversal_fanout,
+        );
     let path_limit = traversal
         .contract
         .as_ref()
         .map(|contract| contract.max_paths)
-        .unwrap_or(options.resource_budget.maximum_graph_traversal_paths)
-        .min(options.resource_budget.maximum_graph_traversal_paths);
+        .unwrap_or(
+            context
+                .options
+                .resource_budget
+                .maximum_graph_traversal_paths,
+        )
+        .min(
+            context
+                .options
+                .resource_budget
+                .maximum_graph_traversal_paths,
+        );
     let frontier_limit = traversal
         .contract
         .as_ref()
         .map(|contract| contract.max_frontier)
-        .unwrap_or(options.resource_budget.maximum_graph_traversal_frontier)
-        .min(options.resource_budget.maximum_graph_traversal_frontier);
+        .unwrap_or(
+            context
+                .options
+                .resource_budget
+                .maximum_graph_traversal_frontier,
+        )
+        .min(
+            context
+                .options
+                .resource_budget
+                .maximum_graph_traversal_frontier,
+        );
     let mut emitted = Vec::new();
     let mut seen = BTreeSet::<String>::new();
     if traversal.min_depth == 0 {
         for row in rows {
-            if let Some(state) = graph_row_path_state(row, root) {
+            if let Some(state) = graph_row_path_state(row, context.root) {
                 push_graph_emitted_row(
                     row.clone(),
                     &state,
@@ -5215,19 +5210,19 @@ fn expand_graph_traversal_rows(
     }
     let mut frontier = rows.to_vec();
     for depth in 1..=traversal.max_depth {
-        check_time(&options.resource_budget, started)?;
+        check_time(&context.options.resource_budget, context.started)?;
         let mut next = Vec::new();
         for row in &frontier {
-            let Some(state) = graph_row_path_state(row, root) else {
+            let Some(state) = graph_row_path_state(row, context.root) else {
                 continue;
             };
             let mut fanout = 0usize;
-            for association in visible_associations.iter().filter(|association| {
+            for association in context.visible_associations.iter().filter(|association| {
                 association.object_type_id == traversal.edge.association.object_type_id
                     && association_row_matches_temporal(
                         association,
                         &traversal.edge.association,
-                        association_valid_at(planned),
+                        association_valid_at(context.planned),
                     )
             }) {
                 let Some((target_goid, source_matches)) =
@@ -5236,8 +5231,8 @@ fn expand_graph_traversal_rows(
                     continue;
                 };
                 if !source_matches
-                    || (object_goids.contains(&target_goid)
-                        && !visible_object_goids.contains(&target_goid))
+                    || (context.object_goids.contains(&target_goid)
+                        && !context.visible_object_goids.contains(&target_goid))
                 {
                     continue;
                 }
@@ -5254,8 +5249,9 @@ fn expand_graph_traversal_rows(
                     &namespace_graph_edge_projection_row(association, &traversal.edge),
                 );
                 if let Some(target) = &traversal.target {
-                    let Some(target_row) =
-                        by_type_and_goid.get(&(target.object.object_type_id, target_goid.clone()))
+                    let Some(target_row) = context
+                        .by_type_and_goid
+                        .get(&(target.object.object_type_id, target_goid.clone()))
                     else {
                         continue;
                     };
@@ -6049,7 +6045,7 @@ fn finish_materialized_rows_with_context(
     let input_rows = rows.len();
     let mut rows = rows
         .into_iter()
-        .filter_map(|row| match predicate_matches(&row, planned, &context) {
+        .filter_map(|row| match predicate_matches(&row, planned, context) {
             Ok(true) => Some(Ok(row)),
             Ok(false) => None,
             Err(err) => Some(Err(err)),
@@ -6058,7 +6054,7 @@ fn finish_materialized_rows_with_context(
     let filtered_rows = rows.len();
     check_time(&options.resource_budget, started)?;
     if grouped_or_aggregate(planned) {
-        let json_rows = aggregate_rows(&rows, planned, &context, options)?;
+        let json_rows = aggregate_rows(&rows, planned, context, options)?;
         return finish_json_rows(
             json_rows,
             input_rows,
@@ -6068,7 +6064,7 @@ fn finish_materialized_rows_with_context(
             started,
         );
     }
-    sort_rows(&mut rows, planned, &context)?;
+    sort_rows(&mut rows, planned, context)?;
     let rows = apply_skip_take(rows, planned);
     let output_rows = rows.len();
     match &planned.resolved.output_mode {
@@ -6133,7 +6129,7 @@ fn finish_materialized_rows_with_context(
             },
         )),
         CoveQlOutputMode::JsonRows => {
-            let json_rows = select_json_rows(&rows, planned, &context)?;
+            let json_rows = select_json_rows(&rows, planned, context)?;
             finish_json_rows(
                 json_rows,
                 input_rows,
@@ -6145,7 +6141,7 @@ fn finish_materialized_rows_with_context(
         }
         CoveQlOutputMode::ArrowRecordBatch { .. } => {
             let batch =
-                crate::kernel_arrow::execution_rows_to_owned_record_batch(&rows, planned, &context)
+                crate::kernel_arrow::execution_rows_to_owned_record_batch(&rows, planned, context)
                     .map_err(|err| {
                         exec_error(
                             "E_ARROW_OUTPUT",
@@ -7406,18 +7402,24 @@ pub(crate) fn validate_execution_grain(planned: &PlannedQuery) -> Result<(), Bui
 pub(crate) fn validate_execution_output_mode(
     planned: &PlannedQuery,
 ) -> Result<(), BuildExecutionError> {
-    let output_valid = match (&planned.resolved.root, &planned.resolved.output_mode) {
+    let output_valid = matches!(
+        (&planned.resolved.root, &planned.resolved.output_mode),
         (_, CoveQlOutputMode::JsonRows)
-        | (_, CoveQlOutputMode::ArrowRecordBatch { .. })
-        | (_, CoveQlOutputMode::ExplainJson) => true,
-        (ResolvedRoot::Object(_), CoveQlOutputMode::ObjectRows) => true,
-        (ResolvedRoot::Association(_), CoveQlOutputMode::AssociationRows) => true,
-        (ResolvedRoot::Evidence(_), CoveQlOutputMode::EvidenceRows) => true,
-        (ResolvedRoot::Projection(_), CoveQlOutputMode::ProjectionRows) => true,
-        (ResolvedRoot::Table(_), CoveQlOutputMode::ProjectionRows) => true,
-        (_, CoveQlOutputMode::DataFusionTableProvider) => true,
-        _ => false,
-    };
+            | (_, CoveQlOutputMode::ArrowRecordBatch { .. })
+            | (_, CoveQlOutputMode::ExplainJson)
+            | (ResolvedRoot::Object(_), CoveQlOutputMode::ObjectRows)
+            | (
+                ResolvedRoot::Association(_),
+                CoveQlOutputMode::AssociationRows
+            )
+            | (ResolvedRoot::Evidence(_), CoveQlOutputMode::EvidenceRows)
+            | (
+                ResolvedRoot::Projection(_),
+                CoveQlOutputMode::ProjectionRows
+            )
+            | (ResolvedRoot::Table(_), CoveQlOutputMode::ProjectionRows)
+            | (_, CoveQlOutputMode::DataFusionTableProvider)
+    );
     if !output_valid {
         return Err(incompatible_execution_grain(
             planned,
@@ -7700,6 +7702,44 @@ fn predicate_contains_aggregate(predicate: &ResolvedPredicate) -> bool {
         ResolvedPredicate::And(parts) | ResolvedPredicate::Or(parts) => {
             parts.iter().any(predicate_contains_aggregate)
         }
+    }
+}
+
+pub(crate) fn resource_error(limit: &str, actual: usize) -> BuildExecutionError {
+    exec_error(
+        "E_RESOURCE_BUDGET_EXCEEDED",
+        format!("{limit} budget exceeded during execution"),
+        json!({ "limit": limit, "actual": actual }),
+    )
+}
+
+pub(crate) fn exec_error(
+    code: &str,
+    message: impl Into<String>,
+    safe_details: Value,
+) -> BuildExecutionError {
+    BuildExecutionError::single(ExecutionDiagnostic {
+        code: code.into(),
+        severity: DiagnosticSeverity::Error,
+        message: message.into(),
+        phase: "execute".into(),
+        safe_details,
+        redacted: false,
+    })
+}
+
+pub(crate) fn exec_warning(
+    code: &str,
+    message: impl Into<String>,
+    safe_details: Value,
+) -> ExecutionDiagnostic {
+    ExecutionDiagnostic {
+        code: code.into(),
+        severity: DiagnosticSeverity::Warning,
+        message: message.into(),
+        phase: "execute".into(),
+        safe_details,
+        redacted: false,
     }
 }
 
@@ -8148,43 +8188,5 @@ mod tests {
             canonical_rfc3339: "n/a".into(),
         };
         assert!(!record_in_half_open_bound(&record, &late_from, &late_to).unwrap());
-    }
-}
-
-pub(crate) fn resource_error(limit: &str, actual: usize) -> BuildExecutionError {
-    exec_error(
-        "E_RESOURCE_BUDGET_EXCEEDED",
-        format!("{limit} budget exceeded during execution"),
-        json!({ "limit": limit, "actual": actual }),
-    )
-}
-
-pub(crate) fn exec_error(
-    code: &str,
-    message: impl Into<String>,
-    safe_details: Value,
-) -> BuildExecutionError {
-    BuildExecutionError::single(ExecutionDiagnostic {
-        code: code.into(),
-        severity: DiagnosticSeverity::Error,
-        message: message.into(),
-        phase: "execute".into(),
-        safe_details,
-        redacted: false,
-    })
-}
-
-pub(crate) fn exec_warning(
-    code: &str,
-    message: impl Into<String>,
-    safe_details: Value,
-) -> ExecutionDiagnostic {
-    ExecutionDiagnostic {
-        code: code.into(),
-        severity: DiagnosticSeverity::Warning,
-        message: message.into(),
-        phase: "execute".into(),
-        safe_details,
-        redacted: false,
     }
 }

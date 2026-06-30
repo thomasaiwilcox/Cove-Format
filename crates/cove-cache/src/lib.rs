@@ -303,7 +303,9 @@ fn read_array<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N], Co
     if end > bytes.len() {
         return Err(CoveError::BufferTooShort);
     }
-    Ok(bytes[offset..end].try_into().unwrap())
+    let mut out = [0u8; N];
+    out.copy_from_slice(&bytes[offset..end]);
+    Ok(out)
 }
 
 #[cfg(test)]

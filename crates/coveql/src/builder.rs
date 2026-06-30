@@ -326,6 +326,7 @@ impl CoveQlQueryBuilder {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn lookup_with_options(
         mut self,
         table_name: impl AsRef<str>,
@@ -868,6 +869,7 @@ impl CoveQlQueryBuilder {
         self
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn with_recursive_table_step(
         mut self,
         name: impl AsRef<str>,

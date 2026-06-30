@@ -4,7 +4,7 @@
 //! the value followed by the row count (LE u64). Pages that claim more
 //! rows than `u32::MAX` are rejected up-front to bound allocation.
 
-use crate::CoveError;
+use crate::{wire, CoveError};
 
 use super::Encoding;
 
@@ -21,8 +21,8 @@ impl ConstantPayload {
         if bytes.len() < Self::ENCODED_LEN {
             return Err(CoveError::BufferTooShort);
         }
-        let value = i64::from_le_bytes(bytes[0..8].try_into().unwrap());
-        let row_count = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+        let value = wire::read_i64_le_checked(bytes, 0)?;
+        let row_count = wire::read_u64_le_checked(bytes, 8)?;
         if row_count > u32::MAX as u64 {
             return Err(CoveError::PageCorrupt);
         }

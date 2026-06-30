@@ -23,29 +23,6 @@
 //! candidates stay fail-closed or diagnostic-only unless a runtime branch proves
 //! equivalence to the materialized executor.
 
-#![allow(
-    clippy::cloned_ref_to_slice_refs,
-    clippy::collapsible_match,
-    clippy::derivable_impls,
-    clippy::field_reassign_with_default,
-    clippy::if_same_then_else,
-    clippy::items_after_test_module,
-    clippy::large_enum_variant,
-    clippy::len_zero,
-    clippy::manual_inspect,
-    clippy::manual_is_multiple_of,
-    clippy::manual_map,
-    clippy::match_like_matches_macro,
-    clippy::needless_borrow,
-    clippy::needless_lifetimes,
-    clippy::redundant_closure,
-    clippy::too_many_arguments,
-    clippy::trim_split_whitespace,
-    clippy::type_complexity,
-    clippy::unnecessary_lazy_evaluations,
-    clippy::unnecessary_map_or
-)]
-
 mod acceleration;
 mod arrow_output;
 mod association_opt;
@@ -1285,19 +1262,15 @@ pub enum CoveQlOutputMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum ExplainMode {
+    #[default]
     Public,
     Developer,
     Proof,
     Coded,
     Ai,
     Forensic,
-}
-
-impl Default for ExplainMode {
-    fn default() -> Self {
-        Self::Public
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1386,17 +1359,9 @@ pub enum BranchSelector {
     RejectAmbiguous,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct TombstoneContext {
     pub include_tombstones: bool,
-}
-
-impl Default for TombstoneContext {
-    fn default() -> Self {
-        Self {
-            include_tombstones: false,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1470,15 +1435,11 @@ pub enum MetadataDisclosurePolicy {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum FallbackPolicy {
+    #[default]
     AllowMaterializedFallback,
     RejectOnFallback,
-}
-
-impl Default for FallbackPolicy {
-    fn default() -> Self {
-        Self::AllowMaterializedFallback
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1725,7 +1686,8 @@ impl DatasetScopeContext {
             footer_crc32c: file.footer_crc32c,
             primary_profile: file.primary_profile,
         };
-        let file_membership_fingerprint = dataset_membership_fingerprint(&[member.clone()]);
+        let file_membership_fingerprint =
+            dataset_membership_fingerprint(std::slice::from_ref(&member));
         Self {
             scope_version: 1,
             dataset_id: snapshot.dataset_id.clone(),
@@ -2105,7 +2067,7 @@ pub fn build_manifest_dataset_scope_context(
     })
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct SnapshotContext {
     pub dataset_id: Option<String>,
     pub snapshot_id: Option<String>,
@@ -2114,20 +2076,6 @@ pub struct SnapshotContext {
     pub semantic_map_fingerprint: Option<String>,
     pub file_digest: Option<String>,
     pub authority: Option<String>,
-}
-
-impl Default for SnapshotContext {
-    fn default() -> Self {
-        Self {
-            dataset_id: None,
-            snapshot_id: None,
-            selected_snapshot_ref: None,
-            schema_fingerprint: None,
-            semantic_map_fingerprint: None,
-            file_digest: None,
-            authority: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2967,9 +2915,9 @@ fn dedup_feature_uses(uses: Vec<FeatureUseRequestV2>) -> Vec<FeatureUseRequestV2
     out
 }
 
-fn feature_use_key(
-    feature_use: &FeatureUseRequestV2,
-) -> (Option<u8>, Option<u16>, Vec<u32>, Vec<(u32, u64)>) {
+type FeatureUseKey = (Option<u8>, Option<u16>, Vec<u32>, Vec<(u32, u64)>);
+
+fn feature_use_key(feature_use: &FeatureUseRequestV2) -> FeatureUseKey {
     (
         feature_use.requested_profile,
         feature_use
@@ -4431,8 +4379,7 @@ mod tests {
         ];
 
         for (field, usage) in cases {
-            let mut req = CoveQlOperationRequest::default();
-            req.resource_budget = ResourceBudgetPolicy {
+            let resource_budget = ResourceBudgetPolicy {
                 maximum_query_bytes: 1,
                 maximum_ast_depth: 1,
                 maximum_method_count: 1,
@@ -4450,7 +4397,11 @@ mod tests {
                 maximum_planning_time_ms: 1,
                 maximum_execution_time_ms: 1,
             };
-            req.resource_use = usage;
+            let req = CoveQlOperationRequest {
+                resource_budget,
+                resource_use: usage,
+                ..CoveQlOperationRequest::default()
+            };
             let err = check_resource_budget(&req).unwrap_err();
             assert!(err.diagnostics[0].message.contains(field));
         }

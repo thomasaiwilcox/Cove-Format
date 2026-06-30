@@ -18,6 +18,7 @@ use crate::{
     canonical::{self, CanonicalValue},
     constants::{StorageClass, ValueTag},
     error::CoveError,
+    wire::{read_u16_le_checked, read_u32_le_checked, read_u64_le_checked},
 };
 
 // ── FileDictionaryHeaderV1 ────────────────────────────────────────────────────
@@ -73,22 +74,22 @@ impl FileDictionaryHeaderV1 {
         if buf.len() < DICT_HEADER_SIZE {
             return Err(CoveError::BufferTooShort);
         }
-        let entry_count = u32::from_le_bytes(buf[0..4].try_into().unwrap());
-        let flags = u32::from_le_bytes(buf[4..8].try_into().unwrap());
-        let index_entry_len = u16::from_le_bytes(buf[8..10].try_into().unwrap());
+        let entry_count = read_u32_le_checked(buf, 0)?;
+        let flags = read_u32_le_checked(buf, 4)?;
+        let index_entry_len = read_u16_le_checked(buf, 8)?;
         if index_entry_len != Self::INDEX_ENTRY_LEN {
             return Err(CoveError::BadSection(format!(
                 "index_entry_len is {index_entry_len}, expected {}",
                 Self::INDEX_ENTRY_LEN
             )));
         }
-        let value_hash_algorithm = u16::from_le_bytes(buf[10..12].try_into().unwrap());
+        let value_hash_algorithm = read_u16_le_checked(buf, 10)?;
         if value_hash_algorithm > 2 {
             return Err(CoveError::BadSection(format!(
                 "unknown value_hash_algorithm {value_hash_algorithm}"
             )));
         }
-        let payload_length = u64::from_le_bytes(buf[12..20].try_into().unwrap());
+        let payload_length = read_u64_le_checked(buf, 12)?;
         let mut reserved = [0u8; 24];
         reserved.copy_from_slice(&buf[20..44]);
         if reserved.iter().any(|&b| b != 0) {
@@ -167,7 +168,7 @@ impl FileDictionaryIndexEntryV1 {
         if buf.len() < DICT_INDEX_ENTRY_SIZE {
             return Err(CoveError::BufferTooShort);
         }
-        let value_tag = u16::from_le_bytes(buf[0..2].try_into().unwrap());
+        let value_tag = read_u16_le_checked(buf, 0)?;
         let storage_class = buf[2];
         let flags = buf[3];
         let inline_len = buf[4];
@@ -181,10 +182,10 @@ impl FileDictionaryIndexEntryV1 {
         let mut inline_data = [0u8; 16];
         inline_data.copy_from_slice(&buf[8..24]);
 
-        let payload_offset = u64::from_le_bytes(buf[24..32].try_into().unwrap());
-        let payload_length = u32::from_le_bytes(buf[32..36].try_into().unwrap());
-        let canonical_hash64 = u64::from_le_bytes(buf[36..44].try_into().unwrap());
-        let reserved1 = u32::from_le_bytes(buf[44..48].try_into().unwrap());
+        let payload_offset = read_u64_le_checked(buf, 24)?;
+        let payload_length = read_u32_le_checked(buf, 32)?;
+        let canonical_hash64 = read_u64_le_checked(buf, 36)?;
+        let reserved1 = read_u32_le_checked(buf, 44)?;
 
         if reserved1 != 0 {
             return Err(CoveError::ReservedNotZero);

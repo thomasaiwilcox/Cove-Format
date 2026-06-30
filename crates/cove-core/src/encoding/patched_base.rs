@@ -12,7 +12,7 @@
 //! Spec §20.3.7 requires patch positions to be unique and strictly
 //! increasing; the parser enforces both.
 
-use crate::CoveError;
+use crate::{wire, CoveError};
 
 use super::Encoding;
 
@@ -27,26 +27,35 @@ impl PatchedBasePayload {
         if bytes.len() < 4 {
             return Err(CoveError::BufferTooShort);
         }
-        let n = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+        let n = wire::read_u32_le_checked(bytes, 0)? as usize;
         let mut pos = 4usize;
-        if bytes.len() < pos + n * 8 + 4 {
+        let base_bytes = n.checked_mul(8).ok_or(CoveError::ArithOverflow)?;
+        let base_end = pos
+            .checked_add(base_bytes)
+            .and_then(|end| end.checked_add(4))
+            .ok_or(CoveError::ArithOverflow)?;
+        if bytes.len() < base_end {
             return Err(CoveError::BufferTooShort);
         }
         let mut base = Vec::with_capacity(n);
         for _ in 0..n {
-            base.push(i64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap()));
+            base.push(wire::read_i64_le_checked(bytes, pos)?);
             pos += 8;
         }
-        let pc = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+        let pc = wire::read_u32_le_checked(bytes, pos)? as usize;
         pos += 4;
-        if bytes.len() < pos + pc * 12 {
+        let patch_bytes = pc.checked_mul(12).ok_or(CoveError::ArithOverflow)?;
+        let patch_end = pos
+            .checked_add(patch_bytes)
+            .ok_or(CoveError::ArithOverflow)?;
+        if bytes.len() < patch_end {
             return Err(CoveError::BufferTooShort);
         }
         let mut patches = Vec::with_capacity(pc);
         let mut prev: Option<u32> = None;
         for _ in 0..pc {
-            let p = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
-            let v = i64::from_le_bytes(bytes[pos + 4..pos + 12].try_into().unwrap());
+            let p = wire::read_u32_le_checked(bytes, pos)?;
+            let v = wire::read_i64_le_checked(bytes, pos + 4)?;
             pos += 12;
             if let Some(prev_pos) = prev {
                 if p <= prev_pos {

@@ -15,7 +15,7 @@ use crate::{
         cove_map::{MapEvidenceIndex, MapProjectionCatalog},
         cove_o::{ObjectTypeCatalog, RecordKind, TemporalSegmentData},
     },
-    CoveError,
+    wire, CoveError,
 };
 
 pub const COVEDELTA_VERSION_MAJOR_V1: u16 = 1;
@@ -1498,8 +1498,7 @@ impl DeltaSparsePatchRecordV1 {
             return Err(CoveError::BufferTooShort);
         }
         let record_bytes = &bytes[..record_len];
-        let checksum =
-            u32::from_le_bytes(record_bytes[record_len - 4..record_len].try_into().unwrap());
+        let checksum = wire::read_u32_le_checked(record_bytes, record_len - 4)?;
         let mut for_crc = record_bytes.to_vec();
         for_crc[record_len - 4..record_len].fill(0);
         if checksum::crc32c(&for_crc) != checksum {
@@ -2589,13 +2588,11 @@ impl CoveDeltaFile {
         if bytes[tail_start + 4..tail_start + 8] != MAGIC_COVEDELTA {
             return Err(CoveError::BadMagic);
         }
-        let postscript_version =
-            u16::from_le_bytes(bytes[tail_start..tail_start + 2].try_into().unwrap());
+        let postscript_version = wire::read_u16_le_checked(bytes, tail_start)?;
         if postscript_version != COVEDELTA_POSTSCRIPT_VERSION_V1 {
             return Err(CoveError::BadVersion);
         }
-        let postscript_len =
-            u16::from_le_bytes(bytes[tail_start + 2..tail_start + 4].try_into().unwrap());
+        let postscript_len = wire::read_u16_le_checked(bytes, tail_start + 2)?;
         if postscript_len != COVEDELTA_POSTSCRIPT_LEN {
             return Err(CoveError::BadSection(format!(
                 "COVEDELTA postscript_len must be {COVEDELTA_POSTSCRIPT_LEN}, got {postscript_len}"

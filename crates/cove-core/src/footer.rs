@@ -19,6 +19,7 @@ use crate::{
     },
     error::CoveError,
     metadata::MetadataJson,
+    wire::{read_array_checked, read_u16_le_checked, read_u32_le_checked, read_u64_le_checked},
 };
 
 // ── CoveFooterHeaderV1 ──────────────────────────────────────────────────────────
@@ -69,33 +70,33 @@ impl CoveFooterHeaderV1 {
         if buf.len() < FOOTER_HEADER_SIZE {
             return Err(CoveError::BufferTooShort);
         }
-        let footer_magic: [u8; 4] = buf[0..4].try_into().unwrap();
+        let footer_magic = read_array_checked(buf, 0)?;
         if footer_magic != MAGIC_COVE_FOOTER {
             return Err(CoveError::BadMagic);
         }
 
-        let footer_version = u16::from_le_bytes(buf[4..6].try_into().unwrap());
+        let footer_version = read_u16_le_checked(buf, 4)?;
         if footer_version != FOOTER_VERSION_V1 {
             return Err(CoveError::BadVersion);
         }
 
-        let header_len = u16::from_le_bytes(buf[6..8].try_into().unwrap());
+        let header_len = read_u16_le_checked(buf, 6)?;
         if header_len != FOOTER_HEADER_LEN as u16 {
             return Err(CoveError::BadSection(format!(
                 "footer header_len is {header_len}, expected {FOOTER_HEADER_LEN}"
             )));
         }
-        let section_count = u32::from_le_bytes(buf[8..12].try_into().unwrap());
+        let section_count = read_u32_le_checked(buf, 8)?;
 
-        let section_entry_len = u16::from_le_bytes(buf[12..14].try_into().unwrap());
+        let section_entry_len = read_u16_le_checked(buf, 12)?;
         if section_entry_len != SECTION_ENTRY_LEN {
             return Err(CoveError::BadSection(format!(
                 "section_entry_len is {section_entry_len}, expected {SECTION_ENTRY_LEN}"
             )));
         }
 
-        let flags = u16::from_le_bytes(buf[14..16].try_into().unwrap());
-        let metadata_len = u32::from_le_bytes(buf[16..20].try_into().unwrap());
+        let flags = read_u16_le_checked(buf, 14)?;
+        let metadata_len = read_u32_le_checked(buf, 16)?;
         if metadata_len > METADATA_LEN_MAX {
             return Err(CoveError::BadSection(format!(
                 "metadata_len {metadata_len} exceeds 1 MiB limit"
@@ -210,8 +211,8 @@ impl CoveSectionEntryV1 {
         if buf.len() < SECTION_ENTRY_SIZE {
             return Err(CoveError::BufferTooShort);
         }
-        let section_id = u32::from_le_bytes(buf[0..4].try_into().unwrap());
-        let section_kind = u16::from_le_bytes(buf[4..6].try_into().unwrap());
+        let section_id = read_u32_le_checked(buf, 0)?;
+        let section_kind = read_u16_le_checked(buf, 4)?;
         if SectionKind::from_u16(section_kind).is_none() {
             return Err(CoveError::BadSection(format!(
                 "unknown section_kind {section_kind}"
@@ -224,19 +225,19 @@ impl CoveSectionEntryV1 {
             )));
         }
         let flags = buf[7];
-        let offset = u64::from_le_bytes(buf[8..16].try_into().unwrap());
-        let length = u64::from_le_bytes(buf[16..24].try_into().unwrap());
-        let uncompressed_length = u64::from_le_bytes(buf[24..32].try_into().unwrap());
-        let item_count = u64::from_le_bytes(buf[32..40].try_into().unwrap());
-        let row_count = u64::from_le_bytes(buf[40..48].try_into().unwrap());
+        let offset = read_u64_le_checked(buf, 8)?;
+        let length = read_u64_le_checked(buf, 16)?;
+        let uncompressed_length = read_u64_le_checked(buf, 24)?;
+        let item_count = read_u64_le_checked(buf, 32)?;
+        let row_count = read_u64_le_checked(buf, 40)?;
         let compression = buf[48];
         let encryption = buf[49];
         let alignment_log2 = buf[50];
         let reserved0 = buf[51];
-        let required_features = u64::from_le_bytes(buf[52..60].try_into().unwrap());
-        let optional_features = u64::from_le_bytes(buf[60..68].try_into().unwrap());
-        let crc32c = u32::from_le_bytes(buf[68..72].try_into().unwrap());
-        let reserved1 = u32::from_le_bytes(buf[72..76].try_into().unwrap());
+        let required_features = read_u64_le_checked(buf, 52)?;
+        let optional_features = read_u64_le_checked(buf, 60)?;
+        let crc32c = read_u32_le_checked(buf, 68)?;
+        let reserved1 = read_u32_le_checked(buf, 72)?;
 
         if CompressionCodec::from_u8(compression).is_none() {
             return Err(CoveError::BadSection(format!(

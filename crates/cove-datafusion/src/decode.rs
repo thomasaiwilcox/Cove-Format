@@ -1,7 +1,5 @@
 //! Decode and materialization kernels shared by execution modes.
 
-#![allow(clippy::too_many_arguments)]
-
 mod cache;
 mod materialize;
 mod morsels;
@@ -2944,6 +2942,7 @@ fn native_bool_group_count_for_page(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn native_bool_i64_group_aggregate_for_pages(
     segment: &TableSegmentPayloadV1,
     key_segment_column: &PreparedSegmentColumn,
@@ -3048,6 +3047,7 @@ fn native_bool_i64_group_aggregate_for_pages(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn native_i64_i64_group_aggregate_for_pages(
     segment: &TableSegmentPayloadV1,
     key_segment_column: &PreparedSegmentColumn,
@@ -3153,6 +3153,7 @@ fn native_i64_i64_group_aggregate_for_pages(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn native_filecode_i64_group_aggregate_for_pages(
     segment: &TableSegmentPayloadV1,
     key_segment_column: &PreparedSegmentColumn,
@@ -3572,6 +3573,7 @@ fn native_i64_aggregate_for_page(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_native_i64_values_for_page(
     segment: &TableSegmentPayloadV1,
     segment_column: &PreparedSegmentColumn,
@@ -3616,6 +3618,7 @@ fn collect_native_i64_values_for_page(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_native_filecode_values_for_page(
     segment: &TableSegmentPayloadV1,
     segment_column: &PreparedSegmentColumn,

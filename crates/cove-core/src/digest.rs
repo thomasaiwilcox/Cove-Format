@@ -5,7 +5,12 @@
 //! for a target is _not_ an error (digests are optional), but a present entry
 //! that fails verification is reported as [`CoveError::DigestMismatch`].
 
-use crate::{checksum, constants::DigestAlgorithm, CoveError};
+use crate::{
+    checksum,
+    constants::DigestAlgorithm,
+    wire::{read_u16_le_checked, read_u32_le_checked, read_u64_le_checked},
+    CoveError,
+};
 
 pub const DIGEST_MANIFEST_HEADER_LEN: usize = 60;
 pub const DIGEST_ENTRY_FIXED_LEN: usize = 32;
@@ -97,12 +102,12 @@ impl DigestManifest {
         // trusted. The checksum field itself is zeroed for CRC computation.
         let mut checksum_bytes = bytes[..DIGEST_MANIFEST_HEADER_LEN].to_vec();
         checksum_bytes[56..60].fill(0);
-        let expected_checksum = u32::from_le_bytes(bytes[56..60].try_into().unwrap());
+        let expected_checksum = read_u32_le_checked(bytes, 56)?;
         if checksum::crc32c(&checksum_bytes) != expected_checksum {
             return Err(CoveError::ChecksumMismatch);
         }
 
-        let algorithm_raw = u16::from_le_bytes(bytes[0..2].try_into().unwrap());
+        let algorithm_raw = read_u16_le_checked(bytes, 0)?;
         let algorithm = DigestAlgorithm::from_u16(algorithm_raw)
             .filter(|algorithm| *algorithm != DigestAlgorithm::None)
             .ok_or_else(|| {
@@ -110,13 +115,13 @@ impl DigestManifest {
                     "digest manifest algorithm must be SHA-256 or BLAKE3, got {algorithm_raw}"
                 ))
             })?;
-        let scope_raw = u16::from_le_bytes(bytes[2..4].try_into().unwrap());
+        let scope_raw = read_u16_le_checked(bytes, 2)?;
         let scope = DigestScope::from_u16(scope_raw).ok_or_else(|| {
             CoveError::BadSection(format!("unknown digest manifest scope {scope_raw}"))
         })?;
-        let entry_count = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
-        let entries_offset = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
-        let entries_length = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
+        let entry_count = read_u32_le_checked(bytes, 4)?;
+        let entries_offset = read_u64_le_checked(bytes, 8)?;
+        let entries_length = read_u64_le_checked(bytes, 16)?;
         let mut root_digest = [0u8; 32];
         root_digest.copy_from_slice(&bytes[24..56]);
 
@@ -148,20 +153,20 @@ impl DigestManifest {
             {
                 return Err(CoveError::BufferTooShort);
             }
-            let target_kind_raw = u16::from_le_bytes(bytes[pos..pos + 2].try_into().unwrap());
+            let target_kind_raw = read_u16_le_checked(bytes, pos)?;
             pos += 2;
             let target_kind = DigestTargetKind::from_u16(target_kind_raw).ok_or_else(|| {
                 CoveError::BadSection(format!("unknown digest target kind {target_kind_raw}"))
             })?;
-            let digest_len = u16::from_le_bytes(bytes[pos..pos + 2].try_into().unwrap()) as usize;
+            let digest_len = read_u16_le_checked(bytes, pos)? as usize;
             pos += 2;
-            let section_id = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+            let section_id = read_u32_le_checked(bytes, pos)?;
             pos += 4;
-            let local_id = u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap());
+            let local_id = read_u64_le_checked(bytes, pos)?;
             pos += 8;
-            let offset = u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap());
+            let offset = read_u64_le_checked(bytes, pos)?;
             pos += 8;
-            let length = u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap());
+            let length = read_u64_le_checked(bytes, pos)?;
             pos += 8;
 
             let digest_end = pos

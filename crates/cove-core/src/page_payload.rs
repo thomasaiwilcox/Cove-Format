@@ -9,6 +9,7 @@ use crate::{
     codec::RegisteredEncodingEnvelopeV2,
     constants::{CoveEncodingKind, CoveLogicalType, CovePhysicalKind},
     retained_bytes::RetainedBytes,
+    wire::{read_array_checked, read_u16_le_checked, read_u32_le_checked, read_u64_le_checked},
     CoveError,
 };
 
@@ -87,28 +88,27 @@ impl ColumnPagePayloadHeaderV1 {
             return Err(CoveError::BufferTooShort);
         }
         let bytes = &bytes[..COLUMN_PAGE_PAYLOAD_HEADER_LEN];
-        let mut magic = [0u8; 4];
-        magic.copy_from_slice(&bytes[0..4]);
+        let magic = read_array_checked(bytes, 0)?;
         if magic != COLUMN_PAGE_PAYLOAD_MAGIC {
             return Err(CoveError::BadMagic);
         }
-        let version_major = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
+        let version_major = read_u16_le_checked(bytes, 4)?;
         if version_major != COLUMN_PAGE_PAYLOAD_VERSION_MAJOR {
             return Err(CoveError::BadVersion);
         }
-        let header_len = u16::from_le_bytes(bytes[6..8].try_into().unwrap());
+        let header_len = read_u16_le_checked(bytes, 6)?;
         if header_len as usize != COLUMN_PAGE_PAYLOAD_HEADER_LEN {
             return Err(CoveError::BadSection(format!(
                 "column page payload header_len must be {COLUMN_PAGE_PAYLOAD_HEADER_LEN}, got {header_len}"
             )));
         }
-        let flags = u16::from_le_bytes(bytes[8..10].try_into().unwrap());
+        let flags = read_u16_le_checked(bytes, 8)?;
         if flags != 0 {
             return Err(CoveError::BadSection(
                 "column page payload flags are reserved and must be zero".into(),
             ));
         }
-        let reserved = u32::from_le_bytes(bytes[32..36].try_into().unwrap());
+        let reserved = read_u32_le_checked(bytes, 32)?;
         if reserved != 0 {
             return Err(CoveError::ReservedNotZero);
         }
@@ -117,13 +117,13 @@ impl ColumnPagePayloadHeaderV1 {
             version_major,
             header_len,
             flags,
-            root_node_id: u16::from_le_bytes(bytes[10..12].try_into().unwrap()),
-            node_count: u16::from_le_bytes(bytes[12..14].try_into().unwrap()),
-            buffer_count: u16::from_le_bytes(bytes[14..16].try_into().unwrap()),
-            row_count: u32::from_le_bytes(bytes[16..20].try_into().unwrap()),
-            nodes_offset: u32::from_le_bytes(bytes[20..24].try_into().unwrap()),
-            buffer_directory_offset: u32::from_le_bytes(bytes[24..28].try_into().unwrap()),
-            buffers_offset: u32::from_le_bytes(bytes[28..32].try_into().unwrap()),
+            root_node_id: read_u16_le_checked(bytes, 10)?,
+            node_count: read_u16_le_checked(bytes, 12)?,
+            buffer_count: read_u16_le_checked(bytes, 14)?,
+            row_count: read_u32_le_checked(bytes, 16)?,
+            nodes_offset: read_u32_le_checked(bytes, 20)?,
+            buffer_directory_offset: read_u32_le_checked(bytes, 24)?,
+            buffers_offset: read_u32_le_checked(bytes, 28)?,
             reserved,
         })
     }
@@ -168,8 +168,8 @@ impl CoveEncodingNodeV1 {
             return Err(CoveError::BufferTooShort);
         }
         let bytes = &bytes[..COVE_ENCODING_NODE_LEN];
-        let encoding_raw = u16::from_le_bytes(bytes[2..4].try_into().unwrap());
-        let logical_raw = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
+        let encoding_raw = read_u16_le_checked(bytes, 2)?;
+        let logical_raw = read_u16_le_checked(bytes, 4)?;
         let physical_raw = bytes[6];
         let encoding_kind = CoveEncodingKind::from_u16(encoding_raw).ok_or_else(|| {
             CoveError::UnsupportedEncoding(format!("unknown encoding kind {encoding_raw}"))
@@ -178,22 +178,22 @@ impl CoveEncodingNodeV1 {
             .ok_or_else(|| CoveError::BadSchema(format!("unknown logical type {logical_raw}")))?;
         let physical_kind = CovePhysicalKind::from_u8(physical_raw)
             .ok_or_else(|| CoveError::BadSchema(format!("unknown physical kind {physical_raw}")))?;
-        let reserved = u16::from_le_bytes(bytes[28..30].try_into().unwrap());
+        let reserved = read_u16_le_checked(bytes, 28)?;
         if reserved != 0 {
             return Err(CoveError::ReservedNotZero);
         }
         Ok(Self {
-            node_id: u16::from_le_bytes(bytes[0..2].try_into().unwrap()),
+            node_id: read_u16_le_checked(bytes, 0)?,
             encoding_kind,
             logical_type,
             physical_kind,
             flags: bytes[7],
-            logical_len: u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
-            child_count: u16::from_le_bytes(bytes[12..14].try_into().unwrap()),
-            buffer_count: u16::from_le_bytes(bytes[14..16].try_into().unwrap()),
-            params_offset: u32::from_le_bytes(bytes[16..20].try_into().unwrap()),
-            params_length: u32::from_le_bytes(bytes[20..24].try_into().unwrap()),
-            stats_id: u32::from_le_bytes(bytes[24..28].try_into().unwrap()),
+            logical_len: read_u32_le_checked(bytes, 8)?,
+            child_count: read_u16_le_checked(bytes, 12)?,
+            buffer_count: read_u16_le_checked(bytes, 14)?,
+            params_offset: read_u32_le_checked(bytes, 16)?,
+            params_length: read_u32_le_checked(bytes, 20)?,
+            stats_id: read_u32_le_checked(bytes, 24)?,
             reserved,
         })
     }
@@ -228,26 +228,26 @@ impl PageBufferDescriptorV1 {
             return Err(CoveError::BufferTooShort);
         }
         let bytes = &bytes[..PAGE_BUFFER_DESCRIPTOR_LEN];
-        let kind_raw = u16::from_le_bytes(bytes[2..4].try_into().unwrap());
+        let kind_raw = read_u16_le_checked(bytes, 2)?;
         let kind = PageBufferKind::from_u16(kind_raw)
             .ok_or_else(|| CoveError::BadSection(format!("unknown page buffer kind {kind_raw}")))?;
-        let flags = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+        let flags = read_u32_le_checked(bytes, 4)?;
         if flags != 0 {
             return Err(CoveError::BadSection(
                 "page buffer flags are reserved and must be zero".into(),
             ));
         }
-        let reserved = u32::from_le_bytes(bytes[28..32].try_into().unwrap());
+        let reserved = read_u32_le_checked(bytes, 28)?;
         if reserved != 0 {
             return Err(CoveError::ReservedNotZero);
         }
         Ok(Self {
-            buffer_id: u16::from_le_bytes(bytes[0..2].try_into().unwrap()),
+            buffer_id: read_u16_le_checked(bytes, 0)?,
             kind,
             flags,
-            offset: u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
-            length: u64::from_le_bytes(bytes[16..24].try_into().unwrap()),
-            checksum: u32::from_le_bytes(bytes[24..28].try_into().unwrap()),
+            offset: read_u64_le_checked(bytes, 8)?,
+            length: read_u64_le_checked(bytes, 16)?,
+            checksum: read_u32_le_checked(bytes, 24)?,
             reserved,
         })
     }

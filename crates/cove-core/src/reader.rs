@@ -50,12 +50,6 @@ pub struct ValidatedCoveFile {
 
 #[derive(Debug, Clone)]
 struct ScopedFeatureMetadata {
-    #[allow(dead_code)]
-    extended: Option<ExtendedFeatureSetV2>,
-    #[allow(dead_code)]
-    profile_matrix: Option<ProfileCapabilityMatrixV2>,
-    #[allow(dead_code)]
-    section_bindings: Vec<SectionFeatureBindingSectionV2>,
     scope_table: FeatureScopeTable,
 }
 
@@ -307,12 +301,7 @@ fn parse_scoped_feature_metadata_with_options(
         profile_matrix.as_ref(),
         &section_bindings,
     )?;
-    Ok(ScopedFeatureMetadata {
-        extended,
-        profile_matrix,
-        section_bindings,
-        scope_table,
-    })
+    Ok(ScopedFeatureMetadata { scope_table })
 }
 
 fn optional_header_section_absent_or_required<T>(

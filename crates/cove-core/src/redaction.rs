@@ -5,7 +5,10 @@
 //! target-local reference, policy, and audit fields needed to prove the
 //! redaction happened deliberately. Redacted values are *not* null values.
 
-use crate::CoveError;
+use crate::{
+    wire::{read_i64_le_checked, read_u16_le_checked, read_u32_le_checked, read_u64_le_checked},
+    CoveError,
+};
 
 /// One redacted value's audit record (Spec §64 `RedactionManifestEntryV1`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,28 +47,32 @@ impl RedactionManifest {
         if bytes.len() < 4 {
             return Err(CoveError::BufferTooShort);
         }
-        let count = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+        let count = read_u32_le_checked(bytes, 0)? as usize;
         let mut pos = 4usize;
         let max_entries_by_min_size = bytes.len().saturating_sub(4) / Self::MIN_ENTRY_LEN;
         let mut entries = Vec::with_capacity(count.min(max_entries_by_min_size));
         for _ in 0..count {
-            if pos + 8 + 4 + 8 + 2 > bytes.len() {
+            if pos
+                .checked_add(8 + 4 + 8 + 2)
+                .ok_or(CoveError::ArithOverflow)?
+                > bytes.len()
+            {
                 return Err(CoveError::BufferTooShort);
             }
-            let redaction_id = u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap());
+            let redaction_id = read_u64_le_checked(bytes, pos)?;
             pos += 8;
-            let section_id = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+            let section_id = read_u32_le_checked(bytes, pos)?;
             pos += 4;
-            let local_ref = u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap());
+            let local_ref = read_u64_le_checked(bytes, pos)?;
             pos += 8;
-            let reason_code = u16::from_le_bytes(bytes[pos..pos + 2].try_into().unwrap());
+            let reason_code = read_u16_le_checked(bytes, pos)?;
             pos += 2;
             let policy_id = read_bytes(bytes, &mut pos, "redaction policy_id")?;
             let audit_ref = read_bytes(bytes, &mut pos, "redaction audit_ref")?;
-            if pos + 8 > bytes.len() {
+            if pos.checked_add(8).ok_or(CoveError::ArithOverflow)? > bytes.len() {
                 return Err(CoveError::BufferTooShort);
             }
-            let created_at_us = i64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap());
+            let created_at_us = read_i64_le_checked(bytes, pos)?;
             pos += 8;
             entries.push(RedactionEntry {
                 redaction_id,
@@ -105,10 +112,11 @@ impl RedactionManifest {
 }
 
 fn read_bytes(bytes: &[u8], pos: &mut usize, _what: &str) -> Result<Vec<u8>, CoveError> {
-    if *pos + 2 > bytes.len() {
+    let len_end = pos.checked_add(2).ok_or(CoveError::ArithOverflow)?;
+    if len_end > bytes.len() {
         return Err(CoveError::BufferTooShort);
     }
-    let len = u16::from_le_bytes(bytes[*pos..*pos + 2].try_into().unwrap()) as usize;
+    let len = read_u16_le_checked(bytes, *pos)? as usize;
     *pos += 2;
     let end = pos.checked_add(len).ok_or(CoveError::ArithOverflow)?;
     if end > bytes.len() {

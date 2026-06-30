@@ -1765,11 +1765,13 @@ fn fingerprint_ref(label: &str, payload: &[u8]) -> u32 {
     material.push(0);
     material.extend_from_slice(payload);
     let digest = compute_digest(DigestAlgorithm::Sha256, &material).unwrap_or_default();
-    let value = digest
-        .get(..4)
-        .and_then(|bytes| bytes.try_into().ok())
-        .map(u32::from_le_bytes)
-        .unwrap_or(1);
+    let value = if digest.len() >= 4 {
+        let mut raw = [0u8; 4];
+        raw.copy_from_slice(&digest[..4]);
+        u32::from_le_bytes(raw)
+    } else {
+        1
+    };
     if value == 0 {
         1
     } else {

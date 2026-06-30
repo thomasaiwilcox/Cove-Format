@@ -2349,8 +2349,8 @@ fn validate_row_ordinal_refs(
         return Err(CoveError::BadCovi);
     }
     let mut previous: Option<u32> = None;
-    for chunk in payload.chunks_exact(4) {
-        let row_ordinal_set_ref = u32::from_le_bytes(chunk.try_into().expect("chunk len checked"));
+    for offset in (0..payload.len()).step_by(4) {
+        let row_ordinal_set_ref = read_u32(payload, offset)?;
         if previous.is_some_and(|previous| row_ordinal_set_ref <= previous) {
             return Err(CoveError::BadCovi);
         }
@@ -2407,8 +2407,8 @@ fn validate_row_ordinal_set_payload(
                 return Err(CoveError::BadCovi);
             }
             let mut previous: Option<u32> = None;
-            for chunk in payload.chunks_exact(4) {
-                let value = u32::from_le_bytes(chunk.try_into().expect("chunk len checked"));
+            for offset in (0..payload.len()).step_by(4) {
+                let value = read_u32(payload, offset)?;
                 if u64::from(value) >= row_set.universe_row_count
                     || previous.is_some_and(|previous| value <= previous)
                 {
@@ -2422,8 +2422,8 @@ fn validate_row_ordinal_set_payload(
                 return Err(CoveError::BadCovi);
             }
             let mut previous: Option<u64> = None;
-            for chunk in payload.chunks_exact(8) {
-                let value = u64::from_le_bytes(chunk.try_into().expect("chunk len checked"));
+            for offset in (0..payload.len()).step_by(8) {
+                let value = read_u64(payload, offset)?;
                 if value >= row_set.universe_row_count
                     || previous.is_some_and(|previous| value <= previous)
                 {
@@ -3702,7 +3702,9 @@ fn read_array<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N], Co
     if end > bytes.len() {
         return Err(CoveError::BufferTooShort);
     }
-    Ok(bytes[offset..end].try_into().unwrap())
+    let mut out = [0u8; N];
+    out.copy_from_slice(&bytes[offset..end]);
+    Ok(out)
 }
 
 #[cfg(test)]

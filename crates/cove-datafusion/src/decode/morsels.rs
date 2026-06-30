@@ -1,5 +1,3 @@
-#![allow(clippy::items_after_test_module)]
-
 use std::collections::HashMap;
 
 use super::*;
@@ -58,7 +56,7 @@ fn topn_score(summary: &cove_core::index::topn::TopNSummary) -> Option<u64> {
         .payload
         .chunks_exact(16)
         .next()
-        .and_then(|chunk| chunk[0..8].try_into().ok().map(u64::from_le_bytes))
+        .and_then(|chunk| wire::read_u64_le_checked(chunk, 0).ok())
 }
 
 #[derive(Debug)]
@@ -380,6 +378,21 @@ fn column_page_index(
     ColumnPageIndex::parse(bytes)
 }
 
+pub(super) fn prepare_segment_payload(
+    segment_bytes: &[u8],
+    segment: &TableSegmentPayloadV1,
+) -> Result<SegmentMetadata, CoveError> {
+    let mut page_indexes = Vec::with_capacity(segment.columns.len());
+    for column in &segment.columns {
+        page_indexes.push(column_page_index(segment_bytes, column)?);
+    }
+    SegmentMetadata::new(
+        segment.morsels.clone(),
+        segment.columns.clone(),
+        page_indexes,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -537,19 +550,4 @@ mod tests {
             Err(CoveError::SegmentCorrupt)
         ));
     }
-}
-
-pub(super) fn prepare_segment_payload(
-    segment_bytes: &[u8],
-    segment: &TableSegmentPayloadV1,
-) -> Result<SegmentMetadata, CoveError> {
-    let mut page_indexes = Vec::with_capacity(segment.columns.len());
-    for column in &segment.columns {
-        page_indexes.push(column_page_index(segment_bytes, column)?);
-    }
-    SegmentMetadata::new(
-        segment.morsels.clone(),
-        segment.columns.clone(),
-        page_indexes,
-    )
 }

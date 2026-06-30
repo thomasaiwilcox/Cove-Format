@@ -4,7 +4,7 @@
 //! little-endian bit stream. `bits_per_value` MUST be in `1..=63`. Decoding
 //! returns the values widened to `i64` (zero-extended).
 
-use crate::CoveError;
+use crate::{wire, CoveError};
 
 use super::Encoding;
 
@@ -25,9 +25,12 @@ impl BitPackedPayload {
         if !(1..=63).contains(&bpv) {
             return Err(CoveError::PageCorrupt);
         }
-        let row_count = u32::from_le_bytes(bytes[1..5].try_into().unwrap());
-        let byte_len = u32::from_le_bytes(bytes[5..9].try_into().unwrap()) as usize;
-        if bytes.len() < 9 + byte_len {
+        let row_count = wire::read_u32_le_checked(bytes, 1)?;
+        let byte_len = wire::read_u32_le_checked(bytes, 5)? as usize;
+        let end = 9usize
+            .checked_add(byte_len)
+            .ok_or(CoveError::ArithOverflow)?;
+        if bytes.len() < end {
             return Err(CoveError::BufferTooShort);
         }
         let need_bits = (row_count as u64) * (bpv as u64);
@@ -38,7 +41,7 @@ impl BitPackedPayload {
         Ok(Self {
             bits_per_value: bpv,
             row_count,
-            bits: bytes[9..9 + byte_len].to_vec(),
+            bits: bytes[9..end].to_vec(),
         })
     }
 

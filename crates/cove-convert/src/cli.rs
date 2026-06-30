@@ -4,12 +4,9 @@ use cove_arrow::convert::{
     ParquetAccelerationPolicy, ParquetAggregatePolicy, ParquetClusteringPolicy,
     ParquetConversionOptions, ParquetConversionResult, ParquetDictionaryPolicy, ParquetStatsPolicy,
 };
-use cove_core::{
-    constants::{CompressionCodec, DigestAlgorithm},
-    digest::compute_digest,
-    durable,
-    utility::hex_encode,
-};
+use cove_core::{constants::CompressionCodec, durable};
+
+use crate::source::ConvertError;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConversionCommand {
@@ -206,16 +203,14 @@ pub fn set_source_identity(
     options: &mut ParquetConversionOptions,
     input: &std::path::Path,
     bytes: &[u8],
-) -> Result<(), String> {
+) -> Result<(), ConvertError> {
     options.source_identifier = Some(input.display().to_string());
     options.source_digest = Some(source_digest(bytes)?);
     Ok(())
 }
 
-pub fn source_digest(bytes: &[u8]) -> Result<String, String> {
-    compute_digest(DigestAlgorithm::Sha256, bytes)
-        .map(|digest| format!("sha256:{}", hex_encode(&digest)))
-        .map_err(|err| err.to_string())
+pub fn source_digest(bytes: &[u8]) -> Result<String, ConvertError> {
+    crate::source::source_digest(bytes)
 }
 
 fn next_value(iter: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, String> {

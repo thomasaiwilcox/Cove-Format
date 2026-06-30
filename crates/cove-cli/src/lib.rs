@@ -1816,7 +1816,7 @@ fn ai_export_jsonl(value: &serde_json::Value) -> String {
     let mut out = String::new();
     if let Some(records) = value.get("records").and_then(|records| records.as_array()) {
         for record in records {
-            out.push_str(&serde_json::to_string(record).unwrap());
+            out.push_str(&record.to_string());
             out.push('\n');
         }
     }
@@ -1830,7 +1830,7 @@ fn write_ai_export_output(
 ) -> Result<(), String> {
     match format {
         "json" => {
-            let text = serde_json::to_string_pretty(value).unwrap();
+            let text = json_pretty_string(value)?;
             if let Some(out) = out {
                 fs::write(&out, text)
                     .map_err(|error| format!("cannot write {}: {error}", out.display()))?;
@@ -1899,7 +1899,7 @@ fn ai_export_record_batch(value: &serde_json::Value) -> Result<RecordBatch, Stri
     let record_json = StringArray::from(
         records
             .iter()
-            .map(|record| serde_json::to_string(record).unwrap())
+            .map(|record| record.to_string())
             .collect::<Vec<_>>(),
     );
     let mut metadata = HashMap::new();
@@ -1916,7 +1916,7 @@ fn ai_export_record_batch(value: &serde_json::Value) -> Result<RecordBatch, Stri
     if let Some(diagnostics) = value.get("diagnostics") {
         metadata.insert(
             "cove.ai.diagnostics_json".to_string(),
-            serde_json::to_string(diagnostics).unwrap(),
+            diagnostics.to_string(),
         );
     }
     let schema = Schema::new(vec![
@@ -2003,16 +2003,12 @@ fn write_ai_export_webdataset(value: &serde_json::Value) -> Result<Vec<u8>, Stri
         object.remove("records");
         object.remove("samples");
     }
-    write_tar_entry(
-        &mut out,
-        "metadata.json",
-        &serde_json::to_vec_pretty(&metadata).unwrap(),
-    )?;
+    write_tar_entry(&mut out, "metadata.json", &json_pretty_bytes(&metadata)?)?;
     for (index, record) in records.iter().enumerate() {
         write_tar_entry(
             &mut out,
             &format!("{index:06}.json"),
-            serde_json::to_string(record).unwrap().as_bytes(),
+            record.to_string().as_bytes(),
         )?;
     }
     out.extend_from_slice(&[0u8; 1024]);
@@ -2585,7 +2581,7 @@ fn training_export_jsonl(
                 include_payloads,
                 payload_reader,
             ))
-            .unwrap(),
+            .map_err(|error| format!("cannot serialize training sample JSON: {error}"))?,
         );
         out.push('\n');
     }
@@ -2829,7 +2825,7 @@ fn run_arrow_query_export(args: Vec<String>) -> Result<(), String> {
             &snapshot.extension,
         );
         if command.delta_plan_json {
-            eprintln!("{}", serde_json::to_string_pretty(&plan_json).unwrap());
+            eprint_json_pretty(&plan_json)?;
         } else if command.delta_plan {
             print_query_delta_plan_text(&command.input, &snapshot.plan);
         }
@@ -3269,10 +3265,7 @@ fn run_map_delta_build(args: Vec<String>) -> Result<(), String> {
         },
     )?;
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&result.manifest).unwrap()
-        );
+        print_json_pretty(&result.manifest)?;
     } else {
         println!("COVE-MAP delta build: {}", out_dir.display());
         if let Some(object) = result
@@ -3352,7 +3345,7 @@ fn run_map_semantic_delta_build(
         },
     )?;
     if json {
-        println!("{}", serde_json::to_string_pretty(&result.report).unwrap());
+        print_json_pretty(&result.report)?;
     } else {
         println!("COVE-MAP semantic delta: {}", out.display());
         if let Some(snapshot_id) = result
@@ -3536,7 +3529,7 @@ fn run_examples(json: bool) -> Result<(), String> {
                 })
             }).collect::<Vec<_>>(),
         });
-        println!("{}", serde_json::to_string_pretty(&value).unwrap());
+        print_json_pretty(&value)?;
         return Ok(());
     }
 
@@ -3740,7 +3733,7 @@ fn run_doctor(file: &Path, json: bool) -> Result<(), String> {
             "suggested_queries": suggestions,
             "performance": acceleration_report_json(&bundle),
         });
-        println!("{}", serde_json::to_string_pretty(&value).unwrap());
+        print_json_pretty(&value)?;
         return Ok(());
     }
 
@@ -3818,7 +3811,7 @@ fn run_inspect(
             );
             value["performance"] = acceleration_report_json(&bundle);
         }
-        println!("{}", serde_json::to_string_pretty(&value).unwrap());
+        print_json_pretty(&value)?;
         return Ok(());
     }
     print_discovery(&discovery, queries);
@@ -3928,7 +3921,7 @@ fn run_ai_inspect(file: &Path, bytes: &[u8], json: bool) -> Result<(), String> {
                 "records": records,
                 "sections": sections,
             });
-            println!("{}", serde_json::to_string_pretty(&value).unwrap());
+            print_json_pretty(&value)?;
             return Ok(());
         }
         println!("AI Inspect: {}", file.display());
@@ -4029,7 +4022,7 @@ fn run_ai_inspect(file: &Path, bytes: &[u8], json: bool) -> Result<(), String> {
         let summary = map_ai_summary(&embedded);
         if json {
             let value = map_ai_summary_json(file, "covemap", &summary);
-            println!("{}", serde_json::to_string_pretty(&value).unwrap());
+            print_json_pretty(&value)?;
             return Ok(());
         }
         print_map_ai_summary(file, "covemap", &summary);
@@ -4065,7 +4058,7 @@ fn run_ai_inspect(file: &Path, bytes: &[u8], json: bool) -> Result<(), String> {
             })).collect::<Vec<_>>(),
             "map_ai": map_ai_summary_value(&summary),
         });
-        println!("{}", serde_json::to_string_pretty(&value).unwrap());
+        print_json_pretty(&value)?;
         return Ok(());
     }
     println!("AI Inspect: {}", file.display());
@@ -4073,12 +4066,12 @@ fn run_ai_inspect(file: &Path, bytes: &[u8], json: bool) -> Result<(), String> {
     println!("Embedded AI sections: {}", ai_sections.len());
     print_map_ai_summary_details(&summary);
     for section in ai_sections {
+        let section_kind = SectionKind::from_u16(section.section_kind)
+            .map(|kind| format!("{kind:?}"))
+            .unwrap_or_else(|| format!("unknown({})", section.section_kind));
         println!(
-            "  - id={} kind={:?} offset={} len={}",
-            section.section_id,
-            SectionKind::from_u16(section.section_kind).unwrap(),
-            section.offset,
-            section.length
+            "  - id={} kind={} offset={} len={}",
+            section.section_id, section_kind, section.offset, section.length
         );
     }
     Ok(())
@@ -4360,7 +4353,7 @@ fn run_optimize(file: &Path, out_dir: Option<&Path>, full: bool, json: bool) -> 
     let report = generate_acceleration_sidecars(&bytes, plan, &out_dir)
         .map_err(|error| format!("cannot optimize {}: {error}", file.display()))?;
     if json {
-        println!("{}", serde_json::to_string_pretty(&report).unwrap());
+        print_json_pretty(&report)?;
         return Ok(());
     }
     println!("Optimized: {}", file.display());
@@ -4396,7 +4389,7 @@ fn run_query(file: Option<&Path>, query: &str, options: QueryCommandOptions) -> 
         Some(file) => {
             fs::read(file).map_err(|error| format!("cannot read {}: {error}", file.display()))?
         }
-        None => external_only_context_bytes(),
+        None => external_only_context_bytes()?,
     };
     let delta_manifest = file.is_some()
         && cove_datafusion::delta_snapshot::delta_chain_required(&bytes).unwrap_or(false);
@@ -4404,7 +4397,9 @@ fn run_query(file: Option<&Path>, query: &str, options: QueryCommandOptions) -> 
     let mut delta_snapshot = None;
     let mut delta_direct_surface = None;
     if delta_manifest {
-        let manifest = file.expect("delta_manifest implies file");
+        let Some(manifest) = file else {
+            return Err("internal error: delta manifest selected without input file".into());
+        };
         let dataset = options
             .dataset
             .as_deref()
@@ -4436,17 +4431,12 @@ fn run_query(file: Option<&Path>, query: &str, options: QueryCommandOptions) -> 
             );
         }
         if options.delta_plan_json {
-            eprintln!(
-                "{}",
-                serde_json::to_string_pretty(
-                    &cove_datafusion::delta_snapshot::delta_snapshot_plan_json(
-                        Some(manifest),
-                        &snapshot.plan,
-                        &snapshot.extension,
-                    )
-                )
-                .unwrap()
+            let plan_json = cove_datafusion::delta_snapshot::delta_snapshot_plan_json(
+                Some(manifest),
+                &snapshot.plan,
+                &snapshot.extension,
             );
+            eprint_json_pretty(&plan_json)?;
         } else if options.delta_plan {
             print_query_delta_plan_text(manifest, &snapshot.plan);
         }
@@ -4551,9 +4541,9 @@ fn run_query(file: Option<&Path>, query: &str, options: QueryCommandOptions) -> 
             ArtifactExecutionEngine::Materialized
         );
     let executed = if use_direct_delta_surface {
-        let surface = delta_direct_surface
-            .as_ref()
-            .expect("checked direct delta surface");
+        let Some(surface) = delta_direct_surface.as_ref() else {
+            return Err("internal error: direct delta surface selected but unavailable".into());
+        };
         match execute_delta_object_surface_query(&bytes, surface, &query, &execute_options) {
             Ok(executed) => {
                 if options.perf_report {
@@ -4572,9 +4562,11 @@ fn run_query(file: Option<&Path>, query: &str, options: QueryCommandOptions) -> 
             }
             Err(direct_error) => {
                 let direct_error = direct_error.to_string();
-                let snapshot = delta_snapshot
-                    .as_ref()
-                    .expect("delta snapshot is loaded when direct surface exists");
+                let Some(snapshot) = delta_snapshot.as_ref() else {
+                    return Err(format!(
+                        "direct delta execution failed ({direct_error}) and validated delta snapshot is unavailable"
+                    ));
+                };
                 let materialized =
                     cove_datafusion::delta_snapshot::materialize_validated_delta_snapshot(
                         snapshot,
@@ -4593,9 +4585,12 @@ fn run_query(file: Option<&Path>, query: &str, options: QueryCommandOptions) -> 
         }
     } else {
         if delta_direct_surface.is_some() {
-            let snapshot = delta_snapshot
-                .as_ref()
-                .expect("delta snapshot is loaded when direct surface exists");
+            let Some(snapshot) = delta_snapshot.as_ref() else {
+                return Err(
+                    "internal error: direct delta surface selected without validated snapshot"
+                        .into(),
+                );
+            };
             let materialized =
                 cove_datafusion::delta_snapshot::materialize_validated_delta_snapshot(snapshot)?;
             bytes = materialized.bytes;
@@ -4832,13 +4827,13 @@ fn execute_query_with_cli_fallback(
     }
 }
 
-fn external_only_context_bytes() -> Vec<u8> {
+fn external_only_context_bytes() -> Result<Vec<u8>, String> {
     ScanProfileCoveWriter::new(TableCatalog {
         flags: 0,
         tables: Vec::new(),
     })
     .write()
-    .expect("empty COVE-T context file is valid")
+    .map_err(|error| format!("cannot build empty COVE-T context file: {error}"))
 }
 
 fn apply_graph_budget(options: &mut ExecuteArtifactOptions, budget: GraphBudgetOverrides) {
@@ -5340,6 +5335,26 @@ fn format_execution_error(error: coveql::BuildExecutionError, json_diagnostics: 
     } else {
         error.to_string()
     }
+}
+
+fn json_pretty_string<T: serde::Serialize + ?Sized>(value: &T) -> Result<String, String> {
+    serde_json::to_string_pretty(value)
+        .map_err(|error| format!("cannot serialize JSON output: {error}"))
+}
+
+fn json_pretty_bytes<T: serde::Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, String> {
+    serde_json::to_vec_pretty(value)
+        .map_err(|error| format!("cannot serialize JSON output: {error}"))
+}
+
+fn print_json_pretty<T: serde::Serialize + ?Sized>(value: &T) -> Result<(), String> {
+    println!("{}", json_pretty_string(value)?);
+    Ok(())
+}
+
+fn eprint_json_pretty<T: serde::Serialize + ?Sized>(value: &T) -> Result<(), String> {
+    eprintln!("{}", json_pretty_string(value)?);
+    Ok(())
 }
 
 fn beginner_suggestion(code: &str) -> &'static str {

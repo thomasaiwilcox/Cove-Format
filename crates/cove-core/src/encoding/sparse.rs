@@ -11,7 +11,7 @@
 //! Spec §20.3.8 requires override positions to be strictly increasing and
 //! distinct from any other override.
 
-use crate::CoveError;
+use crate::{wire, CoveError};
 
 use super::Encoding;
 
@@ -27,10 +27,13 @@ impl SparsePayload {
         if bytes.len() < 16 {
             return Err(CoveError::BufferTooShort);
         }
-        let row_count = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
-        let fill = i64::from_le_bytes(bytes[4..12].try_into().unwrap());
-        let oc = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
-        let need = 16 + oc * 12;
+        let row_count = wire::read_u32_le_checked(bytes, 0)?;
+        let fill = wire::read_i64_le_checked(bytes, 4)?;
+        let oc = wire::read_u32_le_checked(bytes, 12)? as usize;
+        let need = oc
+            .checked_mul(12)
+            .and_then(|bytes| bytes.checked_add(16))
+            .ok_or(CoveError::ArithOverflow)?;
         if bytes.len() < need {
             return Err(CoveError::BufferTooShort);
         }
@@ -38,8 +41,8 @@ impl SparsePayload {
         let mut prev: Option<u32> = None;
         for i in 0..oc {
             let off = 16 + i * 12;
-            let p = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
-            let v = i64::from_le_bytes(bytes[off + 4..off + 12].try_into().unwrap());
+            let p = wire::read_u32_le_checked(bytes, off)?;
+            let v = wire::read_i64_le_checked(bytes, off + 4)?;
             if let Some(prev_pos) = prev {
                 if p <= prev_pos {
                     return Err(CoveError::PageCorrupt);

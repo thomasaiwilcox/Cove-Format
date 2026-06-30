@@ -1651,11 +1651,8 @@ fn planned_with_row_scan_filters(
         .map(|filter| row_predicate_from_scan_filter(planned, filter))
         .collect::<Option<Vec<_>>>()?;
     let mut planned = planned.clone();
-    planned.resolved.method_chain.where_predicate = Some(if predicates.len() == 1 {
-        predicates.into_iter().next().expect("checked len")
-    } else {
-        ResolvedPredicate::And(predicates)
-    });
+    planned.resolved.method_chain.where_predicate =
+        Some(combine_scan_filter_predicates(predicates));
     Some(planned)
 }
 
@@ -1672,12 +1669,17 @@ fn planned_with_projection_scan_filters(
         .map(|filter| projection_predicate_from_scan_filter(schema, filter))
         .collect::<Vec<_>>();
     let mut planned = planned.clone();
-    planned.resolved.method_chain.where_predicate = Some(if predicates.len() == 1 {
-        predicates.into_iter().next().expect("checked len")
+    planned.resolved.method_chain.where_predicate =
+        Some(combine_scan_filter_predicates(predicates));
+    Some(planned)
+}
+
+fn combine_scan_filter_predicates(mut predicates: Vec<ResolvedPredicate>) -> ResolvedPredicate {
+    if predicates.len() == 1 {
+        predicates.remove(0)
     } else {
         ResolvedPredicate::And(predicates)
-    });
-    Some(planned)
+    }
 }
 
 fn projection_predicate_from_scan_filter(

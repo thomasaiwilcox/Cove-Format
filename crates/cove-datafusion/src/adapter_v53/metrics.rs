@@ -18,36 +18,37 @@ pub(crate) struct CoveFileMetrics {
     pub(crate) covx_sidecars_loaded: Count,
     pub(crate) covx_sidecars_stale: Count,
     pub(crate) covx_sidecars_ignored: Count,
-    #[allow(dead_code)]
+    // Populated by projection COVI paths when the `covi` feature is enabled.
+    #[cfg_attr(not(feature = "covi"), allow(dead_code))]
     pub(crate) covi_sidecars_loaded: Count,
-    #[allow(dead_code)]
+    #[cfg_attr(not(feature = "covi"), allow(dead_code))]
     pub(crate) covi_sidecars_stale: Count,
-    #[allow(dead_code)]
+    #[cfg_attr(not(feature = "covi"), allow(dead_code))]
     pub(crate) covi_sidecars_ignored: Count,
     pub(crate) sidecar_index_fallbacks: Count,
-    #[allow(dead_code)]
+    #[cfg_attr(not(feature = "covi"), allow(dead_code))]
     pub(crate) projection_covi_sidecars_found: Count,
-    #[allow(dead_code)]
+    #[cfg_attr(not(feature = "covi"), allow(dead_code))]
     pub(crate) projection_covi_sidecars_ignored: Count,
-    #[allow(dead_code)]
+    #[cfg_attr(not(feature = "covi"), allow(dead_code))]
     pub(crate) projection_covi_validation_bytes: Count,
-    #[allow(dead_code)]
+    #[cfg_attr(not(feature = "covi"), allow(dead_code))]
     pub(crate) projection_covi_root_count: Count,
-    #[allow(dead_code)]
+    #[cfg_attr(not(feature = "covi"), allow(dead_code))]
     pub(crate) projection_covi_eligible_filters: Count,
-    #[allow(dead_code)]
+    #[cfg_attr(not(feature = "covi"), allow(dead_code))]
     pub(crate) projection_covi_candidate_rows: Count,
-    #[allow(dead_code)]
+    #[cfg_attr(not(feature = "covi"), allow(dead_code))]
     pub(crate) projection_covi_rows_skipped: Count,
-    #[allow(dead_code)]
+    #[cfg_attr(not(feature = "covi"), allow(dead_code))]
     pub(crate) projection_covi_residual_rows_checked: Count,
-    #[allow(dead_code)]
+    #[cfg_attr(not(feature = "covi"), allow(dead_code))]
     pub(crate) projection_covi_fallback_no_sidecar: Count,
-    #[allow(dead_code)]
+    #[cfg_attr(not(feature = "covi"), allow(dead_code))]
     pub(crate) projection_covi_fallback_no_eligible_filter: Count,
-    #[allow(dead_code)]
+    #[cfg_attr(not(feature = "covi"), allow(dead_code))]
     pub(crate) projection_covi_fallback_lookup_failed: Count,
-    #[allow(dead_code)]
+    #[cfg_attr(not(feature = "covi"), allow(dead_code))]
     pub(crate) projection_covi_fallback_stale: Count,
     pub(crate) projection_covi_fallback_unavailable: Count,
     pub(crate) covel_sections_loaded: Count,

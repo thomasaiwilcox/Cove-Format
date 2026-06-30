@@ -8,17 +8,13 @@ use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum ProjectionPushdownStatus {
+    #[default]
     FullyPushdownSafe,
     PartiallyPushdownSafe,
     ResidualRequired,
     Disabled,
-}
-
-impl Default for ProjectionPushdownStatus {
-    fn default() -> Self {
-        Self::FullyPushdownSafe
-    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1019,7 +1015,7 @@ fn projection_same_column_equality_or_set(
         }
         literal_keys.extend(summary.literal_keys);
     }
-    (!literal_keys.is_empty()).then(|| ProjectionEqualitySetSummary {
+    (!literal_keys.is_empty()).then_some(ProjectionEqualitySetSummary {
         column,
         literal_keys,
     })

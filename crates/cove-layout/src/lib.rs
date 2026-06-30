@@ -2234,12 +2234,12 @@ impl<'a> Cursor<'a> {
 
     fn u16(&mut self) -> Result<u16, CoveError> {
         let bytes = self.bytes(2)?;
-        Ok(u16::from_le_bytes(bytes.try_into().unwrap()))
+        Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
     }
 
     fn u32(&mut self) -> Result<u32, CoveError> {
         let bytes = self.bytes(4)?;
-        Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
+        Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
     }
 }
 
@@ -2267,7 +2267,9 @@ fn read_array<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N], Co
     if end > bytes.len() {
         return Err(CoveError::BufferTooShort);
     }
-    Ok(bytes[offset..end].try_into().unwrap())
+    let mut out = [0u8; N];
+    out.copy_from_slice(&bytes[offset..end]);
+    Ok(out)
 }
 
 fn checked_end(offset: u64, length: u64) -> Result<u64, CoveError> {

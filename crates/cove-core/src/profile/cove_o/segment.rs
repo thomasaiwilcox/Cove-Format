@@ -14,6 +14,7 @@ use crate::{
     },
     retained_bytes::RetainedBytes,
     segment::{TableColumnDirectoryEntryV1, TABLE_COLUMN_DIRECTORY_ENTRY_LEN},
+    wire::{read_i64_le_checked, read_u32_le_checked, read_u64_le_checked},
     CoveError,
 };
 
@@ -70,7 +71,7 @@ impl TemporalSegmentHeaderV1 {
             return Err(CoveError::BufferTooShort);
         }
         let bytes = &bytes[..TEMPORAL_SEGMENT_HEADER_LEN];
-        let checksum_field = u32::from_le_bytes(bytes[92..96].try_into().unwrap());
+        let checksum_field = read_u32_le_checked(bytes, 92)?;
         let mut for_crc = [0u8; TEMPORAL_SEGMENT_HEADER_LEN];
         for_crc.copy_from_slice(bytes);
         for_crc[92..96].fill(0);
@@ -79,21 +80,21 @@ impl TemporalSegmentHeaderV1 {
         }
 
         Ok(Self {
-            segment_id: u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
-            object_type_id: u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
-            time_range_start_us: i64::from_le_bytes(bytes[8..16].try_into().unwrap()),
-            time_range_end_us: i64::from_le_bytes(bytes[16..24].try_into().unwrap()),
-            csn_min: u64::from_le_bytes(bytes[24..32].try_into().unwrap()),
-            csn_max: u64::from_le_bytes(bytes[32..40].try_into().unwrap()),
-            row_count: u32::from_le_bytes(bytes[40..44].try_into().unwrap()),
-            morsel_count: u32::from_le_bytes(bytes[44..48].try_into().unwrap()),
-            morsel_row_count: u32::from_le_bytes(bytes[48..52].try_into().unwrap()),
-            column_count: u32::from_le_bytes(bytes[52..56].try_into().unwrap()),
-            row_directory_offset: u64::from_le_bytes(bytes[56..64].try_into().unwrap()),
-            column_directory_offset: u64::from_le_bytes(bytes[64..72].try_into().unwrap()),
-            page_index_offset: u64::from_le_bytes(bytes[72..80].try_into().unwrap()),
-            data_offset: u64::from_le_bytes(bytes[80..88].try_into().unwrap()),
-            flags: u32::from_le_bytes(bytes[88..92].try_into().unwrap()),
+            segment_id: read_u32_le_checked(bytes, 0)?,
+            object_type_id: read_u32_le_checked(bytes, 4)?,
+            time_range_start_us: read_i64_le_checked(bytes, 8)?,
+            time_range_end_us: read_i64_le_checked(bytes, 16)?,
+            csn_min: read_u64_le_checked(bytes, 24)?,
+            csn_max: read_u64_le_checked(bytes, 32)?,
+            row_count: read_u32_le_checked(bytes, 40)?,
+            morsel_count: read_u32_le_checked(bytes, 44)?,
+            morsel_row_count: read_u32_le_checked(bytes, 48)?,
+            column_count: read_u32_le_checked(bytes, 52)?,
+            row_directory_offset: read_u64_le_checked(bytes, 56)?,
+            column_directory_offset: read_u64_le_checked(bytes, 64)?,
+            page_index_offset: read_u64_le_checked(bytes, 72)?,
+            data_offset: read_u64_le_checked(bytes, 80)?,
+            flags: read_u32_le_checked(bytes, 88)?,
             checksum: checksum_field,
         })
     }
@@ -123,9 +124,9 @@ impl TemporalRowEntryV1 {
             return Err(CoveError::BufferTooShort);
         }
         let bytes = &bytes[..TEMPORAL_ROW_ENTRY_LEN];
-        let timestamp_us = i64::from_le_bytes(bytes[0..8].try_into().unwrap());
-        let csn = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
-        let branch_key = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
+        let timestamp_us = read_i64_le_checked(bytes, 0)?;
+        let csn = read_u64_le_checked(bytes, 8)?;
+        let branch_key = read_u64_le_checked(bytes, 16)?;
         let mut goid = [0u8; 16];
         goid.copy_from_slice(&bytes[24..40]);
         let mut record_id = [0u8; 16];
@@ -141,8 +142,8 @@ impl TemporalRowEntryV1 {
         if target_kind > 1 {
             return Err(CoveError::RefInvalid);
         }
-        let prev_segment_id = u32::from_le_bytes(bytes[60..64].try_into().unwrap());
-        let prev_row_index = u32::from_le_bytes(bytes[64..68].try_into().unwrap());
+        let prev_segment_id = read_u32_le_checked(bytes, 60)?;
+        let prev_row_index = read_u32_le_checked(bytes, 64)?;
         let prev_ref = match prev_present {
             0 => {
                 if target_kind != 0 || prev_segment_id != 0 || prev_row_index != 0 {
@@ -274,7 +275,7 @@ impl TemporalSegmentData {
         )
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn parse_with_feature_advertisement(
         bytes: &[u8],
         required_features: u64,

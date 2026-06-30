@@ -141,6 +141,7 @@ impl KernelExecutedQuery {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn parse_resolve_plan_build_physical_and_execute_query(
     bytes: &[u8],
     text: &str,
@@ -179,6 +180,7 @@ pub fn parse_resolve_plan_build_physical_and_execute_query(
     execute_physical_planned_query(bytes, physical, execution_options, kernel_options)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn parse_resolve_plan_build_physical_and_execute_query_retained(
     input: CoveQlRetainedInput,
     text: &str,
@@ -5422,7 +5424,12 @@ fn native_system_compare_request(
             let KernelLiteral::String(value) = literal else {
                 return None;
             };
-            let value: [u8; 16] = decode_compact_hex_bytes(value)?.try_into().ok()?;
+            let decoded = decode_compact_hex_bytes(value)?;
+            if decoded.len() != 16 {
+                return None;
+            }
+            let mut value = [0u8; 16];
+            value.copy_from_slice(&decoded);
             Some(NativeScalarPredicateRequest::SystemGoidEq {
                 object_type_id: root_object_type_id,
                 value,
@@ -6623,7 +6630,7 @@ fn set_native_scalar_prune_surface_row(
 }
 
 fn decode_compact_hex_bytes(value: &str) -> Option<Vec<u8>> {
-    if value.len() % 2 != 0 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if !value.len().is_multiple_of(2) || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return None;
     }
     let mut out = Vec::with_capacity(value.len() / 2);
@@ -7501,10 +7508,10 @@ fn collect_conjunctive_covi_empty_lookup_requests(
                     keys.push(key);
                 }
                 if !keys.is_empty() {
-                    out.push(CoviLookupRequestV2::membership_target(
-                        covi_lookup_target_for_path(path),
-                        keys,
-                    ));
+                    let Some(target) = covi_lookup_target_for_path(path) else {
+                        return Ok(());
+                    };
+                    out.push(CoviLookupRequestV2::membership_target(target, keys));
                 }
             }
         }
@@ -7527,10 +7534,10 @@ fn covi_compare_eq_request(
     let Some(key) = covi_canonical_lookup_key(path, literal)? else {
         return Ok(None);
     };
-    Ok(Some(CoviLookupRequestV2::eq_target(
-        covi_lookup_target_for_path(path),
-        key,
-    )))
+    let Some(target) = covi_lookup_target_for_path(path) else {
+        return Ok(None);
+    };
+    Ok(Some(CoviLookupRequestV2::eq_target(target, key)))
 }
 
 fn covi_object_property_path(
@@ -7550,11 +7557,11 @@ fn covi_object_property_path(
     Some(path)
 }
 
-fn covi_lookup_target_for_path(path: &ResolvedPath) -> CoviLookupTargetV2 {
-    CoviLookupTargetV2::ObjectProperty {
-        object_type_id: path.object_type_id.expect("checked object_type_id"),
-        property_id: path.property_id.expect("checked property_id"),
-    }
+fn covi_lookup_target_for_path(path: &ResolvedPath) -> Option<CoviLookupTargetV2> {
+    Some(CoviLookupTargetV2::ObjectProperty {
+        object_type_id: path.object_type_id?,
+        property_id: path.property_id?,
+    })
 }
 
 fn covi_canonical_lookup_key(
@@ -7953,11 +7960,11 @@ fn try_index_only_executed_query(
     }))
 }
 
-fn index_only_aggregate_path<'a>(
+fn index_only_aggregate_path(
     name: AstAggregateName,
-    arg: Option<&'a ResolvedExpr>,
+    arg: Option<&ResolvedExpr>,
     star: bool,
-) -> Option<&'a ResolvedPath> {
+) -> Option<&ResolvedPath> {
     if star {
         return None;
     }
@@ -8432,7 +8439,7 @@ fn try_native_bool_group_count_result(
                 }),
             ));
         }
-        let key = serde_json::to_string(&[value.clone()]).map_err(|err| {
+        let key = serde_json::to_string(std::slice::from_ref(&value)).map_err(|err| {
             exec_error(
                 "E_KERNEL_AGGREGATE",
                 format!("native direct group key could not be serialized: {err}"),
@@ -8652,7 +8659,7 @@ fn try_native_grouped_helper_aggregate_result(
                 }),
             ));
         }
-        let key = serde_json::to_string(&[value.clone()]).map_err(|err| {
+        let key = serde_json::to_string(std::slice::from_ref(&value)).map_err(|err| {
             exec_error(
                 "E_KERNEL_AGGREGATE",
                 format!("native grouped helper key could not be serialized: {err}"),

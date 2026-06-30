@@ -1260,35 +1260,35 @@ fn read_i32_exact(bytes: &[u8]) -> Result<i32, CoveError> {
     if bytes.len() != 4 {
         return Err(CoveError::BadDomain);
     }
-    Ok(i32::from_le_bytes(bytes.try_into().unwrap()))
+    crate::wire::read_i32_le_checked(bytes, 0).map_err(|_| CoveError::BadDomain)
 }
 
 fn read_u32_exact(bytes: &[u8]) -> Result<u32, CoveError> {
     if bytes.len() != 4 {
         return Err(CoveError::BadDomain);
     }
-    Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
+    crate::wire::read_u32_le_checked(bytes, 0).map_err(|_| CoveError::BadDomain)
 }
 
 fn read_i64_prefix(bytes: &[u8]) -> Result<i64, CoveError> {
     if bytes.len() < 8 {
         return Err(CoveError::BadDomain);
     }
-    Ok(i64::from_le_bytes(bytes[..8].try_into().unwrap()))
+    crate::wire::read_i64_le_checked(bytes, 0).map_err(|_| CoveError::BadDomain)
 }
 
 fn read_u64_prefix(bytes: &[u8]) -> Result<u64, CoveError> {
     if bytes.len() < 8 {
         return Err(CoveError::BadDomain);
     }
-    Ok(u64::from_le_bytes(bytes[..8].try_into().unwrap()))
+    crate::wire::read_u64_le_checked(bytes, 0).map_err(|_| CoveError::BadDomain)
 }
 
 fn read_i128_exact(bytes: &[u8]) -> Result<i128, CoveError> {
     if bytes.len() != 16 {
         return Err(CoveError::BadDomain);
     }
-    Ok(i128::from_le_bytes(bytes.try_into().unwrap()))
+    crate::wire::read_i128_le_checked(bytes, 0).map_err(|_| CoveError::BadDomain)
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -82,8 +82,10 @@ pub fn lower_filter(
 ) -> FilterPlan {
     let display = display.into();
     let lowering = lower_filters(state, expr, display.clone());
-    if lowering.fallbacks == 0 && lowering.filters.len() == 1 {
-        return lowering.filters.into_iter().next().expect("single filter");
+    if lowering.fallbacks == 0 {
+        if let [filter] = lowering.filters.as_slice() {
+            return filter.clone();
+        }
     }
     FilterPlan::unsupported(display)
 }
@@ -797,22 +799,20 @@ fn canonical_literal(
             | CoveLogicalType::Int32
             | CoveLogicalType::Int64,
             literal,
-        ) => CanonicalValue::Int {
+        ) => tagged_optional_canonical_literal(CanonicalValue::Int {
             width: integer_width(logical),
             value: signed_literal(literal)?,
-        }
-        .pipe_tagged(),
+        }),
         (
             CoveLogicalType::UInt8
             | CoveLogicalType::UInt16
             | CoveLogicalType::UInt32
             | CoveLogicalType::UInt64,
             literal,
-        ) => CanonicalValue::Uint {
+        ) => tagged_optional_canonical_literal(CanonicalValue::Uint {
             width: integer_width(logical),
             value: unsigned_literal(literal)?,
-        }
-        .pipe_tagged(),
+        }),
         (CoveLogicalType::Float32, LowerLiteral::Float64(value)) => {
             tagged_canonical_literal(CanonicalValue::Float32(*value as f32)).map(Some)
         }
@@ -852,16 +852,6 @@ fn canonical_literal(
     }
 }
 
-trait TaggedCanonicalLiteralExt<'a> {
-    fn pipe_tagged(self) -> Result<Option<FileCodeCanonicalLiteral>, CoveError>;
-}
-
-impl<'a> TaggedCanonicalLiteralExt<'a> for CanonicalValue<'a> {
-    fn pipe_tagged(self) -> Result<Option<FileCodeCanonicalLiteral>, CoveError> {
-        tagged_canonical_literal(self).map(Some)
-    }
-}
-
 fn tagged_canonical_literal(
     value: CanonicalValue<'_>,
 ) -> Result<FileCodeCanonicalLiteral, CoveError> {
@@ -871,6 +861,12 @@ fn tagged_canonical_literal(
         key: tagged_key(tag, &payload),
         payload,
     })
+}
+
+fn tagged_optional_canonical_literal(
+    value: CanonicalValue<'_>,
+) -> Result<Option<FileCodeCanonicalLiteral>, CoveError> {
+    tagged_canonical_literal(value).map(Some)
 }
 
 fn tagged_key(tag: ValueTag, payload: &[u8]) -> Vec<u8> {

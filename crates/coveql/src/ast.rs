@@ -297,29 +297,21 @@ pub struct AstOrderClause {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum AstOrderDirection {
+    #[default]
     Asc,
     Desc,
 }
 
-impl Default for AstOrderDirection {
-    fn default() -> Self {
-        Self::Asc
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum AstNullOrdering {
+    #[default]
     Default,
     NullsFirst,
     NullsLast,
-}
-
-impl Default for AstNullOrdering {
-    fn default() -> Self {
-        Self::Default
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -546,31 +538,23 @@ impl AstChangeBound {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum AstHistoryMode {
     Records,
+    #[default]
     States,
     RecordsAndStates,
 }
 
-impl Default for AstHistoryMode {
-    fn default() -> Self {
-        Self::States
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum AstChangeMode {
+    #[default]
     Records,
     StateTransitions,
     PropertyDiffs,
     FinalRows,
-}
-
-impl Default for AstChangeMode {
-    fn default() -> Self {
-        Self::Records
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1094,6 +1078,7 @@ impl ResolvedQuery {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind", content = "value")]
 pub enum ResolvedRoot {
@@ -1360,6 +1345,7 @@ pub struct ResolvedAiArgument {
     pub value: ResolvedAiArgumentValue,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind", content = "value")]
 pub enum ResolvedAiArgumentValue {
@@ -1657,6 +1643,7 @@ pub struct ResolvedOrderClause {
     pub uses_default_ordering: bool,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind", content = "value")]
 pub enum ResolvedPredicate {
@@ -1680,6 +1667,7 @@ pub enum ResolvedPredicate {
     Or(Vec<ResolvedPredicate>),
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind", content = "value")]
 pub enum ResolvedExpr {

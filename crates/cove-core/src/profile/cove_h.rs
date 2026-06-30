@@ -6,7 +6,11 @@
 
 use std::collections::BTreeMap;
 
-use crate::{checksum, CoveError};
+use crate::{
+    checksum,
+    wire::{read_u16_le_checked, read_u32_le_checked, read_u64_le_checked},
+    CoveError,
+};
 
 pub const HARBOR_MOUNT_HINTS_LEN: usize = 44;
 
@@ -157,21 +161,21 @@ impl HarborMountHintsV1 {
         if bytes.len() < HARBOR_MOUNT_HINTS_LEN {
             return Err(CoveError::BufferTooShort);
         }
-        let harbor_profile_version_major = u16::from_le_bytes(bytes[0..2].try_into().unwrap());
-        let harbor_profile_version_minor = u16::from_le_bytes(bytes[2..4].try_into().unwrap());
-        let tenant_scope_ref = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
-        let code_space_ref = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
-        let lease_epoch = u64::from_le_bytes(bytes[12..20].try_into().unwrap());
-        let dictionary_digest_ref = u32::from_le_bytes(bytes[20..24].try_into().unwrap());
-        let catalog_digest_ref = u32::from_le_bytes(bytes[24..28].try_into().unwrap());
+        let harbor_profile_version_major = read_u16_le_checked(bytes, 0)?;
+        let harbor_profile_version_minor = read_u16_le_checked(bytes, 2)?;
+        let tenant_scope_ref = read_u32_le_checked(bytes, 4)?;
+        let code_space_ref = read_u32_le_checked(bytes, 8)?;
+        let lease_epoch = read_u64_le_checked(bytes, 12)?;
+        let dictionary_digest_ref = read_u32_le_checked(bytes, 20)?;
+        let catalog_digest_ref = read_u32_le_checked(bytes, 24)?;
         let mount_cache_policy = bytes[28];
         let mut reserved = [0u8; 7];
         reserved.copy_from_slice(&bytes[29..36]);
         if reserved != [0; 7] {
             return Err(CoveError::ReservedNotZero);
         }
-        let private_payload_ref = u32::from_le_bytes(bytes[36..40].try_into().unwrap());
-        let checksum_field = u32::from_le_bytes(bytes[40..44].try_into().unwrap());
+        let private_payload_ref = read_u32_le_checked(bytes, 36)?;
+        let checksum_field = read_u32_le_checked(bytes, 40)?;
 
         let mut for_crc = [0u8; HARBOR_MOUNT_HINTS_LEN];
         for_crc.copy_from_slice(&bytes[..HARBOR_MOUNT_HINTS_LEN]);

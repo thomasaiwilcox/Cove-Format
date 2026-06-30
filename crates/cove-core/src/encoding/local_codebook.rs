@@ -10,7 +10,7 @@
 //! `Encoding` trait exposes the integer-compatible subset for the simplified
 //! reference decoder used by conformance fixtures.
 
-use crate::{constants::CoveEncodingKind, constants::CovePhysicalKind, CoveError};
+use crate::{constants::CoveEncodingKind, constants::CovePhysicalKind, wire, CoveError};
 
 use super::{
     bit_packed::{BitPacked, BitPackedPayload},
@@ -168,10 +168,10 @@ impl LocalCodebookValues {
                 if bytes.len() != expected {
                     return Err(CoveError::PageCorrupt);
                 }
-                let values = bytes
-                    .chunks_exact(4)
-                    .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
-                    .collect();
+                let values = (0..expected)
+                    .step_by(4)
+                    .map(|offset| wire::read_u32_le_checked(bytes, offset))
+                    .collect::<Result<Vec<_>, _>>()?;
                 Ok(Self::FileCode(values))
             }
             LocalCodebookValueKind::NumCode => {
@@ -181,10 +181,10 @@ impl LocalCodebookValues {
                 if bytes.len() != expected {
                     return Err(CoveError::PageCorrupt);
                 }
-                let values = bytes
-                    .chunks_exact(8)
-                    .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
-                    .collect();
+                let values = (0..expected)
+                    .step_by(8)
+                    .map(|offset| wire::read_u64_le_checked(bytes, offset))
+                    .collect::<Result<Vec<_>, _>>()?;
                 Ok(Self::NumCode(values))
             }
             LocalCodebookValueKind::Boolean => {
@@ -209,8 +209,7 @@ impl LocalCodebookValues {
                     if length_end > bytes.len() {
                         return Err(CoveError::BufferTooShort);
                     }
-                    let length =
-                        u32::from_le_bytes(bytes[offset..length_end].try_into().unwrap()) as usize;
+                    let length = wire::read_u32_le_checked(bytes, offset)? as usize;
                     let value_end = length_end
                         .checked_add(length)
                         .ok_or(CoveError::ArithOverflow)?;
@@ -303,11 +302,10 @@ impl LocalCodebookPayload {
         if bytes.len() < 12 {
             return Err(CoveError::BufferTooShort);
         }
-        let child_raw = u16::from_le_bytes(bytes[0..2].try_into().unwrap());
-        let value_kind =
-            LocalCodebookValueKind::from_raw(u16::from_le_bytes(bytes[2..4].try_into().unwrap()))?;
-        let codebook_len = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
-        let child_len = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+        let child_raw = wire::read_u16_le_checked(bytes, 0)?;
+        let value_kind = LocalCodebookValueKind::from_raw(wire::read_u16_le_checked(bytes, 2)?)?;
+        let codebook_len = wire::read_u32_le_checked(bytes, 4)? as usize;
+        let child_len = wire::read_u32_le_checked(bytes, 8)? as usize;
         let header_len = 12usize;
         if child_len > bytes.len().saturating_sub(header_len) {
             return Err(CoveError::BufferTooShort);

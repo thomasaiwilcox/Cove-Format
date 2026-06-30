@@ -108,6 +108,26 @@ pub enum Command {
     Help,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandKind {
+    Smoke,
+    Corpus,
+    Parsers,
+    Encodings,
+}
+
+impl CommandKind {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "smoke" => Some(Self::Smoke),
+            "corpus" => Some(Self::Corpus),
+            "parsers" => Some(Self::Parsers),
+            "encodings" => Some(Self::Encodings),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CampaignStats {
     pub campaign: &'static str,
@@ -198,42 +218,43 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, Str
                         .map_err(|_| format!("invalid mutation count '{raw}'"))?,
                 );
             }
-            "smoke" | "corpus" | "parsers" | "encodings" => {
-                if command.replace(arg).is_some() {
-                    return Err("only one subcommand may be provided".into());
-                }
-            }
-            other if other.starts_with('-') => return Err(format!("unknown option {other}")),
-            path => {
-                if command.as_deref() != Some("corpus") {
-                    return Err(format!("unknown subcommand {path}"));
-                }
-                if manifest.replace(PathBuf::from(path)).is_some() {
-                    return Err("only one manifest path may be provided".into());
+            raw => {
+                if let Some(parsed) = CommandKind::parse(raw) {
+                    if command.replace(parsed).is_some() {
+                        return Err("only one subcommand may be provided".into());
+                    }
+                } else if raw.starts_with('-') {
+                    return Err(format!("unknown option {raw}"));
+                } else {
+                    if command != Some(CommandKind::Corpus) {
+                        return Err(format!("unknown subcommand {raw}"));
+                    }
+                    if manifest.replace(PathBuf::from(raw)).is_some() {
+                        return Err("only one manifest path may be provided".into());
+                    }
                 }
             }
         }
     }
 
-    match command.unwrap_or("smoke".to_string()).as_str() {
-        "smoke" => Ok(Command::Smoke {
+    match command.unwrap_or(CommandKind::Smoke) {
+        CommandKind::Smoke => Ok(Command::Smoke {
             seed,
             mutations: mutations.unwrap_or(SMOKE_MUTATIONS),
         }),
-        "corpus" => Ok(Command::Corpus {
+        CommandKind::Corpus => Ok(Command::Corpus {
             manifest: manifest.unwrap_or_else(|| PathBuf::from("conformance/manifest.jsonl")),
             seed,
             mutations: mutations.unwrap_or(CORPUS_MUTATIONS),
         }),
-        "parsers" => Ok(Command::Parsers {
+        CommandKind::Parsers => Ok(Command::Parsers {
             seed,
             mutations: mutations.unwrap_or(PARSER_MUTATIONS),
         }),
-        "encodings" => Ok(Command::Encodings {
+        CommandKind::Encodings => Ok(Command::Encodings {
             seed,
             mutations: mutations.unwrap_or(PARSER_MUTATIONS),
         }),
-        other => Err(format!("unknown subcommand {other}")),
     }
 }
 
@@ -577,11 +598,10 @@ fn run_encoding_parity(seed: u64, stats: &mut CampaignStats) -> Result<(), FuzzF
         })
     })?;
     assert_encoding("local-codebook-bit-packed", seed, 0, stats, || {
+        let indexes = BitPackedPayload::pack(&[0, 1, 2, 1, 0], 2)?;
         assert_parity::<LocalCodebook>(&LocalCodebookPayload {
             values: LocalCodebookValues::FileCode(vec![100, 200, 300]),
-            indexes: LocalIndexPayload::BitPacked(
-                BitPackedPayload::pack(&[0, 1, 2, 1, 0], 2).unwrap(),
-            ),
+            indexes: LocalIndexPayload::BitPacked(indexes),
         })
     })?;
     assert_encoding("local-codebook-rle", seed, 0, stats, || {
@@ -1095,7 +1115,7 @@ fn validate_file_dictionary_fixture(bytes: &[u8]) -> Result<(), CoveError> {
     if bytes.len() < 4 {
         return Err(CoveError::BufferTooShort);
     }
-    let index_len = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+    let index_len = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
     let split = 4usize
         .checked_add(index_len)
         .ok_or(CoveError::ArithOverflow)?;
@@ -1448,6 +1468,14 @@ mod tests {
     #[test]
     fn rejects_unknown_subcommand() {
         assert!(parse_args(["unknown".to_string()]).is_err());
+    }
+
+    #[test]
+    fn rejects_duplicate_subcommands() {
+        assert_eq!(
+            parse_args(["smoke".to_string(), "parsers".to_string()]).unwrap_err(),
+            "only one subcommand may be provided"
+        );
     }
 
     #[test]

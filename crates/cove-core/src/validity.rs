@@ -7,7 +7,7 @@
 //! Bits are packed LSB-first within each byte: row `i` is located at
 //! byte `i / 8`, bit position `i % 8`.
 
-use crate::CoveError;
+use crate::{wire, CoveError};
 
 /// A read-only view of a packed null bitmap.
 ///
@@ -113,8 +113,8 @@ impl<'a> ValidityBitmap<'a> {
         }
         let full_words = needed_bytes / 8;
         let mut count = 0u64;
-        for word_bytes in self.bytes[..full_words * 8].chunks_exact(8) {
-            let word = u64::from_le_bytes(word_bytes.try_into().unwrap());
+        for word_index in 0..full_words {
+            let word = wire::read_u64_le_checked(self.bytes, word_index * 8)?;
             count += word.count_ones() as u64;
         }
         let tail = &self.bytes[full_words * 8..needed_bytes];

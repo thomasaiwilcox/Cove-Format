@@ -4,7 +4,10 @@
 //! catalog (Iceberg, Delta, Hudi, …). Spec §50.6 makes hints **non-
 //! authoritative**: they MUST never override COVE's own structural semantics.
 
-use crate::CoveError;
+use crate::{
+    wire::{read_u16_le_checked, read_u32_le_checked, read_u64_le_checked},
+    CoveError,
+};
 
 pub const LAKEHOUSE_HINT_FLAG_SOURCE_SNAPSHOT: u8 = 0x01;
 pub const LAKEHOUSE_HINT_FLAG_SEQUENCE_NUMBER: u8 = 0x02;
@@ -143,7 +146,7 @@ impl LakehouseHints {
         }
         let mut sf = [0u8; 32];
         sf.copy_from_slice(&bytes[0..32]);
-        let pc = u32::from_le_bytes(bytes[32..36].try_into().unwrap()) as usize;
+        let pc = read_u32_le_checked(bytes, 32)? as usize;
         let remaining = bytes
             .len()
             .checked_sub(Self::PARTITION_HEADER_LEN)
@@ -160,7 +163,7 @@ impl LakehouseHints {
             let v = read_str(bytes, &mut pos)?;
             partitions.push((k, v));
         }
-        if pos + 1 > bytes.len() {
+        if pos.checked_add(1).ok_or(CoveError::ArithOverflow)? > bytes.len() {
             return Err(CoveError::BufferTooShort);
         }
         let flags = bytes[pos];
@@ -171,20 +174,20 @@ impl LakehouseHints {
             ));
         }
         let source_snapshot = if flags & LAKEHOUSE_HINT_FLAG_SOURCE_SNAPSHOT != 0 {
-            if pos + 8 > bytes.len() {
+            if pos.checked_add(8).ok_or(CoveError::ArithOverflow)? > bytes.len() {
                 return Err(CoveError::BufferTooShort);
             }
-            let v = u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap());
+            let v = read_u64_le_checked(bytes, pos)?;
             pos += 8;
             Some(v)
         } else {
             None
         };
         let sequence_number = if flags & LAKEHOUSE_HINT_FLAG_SEQUENCE_NUMBER != 0 {
-            if pos + 8 > bytes.len() {
+            if pos.checked_add(8).ok_or(CoveError::ArithOverflow)? > bytes.len() {
                 return Err(CoveError::BufferTooShort);
             }
-            let v = u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap());
+            let v = read_u64_le_checked(bytes, pos)?;
             pos += 8;
             Some(v)
         } else {
@@ -192,7 +195,7 @@ impl LakehouseHints {
         };
         let catalog_identifier = read_str(bytes, &mut pos)?;
         let provenance = read_str(bytes, &mut pos)?;
-        if pos + 32 > bytes.len() {
+        if pos.checked_add(32).ok_or(CoveError::ArithOverflow)? > bytes.len() {
             return Err(CoveError::BufferTooShort);
         }
         let mut cd = [0u8; 32];
@@ -321,7 +324,7 @@ impl LakehouseVisibilityOverlayRef {
             ));
         }
         let file_id = if fingerprint_flags & LAKEHOUSE_OVERLAY_FINGERPRINT_FILE_ID != 0 {
-            if *pos + 16 > bytes.len() {
+            if pos.checked_add(16).ok_or(CoveError::ArithOverflow)? > bytes.len() {
                 return Err(CoveError::BufferTooShort);
             }
             let mut value = [0u8; 16];
@@ -332,10 +335,10 @@ impl LakehouseVisibilityOverlayRef {
             None
         };
         let file_len = if fingerprint_flags & LAKEHOUSE_OVERLAY_FINGERPRINT_FILE_LEN != 0 {
-            if *pos + 8 > bytes.len() {
+            if pos.checked_add(8).ok_or(CoveError::ArithOverflow)? > bytes.len() {
                 return Err(CoveError::BufferTooShort);
             }
-            let value = u64::from_le_bytes(bytes[*pos..*pos + 8].try_into().unwrap());
+            let value = read_u64_le_checked(bytes, *pos)?;
             *pos += 8;
             Some(value)
         } else {
@@ -343,17 +346,17 @@ impl LakehouseVisibilityOverlayRef {
         };
         let footer_crc32c = if fingerprint_flags & LAKEHOUSE_OVERLAY_FINGERPRINT_FOOTER_CRC32C != 0
         {
-            if *pos + 4 > bytes.len() {
+            if pos.checked_add(4).ok_or(CoveError::ArithOverflow)? > bytes.len() {
                 return Err(CoveError::BufferTooShort);
             }
-            let value = u32::from_le_bytes(bytes[*pos..*pos + 4].try_into().unwrap());
+            let value = read_u32_le_checked(bytes, *pos)?;
             *pos += 4;
             Some(value)
         } else {
             None
         };
         let digest = if fingerprint_flags & LAKEHOUSE_OVERLAY_FINGERPRINT_DIGEST != 0 {
-            if *pos + 32 > bytes.len() {
+            if pos.checked_add(32).ok_or(CoveError::ArithOverflow)? > bytes.len() {
                 return Err(CoveError::BufferTooShort);
             }
             let mut value = [0u8; 32];
@@ -565,10 +568,11 @@ fn hex_nibble(byte: u8) -> Result<u8, CoveError> {
 }
 
 fn read_str(bytes: &[u8], pos: &mut usize) -> Result<String, CoveError> {
-    if *pos + 2 > bytes.len() {
+    let len_end = pos.checked_add(2).ok_or(CoveError::ArithOverflow)?;
+    if len_end > bytes.len() {
         return Err(CoveError::BufferTooShort);
     }
-    let len = u16::from_le_bytes(bytes[*pos..*pos + 2].try_into().unwrap()) as usize;
+    let len = read_u16_le_checked(bytes, *pos)? as usize;
     *pos += 2;
     let end = pos.checked_add(len).ok_or(CoveError::ArithOverflow)?;
     if end > bytes.len() {

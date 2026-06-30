@@ -57,7 +57,7 @@ pub struct RangeReadPlan {
     pub coalesced_ranges: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CoalescedRangeStats {
     pub original_ranges: usize,
     pub coalesced_ranges: usize,

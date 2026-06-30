@@ -711,24 +711,25 @@ pub fn build_ai_training_showcase(
     for index in 0..sample_count {
         let topic = ["retention", "chunking", "vector search", "redaction"][index % 4];
         let withheld = index % 7 == 0;
-        source.push_str(
-            &serde_json::to_string(&json!({
-                "sample_id": format!("demo-{index:04}"),
-                "instruction": format!("Explain governed COVE-AI {topic} behavior."),
-                "input": format!("source_row={index}; policy_scope={}", if withheld { "withheld" } else { "public" }),
-                "output": format!("COVE-AI records {topic} evidence, policy, and payload authority for sample {index}."),
-                "generator": {
-                    "provider": "cove-deterministic-showcase",
-                    "model": "demo-generator-v1",
-                    "reproducibility_class": "deterministic-fixture"
-                },
-                "policy": {
-                    "payload_permission": !withheld,
-                    "diagnostic": if withheld { "showcase_policy_withheld" } else { "allowed" }
-                }
-            }))
-            .unwrap(),
-        );
+        let sample = serde_json::to_string(&json!({
+            "sample_id": format!("demo-{index:04}"),
+            "instruction": format!("Explain governed COVE-AI {topic} behavior."),
+            "input": format!("source_row={index}; policy_scope={}", if withheld { "withheld" } else { "public" }),
+            "output": format!("COVE-AI records {topic} evidence, policy, and payload authority for sample {index}."),
+            "generator": {
+                "provider": "cove-deterministic-showcase",
+                "model": "demo-generator-v1",
+                "reproducibility_class": "deterministic-fixture"
+            },
+            "policy": {
+                "payload_permission": !withheld,
+                "diagnostic": if withheld { "showcase_policy_withheld" } else { "allowed" }
+            }
+        }))
+        .map_err(|error| {
+            AiAdapterError::Message(format!("cannot serialize showcase sample: {error}"))
+        })?;
+        source.push_str(&sample);
         source.push('\n');
     }
     fs::write(&source_path, source)
@@ -749,7 +750,9 @@ pub fn build_ai_training_showcase(
     })?;
     fs::write(
         out_dir.join("verification-report.json"),
-        serde_json::to_vec_pretty(&verify_report).unwrap(),
+        serde_json::to_vec_pretty(&verify_report).map_err(|error| {
+            AiAdapterError::Message(format!("cannot serialize verification report: {error}"))
+        })?,
     )
     .map_err(|error| format!("cannot write verification report: {error}"))?;
     write_export_file(
@@ -874,13 +877,16 @@ fn imported_sample_from_value(
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| format!("sample-{index:012}"));
-    let split = options
+    let split = match options
         .split_column
         .as_deref()
         .and_then(|column| row.get(column))
         .and_then(Value::as_str)
         .and_then(SplitName::parse)
-        .unwrap_or_else(|| deterministic_split(&sample_id_text, row));
+    {
+        Some(split) => split,
+        None => deterministic_split(&sample_id_text, row)?,
+    };
     let mut diagnostics = Vec::new();
     let (input, target, mut metadata) = match options.schema {
         AiImportSchema::Instruction => instruction_payloads(&sample_id_text, row, &mut diagnostics),
@@ -909,9 +915,12 @@ fn imported_sample_from_value(
         sample_id,
         schema: options.schema,
         split,
-        input: serde_json::to_vec(&input).unwrap(),
-        target: serde_json::to_vec(&target).unwrap(),
-        metadata: serde_json::to_vec(&metadata).unwrap(),
+        input: serde_json::to_vec(&input)
+            .map_err(|error| format!("cannot serialize AI sample input: {error}"))?,
+        target: serde_json::to_vec(&target)
+            .map_err(|error| format!("cannot serialize AI sample target: {error}"))?,
+        metadata: serde_json::to_vec(&metadata)
+            .map_err(|error| format!("cannot serialize AI sample metadata: {error}"))?,
         diagnostics,
     })
 }
@@ -1195,9 +1204,10 @@ fn build_training_sidecar(
         payload,
     };
     write_coveai_descriptor_bundle(&CoveAiDescriptorBundleBuild {
-        artifact_id: options
-            .artifact_id
-            .unwrap_or_else(|| artifact_id_from_samples(samples)),
+        artifact_id: match options.artifact_id {
+            Some(artifact_id) => artifact_id,
+            None => artifact_id_from_samples(samples)?,
+        },
         created_at_us: options.created_at_us.unwrap_or_else(now_us),
         payload_sections: vec![payload_section],
         descriptor_tables: tables,
@@ -1239,7 +1249,11 @@ fn push_payload_ref(
 
 fn export_value(report: &Value, format: &str) -> Result<AiExportData, String> {
     let (media_type, bytes) = match format {
-        "json" => ("application/json", serde_json::to_vec_pretty(report).unwrap()),
+        "json" => (
+            "application/json",
+            serde_json::to_vec_pretty(report)
+                .map_err(|error| format!("cannot serialize AI JSON export: {error}"))?,
+        ),
         "jsonl" | "hf-jsonl" => {
             let mut out = Vec::new();
             for sample in report
@@ -1247,7 +1261,9 @@ fn export_value(report: &Value, format: &str) -> Result<AiExportData, String> {
                 .and_then(Value::as_array)
                 .ok_or_else(|| "AI export report is missing samples".to_string())?
             {
-                out.extend_from_slice(serde_json::to_string(sample).unwrap().as_bytes());
+                let line = serde_json::to_string(sample)
+                    .map_err(|error| format!("cannot serialize AI JSONL sample: {error}"))?;
+                out.extend_from_slice(line.as_bytes());
                 out.push(b'\n');
             }
             ("application/x-ndjson", out)
@@ -1337,8 +1353,11 @@ fn export_record_batch(value: &Value) -> Result<RecordBatch, String> {
     let record_json = StringArray::from(
         samples
             .iter()
-            .map(|sample| serde_json::to_string(sample).unwrap())
-            .collect::<Vec<_>>(),
+            .map(|sample| {
+                serde_json::to_string(sample)
+                    .map_err(|error| format!("cannot serialize AI record JSON: {error}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?,
     );
     let mut metadata = HashMap::new();
     if let Some(path) = value.get("path").and_then(Value::as_str) {
@@ -1379,13 +1398,16 @@ fn write_webdataset(value: &Value) -> Result<Vec<u8>, String> {
     write_tar_entry(
         &mut out,
         "metadata.json",
-        &serde_json::to_vec_pretty(&metadata).unwrap(),
+        &serde_json::to_vec_pretty(&metadata)
+            .map_err(|error| format!("cannot serialize WebDataset metadata: {error}"))?,
     )?;
     for (index, sample) in samples.iter().enumerate() {
+        let sample_json = serde_json::to_string(sample)
+            .map_err(|error| format!("cannot serialize WebDataset sample: {error}"))?;
         write_tar_entry(
             &mut out,
             &format!("{index:06}.json"),
-            serde_json::to_string(sample).unwrap().as_bytes(),
+            sample_json.as_bytes(),
         )?;
     }
     out.extend_from_slice(&[0u8; 1024]);
@@ -1711,23 +1733,24 @@ fn covm_source_uri(input_path: &Path, sidecar_path: &Path) -> String {
     source_abs.to_string_lossy().to_string()
 }
 
-fn deterministic_split(sample_id: &str, row: &Value) -> SplitName {
+fn deterministic_split(sample_id: &str, row: &Value) -> Result<SplitName, String> {
     let key = if sample_id.starts_with("sample-") {
         canonical_json(row)
     } else {
         sample_id.to_string()
     };
-    let digest = compute_digest(DigestAlgorithm::Sha256, key.as_bytes()).unwrap();
+    let digest = compute_digest(DigestAlgorithm::Sha256, key.as_bytes())
+        .map_err(|error| format!("cannot digest AI split key: {error}"))?;
     let mut first = [0u8; 8];
     first.copy_from_slice(&digest[..8]);
     let bucket = u64::from_le_bytes(first) % 1_000_000;
-    if bucket < DEFAULT_TRAIN_PPM {
+    Ok(if bucket < DEFAULT_TRAIN_PPM {
         SplitName::Train
     } else if bucket < DEFAULT_TRAIN_PPM + DEFAULT_VALIDATION_PPM {
         SplitName::Validation
     } else {
         SplitName::Test
-    }
+    })
 }
 
 fn sample_id_u64(sample_id: &str, row: &Value) -> Result<u64, String> {
@@ -1741,16 +1764,17 @@ fn sample_id_u64(sample_id: &str, row: &Value) -> Result<u64, String> {
     Ok(u64::from_le_bytes(first).max(1))
 }
 
-fn artifact_id_from_samples(samples: &[ImportedSample]) -> [u8; 16] {
+fn artifact_id_from_samples(samples: &[ImportedSample]) -> Result<[u8; 16], String> {
     let mut material = String::new();
     for sample in samples {
         material.push_str(&sample.sample_id_text);
         material.push('\n');
     }
-    let digest = compute_digest(DigestAlgorithm::Sha256, material.as_bytes()).unwrap();
+    let digest = compute_digest(DigestAlgorithm::Sha256, material.as_bytes())
+        .map_err(|error| format!("cannot digest AI artifact id: {error}"))?;
     let mut artifact_id = [0u8; 16];
     artifact_id.copy_from_slice(&digest[..16]);
-    artifact_id
+    Ok(artifact_id)
 }
 
 fn parse_split_filter(value: &str) -> Result<SplitName, String> {
@@ -1789,7 +1813,7 @@ fn canonical_json(value: &Value) -> String {
                 if index > 0 {
                     out.push(',');
                 }
-                out.push_str(&serde_json::to_string(key).unwrap());
+                out.push_str(&Value::String(key.clone()).to_string());
                 out.push(':');
                 out.push_str(value);
             }
@@ -1807,7 +1831,7 @@ fn canonical_json(value: &Value) -> String {
             out.push(']');
             out
         }
-        _ => serde_json::to_string(value).unwrap(),
+        _ => value.to_string(),
     }
 }
 
@@ -1815,7 +1839,7 @@ fn value_to_key(value: &Value) -> String {
     value
         .as_str()
         .map(ToOwned::to_owned)
-        .unwrap_or_else(|| serde_json::to_string(value).unwrap())
+        .unwrap_or_else(|| value.to_string())
 }
 
 fn ai_record_payload_access_summary(record: &Value) -> String {
@@ -1932,8 +1956,8 @@ mod tests {
     fn deterministic_split_is_stable() {
         let row = json!({"sample_id": "stable-1", "instruction": "a", "output": "b"});
         assert_eq!(
-            deterministic_split("stable-1", &row).as_str(),
-            deterministic_split("stable-1", &row).as_str()
+            deterministic_split("stable-1", &row).unwrap().as_str(),
+            deterministic_split("stable-1", &row).unwrap().as_str()
         );
     }
 

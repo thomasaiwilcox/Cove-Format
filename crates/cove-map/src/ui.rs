@@ -52,9 +52,9 @@ pub(crate) fn explain(file: &CovemapFile, id: &str) -> Result<Value, String> {
                                 resolution.insert(key.to_string(), value.clone());
                             }
                         }
-                        let object = explanation
-                            .as_object_mut()
-                            .expect("explain output is object");
+                        let Some(object) = explanation.as_object_mut() else {
+                            return Err("internal error: explain output is not an object".into());
+                        };
                         object.insert("operation_metadata".into(), json!(entry.operation_metadata));
                         if !resolution.is_empty() {
                             object.insert("resolution".into(), Value::Object(resolution));
@@ -200,8 +200,13 @@ pub(crate) fn candidate_match_id(candidate: &CandidateMatch) -> String {
     )
 }
 
-pub(crate) fn print_json(value: &Value) {
-    println!("{}", serde_json::to_string_pretty(value).unwrap());
+pub(crate) fn print_json(value: &Value) -> Result<(), String> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(value)
+            .map_err(|err| format!("cannot serialize JSON output: {err}"))?
+    );
+    Ok(())
 }
 
 pub(crate) fn write_or_print(output: Option<PathBuf>, value: &Value) -> Result<(), String> {

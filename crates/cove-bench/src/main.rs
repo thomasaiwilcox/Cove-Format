@@ -12,7 +12,6 @@ use std::{
 
 use arrow_array::{ArrayRef, BooleanArray, Int64Array, RecordBatch, StringArray};
 use arrow_ipc::reader::{FileReader, StreamReader};
-use arrow_schema::{DataType, Field, Schema};
 use cove_ai_adapters::{
     import_jsonl, open as open_ai_archive, AiArchiveOpenOptions, AiExportOptions, AiImportOptions,
     AiImportSchema, AiSampleIteratorOptions, AiVerifyOptions,
@@ -368,7 +367,7 @@ fn benchmark_training_source_jsonl(sample_count: usize) -> String {
                 "diagnostic": if index % 37 == 0 { "benchmark_policy_withheld" } else { "allowed" }
             }
         });
-        out.push_str(&serde_json::to_string(&row).unwrap());
+        out.push_str(&row.to_string());
         out.push('\n');
     }
     out
@@ -1129,86 +1128,85 @@ fn run_events_cases(corpus: &Path) -> Result<Vec<Value>, String> {
     Ok(cases)
 }
 
-#[allow(clippy::vec_init_then_push)]
 fn run_spec_gap_cases(path: &Path) -> Result<Vec<Value>, String> {
-    let mut cases = Vec::new();
-    cases.push(run_query_case(
-        "filecode_group_by",
-        "FileCode group-by/export dictionary path",
-        path,
-        ExplainOptions {
-            projection: Some(vec!["bucket".into(), "name".into()]),
-            ..ExplainOptions::default()
-        },
-    )?);
-    cases.push(run_query_case(
-        "execution_code_remap_overhead",
-        "ExecutionCode remap overhead",
-        path,
-        ExplainOptions {
-            projection: Some(vec!["name".into()]),
-            table_options: CoveTableOptions::default(),
-            ..ExplainOptions::default()
-        },
-    )?);
-    cases.push(run_query_case(
-        "registered_codec_decode_predicate_kernel",
-        "registered codec decode and predicate-kernel cost",
-        path,
-        ExplainOptions {
-            filters: vec![FilterDsl {
-                column: "amount".into(),
-                op: FilterOp::Lt,
-                value: Some("500".into()),
-            }],
-            ..ExplainOptions::default()
-        },
-    )?);
-    cases.push(run_query_case(
-        "fallback_payload_overhead",
-        "fallback payload overhead",
-        path,
-        ExplainOptions {
-            projection: Some(vec!["id".into(), "active".into()]),
-            ..ExplainOptions::default()
-        },
-    )?);
-    cases.push(run_query_case(
-        "page_cluster_range_coalescing",
-        "page-cluster range coalescing",
-        path,
-        ExplainOptions {
-            filters: vec![FilterDsl {
-                column: "bucket".into(),
-                op: FilterOp::In,
-                value: Some("bucket-01|bucket-02".into()),
-            }],
-            ..ExplainOptions::default()
-        },
-    )?);
-    cases.push(run_query_case(
-        "zero_copy_success_fallback_rate",
-        "zero-copy success and fallback rate",
-        path,
-        ExplainOptions {
-            projection: Some(vec!["id".into(), "amount".into(), "name".into()]),
-            ..ExplainOptions::default()
-        },
-    )?);
-    cases.push(run_query_case(
-        "coverage_degree_tightness",
-        "coverage degree and pruning tightness",
-        path,
-        ExplainOptions {
-            filters: vec![FilterDsl {
-                column: "id".into(),
-                op: FilterOp::Gte,
-                value: Some("1024".into()),
-            }],
-            ..ExplainOptions::default()
-        },
-    )?);
-    Ok(cases)
+    Ok(vec![
+        run_query_case(
+            "filecode_group_by",
+            "FileCode group-by/export dictionary path",
+            path,
+            ExplainOptions {
+                projection: Some(vec!["bucket".into(), "name".into()]),
+                ..ExplainOptions::default()
+            },
+        )?,
+        run_query_case(
+            "execution_code_remap_overhead",
+            "ExecutionCode remap overhead",
+            path,
+            ExplainOptions {
+                projection: Some(vec!["name".into()]),
+                table_options: CoveTableOptions::default(),
+                ..ExplainOptions::default()
+            },
+        )?,
+        run_query_case(
+            "registered_codec_decode_predicate_kernel",
+            "registered codec decode and predicate-kernel cost",
+            path,
+            ExplainOptions {
+                filters: vec![FilterDsl {
+                    column: "amount".into(),
+                    op: FilterOp::Lt,
+                    value: Some("500".into()),
+                }],
+                ..ExplainOptions::default()
+            },
+        )?,
+        run_query_case(
+            "fallback_payload_overhead",
+            "fallback payload overhead",
+            path,
+            ExplainOptions {
+                projection: Some(vec!["id".into(), "active".into()]),
+                ..ExplainOptions::default()
+            },
+        )?,
+        run_query_case(
+            "page_cluster_range_coalescing",
+            "page-cluster range coalescing",
+            path,
+            ExplainOptions {
+                filters: vec![FilterDsl {
+                    column: "bucket".into(),
+                    op: FilterOp::In,
+                    value: Some("bucket-01|bucket-02".into()),
+                }],
+                ..ExplainOptions::default()
+            },
+        )?,
+        run_query_case(
+            "zero_copy_success_fallback_rate",
+            "zero-copy success and fallback rate",
+            path,
+            ExplainOptions {
+                projection: Some(vec!["id".into(), "amount".into(), "name".into()]),
+                ..ExplainOptions::default()
+            },
+        )?,
+        run_query_case(
+            "coverage_degree_tightness",
+            "coverage degree and pruning tightness",
+            path,
+            ExplainOptions {
+                filters: vec![FilterDsl {
+                    column: "id".into(),
+                    op: FilterOp::Gte,
+                    value: Some("1024".into()),
+                }],
+                ..ExplainOptions::default()
+            },
+        )?,
+    ])
 }
 
 fn run_ai_cases(corpus: &Path) -> Result<Vec<Value>, String> {
@@ -7265,17 +7263,6 @@ fn bools(values: &[bool]) -> Vec<u8> {
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-#[allow(dead_code)]
-fn _schema_for_docs() -> Schema {
-    Schema::new(vec![
-        Field::new("id", DataType::Int64, false),
-        Field::new("amount", DataType::Int64, false),
-        Field::new("bucket", DataType::Utf8, false),
-        Field::new("name", DataType::Utf8, false),
-        Field::new("active", DataType::Boolean, false),
-    ])
 }
 
 #[cfg(test)]

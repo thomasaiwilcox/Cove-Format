@@ -750,6 +750,7 @@ dependencies = [
  "coveql",
  "csv",
  "parquet",
+ "serde",
  "serde_json",
 ]
 

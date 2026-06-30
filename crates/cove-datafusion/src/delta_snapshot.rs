@@ -653,19 +653,27 @@ fn covm_delta_extension_encoded_len(bytes: &[u8]) -> Result<usize, String> {
 }
 
 fn read_u16_at(bytes: &[u8], offset: usize) -> Result<u16, String> {
-    let end = offset + 2;
+    let end = offset
+        .checked_add(2)
+        .ok_or_else(|| "COVM delta-chain extension header is truncated".to_string())?;
     if end > bytes.len() {
         return Err("COVM delta-chain extension header is truncated".into());
     }
-    Ok(u16::from_le_bytes(bytes[offset..end].try_into().unwrap()))
+    let mut value = [0u8; 2];
+    value.copy_from_slice(&bytes[offset..end]);
+    Ok(u16::from_le_bytes(value))
 }
 
 fn read_u32_at(bytes: &[u8], offset: usize) -> Result<u32, String> {
-    let end = offset + 4;
+    let end = offset
+        .checked_add(4)
+        .ok_or_else(|| "COVM delta-chain extension header is truncated".to_string())?;
     if end > bytes.len() {
         return Err("COVM delta-chain extension header is truncated".into());
     }
-    Ok(u32::from_le_bytes(bytes[offset..end].try_into().unwrap()))
+    let mut value = [0u8; 4];
+    value.copy_from_slice(&bytes[offset..end]);
+    Ok(u32::from_le_bytes(value))
 }
 
 fn selected_delta_bytes(extension: &CovmDeltaChainExtensionV1, selected: &[u32]) -> u64 {

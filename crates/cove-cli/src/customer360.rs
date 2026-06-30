@@ -7,7 +7,6 @@ use std::{
 };
 
 use arrow_array::{ArrayRef, BooleanArray, Int64Array, RecordBatch, StringArray};
-use arrow_schema::{DataType, Field, Schema};
 use cove_core::{
     artifact::covemap::{
         CovemapFile, CovemapHeaderV1, CovemapPayloadEncodingV2, CovemapPostscriptV1,
@@ -150,14 +149,14 @@ pub fn generate_customer360(options: &Customer360Options) -> Result<Value, Strin
     durable::durable_replace(&events_cove_path, &events_cove_t(customers, events)?)
         .map_err(|err| format!("cannot write {}: {err}", events_cove_path.display()))?;
 
-    let mapping = customer360_covemap();
+    let mapping = customer360_covemap()?;
     durable::durable_replace(
         &mapping_path,
         &mapping.serialize().map_err(|err| err.to_string())?,
     )
     .map_err(|err| format!("cannot write {}: {err}", mapping_path.display()))?;
 
-    let readback_mapping = customer360_readback_covemap();
+    let readback_mapping = customer360_readback_covemap()?;
     durable::durable_replace(
         &readback_mapping_path,
         &readback_mapping
@@ -593,7 +592,7 @@ fn generate_claims_proof_scenario(
     write_claim_providers_parquet(&providers_parquet, rows)?;
     durable::durable_replace(
         &mapping_path,
-        &claims_covemap()
+        &claims_covemap()?
             .serialize()
             .map_err(|err| err.to_string())?,
     )
@@ -683,7 +682,7 @@ fn generate_catalog_proof_scenario(
     write_product_attributes_parquet(&attributes_parquet, rows)?;
     durable::durable_replace(
         &mapping_path,
-        &catalog_covemap()
+        &catalog_covemap()?
             .serialize()
             .map_err(|err| err.to_string())?,
     )
@@ -1399,7 +1398,7 @@ fn sku(index: usize) -> String {
     format!("sku{index:06}")
 }
 
-fn claims_covemap() -> CovemapFile {
+fn claims_covemap() -> Result<CovemapFile, String> {
     proof_covemap(ProofCovemapSpec {
         file_id_byte: 0xD1,
         mapping_id: "claims",
@@ -1468,7 +1467,7 @@ fn claims_covemap() -> CovemapFile {
     })
 }
 
-fn catalog_covemap() -> CovemapFile {
+fn catalog_covemap() -> Result<CovemapFile, String> {
     proof_covemap(ProofCovemapSpec {
         file_id_byte: 0xD2,
         mapping_id: "catalog",
@@ -1554,7 +1553,7 @@ struct ProofCovemapSpec<'a> {
     evidence_output_table: &'a str,
 }
 
-fn proof_covemap(spec: ProofCovemapSpec<'_>) -> CovemapFile {
+fn proof_covemap(spec: ProofCovemapSpec<'_>) -> Result<CovemapFile, String> {
     let ProofCovemapSpec {
         file_id_byte,
         mapping_id,
@@ -1570,7 +1569,7 @@ fn proof_covemap(spec: ProofCovemapSpec<'_>) -> CovemapFile {
         evidence_projection_id,
         evidence_output_table,
     } = spec;
-    CovemapFile {
+    Ok(CovemapFile {
         header: CovemapHeaderV1::new([file_id_byte; 16], 0),
         mapping_version: mapping_version.into(),
         sections: vec![
@@ -1581,7 +1580,7 @@ fn proof_covemap(spec: ProofCovemapSpec<'_>) -> CovemapFile {
                     "mapping_version": mapping_version,
                     "sources": sources,
                 }),
-            ),
+            )?,
             map_section(
                 SectionKind::MapFunctionRegistry,
                 json!({
@@ -1594,7 +1593,7 @@ fn proof_covemap(spec: ProofCovemapSpec<'_>) -> CovemapFile {
                         "dependency": "pure"
                     }]
                 }),
-            ),
+            )?,
             map_section(
                 SectionKind::MapIdentityRuleCatalog,
                 json!({
@@ -1619,7 +1618,7 @@ fn proof_covemap(spec: ProofCovemapSpec<'_>) -> CovemapFile {
                     }],
                     "do_not_merge": []
                 }),
-            ),
+            )?,
             map_section(
                 SectionKind::MapRowSemanticsCatalog,
                 json!({
@@ -1627,7 +1626,7 @@ fn proof_covemap(spec: ProofCovemapSpec<'_>) -> CovemapFile {
                     "mapping_version": mapping_version,
                     "rules": rules,
                 }),
-            ),
+            )?,
             map_section(
                 SectionKind::MapProjectionCatalog,
                 json!({
@@ -1663,7 +1662,7 @@ fn proof_covemap(spec: ProofCovemapSpec<'_>) -> CovemapFile {
                         }
                     ]
                 }),
-            ),
+            )?,
         ],
         postscript: CovemapPostscriptV1 {
             required_features: FEATURE_SEMANTIC_MAP,
@@ -1673,7 +1672,7 @@ fn proof_covemap(spec: ProofCovemapSpec<'_>) -> CovemapFile {
             header_length: 0,
             checksum: 0,
         },
-    }
+    })
 }
 
 fn source_decl(source_id: &str, identity_rule_id: &str, source_priority: i64) -> Value {
@@ -1692,8 +1691,8 @@ fn projection_column(name: &str, value: &str, logical_type: &str) -> Value {
     })
 }
 
-fn customer360_covemap() -> CovemapFile {
-    CovemapFile {
+fn customer360_covemap() -> Result<CovemapFile, String> {
+    Ok(CovemapFile {
         header: CovemapHeaderV1::new([0xC3; 16], 0),
         mapping_version: "customer360/v1".into(),
         sections: vec![
@@ -1708,7 +1707,7 @@ fn customer360_covemap() -> CovemapFile {
                         {"source_id": "billing", "row_identity_rules": ["customer_by_id"], "source_priority": 30}
                     ]
                 }),
-            ),
+            )?,
             map_section(
                 SectionKind::MapFunctionRegistry,
                 json!({
@@ -1721,7 +1720,7 @@ fn customer360_covemap() -> CovemapFile {
                         "dependency": "pure"
                     }]
                 }),
-            ),
+            )?,
             map_section(
                 SectionKind::MapIdentityRuleCatalog,
                 json!({
@@ -1746,7 +1745,7 @@ fn customer360_covemap() -> CovemapFile {
                     }],
                     "do_not_merge": []
                 }),
-            ),
+            )?,
             map_section(
                 SectionKind::MapRowSemanticsCatalog,
                 json!({
@@ -1774,7 +1773,7 @@ fn customer360_covemap() -> CovemapFile {
                         ])
                     ]
                 }),
-            ),
+            )?,
             map_section(
                 SectionKind::MapProjectionCatalog,
                 json!({
@@ -1822,7 +1821,7 @@ fn customer360_covemap() -> CovemapFile {
                         }
                     ]
                 }),
-            ),
+            )?,
         ],
         postscript: CovemapPostscriptV1 {
             required_features: FEATURE_SEMANTIC_MAP,
@@ -1832,11 +1831,11 @@ fn customer360_covemap() -> CovemapFile {
             header_length: 0,
             checksum: 0,
         },
-    }
+    })
 }
 
-fn customer360_readback_covemap() -> CovemapFile {
-    CovemapFile {
+fn customer360_readback_covemap() -> Result<CovemapFile, String> {
+    Ok(CovemapFile {
         header: CovemapHeaderV1::new([0xC4; 16], 0),
         mapping_version: "customer360-readback/v1".into(),
         sections: vec![
@@ -1850,7 +1849,7 @@ fn customer360_readback_covemap() -> CovemapFile {
                         "row_identity_rules": ["customer_by_id"]
                     }]
                 }),
-            ),
+            )?,
             map_section(
                 SectionKind::MapFunctionRegistry,
                 json!({
@@ -1863,7 +1862,7 @@ fn customer360_readback_covemap() -> CovemapFile {
                         "dependency": "pure"
                     }]
                 }),
-            ),
+            )?,
             map_section(
                 SectionKind::MapIdentityRuleCatalog,
                 json!({
@@ -1888,7 +1887,7 @@ fn customer360_readback_covemap() -> CovemapFile {
                     }],
                     "do_not_merge": []
                 }),
-            ),
+            )?,
             map_section(
                 SectionKind::MapRowSemanticsCatalog,
                 json!({
@@ -1909,7 +1908,7 @@ fn customer360_readback_covemap() -> CovemapFile {
                         ])
                     ]
                 }),
-            ),
+            )?,
             map_section(
                 SectionKind::MapProjectionCatalog,
                 json!({
@@ -1957,7 +1956,7 @@ fn customer360_readback_covemap() -> CovemapFile {
                         }
                     ]
                 }),
-            ),
+            )?,
         ],
         postscript: CovemapPostscriptV1 {
             required_features: FEATURE_SEMANTIC_MAP,
@@ -1967,7 +1966,7 @@ fn customer360_readback_covemap() -> CovemapFile {
             header_length: 0,
             checksum: 0,
         },
-    }
+    })
 }
 
 fn row_rule(rule_id: &str, source_id: &str, property_bindings: Vec<Value>) -> Value {
@@ -2006,7 +2005,7 @@ fn property_binding(property: &str, source_column: &str, logical_type: &str) -> 
     })
 }
 
-fn map_section(kind: SectionKind, mut value: Value) -> CovemapSection {
+fn map_section(kind: SectionKind, mut value: Value) -> Result<CovemapSection, String> {
     if let Value::Object(object) = &mut value {
         object.insert(
             "schema_id".to_string(),
@@ -2017,8 +2016,9 @@ fn map_section(kind: SectionKind, mut value: Value) -> CovemapSection {
             Value::Number((kind as u16).into()),
         );
     }
-    let payload = serde_json::to_vec_pretty(&value).unwrap();
-    CovemapSection {
+    let payload = serde_json::to_vec_pretty(&value)
+        .map_err(|err| format!("cannot serialize COVE-MAP section payload: {err}"))?;
+    Ok(CovemapSection {
         entry: CovemapSectionEntryV1 {
             section_id: kind as u32,
             offset: 0,
@@ -2031,7 +2031,7 @@ fn map_section(kind: SectionKind, mut value: Value) -> CovemapSection {
             checksum: 0,
         },
         payload,
-    }
+    })
 }
 
 fn customer_id(index: usize) -> String {
@@ -2254,15 +2254,6 @@ def main():
 if __name__ == "__main__":
     main()
 "#
-}
-
-#[allow(dead_code)]
-fn _schema_for_docs() -> Schema {
-    Schema::new(vec![
-        Field::new("id", DataType::Utf8, false),
-        Field::new("active", DataType::Boolean, true),
-        Field::new("score", DataType::Int64, true),
-    ])
 }
 
 #[cfg(test)]

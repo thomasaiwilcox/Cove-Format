@@ -159,8 +159,8 @@ use cove_core::{
     table::TableCatalog,
     utility::hex_encode,
     wire::{
-        decode_u64_leb128, encode_u64_leb128, parse_bool_strict, zigzag_decode_i64,
-        zigzag_encode_i64,
+        decode_u64_leb128, encode_u64_leb128, parse_bool_strict, read_u32_le_checked,
+        zigzag_decode_i64, zigzag_encode_i64,
     },
     zone_stats::{
         NumericStatValue, StatKind, StatScalar, ZoneScope, ZoneStatFlags, ZoneStats, ZoneStatsEntry,
@@ -3181,7 +3181,8 @@ fn validate_file_dictionary_fixture(bytes: &[u8]) -> Result<(), CoveError> {
     if bytes.len() < 4 {
         return Err(CoveError::BufferTooShort);
     }
-    let index_len = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+    let index_len =
+        usize::try_from(read_u32_le_checked(bytes, 0)?).map_err(|_| CoveError::ArithOverflow)?;
     let split = 4usize
         .checked_add(index_len)
         .ok_or(CoveError::ArithOverflow)?;

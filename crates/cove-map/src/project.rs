@@ -277,7 +277,7 @@ pub(crate) fn project_rows_with_source_states_output(
     projection_id: Option<&str>,
 ) -> Result<Vec<u8>, String> {
     let materialized = materialize_with_source_states(file, rows, source_states)?;
-    let model = ProjectionModel::from_materialized(&materialized);
+    let model = ProjectionModel::from_materialized(&materialized)?;
     let projection_catalog = projection_catalog(file)?
         .ok_or_else(|| "project requires a MAP_PROJECTION_CATALOG section".to_string())?;
     let function_ids = function_registry(file)?;
@@ -2538,7 +2538,7 @@ enum ProjectionEvidenceEntry {
 }
 
 impl ProjectionModel {
-    fn from_materialized(materialized: &MaterializedModel) -> Self {
+    fn from_materialized(materialized: &MaterializedModel) -> Result<Self, String> {
         let type_flags = materialized
             .object_types
             .iter()
@@ -2577,9 +2577,8 @@ impl ProjectionModel {
             })
             .collect::<Vec<_>>();
         rows.sort_by_key(temporal_sort_key);
-        let reconstructed_rows = reconstruct_projection_rows_at_cut(&rows, |_| true)
-            .expect("materialized projection rows should not contain prev_ref chains");
-        Self {
+        let reconstructed_rows = reconstruct_projection_rows_at_cut(&rows, |_| true)?;
+        Ok(Self {
             rows,
             reconstructed_rows,
             evidence_entries: materialized
@@ -2588,7 +2587,7 @@ impl ProjectionModel {
                 .cloned()
                 .map(ProjectionEvidenceEntry::Json)
                 .collect(),
-        }
+        })
     }
 
     fn from_surface_with_access_plan(
@@ -4448,7 +4447,7 @@ fn row_matches_association(row: &ProjectionRow, association_type: &str) -> bool 
     row.object_type == format!("Association:{association_type}")
 }
 
-pub fn run_fixture_path(path: &Path) -> Result<(), String> {
+pub(crate) fn run_fixture_path(path: &Path) -> Result<(), String> {
     let bytes = fs::read(path).map_err(|err| format!("cannot read {}: {err}", path.display()))?;
     let fixture: Value = serde_json::from_slice(&bytes)
         .map_err(|err| format!("fixture {} is not valid JSON: {err}", path.display()))?;

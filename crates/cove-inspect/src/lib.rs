@@ -27,9 +27,17 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<bool, String> {
         }
         if all_ok {
             if values.len() == 1 {
-                println!("{}", serde_json::to_string_pretty(&values[0]).unwrap());
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&values[0])
+                        .map_err(|error| format!("cannot serialize JSON output: {error}"))?
+                );
             } else {
-                println!("{}", serde_json::to_string_pretty(&values).unwrap());
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&values)
+                        .map_err(|error| format!("cannot serialize JSON output: {error}"))?
+                );
             }
         }
         return Ok(all_ok);

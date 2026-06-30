@@ -21,7 +21,7 @@ use crate::{
     },
     profile::cove_o::{RetainedTemporalSegmentData, TemporalRowEntryV1, TemporalSegmentData},
     segment::{TableColumnDirectoryEntryV1, TableSegmentPayloadV1},
-    CoveError,
+    wire, CoveError,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1429,7 +1429,7 @@ pub fn filter_u64_le_eq_dispatch(
         }
         stats.rows_valid += 1;
         let offset = row * std::mem::size_of::<u64>();
-        let value = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+        let value = wire::read_u64_le_checked(bytes, offset)?;
         if value == needle {
             out.set(row);
             stats.rows_matched += 1;
@@ -1480,7 +1480,7 @@ pub fn filter_u32_le_eq_dispatch(
         }
         stats.rows_valid += 1;
         let offset = row * std::mem::size_of::<u32>();
-        let value = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+        let value = wire::read_u32_le_checked(bytes, offset)?;
         if value == needle {
             out.set(row);
             stats.rows_matched += 1;
@@ -1558,7 +1558,7 @@ pub fn filter_numcode_le_typed(
         }
         stats.rows_valid += 1;
         let offset = row * std::mem::size_of::<u64>();
-        let value = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+        let value = wire::read_u64_le_checked(bytes, offset)?;
         if compare_native_numcode_value(logical_type, value, op, literal)? {
             out.set(row);
             stats.rows_matched += 1;
@@ -1607,7 +1607,7 @@ pub fn filter_numcode_le_in_typed(
         }
         stats.rows_valid += 1;
         let offset = row * std::mem::size_of::<u64>();
-        let value = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+        let value = wire::read_u64_le_checked(bytes, offset)?;
         let mut matched = false;
         for literal in literals {
             if compare_native_numcode_value(
@@ -1670,7 +1670,7 @@ pub fn filter_numcode_le_not_in_typed(
         }
         stats.rows_valid += 1;
         let offset = row * std::mem::size_of::<u64>();
-        let value = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+        let value = wire::read_u64_le_checked(bytes, offset)?;
         let mut matched = false;
         for literal in literals {
             if compare_native_numcode_value(
@@ -1733,7 +1733,7 @@ pub fn filter_i64_le_range(
         }
         stats.rows_valid += 1;
         let offset = row * std::mem::size_of::<i64>();
-        let value = i64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+        let value = wire::read_i64_le_checked(bytes, offset)?;
         if !i64_value_in_range(value, lower, upper) {
             continue;
         }
@@ -1778,7 +1778,7 @@ pub fn filter_u32_le_in_sorted(
         }
         stats.rows_valid += 1;
         let offset = row * std::mem::size_of::<u32>();
-        let value = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+        let value = wire::read_u32_le_checked(bytes, offset)?;
         if needles.binary_search(&value).is_ok() {
             out.set(row);
             stats.rows_matched += 1;
@@ -1827,7 +1827,7 @@ pub fn filter_u32_le_not_in_sorted(
         }
         stats.rows_valid += 1;
         let offset = row * std::mem::size_of::<u32>();
-        let value = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+        let value = wire::read_u32_le_checked(bytes, offset)?;
         if needles.binary_search(&value).is_err() {
             out.set(row);
             stats.rows_matched += 1;
@@ -2309,10 +2309,10 @@ pub fn filter_length_prefixed_varbytes_eq(
     let mut offset = 0usize;
     for row in 0..row_count {
         let len_end = offset.checked_add(4).ok_or(CoveError::ArithOverflow)?;
-        let Some(len_bytes) = values.get(offset..len_end) else {
+        if values.get(offset..len_end).is_none() {
             return Err(CoveError::BufferTooShort);
-        };
-        let len = u32::from_le_bytes(len_bytes.try_into().unwrap()) as usize;
+        }
+        let len = wire::read_u32_le_checked(values, offset)? as usize;
         let value_start = len_end;
         let value_end = value_start
             .checked_add(len)
@@ -2372,10 +2372,10 @@ pub fn filter_length_prefixed_varbytes_in(
     let mut offset = 0usize;
     for row in 0..row_count {
         let len_end = offset.checked_add(4).ok_or(CoveError::ArithOverflow)?;
-        let Some(len_bytes) = values.get(offset..len_end) else {
+        if values.get(offset..len_end).is_none() {
             return Err(CoveError::BufferTooShort);
-        };
-        let len = u32::from_le_bytes(len_bytes.try_into().unwrap()) as usize;
+        }
+        let len = wire::read_u32_le_checked(values, offset)? as usize;
         let value_start = len_end;
         let value_end = value_start
             .checked_add(len)
@@ -2427,10 +2427,10 @@ pub fn filter_length_prefixed_varbytes_prefix(
     let mut offset = 0usize;
     for row in 0..row_count {
         let len_end = offset.checked_add(4).ok_or(CoveError::ArithOverflow)?;
-        let Some(len_bytes) = values.get(offset..len_end) else {
+        if values.get(offset..len_end).is_none() {
             return Err(CoveError::BufferTooShort);
-        };
-        let len = u32::from_le_bytes(len_bytes.try_into().unwrap()) as usize;
+        }
+        let len = wire::read_u32_le_checked(values, offset)? as usize;
         let value_start = len_end;
         let value_end = value_start
             .checked_add(len)
@@ -2800,7 +2800,7 @@ pub fn group_count_u32_le_bytes(
             continue;
         }
         let offset = row * std::mem::size_of::<u32>();
-        let value = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+        let value = wire::read_u32_le_checked(bytes, offset)?;
         stats.rows_valid += 1;
         stats.rows_matched += 1;
         let count = groups.counts.entry(value).or_default();
@@ -2844,7 +2844,7 @@ pub fn group_count_i64_le_bytes(
             continue;
         }
         let offset = row * std::mem::size_of::<u64>();
-        let value = i64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+        let value = wire::read_i64_le_checked(bytes, offset)?;
         stats.rows_valid += 1;
         stats.rows_matched += 1;
         let count = groups.counts.entry(value).or_default();
@@ -3112,7 +3112,7 @@ pub fn aggregate_i64_le_bytes(
             continue;
         }
         let offset = row * std::mem::size_of::<u64>();
-        let value = i64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+        let value = wire::read_i64_le_checked(bytes, offset)?;
         stats.rows_valid += 1;
         stats.rows_matched += 1;
         aggregates.count = aggregates
@@ -3210,11 +3210,7 @@ pub fn aggregate_i64_le_bytes_by_bool(
             let offset = row
                 .checked_mul(std::mem::size_of::<u64>())
                 .ok_or(CoveError::ArithOverflow)?;
-            let value = i64::from_le_bytes(
-                value_bytes[offset..offset + std::mem::size_of::<u64>()]
-                    .try_into()
-                    .unwrap(),
-            );
+            let value = wire::read_i64_le_checked(value_bytes, offset)?;
             stats.rows_valid += 1;
             accumulate_i64(aggregate, value)?;
         } else {
@@ -3448,11 +3444,7 @@ where
             let value_offset = row
                 .checked_mul(std::mem::size_of::<u64>())
                 .ok_or(CoveError::ArithOverflow)?;
-            let value = i64::from_le_bytes(
-                value_bytes[value_offset..value_offset + std::mem::size_of::<u64>()]
-                    .try_into()
-                    .unwrap(),
-            );
+            let value = wire::read_i64_le_checked(value_bytes, value_offset)?;
             stats.rows_valid += 1;
             accumulate_i64(aggregate, value)?;
         } else {
@@ -3627,21 +3619,13 @@ pub fn aggregate_i64_le_bytes_by_i64_le_bytes(
         let key_offset = row
             .checked_mul(std::mem::size_of::<u64>())
             .ok_or(CoveError::ArithOverflow)?;
-        let key = i64::from_le_bytes(
-            key_bytes[key_offset..key_offset + std::mem::size_of::<u64>()]
-                .try_into()
-                .unwrap(),
-        );
+        let key = wire::read_i64_le_checked(key_bytes, key_offset)?;
         let aggregate = i64_group_for_row(&mut groups, key_validity, row, key)?;
         if value_validity.is_valid(row) {
             let value_offset = row
                 .checked_mul(std::mem::size_of::<u64>())
                 .ok_or(CoveError::ArithOverflow)?;
-            let value = i64::from_le_bytes(
-                value_bytes[value_offset..value_offset + std::mem::size_of::<u64>()]
-                    .try_into()
-                    .unwrap(),
-            );
+            let value = wire::read_i64_le_checked(value_bytes, value_offset)?;
             stats.rows_valid += 1;
             accumulate_i64(aggregate, value)?;
         } else {
@@ -3767,21 +3751,13 @@ pub fn aggregate_i64_le_bytes_by_u32_le_bytes(
         let key_offset = row
             .checked_mul(std::mem::size_of::<u32>())
             .ok_or(CoveError::ArithOverflow)?;
-        let key = u32::from_le_bytes(
-            key_bytes[key_offset..key_offset + std::mem::size_of::<u32>()]
-                .try_into()
-                .unwrap(),
-        );
+        let key = wire::read_u32_le_checked(key_bytes, key_offset)?;
         let aggregate = u32_group_for_row(&mut groups, key_validity, row, key)?;
         if value_validity.is_valid(row) {
             let value_offset = row
                 .checked_mul(std::mem::size_of::<u64>())
                 .ok_or(CoveError::ArithOverflow)?;
-            let value = i64::from_le_bytes(
-                value_bytes[value_offset..value_offset + std::mem::size_of::<u64>()]
-                    .try_into()
-                    .unwrap(),
-            );
+            let value = wire::read_i64_le_checked(value_bytes, value_offset)?;
             stats.rows_valid += 1;
             accumulate_i64(aggregate, value)?;
         } else {
@@ -5033,10 +5009,10 @@ fn prepare_varbytes_row_offsets(
     for _ in 0..row_count {
         row_offsets.push(u32::try_from(pos).map_err(|_| CoveError::ArithOverflow)?);
         let len_end = pos.checked_add(4).ok_or(CoveError::ArithOverflow)?;
-        let Some(len_bytes) = values.get(pos..len_end) else {
+        if values.get(pos..len_end).is_none() {
             return Err(CoveError::BufferTooShort);
-        };
-        let len = u32::from_le_bytes(len_bytes.try_into().unwrap()) as usize;
+        }
+        let len = wire::read_u32_le_checked(values, pos)? as usize;
         pos = len_end.checked_add(len).ok_or(CoveError::ArithOverflow)?;
         if pos > values.len() {
             return Err(CoveError::BufferTooShort);
@@ -5058,10 +5034,10 @@ fn varbytes_payload_at<'a>(
         .copied()
         .ok_or(CoveError::OffsetRange)? as usize;
     let len_end = offset.checked_add(4).ok_or(CoveError::ArithOverflow)?;
-    let Some(len_bytes) = values.get(offset..len_end) else {
+    if values.get(offset..len_end).is_none() {
         return Err(CoveError::BufferTooShort);
-    };
-    let len = u32::from_le_bytes(len_bytes.try_into().unwrap()) as usize;
+    }
+    let len = wire::read_u32_le_checked(values, offset)? as usize;
     let value_end = len_end.checked_add(len).ok_or(CoveError::ArithOverflow)?;
     values
         .get(len_end..value_end)
@@ -6432,7 +6408,9 @@ fn filter_u64_le_eq_scalar_tail(
 ) {
     for row in start..row_count {
         let offset = row * std::mem::size_of::<u64>();
-        let value = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+        let mut value_bytes = [0u8; 8];
+        value_bytes.copy_from_slice(&bytes[offset..offset + 8]);
+        let value = u64::from_le_bytes(value_bytes);
         if value == needle {
             out.set(row);
         }
@@ -6448,7 +6426,9 @@ fn filter_u32_le_eq_scalar_tail(
 ) {
     for row in start..row_count {
         let offset = row * std::mem::size_of::<u32>();
-        let value = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+        let mut value_bytes = [0u8; 4];
+        value_bytes.copy_from_slice(&bytes[offset..offset + 4]);
+        let value = u32::from_le_bytes(value_bytes);
         if value == needle {
             out.set(row);
         }
@@ -6507,7 +6487,9 @@ fn filter_i64_le_cmp_scalar_tail(
 ) {
     for row in start..row_count {
         let offset = row * std::mem::size_of::<i64>();
-        let value = i64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+        let mut value_bytes = [0u8; 8];
+        value_bytes.copy_from_slice(&bytes[offset..offset + 8]);
+        let value = i64::from_le_bytes(value_bytes);
         if compare_i64_predicate(value, op, needle) {
             out.set(row);
         }
@@ -6525,7 +6507,9 @@ fn filter_i64_le_range_scalar_tail(
 ) {
     for row in start..row_count {
         let offset = row * std::mem::size_of::<i64>();
-        let value = i64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+        let mut value_bytes = [0u8; 8];
+        value_bytes.copy_from_slice(&bytes[offset..offset + 8]);
+        let value = i64::from_le_bytes(value_bytes);
         if i64_value_in_range(value, lower, upper) {
             out.set(row);
         }

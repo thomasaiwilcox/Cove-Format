@@ -8415,7 +8415,7 @@ fn main() {
     let manifest = root.join("manifest.jsonl");
     let manifest_content = entries
         .iter()
-        .map(|entry| serde_json::to_string(entry).unwrap())
+        .map(Value::to_string)
         .collect::<Vec<_>>()
         .join("\n")
         + "\n";

@@ -142,6 +142,7 @@ impl LogicalPlanNode {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind", content = "value")]
 pub enum LogicalPlanNodeKind {
@@ -683,7 +684,9 @@ fn validate_grouping(
     if !options.strict_group_by || resolved.method_chain.group_by.is_none() {
         return Ok(());
     }
-    let group_exprs = resolved.method_chain.group_by.as_ref().unwrap();
+    let Some(group_exprs) = resolved.method_chain.group_by.as_ref() else {
+        return Ok(());
+    };
     let Some(select) = &resolved.method_chain.select else {
         return Ok(());
     };

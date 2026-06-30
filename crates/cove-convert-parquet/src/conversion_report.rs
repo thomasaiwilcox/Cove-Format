@@ -58,26 +58,28 @@ impl Default for ReverseOptions {
 }
 
 pub fn run(args: Vec<String>) -> Result<(), String> {
-    let Some((direction, format, target_format, reverse_options, input)) = parse_args(args)? else {
+    let Some(parsed) = parse_args(args)? else {
         print_usage();
         return Ok(());
     };
-    if direction == Direction::CoveToSource {
-        let json = cove_to_source_report(&input, target_format, &reverse_options)?;
+    if parsed.direction == Direction::CoveToSource {
+        let json =
+            cove_to_source_report(&parsed.input, parsed.target_format, &parsed.reverse_options)?;
         println!("{json}");
         return Ok(());
     }
-    let format =
-        format.ok_or_else(|| "--source-format is required for source-to-COVE".to_string())?;
-    let bytes =
-        fs::read(&input).map_err(|err| format!("cannot read {}: {err}", input.display()))?;
+    let format = parsed
+        .source_format
+        .ok_or_else(|| "--source-format is required for source-to-COVE".to_string())?;
+    let bytes = fs::read(&parsed.input)
+        .map_err(|err| format!("cannot read {}: {err}", parsed.input.display()))?;
     let result = convert_bytes_to_cove(
-        input.display().to_string(),
+        parsed.input.display().to_string(),
         &bytes,
         facade_source_format(format),
         ConversionOptions {
             source_format: Some(facade_source_format(format)),
-            cove: conversion_options(&input, source_format_default_table(format), &bytes)?,
+            cove: conversion_options(&parsed.input, source_format_default_table(format), &bytes)?,
             ..ConversionOptions::default()
         },
     )?;
@@ -88,19 +90,16 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
     Ok(())
 }
 
-#[allow(clippy::type_complexity)]
-fn parse_args(
-    args: Vec<String>,
-) -> Result<
-    Option<(
-        Direction,
-        Option<SourceFormat>,
-        TargetFormat,
-        ReverseOptions,
-        PathBuf,
-    )>,
-    String,
-> {
+#[derive(Debug, Clone)]
+struct ReportArgs {
+    direction: Direction,
+    source_format: Option<SourceFormat>,
+    target_format: TargetFormat,
+    reverse_options: ReverseOptions,
+    input: PathBuf,
+}
+
+fn parse_args(args: Vec<String>) -> Result<Option<ReportArgs>, String> {
     let mut direction = Direction::SourceToCove;
     let mut source_format = None;
     let mut target_format = TargetFormat::Unspecified;
@@ -166,13 +165,13 @@ fn parse_args(
         (Direction::SourceToCove, None) => Some(detect_source_format(&input)?),
         (Direction::CoveToSource, _) => None,
     };
-    Ok(Some((
+    Ok(Some(ReportArgs {
         direction,
-        format,
+        source_format: format,
         target_format,
         reverse_options,
         input,
-    )))
+    }))
 }
 
 fn parse_source_format(raw: &str) -> Result<SourceFormat, String> {

@@ -120,6 +120,12 @@ impl RuntimeCapabilityRegistry {
     pub fn capabilities(&self) -> impl Iterator<Item = &RuntimeCapability> {
         self.capabilities.iter()
     }
+
+    fn register_builtin(&mut self, capability: RuntimeCapability) {
+        debug_assert!(!capability.namespace.is_empty());
+        debug_assert!(!capability.name.is_empty());
+        self.capabilities.insert(capability);
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -204,26 +210,53 @@ impl RuntimeSession {
 
     pub fn default_builtins() -> Self {
         let mut session = Self::empty();
-        session
-            .codecs
-            .register("org.cove", "core-codecs", 1, 0)
-            .expect("builtin runtime capability is valid");
+        session.codecs.0.register_builtin(RuntimeCapability::new(
+            RuntimeHintKindV2::CodecRegistry,
+            "org.cove",
+            "core-codecs",
+            1,
+            0,
+        ));
         session
             .layout_plans
-            .register("org.cove", "scan-plan-v1", 1, 0)
-            .expect("builtin runtime capability is valid");
+            .0
+            .register_builtin(RuntimeCapability::new(
+                RuntimeHintKindV2::LayoutRegistry,
+                "org.cove",
+                "scan-plan-v1",
+                1,
+                0,
+            ));
         session
             .predicate_kernels
-            .register("org.cove", "metadata-pruning", 1, 0)
-            .expect("builtin runtime capability is valid");
+            .0
+            .register_builtin(RuntimeCapability::new(
+                RuntimeHintKindV2::PredicateKernel,
+                "org.cove",
+                "metadata-pruning",
+                1,
+                0,
+            ));
         session
             .mapping_functions
-            .register("org.cove", "filecode-canonical", 1, 0)
-            .expect("builtin runtime capability is valid");
+            .0
+            .register_builtin(RuntimeCapability::new(
+                RuntimeHintKindV2::LanguageBinding,
+                "org.cove",
+                "filecode-canonical",
+                1,
+                0,
+            ));
         session
             .engine_profiles
-            .register("org.cove", "datafusion", 1, 0)
-            .expect("builtin runtime capability is valid");
+            .0
+            .register_builtin(RuntimeCapability::new(
+                RuntimeHintKindV2::EngineAdapter,
+                "org.cove",
+                "datafusion",
+                1,
+                0,
+            ));
         session
     }
 
@@ -426,11 +459,13 @@ impl<'a> Cursor<'a> {
     }
 
     fn u16(&mut self) -> Result<u16, CoveError> {
-        Ok(u16::from_le_bytes(self.bytes(2)?.try_into().unwrap()))
+        let bytes = self.bytes(2)?;
+        Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
     }
 
     fn u32(&mut self) -> Result<u32, CoveError> {
-        Ok(u32::from_le_bytes(self.bytes(4)?.try_into().unwrap()))
+        let bytes = self.bytes(4)?;
+        Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
     }
 }
 

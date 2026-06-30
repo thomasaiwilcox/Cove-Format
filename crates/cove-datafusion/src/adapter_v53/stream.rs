@@ -1,7 +1,5 @@
 //! DataFusion 53.x stream glue.
 
-#![allow(clippy::too_many_arguments)]
-
 use std::{
     collections::VecDeque,
     future::Future,
@@ -612,6 +610,7 @@ enum CoveRecordBatchStreamInner {
 }
 
 impl CoveRecordBatchStream {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_streaming(
         schema: SchemaRef,
         state: Arc<DatasetState>,
@@ -665,6 +664,7 @@ impl CoveRecordBatchStream {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_buffered(
         schema: SchemaRef,
         state: Arc<DatasetState>,

@@ -40,7 +40,7 @@ impl ListLayout {
 
     pub fn validate_child_count(&self, child_row_count: usize) -> Result<(), CoveError> {
         self.validate()?;
-        if self.offsets.last().copied().unwrap() as usize != child_row_count {
+        if self.offsets.last().copied().ok_or(CoveError::PageCorrupt)? as usize != child_row_count {
             return Err(CoveError::PageCorrupt);
         }
         Ok(())
@@ -364,13 +364,11 @@ pub fn validate_no_duplicate_keys(keys: &[Vec<u8>]) -> Result<(), CoveError> {
 }
 
 fn read_u32_le(bytes: &[u8], offset: usize) -> Result<u32, CoveError> {
-    let slice = wire::read_range_checked(bytes, offset, 4)?;
-    Ok(u32::from_le_bytes(slice.try_into().unwrap()))
+    wire::read_u32_le_checked(bytes, offset)
 }
 
 fn read_u64_le(bytes: &[u8], offset: usize) -> Result<u64, CoveError> {
-    let slice = wire::read_range_checked(bytes, offset, 8)?;
-    Ok(u64::from_le_bytes(slice.try_into().unwrap()))
+    wire::read_u64_le_checked(bytes, offset)
 }
 
 #[cfg(test)]

@@ -55,6 +55,7 @@ pub(crate) enum KernelPredicate {
     Or(Vec<KernelPredicate>),
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum KernelBoolTerm {
     Path(ResolvedPath),
@@ -402,22 +403,22 @@ fn path_value_is_null(surface: &CoveObjectKernelSurface, row: usize, path: &Reso
     property_lane(surface, path)
         .map(|lane| match &lane.values {
             CoveObjectKernelPropertyValues::Bool(values) => {
-                values.get(row).map_or(true, Option::is_none)
+                values.get(row).is_none_or(Option::is_none)
             }
             CoveObjectKernelPropertyValues::I64(values) => {
-                values.get(row).map_or(true, Option::is_none)
+                values.get(row).is_none_or(Option::is_none)
             }
             CoveObjectKernelPropertyValues::U64(values) => {
-                values.get(row).map_or(true, Option::is_none)
+                values.get(row).is_none_or(Option::is_none)
             }
             CoveObjectKernelPropertyValues::F64(values) => {
-                values.get(row).map_or(true, Option::is_none)
+                values.get(row).is_none_or(Option::is_none)
             }
             CoveObjectKernelPropertyValues::String(values) => {
-                values.get(row).map_or(true, Option::is_none)
+                values.get(row).is_none_or(Option::is_none)
             }
             CoveObjectKernelPropertyValues::Json(values) => {
-                values.get(row).map_or(true, serde_json::Value::is_null)
+                values.get(row).is_none_or(serde_json::Value::is_null)
             }
         })
         .unwrap_or(true)

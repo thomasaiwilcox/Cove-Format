@@ -1166,8 +1166,7 @@ fn arrow_null_buffer(
 }
 
 fn read_u32_le(bytes: &[u8], offset: usize) -> Result<u32, CoveError> {
-    let slice = wire::read_range_checked(bytes, offset, 4)?;
-    Ok(u32::from_le_bytes(slice.try_into().unwrap()))
+    wire::read_u32_le_checked(bytes, offset)
 }
 
 #[inline]
@@ -4339,9 +4338,7 @@ fn value_to_f32(value: &CoveArrayValue<'_>) -> Result<f32, CoveError> {
     if bytes.len() != 4 {
         return Err(CoveError::PageCorrupt);
     }
-    Ok(f32::from_bits(u32::from_le_bytes(
-        bytes.try_into().unwrap(),
-    )))
+    Ok(f32::from_bits(u32::from_le_bytes(exact_bytes(bytes)?)))
 }
 
 fn value_to_f64(value: &CoveArrayValue<'_>) -> Result<f64, CoveError> {
@@ -4352,9 +4349,7 @@ fn value_to_f64(value: &CoveArrayValue<'_>) -> Result<f64, CoveError> {
     if bytes.len() != 8 {
         return Err(CoveError::PageCorrupt);
     }
-    Ok(f64::from_bits(u64::from_le_bytes(
-        bytes.try_into().unwrap(),
-    )))
+    Ok(f64::from_bits(u64::from_le_bytes(exact_bytes(bytes)?)))
 }
 
 fn value_to_bytes<'a>(
@@ -4444,7 +4439,9 @@ fn exact_bytes<const N: usize>(bytes: &[u8]) -> Result<[u8; N], CoveError> {
     if bytes.len() != N {
         return Err(CoveError::PageCorrupt);
     }
-    Ok(bytes.try_into().unwrap())
+    let mut out = [0u8; N];
+    out.copy_from_slice(bytes);
+    Ok(out)
 }
 
 fn unexpected_value(expected: &str, value: &CoveArrayValue<'_>) -> CoveError {

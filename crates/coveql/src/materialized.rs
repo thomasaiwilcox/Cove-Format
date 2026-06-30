@@ -21,7 +21,9 @@ pub(crate) fn window_function_key(name: &str, args: &[ResolvedExpr]) -> String {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum OutputGrain {
+    #[default]
     LatestState,
     HistoryRecord,
     HistoryState,
@@ -32,12 +34,6 @@ pub enum OutputGrain {
     AssociationState,
     ProjectionRow,
     EvidenceRow,
-}
-
-impl Default for OutputGrain {
-    fn default() -> Self {
-        Self::LatestState
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

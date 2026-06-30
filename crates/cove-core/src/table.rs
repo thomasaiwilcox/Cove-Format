@@ -44,6 +44,7 @@
 use crate::{
     constants::{CoveLogicalType, CovePhysicalKind},
     types::{validate_logical_physical_pair_with_options, LogicalPhysicalOptions},
+    wire::{read_i16_le_checked, read_u16_le_checked, read_u32_le_checked, read_u64_le_checked},
     CoveError,
 };
 
@@ -103,27 +104,27 @@ impl ColumnEntry {
         if bytes.len() < 4 + 2 {
             return Err(CoveError::BufferTooShort);
         }
-        let column_id = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        let column_id = read_u32_le_checked(bytes, 0)?;
         let mut pos = 4usize;
         let name = read_str(bytes, &mut pos, "column name")?;
         if bytes.len() < pos + 2 + 1 + 1 + 2 + 2 + 2 + 2 + 4 {
             return Err(CoveError::BufferTooShort);
         }
-        let lt_raw = u16::from_le_bytes(bytes[pos..pos + 2].try_into().unwrap());
+        let lt_raw = read_u16_le_checked(bytes, pos)?;
         pos += 2;
         let pk_raw = bytes[pos];
         pos += 1;
         let nullable_raw = bytes[pos];
         pos += 1;
-        let sort_order = u16::from_le_bytes(bytes[pos..pos + 2].try_into().unwrap());
+        let sort_order = read_u16_le_checked(bytes, pos)?;
         pos += 2;
-        let collation_id = u16::from_le_bytes(bytes[pos..pos + 2].try_into().unwrap());
+        let collation_id = read_u16_le_checked(bytes, pos)?;
         pos += 2;
-        let precision = u16::from_le_bytes(bytes[pos..pos + 2].try_into().unwrap());
+        let precision = read_u16_le_checked(bytes, pos)?;
         pos += 2;
-        let scale = i16::from_le_bytes(bytes[pos..pos + 2].try_into().unwrap());
+        let scale = read_i16_le_checked(bytes, pos)?;
         pos += 2;
-        let flags = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+        let flags = read_u32_le_checked(bytes, pos)?;
         pos += 4;
 
         let logical = CoveLogicalType::from_u16(lt_raw)
@@ -204,22 +205,22 @@ impl TableEntry {
         if bytes.len() < 4 + 2 {
             return Err(CoveError::BufferTooShort);
         }
-        let table_id = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        let table_id = read_u32_le_checked(bytes, 0)?;
         let mut pos = 4usize;
         let namespace = read_str(bytes, &mut pos, "namespace")?;
         let name = read_str(bytes, &mut pos, "table name")?;
         if bytes.len() < pos + 4 + 8 + 2 + 2 + 4 {
             return Err(CoveError::BufferTooShort);
         }
-        let column_count = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+        let column_count = read_u32_le_checked(bytes, pos)? as usize;
         pos += 4;
-        let row_count = u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap());
+        let row_count = read_u64_le_checked(bytes, pos)?;
         pos += 8;
-        let primary_sort_key_count = u16::from_le_bytes(bytes[pos..pos + 2].try_into().unwrap());
+        let primary_sort_key_count = read_u16_le_checked(bytes, pos)?;
         pos += 2;
-        let clustering_key_count = u16::from_le_bytes(bytes[pos..pos + 2].try_into().unwrap());
+        let clustering_key_count = read_u16_le_checked(bytes, pos)?;
         pos += 2;
-        let flags = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+        let flags = read_u32_le_checked(bytes, pos)?;
         pos += 4;
 
         let mut columns = Vec::with_capacity(column_count);
@@ -272,8 +273,8 @@ impl TableCatalog {
         if bytes.len() < 4 + 4 {
             return Err(CoveError::BufferTooShort);
         }
-        let table_count = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
-        let flags = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+        let table_count = read_u32_le_checked(bytes, 0)? as usize;
+        let flags = read_u32_le_checked(bytes, 4)?;
         let mut pos = 8usize;
         let mut tables = Vec::with_capacity(table_count);
         for _ in 0..table_count {
@@ -373,7 +374,7 @@ fn read_str(bytes: &[u8], pos: &mut usize, what: &str) -> Result<String, CoveErr
     if *pos + 2 > bytes.len() {
         return Err(CoveError::BufferTooShort);
     }
-    let len = u16::from_le_bytes(bytes[*pos..*pos + 2].try_into().unwrap()) as usize;
+    let len = read_u16_le_checked(bytes, *pos)? as usize;
     *pos += 2;
     let end = pos.checked_add(len).ok_or(CoveError::ArithOverflow)?;
     if end > bytes.len() {

@@ -3,7 +3,10 @@
 //! Exact membership index over a column's FileCodes. The index is sorted and
 //! supports binary search; corruption falls back to scan (Spec §73).
 
-use crate::CoveError;
+use crate::{
+    wire::{read_u32_le_checked, read_u64_le_checked},
+    CoveError,
+};
 
 use super::{checked_region, verify_checksum_field};
 
@@ -109,15 +112,15 @@ impl ExactSetIndexHeaderV1 {
         let representation =
             ExactSetRepresentation::from_u8(bytes[10]).ok_or(CoveError::BadIndex)?;
         Ok(Self {
-            table_id: u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
-            column_id: u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+            table_id: read_u32_le_checked(bytes, 0)?,
+            column_id: read_u32_le_checked(bytes, 4)?,
             granularity,
             key_kind,
             representation,
             flags: bytes[11],
-            entry_count: u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
-            data_offset: u64::from_le_bytes(bytes[16..24].try_into().unwrap()),
-            data_length: u64::from_le_bytes(bytes[24..32].try_into().unwrap()),
+            entry_count: read_u32_le_checked(bytes, 12)?,
+            data_offset: read_u64_le_checked(bytes, 16)?,
+            data_length: read_u64_le_checked(bytes, 24)?,
             checksum,
         })
     }
@@ -145,7 +148,7 @@ impl ExactSetIndex {
             }
             keys.reserve(header.entry_count as usize);
             for chunk in data.chunks_exact(8) {
-                keys.push(u64::from_le_bytes(chunk.try_into().unwrap()));
+                keys.push(read_u64_le_checked(chunk, 0)?);
             }
             for pair in keys.windows(2) {
                 if pair[0] >= pair[1] {

@@ -1,5 +1,3 @@
-#![allow(clippy::field_reassign_with_default, clippy::too_many_arguments)]
-
 use std::sync::Arc;
 
 use cove_arrow::arrow::ArrowStringValidationPolicy;
@@ -75,6 +73,7 @@ impl DatasetState {
     /// export options. This compatibility entrypoint keeps the original
     /// single-table behavior; use [`Self::from_bytes_with_table_options`] for
     /// selected-table reads from multi-table files.
+    #[allow(clippy::too_many_arguments)]
     pub fn from_bytes_with_options(
         source: impl Into<Arc<str>>,
         bytes: Vec<u8>,
@@ -100,6 +99,7 @@ impl DatasetState {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn from_bytes_with_selected_table(
         source: impl Into<Arc<str>>,
         bytes: Vec<u8>,
@@ -236,6 +236,7 @@ impl DatasetState {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn from_metadata_with_options(
         source: impl Into<Arc<str>>,
         file_len: u64,
@@ -370,6 +371,7 @@ impl DatasetState {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn from_file_metadata_with_options(
         source: impl Into<Arc<str>>,
         files: Vec<FileMetadata>,
@@ -720,9 +722,7 @@ fn layout_from_bytes(
     table: &TableEntry,
     segments: &[TableSegmentIndexEntryV1],
 ) -> LayoutPlanningMetadataV2 {
-    let mut layout = LayoutPlanningMetadataV2::default();
-
-    layout.fast_metadata = mounted
+    let fast_metadata = mounted
         .footer
         .sections
         .iter()
@@ -735,6 +735,10 @@ fn layout_from_bytes(
                 .ok()
                 .map(|_| Arc::new(index))
         });
+    let mut layout = LayoutPlanningMetadataV2 {
+        fast_metadata,
+        ..LayoutPlanningMetadataV2::default()
+    };
     if layout.fast_metadata.is_some() {
         layout.record_loaded();
     } else if mounted.header.fast_metadata_section_id != 0 {

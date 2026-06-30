@@ -16,7 +16,10 @@
 //! be embedded directly in a `TableEntryV1` (Spec §24) array of sort or
 //! clustering keys without any per-entry framing.
 
-use crate::CoveError;
+use crate::{
+    wire::{read_u16_le_checked, read_u32_le_checked},
+    CoveError,
+};
 
 // ── SortKeyEntryV1 (Spec §53.1) ──────────────────────────────────────────────
 
@@ -88,12 +91,12 @@ impl SortKeyEntryV1 {
         if bytes.len() < SORT_KEY_ENTRY_LEN {
             return Err(CoveError::BufferTooShort);
         }
-        let column_id = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        let column_id = read_u32_le_checked(bytes, 0)?;
         let direction = SortDirection::from_u8(bytes[4])
             .ok_or_else(|| CoveError::BadSection(format!("bad sort direction {}", bytes[4])))?;
         let null_order = NullOrder::from_u8(bytes[5])
             .ok_or_else(|| CoveError::BadSection(format!("bad null order {}", bytes[5])))?;
-        let collation_id = u16::from_le_bytes(bytes[6..8].try_into().unwrap());
+        let collation_id = read_u16_le_checked(bytes, 6)?;
         Ok(Self {
             column_id,
             direction,
@@ -157,7 +160,7 @@ impl ClusteringKeyEntryV1 {
         if bytes.len() < CLUSTERING_KEY_ENTRY_LEN {
             return Err(CoveError::BufferTooShort);
         }
-        let column_id = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        let column_id = read_u32_le_checked(bytes, 0)?;
         let clustering_strength = ClusteringStrength::from_u8(bytes[4]);
         let mut reserved = [0u8; 3];
         reserved.copy_from_slice(&bytes[5..8]);

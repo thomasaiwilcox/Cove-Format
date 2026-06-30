@@ -95,11 +95,7 @@ pub(crate) fn candidate_matches(file: &CovemapFile, rows: &[SourceRow]) -> Resul
             Err(err) => return Err(err),
         }
     }
-    matches.sort_by(|left, right| {
-        serde_json::to_string(left)
-            .unwrap()
-            .cmp(&serde_json::to_string(right).unwrap())
-    });
+    matches.sort_by_cached_key(|value| value.to_string());
     Ok(json!({
         "mapping_id": mapping_id,
         "mapping_version": mapping_version,

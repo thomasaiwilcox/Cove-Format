@@ -5,6 +5,7 @@ use crate::{
     checksum, compression,
     constants::{CoveLogicalType, SectionKind, ValueTag},
     footer::{CoveFooter, CoveSectionEntryV1},
+    wire::{read_u16_le_checked, read_u32_le_checked, read_u64_le_checked},
     CoveError,
 };
 
@@ -163,8 +164,8 @@ impl ExtensionRegistry {
         if bytes.len() < EXTENSION_REGISTRY_HEADER_LEN {
             return Err(CoveError::BufferTooShort);
         }
-        let extension_count = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
-        let flags = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+        let extension_count = read_u32_le_checked(bytes, 0)? as usize;
+        let flags = read_u32_le_checked(bytes, 4)?;
         if flags != 0 {
             return Err(CoveError::ReservedNotZero);
         }
@@ -353,12 +354,12 @@ impl ExtensionLogicalTypeV1 {
         if bytes.len() < EXTENSION_LOGICAL_TYPE_FIXED_LEN {
             return Err(CoveError::BufferTooShort);
         }
-        let extension_id = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
-        let base_logical_raw = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
-        let canonical_tag_raw = u16::from_le_bytes(bytes[6..8].try_into().unwrap());
-        let collation_id = u16::from_le_bytes(bytes[8..10].try_into().unwrap());
-        let flags = u16::from_le_bytes(bytes[10..12].try_into().unwrap());
-        let name_len = u16::from_le_bytes(bytes[12..14].try_into().unwrap()) as usize;
+        let extension_id = read_u32_le_checked(bytes, 0)?;
+        let base_logical_raw = read_u16_le_checked(bytes, 4)?;
+        let canonical_tag_raw = read_u16_le_checked(bytes, 6)?;
+        let collation_id = read_u16_le_checked(bytes, 8)?;
+        let flags = read_u16_le_checked(bytes, 10)?;
+        let name_len = read_u16_le_checked(bytes, 12)? as usize;
         let name_start = 14usize;
         let name_end = name_start
             .checked_add(name_len)
@@ -373,8 +374,7 @@ impl ExtensionLogicalTypeV1 {
         let arrow_extension_name = std::str::from_utf8(&bytes[name_start..name_end])
             .map_err(|_| CoveError::BadExtension)?
             .to_string();
-        let metadata_payload_ref =
-            u32::from_le_bytes(bytes[name_end..metadata_ref_end].try_into().unwrap());
+        let metadata_payload_ref = read_u32_le_checked(bytes, name_end)?;
         let base_logical_type =
             CoveLogicalType::from_u16(base_logical_raw).ok_or(CoveError::BadExtension)?;
         let canonical_value_tag =
@@ -429,13 +429,13 @@ impl ExtensionIndexDescriptorV1 {
         let false_negative_policy =
             ExtensionFalseNegativePolicy::from_u8(bytes[9]).ok_or(CoveError::BadExtension)?;
         Ok(Self {
-            extension_id: u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
-            index_kind: u16::from_le_bytes(bytes[4..6].try_into().unwrap()),
-            key_column_count: u16::from_le_bytes(bytes[6..8].try_into().unwrap()),
+            extension_id: read_u32_le_checked(bytes, 0)?,
+            index_kind: read_u16_le_checked(bytes, 4)?,
+            key_column_count: read_u16_le_checked(bytes, 6)?,
             proof_capability,
             false_negative_policy,
-            flags: u32::from_le_bytes(bytes[10..14].try_into().unwrap()),
-            payload_ref: u32::from_le_bytes(bytes[14..18].try_into().unwrap()),
+            flags: read_u32_le_checked(bytes, 10)?,
+            payload_ref: read_u32_le_checked(bytes, 14)?,
         })
     }
 
@@ -485,7 +485,7 @@ fn read_u16(bytes: &[u8], pos: &mut usize) -> Result<u16, CoveError> {
     if end > bytes.len() {
         return Err(CoveError::BufferTooShort);
     }
-    let value = u16::from_le_bytes(bytes[*pos..end].try_into().unwrap());
+    let value = read_u16_le_checked(bytes, *pos)?;
     *pos = end;
     Ok(value)
 }
@@ -495,7 +495,7 @@ fn read_u32(bytes: &[u8], pos: &mut usize) -> Result<u32, CoveError> {
     if end > bytes.len() {
         return Err(CoveError::BufferTooShort);
     }
-    let value = u32::from_le_bytes(bytes[*pos..end].try_into().unwrap());
+    let value = read_u32_le_checked(bytes, *pos)?;
     *pos = end;
     Ok(value)
 }
@@ -505,7 +505,7 @@ fn read_u64(bytes: &[u8], pos: &mut usize) -> Result<u64, CoveError> {
     if end > bytes.len() {
         return Err(CoveError::BufferTooShort);
     }
-    let value = u64::from_le_bytes(bytes[*pos..end].try_into().unwrap());
+    let value = read_u64_le_checked(bytes, *pos)?;
     *pos = end;
     Ok(value)
 }

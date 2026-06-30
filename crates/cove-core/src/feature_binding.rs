@@ -386,7 +386,9 @@ impl SectionFeatureBindingSectionV2 {
 
         let mut feature_words = Vec::with_capacity(header.feature_word_count as usize);
         for chunk in bytes[feature_word_range.0..feature_word_range.1].chunks_exact(8) {
-            feature_words.push(u64::from_le_bytes(chunk.try_into().unwrap()));
+            let mut word_bytes = [0u8; 8];
+            word_bytes.copy_from_slice(chunk);
+            feature_words.push(u64::from_le_bytes(word_bytes));
         }
         let payload_data = bytes[payload_data_range.0..payload_data_range.1].to_vec();
 
@@ -739,7 +741,9 @@ fn read_array<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N], Co
     if end > bytes.len() {
         return Err(CoveError::BufferTooShort);
     }
-    Ok(bytes[offset..end].try_into().unwrap())
+    let mut out = [0u8; N];
+    out.copy_from_slice(&bytes[offset..end]);
+    Ok(out)
 }
 
 #[cfg(test)]
