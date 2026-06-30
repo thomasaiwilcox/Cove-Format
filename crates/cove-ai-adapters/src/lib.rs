@@ -1,3 +1,8 @@
+//! Stable facade for COVE-AI archive import, verification, reporting, and export.
+//!
+//! The public API returns typed `AiAdapterError` values; their `Display`
+//! implementation is kept compatible with the CLI-facing diagnostics.
+
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     error::Error,
@@ -51,7 +56,21 @@ pub enum AiAdapterError {
         path: PathBuf,
         source: CoveError,
     },
-    Message(String),
+    UnsupportedImportSchema {
+        schema: String,
+    },
+    UnsupportedSplitPolicy {
+        policy: String,
+    },
+    UnsupportedExportFormat {
+        format: String,
+    },
+    Export {
+        message: String,
+    },
+    InvalidInput {
+        message: String,
+    },
 }
 
 impl fmt::Display for AiAdapterError {
@@ -69,7 +88,25 @@ impl fmt::Display for AiAdapterError {
                     path.display()
                 )
             }
-            AiAdapterError::Message(message) => f.write_str(message),
+            AiAdapterError::UnsupportedImportSchema { schema } => write!(
+                f,
+                "unsupported AI import schema '{schema}'; expected instruction, chat, pretrain, preference, or rag"
+            ),
+            AiAdapterError::UnsupportedSplitPolicy { policy } => {
+                write!(
+                    f,
+                    "unsupported split policy '{policy}'; only deterministic is implemented"
+                )
+            }
+            AiAdapterError::UnsupportedExportFormat { format } => {
+                write!(
+                    f,
+                    "unsupported AI export format '{format}'; expected json, jsonl, hf-jsonl, arrow, parquet, or webdataset"
+                )
+            }
+            AiAdapterError::Export { message } | AiAdapterError::InvalidInput { message } => {
+                f.write_str(message)
+            }
         }
     }
 }
@@ -79,29 +116,37 @@ impl Error for AiAdapterError {
         match self {
             AiAdapterError::Io { source, .. } => Some(source),
             AiAdapterError::InvalidSidecar { source, .. } => Some(source),
-            AiAdapterError::Message(_) => None,
+            AiAdapterError::UnsupportedImportSchema { .. }
+            | AiAdapterError::UnsupportedSplitPolicy { .. }
+            | AiAdapterError::UnsupportedExportFormat { .. }
+            | AiAdapterError::Export { .. }
+            | AiAdapterError::InvalidInput { .. } => None,
         }
     }
 }
 
 impl From<String> for AiAdapterError {
     fn from(message: String) -> Self {
-        AiAdapterError::Message(message)
+        AiAdapterError::InvalidInput { message }
     }
 }
 
 impl From<&str> for AiAdapterError {
     fn from(message: &str) -> Self {
-        AiAdapterError::Message(message.to_string())
+        AiAdapterError::InvalidInput {
+            message: message.to_string(),
+        }
     }
 }
 
+#[must_use]
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AiArchiveOpenOptions {
     pub cove_ai: Option<PathBuf>,
     pub dataset_dir: Option<PathBuf>,
 }
 
+#[must_use]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AiVerifyOptions {
     pub policy_report: bool,
@@ -115,12 +160,14 @@ impl Default for AiVerifyOptions {
     }
 }
 
+#[must_use]
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AiSampleIteratorOptions {
     pub split: Option<String>,
     pub include_payloads: bool,
 }
 
+#[must_use]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AiExportOptions {
     pub format: String,
@@ -142,6 +189,7 @@ impl Default for AiExportOptions {
     }
 }
 
+#[must_use]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AiImportOptions {
     pub schema: AiImportSchema,
@@ -185,9 +233,9 @@ impl AiImportSchema {
             "pretrain" => Ok(Self::Pretrain),
             "preference" => Ok(Self::Preference),
             "rag" => Ok(Self::Rag),
-            other => Err(AiAdapterError::Message(format!(
-                "unsupported AI import schema '{other}'; expected instruction, chat, pretrain, preference, or rag"
-            ))),
+            other => Err(AiAdapterError::UnsupportedImportSchema {
+                schema: other.to_string(),
+            }),
         }
     }
 
@@ -212,13 +260,14 @@ impl AiSplitPolicy {
     pub fn parse(value: &str) -> Result<Self, AiAdapterError> {
         match value {
             "deterministic" => Ok(Self::Deterministic),
-            other => Err(AiAdapterError::Message(format!(
-                "unsupported split policy '{other}'; only deterministic is implemented"
-            ))),
+            other => Err(AiAdapterError::UnsupportedSplitPolicy {
+                policy: other.to_string(),
+            }),
         }
     }
 }
 
+#[must_use]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AiArchiveReport {
     pub path: PathBuf,
@@ -231,6 +280,7 @@ pub struct AiArchiveReport {
     pub diagnostics: Vec<AiWithheldDiagnostic>,
 }
 
+#[must_use]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AiWithheldDiagnostic {
     pub code: String,
@@ -238,6 +288,7 @@ pub struct AiWithheldDiagnostic {
     pub message: String,
 }
 
+#[must_use]
 #[derive(Debug, Clone)]
 pub struct AiTrainingArchive {
     path: PathBuf,
@@ -245,6 +296,7 @@ pub struct AiTrainingArchive {
     sidecar: CoveAiFile,
 }
 
+#[must_use]
 #[derive(Debug, Clone)]
 pub struct AiExportData {
     pub media_type: &'static str,
@@ -523,7 +575,7 @@ impl AiTrainingArchive {
             "samples": samples,
             "diagnostics": self.report(AiVerifyOptions { policy_report: options.policy_report })?.diagnostics,
         });
-        Ok(export_value(&report, &options.format)?)
+        export_value(&report, &options.format)
     }
 }
 
@@ -606,10 +658,12 @@ pub fn import_hf_dir(
         }
     }
     if rows.is_empty() {
-        return Err(AiAdapterError::Message(format!(
-            "{} did not contain any .jsonl records to import",
-            input_dir.display()
-        )));
+        return Err(AiAdapterError::InvalidInput {
+            message: format!(
+                "{} did not contain any .jsonl records to import",
+                input_dir.display()
+            ),
+        });
     }
     Ok(import_values(input_dir, rows, out, options)?)
 }
@@ -701,9 +755,9 @@ pub fn build_ai_training_showcase(
         "standard" => 128usize,
         "publication" => 512usize,
         other => {
-            return Err(AiAdapterError::Message(format!(
-                "unknown ai-training showcase profile '{other}'"
-            )))
+            return Err(AiAdapterError::InvalidInput {
+                message: format!("unknown ai-training showcase profile '{other}'"),
+            })
         }
     };
     let source_path = out_dir.join("training-source.jsonl");
@@ -726,8 +780,8 @@ pub fn build_ai_training_showcase(
                 "diagnostic": if withheld { "showcase_policy_withheld" } else { "allowed" }
             }
         }))
-        .map_err(|error| {
-            AiAdapterError::Message(format!("cannot serialize showcase sample: {error}"))
+        .map_err(|error| AiAdapterError::Export {
+            message: format!("cannot serialize showcase sample: {error}"),
         })?;
         source.push_str(&sample);
         source.push('\n');
@@ -750,8 +804,8 @@ pub fn build_ai_training_showcase(
     })?;
     fs::write(
         out_dir.join("verification-report.json"),
-        serde_json::to_vec_pretty(&verify_report).map_err(|error| {
-            AiAdapterError::Message(format!("cannot serialize verification report: {error}"))
+        serde_json::to_vec_pretty(&verify_report).map_err(|error| AiAdapterError::Export {
+            message: format!("cannot serialize verification report: {error}"),
         })?,
     )
     .map_err(|error| format!("cannot write verification report: {error}"))?;
@@ -1247,34 +1301,45 @@ fn push_payload_ref(
     Ok(payload_ref)
 }
 
-fn export_value(report: &Value, format: &str) -> Result<AiExportData, String> {
+fn export_value(report: &Value, format: &str) -> Result<AiExportData, AiAdapterError> {
     let (media_type, bytes) = match format {
         "json" => (
             "application/json",
-            serde_json::to_vec_pretty(report)
-                .map_err(|error| format!("cannot serialize AI JSON export: {error}"))?,
+            serde_json::to_vec_pretty(report).map_err(|error| {
+                ai_export_error(format!("cannot serialize AI JSON export: {error}"))
+            })?,
         ),
         "jsonl" | "hf-jsonl" => {
             let mut out = Vec::new();
             for sample in report
                 .get("samples")
                 .and_then(Value::as_array)
-                .ok_or_else(|| "AI export report is missing samples".to_string())?
+                .ok_or_else(|| ai_export_error("AI export report is missing samples"))?
             {
-                let line = serde_json::to_string(sample)
-                    .map_err(|error| format!("cannot serialize AI JSONL sample: {error}"))?;
+                let line = serde_json::to_string(sample).map_err(|error| {
+                    ai_export_error(format!("cannot serialize AI JSONL sample: {error}"))
+                })?;
                 out.extend_from_slice(line.as_bytes());
                 out.push(b'\n');
             }
             ("application/x-ndjson", out)
         }
-        "arrow" => ("application/vnd.apache.arrow.file", write_arrow_ipc(report)?),
-        "parquet" => ("application/vnd.apache.parquet", write_parquet(report)?),
-        "webdataset" => ("application/x-tar", write_webdataset(report)?),
+        "arrow" => (
+            "application/vnd.apache.arrow.file",
+            write_arrow_ipc(report).map_err(ai_export_error)?,
+        ),
+        "parquet" => (
+            "application/vnd.apache.parquet",
+            write_parquet(report).map_err(ai_export_error)?,
+        ),
+        "webdataset" => (
+            "application/x-tar",
+            write_webdataset(report).map_err(ai_export_error)?,
+        ),
         other => {
-            return Err(format!(
-                "unsupported AI export format '{other}'; expected json, jsonl, hf-jsonl, arrow, parquet, or webdataset"
-            ))
+            return Err(AiAdapterError::UnsupportedExportFormat {
+                format: other.to_string(),
+            })
         }
     };
     Ok(AiExportData {
@@ -1282,6 +1347,12 @@ fn export_value(report: &Value, format: &str) -> Result<AiExportData, String> {
         bytes,
         report: report.clone(),
     })
+}
+
+fn ai_export_error(message: impl Into<String>) -> AiAdapterError {
+    AiAdapterError::Export {
+        message: message.into(),
+    }
 }
 
 pub fn write_export_file(data: AiExportData, out: Option<PathBuf>) -> Result<(), AiAdapterError> {
@@ -1983,7 +2054,10 @@ mod tests {
     #[test]
     fn import_schema_parse_reports_typed_error() {
         let error = AiImportSchema::parse("made-up-schema").unwrap_err();
-        assert!(matches!(error, AiAdapterError::Message(_)));
+        assert!(matches!(
+            error,
+            AiAdapterError::UnsupportedImportSchema { .. }
+        ));
         assert!(error
             .to_string()
             .contains("unsupported AI import schema 'made-up-schema'"));
@@ -2095,7 +2169,10 @@ mod tests {
                 ..AiExportOptions::default()
             })
             .unwrap_err();
-        assert!(matches!(error, AiAdapterError::Message(_)));
+        assert!(matches!(
+            error,
+            AiAdapterError::UnsupportedExportFormat { .. }
+        ));
         assert!(error
             .to_string()
             .contains("unsupported AI export format 'made-up-format'"));

@@ -637,7 +637,7 @@ fn render_method(method: &AstMethod) -> String {
             let exprs = exprs.iter().map(render_expr).collect::<Vec<_>>().join(", ");
             format!("groupBy({exprs})")
         }
-        AstMethod::Explain(mode) => format!("explain({})", render_explain_mode(*mode)),
+        AstMethod::Explain(mode) => format!("explain({})", mode.as_str()),
         AstMethod::ProfileCall { name, args } => {
             let args = args
                 .iter()
@@ -992,17 +992,6 @@ fn render_null_ordering(nulls: AstNullOrdering) -> &'static str {
         AstNullOrdering::Default => "nulls_last",
         AstNullOrdering::NullsFirst => "nulls_first",
         AstNullOrdering::NullsLast => "nulls_last",
-    }
-}
-
-fn render_explain_mode(mode: crate::ExplainMode) -> &'static str {
-    match mode {
-        crate::ExplainMode::Public => "public",
-        crate::ExplainMode::Developer => "developer",
-        crate::ExplainMode::Proof => "proof",
-        crate::ExplainMode::Coded => "coded",
-        crate::ExplainMode::Ai => "ai",
-        crate::ExplainMode::Forensic => "forensic",
     }
 }
 

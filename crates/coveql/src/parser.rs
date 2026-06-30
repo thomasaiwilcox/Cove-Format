@@ -1690,7 +1690,9 @@ impl Parser {
             }
             _ => return Err(self.err_current("expected explain mode")),
         };
-        explain_mode_from_str(&value).ok_or_else(|| self.err_previous("unsupported explain mode"))
+        value
+            .parse()
+            .map_err(|_| self.err_previous("unsupported explain mode"))
     }
 
     fn current_explain_mode_prefix(&self) -> Option<ExplainMode> {
@@ -1704,7 +1706,7 @@ impl Parser {
             TokenKind::Identifier(value, _) | TokenKind::String(value) => value,
             _ => return None,
         };
-        explain_mode_from_str(value)
+        value.parse().ok()
     }
 
     fn parse_u64(&mut self, message: &'static str) -> Result<u64, Vec<CoveQlDiagnostic>> {
@@ -1892,18 +1894,6 @@ impl Parser {
             "parse",
             self.previous().span,
         )]
-    }
-}
-
-fn explain_mode_from_str(value: &str) -> Option<ExplainMode> {
-    match value.to_ascii_lowercase().as_str() {
-        "public" => Some(ExplainMode::Public),
-        "developer" => Some(ExplainMode::Developer),
-        "proof" => Some(ExplainMode::Proof),
-        "coded" => Some(ExplainMode::Coded),
-        "ai" => Some(ExplainMode::Ai),
-        "forensic" => Some(ExplainMode::Forensic),
-        _ => None,
     }
 }
 

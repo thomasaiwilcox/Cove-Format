@@ -27,6 +27,8 @@ use cove_map::{
 use parquet::{arrow::ArrowWriter, file::properties::WriterProperties};
 use serde_json::{json, Value};
 
+use crate::CliError;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Customer360Profile {
     Quick,
@@ -35,14 +37,14 @@ pub enum Customer360Profile {
 }
 
 impl Customer360Profile {
-    pub fn parse(value: &str) -> Result<Self, String> {
+    pub fn parse(value: &str) -> Result<Self, CliError> {
         match value {
             "quick" => Ok(Self::Quick),
             "standard" => Ok(Self::Standard),
             "publication" => Ok(Self::Publication),
-            other => Err(format!(
+            other => Err(CliError::Usage(format!(
                 "unknown customer360 profile '{other}'; expected quick, standard, or publication"
-            )),
+            ))),
         }
     }
 
@@ -67,6 +69,7 @@ impl Customer360Profile {
     }
 }
 
+#[must_use]
 #[derive(Debug, Clone)]
 pub struct Customer360Options {
     pub out_dir: PathBuf,
@@ -83,15 +86,15 @@ pub enum ProofSuiteScenario {
 }
 
 impl ProofSuiteScenario {
-    pub fn parse(value: &str) -> Result<Self, String> {
+    pub fn parse(value: &str) -> Result<Self, CliError> {
         match value {
             "customer360" => Ok(Self::Customer360),
             "claims" => Ok(Self::Claims),
             "catalog" => Ok(Self::Catalog),
             "all" => Ok(Self::All),
-            other => Err(format!(
+            other => Err(CliError::Usage(format!(
                 "unknown proof-suite scenario '{other}'; expected customer360, claims, catalog, or all"
-            )),
+            ))),
         }
     }
 
@@ -112,6 +115,7 @@ impl ProofSuiteScenario {
     }
 }
 
+#[must_use]
 #[derive(Debug, Clone)]
 pub struct ProofSuiteOptions {
     pub out_dir: PathBuf,
@@ -120,7 +124,7 @@ pub struct ProofSuiteOptions {
     pub force: bool,
 }
 
-pub fn generate_customer360(options: &Customer360Options) -> Result<Value, String> {
+pub fn generate_customer360(options: &Customer360Options) -> Result<Value, CliError> {
     prepare_output_dir(&options.out_dir, options.force)?;
 
     let profile = options.profile;
@@ -234,7 +238,7 @@ pub fn generate_customer360(options: &Customer360Options) -> Result<Value, Strin
     Ok(manifest)
 }
 
-pub fn generate_proof_suite(options: &ProofSuiteOptions) -> Result<Value, String> {
+pub fn generate_proof_suite(options: &ProofSuiteOptions) -> Result<Value, CliError> {
     prepare_output_dir(&options.out_dir, options.force)?;
     let mut scenarios = Vec::new();
     for scenario in options.scenario.selected() {

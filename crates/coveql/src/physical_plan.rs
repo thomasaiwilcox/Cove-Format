@@ -19,11 +19,17 @@ use crate::{
         ZeroCopyEligibilityReport,
     },
     physical_sidecars::{PhysicalSidecarInputs, PhysicalSidecarStatus, PhysicalSidecarValidation},
-    AssociationDirectionPlan, AssociationOptimizationReport, AstAggregateName, AstChangeMode,
-    AstHistoryMode, BuildLogicalPlanError, CoveQlAiOperation, CoveQlOutputMode, DiagnosticSeverity,
+    AssociationDirectionPlan, AssociationOptimizationReport, AstAggregateName,
+    BuildLogicalPlanError, CoveQlAiOperation, CoveQlOutputMode, DiagnosticSeverity,
     EvidenceGrainKind, EvidenceOptimizationReport, EvidenceTargetIndexKind,
     MetadataDisclosurePolicy, ParseOptions, PlanOptions, PlannedQuery, ResolveOptions,
 };
+
+mod contract;
+mod vocabulary;
+
+use contract::contract;
+use vocabulary::PhysicalTemporalGrain;
 
 pub type PhysicalPlanFingerprint = String;
 
@@ -152,75 +158,6 @@ pub struct PhysicalOperatorContract {
     pub index_only_eligible: bool,
     pub fallback: String,
     pub explain_fields: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PhysicalContractName(String);
-
-impl PhysicalContractName {
-    fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl From<&str> for PhysicalContractName {
-    fn from(value: &str) -> Self {
-        Self(value.to_string())
-    }
-}
-
-impl From<String> for PhysicalContractName {
-    fn from(value: String) -> Self {
-        Self(value)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PhysicalContractPort(String);
-
-impl PhysicalContractPort {
-    fn into_string(self) -> String {
-        self.0
-    }
-}
-
-impl From<&str> for PhysicalContractPort {
-    fn from(value: &str) -> Self {
-        Self(value.to_string())
-    }
-}
-
-impl From<&&str> for PhysicalContractPort {
-    fn from(value: &&str) -> Self {
-        Self((*value).to_string())
-    }
-}
-
-impl From<String> for PhysicalContractPort {
-    fn from(value: String) -> Self {
-        Self(value)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PhysicalContractFallback(String);
-
-impl PhysicalContractFallback {
-    fn into_string(self) -> String {
-        self.0
-    }
-}
-
-impl From<&str> for PhysicalContractFallback {
-    fn from(value: &str) -> Self {
-        Self(value.to_string())
-    }
-}
-
-impl From<String> for PhysicalContractFallback {
-    fn from(value: String) -> Self {
-        Self(value)
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1129,60 +1066,6 @@ fn build_nodes(
     );
 }
 
-fn contract<I, O, Input, Output>(
-    name: impl Into<PhysicalContractName>,
-    inputs: I,
-    outputs: O,
-    fallback: impl Into<PhysicalContractFallback>,
-) -> PhysicalOperatorContract
-where
-    I: IntoIterator<Item = Input>,
-    Input: Into<PhysicalContractPort>,
-    O: IntoIterator<Item = Output>,
-    Output: Into<PhysicalContractPort>,
-{
-    let name = name.into();
-    PhysicalOperatorContract {
-        contract_version: crate::PHYSICAL_OPERATOR_CONTRACT_VERSION.into(),
-        inputs: inputs
-            .into_iter()
-            .map(Into::into)
-            .map(PhysicalContractPort::into_string)
-            .collect(),
-        outputs: outputs
-            .into_iter()
-            .map(Into::into)
-            .map(PhysicalContractPort::into_string)
-            .collect(),
-        preconditions: vec![format!(
-            "{} preconditions must be validated before use",
-            name.as_str()
-        )],
-        postconditions: vec![format!(
-            "{} must preserve logical truth under its validated authority contract",
-            name.as_str()
-        )],
-        cardinality:
-            "exact-authoritative when proofs pass; otherwise no false negatives with residual checks"
-                .into(),
-        ordering: "does not establish logical ordering unless materialized sort follows".into(),
-        protected_metadata: vec![
-            "paths".into(),
-            "literals".into(),
-            "sidecar identifiers".into(),
-        ],
-        pre_redaction_safe: false,
-        index_only_eligible: false,
-        fallback: fallback.into().into_string(),
-        explain_fields: vec![
-            "operator".into(),
-            "candidate_count".into(),
-            "fallback".into(),
-            "redacted_metadata".into(),
-        ],
-    }
-}
-
 fn forms_by_representation(
     forms: &PhysicalPredicateNormalForms,
     representation: PhysicalRepresentationClass,
@@ -1235,9 +1118,10 @@ fn association_endpoint_fast_path_exact(
 fn temporal_grain_reconstruction(planned: &PlannedQuery) -> Option<(String, String, bool)> {
     let native_exact = native_temporal_direct_projection_shape(planned);
     if let Some(history) = planned.resolved.method_chain.history {
+        let temporal_grain = PhysicalTemporalGrain::history(history);
         return Some((
-            format!("history_{}", physical_history_mode_name(history)),
-            physical_history_row_grain(history).into(),
+            temporal_grain.mode().into(),
+            temporal_grain.row_grain().to_string(),
             native_exact,
         ));
     }
@@ -1247,46 +1131,13 @@ fn temporal_grain_reconstruction(planned: &PlannedQuery) -> Option<(String, Stri
         .changes
         .as_ref()
         .map(|changes| {
+            let temporal_grain = PhysicalTemporalGrain::changes(changes.mode);
             (
-                format!("changes_{}", physical_change_mode_name(changes.mode)),
-                physical_change_row_grain(changes.mode).into(),
+                temporal_grain.mode().into(),
+                temporal_grain.row_grain().to_string(),
                 native_exact,
             )
         })
-}
-
-fn physical_history_mode_name(mode: AstHistoryMode) -> &'static str {
-    match mode {
-        AstHistoryMode::Records => "records",
-        AstHistoryMode::States => "states",
-        AstHistoryMode::RecordsAndStates => "records_and_states",
-    }
-}
-
-fn physical_history_row_grain(mode: AstHistoryMode) -> &'static str {
-    match mode {
-        AstHistoryMode::Records => "history_record",
-        AstHistoryMode::States => "history_state",
-        AstHistoryMode::RecordsAndStates => "history_records_and_states",
-    }
-}
-
-fn physical_change_mode_name(mode: AstChangeMode) -> &'static str {
-    match mode {
-        AstChangeMode::Records => "records",
-        AstChangeMode::StateTransitions => "state_transitions",
-        AstChangeMode::PropertyDiffs => "property_diffs",
-        AstChangeMode::FinalRows => "final_rows",
-    }
-}
-
-fn physical_change_row_grain(mode: AstChangeMode) -> &'static str {
-    match mode {
-        AstChangeMode::Records => "change_record",
-        AstChangeMode::StateTransitions => "change_state_transition",
-        AstChangeMode::PropertyDiffs => "change_property_diff",
-        AstChangeMode::FinalRows => "change_final_row",
-    }
 }
 
 fn association_aggregate_fast_path_exact(

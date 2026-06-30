@@ -82,7 +82,8 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
             cove: conversion_options(&parsed.input, source_format_default_table(format), &bytes)?,
             ..ConversionOptions::default()
         },
-    )?;
+    )
+    .map_err(|err| err.to_string())?;
     validate_report_result(&result)?;
     let json = serde_json::to_string_pretty(&result.report.to_json_value())
         .map_err(|err| format!("cannot serialize conversion report: {err}"))?;
@@ -162,7 +163,9 @@ fn parse_args(args: Vec<String>) -> Result<Option<ReportArgs>, String> {
     let input = input.ok_or_else(|| "expected an input file".to_string())?;
     let format = match (direction, source_format) {
         (Direction::SourceToCove, Some(format)) => Some(format),
-        (Direction::SourceToCove, None) => Some(detect_source_format(&input)?),
+        (Direction::SourceToCove, None) => {
+            Some(detect_source_format(&input).map_err(|err| err.to_string())?)
+        }
         (Direction::CoveToSource, _) => None,
     };
     Ok(Some(ReportArgs {
@@ -260,7 +263,7 @@ fn conversion_options(
             .to_string(),
         namespace: "interop".into(),
         source_identifier: Some(input.display().to_string()),
-        source_digest: Some(source_digest(source_bytes)?),
+        source_digest: Some(source_digest(source_bytes).map_err(|err| err.to_string())?),
         ..ParquetConversionOptions::default()
     })
 }
@@ -315,7 +318,7 @@ fn cove_to_source_report(
         "direction": "cove-to-source",
         "source_format": "cove",
         "source_identifier": input.display().to_string(),
-        "source_digest": source_digest(&bytes)?,
+        "source_digest": source_digest(&bytes).map_err(|err| err.to_string())?,
         "target_format": target_name,
         "conversion_policy_version": "cove-reference-v2.0",
         "validation_result": true,

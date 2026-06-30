@@ -125,7 +125,7 @@ pub(crate) fn operation_context_explain_json(context: &OperationContext) -> Valu
 
     let mut value = explain_document(ExplainDocumentParts {
         schema_version: context.explain_json_schema_version.into(),
-        mode: explain_mode_name(effective_mode).into(),
+        mode: effective_mode.as_str().into(),
         primary_profile: Value::String("object".into()),
         profiles: json!(["object"]),
         profile_contracts: default_profile_contracts_json(),
@@ -180,7 +180,7 @@ pub(crate) fn resolved_query_explain_json(resolved: &ResolvedQuery) -> Value {
 
     let mut value = explain_document(ExplainDocumentParts {
         schema_version: context.explain_json_schema_version.into(),
-        mode: explain_mode_name(effective_mode).into(),
+        mode: effective_mode.as_str().into(),
         primary_profile: primary_profile_json(resolved),
         profiles: profiles_json(resolved),
         profile_contracts: profile_contracts_json(resolved),
@@ -244,7 +244,7 @@ pub(crate) fn planned_query_explain_json(planned: &PlannedQuery) -> Value {
 
     let mut value = explain_document(ExplainDocumentParts {
         schema_version: context.explain_json_schema_version.into(),
-        mode: explain_mode_name(effective_mode).into(),
+        mode: effective_mode.as_str().into(),
         primary_profile: primary_profile_json(&planned.resolved),
         profiles: profiles_json(&planned.resolved),
         profile_contracts: profile_contracts_json(&planned.resolved),
@@ -319,7 +319,7 @@ pub(crate) fn executed_query_explain_json(executed: &ExecutedQuery) -> Value {
 
     let mut value = explain_document(ExplainDocumentParts {
         schema_version: context.explain_json_schema_version.into(),
-        mode: explain_mode_name(effective_mode).into(),
+        mode: effective_mode.as_str().into(),
         primary_profile: primary_profile_json(&planned.resolved),
         profiles: profiles_json(&planned.resolved),
         profile_contracts: profile_contracts_json(&planned.resolved),
@@ -390,7 +390,7 @@ pub(crate) fn physical_planned_query_explain_json(physical: &PhysicalPlannedQuer
 
     let mut value = explain_document(ExplainDocumentParts {
         schema_version: context.explain_json_schema_version.into(),
-        mode: explain_mode_name(effective_mode).into(),
+        mode: effective_mode.as_str().into(),
         primary_profile: primary_profile_json(&planned.resolved),
         profiles: profiles_json(&planned.resolved),
         profile_contracts: profile_contracts_json(&planned.resolved),
@@ -1470,14 +1470,8 @@ fn mode_policy_diagnostics(
         return Vec::new();
     }
     let safe_details = object([
-        (
-            "requested_mode",
-            Value::String(explain_mode_name(requested).into()),
-        ),
-        (
-            "effective_mode",
-            Value::String(explain_mode_name(effective).into()),
-        ),
+        ("requested_mode", Value::String(requested.as_str().into())),
+        ("effective_mode", Value::String(effective.as_str().into())),
     ]);
     vec![diagnostic_json(
         "E_SECURITY_DISCLOSURE_FORBIDDEN",
@@ -1808,17 +1802,6 @@ fn cache_state_name(state: crate::CacheState) -> &'static str {
     match state {
         crate::CacheState::Disabled => "disabled",
         crate::CacheState::HookRegistered => "hook_registered",
-    }
-}
-
-fn explain_mode_name(mode: ExplainMode) -> &'static str {
-    match mode {
-        ExplainMode::Public => "public",
-        ExplainMode::Developer => "developer",
-        ExplainMode::Proof => "proof",
-        ExplainMode::Coded => "coded",
-        ExplainMode::Ai => "ai",
-        ExplainMode::Forensic => "forensic",
     }
 }
 

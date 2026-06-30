@@ -808,6 +808,7 @@ dependencies = [
  "arrow-schema",
  "bytes",
  "cove-arrow",
+ "cove-convert",
  "cove-core",
  "cove-datafusion",
  "orc-rust",

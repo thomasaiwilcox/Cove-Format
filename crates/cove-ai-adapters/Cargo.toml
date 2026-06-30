@@ -2,6 +2,7 @@
 name = "cove-ai-adapters"
 version = "0.1.0"
 edition = "2021"
+rust-version.workspace = true
 description = "COVE-AI training archive import, verification, streaming, and export adapters"
 license = "MIT"
 

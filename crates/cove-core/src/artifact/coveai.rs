@@ -27,6 +27,14 @@ use crate::{
     CoveError,
 };
 
+mod model_input;
+mod payload_access;
+
+use model_input::{EffectiveSourceRef, ModelInputDigestRef, ModelInputVectorKey, VectorSpaceId};
+use payload_access::payload_access_state;
+
+pub use payload_access::AiPayloadAccessState;
+
 pub const COVEAI_VERSION_MAJOR_V1: u16 = 1;
 pub const COVEAI_VERSION_MINOR_V1: u16 = 0;
 pub const COVEAI_POSTSCRIPT_VERSION_V1: u16 = 1;
@@ -539,15 +547,8 @@ impl CoveAiFile {
         }
 
         descriptor_tables.validate(&sections, data.len() as u64, header.required_ai_features)?;
-        let payload_access = if descriptor_tables.privacy_summaries.is_empty()
-            && sections
-                .iter()
-                .any(|section| is_payload_bearing_section(section.entry.section_kind))
-        {
-            AiPayloadAccessState::PolicyBlockedMissingPrivacySummary
-        } else {
-            AiPayloadAccessState::StructurallyAllowed
-        };
+        let payload_access =
+            payload_access_state(&sections, !descriptor_tables.privacy_summaries.is_empty());
 
         Ok(Self {
             artifact_kind,
@@ -558,12 +559,6 @@ impl CoveAiFile {
             payload_access,
         })
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AiPayloadAccessState {
-    StructurallyAllowed,
-    PolicyBlockedMissingPrivacySummary,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -1436,7 +1431,7 @@ impl AiDescriptorTablesV1 {
             })
             .collect::<BTreeMap<_, _>>();
 
-        let mut model_input_vectors = BTreeMap::<(u32, u32, u32), u64>::new();
+        let mut model_input_vectors = BTreeMap::<ModelInputVectorKey, u64>::new();
         let mut semantic_keys = BTreeSet::<VectorSemanticBindingKey>::new();
 
         for binding in &self.filecode_vector_bindings {
@@ -2099,14 +2094,20 @@ fn validate_model_input_vector_mapping(
     vector_space_id: u32,
     model_input_digest_ref: u32,
     vector_ref: u64,
-    model_input_vectors: &mut BTreeMap<(u32, u32, u32), u64>,
+    model_input_vectors: &mut BTreeMap<ModelInputVectorKey, u64>,
 ) -> Result<(), CoveError> {
-    if model_input_digest_ref == 0 {
+    let Some(model_input_digest_ref_id) = ModelInputDigestRef::non_zero(model_input_digest_ref)
+    else {
         return Ok(());
-    }
-    let key = (effective_source, vector_space_id, model_input_digest_ref);
+    };
+    let key = ModelInputVectorKey {
+        effective_source: EffectiveSourceRef::from_raw(effective_source),
+        vector_space_id: VectorSpaceId::from_raw(vector_space_id),
+        model_input_digest_ref: model_input_digest_ref_id,
+    };
     if let Some(existing_vector_ref) = model_input_vectors.get(&key) {
         if *existing_vector_ref != vector_ref {
+            let model_input_digest_ref = model_input_digest_ref_id.raw();
             return Err(CoveError::BadSection(format!(
                 "{label} {binding_id} maps model_input_digest_ref {model_input_digest_ref} in vector_space_id {vector_space_id} to vector_ref {vector_ref}, but the same effective source already maps it to vector_ref {existing_vector_ref}"
             )));
@@ -5778,9 +5779,11 @@ fn validate_model_input_digest_ref(
     digest_ref_ids: &BTreeSet<u32>,
     model_input_digest_refs: &BTreeSet<u32>,
 ) -> Result<(), CoveError> {
-    if model_input_digest_ref == 0 {
+    let Some(model_input_digest_ref_id) = ModelInputDigestRef::non_zero(model_input_digest_ref)
+    else {
         return Ok(());
-    }
+    };
+    let model_input_digest_ref = model_input_digest_ref_id.raw();
     if !digest_ref_ids.contains(&model_input_digest_ref) {
         return Err(CoveError::BadSection(format!(
             "{label} {binding_id} references missing model_input_digest_ref {model_input_digest_ref}"
@@ -12642,22 +12645,6 @@ fn section_by_id(sections: &[CoveAiSection], section_id: u32) -> Option<&CoveAiS
     sections
         .iter()
         .find(|section| section.entry.section_id == section_id)
-}
-
-fn is_payload_bearing_section(section_kind: u32) -> bool {
-    matches!(
-        SectionKind::from_u16(section_kind as u16),
-        Some(
-            SectionKind::AiPayloadBytes
-                | SectionKind::AiTokenBlock
-                | SectionKind::AiVectorPayloadBlock
-                | SectionKind::AiVectorDirectory
-                | SectionKind::AiTokenSequencePack
-                | SectionKind::AiTrainingSampleIndex
-                | SectionKind::AiMultimodalSequence
-                | SectionKind::AiAssetManifest
-        )
-    )
 }
 
 fn element_width_bytes(element_type: u8) -> Option<u64> {

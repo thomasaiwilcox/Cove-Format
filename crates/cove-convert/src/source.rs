@@ -42,7 +42,7 @@ pub enum ConvertError {
     Orc(String),
     Digest(String),
     Conversion(String),
-    Message(String),
+    InvalidInput(String),
 }
 
 impl fmt::Display for ConvertError {
@@ -63,7 +63,7 @@ impl fmt::Display for ConvertError {
             | ConvertError::Orc(message)
             | ConvertError::Digest(message)
             | ConvertError::Conversion(message)
-            | ConvertError::Message(message) => f.write_str(message),
+            | ConvertError::InvalidInput(message) => f.write_str(message),
         }
     }
 }
@@ -79,16 +79,17 @@ impl Error for ConvertError {
 
 impl From<String> for ConvertError {
     fn from(message: String) -> Self {
-        ConvertError::Message(message)
+        ConvertError::InvalidInput(message)
     }
 }
 
 impl From<&str> for ConvertError {
     fn from(message: &str) -> Self {
-        ConvertError::Message(message.to_string())
+        ConvertError::InvalidInput(message.to_string())
     }
 }
 
+#[must_use]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CsvReadOptions {
     pub has_header: bool,
@@ -110,6 +111,7 @@ impl Default for CsvReadOptions {
     }
 }
 
+#[must_use]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ConversionOptions {
     pub source_format: Option<SourceFormat>,

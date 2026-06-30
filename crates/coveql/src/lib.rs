@@ -58,7 +58,7 @@ mod pushdown;
 mod resolver;
 mod zero_copy_arrow;
 
-use std::{collections::BTreeSet, error::Error, fmt};
+use std::{collections::BTreeSet, error::Error, fmt, str::FromStr};
 
 use cove_core::{
     artifact::covm::CovmFile,
@@ -1271,6 +1271,56 @@ pub enum ExplainMode {
     Coded,
     Ai,
     Forensic,
+}
+
+impl ExplainMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Public => "public",
+            Self::Developer => "developer",
+            Self::Proof => "proof",
+            Self::Coded => "coded",
+            Self::Ai => "ai",
+            Self::Forensic => "forensic",
+        }
+    }
+}
+
+impl fmt::Display for ExplainMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseExplainModeError {
+    value: String,
+}
+
+impl fmt::Display for ParseExplainModeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "unsupported explain mode '{}'", self.value)
+    }
+}
+
+impl Error for ParseExplainModeError {}
+
+impl FromStr for ExplainMode {
+    type Err = ParseExplainModeError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.to_ascii_lowercase().as_str() {
+            "public" => Ok(Self::Public),
+            "developer" => Ok(Self::Developer),
+            "proof" => Ok(Self::Proof),
+            "coded" => Ok(Self::Coded),
+            "ai" => Ok(Self::Ai),
+            "forensic" => Ok(Self::Forensic),
+            _ => Err(ParseExplainModeError {
+                value: value.to_string(),
+            }),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

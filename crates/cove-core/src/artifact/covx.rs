@@ -26,6 +26,7 @@
 use crate::checksum;
 use crate::constants::{MAGIC_COVX, POSTSCRIPT_VERSION_V1};
 use crate::error::CoveError;
+use crate::wire;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -116,30 +117,30 @@ impl CovxHeaderV1 {
             return Err(CoveError::BadMagic);
         }
 
-        let header_len = read_u16_at(bytes, 4)?;
+        let header_len = wire::read_u16_le_checked(bytes, 4)?;
         if header_len != COVX_HEADER_LEN {
             return Err(CoveError::BadSection(format!(
                 "COVX header_len must be {COVX_HEADER_LEN}, got {header_len}"
             )));
         }
 
-        let version_major = read_u16_at(bytes, 6)?;
-        let version_minor = read_u16_at(bytes, 8)?;
+        let version_major = wire::read_u16_le_checked(bytes, 6)?;
+        let version_minor = wire::read_u16_le_checked(bytes, 8)?;
         if version_major != COVX_VERSION_MAJOR_V1 {
             return Err(CoveError::BadVersion);
         }
 
-        let flags = read_u32_at(bytes, 10)?;
+        let flags = wire::read_u32_le_checked(bytes, 10)?;
         let mut accelerator_id = [0u8; 16];
         accelerator_id.copy_from_slice(&bytes[14..30]);
-        let referenced_file_count = read_u32_at(bytes, 30)?;
-        let created_at_us = read_i64_at(bytes, 34)?;
+        let referenced_file_count = wire::read_u32_le_checked(bytes, 30)?;
+        let created_at_us = wire::read_i64_le_checked(bytes, 34)?;
         let mut reserved = [0u8; 40];
         reserved.copy_from_slice(&bytes[42..82]);
         if reserved.iter().any(|b| *b != 0) {
             return Err(CoveError::ReservedNotZero);
         }
-        let checksum_field = read_u32_at(bytes, 82)?;
+        let checksum_field = wire::read_u32_le_checked(bytes, 82)?;
 
         // Verify CRC32C with the checksum field zeroed.
         let mut for_crc = [0u8; COVX_HEADER_LEN as usize];
@@ -228,10 +229,10 @@ impl CovxReferencedFileV1 {
         }
         let mut file_id = [0u8; 16];
         file_id.copy_from_slice(&bytes[0..16]);
-        let file_len = read_u64_at(bytes, 16)?;
-        let footer_crc32c = read_u32_at(bytes, 24)?;
-        let digest_algorithm = read_u16_at(bytes, 28)?;
-        let digest_len = read_u16_at(bytes, 30)? as usize;
+        let file_len = wire::read_u64_le_checked(bytes, 16)?;
+        let footer_crc32c = wire::read_u32_le_checked(bytes, 24)?;
+        let digest_algorithm = wire::read_u16_le_checked(bytes, 28)?;
+        let digest_len = wire::read_u16_le_checked(bytes, 30)? as usize;
         let end = FIXED
             .checked_add(digest_len)
             .ok_or(CoveError::ArithOverflow)?;
@@ -332,9 +333,9 @@ impl CovxPostscriptV1 {
         let tail = &file_data[file_data.len() - total..];
 
         let n = COVX_POSTSCRIPT_LEN as usize;
-        let version = read_u16_at(tail, n)?;
-        let len = read_u16_at(tail, n + 2)?;
-        let magic = read_array_at::<4>(tail, n + 4)?;
+        let version = wire::read_u16_le_checked(tail, n)?;
+        let len = wire::read_u16_le_checked(tail, n + 2)?;
+        let magic = wire::read_array_checked::<4>(tail, n + 4)?;
 
         if magic != MAGIC_COVX {
             return Err(CoveError::BadMagic);
@@ -348,14 +349,14 @@ impl CovxPostscriptV1 {
             )));
         }
 
-        let payload = read_array_at::<{ COVX_POSTSCRIPT_LEN as usize }>(tail, 0)?;
-        let header_offset = read_u64_at(&payload, 0)?;
-        let header_len = read_u64_at(&payload, 8)?;
-        let entries_offset = read_u64_at(&payload, 16)?;
-        let entries_len = read_u64_at(&payload, 24)?;
-        let file_len = read_u64_at(&payload, 32)?;
-        let flags = read_u32_at(&payload, 40)?;
-        let checksum_field = read_u32_at(&payload, 44)?;
+        let payload = wire::read_array_checked::<{ COVX_POSTSCRIPT_LEN as usize }>(tail, 0)?;
+        let header_offset = wire::read_u64_le_checked(&payload, 0)?;
+        let header_len = wire::read_u64_le_checked(&payload, 8)?;
+        let entries_offset = wire::read_u64_le_checked(&payload, 16)?;
+        let entries_len = wire::read_u64_le_checked(&payload, 24)?;
+        let file_len = wire::read_u64_le_checked(&payload, 32)?;
+        let flags = wire::read_u32_le_checked(&payload, 40)?;
+        let checksum_field = wire::read_u32_le_checked(&payload, 44)?;
 
         let mut for_crc = payload;
         for_crc[44..48].fill(0);
@@ -483,32 +484,6 @@ impl CovxFile {
         debug_assert_eq!(out.len() as u64, file_len);
         Ok(out)
     }
-}
-
-fn read_array_at<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N], CoveError> {
-    let end = offset.checked_add(N).ok_or(CoveError::ArithOverflow)?;
-    if end > bytes.len() {
-        return Err(CoveError::BufferTooShort);
-    }
-    let mut out = [0u8; N];
-    out.copy_from_slice(&bytes[offset..end]);
-    Ok(out)
-}
-
-fn read_u16_at(bytes: &[u8], offset: usize) -> Result<u16, CoveError> {
-    Ok(u16::from_le_bytes(read_array_at(bytes, offset)?))
-}
-
-fn read_u32_at(bytes: &[u8], offset: usize) -> Result<u32, CoveError> {
-    Ok(u32::from_le_bytes(read_array_at(bytes, offset)?))
-}
-
-fn read_u64_at(bytes: &[u8], offset: usize) -> Result<u64, CoveError> {
-    Ok(u64::from_le_bytes(read_array_at(bytes, offset)?))
-}
-
-fn read_i64_at(bytes: &[u8], offset: usize) -> Result<i64, CoveError> {
-    Ok(i64::from_le_bytes(read_array_at(bytes, offset)?))
 }
 
 #[cfg(test)]

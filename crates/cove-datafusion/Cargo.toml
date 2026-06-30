@@ -2,6 +2,7 @@
 name = "cove-datafusion"
 version = "0.1.0"
 edition = "2021"
+rust-version.workspace = true
 description = "DataFusion integration for the Cove Format (COVE)"
 license = "MIT"
 autobins = false

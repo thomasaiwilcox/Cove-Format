@@ -2,6 +2,7 @@
 name = "cove-convert"
 version = "0.1.0"
 edition = "2021"
+rust-version.workspace = true
 description = "Lightweight conversion facade for the Cove Format (COVE)"
 license = "MIT"
 

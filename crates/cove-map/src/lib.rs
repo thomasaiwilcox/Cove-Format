@@ -1,3 +1,8 @@
+//! Stable facade for building, validating, replaying, and projecting COVE-MAP artifacts.
+//!
+//! Public helpers return typed map errors at API and CLI boundaries while keeping
+//! the COVE wire sections, projection JSON, and command-line diagnostics stable.
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use cove_core::{
@@ -48,6 +53,7 @@ mod context;
 mod emit;
 mod identity;
 mod input;
+mod materialization;
 mod parity;
 mod project;
 mod replay;
@@ -93,6 +99,11 @@ use input::read_csv;
 use input::{
     read_source_inputs, read_sources, validate_source_inputs, ObservedSourceState, SourceRow,
 };
+pub use materialization::CoveObjectCheckpointTemporalSection;
+pub(crate) use materialization::{
+    MaterializedModel, MaterializedProperty, NestedShapeByProperty, ObjectRow,
+    ReconstructedTemporalSegmentBuild, TemporalSegmentBuild,
+};
 use parity::{parity_from_cove_o_path, parity_from_paths, parity_has_failures, ParityOptions};
 use project::{
     diff_maps, project_cove_o_path_output, project_rows_with_source_states_output, run_fixture_path,
@@ -117,43 +128,7 @@ pub(crate) use ui::{
 };
 use verify::{report_has_failures, verify_bundle_dir};
 
-pub use cli::run_cli;
-
-#[derive(Debug, Clone)]
-struct ObjectRow {
-    goid: [u8; 16],
-    record_id: [u8; 16],
-    object_type_id: u32,
-    object_type: String,
-    source_id: String,
-    source_row_index: usize,
-    record_kind: RecordKind,
-    properties: BTreeMap<u32, MaterializedProperty>,
-}
-
-#[derive(Debug, Clone)]
-struct MaterializedProperty {
-    entry: PropertyEntryV1,
-    value: Value,
-    assertion_id: String,
-    source_id: String,
-    source_row_index: usize,
-    source_priority: i64,
-    source_order: usize,
-    conflict_policy: String,
-}
-
-#[derive(Debug, Clone)]
-struct MaterializedModel {
-    object_types: Vec<ObjectTypeEntryV1>,
-    rows: Vec<ObjectRow>,
-    assertions: Vec<Value>,
-    assertion_log: Value,
-    identity_equivalence_index: Value,
-    evidence_entries: Vec<Value>,
-    evidence_index: Value,
-    conversion_report: Value,
-}
+pub use cli::{run_cli, MapCliError};
 
 #[derive(Debug, Clone)]
 struct ReviewedDecisionReplayBinding {
@@ -192,31 +167,6 @@ pub(crate) struct ResolutionMetadata {
     pub(crate) alias_ambiguous: bool,
     pub(crate) miss_policy: Option<String>,
 }
-
-#[derive(Debug, Clone)]
-struct TemporalSegmentBuild {
-    segment_id: u32,
-    object_type_id: u32,
-    rows: Vec<ObjectRow>,
-    payload: Vec<u8>,
-}
-
-#[derive(Debug, Clone)]
-struct ReconstructedTemporalSegmentBuild {
-    segment_id: u32,
-    object_type_id: u32,
-    rows: Vec<CoveObjectState>,
-    payload: Vec<u8>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CoveObjectCheckpointTemporalSection {
-    pub object_type_id: u32,
-    pub row_count: u64,
-    pub payload: Vec<u8>,
-}
-
-type NestedShapeByProperty = BTreeMap<(u32, u32), NestedSchemaNodeV1>;
 
 fn materialize_with_source_states(
     file: &CovemapFile,
@@ -5891,6 +5841,13 @@ mod tests {
     }
 
     #[test]
+    fn run_cli_reports_typed_usage_error_with_stable_text() {
+        let error = run_cli(["unknown".to_string()]).unwrap_err();
+        assert!(matches!(error, MapCliError::Usage(_)));
+        assert_eq!(error.to_string(), "unknown subcommand unknown");
+    }
+
+    #[test]
     fn parses_doctor_suggest_and_parity_commands() {
         assert_eq!(
             parse_args([
@@ -7417,7 +7374,7 @@ uk-company:tesco,Tesco,Tesco Holdings,curated,authoritative,{}
         let (map, source_paths, delta_dir) =
             write_map_and_sources("semantic-delta-sparse-set", &map_file, &delta_sources);
         let out = delta_dir.join("semantic.covedelta");
-        build_semantic_delta_from_paths(
+        let _ = build_semantic_delta_from_paths(
             &map,
             &source_paths,
             semantic_delta_options_from_parent_bytes(out.clone(), &parent_bytes),
@@ -8680,7 +8637,7 @@ uk-company:acme,Acme,Acme Holdings,curated,authoritative,{}
         let file = build_projection_map();
         let (map, sources, dir) = write_build_fixture("doctor-invalid", &file);
         let out_dir = dir.join("bundle");
-        build_from_paths(&map, &sources, MapBuildOptions::new(&out_dir)).unwrap();
+        let _ = build_from_paths(&map, &sources, MapBuildOptions::new(&out_dir)).unwrap();
         fs::write(
             out_dir.join("projections/people_projection.cove"),
             b"not cove",
@@ -8706,7 +8663,7 @@ uk-company:acme,Acme,Acme Holdings,curated,authoritative,{}
         let file = build_projection_map();
         let (map, sources, dir) = write_build_fixture("doctor-projection-covi-readiness", &file);
         let out_dir = dir.join("bundle");
-        build_from_paths(&map, &sources, MapBuildOptions::new(&out_dir)).unwrap();
+        let _ = build_from_paths(&map, &sources, MapBuildOptions::new(&out_dir)).unwrap();
 
         match fs::remove_file(out_dir.join("indexes/projection_columns.covi")) {
             Ok(()) => {}
@@ -8726,7 +8683,7 @@ uk-company:acme,Acme,Acme Holdings,curated,authoritative,{}
 
         let mut options = MapBuildOptions::new(&out_dir);
         options.force = true;
-        build_from_paths(&map, &sources, options).unwrap();
+        let _ = build_from_paths(&map, &sources, options).unwrap();
         fs::write(out_dir.join("indexes/projection_columns.covi"), b"not covi").unwrap();
         let doctor = verify_bundle_dir(&out_dir).unwrap();
         assert_eq!(
@@ -8748,7 +8705,7 @@ uk-company:acme,Acme,Acme Holdings,curated,authoritative,{}
         let out_dir = dir.join("bundle");
         let mut options = MapBuildOptions::new(&out_dir);
         options.projection_output = MapBuildProjectionOutput::None;
-        build_from_paths(&map, &sources, options).unwrap();
+        let _ = build_from_paths(&map, &sources, options).unwrap();
 
         let doctor = verify_bundle_dir(&out_dir).unwrap();
         assert!(!report_has_failures(&doctor, false));
@@ -8880,12 +8837,12 @@ uk-company:acme,Acme,Acme Holdings,curated,authoritative,{}
         let file = build_projection_map();
         let (map, sources, dir) = write_build_fixture("build-collision", &file);
         let out_dir = dir.join("bundle");
-        build_from_paths(&map, &sources, MapBuildOptions::new(&out_dir)).unwrap();
+        let _ = build_from_paths(&map, &sources, MapBuildOptions::new(&out_dir)).unwrap();
         let err = build_from_paths(&map, &sources, MapBuildOptions::new(&out_dir)).unwrap_err();
         assert!(err.contains("--force"));
         let mut options = MapBuildOptions::new(&out_dir);
         options.force = true;
-        build_from_paths(&map, &sources, options).unwrap();
+        let _ = build_from_paths(&map, &sources, options).unwrap();
         fs::remove_dir_all(&dir).unwrap();
     }
 

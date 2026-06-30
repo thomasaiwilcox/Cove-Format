@@ -28,6 +28,7 @@ use cove_core::{
         ObjectTypeEntryV1,
     },
     utility::hex_encode,
+    wire,
 };
 use serde_json::{json, Value};
 
@@ -638,9 +639,9 @@ fn covm_delta_extension_encoded_len(bytes: &[u8]) -> Result<usize, String> {
     if bytes.len() < COVM_DELTA_CHAIN_EXTENSION_HEADER_LEN {
         return Err("COVM delta-chain extension header is truncated".into());
     }
-    let ordered_delta_count = read_u32_at(bytes, 184)? as usize;
-    let chain_digest_len = read_u16_at(bytes, 206)? as usize;
-    let chain_summary_digest_len = read_u16_at(bytes, 240)? as usize;
+    let ordered_delta_count = read_delta_chain_u32(bytes, 184)? as usize;
+    let chain_digest_len = read_delta_chain_u16(bytes, 206)? as usize;
+    let chain_summary_digest_len = read_delta_chain_u16(bytes, 240)? as usize;
     COVM_DELTA_CHAIN_EXTENSION_HEADER_LEN
         .checked_add(
             ordered_delta_count
@@ -652,28 +653,14 @@ fn covm_delta_extension_encoded_len(bytes: &[u8]) -> Result<usize, String> {
         .ok_or_else(|| "COVM delta-chain extension length overflows".to_string())
 }
 
-fn read_u16_at(bytes: &[u8], offset: usize) -> Result<u16, String> {
-    let end = offset
-        .checked_add(2)
-        .ok_or_else(|| "COVM delta-chain extension header is truncated".to_string())?;
-    if end > bytes.len() {
-        return Err("COVM delta-chain extension header is truncated".into());
-    }
-    let mut value = [0u8; 2];
-    value.copy_from_slice(&bytes[offset..end]);
-    Ok(u16::from_le_bytes(value))
+fn read_delta_chain_u16(bytes: &[u8], offset: usize) -> Result<u16, String> {
+    wire::read_u16_le_checked(bytes, offset)
+        .map_err(|_| "COVM delta-chain extension header is truncated".to_string())
 }
 
-fn read_u32_at(bytes: &[u8], offset: usize) -> Result<u32, String> {
-    let end = offset
-        .checked_add(4)
-        .ok_or_else(|| "COVM delta-chain extension header is truncated".to_string())?;
-    if end > bytes.len() {
-        return Err("COVM delta-chain extension header is truncated".into());
-    }
-    let mut value = [0u8; 4];
-    value.copy_from_slice(&bytes[offset..end]);
-    Ok(u32::from_le_bytes(value))
+fn read_delta_chain_u32(bytes: &[u8], offset: usize) -> Result<u32, String> {
+    wire::read_u32_le_checked(bytes, offset)
+        .map_err(|_| "COVM delta-chain extension header is truncated".to_string())
 }
 
 fn selected_delta_bytes(extension: &CovmDeltaChainExtensionV1, selected: &[u32]) -> u64 {

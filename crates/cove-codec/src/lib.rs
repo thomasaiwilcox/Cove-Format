@@ -1,6 +1,6 @@
 //! COVE-CX registered codec descriptors and envelopes for COVE v2.
 
-use cove_core::CoveError;
+use cove_core::{wire, CoveError};
 
 pub use cove_core::codec::{
     stable_registered_codec_supported_masks, validate_descriptor_set, CodecExtensionDescriptorV2,
@@ -245,9 +245,9 @@ fn decode_row_bytes(expected_magic: &[u8; 4], bytes: &[u8]) -> Result<LogicalPag
     if bytes.len() < 16 || &bytes[0..4] != expected_magic {
         return Err(CoveError::BadCodecExtension);
     }
-    let row_count = read_u32_at(bytes, 4)? as usize;
-    let null_bitmap_len = read_u32_at(bytes, 8)? as usize;
-    let offsets_len = read_u32_at(bytes, 12)? as usize;
+    let row_count = wire::read_u32_le_checked(bytes, 4)? as usize;
+    let null_bitmap_len = wire::read_u32_le_checked(bytes, 8)? as usize;
+    let offsets_len = wire::read_u32_le_checked(bytes, 12)? as usize;
     if null_bitmap_len != row_count.div_ceil(8) || offsets_len != (row_count + 1) * 4 {
         return Err(CoveError::BadCodecExtension);
     }
@@ -290,19 +290,6 @@ fn decode_row_bytes(expected_magic: &[u8; 4], bytes: &[u8]) -> Result<LogicalPag
         }
     }
     Ok(LogicalPage { values })
-}
-
-fn read_u32_at(bytes: &[u8], offset: usize) -> Result<u32, CoveError> {
-    let end = offset.checked_add(4).ok_or(CoveError::ArithOverflow)?;
-    if end > bytes.len() {
-        return Err(CoveError::BufferTooShort);
-    }
-    Ok(u32::from_le_bytes([
-        bytes[offset],
-        bytes[offset + 1],
-        bytes[offset + 2],
-        bytes[offset + 3],
-    ]))
 }
 
 #[cfg(test)]

@@ -2,6 +2,7 @@
 name = "cove-conformance"
 version = "0.1.0"
 edition = "2021"
+rust-version.workspace = true
 description = "Generated conformance corpus and runner for COVE v2"
 license = "MIT"
 

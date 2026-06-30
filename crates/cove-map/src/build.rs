@@ -116,6 +116,7 @@ impl MapBuildSectionCompression {
     }
 }
 
+#[must_use]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MapBuildOptions {
     pub out_dir: PathBuf,
@@ -145,12 +146,14 @@ impl MapBuildOptions {
     }
 }
 
+#[must_use]
 #[derive(Debug, Clone, PartialEq)]
 pub struct MapBuildResult {
     pub manifest: Value,
     pub report: Value,
 }
 
+#[must_use]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MapSemanticDeltaParent {
     pub dataset_id: [u8; 16],
@@ -160,6 +163,7 @@ pub struct MapSemanticDeltaParent {
     pub parent_ref: CovmDeltaArtifactRefV1,
 }
 
+#[must_use]
 #[derive(Debug, Clone, PartialEq)]
 pub struct MapSemanticDeltaBuildOptions {
     pub out: PathBuf,
@@ -174,6 +178,7 @@ pub struct MapSemanticDeltaBuildOptions {
     pub source_publish_range_us: Option<(i64, i64)>,
 }
 
+#[must_use]
 #[derive(Debug, Clone, PartialEq)]
 pub struct MapSemanticDeltaBuildResult {
     pub report: Value,

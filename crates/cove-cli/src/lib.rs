@@ -1,3 +1,9 @@
+//! Beginner-friendly CLI facade for the COVE reference workspace.
+//!
+//! The command surface keeps user-facing stderr stable. Rust callers receive
+//! typed `CliError` values so argument/usage failures can be distinguished from
+//! command execution failures without parsing display text.
+
 pub mod customer360;
 mod delta;
 mod external_tables;
@@ -7,7 +13,8 @@ mod sidecar;
 
 use std::{
     collections::HashMap,
-    fs,
+    error::Error,
+    fmt, fs,
     io::{self, Read},
     path::{Path, PathBuf},
     sync::Arc,
@@ -61,6 +68,41 @@ use external_tables::{register_external_tables, ExternalTableSpec};
 use help::{print_usage, usage, HelpTopic};
 use output::{write_result, OutputFormat};
 use sidecar::run_sidecar;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CliError {
+    Usage(String),
+    Command(String),
+}
+
+impl CliError {
+    fn usage(message: String) -> Self {
+        Self::Usage(message)
+    }
+}
+
+impl fmt::Display for CliError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CliError::Usage(message) | CliError::Command(message) => f.write_str(message),
+        }
+    }
+}
+
+impl Error for CliError {}
+
+impl From<String> for CliError {
+    fn from(message: String) -> Self {
+        Self::Command(message)
+    }
+}
+
+impl From<&str> for CliError {
+    fn from(message: &str) -> Self {
+        Self::Command(message.to_string())
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Command {
@@ -234,8 +276,8 @@ struct QueryCommand {
     max_cell_width: usize,
 }
 
-pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<(), String> {
-    match parse_args(args)? {
+pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<(), CliError> {
+    let result: Result<(), String> = match parse_args(args).map_err(CliError::usage)? {
         Command::Help(topic) => {
             print_usage(topic);
             Ok(())
@@ -318,7 +360,8 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<(), String> {
         Command::Digest { args } => run_digest(args),
         Command::Profile { args } => run_profile(args),
         Command::Canonicalise { args } => run_canonicalise(args),
-    }
+    };
+    result.map_err(CliError::from)
 }
 
 struct QueryCommandOptions {
@@ -692,7 +735,7 @@ fn parse_showcase_customer360(args: Vec<String>) -> Result<Command, String> {
                 let value = iter.next().ok_or_else(|| {
                     "--profile requires quick, standard, or publication".to_string()
                 })?;
-                profile = Customer360Profile::parse(&value)?;
+                profile = Customer360Profile::parse(&value).map_err(|error| error.to_string())?;
             }
             "--force" => force = true,
             "--json" => json = true,
@@ -736,13 +779,13 @@ fn parse_showcase_proof_suite(args: Vec<String>) -> Result<Command, String> {
                 let value = iter.next().ok_or_else(|| {
                     "--profile requires quick, standard, or publication".to_string()
                 })?;
-                profile = Customer360Profile::parse(&value)?;
+                profile = Customer360Profile::parse(&value).map_err(|error| error.to_string())?;
             }
             "--scenario" => {
                 let value = iter.next().ok_or_else(|| {
                     "--scenario requires customer360, claims, catalog, or all".to_string()
                 })?;
-                scenario = ProofSuiteScenario::parse(&value)?;
+                scenario = ProofSuiteScenario::parse(&value).map_err(|error| error.to_string())?;
             }
             "--force" => force = true,
             "--json" => json = true,
@@ -786,7 +829,7 @@ fn parse_showcase_ai_training(args: Vec<String>) -> Result<Command, String> {
                 let value = iter.next().ok_or_else(|| {
                     "--profile requires quick, standard, or publication".to_string()
                 })?;
-                profile = Customer360Profile::parse(&value)?;
+                profile = Customer360Profile::parse(&value).map_err(|error| error.to_string())?;
             }
             "--force" => force = true,
             "--json" => json = true,
@@ -1227,13 +1270,14 @@ fn explain_policy_for_cli(mode: &str) -> ExplainDisclosurePolicy {
 }
 
 fn run_convert(format: ConvertFormat, args: Vec<String>) -> Result<(), String> {
-    match format {
+    let result = match format {
         ConvertFormat::Parquet => cove_convert_parquet::commands::run_parquet(args),
         ConvertFormat::Arrow => cove_convert_parquet::commands::run_arrow(args),
         ConvertFormat::Orc => cove_convert_parquet::commands::run_orc(args),
         ConvertFormat::Csv => cove_convert_parquet::commands::run_csv(args),
         ConvertFormat::Report => cove_convert_parquet::commands::run_report(args),
-    }
+    };
+    result.map_err(|error| error.to_string())
 }
 
 fn run_validate(args: Vec<String>) -> Result<(), String> {
@@ -3076,7 +3120,7 @@ fn run_map(args: Vec<String>) -> Result<(), String> {
     if args.first().is_some_and(|arg| arg == "delta") {
         return run_map_delta(args.into_iter().skip(1).collect());
     }
-    cove_map::run_cli(args)
+    cove_map::run_cli(args).map_err(|error| error.to_string())
 }
 
 const MAP_DELTA_BUILD_USAGE: &str = "usage: cove map delta build <manifest.covm> --dataset <dir> --out-dir <dir> [--as-of-csn n|--as-of-commit-us n] [--force] [--json] [--publish-covm] [--verify] [--projection-output cove-t|none] [--object-name <file.cove>]\n       cove map delta build --base <manifest.covm> --dataset <dir> --mapping <mapping.covemap> --out <delta.covedelta> [--source-publish-range start:end] [--force] [--json] <source...>";
@@ -3564,7 +3608,8 @@ fn run_showcase_customer360(
         out_dir: out_dir.to_path_buf(),
         profile,
         force,
-    })?;
+    })
+    .map_err(|error| error.to_string())?;
     if json {
         println!(
             "{}",
@@ -3608,7 +3653,8 @@ fn run_showcase_proof_suite(
         profile,
         scenario,
         force,
-    })?;
+    })
+    .map_err(|error| error.to_string())?;
     if json {
         println!(
             "{}",
@@ -5428,5 +5474,14 @@ mod tests {
             parse_args(args(&["canonicalize", "digest", "--json"])).unwrap(),
             Command::Canonicalise { args: forwarded }
         );
+    }
+
+    #[test]
+    fn run_cli_reports_typed_usage_error_with_stable_text() {
+        let error = run_cli(args(&["unknown-command"])).unwrap_err();
+        assert!(matches!(error, CliError::Usage(_)));
+        let message = error.to_string();
+        assert!(message.starts_with("unknown command 'unknown-command'\n\nUsage:"));
+        assert!(message.contains("cove examples [--json]"));
     }
 }

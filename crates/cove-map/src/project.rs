@@ -51,6 +51,17 @@ use serde_json::{json, Map, Value};
 use super::*;
 
 mod encoding;
+mod id;
+mod report;
+mod vocabulary;
+
+use id::RequestedProjectionId;
+use vocabulary::{ProjectionRowGrain, ProjectionTemporalMode};
+
+pub(crate) use report::projection_catalog_json_value;
+pub(crate) use vocabulary::{
+    ProjectionCoviFilterReason, ProjectionCoviLineageStatus, ProjectionFilterPushdown,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProjectionFormat {
@@ -73,6 +84,7 @@ impl ProjectionFormat {
     }
 }
 
+#[must_use]
 #[derive(Debug, Clone, Default)]
 pub struct ProjectionBatchOptions {
     pub max_rows: Option<usize>,
@@ -82,6 +94,7 @@ pub struct ProjectionBatchOptions {
     pub candidate_projection_rows: Option<ProjectionCandidateRows>,
 }
 
+#[must_use]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProjectionCandidateRows {
     pub row_ordinals: BTreeSet<u64>,
@@ -152,6 +165,7 @@ struct ProjectionAccessPlan {
     needs_history_rows: bool,
 }
 
+#[must_use]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectionReadRequirements {
     pub requested_object_type_names: Vec<String>,
@@ -664,11 +678,8 @@ fn projection_column_object_property_lineage(
     projection_column_id: u32,
     object_types_by_name: &BTreeMap<&str, &ObjectTypeEntryV1>,
 ) -> Option<MapProjectionColumnLineage> {
-    let row_grain = projection.row_grain.as_deref()?;
-    if !matches!(
-        row_grain,
-        "one_row_per_object" | "one_row_per_event_object" | "one_row_per_object_as_of_time"
-    ) {
+    let row_grain = ProjectionRowGrain::parse(projection.row_grain.as_deref()?);
+    if !row_grain.is_some_and(ProjectionRowGrain::supports_object_property_lineage) {
         return None;
     }
     if column.conflict_policy != "canonical_value" || column.nested_shape.is_some() {
@@ -707,7 +718,9 @@ fn projection_column_object_property_lineage(
         projection_column_id,
         expression: expression.to_string(),
         transform: "identity".into(),
-        filter_pushdown: "projection_covi_prefilter".into(),
+        filter_pushdown: ProjectionFilterPushdown::ProjectionCoviPrefilter
+            .as_str()
+            .into(),
     })
 }
 
@@ -738,82 +751,6 @@ fn projection_property_lineage_type_supported(logical_type: CoveLogicalType) -> 
             | CoveLogicalType::Struct
             | CoveLogicalType::Map
     )
-}
-
-pub(crate) fn projection_catalog_json_value(catalog: &MapProjectionCatalog) -> Value {
-    json!({
-        "mapping_id": catalog.mapping_id,
-        "mapping_version": catalog.mapping_version,
-        "projections": catalog.projections.iter().map(projection_entry_json_value).collect::<Vec<_>>()
-    })
-}
-
-fn projection_entry_json_value(projection: &MapProjectionEntry) -> Value {
-    let mut value = json!({
-        "projection_id": projection.projection_id,
-        "assertion_ids": projection.assertion_ids,
-        "output_table": projection.output_table,
-        "row_grain": projection.row_grain,
-        "anchor": projection.anchor.as_ref().map(|anchor| json!({
-            "object_type": anchor.object_type,
-            "association_type": anchor.association_type,
-        })),
-        "temporal_mode": projection.temporal_mode,
-        "columns": projection.columns.iter().map(projection_column_json_value).collect::<Vec<_>>(),
-        "multi_value_policy": projection.multi_value_policy,
-        "missing_policy": projection.missing_policy,
-        "ordering": projection.ordering,
-        "evidence_policy": projection.evidence_policy,
-        "output_modes": projection.output_modes,
-    });
-    strip_null_json_fields(&mut value);
-    value
-}
-
-fn projection_column_json_value(column: &MapProjectionColumn) -> Value {
-    let mut value = json!({
-        "name": column.name,
-        "value": column.value,
-        "logical_type": column.logical_type,
-        "nested_shape": column.nested_shape,
-        "conflict_policy": column.conflict_policy,
-        "missing_policy": column.missing_policy,
-        "lineage": column.lineage.as_ref().map(projection_column_lineage_json_value),
-    });
-    strip_null_json_fields(&mut value);
-    value
-}
-
-fn projection_column_lineage_json_value(lineage: &MapProjectionColumnLineage) -> Value {
-    json!({
-        "source": lineage.source,
-        "object_type_id": lineage.object_type_id,
-        "object_type_name": lineage.object_type_name,
-        "property_id": lineage.property_id,
-        "property_name": lineage.property_name,
-        "projection_table_id": lineage.projection_table_id,
-        "projection_column_id": lineage.projection_column_id,
-        "expression": lineage.expression,
-        "transform": lineage.transform,
-        "filter_pushdown": lineage.filter_pushdown,
-    })
-}
-
-fn strip_null_json_fields(value: &mut Value) {
-    match value {
-        Value::Object(object) => {
-            for value in object.values_mut() {
-                strip_null_json_fields(value);
-            }
-            object.retain(|_, value| !value.is_null());
-        }
-        Value::Array(values) => {
-            for value in values {
-                strip_null_json_fields(value);
-            }
-        }
-        _ => {}
-    }
 }
 
 fn function_registry(file: &CovemapFile) -> Result<std::collections::BTreeSet<String>, String> {
@@ -860,7 +797,11 @@ fn compile_projection_access_plan(
     format: ProjectionFormat,
     options: &ProjectionBatchOptions,
 ) -> Result<ProjectionAccessPlan, String> {
-    let selected = select_projections(catalog, projection_id, format)?;
+    let selected = select_projections(
+        catalog,
+        projection_id.map(RequestedProjectionId::new),
+        format,
+    )?;
     let output_columns = required_projection_columns(options);
     let mut requested_property_names = BTreeSet::new();
     let mut requested_object_type_names = BTreeSet::new();
@@ -930,36 +871,35 @@ fn compile_projection_access_plan(
             include_association_object_types = true;
             requested_property_names.insert("association_type".into());
         }
-        match row_grain {
-            "one_row_per_object"
-            | "one_row_per_event_object"
-            | "one_row_per_object_as_of_time"
-            | "one_row_per_association"
-            | "one_row_per_link_object" => {
+        match ProjectionRowGrain::parse(row_grain) {
+            Some(
+                ProjectionRowGrain::Object
+                | ProjectionRowGrain::EventObject
+                | ProjectionRowGrain::ObjectAsOfTime
+                | ProjectionRowGrain::Association
+                | ProjectionRowGrain::LinkObject,
+            ) => {
                 include_records = true;
                 let temporal_mode = projection
                     .temporal_mode
                     .as_deref()
                     .unwrap_or("latest_committed");
-                if matches!(
-                    parse_projection_temporal_mode(temporal_mode),
-                    Some(
-                        ProjectionTemporalMode::LatestCommitted | ProjectionTemporalMode::ValidTime
-                    )
-                ) {
+                if ProjectionTemporalMode::parse(temporal_mode)
+                    .is_some_and(ProjectionTemporalMode::reads_reconstructed_rows_for_access)
+                {
                     needs_reconstructed_rows = true;
                 } else {
                     needs_history_rows = true;
                 }
             }
-            "one_row_per_property_version" => {
+            Some(ProjectionRowGrain::PropertyVersion) => {
                 include_records = true;
                 needs_history_rows = true;
             }
-            "one_row_per_evidence_assertion" => {
+            Some(ProjectionRowGrain::EvidenceAssertion) => {
                 include_evidence_index = true;
             }
-            _ => {
+            None => {
                 include_records = true;
                 needs_reconstructed_rows = true;
             }
@@ -984,7 +924,7 @@ fn compile_projection_access_plan(
 
 fn select_projections<'a>(
     catalog: &'a MapProjectionCatalog,
-    projection_id: Option<&str>,
+    projection_id: Option<RequestedProjectionId<'_>>,
     format: ProjectionFormat,
 ) -> Result<Vec<&'a MapProjectionEntry>, String> {
     let selected = catalog
@@ -992,13 +932,13 @@ fn select_projections<'a>(
         .iter()
         .filter(|projection| {
             projection_id
-                .map(|requested| projection.projection_id == requested)
+                .map(|requested| requested.matches_entry(projection))
                 .unwrap_or(true)
         })
         .collect::<Vec<_>>();
     if selected.is_empty() {
         return Err(match projection_id {
-            Some(id) => format!("projection_id '{id}' was not found"),
+            Some(id) => format!("projection_id '{}' was not found", id.as_str()),
             None => "projection catalog contains no projections".to_string(),
         });
     }
@@ -1218,7 +1158,11 @@ fn project_tables(
     options: &ProjectionBatchOptions,
 ) -> Result<Vec<ProjectedTable>, String> {
     let output_columns = required_projection_columns(options);
-    let selected = select_projections(catalog, projection_id, format)?;
+    let selected = select_projections(
+        catalog,
+        projection_id.map(RequestedProjectionId::new),
+        format,
+    )?;
 
     let mut tables = Vec::new();
     for projection in selected {
@@ -1287,7 +1231,11 @@ fn project_arrow_record_batches_from_surface(
     )?;
     let model = ProjectionModel::from_surface_with_access_plan(surface, &access_plan)
         .map_err(|err| err.to_string())?;
-    let selected = select_projections(catalog, Some(projection_id), ProjectionFormat::Arrow)?;
+    let selected = select_projections(
+        catalog,
+        Some(RequestedProjectionId::new(projection_id)),
+        ProjectionFormat::Arrow,
+    )?;
     let projection = match selected.as_slice() {
         [projection] => *projection,
         _ => return Err("Arrow projection output requires exactly one projection".into()),
@@ -1369,10 +1317,11 @@ fn object_projection_arrow_fast_path_plan(
     {
         return None;
     }
-    if !matches!(
-        access_projection.row_grain.as_deref(),
-        Some("one_row_per_object" | "one_row_per_event_object" | "one_row_per_object_as_of_time")
-    ) {
+    let row_grain = access_projection
+        .row_grain
+        .as_deref()
+        .and_then(ProjectionRowGrain::parse);
+    if !row_grain.is_some_and(ProjectionRowGrain::supports_object_property_lineage) {
         return None;
     }
     let anchor = access_projection.anchor.as_ref()?;
@@ -1556,7 +1505,11 @@ fn evidence_projection_arrow_fast_path_supported(
     projection: &MapProjectionEntry,
     projected_columns: &[ProjectedColumn],
 ) -> bool {
-    projection.row_grain.as_deref() == Some("one_row_per_evidence_assertion")
+    projection
+        .row_grain
+        .as_deref()
+        .and_then(ProjectionRowGrain::parse)
+        == Some(ProjectionRowGrain::EvidenceAssertion)
         && projection.columns.len() == projected_columns.len()
         && projection.columns.iter().all(|column| {
             column.value.starts_with("evidence.")
@@ -1957,20 +1910,22 @@ where
         .row_grain
         .as_deref()
         .ok_or_else(|| "projection row_grain is required".to_string())?;
-    match row_grain {
-        "one_row_per_object" | "one_row_per_event_object" | "one_row_per_object_as_of_time" => {
-            emit_object_projection_rows(model, projection, false, options, &mut emit)
-        }
-        "one_row_per_association" | "one_row_per_link_object" => {
+    match ProjectionRowGrain::parse(row_grain) {
+        Some(
+            ProjectionRowGrain::Object
+            | ProjectionRowGrain::EventObject
+            | ProjectionRowGrain::ObjectAsOfTime,
+        ) => emit_object_projection_rows(model, projection, false, options, &mut emit),
+        Some(ProjectionRowGrain::Association | ProjectionRowGrain::LinkObject) => {
             emit_object_projection_rows(model, projection, true, options, &mut emit)
         }
-        "one_row_per_property_version" => {
+        Some(ProjectionRowGrain::PropertyVersion) => {
             emit_property_version_projection_rows(model, projection, options, &mut emit)
         }
-        "one_row_per_evidence_assertion" => {
+        Some(ProjectionRowGrain::EvidenceAssertion) => {
             emit_evidence_projection_rows(model, projection, options, &mut emit)
         }
-        other => Err(format!("unsupported projection row_grain '{other}'")),
+        None => Err(format!("unsupported projection row_grain '{row_grain}'")),
     }
 }
 
@@ -2641,7 +2596,7 @@ impl ProjectionModel {
         &self,
         projection: &MapProjectionEntry,
     ) -> Result<Cow<'_, [ProjectionRow]>, String> {
-        match parse_projection_temporal_mode(
+        match ProjectionTemporalMode::parse(
             projection
                 .temporal_mode
                 .as_deref()
@@ -2686,49 +2641,6 @@ impl ProjectionModel {
             )),
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProjectionTemporalMode {
-    LatestCommitted,
-    FullHistory,
-    CommitOrder,
-    ValidTime,
-    ObservedTime,
-    AsOfTimestamp(i64),
-    AsOfCsn(u64),
-}
-
-fn parse_projection_temporal_mode(value: &str) -> Option<ProjectionTemporalMode> {
-    match value {
-        "latest_committed" => Some(ProjectionTemporalMode::LatestCommitted),
-        "full_history" => Some(ProjectionTemporalMode::FullHistory),
-        "commit_order" => Some(ProjectionTemporalMode::CommitOrder),
-        "valid_time" => Some(ProjectionTemporalMode::ValidTime),
-        "observed_time" => Some(ProjectionTemporalMode::ObservedTime),
-        _ => parse_temporal_cut_value(value),
-    }
-}
-
-fn parse_temporal_cut_value(value: &str) -> Option<ProjectionTemporalMode> {
-    for prefix in [
-        "as_of_timestamp_us:",
-        "as_of_timestamp_us=",
-        "timestamp_us:",
-        "timestamp_us=",
-        "as_of_time:",
-        "as_of_time=",
-    ] {
-        if let Some(raw) = value.strip_prefix(prefix) {
-            return raw.parse().ok().map(ProjectionTemporalMode::AsOfTimestamp);
-        }
-    }
-    for prefix in ["as_of_csn:", "as_of_csn=", "csn:", "csn="] {
-        if let Some(raw) = value.strip_prefix(prefix) {
-            return raw.parse().ok().map(ProjectionTemporalMode::AsOfCsn);
-        }
-    }
-    None
 }
 
 fn ensure_temporal_surface_fields(
@@ -3007,7 +2919,7 @@ fn validate_executable_projection(
         ));
     }
     let temporal_mode = projection.temporal_mode.as_deref().unwrap_or_default();
-    if parse_projection_temporal_mode(temporal_mode).is_none() {
+    if ProjectionTemporalMode::parse(temporal_mode).is_none() {
         return Err(format!(
             "projection '{}' uses unsupported temporal_mode '{temporal_mode}'",
             projection.projection_id
@@ -3400,17 +3312,21 @@ fn project_one(
         .row_grain
         .as_deref()
         .ok_or_else(|| "projection row_grain is required".to_string())?;
-    match row_grain {
-        "one_row_per_object" => project_object_rows(model, projection, false, options),
-        "one_row_per_event_object" | "one_row_per_object_as_of_time" => {
+    match ProjectionRowGrain::parse(row_grain) {
+        Some(ProjectionRowGrain::Object) => project_object_rows(model, projection, false, options),
+        Some(ProjectionRowGrain::EventObject | ProjectionRowGrain::ObjectAsOfTime) => {
             project_object_rows(model, projection, false, options)
         }
-        "one_row_per_association" | "one_row_per_link_object" => {
+        Some(ProjectionRowGrain::Association | ProjectionRowGrain::LinkObject) => {
             project_object_rows(model, projection, true, options)
         }
-        "one_row_per_property_version" => project_property_versions(model, projection, options),
-        "one_row_per_evidence_assertion" => project_evidence_rows(model, projection, options),
-        other => Err(format!("unsupported projection row_grain '{other}'")),
+        Some(ProjectionRowGrain::PropertyVersion) => {
+            project_property_versions(model, projection, options)
+        }
+        Some(ProjectionRowGrain::EvidenceAssertion) => {
+            project_evidence_rows(model, projection, options)
+        }
+        None => Err(format!("unsupported projection row_grain '{row_grain}'")),
     }
 }
 

@@ -5,7 +5,75 @@ use serde_json::{json, Value};
 
 use crate::{mapping_context, mapping_identity, reviewed_decision_replay_binding};
 
-pub(crate) fn verify_replay_report(file: &CovemapFile, report: &Value) -> Result<Value, String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReplayError {
+    kind: ReplayErrorKind,
+    message: String,
+}
+
+impl ReplayError {
+    fn new(message: String) -> Self {
+        let kind = ReplayErrorKind::from_message(&message);
+        Self { kind, message }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn contains(&self, pattern: &str) -> bool {
+        self.message.contains(pattern)
+    }
+}
+
+impl std::fmt::Display for ReplayError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.kind {
+            ReplayErrorKind::InvalidReport
+            | ReplayErrorKind::MappingMismatch
+            | ReplayErrorKind::SourceBinding
+            | ReplayErrorKind::ResolverDigest
+            | ReplayErrorKind::ReviewDigest => f.write_str(&self.message),
+        }
+    }
+}
+
+impl std::error::Error for ReplayError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReplayErrorKind {
+    InvalidReport,
+    MappingMismatch,
+    SourceBinding,
+    ResolverDigest,
+    ReviewDigest,
+}
+
+impl ReplayErrorKind {
+    fn from_message(message: &str) -> Self {
+        if message.starts_with("MAP_REPLAY_STALE_MAPPING") {
+            Self::MappingMismatch
+        } else if message.starts_with("MAP_REPLAY_SOURCE_") {
+            Self::SourceBinding
+        } else if message.starts_with("MAP_REPLAY_RESOLVER_DIGEST_")
+            || message.starts_with("MAP_REPLAY_STALE_RESOLVER")
+        {
+            Self::ResolverDigest
+        } else if message.starts_with("MAP_REPLAY_REVIEW_DIGEST_")
+            || message.starts_with("MAP_REPLAY_STALE_REVIEW")
+        {
+            Self::ReviewDigest
+        } else {
+            Self::InvalidReport
+        }
+    }
+}
+
+pub(crate) fn verify_replay_report(
+    file: &CovemapFile,
+    report: &Value,
+) -> Result<Value, ReplayError> {
+    verify_replay_report_inner(file, report).map_err(ReplayError::new)
+}
+
+fn verify_replay_report_inner(file: &CovemapFile, report: &Value) -> Result<Value, String> {
     let report = report
         .as_object()
         .ok_or_else(|| "replay report must be a JSON object".to_string())?;

@@ -2,6 +2,7 @@
 name = "cove-runtime"
 version = "0.1.0"
 edition = "2021"
+rust-version.workspace = true
 description = "COVE-R runtime compatibility hint descriptors and validation"
 license = "MIT"
 autobins = false

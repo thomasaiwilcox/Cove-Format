@@ -14,7 +14,7 @@ use crate::{
     },
     postscript::CoveSectionSpecV1,
     profile::cove_map::{parse_embedded_section, validate_embedded_sections, EmbeddedMapSection},
-    CoveError,
+    wire, CoveError,
 };
 
 /// Encoded length of [`CovemapHeaderV2`] in bytes.
@@ -118,15 +118,15 @@ impl CovemapHeaderV1 {
             return Err(CoveError::BadMagic);
         }
 
-        let header_len = read_u16_at(bytes, 4)?;
+        let header_len = wire::read_u16_le_checked(bytes, 4)?;
         if header_len != COVEMAP_HEADER_LEN {
             return Err(CoveError::BadSection(format!(
                 "COVEMAP header_len must be {COVEMAP_HEADER_LEN}, got {header_len}"
             )));
         }
 
-        let version_major = read_u16_at(bytes, 6)?;
-        let version_minor = read_u16_at(bytes, 8)?;
+        let version_major = wire::read_u16_le_checked(bytes, 6)?;
+        let version_minor = wire::read_u16_le_checked(bytes, 8)?;
         if !matches!(
             (version_major, version_minor),
             (COVEMAP_VERSION_MAJOR_V2, COVEMAP_VERSION_MINOR_V2)
@@ -135,24 +135,24 @@ impl CovemapHeaderV1 {
             return Err(CoveError::BadVersion);
         }
 
-        let flags = read_u32_at(bytes, 10)?;
+        let flags = wire::read_u32_le_checked(bytes, 10)?;
         let mut mapping_id = [0u8; 16];
         mapping_id.copy_from_slice(&bytes[14..30]);
-        let required_features = read_u64_at(bytes, 30)?;
-        let optional_features = read_u64_at(bytes, 38)?;
-        let section_count = read_u32_at(bytes, 46)?;
-        let mapping_version_len = read_u16_at(bytes, 50)?;
-        let reserved0 = read_u16_at(bytes, 52)?;
+        let required_features = wire::read_u64_le_checked(bytes, 30)?;
+        let optional_features = wire::read_u64_le_checked(bytes, 38)?;
+        let section_count = wire::read_u32_le_checked(bytes, 46)?;
+        let mapping_version_len = wire::read_u16_le_checked(bytes, 50)?;
+        let reserved0 = wire::read_u16_le_checked(bytes, 52)?;
         if reserved0 != 0 {
             return Err(CoveError::ReservedNotZero);
         }
-        let created_at_us = read_i64_at(bytes, 54)?;
+        let created_at_us = wire::read_i64_le_checked(bytes, 54)?;
         let mut reserved = [0u8; 32];
         reserved.copy_from_slice(&bytes[62..94]);
         if reserved.iter().any(|byte| *byte != 0) {
             return Err(CoveError::ReservedNotZero);
         }
-        let checksum_field = read_u32_at(bytes, 94)?;
+        let checksum_field = wire::read_u32_le_checked(bytes, 94)?;
         if checksum::crc32c(&bytes[..94]) != checksum_field {
             return Err(CoveError::ChecksumMismatch);
         }
@@ -234,10 +234,10 @@ impl CovemapSectionEntryV1 {
         }
         let bytes = &bytes[..COVEMAP_SECTION_ENTRY_LEN as usize];
 
-        let section_id = read_u32_at(bytes, 0)?;
-        let offset = read_u64_at(bytes, 4)?;
-        let length = read_u64_at(bytes, 12)?;
-        let uncompressed_length = read_u64_at(bytes, 20)?;
+        let section_id = wire::read_u32_le_checked(bytes, 0)?;
+        let offset = wire::read_u64_le_checked(bytes, 4)?;
+        let length = wire::read_u64_le_checked(bytes, 12)?;
+        let uncompressed_length = wire::read_u64_le_checked(bytes, 20)?;
         let compression = bytes[28];
         CompressionCodec::from_u8(compression).ok_or_else(|| {
             CoveError::BadSection(format!("unknown COVEMAP compression codec {compression}"))
@@ -261,7 +261,7 @@ impl CovemapSectionEntryV1 {
         if reserved != 0 {
             return Err(CoveError::ReservedNotZero);
         }
-        let checksum = read_u32_at(bytes, 32)?;
+        let checksum = wire::read_u32_le_checked(bytes, 32)?;
 
         if length == 0 && uncompressed_length != 0 {
             return Err(CoveError::BadSection(
@@ -293,10 +293,10 @@ impl CovemapSectionEntryV1 {
         }
         let bytes = &bytes[..COVEMAP_SECTION_ENTRY_LEN as usize];
 
-        let section_id = read_u32_at(bytes, 0)?;
-        let offset = read_u64_at(bytes, 4)?;
-        let length = read_u64_at(bytes, 12)?;
-        let uncompressed_length = read_u64_at(bytes, 20)?;
+        let section_id = wire::read_u32_le_checked(bytes, 0)?;
+        let offset = wire::read_u64_le_checked(bytes, 4)?;
+        let length = wire::read_u64_le_checked(bytes, 12)?;
+        let uncompressed_length = wire::read_u64_le_checked(bytes, 20)?;
         let compression = bytes[28];
         CompressionCodec::from_u8(compression).ok_or_else(|| {
             CoveError::BadSection(format!("unknown COVEMAP compression codec {compression}"))
@@ -310,10 +310,10 @@ impl CovemapSectionEntryV1 {
                 )))
             }
         };
-        if read_u16_at(bytes, 30)? != 0 {
+        if wire::read_u16_le_checked(bytes, 30)? != 0 {
             return Err(CoveError::ReservedNotZero);
         }
-        let checksum = read_u32_at(bytes, 32)?;
+        let checksum = wire::read_u32_le_checked(bytes, 32)?;
 
         if length == 0 && uncompressed_length != 0 {
             return Err(CoveError::BadSection(
@@ -396,8 +396,8 @@ impl CovemapPostscriptV1 {
         let tail = &file_data[start..];
         let n = COVEMAP_POSTSCRIPT_LEN as usize;
 
-        let version = read_u16_at(tail, n)?;
-        let len = read_u16_at(tail, n + 2)?;
+        let version = wire::read_u16_le_checked(tail, n)?;
+        let len = wire::read_u16_le_checked(tail, n + 2)?;
         let mut magic = [0u8; 4];
         magic.copy_from_slice(&tail[n + 4..n + 8]);
 
@@ -413,18 +413,18 @@ impl CovemapPostscriptV1 {
             )));
         }
 
-        let payload = read_array_at::<{ COVEMAP_POSTSCRIPT_LEN as usize }>(tail, 0)?;
-        if checksum::crc32c(&payload[..40]) != read_u32_at(&payload, 40)? {
+        let payload = wire::read_array_checked::<{ COVEMAP_POSTSCRIPT_LEN as usize }>(tail, 0)?;
+        if checksum::crc32c(&payload[..40]) != wire::read_u32_le_checked(&payload, 40)? {
             return Err(CoveError::ChecksumMismatch);
         }
 
         Ok(Self {
-            required_features: read_u64_at(&payload, 0)?,
-            optional_features: read_u64_at(&payload, 8)?,
-            file_len: read_u64_at(&payload, 16)?,
-            header_offset: read_u64_at(&payload, 24)?,
-            header_length: read_u64_at(&payload, 32)?,
-            checksum: read_u32_at(&payload, 40)?,
+            required_features: wire::read_u64_le_checked(&payload, 0)?,
+            optional_features: wire::read_u64_le_checked(&payload, 8)?,
+            file_len: wire::read_u64_le_checked(&payload, 16)?,
+            header_offset: wire::read_u64_le_checked(&payload, 24)?,
+            header_length: wire::read_u64_le_checked(&payload, 32)?,
+            checksum: wire::read_u32_le_checked(&payload, 40)?,
         })
     }
 }
@@ -775,32 +775,6 @@ fn covemap_codec_feature_bit(compression: u8) -> Result<u64, CoveError> {
         CompressionCodec::Lz4 => Ok(FEATURE_CODEC_LZ4),
         CompressionCodec::Zstd => Ok(FEATURE_CODEC_ZSTD),
     }
-}
-
-fn read_array_at<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N], CoveError> {
-    let end = offset.checked_add(N).ok_or(CoveError::ArithOverflow)?;
-    if end > bytes.len() {
-        return Err(CoveError::BufferTooShort);
-    }
-    let mut out = [0u8; N];
-    out.copy_from_slice(&bytes[offset..end]);
-    Ok(out)
-}
-
-fn read_u16_at(bytes: &[u8], offset: usize) -> Result<u16, CoveError> {
-    Ok(u16::from_le_bytes(read_array_at(bytes, offset)?))
-}
-
-fn read_u32_at(bytes: &[u8], offset: usize) -> Result<u32, CoveError> {
-    Ok(u32::from_le_bytes(read_array_at(bytes, offset)?))
-}
-
-fn read_u64_at(bytes: &[u8], offset: usize) -> Result<u64, CoveError> {
-    Ok(u64::from_le_bytes(read_array_at(bytes, offset)?))
-}
-
-fn read_i64_at(bytes: &[u8], offset: usize) -> Result<i64, CoveError> {
-    Ok(i64::from_le_bytes(read_array_at(bytes, offset)?))
 }
 
 #[cfg(test)]

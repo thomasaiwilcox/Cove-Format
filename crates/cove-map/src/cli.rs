@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{error::Error, fmt, path::PathBuf};
 
 use serde_json::json;
 
@@ -10,6 +10,41 @@ use crate::{
 };
 
 use super::*;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MapCliError {
+    Usage(String),
+    Command(String),
+}
+
+impl MapCliError {
+    fn usage(message: String) -> Self {
+        Self::Usage(message)
+    }
+}
+
+impl fmt::Display for MapCliError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MapCliError::Usage(message) | MapCliError::Command(message) => f.write_str(message),
+        }
+    }
+}
+
+impl Error for MapCliError {}
+
+impl From<String> for MapCliError {
+    fn from(message: String) -> Self {
+        Self::Command(message)
+    }
+}
+
+impl From<&str> for MapCliError {
+    fn from(message: &str) -> Self {
+        Self::Command(message.to_string())
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Command {
@@ -137,8 +172,8 @@ pub(crate) enum OutputFormat {
     Sql,
 }
 
-pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<(), String> {
-    let Some(command) = parse_args(args)? else {
+pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<(), MapCliError> {
+    let Some(command) = parse_args(args).map_err(MapCliError::usage)? else {
         print_usage();
         return Ok(());
     };
@@ -219,7 +254,9 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<(), String> {
                 .map_err(|err| format!("cannot read {}: {err}", report.display()))?;
             let report_json: serde_json::Value = serde_json::from_slice(&bytes)
                 .map_err(|err| format!("invalid replay report JSON: {err}"))?;
-            print_json(&verify_replay_report(&file, &report_json)?)?;
+            print_json(
+                &verify_replay_report(&file, &report_json).map_err(|error| error.to_string())?,
+            )?;
         }
         Command::Convert {
             map,

@@ -31,5 +31,8 @@ members = [
 ]
 resolver = "2"
 
+[workspace.package]
+rust-version = "1.94"
+
 [patch.crates-io]
 orc-rust = { path = "vendor/orc-rust" }
