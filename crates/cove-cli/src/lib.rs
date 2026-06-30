@@ -1,3 +1,9 @@
+//! Beginner-friendly CLI facade for the COVE reference workspace.
+//!
+//! The command surface keeps user-facing stderr stable. Rust callers receive
+//! typed `CliError` values so argument/usage failures can be distinguished from
+//! command execution failures without parsing display text.
+
 pub mod customer360;
 mod delta;
 mod external_tables;
@@ -7,7 +13,8 @@ mod sidecar;
 
 use std::{
     collections::HashMap,
-    fs,
+    error::Error,
+    fmt, fs,
     io::{self, Read},
     path::{Path, PathBuf},
     sync::Arc,
@@ -61,6 +68,41 @@ use external_tables::{register_external_tables, ExternalTableSpec};
 use help::{print_usage, usage, HelpTopic};
 use output::{write_result, OutputFormat};
 use sidecar::run_sidecar;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CliError {
+    Usage(String),
+    Command(String),
+}
+
+impl CliError {
+    fn usage(message: String) -> Self {
+        Self::Usage(message)
+    }
+}
+
+impl fmt::Display for CliError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CliError::Usage(message) | CliError::Command(message) => f.write_str(message),
+        }
+    }
+}
+
+impl Error for CliError {}
+
+impl From<String> for CliError {
+    fn from(message: String) -> Self {
+        Self::Command(message)
+    }
+}
+
+impl From<&str> for CliError {
+    fn from(message: &str) -> Self {
+        Self::Command(message.to_string())
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Command {
@@ -234,8 +276,8 @@ struct QueryCommand {
     max_cell_width: usize,
 }
 
-pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<(), String> {
-    match parse_args(args)? {
+pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<(), CliError> {
+    let result: Result<(), String> = match parse_args(args).map_err(CliError::usage)? {
         Command::Help(topic) => {
             print_usage(topic);
             Ok(())
@@ -309,7 +351,7 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<(), String> {
         Command::Ai { args } => run_ai(args),
         Command::Train { args } => run_train(args),
         Command::InspectDetailed { args } => run_inspect_detailed(args),
-        Command::Dump { args } => cove_dump::run_cli(args),
+        Command::Dump { args } => cove_dump::run_cli(args).map_err(|error| error.to_string()),
         Command::Map { args } => run_map(args),
         Command::Export { format, args } => run_export(format, args),
         Command::Perf { command, args } => run_perf(command, args),
@@ -318,7 +360,8 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<(), String> {
         Command::Digest { args } => run_digest(args),
         Command::Profile { args } => run_profile(args),
         Command::Canonicalise { args } => run_canonicalise(args),
-    }
+    };
+    result.map_err(CliError::from)
 }
 
 struct QueryCommandOptions {
@@ -413,56 +456,29 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, String>
         "query" => parse_query(args),
         "convert" => parse_convert(args),
         "validate" => Ok(Command::Validate { args }),
-        "vec"
-            if args
-                .first()
-                .is_some_and(|arg| arg == "-h" || arg == "--help") =>
-        {
-            Ok(Command::Help(HelpTopic::Vec))
-        }
-        "vec" => Ok(Command::Vector { args }),
-        "ai" if args
-            .first()
-            .is_some_and(|arg| arg == "-h" || arg == "--help") =>
-        {
-            Ok(Command::Help(HelpTopic::Ai))
-        }
-        "ai" => Ok(Command::Ai { args }),
-        "train"
-            if args
-                .first()
-                .is_some_and(|arg| arg == "-h" || arg == "--help") =>
-        {
-            Ok(Command::Help(HelpTopic::Train))
-        }
-        "train" => Ok(Command::Train { args }),
+        "vec" => Ok(parse_passthrough_or_help(args, HelpTopic::Vec, |args| {
+            Command::Vector { args }
+        })),
+        "ai" => Ok(parse_passthrough_or_help(args, HelpTopic::Ai, |args| {
+            Command::Ai { args }
+        })),
+        "train" => Ok(parse_passthrough_or_help(args, HelpTopic::Train, |args| {
+            Command::Train { args }
+        })),
         "dump" => Ok(Command::Dump { args }),
-        "map"
-            if args
-                .first()
-                .is_some_and(|arg| arg == "-h" || arg == "--help") =>
-        {
-            Ok(Command::Help(HelpTopic::Map))
-        }
-        "map" => Ok(Command::Map { args }),
+        "map" => Ok(parse_passthrough_or_help(args, HelpTopic::Map, |args| {
+            Command::Map { args }
+        })),
         "export" => parse_export(args),
         "perf" => parse_perf(args),
-        "sidecar"
-            if args
-                .first()
-                .is_some_and(|arg| arg == "-h" || arg == "--help") =>
-        {
-            Ok(Command::Help(HelpTopic::Sidecar))
-        }
-        "sidecar" => Ok(Command::Sidecar { args }),
-        "delta"
-            if args
-                .first()
-                .is_some_and(|arg| arg == "-h" || arg == "--help") =>
-        {
-            Ok(Command::Help(HelpTopic::Delta))
-        }
-        "delta" => Ok(Command::Delta { args }),
+        "sidecar" => Ok(parse_passthrough_or_help(
+            args,
+            HelpTopic::Sidecar,
+            |args| Command::Sidecar { args },
+        )),
+        "delta" => Ok(parse_passthrough_or_help(args, HelpTopic::Delta, |args| {
+            Command::Delta { args }
+        })),
         "digest" => parse_digest(args),
         "profile" => Ok(Command::Profile { args }),
         "canonicalise" | "canonicalize" => Ok(Command::Canonicalise { args }),
@@ -471,6 +487,22 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, String>
             usage(HelpTopic::Global)
         )),
     }
+}
+
+fn parse_passthrough_or_help(
+    args: Vec<String>,
+    help_topic: HelpTopic,
+    command: impl FnOnce(Vec<String>) -> Command,
+) -> Command {
+    if args.first().is_some_and(|arg| is_help_flag(arg)) {
+        Command::Help(help_topic)
+    } else {
+        command(args)
+    }
+}
+
+fn is_help_flag(arg: &str) -> bool {
+    arg == "-h" || arg == "--help"
 }
 
 fn parse_examples(args: Vec<String>) -> Result<Command, String> {
@@ -703,7 +735,7 @@ fn parse_showcase_customer360(args: Vec<String>) -> Result<Command, String> {
                 let value = iter.next().ok_or_else(|| {
                     "--profile requires quick, standard, or publication".to_string()
                 })?;
-                profile = Customer360Profile::parse(&value)?;
+                profile = Customer360Profile::parse(&value).map_err(|error| error.to_string())?;
             }
             "--force" => force = true,
             "--json" => json = true,
@@ -747,13 +779,13 @@ fn parse_showcase_proof_suite(args: Vec<String>) -> Result<Command, String> {
                 let value = iter.next().ok_or_else(|| {
                     "--profile requires quick, standard, or publication".to_string()
                 })?;
-                profile = Customer360Profile::parse(&value)?;
+                profile = Customer360Profile::parse(&value).map_err(|error| error.to_string())?;
             }
             "--scenario" => {
                 let value = iter.next().ok_or_else(|| {
                     "--scenario requires customer360, claims, catalog, or all".to_string()
                 })?;
-                scenario = ProofSuiteScenario::parse(&value)?;
+                scenario = ProofSuiteScenario::parse(&value).map_err(|error| error.to_string())?;
             }
             "--force" => force = true,
             "--json" => json = true,
@@ -797,7 +829,7 @@ fn parse_showcase_ai_training(args: Vec<String>) -> Result<Command, String> {
                 let value = iter.next().ok_or_else(|| {
                     "--profile requires quick, standard, or publication".to_string()
                 })?;
-                profile = Customer360Profile::parse(&value)?;
+                profile = Customer360Profile::parse(&value).map_err(|error| error.to_string())?;
             }
             "--force" => force = true,
             "--json" => json = true,
@@ -1238,17 +1270,18 @@ fn explain_policy_for_cli(mode: &str) -> ExplainDisclosurePolicy {
 }
 
 fn run_convert(format: ConvertFormat, args: Vec<String>) -> Result<(), String> {
-    match format {
+    let result = match format {
         ConvertFormat::Parquet => cove_convert_parquet::commands::run_parquet(args),
         ConvertFormat::Arrow => cove_convert_parquet::commands::run_arrow(args),
         ConvertFormat::Orc => cove_convert_parquet::commands::run_orc(args),
         ConvertFormat::Csv => cove_convert_parquet::commands::run_csv(args),
         ConvertFormat::Report => cove_convert_parquet::commands::run_report(args),
-    }
+    };
+    result.map_err(|error| error.to_string())
 }
 
 fn run_validate(args: Vec<String>) -> Result<(), String> {
-    if cove_validate::run_cli(args)? {
+    if cove_validate::run_cli(args).map_err(|error| error.to_string())? {
         Ok(())
     } else {
         Err("validation failed".into())
@@ -1508,14 +1541,16 @@ fn run_ai_import(mut args: Vec<String>) -> Result<(), String> {
                     &iter
                         .next()
                         .ok_or_else(|| "--schema requires a value".to_string())?,
-                )?;
+                )
+                .map_err(|err| err.to_string())?;
             }
             "--split-policy" => {
                 split_policy = AiSplitPolicy::parse(
                     &iter
                         .next()
                         .ok_or_else(|| "--split-policy requires a value".to_string())?,
-                )?;
+                )
+                .map_err(|err| err.to_string())?;
             }
             "--split-column" => {
                 split_column = Some(
@@ -1552,10 +1587,13 @@ fn run_ai_import(mut args: Vec<String>) -> Result<(), String> {
         "jsonl" => import_jsonl(&input, out.as_deref(), options),
         "parquet" => import_parquet(&input, out.as_deref(), options),
         "hf" => import_hf_dir(&input, out.as_deref(), options),
-        other => Err(format!(
-            "unknown ai import kind '{other}'; expected jsonl, parquet, or hf"
-        )),
-    }?;
+        other => {
+            return Err(format!(
+                "unknown ai import kind '{other}'; expected jsonl, parquet, or hf"
+            ))
+        }
+    }
+    .map_err(|err| err.to_string())?;
     println!(
         "{}",
         serde_json::to_string_pretty(&report)
@@ -1601,8 +1639,11 @@ fn run_ai_verify(args: Vec<String>) -> Result<(), String> {
             cove_ai: None,
             dataset_dir,
         },
-    )?;
-    let report = archive.verify(AiVerifyOptions { policy_report })?;
+    )
+    .map_err(|err| err.to_string())?;
+    let report = archive
+        .verify(AiVerifyOptions { policy_report })
+        .map_err(|err| err.to_string())?;
     if json_output {
         println!(
             "{}",
@@ -1690,8 +1731,9 @@ fn run_ai_stream(args: Vec<String>) -> Result<(), String> {
             include_payloads,
             policy_report: true,
         },
-    )?;
-    write_export_file(data, out)
+    )
+    .map_err(|err| err.to_string())?;
+    write_export_file(data, out).map_err(|err| err.to_string())
 }
 
 fn run_ai_diff(args: Vec<String>) -> Result<(), String> {
@@ -1727,7 +1769,7 @@ fn run_ai_diff(args: Vec<String>) -> Result<(), String> {
     }
     let old = old.ok_or_else(|| "ai diff requires <old.coveai>".to_string())?;
     let new = new.ok_or_else(|| "ai diff requires <new.coveai>".to_string())?;
-    let report = diff_archives(&old, &new, &key_field)?;
+    let report = diff_archives(&old, &new, &key_field).map_err(|err| err.to_string())?;
     let text = serde_json::to_string_pretty(&report)
         .map_err(|error| format!("cannot serialize AI diff report: {error}"))?;
     if let Some(report_path) = report_path {
@@ -1818,7 +1860,7 @@ fn ai_export_jsonl(value: &serde_json::Value) -> String {
     let mut out = String::new();
     if let Some(records) = value.get("records").and_then(|records| records.as_array()) {
         for record in records {
-            out.push_str(&serde_json::to_string(record).unwrap());
+            out.push_str(&record.to_string());
             out.push('\n');
         }
     }
@@ -1832,7 +1874,7 @@ fn write_ai_export_output(
 ) -> Result<(), String> {
     match format {
         "json" => {
-            let text = serde_json::to_string_pretty(value).unwrap();
+            let text = json_pretty_string(value)?;
             if let Some(out) = out {
                 fs::write(&out, text)
                     .map_err(|error| format!("cannot write {}: {error}", out.display()))?;
@@ -1856,7 +1898,8 @@ fn write_ai_export_output(
             let bytes = match format {
                 "arrow" => {
                     let batch = ai_export_record_batch(value)?;
-                    cove_datafusion::arrow_export_cli::write_ipc(&batch.schema(), &[batch])?
+                    cove_datafusion::arrow_export_cli::write_ipc(&batch.schema(), &[batch])
+                        .map_err(|error| error.to_string())?
                 }
                 "parquet" => {
                     let batch = ai_export_record_batch(value)?;
@@ -1901,7 +1944,7 @@ fn ai_export_record_batch(value: &serde_json::Value) -> Result<RecordBatch, Stri
     let record_json = StringArray::from(
         records
             .iter()
-            .map(|record| serde_json::to_string(record).unwrap())
+            .map(|record| record.to_string())
             .collect::<Vec<_>>(),
     );
     let mut metadata = HashMap::new();
@@ -1918,7 +1961,7 @@ fn ai_export_record_batch(value: &serde_json::Value) -> Result<RecordBatch, Stri
     if let Some(diagnostics) = value.get("diagnostics") {
         metadata.insert(
             "cove.ai.diagnostics_json".to_string(),
-            serde_json::to_string(diagnostics).unwrap(),
+            diagnostics.to_string(),
         );
     }
     let schema = Schema::new(vec![
@@ -2005,16 +2048,12 @@ fn write_ai_export_webdataset(value: &serde_json::Value) -> Result<Vec<u8>, Stri
         object.remove("records");
         object.remove("samples");
     }
-    write_tar_entry(
-        &mut out,
-        "metadata.json",
-        &serde_json::to_vec_pretty(&metadata).unwrap(),
-    )?;
+    write_tar_entry(&mut out, "metadata.json", &json_pretty_bytes(&metadata)?)?;
     for (index, record) in records.iter().enumerate() {
         write_tar_entry(
             &mut out,
             &format!("{index:06}.json"),
-            serde_json::to_string(record).unwrap().as_bytes(),
+            record.to_string().as_bytes(),
         )?;
     }
     out.extend_from_slice(&[0u8; 1024]);
@@ -2424,46 +2463,34 @@ fn run_train_export(args: Vec<String>) -> Result<(), String> {
             print!("{text}");
         }
     } else {
-        let value = training_export_json(TrainingExportJsonRequest {
-            input: &input,
-            sidecar: &sidecar,
+        let value = training_export_json(
+            &input,
+            &sidecar,
             profile_filter,
             split_filter,
             epoch_plan_filter,
             include_payloads,
             policy_report,
-            payload_reader: &payload_reader,
-            format: &format,
-        });
+            &payload_reader,
+            &format,
+        );
         write_ai_export_output(&value, &format, out)?;
     }
     Ok(())
 }
 
-struct TrainingExportJsonRequest<'a, 'payload> {
-    input: &'a Path,
-    sidecar: &'a CoveAiFile,
+#[allow(clippy::too_many_arguments)]
+fn training_export_json(
+    input: &Path,
+    sidecar: &CoveAiFile,
     profile_filter: Option<u32>,
     split_filter: Option<u32>,
     epoch_plan_filter: Option<u64>,
     include_payloads: bool,
     policy_report: bool,
-    payload_reader: &'a AiPayloadReader<'payload>,
-    format: &'a str,
-}
-
-fn training_export_json(request: TrainingExportJsonRequest<'_, '_>) -> serde_json::Value {
-    let TrainingExportJsonRequest {
-        input,
-        sidecar,
-        profile_filter,
-        split_filter,
-        epoch_plan_filter,
-        include_payloads,
-        policy_report,
-        payload_reader,
-        format,
-    } = request;
+    payload_reader: &AiPayloadReader<'_>,
+    format: &str,
+) -> serde_json::Value {
     let samples = filtered_training_samples(sidecar, profile_filter, split_filter)
         .into_iter()
         .map(|sample| training_sample_json_with_payloads(sample, include_payloads, payload_reader))
@@ -2599,7 +2626,7 @@ fn training_export_jsonl(
                 include_payloads,
                 payload_reader,
             ))
-            .unwrap(),
+            .map_err(|error| format!("cannot serialize training sample JSON: {error}"))?,
         );
         out.push('\n');
     }
@@ -2782,7 +2809,7 @@ fn cove_vec_quantization_kind(value: &str) -> Result<u8, String> {
 }
 
 fn run_inspect_detailed(args: Vec<String>) -> Result<(), String> {
-    if cove_inspect::run_cli(args)? {
+    if cove_inspect::run_cli(args).map_err(|error| error.to_string())? {
         Ok(())
     } else {
         Err("inspection failed".into())
@@ -2794,7 +2821,9 @@ fn run_export(format: ExportFormat, args: Vec<String>) -> Result<(), String> {
         ExportFormat::Arrow if arrow_export_uses_coveql_query(&args) => {
             run_arrow_query_export(args)
         }
-        ExportFormat::Arrow => cove_datafusion::arrow_export_cli::run(args),
+        ExportFormat::Arrow => {
+            cove_datafusion::arrow_export_cli::run(args).map_err(|error| error.to_string())
+        }
     }
 }
 
@@ -2836,14 +2865,15 @@ fn run_arrow_query_export(args: Vec<String>) -> Result<(), String> {
             &command.input,
             dataset,
             command.delta_request,
-        )?;
+        )
+        .map_err(|error| error.to_string())?;
         let plan_json = cove_datafusion::delta_snapshot::delta_snapshot_plan_json(
             Some(&command.input),
             &snapshot.plan,
             &snapshot.extension,
         );
         if command.delta_plan_json {
-            eprintln!("{}", serde_json::to_string_pretty(&plan_json).unwrap());
+            eprint_json_pretty(&plan_json)?;
         } else if command.delta_plan {
             print_query_delta_plan_text(&command.input, &snapshot.plan);
         }
@@ -2861,7 +2891,8 @@ fn run_arrow_query_export(args: Vec<String>) -> Result<(), String> {
                 let surface =
                     cove_datafusion::delta_snapshot::read_validated_delta_object_surface(
                         &snapshot,
-                    )?;
+                    )
+                    .map_err(|error| error.to_string())?;
                 delta_execution = Some("direct_object_surface");
                 if command.perf_report {
                     eprintln!("delta_execution=direct_object_surface");
@@ -2905,10 +2936,12 @@ fn run_arrow_query_export(args: Vec<String>) -> Result<(), String> {
         .ok_or_else(|| "CoveQL export produced no Arrow batches".to_string())?;
     let output_bytes = match command.format {
         ArrowQueryExportOutputFormat::Ipc => {
-            cove_datafusion::arrow_export_cli::write_ipc(&schema, &batches)?
+            cove_datafusion::arrow_export_cli::write_ipc(&schema, &batches)
+                .map_err(|error| error.to_string())?
         }
         ArrowQueryExportOutputFormat::Json => {
-            cove_datafusion::arrow_export_cli::write_json(&batches)?
+            cove_datafusion::arrow_export_cli::write_json(&batches)
+                .map_err(|error| error.to_string())?
         }
     };
     cove_core::durable::durable_replace(&command.output, &output_bytes).map_err(|error| {
@@ -3094,7 +3127,7 @@ fn run_map(args: Vec<String>) -> Result<(), String> {
     if args.first().is_some_and(|arg| arg == "delta") {
         return run_map_delta(args.into_iter().skip(1).collect());
     }
-    cove_map::run_cli(args)
+    cove_map::run_cli(args).map_err(|error| error.to_string())
 }
 
 const MAP_DELTA_BUILD_USAGE: &str = "usage: cove map delta build <manifest.covm> --dataset <dir> --out-dir <dir> [--as-of-csn n|--as-of-commit-us n] [--force] [--json] [--publish-covm] [--verify] [--projection-output cove-t|none] [--object-name <file.cove>]\n       cove map delta build --base <manifest.covm> --dataset <dir> --mapping <mapping.covemap> --out <delta.covedelta> [--source-publish-range start:end] [--force] [--json] <source...>";
@@ -3266,7 +3299,8 @@ fn run_map_delta_build(args: Vec<String>) -> Result<(), String> {
     let dataset = dataset.ok_or_else(|| "map delta build requires --dataset <dir>".to_string())?;
     let out_dir = out_dir.ok_or_else(|| "map delta build requires --out-dir <dir>".to_string())?;
     let (_snapshot, materialized) =
-        cove_datafusion::delta_snapshot::materialize_delta_snapshot(&manifest, &dataset, request)?;
+        cove_datafusion::delta_snapshot::materialize_delta_snapshot(&manifest, &dataset, request)
+            .map_err(|error| error.to_string())?;
     let result = cove_map::build_from_cove_o_bytes(
         &format!("{}#delta-snapshot", manifest.display()),
         materialized.bytes,
@@ -3281,12 +3315,10 @@ fn run_map_delta_build(args: Vec<String>) -> Result<(), String> {
             publish_covm,
             reuse_cache: true,
         },
-    )?;
+    )
+    .map_err(|error| error.to_string())?;
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&result.manifest).unwrap()
-        );
+        print_json_pretty(&result.manifest)?;
     } else {
         println!("COVE-MAP delta build: {}", out_dir.display());
         if let Some(object) = result
@@ -3322,9 +3354,11 @@ fn run_map_semantic_delta_build(
         &base_manifest,
         &dataset,
         CovmDeltaPruneRequest::default(),
-    )?;
+    )
+    .map_err(|error| error.to_string())?;
     let parent_surface =
-        cove_datafusion::delta_snapshot::read_validated_delta_object_surface(&snapshot)?;
+        cove_datafusion::delta_snapshot::read_validated_delta_object_surface(&snapshot)
+            .map_err(|error| error.to_string())?;
     let parent_object_states =
         cove_core::profile::cove_o::reconstruct_object_states(&parent_surface, &Default::default())
             .map_err(|error| {
@@ -3364,9 +3398,10 @@ fn run_map_semantic_delta_build(
             commit_time_start_us,
             source_publish_range_us,
         },
-    )?;
+    )
+    .map_err(|error| error.to_string())?;
     if json {
-        println!("{}", serde_json::to_string_pretty(&result.report).unwrap());
+        print_json_pretty(&result.report)?;
     } else {
         println!("COVE-MAP semantic delta: {}", out.display());
         if let Some(snapshot_id) = result
@@ -3383,13 +3418,17 @@ fn run_map_semantic_delta_build(
 
 fn run_perf(command: PerfCommand, args: Vec<String>) -> Result<(), String> {
     match command {
-        PerfCommand::ExplainPruning => cove_datafusion::explain_pruning_cli::run(args),
-        PerfCommand::PlanCost => cove_datafusion::plan_cost_cli::run(args),
+        PerfCommand::ExplainPruning => {
+            cove_datafusion::explain_pruning_cli::run(args).map_err(|error| error.to_string())
+        }
+        PerfCommand::PlanCost => {
+            cove_datafusion::plan_cost_cli::run(args).map_err(|error| error.to_string())
+        }
     }
 }
 
 fn run_profile(args: Vec<String>) -> Result<(), String> {
-    if cove_core::profile_cli::run(args)? {
+    if cove_core::profile_cli::run(args).map_err(|error| error.to_string())? {
         Ok(())
     } else {
         Err("profile command failed".into())
@@ -3397,7 +3436,7 @@ fn run_profile(args: Vec<String>) -> Result<(), String> {
 }
 
 fn run_canonicalise(args: Vec<String>) -> Result<(), String> {
-    if cove_core::canonicalise_cli::run(args)? {
+    if cove_core::canonicalise_cli::run(args).map_err(|error| error.to_string())? {
         Ok(())
     } else {
         Err("canonicalise command failed".into())
@@ -3550,7 +3589,7 @@ fn run_examples(json: bool) -> Result<(), String> {
                 })
             }).collect::<Vec<_>>(),
         });
-        println!("{}", serde_json::to_string_pretty(&value).unwrap());
+        print_json_pretty(&value)?;
         return Ok(());
     }
 
@@ -3585,7 +3624,8 @@ fn run_showcase_customer360(
         out_dir: out_dir.to_path_buf(),
         profile,
         force,
-    })?;
+    })
+    .map_err(|error| error.to_string())?;
     if json {
         println!(
             "{}",
@@ -3629,7 +3669,8 @@ fn run_showcase_proof_suite(
         profile,
         scenario,
         force,
-    })?;
+    })
+    .map_err(|error| error.to_string())?;
     if json {
         println!(
             "{}",
@@ -3670,7 +3711,8 @@ fn run_showcase_ai_training(
     force: bool,
     json: bool,
 ) -> Result<(), String> {
-    let manifest = build_ai_training_showcase(out_dir, profile.as_str(), force)?;
+    let manifest = build_ai_training_showcase(out_dir, profile.as_str(), force)
+        .map_err(|err| err.to_string())?;
     if json {
         println!(
             "{}",
@@ -3753,7 +3795,7 @@ fn run_doctor(file: &Path, json: bool) -> Result<(), String> {
             "suggested_queries": suggestions,
             "performance": acceleration_report_json(&bundle),
         });
-        println!("{}", serde_json::to_string_pretty(&value).unwrap());
+        print_json_pretty(&value)?;
         return Ok(());
     }
 
@@ -3831,7 +3873,7 @@ fn run_inspect(
             );
             value["performance"] = acceleration_report_json(&bundle);
         }
-        println!("{}", serde_json::to_string_pretty(&value).unwrap());
+        print_json_pretty(&value)?;
         return Ok(());
     }
     print_discovery(&discovery, queries);
@@ -3941,7 +3983,7 @@ fn run_ai_inspect(file: &Path, bytes: &[u8], json: bool) -> Result<(), String> {
                 "records": records,
                 "sections": sections,
             });
-            println!("{}", serde_json::to_string_pretty(&value).unwrap());
+            print_json_pretty(&value)?;
             return Ok(());
         }
         println!("AI Inspect: {}", file.display());
@@ -4042,7 +4084,7 @@ fn run_ai_inspect(file: &Path, bytes: &[u8], json: bool) -> Result<(), String> {
         let summary = map_ai_summary(&embedded);
         if json {
             let value = map_ai_summary_json(file, "covemap", &summary);
-            println!("{}", serde_json::to_string_pretty(&value).unwrap());
+            print_json_pretty(&value)?;
             return Ok(());
         }
         print_map_ai_summary(file, "covemap", &summary);
@@ -4078,7 +4120,7 @@ fn run_ai_inspect(file: &Path, bytes: &[u8], json: bool) -> Result<(), String> {
             })).collect::<Vec<_>>(),
             "map_ai": map_ai_summary_value(&summary),
         });
-        println!("{}", serde_json::to_string_pretty(&value).unwrap());
+        print_json_pretty(&value)?;
         return Ok(());
     }
     println!("AI Inspect: {}", file.display());
@@ -4086,12 +4128,12 @@ fn run_ai_inspect(file: &Path, bytes: &[u8], json: bool) -> Result<(), String> {
     println!("Embedded AI sections: {}", ai_sections.len());
     print_map_ai_summary_details(&summary);
     for section in ai_sections {
+        let section_kind = SectionKind::from_u16(section.section_kind)
+            .map(|kind| format!("{kind:?}"))
+            .unwrap_or_else(|| format!("unknown({})", section.section_kind));
         println!(
-            "  - id={} kind={:?} offset={} len={}",
-            section.section_id,
-            SectionKind::from_u16(section.section_kind).unwrap(),
-            section.offset,
-            section.length
+            "  - id={} kind={} offset={} len={}",
+            section.section_id, section_kind, section.offset, section.length
         );
     }
     Ok(())
@@ -4373,7 +4415,7 @@ fn run_optimize(file: &Path, out_dir: Option<&Path>, full: bool, json: bool) -> 
     let report = generate_acceleration_sidecars(&bytes, plan, &out_dir)
         .map_err(|error| format!("cannot optimize {}: {error}", file.display()))?;
     if json {
-        println!("{}", serde_json::to_string_pretty(&report).unwrap());
+        print_json_pretty(&report)?;
         return Ok(());
     }
     println!("Optimized: {}", file.display());
@@ -4409,7 +4451,7 @@ fn run_query(file: Option<&Path>, query: &str, options: QueryCommandOptions) -> 
         Some(file) => {
             fs::read(file).map_err(|error| format!("cannot read {}: {error}", file.display()))?
         }
-        None => external_only_context_bytes(),
+        None => external_only_context_bytes()?,
     };
     let delta_manifest = file.is_some()
         && cove_datafusion::delta_snapshot::delta_chain_required(&bytes).unwrap_or(false);
@@ -4417,7 +4459,9 @@ fn run_query(file: Option<&Path>, query: &str, options: QueryCommandOptions) -> 
     let mut delta_snapshot = None;
     let mut delta_direct_surface = None;
     if delta_manifest {
-        let manifest = file.expect("delta_manifest implies file");
+        let Some(manifest) = file else {
+            return Err("internal error: delta manifest selected without input file".into());
+        };
         let dataset = options
             .dataset
             .as_deref()
@@ -4432,7 +4476,8 @@ fn run_query(file: Option<&Path>, query: &str, options: QueryCommandOptions) -> 
             manifest,
             dataset,
             options.delta_request,
-        )?;
+        )
+        .map_err(|error| error.to_string())?;
         if options.strict_performance
             && snapshot
                 .plan
@@ -4449,17 +4494,12 @@ fn run_query(file: Option<&Path>, query: &str, options: QueryCommandOptions) -> 
             );
         }
         if options.delta_plan_json {
-            eprintln!(
-                "{}",
-                serde_json::to_string_pretty(
-                    &cove_datafusion::delta_snapshot::delta_snapshot_plan_json(
-                        Some(manifest),
-                        &snapshot.plan,
-                        &snapshot.extension,
-                    )
-                )
-                .unwrap()
+            let plan_json = cove_datafusion::delta_snapshot::delta_snapshot_plan_json(
+                Some(manifest),
+                &snapshot.plan,
+                &snapshot.extension,
             );
+            eprint_json_pretty(&plan_json)?;
         } else if options.delta_plan {
             print_query_delta_plan_text(manifest, &snapshot.plan);
         }
@@ -4469,7 +4509,8 @@ fn run_query(file: Option<&Path>, query: &str, options: QueryCommandOptions) -> 
                 delta_direct_surface = Some(
                     cove_datafusion::delta_snapshot::read_validated_delta_object_surface(
                         &snapshot,
-                    )?,
+                    )
+                    .map_err(|error| error.to_string())?,
                 );
                 bytes = snapshot.base.bytes.clone();
             }
@@ -4479,7 +4520,8 @@ fn run_query(file: Option<&Path>, query: &str, options: QueryCommandOptions) -> 
                 let materialized =
                     cove_datafusion::delta_snapshot::materialize_validated_delta_snapshot(
                         &snapshot,
-                    )?;
+                    )
+                    .map_err(|error| error.to_string())?;
                 bytes = materialized.bytes;
             }
         }
@@ -4564,9 +4606,9 @@ fn run_query(file: Option<&Path>, query: &str, options: QueryCommandOptions) -> 
             ArtifactExecutionEngine::Materialized
         );
     let executed = if use_direct_delta_surface {
-        let surface = delta_direct_surface
-            .as_ref()
-            .expect("checked direct delta surface");
+        let Some(surface) = delta_direct_surface.as_ref() else {
+            return Err("internal error: direct delta surface selected but unavailable".into());
+        };
         match execute_delta_object_surface_query(&bytes, surface, &query, &execute_options) {
             Ok(executed) => {
                 if options.perf_report {
@@ -4585,13 +4627,14 @@ fn run_query(file: Option<&Path>, query: &str, options: QueryCommandOptions) -> 
             }
             Err(direct_error) => {
                 let direct_error = direct_error.to_string();
-                let snapshot = delta_snapshot
-                    .as_ref()
-                    .expect("delta snapshot is loaded when direct surface exists");
+                let Some(snapshot) = delta_snapshot.as_ref() else {
+                    return Err(format!(
+                        "direct delta execution failed ({direct_error}) and validated delta snapshot is unavailable"
+                    ));
+                };
                 let materialized =
-                    cove_datafusion::delta_snapshot::materialize_validated_delta_snapshot(
-                        snapshot,
-                    )?;
+                    cove_datafusion::delta_snapshot::materialize_validated_delta_snapshot(snapshot)
+                        .map_err(|error| error.to_string())?;
                 bytes = materialized.bytes;
                 execute_query_with_cli_fallback(
                     &bytes,
@@ -4606,11 +4649,15 @@ fn run_query(file: Option<&Path>, query: &str, options: QueryCommandOptions) -> 
         }
     } else {
         if delta_direct_surface.is_some() {
-            let snapshot = delta_snapshot
-                .as_ref()
-                .expect("delta snapshot is loaded when direct surface exists");
+            let Some(snapshot) = delta_snapshot.as_ref() else {
+                return Err(
+                    "internal error: direct delta surface selected without validated snapshot"
+                        .into(),
+                );
+            };
             let materialized =
-                cove_datafusion::delta_snapshot::materialize_validated_delta_snapshot(snapshot)?;
+                cove_datafusion::delta_snapshot::materialize_validated_delta_snapshot(snapshot)
+                    .map_err(|error| error.to_string())?;
             bytes = materialized.bytes;
         }
         execute_query_with_cli_fallback(
@@ -4845,13 +4892,13 @@ fn execute_query_with_cli_fallback(
     }
 }
 
-fn external_only_context_bytes() -> Vec<u8> {
+fn external_only_context_bytes() -> Result<Vec<u8>, String> {
     ScanProfileCoveWriter::new(TableCatalog {
         flags: 0,
         tables: Vec::new(),
     })
     .write()
-    .expect("empty COVE-T context file is valid")
+    .map_err(|error| format!("cannot build empty COVE-T context file: {error}"))
 }
 
 fn apply_graph_budget(options: &mut ExecuteArtifactOptions, budget: GraphBudgetOverrides) {
@@ -5355,6 +5402,26 @@ fn format_execution_error(error: coveql::BuildExecutionError, json_diagnostics: 
     }
 }
 
+fn json_pretty_string<T: serde::Serialize + ?Sized>(value: &T) -> Result<String, String> {
+    serde_json::to_string_pretty(value)
+        .map_err(|error| format!("cannot serialize JSON output: {error}"))
+}
+
+fn json_pretty_bytes<T: serde::Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, String> {
+    serde_json::to_vec_pretty(value)
+        .map_err(|error| format!("cannot serialize JSON output: {error}"))
+}
+
+fn print_json_pretty<T: serde::Serialize + ?Sized>(value: &T) -> Result<(), String> {
+    println!("{}", json_pretty_string(value)?);
+    Ok(())
+}
+
+fn eprint_json_pretty<T: serde::Serialize + ?Sized>(value: &T) -> Result<(), String> {
+    eprintln!("{}", json_pretty_string(value)?);
+    Ok(())
+}
+
 fn beginner_suggestion(code: &str) -> &'static str {
     match code {
         "E_UNKNOWN_TABLE_SURFACE" => {
@@ -5365,5 +5432,75 @@ fn beginner_suggestion(code: &str) -> &'static str {
         }
         "E_PARSE" => "Check the CoveQL syntax or start from a suggested query.",
         _ => "Run with `--json-diagnostics` for structured diagnostic details.",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn pass_through_commands_route_first_arg_help_to_topic() {
+        for (command, topic) in [
+            ("vec", HelpTopic::Vec),
+            ("ai", HelpTopic::Ai),
+            ("train", HelpTopic::Train),
+            ("map", HelpTopic::Map),
+            ("sidecar", HelpTopic::Sidecar),
+            ("delta", HelpTopic::Delta),
+        ] {
+            assert_eq!(
+                parse_args(args(&[command, "--help"])).unwrap(),
+                Command::Help(topic)
+            );
+            assert_eq!(
+                parse_args(args(&[command, "-h"])).unwrap(),
+                Command::Help(topic)
+            );
+        }
+    }
+
+    #[test]
+    fn pass_through_commands_preserve_forwarded_arguments() {
+        assert_eq!(
+            parse_args(args(&["vec", "build", "--metric", "cosine"])).unwrap(),
+            Command::Vector {
+                args: args(&["build", "--metric", "cosine"])
+            }
+        );
+        assert_eq!(
+            parse_args(args(&["map", "project", "--format", "json"])).unwrap(),
+            Command::Map {
+                args: args(&["project", "--format", "json"])
+            }
+        );
+    }
+
+    #[test]
+    fn canonicalise_aliases_preserve_forwarded_arguments() {
+        let forwarded = args(&["digest", "--json"]);
+        assert_eq!(
+            parse_args(args(&["canonicalise", "digest", "--json"])).unwrap(),
+            Command::Canonicalise {
+                args: forwarded.clone()
+            }
+        );
+        assert_eq!(
+            parse_args(args(&["canonicalize", "digest", "--json"])).unwrap(),
+            Command::Canonicalise { args: forwarded }
+        );
+    }
+
+    #[test]
+    fn run_cli_reports_typed_usage_error_with_stable_text() {
+        let error = run_cli(args(&["unknown-command"])).unwrap_err();
+        assert!(matches!(error, CliError::Usage(_)));
+        let message = error.to_string();
+        assert!(message.starts_with("unknown command 'unknown-command'\n\nUsage:"));
+        assert!(message.contains("cove examples [--json]"));
     }
 }

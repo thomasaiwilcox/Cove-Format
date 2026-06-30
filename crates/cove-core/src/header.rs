@@ -12,6 +12,10 @@ use crate::{
         KNOWN_FEATURE_BITS_MASK, MAGIC_COVE, VERSION_MAJOR_V1,
     },
     error::CoveError,
+    wire::{
+        read_array_checked, read_i64_le_checked, read_u16_le_checked, read_u32_le_checked,
+        read_u64_le_checked,
+    },
 };
 
 /// Serialised size of the header in bytes. Always 160 for v2.
@@ -110,11 +114,7 @@ impl CoveHeaderV1 {
         let buf = &buf[..HEADER_SIZE];
 
         // 1. Verify checksum before trusting any other field (Section 10 rule).
-        let stored_crc = u32::from_le_bytes(
-            buf[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4]
-                .try_into()
-                .unwrap(),
-        );
+        let stored_crc = read_u32_le_checked(buf, CHECKSUM_OFFSET)?;
         let mut check_buf = [0u8; HEADER_SIZE];
         check_buf.copy_from_slice(buf);
         check_buf[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4].copy_from_slice(&[0, 0, 0, 0]);
@@ -122,24 +122,24 @@ impl CoveHeaderV1 {
             return Err(CoveError::ChecksumMismatch);
         }
 
-        let magic: [u8; 4] = buf[0..4].try_into().unwrap();
+        let magic = read_array_checked(buf, 0)?;
         if magic != MAGIC_COVE {
             return Err(CoveError::BadMagic);
         }
 
-        let header_len = u16::from_le_bytes(buf[4..6].try_into().unwrap());
+        let header_len = read_u16_le_checked(buf, 4)?;
         if header_len != HEADER_LEN_V1 {
             return Err(CoveError::BadSection(format!(
                 "header_len is {header_len}, expected {HEADER_LEN_V1}"
             )));
         }
 
-        let version_major = u16::from_le_bytes(buf[6..8].try_into().unwrap());
+        let version_major = read_u16_le_checked(buf, 6)?;
         if version_major != VERSION_MAJOR_V1 {
             return Err(CoveError::BadVersion);
         }
 
-        let version_minor = u16::from_le_bytes(buf[8..10].try_into().unwrap());
+        let version_minor = read_u16_le_checked(buf, 8)?;
 
         let primary_profile = buf[10];
         if PrimaryProfile::from_u8(primary_profile).is_none() {
@@ -154,12 +154,12 @@ impl CoveHeaderV1 {
             )));
         }
 
-        let flags = u32::from_le_bytes(buf[12..16].try_into().unwrap());
+        let flags = read_u32_le_checked(buf, 12)?;
         if flags != 0 {
             return Err(CoveError::ReservedNotZero);
         }
-        let required_features = u64::from_le_bytes(buf[16..24].try_into().unwrap());
-        let optional_features = u64::from_le_bytes(buf[24..32].try_into().unwrap());
+        let required_features = read_u64_le_checked(buf, 16)?;
+        let optional_features = read_u64_le_checked(buf, 24)?;
 
         // Section 11: Readers MUST reject unknown required feature bits.
         let unknown_required = required_features & !KNOWN_FEATURE_BITS_MASK;
@@ -173,21 +173,21 @@ impl CoveHeaderV1 {
         let mut producer_scope_id = [0u8; 16];
         producer_scope_id.copy_from_slice(&buf[48..64]);
 
-        let producer_scope_kind = u16::from_le_bytes(buf[64..66].try_into().unwrap());
+        let producer_scope_kind = read_u16_le_checked(buf, 64)?;
         if ProducerScopeKind::from_u16(producer_scope_kind).is_none() {
             return Err(CoveError::BadSection(format!(
                 "unknown producer_scope_kind {producer_scope_kind}"
             )));
         }
-        let reserved_scope_flags = u16::from_le_bytes(buf[66..68].try_into().unwrap());
+        let reserved_scope_flags = read_u16_le_checked(buf, 66)?;
         if reserved_scope_flags != 0 {
             return Err(CoveError::ReservedNotZero);
         }
-        let created_at_us = i64::from_le_bytes(buf[68..76].try_into().unwrap());
-        let feature_set_section_id = u32::from_le_bytes(buf[76..80].try_into().unwrap());
-        let profile_capability_section_id = u32::from_le_bytes(buf[80..84].try_into().unwrap());
-        let fast_metadata_section_id = u32::from_le_bytes(buf[84..88].try_into().unwrap());
-        let v2_flags = u32::from_le_bytes(buf[88..92].try_into().unwrap());
+        let created_at_us = read_i64_le_checked(buf, 68)?;
+        let feature_set_section_id = read_u32_le_checked(buf, 76)?;
+        let profile_capability_section_id = read_u32_le_checked(buf, 80)?;
+        let fast_metadata_section_id = read_u32_le_checked(buf, 84)?;
+        let v2_flags = read_u32_le_checked(buf, 88)?;
         if v2_flags != 0 {
             return Err(CoveError::ReservedNotZero);
         }

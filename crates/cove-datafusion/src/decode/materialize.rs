@@ -11,6 +11,7 @@ pub(super) struct DecodedArrowColumn<'name, 'array, 'data> {
 }
 
 #[inline]
+#[allow(clippy::too_many_arguments)]
 pub(super) fn arrow_encoded_columns_for_payloads<'name, 'array, 'data>(
     state: &DatasetState,
     segment_id: u32,
@@ -410,6 +411,7 @@ fn zero_copy_export_path_eligible(path: ArrowExportPath, options: ArrowExportOpt
             || options.varbytes_policy == ArrowVarBytesExportPolicy::View)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn materialize_page_payload(
     segment_bytes: &[u8],
     table_id: u32,
@@ -457,6 +459,7 @@ pub(super) fn materialize_page_payload(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn materialize_page_payload_from_wire(
     table_id: u32,
     segment_id: u32,

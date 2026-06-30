@@ -7,6 +7,7 @@ use cove_core::{
         explain_bloom_membership, explain_file_code_equality, explain_is_not_null, explain_is_null,
         explain_numcode_range,
     },
+    wire,
     zone_stats::NumericStatValue,
     CoveError,
 };
@@ -455,15 +456,15 @@ fn composite_tuple_has_match(
         return None;
     }
     for entry in index.entries.chunks_exact(entry_width) {
-        let entry_segment = u32::from_le_bytes(entry[key_width..key_width + 4].try_into().ok()?);
-        let entry_morsel = u32::from_le_bytes(entry[key_width + 4..key_width + 8].try_into().ok()?);
+        let entry_segment = wire::read_u32_le_checked(entry, key_width).ok()?;
+        let entry_morsel = wire::read_u32_le_checked(entry, key_width + 4).ok()?;
         if entry_segment != segment_id || entry_morsel != morsel_id {
             continue;
         }
         let mut all_match = true;
         for (idx, codes) in code_sets.iter().enumerate() {
             let start = idx.checked_mul(8)?;
-            let value = u64::from_le_bytes(entry[start..start + 8].try_into().ok()?);
+            let value = wire::read_u64_le_checked(entry, start).ok()?;
             let Ok(code) = u32::try_from(value) else {
                 all_match = false;
                 break;

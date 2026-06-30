@@ -121,7 +121,10 @@ pub fn encoded_filecode_array_to_arrow_dictionary_remapped(
     selection.for_each_row(array.row_count, |row| {
         let is_null = has_nulls && array.is_null(row as u64)?;
         if !is_null {
-            let code = read_u32_le(data, row.checked_mul(4).ok_or(CoveError::ArithOverflow)?)?;
+            let code = wire::read_u32_le_checked(
+                data,
+                row.checked_mul(4).ok_or(CoveError::ArithOverflow)?,
+            )?;
             dense_by_code.entry(code).or_insert(0);
         }
         Ok(())
@@ -146,7 +149,10 @@ pub fn encoded_filecode_array_to_arrow_dictionary_remapped(
         if is_null {
             keys.push(0);
         } else {
-            let code = read_u32_le(data, row.checked_mul(4).ok_or(CoveError::ArithOverflow)?)?;
+            let code = wire::read_u32_le_checked(
+                data,
+                row.checked_mul(4).ok_or(CoveError::ArithOverflow)?,
+            )?;
             let dense = dense_by_code
                 .get(&code)
                 .copied()
@@ -185,7 +191,7 @@ fn filecode_key_array(
         if is_null {
             keys.push(0);
         } else {
-            keys.push(read_u32_le(
+            keys.push(wire::read_u32_le_checked(
                 data,
                 row.checked_mul(4).ok_or(CoveError::ArithOverflow)?,
             )?);

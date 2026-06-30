@@ -10,7 +10,10 @@
 //! * If `null_count == row_count` the zone is null-only and stats MUST be
 //!   absent.
 
-use crate::CoveError;
+use crate::{
+    wire::{read_u16_le_checked, read_u32_le_checked},
+    CoveError,
+};
 
 pub const STAT_SCALAR_ENCODED_LEN: usize = 20;
 pub const ZONE_STATS_ENTRY_LEN: usize = 96;
@@ -205,22 +208,22 @@ impl ZoneStatsEntry {
             return Err(CoveError::BufferTooShort);
         }
         let bytes = &bytes[..ZONE_STATS_ENTRY_LEN];
-        let table_id = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
-        let segment_id = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
-        let morsel_id = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
-        let column_id = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
-        let row_count = u32::from_le_bytes(bytes[16..20].try_into().unwrap());
-        let null_count = u32::from_le_bytes(bytes[20..24].try_into().unwrap());
-        let non_null_count = u32::from_le_bytes(bytes[24..28].try_into().unwrap());
-        let distinct_count = u32::from_le_bytes(bytes[28..32].try_into().unwrap());
-        let run_count = u32::from_le_bytes(bytes[32..36].try_into().unwrap());
-        let flags = ZoneStatFlags::from_bits(u32::from_le_bytes(bytes[36..40].try_into().unwrap()));
+        let table_id = read_u32_le_checked(bytes, 0)?;
+        let segment_id = read_u32_le_checked(bytes, 4)?;
+        let morsel_id = read_u32_le_checked(bytes, 8)?;
+        let column_id = read_u32_le_checked(bytes, 12)?;
+        let row_count = read_u32_le_checked(bytes, 16)?;
+        let null_count = read_u32_le_checked(bytes, 20)?;
+        let non_null_count = read_u32_le_checked(bytes, 24)?;
+        let distinct_count = read_u32_le_checked(bytes, 28)?;
+        let run_count = read_u32_le_checked(bytes, 32)?;
+        let flags = ZoneStatFlags::from_bits(read_u32_le_checked(bytes, 36)?);
         let min = parse_stat_scalar(&bytes[40..40 + STAT_SCALAR_ENCODED_LEN])?;
         let max = parse_stat_scalar(&bytes[60..60 + STAT_SCALAR_ENCODED_LEN])?;
-        let min_domain_rank = u32::from_le_bytes(bytes[80..84].try_into().unwrap());
-        let max_domain_rank = u32::from_le_bytes(bytes[84..88].try_into().unwrap());
-        let exact_set_ref = u32::from_le_bytes(bytes[88..92].try_into().unwrap());
-        let bloom_ref = u32::from_le_bytes(bytes[92..96].try_into().unwrap());
+        let min_domain_rank = read_u32_le_checked(bytes, 80)?;
+        let max_domain_rank = read_u32_le_checked(bytes, 84)?;
+        let exact_set_ref = read_u32_le_checked(bytes, 88)?;
+        let bloom_ref = read_u32_le_checked(bytes, 92)?;
 
         let entry = Self {
             table_id,
@@ -395,7 +398,7 @@ fn parse_stat_scalar(bytes: &[u8]) -> Result<Option<StatScalar>, CoveError> {
     if flags & !STAT_SCALAR_KNOWN_FLAGS != 0 {
         return Err(CoveError::BadStats);
     }
-    let length = u16::from_le_bytes(bytes[2..4].try_into().unwrap()) as usize;
+    let length = read_u16_le_checked(bytes, 2)? as usize;
     if length > 16 {
         return Err(CoveError::BadStats);
     }
@@ -451,35 +454,28 @@ fn encode_stat_scalar(value: &Option<StatScalar>, dst: &mut [u8]) -> Result<(), 
 }
 
 fn decode_i32_exact(bytes: &[u8]) -> Option<i32> {
-    if bytes.len() != 4 {
-        return None;
-    }
-    let array: [u8; 4] = bytes.get(..4)?.try_into().ok()?;
-    Some(i32::from_le_bytes(array))
+    exact_array(bytes).map(i32::from_le_bytes)
 }
 
 fn decode_i64_exact(bytes: &[u8]) -> Option<i64> {
-    if bytes.len() != 8 {
-        return None;
-    }
-    let array: [u8; 8] = bytes.get(..8)?.try_into().ok()?;
-    Some(i64::from_le_bytes(array))
+    exact_array(bytes).map(i64::from_le_bytes)
 }
 
 fn decode_u64_exact(bytes: &[u8]) -> Option<u64> {
-    if bytes.len() != 8 {
-        return None;
-    }
-    let array: [u8; 8] = bytes.get(..8)?.try_into().ok()?;
-    Some(u64::from_le_bytes(array))
+    exact_array(bytes).map(u64::from_le_bytes)
 }
 
 fn decode_i128_exact(bytes: &[u8]) -> Option<i128> {
-    if bytes.len() != 16 {
+    exact_array(bytes).map(i128::from_le_bytes)
+}
+
+fn exact_array<const N: usize>(bytes: &[u8]) -> Option<[u8; N]> {
+    if bytes.len() != N {
         return None;
     }
-    let array: [u8; 16] = bytes.get(..16)?.try_into().ok()?;
-    Some(i128::from_le_bytes(array))
+    let mut out = [0u8; N];
+    out.copy_from_slice(bytes);
+    Some(out)
 }
 
 #[cfg(test)]

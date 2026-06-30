@@ -208,6 +208,7 @@ struct CoveProjectionExec {
 }
 
 impl CoveProjectionExec {
+    #[allow(clippy::too_many_arguments)]
     fn try_new(
         object_path: PathBuf,
         object_len: u64,

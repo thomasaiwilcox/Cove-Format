@@ -2,6 +2,7 @@
 name = "cove-cli"
 version = "0.1.0"
 edition = "2021"
+rust-version.workspace = true
 description = "Beginner-friendly Cove Format and CoveQL command line interface"
 license = "MIT"
 
@@ -32,4 +33,5 @@ cove-validate = { path = "../cove-validate" }
 coveql = { path = "../coveql" }
 csv = "1"
 parquet = { version = "58", default-features = false, features = ["arrow"] }
+serde = "1"
 serde_json = { version = "1", features = ["preserve_order"] }

@@ -84,7 +84,7 @@ impl VariableOffsets {
         let mut pos = 0usize;
         for _ in 0..row_count {
             row_offsets.push(pos);
-            let len = read_u32_le(data, pos)? as usize;
+            let len = wire::read_u32_le_checked(data, pos)? as usize;
             pos = pos
                 .checked_add(4)
                 .and_then(|offset| offset.checked_add(len))
@@ -211,7 +211,7 @@ impl<'a> PreparedEncodedArray<'a> {
                         Ok(CoveArrayValue::Varint(value))
                     }
                     VariableOffsetKind::VarBytes => {
-                        let len = read_u32_le(self.array.data, offset)? as usize;
+                        let len = wire::read_u32_le_checked(self.array.data, offset)? as usize;
                         let data_start = offset.checked_add(4).ok_or(CoveError::ArithOverflow)?;
                         let slice = wire::read_range_checked(self.array.data, data_start, len)?;
                         Ok(CoveArrayValue::Bytes(slice))
@@ -403,7 +403,7 @@ impl<'a> EncodedArray<'a> {
                 self.value_from_constant_payload(&payload)
             }
             CoveEncodingKind::FileCode => {
-                let code = read_u32_le(
+                let code = wire::read_u32_le_checked(
                     self.data,
                     (row as usize)
                         .checked_mul(4)
@@ -418,7 +418,7 @@ impl<'a> EncodedArray<'a> {
                 }
             }
             CoveEncodingKind::NumCode => {
-                let code = read_u64_le(
+                let code = wire::read_u64_le_checked(
                     self.data,
                     (row as usize)
                         .checked_mul(8)
@@ -459,7 +459,7 @@ impl<'a> EncodedArray<'a> {
                 // O(n): variable-width encoding requires scanning all preceding rows.
                 let mut pos = 0usize;
                 for _ in 0..row {
-                    let len = read_u32_le(self.data, pos)? as usize;
+                    let len = wire::read_u32_le_checked(self.data, pos)? as usize;
                     pos = pos
                         .checked_add(4)
                         .and_then(|p| p.checked_add(len))
@@ -468,7 +468,7 @@ impl<'a> EncodedArray<'a> {
                         return Err(CoveError::OffsetRange);
                     }
                 }
-                let len = read_u32_le(self.data, pos)? as usize;
+                let len = wire::read_u32_le_checked(self.data, pos)? as usize;
                 let data_start = pos.checked_add(4).ok_or(CoveError::ArithOverflow)?;
                 let slice = wire::read_range_checked(self.data, data_start, len)?;
                 Ok(CoveArrayValue::Bytes(slice))
@@ -594,7 +594,7 @@ impl<'a> EncodedArray<'a> {
         let mut out = Vec::with_capacity(expected_row_count(self.row_count)?);
         let mut pos = 0usize;
         for row in 0..self.row_count {
-            let len = read_u32_le(self.data, pos)? as usize;
+            let len = wire::read_u32_le_checked(self.data, pos)? as usize;
             let data_start = pos.checked_add(4).ok_or(CoveError::ArithOverflow)?;
             let slice = wire::read_range_checked(self.data, data_start, len)?;
             pos = data_start
@@ -794,18 +794,6 @@ pub fn logical_type_fixed_width(logical: CoveLogicalType) -> Option<usize> {
         CoveLogicalType::Decimal128 | CoveLogicalType::Uuid => Some(16),
         _ => None,
     }
-}
-
-/// Reads a little-endian `u32` from `bytes` at `offset`.
-fn read_u32_le(bytes: &[u8], offset: usize) -> Result<u32, CoveError> {
-    let slice = wire::read_range_checked(bytes, offset, 4)?;
-    Ok(u32::from_le_bytes(slice.try_into().unwrap()))
-}
-
-/// Reads a little-endian `u64` from `bytes` at `offset`.
-fn read_u64_le(bytes: &[u8], offset: usize) -> Result<u64, CoveError> {
-    let slice = wire::read_range_checked(bytes, offset, 8)?;
-    Ok(u64::from_le_bytes(slice.try_into().unwrap()))
 }
 
 fn expected_row_count(row_count: u64) -> Result<usize, CoveError> {

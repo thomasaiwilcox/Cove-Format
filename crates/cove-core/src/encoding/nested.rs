@@ -40,7 +40,7 @@ impl ListLayout {
 
     pub fn validate_child_count(&self, child_row_count: usize) -> Result<(), CoveError> {
         self.validate()?;
-        if self.offsets.last().copied().unwrap() as usize != child_row_count {
+        if self.offsets.last().copied().ok_or(CoveError::PageCorrupt)? as usize != child_row_count {
             return Err(CoveError::PageCorrupt);
         }
         Ok(())
@@ -64,8 +64,8 @@ impl ListLayoutPayload {
         if bytes.len() < 8 {
             return Err(CoveError::BufferTooShort);
         }
-        let child_row_count = read_u32_le(bytes, 0)?;
-        let offset_count = read_u32_le(bytes, 4)? as usize;
+        let child_row_count = wire::read_u32_le_checked(bytes, 0)?;
+        let offset_count = wire::read_u32_le_checked(bytes, 4)? as usize;
         let offsets_bytes_len = offset_count
             .checked_mul(4)
             .ok_or(CoveError::ArithOverflow)?;
@@ -81,7 +81,7 @@ impl ListLayoutPayload {
         }
         let mut offsets = Vec::with_capacity(offset_count);
         for index in 0..offset_count {
-            offsets.push(read_u32_le(bytes, offsets_start + index * 4)?);
+            offsets.push(wire::read_u32_le_checked(bytes, offsets_start + index * 4)?);
         }
         Ok(Self {
             layout: ListLayout { offsets },
@@ -168,7 +168,7 @@ impl StructLayoutPayload {
             1 => true,
             _ => return Err(CoveError::PageCorrupt),
         };
-        let field_count = read_u32_le(bytes, 4)? as usize;
+        let field_count = wire::read_u32_le_checked(bytes, 4)? as usize;
         let counts_bytes_len = field_count.checked_mul(8).ok_or(CoveError::ArithOverflow)?;
         let counts_start = 8usize;
         let counts_end = counts_start
@@ -182,7 +182,7 @@ impl StructLayoutPayload {
         }
         let mut field_row_counts = Vec::with_capacity(field_count);
         for index in 0..field_count {
-            field_row_counts.push(read_u64_le(bytes, counts_start + index * 8)?);
+            field_row_counts.push(wire::read_u64_le_checked(bytes, counts_start + index * 8)?);
         }
         Ok(Self {
             layout: StructLayout { field_row_counts },
@@ -271,9 +271,9 @@ impl MapLayoutPayload {
         if bytes.len() < 16 {
             return Err(CoveError::BufferTooShort);
         }
-        let offset_count = read_u32_le(bytes, 0)? as usize;
-        let key_row_count = read_u32_le(bytes, 4)?;
-        let value_row_count = read_u32_le(bytes, 8)?;
+        let offset_count = wire::read_u32_le_checked(bytes, 0)? as usize;
+        let key_row_count = wire::read_u32_le_checked(bytes, 4)?;
+        let value_row_count = wire::read_u32_le_checked(bytes, 8)?;
         let keys_are_scalar = match bytes[12] {
             0 => false,
             1 => true,
@@ -300,13 +300,13 @@ impl MapLayoutPayload {
         }
         let mut offsets = Vec::with_capacity(offset_count);
         for index in 0..offset_count {
-            offsets.push(read_u32_le(bytes, offsets_start + index * 4)?);
+            offsets.push(wire::read_u32_le_checked(bytes, offsets_start + index * 4)?);
         }
 
         let mut pos = offsets_end;
         let mut canonical_keys = Vec::with_capacity(key_row_count as usize);
         for _ in 0..key_row_count {
-            let key_len = read_u32_le(bytes, pos)? as usize;
+            let key_len = wire::read_u32_le_checked(bytes, pos)? as usize;
             pos = pos.checked_add(4).ok_or(CoveError::ArithOverflow)?;
             let key = wire::read_range_checked(bytes, pos, key_len)?.to_vec();
             pos = pos.checked_add(key_len).ok_or(CoveError::ArithOverflow)?;
@@ -361,16 +361,6 @@ pub fn validate_no_duplicate_keys(keys: &[Vec<u8>]) -> Result<(), CoveError> {
         }
     }
     Ok(())
-}
-
-fn read_u32_le(bytes: &[u8], offset: usize) -> Result<u32, CoveError> {
-    let slice = wire::read_range_checked(bytes, offset, 4)?;
-    Ok(u32::from_le_bytes(slice.try_into().unwrap()))
-}
-
-fn read_u64_le(bytes: &[u8], offset: usize) -> Result<u64, CoveError> {
-    let slice = wire::read_range_checked(bytes, offset, 8)?;
-    Ok(u64::from_le_bytes(slice.try_into().unwrap()))
 }
 
 #[cfg(test)]

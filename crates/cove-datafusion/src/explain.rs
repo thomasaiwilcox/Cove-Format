@@ -18,7 +18,7 @@ use crate::{
         plan_scan, FilterPlan, NullPredicateKind, NumericPredicateOp, PredicateLiteral, ScanPlan,
         TopNScanHint,
     },
-    range_reader::{coalesced_range_stats, CoalescedRangeStats},
+    range_reader::coalesced_range_stats,
     scan_program::PredicateExactness,
     task_graph::{build_task_graph, TaskGraph},
 };
@@ -402,7 +402,7 @@ pub fn cost_report(planned: &PlannedScan, observed: Option<DecodeStats>) -> Plan
         .iter()
         .map(|range| range.end.saturating_sub(range.start))
         .sum::<u64>();
-    let observed_json = observed.map(|stats| decode_stats_json(stats));
+    let observed_json = observed.map(decode_stats_json);
     PlanCostReport {
         version: 1,
         source: state.source().to_string(),
@@ -623,19 +623,17 @@ fn canonical_literal(
         CoveLogicalType::Int8
         | CoveLogicalType::Int16
         | CoveLogicalType::Int32
-        | CoveLogicalType::Int64 => CanonicalValue::Int {
+        | CoveLogicalType::Int64 => tagged_canonical_literal(CanonicalValue::Int {
             width: integer_width(logical),
             value: i128::from(parse_i64(value)?),
-        }
-        .pipe_tagged(),
+        }),
         CoveLogicalType::UInt8
         | CoveLogicalType::UInt16
         | CoveLogicalType::UInt32
-        | CoveLogicalType::UInt64 => CanonicalValue::Uint {
+        | CoveLogicalType::UInt64 => tagged_canonical_literal(CanonicalValue::Uint {
             width: integer_width(logical),
             value: u128::from(parse_u64(value)?),
-        }
-        .pipe_tagged(),
+        }),
         CoveLogicalType::Float32 => {
             tagged_canonical_literal(CanonicalValue::Float32(parse_f64(value)? as f32))
         }
@@ -655,16 +653,6 @@ fn canonical_literal(
         _ => Err(CoveError::UnsupportedEncoding(format!(
             "filter DSL cannot encode canonical literal for {logical:?}"
         ))),
-    }
-}
-
-trait FilterCanonicalLiteralExt<'a> {
-    fn pipe_tagged(self) -> Result<FilterCanonicalLiteral, CoveError>;
-}
-
-impl<'a> FilterCanonicalLiteralExt<'a> for CanonicalValue<'a> {
-    fn pipe_tagged(self) -> Result<FilterCanonicalLiteral, CoveError> {
-        tagged_canonical_literal(self)
     }
 }
 
@@ -954,7 +942,7 @@ fn estimate_task_range(
     if segment.row_count == 0 || segment.length == 0 {
         return segment.offset..segment.offset;
     }
-    let relative_row = row_start.saturating_sub(u64::from(segment.row_start));
+    let relative_row = row_start.saturating_sub(segment.row_start);
     let start_delta = ((u128::from(segment.length) * u128::from(relative_row))
         / u128::from(segment.row_count)) as u64;
     let len = ((u128::from(segment.length) * u128::from(row_count)) / u128::from(segment.row_count))
@@ -985,7 +973,7 @@ fn synthetic_report_morsels(
 ) -> Vec<(u32, u64, u32)> {
     (0..segment.morsel_count)
         .map(|morsel_id| {
-            let row_start = u64::from(segment.row_start).saturating_add(
+            let row_start = segment.row_start.saturating_add(
                 u64::from(morsel_id).saturating_mul(u64::from(segment.morsel_row_count)),
             );
             let row_count = morsel_row_count_for(segment, morsel_id).unwrap_or(0);
@@ -1150,17 +1138,6 @@ fn decode_stats_json(stats: DecodeStats) -> Value {
         stats.native_projection_decode_boundaries
     );
     Value::Object(out)
-}
-
-impl Default for CoalescedRangeStats {
-    fn default() -> Self {
-        Self {
-            original_ranges: 0,
-            coalesced_ranges: 0,
-            original_bytes: 0,
-            coalesced_bytes: 0,
-        }
-    }
 }
 
 #[cfg(test)]

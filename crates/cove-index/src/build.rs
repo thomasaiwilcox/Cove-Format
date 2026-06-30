@@ -2114,18 +2114,18 @@ fn row_count_for_ranges(ranges: &[CoviRowRangePostingV2]) -> Result<u64, CoveErr
 
 fn signed_i64_payload_from_key(key: &[u8]) -> Result<i64, CoveError> {
     let (tag, payload) = tagged_key_payload(key)?;
-    if tag != ValueTag::Int64 || payload.len() != 8 {
+    if tag != ValueTag::Int64 {
         return Err(CoveError::BadCovi);
     }
-    Ok(i64::from_le_bytes(payload.try_into().unwrap()))
+    Ok(i64::from_le_bytes(covi_payload_array(payload)?))
 }
 
 fn unsigned_u64_payload_from_key(key: &[u8]) -> Result<u64, CoveError> {
     let (tag, payload) = tagged_key_payload(key)?;
-    if tag != ValueTag::UInt64 || payload.len() != 8 {
+    if tag != ValueTag::UInt64 {
         return Err(CoveError::BadCovi);
     }
-    Ok(u64::from_le_bytes(payload.try_into().unwrap()))
+    Ok(u64::from_le_bytes(covi_payload_array(payload)?))
 }
 
 fn tagged_key_payload(key: &[u8]) -> Result<(ValueTag, &[u8]), CoveError> {
@@ -2149,15 +2149,24 @@ fn canonical_float_key_is_nan(
     let payload = &key[consumed..];
     match (logical_type, tag, payload.len()) {
         (CoveLogicalType::Float32, ValueTag::Float32Bits, 4) => {
-            let bits = u32::from_le_bytes(payload.try_into().unwrap());
+            let bits = u32::from_le_bytes(covi_payload_array(payload)?);
             Ok(f32::from_bits(bits).is_nan())
         }
         (CoveLogicalType::Float64, ValueTag::Float64Bits, 8) => {
-            let bits = u64::from_le_bytes(payload.try_into().unwrap());
+            let bits = u64::from_le_bytes(covi_payload_array(payload)?);
             Ok(f64::from_bits(bits).is_nan())
         }
         _ => Err(CoveError::BadCovi),
     }
+}
+
+fn covi_payload_array<const N: usize>(payload: &[u8]) -> Result<[u8; N], CoveError> {
+    if payload.len() != N {
+        return Err(CoveError::BadCovi);
+    }
+    let mut out = [0u8; N];
+    out.copy_from_slice(payload);
+    Ok(out)
 }
 
 fn order_key_items(
@@ -2954,6 +2963,13 @@ mod tests {
         key_from_i64(CoveLogicalType::Int64, value).unwrap()
     }
 
+    fn signed_key_value(key: &[u8]) -> i64 {
+        assert_eq!(key.len(), 9);
+        let mut value = [0u8; 8];
+        value.copy_from_slice(&key[1..]);
+        i64::from_le_bytes(value)
+    }
+
     fn one_column_two_morsel_scan_file() -> Vec<u8> {
         let catalog = TableCatalog {
             flags: 0,
@@ -3117,7 +3133,7 @@ mod tests {
         .unwrap();
         let sorted_values = sorted
             .iter()
-            .map(|(key, _)| i64::from_le_bytes(key[1..9].try_into().unwrap()))
+            .map(|(key, _)| signed_key_value(key))
             .collect::<Vec<_>>();
         assert_eq!(sorted_values, vec![-10, -5, 0, 5]);
     }

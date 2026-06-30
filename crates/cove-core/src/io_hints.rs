@@ -3,7 +3,7 @@
 //! Optional descriptive metadata that nudges the reader toward efficient
 //! object-store / NVMe access patterns. The reader is free to ignore hints.
 
-use crate::CoveError;
+use crate::{wire::read_u32_le_checked, CoveError};
 
 /// Spec §67 `CoveIoHintV1`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,12 +29,12 @@ impl IoHints {
             ));
         }
         Ok(Self {
-            preferred_read_alignment: u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
-            preferred_coalesce_distance: u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
-            preferred_max_coalesced_read: u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
-            prefetch_group_id: u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
-            page_cluster_id: u32::from_le_bytes(bytes[16..20].try_into().unwrap()),
-            flags: u32::from_le_bytes(bytes[20..24].try_into().unwrap()),
+            preferred_read_alignment: read_u32_le_checked(bytes, 0)?,
+            preferred_coalesce_distance: read_u32_le_checked(bytes, 4)?,
+            preferred_max_coalesced_read: read_u32_le_checked(bytes, 8)?,
+            prefetch_group_id: read_u32_le_checked(bytes, 12)?,
+            page_cluster_id: read_u32_le_checked(bytes, 16)?,
+            flags: read_u32_le_checked(bytes, 20)?,
         })
     }
 

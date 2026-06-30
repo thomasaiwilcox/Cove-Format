@@ -22,7 +22,7 @@ use serde_json::{json, Value};
 use crate::{
     project::{
         project_cove_o_bytes_output, projection_catalog_from_cove_o_bytes_internal,
-        ProjectionFormat,
+        ProjectionFilterPushdown, ProjectionFormat,
     },
     sha256_hex,
 };
@@ -546,7 +546,8 @@ fn projection_covi_acceleration(
                     let lineage = column.lineage.as_ref()?;
                     if lineage.source != "object_property"
                         || lineage.transform != "identity"
-                        || lineage.filter_pushdown != "projection_covi_prefilter"
+                        || lineage.filter_pushdown
+                            != ProjectionFilterPushdown::ProjectionCoviPrefilter.as_str()
                     {
                         return None;
                     }

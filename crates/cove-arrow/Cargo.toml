@@ -2,6 +2,7 @@
 name = "cove-arrow"
 version = "0.1.0"
 edition = "2021"
+rust-version.workspace = true
 description = "Arrow and Parquet interop for the Cove Format (COVE)"
 license = "MIT"
 

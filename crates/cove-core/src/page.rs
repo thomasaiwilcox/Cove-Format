@@ -9,6 +9,7 @@
 use crate::{
     checksum::crc32c,
     constants::{CompressionCodec, CoveEncodingKind},
+    wire::{read_u16_le_checked, read_u32_le_checked, read_u64_le_checked},
     CoveError,
 };
 
@@ -90,10 +91,10 @@ impl ColumnPageIndexEntryV1 {
             return Err(CoveError::BufferTooShort);
         }
         let bytes = &bytes[..COLUMN_PAGE_INDEX_ENTRY_LEN];
-        let checksum = u32::from_le_bytes(bytes[56..60].try_into().unwrap());
-        let row_count = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
-        let non_null_count = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
-        let null_count = u32::from_le_bytes(bytes[16..20].try_into().unwrap());
+        let checksum = read_u32_le_checked(bytes, 56)?;
+        let row_count = read_u32_le_checked(bytes, 8)?;
+        let non_null_count = read_u32_le_checked(bytes, 12)?;
+        let null_count = read_u32_le_checked(bytes, 16)?;
         if non_null_count
             .checked_add(null_count)
             .ok_or(CoveError::ArithOverflow)?
@@ -102,9 +103,9 @@ impl ColumnPageIndexEntryV1 {
             return Err(CoveError::PageCorrupt);
         }
 
-        let page_length = u64::from_le_bytes(bytes[32..40].try_into().unwrap());
-        let uncompressed_length = u64::from_le_bytes(bytes[40..48].try_into().unwrap());
-        let flags = u32::from_le_bytes(bytes[52..56].try_into().unwrap());
+        let page_length = read_u64_le_checked(bytes, 32)?;
+        let uncompressed_length = read_u64_le_checked(bytes, 40)?;
+        let flags = read_u32_le_checked(bytes, 52)?;
         let codec = page_flag_codec(flags)?;
         let stats_only_constant = flags & PAGE_FLAG_STATS_ONLY_CONSTANT != 0;
         let all_null = flags & PAGE_FLAG_ALL_NULL != 0;
@@ -143,12 +144,12 @@ impl ColumnPageIndexEntryV1 {
                         .into(),
                 ));
             }
-            if u64::from_le_bytes(bytes[24..32].try_into().unwrap()) != 0 {
+            if read_u64_le_checked(bytes, 24)? != 0 {
                 return Err(CoveError::BadSection(
                     "stats-only constant pages must set page_offset=0".into(),
                 ));
             }
-            if u32::from_le_bytes(bytes[20..24].try_into().unwrap()) != u32::MAX {
+            if read_u32_le_checked(bytes, 20)? != u32::MAX {
                 return Err(CoveError::BadSection(
                     "stats-only constant pages must set encoding_root=u32::MAX".into(),
                 ));
@@ -182,16 +183,16 @@ impl ColumnPageIndexEntryV1 {
         }
 
         Ok(Self {
-            column_id: u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
-            morsel_id: u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+            column_id: read_u32_le_checked(bytes, 0)?,
+            morsel_id: read_u32_le_checked(bytes, 4)?,
             row_count,
             non_null_count,
             null_count,
-            encoding_root: u32::from_le_bytes(bytes[20..24].try_into().unwrap()),
-            page_offset: u64::from_le_bytes(bytes[24..32].try_into().unwrap()),
+            encoding_root: read_u32_le_checked(bytes, 20)?,
+            page_offset: read_u64_le_checked(bytes, 24)?,
             page_length,
             uncompressed_length,
-            stats_ref: u32::from_le_bytes(bytes[48..52].try_into().unwrap()),
+            stats_ref: read_u32_le_checked(bytes, 48)?,
             flags,
             checksum,
         })
@@ -281,7 +282,7 @@ impl PageIndex {
         if bytes.len() < 4 {
             return Err(CoveError::BufferTooShort);
         }
-        let count = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+        let count = read_u32_le_checked(bytes, 0)? as usize;
         let entry_size = 4usize + 4 + 4 + 4 + 8 + 8 + 2 + 4;
         let entries_bytes = count
             .checked_mul(entry_size)
@@ -298,21 +299,21 @@ impl PageIndex {
         let mut entries = Vec::with_capacity(count);
         let mut pos = 4usize;
         for _ in 0..count {
-            let page_id = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+            let page_id = read_u32_le_checked(bytes, pos)?;
             pos += 4;
-            let morsel_id = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+            let morsel_id = read_u32_le_checked(bytes, pos)?;
             pos += 4;
-            let row_count = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+            let row_count = read_u32_le_checked(bytes, pos)?;
             pos += 4;
-            let null_count = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+            let null_count = read_u32_le_checked(bytes, pos)?;
             pos += 4;
-            let offset = u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap());
+            let offset = read_u64_le_checked(bytes, pos)?;
             pos += 8;
-            let length = u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap());
+            let length = read_u64_le_checked(bytes, pos)?;
             pos += 8;
-            let enc_raw = u16::from_le_bytes(bytes[pos..pos + 2].try_into().unwrap());
+            let enc_raw = read_u16_le_checked(bytes, pos)?;
             pos += 2;
-            let crc = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+            let crc = read_u32_le_checked(bytes, pos)?;
             pos += 4;
             if null_count > row_count {
                 return Err(CoveError::PageCorrupt);

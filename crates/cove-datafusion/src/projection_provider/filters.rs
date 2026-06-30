@@ -413,6 +413,46 @@ fn projection_filterable_type(data_type: &DataType) -> bool {
     )
 }
 
+fn projection_filter_literal(expr: &Expr) -> Option<ProjectionFilterLiteral> {
+    let Expr::Literal(value, _) = expr else {
+        return None;
+    };
+    match value {
+        ScalarValue::Null => Some(ProjectionFilterLiteral::Null),
+        ScalarValue::Boolean(Some(value)) => Some(ProjectionFilterLiteral::Boolean(*value)),
+        ScalarValue::Int8(Some(value)) => Some(ProjectionFilterLiteral::Int64(i64::from(*value))),
+        ScalarValue::Int16(Some(value)) => Some(ProjectionFilterLiteral::Int64(i64::from(*value))),
+        ScalarValue::Int32(Some(value)) => Some(ProjectionFilterLiteral::Int64(i64::from(*value))),
+        ScalarValue::Int64(Some(value)) => Some(ProjectionFilterLiteral::Int64(*value)),
+        ScalarValue::UInt8(Some(value)) => Some(ProjectionFilterLiteral::UInt64(u64::from(*value))),
+        ScalarValue::UInt16(Some(value)) => {
+            Some(ProjectionFilterLiteral::UInt64(u64::from(*value)))
+        }
+        ScalarValue::UInt32(Some(value)) => {
+            Some(ProjectionFilterLiteral::UInt64(u64::from(*value)))
+        }
+        ScalarValue::UInt64(Some(value)) => Some(ProjectionFilterLiteral::UInt64(*value)),
+        ScalarValue::Float32(Some(value)) => {
+            Some(ProjectionFilterLiteral::Float64(f64::from(*value)))
+        }
+        ScalarValue::Float64(Some(value)) => Some(ProjectionFilterLiteral::Float64(*value)),
+        ScalarValue::Date32(Some(value)) => Some(ProjectionFilterLiteral::Int64(i64::from(*value))),
+        ScalarValue::TimestampMicrosecond(Some(value), None) => {
+            Some(ProjectionFilterLiteral::Int64(*value))
+        }
+        ScalarValue::TimestampNanosecond(Some(value), None) => {
+            Some(ProjectionFilterLiteral::Int64(*value))
+        }
+        ScalarValue::Utf8(Some(value))
+        | ScalarValue::Utf8View(Some(value))
+        | ScalarValue::LargeUtf8(Some(value)) => Some(ProjectionFilterLiteral::Utf8(value.clone())),
+        ScalarValue::Dictionary(_, value) => {
+            projection_filter_literal(&Expr::Literal((**value).clone(), None))
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -671,45 +711,5 @@ mod tests {
         ));
 
         assert!(classify_projection_filter(&schema, &filter).is_none());
-    }
-}
-
-fn projection_filter_literal(expr: &Expr) -> Option<ProjectionFilterLiteral> {
-    let Expr::Literal(value, _) = expr else {
-        return None;
-    };
-    match value {
-        ScalarValue::Null => Some(ProjectionFilterLiteral::Null),
-        ScalarValue::Boolean(Some(value)) => Some(ProjectionFilterLiteral::Boolean(*value)),
-        ScalarValue::Int8(Some(value)) => Some(ProjectionFilterLiteral::Int64(i64::from(*value))),
-        ScalarValue::Int16(Some(value)) => Some(ProjectionFilterLiteral::Int64(i64::from(*value))),
-        ScalarValue::Int32(Some(value)) => Some(ProjectionFilterLiteral::Int64(i64::from(*value))),
-        ScalarValue::Int64(Some(value)) => Some(ProjectionFilterLiteral::Int64(*value)),
-        ScalarValue::UInt8(Some(value)) => Some(ProjectionFilterLiteral::UInt64(u64::from(*value))),
-        ScalarValue::UInt16(Some(value)) => {
-            Some(ProjectionFilterLiteral::UInt64(u64::from(*value)))
-        }
-        ScalarValue::UInt32(Some(value)) => {
-            Some(ProjectionFilterLiteral::UInt64(u64::from(*value)))
-        }
-        ScalarValue::UInt64(Some(value)) => Some(ProjectionFilterLiteral::UInt64(*value)),
-        ScalarValue::Float32(Some(value)) => {
-            Some(ProjectionFilterLiteral::Float64(f64::from(*value)))
-        }
-        ScalarValue::Float64(Some(value)) => Some(ProjectionFilterLiteral::Float64(*value)),
-        ScalarValue::Date32(Some(value)) => Some(ProjectionFilterLiteral::Int64(i64::from(*value))),
-        ScalarValue::TimestampMicrosecond(Some(value), None) => {
-            Some(ProjectionFilterLiteral::Int64(*value))
-        }
-        ScalarValue::TimestampNanosecond(Some(value), None) => {
-            Some(ProjectionFilterLiteral::Int64(*value))
-        }
-        ScalarValue::Utf8(Some(value))
-        | ScalarValue::Utf8View(Some(value))
-        | ScalarValue::LargeUtf8(Some(value)) => Some(ProjectionFilterLiteral::Utf8(value.clone())),
-        ScalarValue::Dictionary(_, value) => {
-            projection_filter_literal(&Expr::Literal((**value).clone(), None))
-        }
-        _ => None,
     }
 }

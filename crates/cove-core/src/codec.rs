@@ -977,7 +977,7 @@ fn append_non_null_value(
                 return Err(CoveError::BadCodecExtension);
             }
             if let Some(dictionary_len) = dictionary_len {
-                let code = u32::from_le_bytes(bytes.try_into().unwrap());
+                let code = wire::read_u32_le_checked(bytes, 0)?;
                 if code >= dictionary_len {
                     return Err(CoveError::BadFileCode);
                 }
@@ -1077,9 +1077,9 @@ fn decode_row_bytes(expected_magic: &[u8; 4], bytes: &[u8]) -> Result<LogicalPag
     if bytes.len() < 16 || &bytes[0..4] != expected_magic {
         return Err(CoveError::BadCodecExtension);
     }
-    let row_count = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
-    let null_bitmap_len = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
-    let offsets_len = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+    let row_count = wire::read_u32_le_checked(bytes, 4)? as usize;
+    let null_bitmap_len = wire::read_u32_le_checked(bytes, 8)? as usize;
+    let offsets_len = wire::read_u32_le_checked(bytes, 12)? as usize;
     if null_bitmap_len != row_count.div_ceil(8) || offsets_len != (row_count + 1) * 4 {
         return Err(CoveError::BadCodecExtension);
     }
@@ -1095,8 +1095,8 @@ fn decode_row_bytes(expected_magic: &[u8; 4], bytes: &[u8]) -> Result<LogicalPag
     }
     let null_bitmap = &bytes[bitmap_start..offsets_start];
     let mut offsets = Vec::with_capacity(row_count + 1);
-    for chunk in bytes[offsets_start..payload_start].chunks_exact(4) {
-        offsets.push(u32::from_le_bytes(chunk.try_into().unwrap()) as usize);
+    for offset in (offsets_start..payload_start).step_by(4) {
+        offsets.push(wire::read_u32_le_checked(bytes, offset)? as usize);
     }
     if offsets.first() != Some(&0) {
         return Err(CoveError::BadCodecExtension);
@@ -1152,15 +1152,21 @@ impl<'a> Cursor<'a> {
     }
 
     fn u16(&mut self) -> Result<u16, CoveError> {
-        Ok(u16::from_le_bytes(self.bytes(2)?.try_into().unwrap()))
+        let offset = self.position;
+        self.bytes(2)?;
+        wire::read_u16_le_checked(self.bytes, offset)
     }
 
     fn u32(&mut self) -> Result<u32, CoveError> {
-        Ok(u32::from_le_bytes(self.bytes(4)?.try_into().unwrap()))
+        let offset = self.position;
+        self.bytes(4)?;
+        wire::read_u32_le_checked(self.bytes, offset)
     }
 
     fn u64(&mut self) -> Result<u64, CoveError> {
-        Ok(u64::from_le_bytes(self.bytes(8)?.try_into().unwrap()))
+        let offset = self.position;
+        self.bytes(8)?;
+        wire::read_u64_le_checked(self.bytes, offset)
     }
 }
 

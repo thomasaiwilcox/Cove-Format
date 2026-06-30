@@ -14,6 +14,7 @@ use crate::{
         numcode_as_timestamp_nanos, numcode_as_u16, numcode_as_u32, numcode_as_u64, numcode_as_u8,
     },
     validity::ValidityBitmap,
+    wire::read_u32_le_checked,
     CoveError,
 };
 
@@ -36,7 +37,7 @@ impl TrustManifest {
         if bytes.len() < 4 {
             return Err(CoveError::BufferTooShort);
         }
-        let entry_count = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+        let entry_count = read_u32_le_checked(bytes, 0)? as usize;
         let needed = 4usize
             .checked_add(
                 entry_count
@@ -53,8 +54,8 @@ impl TrustManifest {
             let mut expected_hash = [0u8; 32];
             expected_hash.copy_from_slice(&bytes[pos + 8..pos + 40]);
             entries.push(TrustManifestEntryV1 {
-                segment_id: u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()),
-                row_index: u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().unwrap()),
+                segment_id: read_u32_le_checked(bytes, pos)?,
+                row_index: read_u32_le_checked(bytes, pos + 4)?,
                 expected_hash,
             });
             pos += TRUST_MANIFEST_ENTRY_LEN;

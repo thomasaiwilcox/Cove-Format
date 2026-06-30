@@ -1,9 +1,9 @@
-use std::{collections::BTreeSet, sync::Arc};
+use std::{collections::BTreeSet, fmt, sync::Arc};
 
 use arrow_array::{
     ArrayRef, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray, UInt64Array,
 };
-use arrow_schema::{Field, Schema};
+use arrow_schema::{ArrowError, Field, Schema};
 use serde_json::Value;
 
 use crate::{
@@ -12,11 +12,41 @@ use crate::{
     PlannedQuery, ResolvedExpr, ResolvedSelectItem,
 };
 
+#[derive(Debug)]
+pub(crate) enum KernelArrowError {
+    ExpressionEvaluation(String),
+    RecordBatch(ArrowError),
+}
+
+impl fmt::Display for KernelArrowError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ExpressionEvaluation(message) => f.write_str(message),
+            Self::RecordBatch(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl std::error::Error for KernelArrowError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ExpressionEvaluation(_) => None,
+            Self::RecordBatch(err) => Some(err),
+        }
+    }
+}
+
+impl From<ArrowError> for KernelArrowError {
+    fn from(err: ArrowError) -> Self {
+        Self::RecordBatch(err)
+    }
+}
+
 pub(crate) fn execution_rows_to_owned_record_batch(
     rows: &[ExecutionRow],
     planned: &PlannedQuery,
     context: &EvalContext<'_>,
-) -> Result<RecordBatch, String> {
+) -> Result<RecordBatch, KernelArrowError> {
     if let Some(select) = &planned.resolved.method_chain.select {
         return selected_execution_rows_to_owned_record_batch(rows, select, context);
     }
@@ -28,7 +58,7 @@ fn selected_execution_rows_to_owned_record_batch(
     rows: &[ExecutionRow],
     select: &[ResolvedSelectItem],
     context: &EvalContext<'_>,
-) -> Result<RecordBatch, String> {
+) -> Result<RecordBatch, KernelArrowError> {
     let mut fields = Vec::with_capacity(select.len());
     let mut arrays = Vec::with_capacity(select.len());
     for item in select {
@@ -41,7 +71,10 @@ fn selected_execution_rows_to_owned_record_batch(
         } else {
             let values = rows
                 .iter()
-                .map(|row| eval_expr(&item.expr, row, context).map_err(|err| err.message))
+                .map(|row| {
+                    eval_expr(&item.expr, row, context)
+                        .map_err(|err| KernelArrowError::ExpressionEvaluation(err.message))
+                })
                 .collect::<Result<Vec<_>, _>>()?;
             values_to_array(&values)?
         };
@@ -49,13 +82,13 @@ fn selected_execution_rows_to_owned_record_batch(
         arrays.push(array);
     }
     let schema = Arc::new(Schema::new(fields));
-    RecordBatch::try_new(schema, arrays).map_err(|err| err.to_string())
+    RecordBatch::try_new(schema, arrays).map_err(Into::into)
 }
 
 pub(crate) fn json_rows_to_owned_record_batch_for_plan(
     rows: &[Value],
     planned: &PlannedQuery,
-) -> Result<RecordBatch, String> {
+) -> Result<RecordBatch, KernelArrowError> {
     if rows.is_empty() {
         if let Some(select) = &planned.resolved.method_chain.select {
             return empty_selected_record_batch(select);
@@ -66,7 +99,7 @@ pub(crate) fn json_rows_to_owned_record_batch_for_plan(
 
 pub(crate) fn empty_selected_record_batch(
     select: &[ResolvedSelectItem],
-) -> Result<RecordBatch, String> {
+) -> Result<RecordBatch, KernelArrowError> {
     let mut fields = Vec::with_capacity(select.len());
     let mut arrays = Vec::with_capacity(select.len());
     for item in select {
@@ -79,7 +112,7 @@ pub(crate) fn empty_selected_record_batch(
         arrays.push(array);
     }
     let schema = Arc::new(Schema::new(fields));
-    RecordBatch::try_new(schema, arrays).map_err(|err| err.to_string())
+    RecordBatch::try_new(schema, arrays).map_err(Into::into)
 }
 
 fn empty_array_for_expr(expr: &ResolvedExpr) -> ArrayRef {
@@ -97,7 +130,9 @@ fn empty_array_for_expr(expr: &ResolvedExpr) -> ArrayRef {
     }
 }
 
-pub(crate) fn json_rows_to_owned_record_batch(rows: &[Value]) -> Result<RecordBatch, String> {
+pub(crate) fn json_rows_to_owned_record_batch(
+    rows: &[Value],
+) -> Result<RecordBatch, KernelArrowError> {
     let fields = ordered_fields(rows);
     let arrays = fields
         .iter()
@@ -110,7 +145,7 @@ pub(crate) fn json_rows_to_owned_record_batch(rows: &[Value]) -> Result<RecordBa
             .map(|(name, array)| Field::new(name, array.data_type().clone(), true))
             .collect::<Vec<_>>(),
     ));
-    RecordBatch::try_new(schema, arrays).map_err(|err| err.to_string())
+    RecordBatch::try_new(schema, arrays).map_err(Into::into)
 }
 
 fn ordered_fields(rows: &[Value]) -> Vec<String> {
@@ -132,7 +167,7 @@ fn ordered_fields(rows: &[Value]) -> Vec<String> {
     out
 }
 
-fn build_array(rows: &[Value], field: &str) -> Result<ArrayRef, String> {
+fn build_array(rows: &[Value], field: &str) -> Result<ArrayRef, KernelArrowError> {
     let values = rows
         .iter()
         .map(|row| {
@@ -146,7 +181,7 @@ fn build_array(rows: &[Value], field: &str) -> Result<ArrayRef, String> {
     values_to_array(&values)
 }
 
-fn values_to_array(values: &[Value]) -> Result<ArrayRef, String> {
+fn values_to_array(values: &[Value]) -> Result<ArrayRef, KernelArrowError> {
     if values
         .iter()
         .all(|value| value.is_null() || value.as_bool().is_some())

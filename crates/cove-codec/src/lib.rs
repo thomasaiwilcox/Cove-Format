@@ -1,6 +1,6 @@
 //! COVE-CX registered codec descriptors and envelopes for COVE v2.
 
-use cove_core::CoveError;
+use cove_core::{wire, CoveError};
 
 pub use cove_core::codec::{
     stable_registered_codec_supported_masks, validate_descriptor_set, CodecExtensionDescriptorV2,
@@ -44,14 +44,27 @@ impl StableRegisteredCodec {
             Self::FastLanesInteger => 2,
         }
     }
+
+    fn core_registered_type_masks(self) -> (u64, u64) {
+        let (namespace, name, version_major, version_minor) = self.descriptor_identity();
+        match stable_registered_codec_supported_masks(namespace, name, version_major, version_minor)
+        {
+            Some(masks) => masks,
+            None => {
+                debug_assert!(
+                    false,
+                    "stable codec identity missing from cove-core registry"
+                );
+                (0, 0)
+            }
+        }
+    }
 }
 
 impl RegisteredCodec for StableRegisteredCodec {
     fn descriptor(&self) -> CodecExtensionDescriptorV2 {
         let (namespace, name, version_major, version_minor) = self.descriptor_identity();
-        let (logical_type_mask, physical_kind_mask) =
-            stable_registered_codec_supported_masks(namespace, name, version_major, version_minor)
-                .expect("stable codec identity has registered type masks");
+        let (logical_type_mask, physical_kind_mask) = self.core_registered_type_masks();
         CodecExtensionDescriptorV2 {
             codec_id: match self {
                 StableRegisteredCodec::FsstUtf8 => 1,
@@ -62,11 +75,7 @@ impl RegisteredCodec for StableRegisteredCodec {
             name: name.into(),
             version_major,
             version_minor,
-            codec_family: match self {
-                StableRegisteredCodec::FsstUtf8 => 0,
-                StableRegisteredCodec::AlpFloat => 1,
-                StableRegisteredCodec::FastLanesInteger => 2,
-            },
+            codec_family: self.codec_family(),
             logical_type_mask,
             physical_kind_mask,
             requirement: CodecRequirementV2::OptionalWithFallback,
@@ -201,17 +210,15 @@ fn encode_row_bytes(magic: &[u8; 4], page: &LogicalPage) -> Result<Vec<u8>, Cove
     let mut offsets = Vec::with_capacity(page.values.len() + 1);
     offsets.push(0u32);
     for value in &page.values {
+        let current_offset = offsets.last().copied().ok_or(CoveError::ArithOverflow)?;
         if let Some(bytes) = value {
-            let next = offsets
-                .last()
-                .copied()
-                .unwrap()
+            let next = current_offset
                 .checked_add(u32::try_from(bytes.len()).map_err(|_| CoveError::ArithOverflow)?)
                 .ok_or(CoveError::ArithOverflow)?;
             offsets.push(next);
             payload.extend_from_slice(bytes);
         } else {
-            offsets.push(*offsets.last().unwrap());
+            offsets.push(current_offset);
         }
     }
 
@@ -238,9 +245,9 @@ fn decode_row_bytes(expected_magic: &[u8; 4], bytes: &[u8]) -> Result<LogicalPag
     if bytes.len() < 16 || &bytes[0..4] != expected_magic {
         return Err(CoveError::BadCodecExtension);
     }
-    let row_count = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
-    let null_bitmap_len = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
-    let offsets_len = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+    let row_count = wire::read_u32_le_checked(bytes, 4)? as usize;
+    let null_bitmap_len = wire::read_u32_le_checked(bytes, 8)? as usize;
+    let offsets_len = wire::read_u32_le_checked(bytes, 12)? as usize;
     if null_bitmap_len != row_count.div_ceil(8) || offsets_len != (row_count + 1) * 4 {
         return Err(CoveError::BadCodecExtension);
     }
@@ -257,7 +264,7 @@ fn decode_row_bytes(expected_magic: &[u8; 4], bytes: &[u8]) -> Result<LogicalPag
     let null_bitmap = &bytes[bitmap_start..offsets_start];
     let mut offsets = Vec::with_capacity(row_count + 1);
     for chunk in bytes[offsets_start..payload_start].chunks_exact(4) {
-        offsets.push(u32::from_le_bytes(chunk.try_into().unwrap()) as usize);
+        offsets.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) as usize);
     }
     if offsets.first() != Some(&0) {
         return Err(CoveError::BadCodecExtension);
@@ -363,6 +370,25 @@ mod tests {
 
     #[test]
     fn stable_descriptors_advertise_registered_type_domains() {
+        for codec in [
+            StableRegisteredCodec::FsstUtf8,
+            StableRegisteredCodec::AlpFloat,
+            StableRegisteredCodec::FastLanesInteger,
+        ] {
+            let descriptor = codec.descriptor();
+            let (namespace, name, version_major, version_minor) = codec.descriptor_identity();
+            assert_eq!(
+                (descriptor.logical_type_mask, descriptor.physical_kind_mask),
+                stable_registered_codec_supported_masks(
+                    namespace,
+                    name,
+                    version_major,
+                    version_minor
+                )
+                .expect("stable codec identity is registered in cove-core")
+            );
+        }
+
         let fsst = StableRegisteredCodec::FsstUtf8.descriptor();
         assert_eq!(
             fsst.logical_type_mask,

@@ -19,11 +19,17 @@ use crate::{
         ZeroCopyEligibilityReport,
     },
     physical_sidecars::{PhysicalSidecarInputs, PhysicalSidecarStatus, PhysicalSidecarValidation},
-    AssociationDirectionPlan, AssociationOptimizationReport, AstAggregateName, AstChangeMode,
-    AstHistoryMode, BuildLogicalPlanError, CoveQlAiOperation, CoveQlOutputMode, DiagnosticSeverity,
+    AssociationDirectionPlan, AssociationOptimizationReport, AstAggregateName,
+    BuildLogicalPlanError, CoveQlAiOperation, CoveQlOutputMode, DiagnosticSeverity,
     EvidenceGrainKind, EvidenceOptimizationReport, EvidenceTargetIndexKind,
     MetadataDisclosurePolicy, ParseOptions, PlanOptions, PlannedQuery, ResolveOptions,
 };
+
+mod contract;
+mod vocabulary;
+
+use contract::contract;
+use vocabulary::PhysicalTemporalGrain;
 
 pub type PhysicalPlanFingerprint = String;
 
@@ -528,8 +534,8 @@ fn build_nodes(
         },
         contract(
             "validate feature scopes",
-            &["operation_context"],
-            &["validated_feature_scope"],
+            ["operation_context"],
+            ["validated_feature_scope"],
             "reject on required feature mismatch",
         ),
     );
@@ -544,8 +550,8 @@ fn build_nodes(
         },
         contract(
             "build predicate normal forms",
-            &["resolved_predicates"],
-            &["ast", "cnf", "interval", "encoded", "coverage", "residual"],
+            ["resolved_predicates"],
+            ["ast", "cnf", "interval", "encoded", "coverage", "residual"],
             "unsupported forms remain residual",
         ),
     );
@@ -557,8 +563,8 @@ fn build_nodes(
         },
         contract(
             "read object catalog",
-            &["validated_file"],
-            &["object_catalog"],
+            ["validated_file"],
+            ["object_catalog"],
             "materialized readback remains available",
         ),
     );
@@ -570,8 +576,8 @@ fn build_nodes(
         },
         contract(
             "select temporal segments",
-            &["object_catalog", "temporal_context"],
-            &["segment_candidates"],
+            ["object_catalog", "temporal_context"],
+            ["segment_candidates"],
             "scan wider if temporal proof is unavailable",
         ),
     );
@@ -582,8 +588,8 @@ fn build_nodes(
         },
         contract(
             "temporal bloom probe",
-            &["segment_candidates"],
-            &["segment_candidates"],
+            ["segment_candidates"],
+            ["segment_candidates"],
             "ignore absent or unsupported bloom metadata",
         ),
     );
@@ -594,8 +600,8 @@ fn build_nodes(
         },
         contract(
             "validate coverage proofs",
-            &["coverage_sidecars", "predicate_forms"],
-            &["coverage_candidates"],
+            ["coverage_sidecars", "predicate_forms"],
+            ["coverage_candidates"],
             "ignore any proof without no-false-negative semantics",
         ),
     );
@@ -606,8 +612,8 @@ fn build_nodes(
         },
         contract(
             "coverage prune",
-            &["coverage_candidates"],
-            &["wider_or_equal_candidates"],
+            ["coverage_candidates"],
+            ["wider_or_equal_candidates"],
             "fallback to full scan candidate set",
         ),
     );
@@ -619,8 +625,8 @@ fn build_nodes(
         },
         contract(
             "validate COVE-I/COVX",
-            &["index_sidecars", "predicate_forms"],
-            &["index_candidates"],
+            ["index_sidecars", "predicate_forms"],
+            ["index_candidates"],
             "ignore stale or inexact index metadata",
         ),
     );
@@ -631,8 +637,8 @@ fn build_nodes(
         },
         contract(
             "plan COVI lookup",
-            &["index_candidates"],
-            &["row_or_range_candidates"],
+            ["index_candidates"],
+            ["row_or_range_candidates"],
             "residual materialized predicates remain final truth",
         ),
     );
@@ -643,8 +649,8 @@ fn build_nodes(
         },
         contract(
             "plan layout ranges",
-            &["layout_sidecars", "row_or_range_candidates"],
-            &["range_plan"],
+            ["layout_sidecars", "row_or_range_candidates"],
+            ["range_plan"],
             "use ordinary read ranges when layout metadata is absent",
         ),
     );
@@ -654,8 +660,8 @@ fn build_nodes(
         },
         contract(
             "coalesce range reads",
-            &["range_plan"],
-            &["coalesced_ranges"],
+            ["range_plan"],
+            ["coalesced_ranges"],
             "uncoalesced ranges remain valid",
         ),
     );
@@ -670,8 +676,8 @@ fn build_nodes(
         },
         contract(
             "read system columns",
-            &["coalesced_ranges"],
-            &["system_column_values"],
+            ["coalesced_ranges"],
+            ["system_column_values"],
             "materialized readback can request all system columns",
         ),
     );
@@ -682,8 +688,8 @@ fn build_nodes(
         },
         contract(
             "read property columns",
-            &["coalesced_ranges"],
-            &["property_column_values"],
+            ["coalesced_ranges"],
+            ["property_column_values"],
             "materialized readback can decode required properties",
         ),
     );
@@ -695,8 +701,8 @@ fn build_nodes(
         },
         contract(
             "evaluate morsel bitmaps",
-            &["encoded_predicates", "property_column_values"],
-            &["candidate_bitmaps"],
+            ["encoded_predicates", "property_column_values"],
+            ["candidate_bitmaps"],
             "exact predicate proofs emit authoritative bitmaps; candidate forms require residual verification",
         ),
     );
@@ -706,8 +712,8 @@ fn build_nodes(
         },
         contract(
             "file-code predicate",
-            &["file_codes", "code_domains"],
-            &["candidate_bitmaps"],
+            ["file_codes", "code_domains"],
+            ["candidate_bitmaps"],
             "same-domain equality and IN proofs are authoritative; otherwise decode or residualize",
         ),
     );
@@ -721,8 +727,8 @@ fn build_nodes(
         },
         contract(
             "execution-code predicate",
-            &["execution_code_domains"],
-            &["candidate_bitmaps"],
+            ["execution_code_domains"],
+            ["candidate_bitmaps"],
             "validated complete COVE-E remaps are authoritative; stale or incomplete maps fall back",
         ),
     );
@@ -732,8 +738,8 @@ fn build_nodes(
         },
         contract(
             "numeric predicate",
-            &["typed_numeric_lanes"],
-            &["candidate_bitmaps"],
+            ["typed_numeric_lanes"],
+            ["candidate_bitmaps"],
             "typed NumCode lanes are authoritative for compatible equality, range, and IN predicates",
         ),
     );
@@ -743,8 +749,8 @@ fn build_nodes(
         },
         contract(
             "dictionary-lifted predicate",
-            &["dictionary_domain"],
-            &["candidate_bitmaps"],
+            ["dictionary_domain"],
+            ["candidate_bitmaps"],
             "deterministic dictionary-lift contracts are authoritative; unsupported collation or redaction residualizes",
         ),
     );
@@ -754,8 +760,8 @@ fn build_nodes(
         },
         contract(
             "reconstruct object state",
-            &["candidate_record_chains"],
-            &["materialized_object_states"],
+            ["candidate_record_chains"],
+            ["materialized_object_states"],
             "retain complete chains for candidate objects",
         ),
     );
@@ -768,8 +774,8 @@ fn build_nodes(
             },
             contract(
                 "temporal grain reconstruction",
-                &["candidate_record_chains"],
-                &["history_or_change_rows"],
+                ["candidate_record_chains"],
+                ["history_or_change_rows"],
                 if native_exact {
                     "history/change direct projection uses exact temporal row-grain reconstruction before final output materialization"
                 } else {
@@ -778,7 +784,7 @@ fn build_nodes(
             ),
         );
     }
-    if planned.dependencies.association_type_ids.len() > 0
+    if !planned.dependencies.association_type_ids.is_empty()
         || matches!(
             planned.logical_plan.context.root_kind,
             LogicalRootKind::Association
@@ -791,8 +797,8 @@ fn build_nodes(
             },
             contract(
                 "association link scan",
-                &["materialized_object_states"],
-                &["association_links"],
+                ["materialized_object_states"],
+                ["association_links"],
                 "materialize association links when coded proof is absent",
             ),
         );
@@ -819,8 +825,8 @@ fn build_nodes(
             },
             contract(
                 "association semi-join",
-                &["association_links"],
-                &["candidate_object_keys"],
+                ["association_links"],
+                ["candidate_object_keys"],
                 if endpoint_fast_path_exact {
                     "association endpoint edge-table semi-join is an exact prefilter candidate before final visibility/redaction checks"
                 } else {
@@ -854,8 +860,8 @@ fn build_nodes(
             },
             contract(
                 "association anti-join",
-                &["association_links"],
-                &["candidate_object_keys"],
+                ["association_links"],
+                ["candidate_object_keys"],
                 if endpoint_fast_path_exact {
                     "association endpoint edge-table anti-join is an exact absence prefilter candidate under protected disclosure policy"
                 } else {
@@ -890,8 +896,8 @@ fn build_nodes(
             },
             contract(
                 "association aggregate",
-                &["association_links"],
-                &["aggregate_states"],
+                ["association_links"],
+                ["aggregate_states"],
                 if aggregate_fast_path_exact {
                     "association helper aggregates have exact endpoint edge-table fast-path authority under protected metadata and exact aggregate disclosure"
                 } else {
@@ -900,7 +906,7 @@ fn build_nodes(
             ),
         );
     }
-    if planned.dependencies.evidence_fields.len() > 0
+    if !planned.dependencies.evidence_fields.is_empty()
         || matches!(
             planned.logical_plan.context.root_kind,
             LogicalRootKind::Evidence
@@ -925,8 +931,8 @@ fn build_nodes(
             },
             contract(
                 "evidence read",
-                &["materialized_object_states"],
-                &["evidence_rows"],
+                ["materialized_object_states"],
+                ["evidence_rows"],
                 "evidence reads happen after visibility and redaction unless proven safe",
             ),
         );
@@ -948,8 +954,8 @@ fn build_nodes(
             },
             contract(
                 "AI sidecar operation",
-                &["visible_host_grain", "validated_ai_sidecar"],
-                &["ai_operation_rows_or_diagnostics"],
+                ["visible_host_grain", "validated_ai_sidecar"],
+                ["ai_operation_rows_or_diagnostics"],
                 "selected AI operations reject or report policy-withheld diagnostics when sidecar binding, privacy, redaction, freshness, or integrity proof is absent",
             ),
         );
@@ -971,8 +977,8 @@ fn build_nodes(
         },
         contract(
             "apply visibility and redaction",
-            &["materialized_rows"],
-            &["visible_rows"],
+            ["materialized_rows"],
+            ["visible_rows"],
             "reject or materialize if metadata-only disclosure is unsafe",
         ),
     );
@@ -984,8 +990,8 @@ fn build_nodes(
         },
         contract(
             "zero-copy Arrow projection",
-            &["visible_rows", "zero_copy_map"],
-            &["arrow_projection_candidate"],
+            ["visible_rows", "zero_copy_map"],
+            ["arrow_projection_candidate"],
             "validated COVE-L compatibility can retain buffers; otherwise owned Arrow fallback or rejection applies",
         ),
     );
@@ -999,8 +1005,8 @@ fn build_nodes(
             },
             contract(
                 "Arrow projection",
-                &["visible_rows"],
-                &["owned_arrow_batches"],
+                ["visible_rows"],
+                ["owned_arrow_batches"],
                 "materialize Arrow buffers",
             ),
         );
@@ -1009,8 +1015,8 @@ fn build_nodes(
         PhysicalPlanNodeKind::JsonProjection { canonical: true },
         contract(
             "JSON projection",
-            &["visible_rows"],
-            &["canonical_json_rows"],
+            ["visible_rows"],
+            ["canonical_json_rows"],
             "JSON remains golden-test output",
         ),
     );
@@ -1020,8 +1026,8 @@ fn build_nodes(
         },
         contract(
             "materialized filter",
-            &["visible_rows"],
-            &["filtered_rows"],
+            ["visible_rows"],
+            ["filtered_rows"],
             "all where predicates are rechecked after materialization",
         ),
     );
@@ -1031,8 +1037,8 @@ fn build_nodes(
         },
         contract(
             "materialized sort",
-            &["filtered_rows"],
-            &["sorted_rows"],
+            ["filtered_rows"],
+            ["sorted_rows"],
             "raw FileCode integer order is never logical order",
         ),
     );
@@ -1042,8 +1048,8 @@ fn build_nodes(
         },
         contract(
             "fallback boundary",
-            &["physical_candidates"],
-            &["materialized_baseline"],
+            ["physical_candidates"],
+            ["materialized_baseline"],
             "fallback to materialized execution preserves visible rows",
         ),
     );
@@ -1053,46 +1059,11 @@ fn build_nodes(
         },
         contract(
             "output boundary",
-            &["sorted_rows"],
-            &["requested_output"],
+            ["sorted_rows"],
+            ["requested_output"],
             "output authority is reported as materialized, exact kernel, exact index-only, or zero-copy",
         ),
     );
-}
-
-fn contract(
-    name: &str,
-    inputs: &[&str],
-    outputs: &[&str],
-    fallback: &str,
-) -> PhysicalOperatorContract {
-    PhysicalOperatorContract {
-        contract_version: crate::PHYSICAL_OPERATOR_CONTRACT_VERSION.into(),
-        inputs: inputs.iter().map(|item| (*item).into()).collect(),
-        outputs: outputs.iter().map(|item| (*item).into()).collect(),
-        preconditions: vec![format!("{name} preconditions must be validated before use")],
-        postconditions: vec![format!(
-            "{name} must preserve logical truth under its validated authority contract"
-        )],
-        cardinality:
-            "exact-authoritative when proofs pass; otherwise no false negatives with residual checks"
-                .into(),
-        ordering: "does not establish logical ordering unless materialized sort follows".into(),
-        protected_metadata: vec![
-            "paths".into(),
-            "literals".into(),
-            "sidecar identifiers".into(),
-        ],
-        pre_redaction_safe: false,
-        index_only_eligible: false,
-        fallback: fallback.into(),
-        explain_fields: vec![
-            "operator".into(),
-            "candidate_count".into(),
-            "fallback".into(),
-            "redacted_metadata".into(),
-        ],
-    }
 }
 
 fn forms_by_representation(
@@ -1147,9 +1118,10 @@ fn association_endpoint_fast_path_exact(
 fn temporal_grain_reconstruction(planned: &PlannedQuery) -> Option<(String, String, bool)> {
     let native_exact = native_temporal_direct_projection_shape(planned);
     if let Some(history) = planned.resolved.method_chain.history {
+        let temporal_grain = PhysicalTemporalGrain::history(history);
         return Some((
-            format!("history_{}", physical_history_mode_name(history)),
-            physical_history_row_grain(history).into(),
+            temporal_grain.mode().into(),
+            temporal_grain.row_grain().to_string(),
             native_exact,
         ));
     }
@@ -1159,46 +1131,13 @@ fn temporal_grain_reconstruction(planned: &PlannedQuery) -> Option<(String, Stri
         .changes
         .as_ref()
         .map(|changes| {
+            let temporal_grain = PhysicalTemporalGrain::changes(changes.mode);
             (
-                format!("changes_{}", physical_change_mode_name(changes.mode)),
-                physical_change_row_grain(changes.mode).into(),
+                temporal_grain.mode().into(),
+                temporal_grain.row_grain().to_string(),
                 native_exact,
             )
         })
-}
-
-fn physical_history_mode_name(mode: AstHistoryMode) -> &'static str {
-    match mode {
-        AstHistoryMode::Records => "records",
-        AstHistoryMode::States => "states",
-        AstHistoryMode::RecordsAndStates => "records_and_states",
-    }
-}
-
-fn physical_history_row_grain(mode: AstHistoryMode) -> &'static str {
-    match mode {
-        AstHistoryMode::Records => "history_record",
-        AstHistoryMode::States => "history_state",
-        AstHistoryMode::RecordsAndStates => "history_records_and_states",
-    }
-}
-
-fn physical_change_mode_name(mode: AstChangeMode) -> &'static str {
-    match mode {
-        AstChangeMode::Records => "records",
-        AstChangeMode::StateTransitions => "state_transitions",
-        AstChangeMode::PropertyDiffs => "property_diffs",
-        AstChangeMode::FinalRows => "final_rows",
-    }
-}
-
-fn physical_change_row_grain(mode: AstChangeMode) -> &'static str {
-    match mode {
-        AstChangeMode::Records => "change_record",
-        AstChangeMode::StateTransitions => "change_state_transition",
-        AstChangeMode::PropertyDiffs => "change_property_diff",
-        AstChangeMode::FinalRows => "change_final_row",
-    }
 }
 
 fn association_aggregate_fast_path_exact(
@@ -1406,4 +1345,37 @@ fn sha256_hex(bytes: &[u8]) -> String {
         out.push(HEX[(byte & 0x0F) as usize] as char);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn physical_contract_serializes_existing_string_shape() {
+        let contract = contract(
+            "unit operator",
+            ["input_rows"],
+            ["output_rows"],
+            "materialized fallback remains available",
+        );
+        let value = serde_json::to_value(&contract).unwrap();
+
+        assert_eq!(
+            value["contract_version"],
+            crate::PHYSICAL_OPERATOR_CONTRACT_VERSION
+        );
+        assert_eq!(value["inputs"], json!(["input_rows"]));
+        assert_eq!(value["outputs"], json!(["output_rows"]));
+        assert_eq!(value["fallback"], "materialized fallback remains available");
+        assert_eq!(
+            value["explain_fields"],
+            json!([
+                "operator",
+                "candidate_count",
+                "fallback",
+                "redacted_metadata"
+            ])
+        );
+    }
 }

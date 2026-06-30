@@ -592,7 +592,7 @@ fn lex_number(text: &str, start: usize) -> (TokenKind, usize) {
 }
 
 fn canonical_hex_literal(value: &str) -> Result<String, &'static str> {
-    if value.len() % 2 != 0 {
+    if !value.len().is_multiple_of(2) {
         return Err("hex binary literal must contain an even number of digits");
     }
     if !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
@@ -634,9 +634,8 @@ impl Parser {
         self.advance();
         let mode = self
             .current_explain_mode_prefix()
-            .map(|mode| {
+            .inspect(|_mode| {
                 self.advance();
-                mode
             })
             .unwrap_or(ExplainMode::Public);
         Ok(Some(Spanned::new(
@@ -1256,7 +1255,9 @@ impl Parser {
     fn parse_aggregate_expr(&mut self) -> Result<Spanned<AstExpr>, Vec<CoveQlDiagnostic>> {
         let start = self.current().span.start;
         let name_ident = self.parse_identifier("expected aggregate name")?;
-        let name = aggregate_name(&name_ident.name).expect("guarded by caller");
+        let Some(name) = aggregate_name(&name_ident.name) else {
+            return Err(self.err_current(format!("unsupported aggregate '{}'", name_ident.name)));
+        };
         self.expect(
             TokenDiscriminant::LParen,
             "expected '(' after aggregate name",
@@ -1689,7 +1690,9 @@ impl Parser {
             }
             _ => return Err(self.err_current("expected explain mode")),
         };
-        explain_mode_from_str(&value).ok_or_else(|| self.err_previous("unsupported explain mode"))
+        value
+            .parse()
+            .map_err(|_| self.err_previous("unsupported explain mode"))
     }
 
     fn current_explain_mode_prefix(&self) -> Option<ExplainMode> {
@@ -1703,7 +1706,7 @@ impl Parser {
             TokenKind::Identifier(value, _) | TokenKind::String(value) => value,
             _ => return None,
         };
-        explain_mode_from_str(value)
+        value.parse().ok()
     }
 
     fn parse_u64(&mut self, message: &'static str) -> Result<u64, Vec<CoveQlDiagnostic>> {
@@ -1891,18 +1894,6 @@ impl Parser {
             "parse",
             self.previous().span,
         )]
-    }
-}
-
-fn explain_mode_from_str(value: &str) -> Option<ExplainMode> {
-    match value.to_ascii_lowercase().as_str() {
-        "public" => Some(ExplainMode::Public),
-        "developer" => Some(ExplainMode::Developer),
-        "proof" => Some(ExplainMode::Proof),
-        "coded" => Some(ExplainMode::Coded),
-        "ai" => Some(ExplainMode::Ai),
-        "forensic" => Some(ExplainMode::Forensic),
-        _ => None,
     }
 }
 
@@ -2172,7 +2163,9 @@ fn is_identifier_continue(ch: char) -> bool {
 }
 
 fn next_char(text: &str, pos: usize) -> char {
-    text[pos..].chars().next().expect("pos is on char boundary")
+    text.get(pos..)
+        .and_then(|tail| tail.chars().next())
+        .unwrap_or('\0')
 }
 
 fn diagnostic(

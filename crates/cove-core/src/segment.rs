@@ -36,6 +36,7 @@ use crate::{
         validate_column_page_wire, validate_page_codec_feature_advertisement, PageValidationContext,
     },
     types::{validate_logical_physical_pair_with_options, LogicalPhysicalOptions},
+    wire::{read_u16_le_checked, read_u32_le_checked, read_u64_le_checked},
     CoveError,
 };
 
@@ -94,18 +95,18 @@ impl TableSegmentIndexEntryV1 {
             return Err(CoveError::BufferTooShort);
         }
         let bytes = &bytes[..TABLE_SEGMENT_INDEX_ENTRY_LEN];
-        let table_id = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
-        let segment_id = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
-        let row_start = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
-        let row_count = u32::from_le_bytes(bytes[16..20].try_into().unwrap());
-        let morsel_count = u32::from_le_bytes(bytes[20..24].try_into().unwrap());
-        let morsel_row_count = u32::from_le_bytes(bytes[24..28].try_into().unwrap());
-        let column_count = u32::from_le_bytes(bytes[28..32].try_into().unwrap());
-        let offset = u64::from_le_bytes(bytes[32..40].try_into().unwrap());
-        let length = u64::from_le_bytes(bytes[40..48].try_into().unwrap());
-        let stats_ref = u32::from_le_bytes(bytes[48..52].try_into().unwrap());
-        let flags = u32::from_le_bytes(bytes[52..56].try_into().unwrap());
-        let checksum_field = u32::from_le_bytes(bytes[56..60].try_into().unwrap());
+        let table_id = read_u32_le_checked(bytes, 0)?;
+        let segment_id = read_u32_le_checked(bytes, 4)?;
+        let row_start = read_u64_le_checked(bytes, 8)?;
+        let row_count = read_u32_le_checked(bytes, 16)?;
+        let morsel_count = read_u32_le_checked(bytes, 20)?;
+        let morsel_row_count = read_u32_le_checked(bytes, 24)?;
+        let column_count = read_u32_le_checked(bytes, 28)?;
+        let offset = read_u64_le_checked(bytes, 32)?;
+        let length = read_u64_le_checked(bytes, 40)?;
+        let stats_ref = read_u32_le_checked(bytes, 48)?;
+        let flags = read_u32_le_checked(bytes, 52)?;
+        let checksum_field = read_u32_le_checked(bytes, 56)?;
 
         let mut for_crc = [0u8; TABLE_SEGMENT_INDEX_ENTRY_LEN];
         for_crc.copy_from_slice(bytes);
@@ -161,8 +162,8 @@ impl TableSegmentIndex {
         if bytes.len() < 8 {
             return Err(CoveError::BufferTooShort);
         }
-        let count = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
-        let flags = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+        let count = read_u32_le_checked(bytes, 0)? as usize;
+        let flags = read_u32_le_checked(bytes, 4)?;
         let needed = 8usize
             .checked_add(
                 count
@@ -305,14 +306,14 @@ impl TableColumnDirectoryEntryV1 {
             return Err(CoveError::BufferTooShort);
         }
         let bytes = &bytes[..TABLE_COLUMN_DIRECTORY_ENTRY_LEN];
-        let checksum_field = u32::from_le_bytes(bytes[48..52].try_into().unwrap());
+        let checksum_field = read_u32_le_checked(bytes, 48)?;
         let mut for_crc = [0u8; TABLE_COLUMN_DIRECTORY_ENTRY_LEN];
         for_crc.copy_from_slice(bytes);
         for_crc[48..52].fill(0);
         if checksum::crc32c(&for_crc) != checksum_field {
             return Err(CoveError::ChecksumMismatch);
         }
-        let logical_raw = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
+        let logical_raw = read_u16_le_checked(bytes, 4)?;
         let physical_raw = bytes[6];
         let logical_type = CoveLogicalType::from_u16(logical_raw)
             .ok_or_else(|| CoveError::BadSchema(format!("unknown logical type {logical_raw}")))?;
@@ -328,16 +329,16 @@ impl TableColumnDirectoryEntryV1 {
         )?;
 
         Ok(Self {
-            column_id: u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
+            column_id: read_u32_le_checked(bytes, 0)?,
             logical_type,
             physical_kind,
             flags,
-            page_index_offset: u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
-            page_index_length: u64::from_le_bytes(bytes[16..24].try_into().unwrap()),
-            data_offset: u64::from_le_bytes(bytes[24..32].try_into().unwrap()),
-            data_length: u64::from_le_bytes(bytes[32..40].try_into().unwrap()),
-            stats_ref: u32::from_le_bytes(bytes[40..44].try_into().unwrap()),
-            domain_ref: u32::from_le_bytes(bytes[44..48].try_into().unwrap()),
+            page_index_offset: read_u64_le_checked(bytes, 8)?,
+            page_index_length: read_u64_le_checked(bytes, 16)?,
+            data_offset: read_u64_le_checked(bytes, 24)?,
+            data_length: read_u64_le_checked(bytes, 32)?,
+            stats_ref: read_u32_le_checked(bytes, 40)?,
+            domain_ref: read_u32_le_checked(bytes, 44)?,
             checksum: checksum_field,
         })
     }
@@ -369,19 +370,19 @@ impl TableSegmentHeaderV1 {
             return Err(CoveError::BufferTooShort);
         }
         let bytes = &bytes[..TABLE_SEGMENT_HEADER_LEN];
-        let table_id = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
-        let segment_id = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
-        let row_start = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
-        let row_count = u32::from_le_bytes(bytes[16..20].try_into().unwrap());
-        let morsel_count = u32::from_le_bytes(bytes[20..24].try_into().unwrap());
-        let morsel_row_count = u32::from_le_bytes(bytes[24..28].try_into().unwrap());
-        let column_count = u32::from_le_bytes(bytes[28..32].try_into().unwrap());
-        let morsel_directory_offset = u64::from_le_bytes(bytes[32..40].try_into().unwrap());
-        let column_directory_offset = u64::from_le_bytes(bytes[40..48].try_into().unwrap());
-        let page_index_offset = u64::from_le_bytes(bytes[48..56].try_into().unwrap());
-        let data_offset = u64::from_le_bytes(bytes[56..64].try_into().unwrap());
-        let flags = u32::from_le_bytes(bytes[64..68].try_into().unwrap());
-        let checksum_field = u32::from_le_bytes(bytes[68..72].try_into().unwrap());
+        let table_id = read_u32_le_checked(bytes, 0)?;
+        let segment_id = read_u32_le_checked(bytes, 4)?;
+        let row_start = read_u64_le_checked(bytes, 8)?;
+        let row_count = read_u32_le_checked(bytes, 16)?;
+        let morsel_count = read_u32_le_checked(bytes, 20)?;
+        let morsel_row_count = read_u32_le_checked(bytes, 24)?;
+        let column_count = read_u32_le_checked(bytes, 28)?;
+        let morsel_directory_offset = read_u64_le_checked(bytes, 32)?;
+        let column_directory_offset = read_u64_le_checked(bytes, 40)?;
+        let page_index_offset = read_u64_le_checked(bytes, 48)?;
+        let data_offset = read_u64_le_checked(bytes, 56)?;
+        let flags = read_u32_le_checked(bytes, 64)?;
+        let checksum_field = read_u32_le_checked(bytes, 68)?;
 
         let mut for_crc = [0u8; TABLE_SEGMENT_HEADER_LEN];
         for_crc.copy_from_slice(bytes);
@@ -670,12 +671,12 @@ impl RowMorselEntryV1 {
             return Err(CoveError::BufferTooShort);
         }
         let bytes = &bytes[..ROW_MORSEL_ENTRY_LEN];
-        let morsel_id = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
-        let first_row_in_segment = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
-        let row_count = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
-        let flags = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
-        let stats_ref = u32::from_le_bytes(bytes[16..20].try_into().unwrap());
-        let checksum_field = u32::from_le_bytes(bytes[20..24].try_into().unwrap());
+        let morsel_id = read_u32_le_checked(bytes, 0)?;
+        let first_row_in_segment = read_u32_le_checked(bytes, 4)?;
+        let row_count = read_u32_le_checked(bytes, 8)?;
+        let flags = read_u32_le_checked(bytes, 12)?;
+        let stats_ref = read_u32_le_checked(bytes, 16)?;
+        let checksum_field = read_u32_le_checked(bytes, 20)?;
 
         let mut for_crc = [0u8; ROW_MORSEL_ENTRY_LEN];
         for_crc.copy_from_slice(bytes);

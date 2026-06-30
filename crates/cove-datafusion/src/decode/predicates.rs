@@ -422,7 +422,7 @@ pub(super) fn apply_predicate_to_selection(
             let index = word_index
                 .checked_mul(64)
                 .and_then(|base| base.checked_add(bit))
-                .ok_or_else(|| CoveError::ArithOverflow)?;
+                .ok_or(CoveError::ArithOverflow)?;
             if index >= selected.len() {
                 break;
             }
@@ -1777,7 +1777,9 @@ fn value_as_i64(value: &CoveArrayValue<'_>) -> Result<Option<i64>, CoveError> {
             .map_err(|_| CoveError::UnsupportedEncoding("NumCode value exceeds i64".into())),
         CoveArrayValue::Int64(value) => Ok(Some(*value)),
         CoveArrayValue::Bytes(bytes) if bytes.len() == 8 => {
-            Ok(Some(i64::from_le_bytes((*bytes).try_into().unwrap())))
+            let mut value = [0u8; 8];
+            value.copy_from_slice(bytes);
+            Ok(Some(i64::from_le_bytes(value)))
         }
         _ => Ok(None),
     }
@@ -1790,7 +1792,9 @@ fn value_as_u64(value: &CoveArrayValue<'_>) -> Result<Option<u64>, CoveError> {
             CoveError::UnsupportedEncoding("negative value cannot compare as u64".into())
         }),
         CoveArrayValue::Bytes(bytes) if bytes.len() == 8 => {
-            Ok(Some(u64::from_le_bytes((*bytes).try_into().unwrap())))
+            let mut value = [0u8; 8];
+            value.copy_from_slice(bytes);
+            Ok(Some(u64::from_le_bytes(value)))
         }
         _ => Ok(None),
     }
@@ -1823,7 +1827,9 @@ fn value_as_f64(
         CoveArrayValue::Varint(value) => Ok(Some(*value as f64)),
         CoveArrayValue::Int64(value) => Ok(Some(*value as f64)),
         CoveArrayValue::Bytes(bytes) if bytes.len() == 8 => {
-            let value = f64::from_bits(u64::from_le_bytes((*bytes).try_into().unwrap()));
+            let mut fixed = [0u8; 8];
+            fixed.copy_from_slice(bytes);
+            let value = f64::from_bits(u64::from_le_bytes(fixed));
             if value.is_nan() {
                 Ok(None)
             } else {
@@ -1841,9 +1847,8 @@ fn raw_file_code_at(array: &EncodedArray<'_>, row: u64) -> Result<Option<u32>, C
     let offset = usize::try_from(row)
         .map_err(|_| CoveError::ArithOverflow)?
         .checked_mul(4)
-        .ok_or_else(|| CoveError::ArithOverflow)?;
-    let bytes = wire::read_range_checked(array.data, offset, 4)?;
-    Ok(Some(u32::from_le_bytes(bytes.try_into().unwrap())))
+        .ok_or(CoveError::ArithOverflow)?;
+    Ok(Some(wire::read_u32_le_checked(array.data, offset)?))
 }
 
 #[cfg(test)]

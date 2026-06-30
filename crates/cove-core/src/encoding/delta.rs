@@ -21,8 +21,8 @@ impl DeltaPayload {
         if bytes.len() < 12 {
             return Err(CoveError::BufferTooShort);
         }
-        let base = i64::from_le_bytes(bytes[0..8].try_into().unwrap());
-        let n = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+        let base = wire::read_i64_le_checked(bytes, 0)?;
+        let n = wire::read_u32_le_checked(bytes, 8)? as usize;
         let mut deltas = Vec::with_capacity(n);
         let mut pos = 12usize;
         for _ in 0..n {

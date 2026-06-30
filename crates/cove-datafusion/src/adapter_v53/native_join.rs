@@ -67,6 +67,7 @@ pub(crate) struct CoveNativeI64JoinTableProvider {
 }
 
 impl CoveNativeI64JoinTableProvider {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         schema: SchemaRef,
         join_kind: NativeI64JoinKind,
@@ -147,6 +148,7 @@ pub(crate) struct CoveNativeFileCodeJoinTableProvider {
 }
 
 impl CoveNativeFileCodeJoinTableProvider {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         schema: SchemaRef,
         join_kind: NativeI64JoinKind,
@@ -229,6 +231,7 @@ pub(crate) struct CoveNativeI64JoinExec {
 }
 
 impl CoveNativeI64JoinExec {
+    #[allow(clippy::too_many_arguments)]
     fn try_new(
         schema: SchemaRef,
         join_kind: NativeI64JoinKind,
@@ -398,6 +401,7 @@ pub(crate) struct CoveNativeFileCodeJoinExec {
 }
 
 impl CoveNativeFileCodeJoinExec {
+    #[allow(clippy::too_many_arguments)]
     fn try_new(
         schema: SchemaRef,
         join_kind: NativeI64JoinKind,

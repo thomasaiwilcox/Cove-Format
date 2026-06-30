@@ -1,16 +1,82 @@
-use std::{fs, path::PathBuf};
+use std::{
+    error::Error,
+    fmt, fs,
+    path::{Path, PathBuf},
+};
 
 use cove_arrow::convert::{
     ParquetAccelerationPolicy, ParquetAggregatePolicy, ParquetClusteringPolicy,
     ParquetConversionOptions, ParquetConversionResult, ParquetDictionaryPolicy, ParquetStatsPolicy,
 };
-use cove_core::{
-    constants::{CompressionCodec, DigestAlgorithm},
-    digest::compute_digest,
-    durable,
-    utility::hex_encode,
-};
+use cove_core::{constants::CompressionCodec, durable, CoveError};
 
+use crate::source::ConvertError;
+
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum ConvertCliError {
+    MissingValue {
+        flag: &'static str,
+    },
+    InvalidValue {
+        message: &'static str,
+    },
+    UnknownOption {
+        option: String,
+    },
+    InvalidArity {
+        input_label: String,
+    },
+    Publish {
+        path: PathBuf,
+        source: CoveError,
+    },
+    SerializeReport {
+        source: serde_json::Error,
+    },
+    WriteReport {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+}
+
+impl fmt::Display for ConvertCliError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ConvertCliError::MissingValue { flag } => write!(f, "{flag} requires a value"),
+            ConvertCliError::InvalidValue { message } => f.write_str(message),
+            ConvertCliError::UnknownOption { option } => write!(f, "unknown option {option}"),
+            ConvertCliError::InvalidArity { input_label } => {
+                write!(f, "expected <{input_label}> and <output.cove>")
+            }
+            ConvertCliError::Publish { path, source } => {
+                write!(f, "cannot durably publish {}: {source}", path.display())
+            }
+            ConvertCliError::SerializeReport { source } => {
+                write!(f, "cannot serialize conversion report: {source}")
+            }
+            ConvertCliError::WriteReport { path, source } => {
+                write!(f, "cannot write {}: {source}", path.display())
+            }
+        }
+    }
+}
+
+impl Error for ConvertCliError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            ConvertCliError::Publish { source, .. } => Some(source),
+            ConvertCliError::WriteReport { source, .. } => Some(source),
+            ConvertCliError::SerializeReport { source } => Some(source),
+            ConvertCliError::MissingValue { .. }
+            | ConvertCliError::InvalidValue { .. }
+            | ConvertCliError::UnknownOption { .. }
+            | ConvertCliError::InvalidArity { .. } => None,
+        }
+    }
+}
+
+#[must_use]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConversionCommand {
     pub input: PathBuf,
@@ -19,6 +85,7 @@ pub struct ConversionCommand {
     pub report: Option<ReportTarget>,
 }
 
+#[must_use]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReportTarget {
     Stdout,
@@ -29,7 +96,7 @@ pub fn parse_conversion_args(
     args: impl IntoIterator<Item = String>,
     input_label: &str,
     default_table_name: &str,
-) -> Result<Option<ConversionCommand>, String> {
+) -> Result<Option<ConversionCommand>, ConvertCliError> {
     let mut options = ParquetConversionOptions {
         table_name: default_table_name.to_string(),
         ..ParquetConversionOptions::default()
@@ -47,18 +114,22 @@ pub fn parse_conversion_args(
                 let raw = next_value(&mut iter, "--morsel-row-count")?;
                 options.morsel_row_count = raw
                     .parse::<u32>()
-                    .map_err(|_| "--morsel-row-count must be a u32".to_string())?;
+                    .map_err(|_| invalid_value("--morsel-row-count must be a u32"))?;
                 if options.morsel_row_count == 0 {
-                    return Err("--morsel-row-count must be greater than zero".into());
+                    return Err(invalid_value(
+                        "--morsel-row-count must be greater than zero",
+                    ));
                 }
             }
             "--segment-row-count" => {
                 let raw = next_value(&mut iter, "--segment-row-count")?;
                 options.segment_row_count = raw
                     .parse::<u32>()
-                    .map_err(|_| "--segment-row-count must be a u32".to_string())?;
+                    .map_err(|_| invalid_value("--segment-row-count must be a u32"))?;
                 if options.segment_row_count == 0 {
-                    return Err("--segment-row-count must be greater than zero".into());
+                    return Err(invalid_value(
+                        "--segment-row-count must be greater than zero",
+                    ));
                 }
             }
             "--compression" => {
@@ -112,24 +183,26 @@ pub fn parse_conversion_args(
                 let raw = next_value(&mut iter, "--aggregate-topk-k")?;
                 options.aggregate_topk_k = raw
                     .parse::<u32>()
-                    .map_err(|_| "--aggregate-topk-k must be a u32".to_string())?;
+                    .map_err(|_| invalid_value("--aggregate-topk-k must be a u32"))?;
                 if options.aggregate_topk_k == 0 {
-                    return Err("--aggregate-topk-k must be greater than zero".into());
+                    return Err(invalid_value(
+                        "--aggregate-topk-k must be greater than zero",
+                    ));
                 }
             }
             "--hll-precision" => {
                 let raw = next_value(&mut iter, "--hll-precision")?;
                 options.hll_precision = raw
                     .parse::<u8>()
-                    .map_err(|_| "--hll-precision must be a u8".to_string())?;
+                    .map_err(|_| invalid_value("--hll-precision must be a u8"))?;
             }
             "--kll-k" => {
                 let raw = next_value(&mut iter, "--kll-k")?;
                 options.kll_k = raw
                     .parse::<u32>()
-                    .map_err(|_| "--kll-k must be a u32".to_string())?;
+                    .map_err(|_| invalid_value("--kll-k must be a u32"))?;
                 if options.kll_k < 8 {
-                    return Err("--kll-k must be at least 8".into());
+                    return Err(invalid_value("--kll-k must be at least 8"));
                 }
             }
             "--composite-zone" => {
@@ -150,13 +223,17 @@ pub fn parse_conversion_args(
                     ReportTarget::Path(PathBuf::from(raw))
                 });
             }
-            _ if arg.starts_with('-') => return Err(format!("unknown option {arg}")),
+            _ if arg.starts_with('-') => {
+                return Err(ConvertCliError::UnknownOption { option: arg })
+            }
             _ => positional.push(PathBuf::from(arg)),
         }
     }
 
     if positional.len() != 2 {
-        return Err(format!("expected <{input_label}> and <output.cove>"));
+        return Err(ConvertCliError::InvalidArity {
+            input_label: input_label.to_string(),
+        });
     }
     Ok(Some(ConversionCommand {
         input: positional.remove(0),
@@ -169,27 +246,24 @@ pub fn parse_conversion_args(
 pub fn publish_conversion_result(
     command: ConversionCommand,
     result: ParquetConversionResult,
-) -> Result<(), String> {
-    durable::durable_replace(&command.output, &result.cove_bytes)
-        .map_err(|err| format!("cannot durably publish {}: {err}", command.output.display()))?;
+) -> Result<(), ConvertCliError> {
+    publish_bytes(&command.output, &result.cove_bytes)?;
     if let Some(covx_bytes) = &result.covx_bytes {
         let path = command.output.with_extension("covx");
-        durable::durable_replace(&path, covx_bytes)
-            .map_err(|err| format!("cannot durably publish {}: {err}", path.display()))?;
+        publish_bytes(&path, covx_bytes)?;
     }
     if let Some(covm_bytes) = &result.covm_bytes {
         let path = command.output.with_extension("covm");
-        durable::durable_replace(&path, covm_bytes)
-            .map_err(|err| format!("cannot durably publish {}: {err}", path.display()))?;
+        publish_bytes(&path, covm_bytes)?;
     }
 
     if let Some(target) = command.report {
         let report = serde_json::to_string_pretty(&result.report.to_json_value())
-            .map_err(|err| format!("cannot serialize conversion report: {err}"))?;
+            .map_err(|source| ConvertCliError::SerializeReport { source })?;
         match target {
             ReportTarget::Stdout => println!("{report}"),
             ReportTarget::Path(path) => fs::write(&path, report)
-                .map_err(|err| format!("cannot write {}: {err}", path.display()))?,
+                .map_err(|source| ConvertCliError::WriteReport { path, source })?,
         }
     } else {
         eprintln!(
@@ -206,21 +280,21 @@ pub fn set_source_identity(
     options: &mut ParquetConversionOptions,
     input: &std::path::Path,
     bytes: &[u8],
-) -> Result<(), String> {
+) -> Result<(), ConvertError> {
     options.source_identifier = Some(input.display().to_string());
     options.source_digest = Some(source_digest(bytes)?);
     Ok(())
 }
 
-pub fn source_digest(bytes: &[u8]) -> Result<String, String> {
-    compute_digest(DigestAlgorithm::Sha256, bytes)
-        .map(|digest| format!("sha256:{}", hex_encode(&digest)))
-        .map_err(|err| err.to_string())
+pub fn source_digest(bytes: &[u8]) -> Result<String, ConvertError> {
+    crate::source::source_digest(bytes)
 }
 
-fn next_value(iter: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, String> {
-    iter.next()
-        .ok_or_else(|| format!("{flag} requires a value"))
+fn next_value(
+    iter: &mut impl Iterator<Item = String>,
+    flag: &'static str,
+) -> Result<String, ConvertCliError> {
+    iter.next().ok_or(ConvertCliError::MissingValue { flag })
 }
 
 fn parse_csv_list(raw: &str) -> Vec<String> {
@@ -231,46 +305,111 @@ fn parse_csv_list(raw: &str) -> Vec<String> {
         .collect()
 }
 
-fn parse_compression(raw: &str) -> Result<CompressionCodec, String> {
+fn parse_compression(raw: &str) -> Result<CompressionCodec, ConvertCliError> {
     match raw {
         "none" => Ok(CompressionCodec::None),
         "lz4" => Ok(CompressionCodec::Lz4),
         "zstd" => Ok(CompressionCodec::Zstd),
-        _ => Err("--compression must be one of: none, lz4, zstd".into()),
+        _ => Err(invalid_value(
+            "--compression must be one of: none, lz4, zstd",
+        )),
     }
 }
 
-fn parse_dictionary_policy(raw: &str) -> Result<ParquetDictionaryPolicy, String> {
+fn parse_dictionary_policy(raw: &str) -> Result<ParquetDictionaryPolicy, ConvertCliError> {
     match raw {
         "auto" => Ok(ParquetDictionaryPolicy::Auto),
         "never" => Ok(ParquetDictionaryPolicy::Never),
         "always" => Ok(ParquetDictionaryPolicy::Always),
-        _ => Err("--dictionary-policy must be one of: auto, never, always".into()),
+        _ => Err(invalid_value(
+            "--dictionary-policy must be one of: auto, never, always",
+        )),
     }
 }
 
-fn parse_stats_policy(raw: &str) -> Result<ParquetStatsPolicy, String> {
+fn parse_stats_policy(raw: &str) -> Result<ParquetStatsPolicy, ConvertCliError> {
     match raw {
         "none" => Ok(ParquetStatsPolicy::None),
         "recompute" => Ok(ParquetStatsPolicy::Recompute),
-        _ => Err("--stats-policy must be one of: none, recompute".into()),
+        _ => Err(invalid_value(
+            "--stats-policy must be one of: none, recompute",
+        )),
     }
 }
 
-fn parse_acceleration_policy(raw: &str) -> Result<ParquetAccelerationPolicy, String> {
+fn parse_acceleration_policy(raw: &str) -> Result<ParquetAccelerationPolicy, ConvertCliError> {
     match raw {
         "none" => Ok(ParquetAccelerationPolicy::None),
         "declared-only" => Ok(ParquetAccelerationPolicy::DeclaredOnly),
         "auto" => Ok(ParquetAccelerationPolicy::Auto),
-        _ => Err("--acceleration-policy must be one of: none, declared-only, auto".into()),
+        _ => Err(invalid_value(
+            "--acceleration-policy must be one of: none, declared-only, auto",
+        )),
     }
 }
 
-fn parse_aggregate_policy(raw: &str) -> Result<ParquetAggregatePolicy, String> {
+fn parse_aggregate_policy(raw: &str) -> Result<ParquetAggregatePolicy, ConvertCliError> {
     match raw {
         "none" => Ok(ParquetAggregatePolicy::None),
         "declared-only" => Ok(ParquetAggregatePolicy::DeclaredOnly),
         "auto" => Ok(ParquetAggregatePolicy::Auto),
-        _ => Err("--aggregate-synopsis must be one of: none, declared-only, auto".into()),
+        _ => Err(invalid_value(
+            "--aggregate-synopsis must be one of: none, declared-only, auto",
+        )),
+    }
+}
+
+fn publish_bytes(path: &Path, bytes: &[u8]) -> Result<(), ConvertCliError> {
+    durable::durable_replace(path, bytes).map_err(|source| ConvertCliError::Publish {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok(())
+}
+
+fn invalid_value(message: &'static str) -> ConvertCliError {
+    ConvertCliError::InvalidValue { message }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parser_reports_typed_usage_errors_with_stable_text() {
+        let missing_value =
+            parse_conversion_args(["--table-name".to_string()], "input.csv", "csv_import")
+                .unwrap_err();
+        assert!(matches!(
+            missing_value,
+            ConvertCliError::MissingValue {
+                flag: "--table-name"
+            }
+        ));
+        assert_eq!(missing_value.to_string(), "--table-name requires a value");
+
+        let unknown = parse_conversion_args(
+            [
+                "--surprise".to_string(),
+                "in.csv".to_string(),
+                "out.cove".to_string(),
+            ],
+            "input.csv",
+            "csv_import",
+        )
+        .unwrap_err();
+        assert!(matches!(unknown, ConvertCliError::UnknownOption { .. }));
+        assert_eq!(unknown.to_string(), "unknown option --surprise");
+
+        let invalid_arity =
+            parse_conversion_args(["in.csv".to_string()], "input.csv", "csv_import").unwrap_err();
+        assert!(matches!(
+            invalid_arity,
+            ConvertCliError::InvalidArity { .. }
+        ));
+        assert_eq!(
+            invalid_arity.to_string(),
+            "expected <input.csv> and <output.cove>"
+        );
     }
 }

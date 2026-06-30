@@ -2,7 +2,15 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use cove_core::{checksum, CoveError};
+use cove_core::{
+    checksum,
+    wire::{
+        read_array_checked as read_array, read_u16_le_checked as read_u16,
+        read_u32_le_checked as read_u32, read_u64_le_checked as read_u64,
+        read_u8_checked as read_u8,
+    },
+    CoveError,
+};
 
 const ABSENT_ID: u32 = u32::MAX;
 
@@ -2258,11 +2266,13 @@ impl<'a> Cursor<'a> {
     }
 
     fn u16(&mut self) -> Result<u16, CoveError> {
-        Ok(u16::from_le_bytes(self.bytes(2)?.try_into().unwrap()))
+        let bytes = self.bytes(2)?;
+        Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
     }
 
     fn u32(&mut self) -> Result<u32, CoveError> {
-        Ok(u32::from_le_bytes(self.bytes(4)?.try_into().unwrap()))
+        let bytes = self.bytes(4)?;
+        Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
     }
 }
 
@@ -2289,33 +2299,6 @@ fn verify_crc(bytes: &[u8], checksum_offset: usize, expected: u32) -> Result<(),
         return Err(CoveError::ChecksumMismatch);
     }
     Ok(())
-}
-
-fn read_u8(bytes: &[u8], offset: usize) -> Result<u8, CoveError> {
-    if offset >= bytes.len() {
-        return Err(CoveError::BufferTooShort);
-    }
-    Ok(bytes[offset])
-}
-
-fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, CoveError> {
-    Ok(u16::from_le_bytes(read_array(bytes, offset)?))
-}
-
-fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, CoveError> {
-    Ok(u32::from_le_bytes(read_array(bytes, offset)?))
-}
-
-fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, CoveError> {
-    Ok(u64::from_le_bytes(read_array(bytes, offset)?))
-}
-
-fn read_array<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N], CoveError> {
-    let end = offset.checked_add(N).ok_or(CoveError::ArithOverflow)?;
-    if end > bytes.len() {
-        return Err(CoveError::BufferTooShort);
-    }
-    Ok(bytes[offset..end].try_into().unwrap())
 }
 
 fn checked_end(offset: u64, length: u64) -> Result<u64, CoveError> {

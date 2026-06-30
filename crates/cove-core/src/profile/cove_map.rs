@@ -615,7 +615,8 @@ mod tests {
     fn parse_json(kind: SectionKind, value: Value) -> EmbeddedMapSection {
         parse_embedded_section(
             kind,
-            &serde_json::to_vec_pretty(&payload(kind, value)).unwrap(),
+            &serde_json::to_vec_pretty(&payload(kind, value))
+                .expect("serializing serde_json::Value cannot fail"),
         )
         .unwrap()
     }
@@ -623,7 +624,8 @@ mod tests {
     fn parse_json_result(kind: SectionKind, value: Value) -> Result<EmbeddedMapSection, CoveError> {
         parse_embedded_section(
             kind,
-            &serde_json::to_vec_pretty(&payload(kind, value)).unwrap(),
+            &serde_json::to_vec_pretty(&payload(kind, value))
+                .expect("serializing serde_json::Value cannot fail"),
         )
     }
 

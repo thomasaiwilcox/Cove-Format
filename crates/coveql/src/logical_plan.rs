@@ -142,6 +142,7 @@ impl LogicalPlanNode {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind", content = "value")]
 pub enum LogicalPlanNodeKind {
@@ -412,7 +413,7 @@ pub fn build_logical_plan(
         diagnostics.push(plan_warning(
             "W_DECODE_BOUNDARY",
             "one or more predicates require materialized residual evaluation",
-            &resolved.security_context(),
+            &resolved_security_context(&resolved),
         ));
     }
 
@@ -660,14 +661,8 @@ impl PlanContext {
     }
 }
 
-trait ResolvedSecurity {
-    fn security_context(&self) -> SecurityContext;
-}
-
-impl ResolvedSecurity for ResolvedQuery {
-    fn security_context(&self) -> SecurityContext {
-        self.operation_context.security.clone()
-    }
+fn resolved_security_context(resolved: &ResolvedQuery) -> SecurityContext {
+    resolved.operation_context.security.clone()
 }
 
 #[derive(Default)]
@@ -689,7 +684,9 @@ fn validate_grouping(
     if !options.strict_group_by || resolved.method_chain.group_by.is_none() {
         return Ok(());
     }
-    let group_exprs = resolved.method_chain.group_by.as_ref().unwrap();
+    let Some(group_exprs) = resolved.method_chain.group_by.as_ref() else {
+        return Ok(());
+    };
     let Some(select) = &resolved.method_chain.select else {
         return Ok(());
     };
@@ -698,7 +695,7 @@ fn validate_grouping(
             return Err(BuildLogicalPlanError::single(plan_error(
                 "E_GROUPING",
                 "select expression is neither grouped nor aggregated",
-                &resolved.security_context(),
+                &resolved_security_context(resolved),
             )));
         }
     }
@@ -718,7 +715,7 @@ fn validate_aggregate_disclosure(resolved: &ResolvedQuery) -> Result<(), BuildLo
         return Err(BuildLogicalPlanError::single(plan_error(
             "E_AGGREGATE_DISCLOSURE_FORBIDDEN",
             "aggregate disclosure is rejected by the active security context",
-            &resolved.security_context(),
+            &resolved_security_context(resolved),
         )));
     }
     Ok(())
@@ -732,7 +729,7 @@ fn validate_aggregate_filters(resolved: &ResolvedQuery) -> Result<(), BuildLogic
         return Err(BuildLogicalPlanError::single(plan_error(
             "E_UNSUPPORTED_AGGREGATE_FILTER",
             "aggregate expressions are not supported inside where; use select/groupBy aggregates only",
-            &resolved.security_context(),
+            &resolved_security_context(resolved),
         )));
     }
     Ok(())
@@ -753,7 +750,7 @@ fn validate_sort(
             return Err(BuildLogicalPlanError::single(plan_error(
                 "E_UNSAFE_CODE_ORDERING",
                 "orderBy over FileCode requires an order-preserving collation contract or materialized sort key",
-                &resolved.security_context(),
+                &resolved_security_context(resolved),
             )));
         }
     }

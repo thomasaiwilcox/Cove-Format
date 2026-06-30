@@ -5,7 +5,10 @@
 //! Comparisons are total orders so they can drive ColumnDomain rank maps,
 //! min/max statistics, and ordered indexes safely.
 
-use crate::CoveError;
+use crate::{
+    wire::{read_u16_le_checked, read_u32_le_checked},
+    CoveError,
+};
 
 /// Total order produced by comparing two values under a collation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -150,11 +153,27 @@ fn read_unsigned(b: &[u8]) -> u128 {
 
 fn read_signed(b: &[u8]) -> i128 {
     match b.len() {
-        1 => i8::from_le_bytes(b.try_into().unwrap()) as i128,
-        2 => i16::from_le_bytes(b.try_into().unwrap()) as i128,
-        4 => i32::from_le_bytes(b.try_into().unwrap()) as i128,
-        8 => i64::from_le_bytes(b.try_into().unwrap()) as i128,
-        16 => i128::from_le_bytes(b.try_into().unwrap()),
+        1 => i8::from_le_bytes([b[0]]) as i128,
+        2 => {
+            let mut bytes = [0u8; 2];
+            bytes.copy_from_slice(b);
+            i16::from_le_bytes(bytes) as i128
+        }
+        4 => {
+            let mut bytes = [0u8; 4];
+            bytes.copy_from_slice(b);
+            i32::from_le_bytes(bytes) as i128
+        }
+        8 => {
+            let mut bytes = [0u8; 8];
+            bytes.copy_from_slice(b);
+            i64::from_le_bytes(bytes) as i128
+        }
+        16 => {
+            let mut bytes = [0u8; 16];
+            bytes.copy_from_slice(b);
+            i128::from_le_bytes(bytes)
+        }
         _ => 0,
     }
 }
@@ -200,8 +219,8 @@ impl CollationRegistry {
         if bytes.len() < 8 {
             return Err(CoveError::BufferTooShort);
         }
-        let entry_count = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
-        let flags = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+        let entry_count = read_u32_le_checked(bytes, 0)?;
+        let flags = read_u32_le_checked(bytes, 4)?;
         if flags != 0 {
             return Err(CoveError::BadSection(
                 "collation registry reserved flags must be zero".into(),
@@ -212,12 +231,12 @@ impl CollationRegistry {
         let mut seen_ids = std::collections::BTreeSet::new();
 
         for _ in 0..entry_count {
-            if pos + 4 > bytes.len() {
+            if pos.checked_add(4).ok_or(CoveError::ArithOverflow)? > bytes.len() {
                 return Err(CoveError::BufferTooShort);
             }
-            let collation_id = u16::from_le_bytes(bytes[pos..pos + 2].try_into().unwrap());
+            let collation_id = read_u16_le_checked(bytes, pos)?;
             pos += 2;
-            let name_len = u16::from_le_bytes(bytes[pos..pos + 2].try_into().unwrap()) as usize;
+            let name_len = read_u16_le_checked(bytes, pos)? as usize;
             pos += 2;
             let name_end = pos.checked_add(name_len).ok_or(CoveError::ArithOverflow)?;
             if name_end > bytes.len() {
@@ -228,10 +247,10 @@ impl CollationRegistry {
                 .to_string();
             pos = name_end;
 
-            if pos + 2 > bytes.len() {
+            if pos.checked_add(2).ok_or(CoveError::ArithOverflow)? > bytes.len() {
                 return Err(CoveError::BufferTooShort);
             }
-            let version_len = u16::from_le_bytes(bytes[pos..pos + 2].try_into().unwrap()) as usize;
+            let version_len = read_u16_le_checked(bytes, pos)? as usize;
             pos += 2;
             let version_end = pos
                 .checked_add(version_len)
@@ -244,10 +263,10 @@ impl CollationRegistry {
                 .to_string();
             pos = version_end;
 
-            if pos + 4 > bytes.len() {
+            if pos.checked_add(4).ok_or(CoveError::ArithOverflow)? > bytes.len() {
                 return Err(CoveError::BufferTooShort);
             }
-            let flags = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+            let flags = read_u32_le_checked(bytes, pos)?;
             pos += 4;
 
             if !seen_ids.insert(collation_id) {

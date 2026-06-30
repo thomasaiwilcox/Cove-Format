@@ -350,13 +350,13 @@ where
             lossy_features,
             nested_shape_fallbacks: columns
                 .iter()
-                .filter(|column| column.fallback.is_some())
-                .map(|column| {
-                    format!(
-                        "{}: {:?} fallback is pushdown-limited",
-                        column.entry.name,
-                        column.fallback.unwrap()
-                    )
+                .filter_map(|column| {
+                    column.fallback.as_ref().map(|fallback| {
+                        format!(
+                            "{}: {:?} fallback is pushdown-limited",
+                            column.entry.name, fallback
+                        )
+                    })
                 })
                 .collect(),
             notes,

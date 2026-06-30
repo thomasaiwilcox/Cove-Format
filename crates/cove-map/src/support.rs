@@ -120,7 +120,9 @@ pub(crate) fn var_bytes_for_property(
 
 pub(crate) fn stable_u32(text: &str, fallback: u32) -> u32 {
     let digest = Sha256::digest(text.as_bytes());
-    let value = u32::from_le_bytes(digest[..4].try_into().unwrap());
+    let mut prefix = [0u8; 4];
+    prefix.copy_from_slice(&digest[..4]);
+    let value = u32::from_le_bytes(prefix);
     if value == 0 {
         fallback
     } else {

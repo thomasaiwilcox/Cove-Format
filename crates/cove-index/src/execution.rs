@@ -1065,7 +1065,7 @@ impl ValidatedCoviArtifactV2 {
             }
             if request.require_exact
                 && (capability.exactness != IndexCapabilityExactnessV2::Exact
-                    || !capability.proof_strength.supports_exact_covi_use()
+                    || !covi_proof_strength_supports_exact_use(capability.proof_strength)
                     || !root_supports_exact_covi_use(root)?)
             {
                 saw_inexact_candidate = true;
@@ -1190,7 +1190,7 @@ fn lookup_capability_supports_request(
         if capability.exactness != IndexCapabilityExactnessV2::Exact {
             return false;
         }
-        if !capability.proof_strength.supports_exact_covi_use() {
+        if !covi_proof_strength_supports_exact_use(capability.proof_strength) {
             return false;
         }
     }
@@ -1202,20 +1202,17 @@ fn lookup_capability_supports_request(
     }
 }
 
-trait CoviExactProofStrength {
-    fn supports_exact_covi_use(self) -> bool;
-}
-
-impl CoviExactProofStrength for CoverageProofStrengthV2 {
-    fn supports_exact_covi_use(self) -> bool {
-        matches!(self, Self::ExactTight | Self::ExactConservative)
-    }
+fn covi_proof_strength_supports_exact_use(proof_strength: CoverageProofStrengthV2) -> bool {
+    matches!(
+        proof_strength,
+        CoverageProofStrengthV2::ExactTight | CoverageProofStrengthV2::ExactConservative
+    )
 }
 
 fn root_supports_exact_covi_use(root: &CoviIndexRootV2) -> Result<bool, CoveError> {
     let proof_strength =
         CoverageProofStrengthV2::from_u8(root.proof_strength).ok_or(CoveError::BadCovi)?;
-    Ok(proof_strength.supports_exact_covi_use())
+    Ok(covi_proof_strength_supports_exact_use(proof_strength))
 }
 
 fn index_only_capability_supports_aggregate(
@@ -2210,7 +2207,7 @@ fn split_hash128_key(key: &[u8]) -> Result<([u8; 16], &[u8]), CoveError> {
     if key.len() <= 16 {
         return Err(CoveError::BadCovi);
     }
-    let hash = key[..16].try_into().unwrap();
+    let hash = wire::read_array_checked(key, 0)?;
     Ok((hash, &key[16..]))
 }
 
@@ -2325,8 +2322,8 @@ fn compare_numcode_range_key(
     if left.len() != 8 || right.len() != 8 {
         return Err(CoveError::BadCovi);
     }
-    let left = u64::from_le_bytes(left.try_into().unwrap());
-    let right = u64::from_le_bytes(right.try_into().unwrap());
+    let left = wire::read_u64_le_checked(left, 0)?;
+    let right = wire::read_u64_le_checked(right, 0)?;
     let ordering = match logical {
         CoveLogicalType::Int8 => {
             cove_core::types::numcode_as_i8(left).cmp(&cove_core::types::numcode_as_i8(right))
@@ -2495,7 +2492,7 @@ fn domain_rank_for_key(
     let context = comparator_context.domain_rank.as_ref().ok_or_else(|| {
         CoveError::UnsupportedEncoding("COVE-I DomainRankOrdering requires rank context".into())
     })?;
-    let file_code = u32::from_le_bytes(key.try_into().unwrap());
+    let file_code = wire::read_u32_le_checked(key, 0)?;
     let rank = *context
         .file_code_to_rank
         .get(file_code as usize)
@@ -2582,7 +2579,7 @@ fn read_interval_len(bytes: &[u8], offset: &mut usize) -> Result<u32, CoveError>
     if end > bytes.len() {
         return Err(CoveError::BufferTooShort);
     }
-    let value = u32::from_le_bytes(bytes[*offset..end].try_into().unwrap());
+    let value = wire::read_u32_le_checked(bytes, *offset)?;
     *offset = end;
     Ok(value)
 }
@@ -2684,10 +2681,10 @@ fn parse_u32_refs(payload: &[u8]) -> Result<Vec<u32>, CoveError> {
     if !payload.len().is_multiple_of(4) {
         return Err(CoveError::BadCovi);
     }
-    Ok(payload
+    payload
         .chunks_exact(4)
-        .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
-        .collect())
+        .map(|chunk| wire::read_u32_le_checked(chunk, 0))
+        .collect::<Result<Vec<_>, _>>()
 }
 
 fn aggregate_sum_answer_value_tag(logical: CoveLogicalType) -> Option<ValueTag> {

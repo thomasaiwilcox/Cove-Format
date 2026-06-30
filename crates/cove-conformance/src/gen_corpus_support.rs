@@ -88,7 +88,7 @@ pub(crate) fn write_auxiliary_file(root: &Path, path: &str, bytes: &[u8]) {
 }
 
 pub(crate) fn json_fixture_bytes(value: Value) -> Vec<u8> {
-    serde_json::to_vec_pretty(&value).unwrap()
+    serde_json::to_vec_pretty(&value).expect("serializing serde_json::Value cannot fail")
 }
 
 fn enrich_manifest_entry(entry: &mut Value, bytes: &[u8]) {

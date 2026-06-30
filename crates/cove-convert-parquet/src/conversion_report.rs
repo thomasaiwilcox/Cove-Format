@@ -1,5 +1,6 @@
 use std::{
-    fs,
+    error::Error,
+    fmt, fs,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -57,30 +58,66 @@ impl Default for ReverseOptions {
     }
 }
 
-pub fn run(args: Vec<String>) -> Result<(), String> {
-    let Some((direction, format, target_format, reverse_options, input)) = parse_args(args)? else {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConversionReportError {
+    message: String,
+}
+
+impl ConversionReportError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for ConversionReportError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl Error for ConversionReportError {}
+
+impl From<String> for ConversionReportError {
+    fn from(message: String) -> Self {
+        Self::new(message)
+    }
+}
+
+impl From<&str> for ConversionReportError {
+    fn from(message: &str) -> Self {
+        Self::new(message)
+    }
+}
+
+pub(crate) fn run(args: Vec<String>) -> Result<(), ConversionReportError> {
+    let Some(parsed) = parse_args(args)? else {
         print_usage();
         return Ok(());
     };
-    if direction == Direction::CoveToSource {
-        let json = cove_to_source_report(&input, target_format, &reverse_options)?;
+    if parsed.direction == Direction::CoveToSource {
+        let json =
+            cove_to_source_report(&parsed.input, parsed.target_format, &parsed.reverse_options)?;
         println!("{json}");
         return Ok(());
     }
-    let format =
-        format.ok_or_else(|| "--source-format is required for source-to-COVE".to_string())?;
-    let bytes =
-        fs::read(&input).map_err(|err| format!("cannot read {}: {err}", input.display()))?;
+    let format = parsed
+        .source_format
+        .ok_or_else(|| "--source-format is required for source-to-COVE".to_string())?;
+    let bytes = fs::read(&parsed.input)
+        .map_err(|err| format!("cannot read {}: {err}", parsed.input.display()))?;
     let result = convert_bytes_to_cove(
-        input.display().to_string(),
+        parsed.input.display().to_string(),
         &bytes,
         facade_source_format(format),
         ConversionOptions {
             source_format: Some(facade_source_format(format)),
-            cove: conversion_options(&input, source_format_default_table(format), &bytes)?,
+            cove: conversion_options(&parsed.input, source_format_default_table(format), &bytes)?,
             ..ConversionOptions::default()
         },
-    )?;
+    )
+    .map_err(|err| err.to_string())?;
     validate_report_result(&result)?;
     let json = serde_json::to_string_pretty(&result.report.to_json_value())
         .map_err(|err| format!("cannot serialize conversion report: {err}"))?;
@@ -88,19 +125,16 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
     Ok(())
 }
 
-#[allow(clippy::type_complexity)]
-fn parse_args(
-    args: Vec<String>,
-) -> Result<
-    Option<(
-        Direction,
-        Option<SourceFormat>,
-        TargetFormat,
-        ReverseOptions,
-        PathBuf,
-    )>,
-    String,
-> {
+#[derive(Debug, Clone)]
+struct ReportArgs {
+    direction: Direction,
+    source_format: Option<SourceFormat>,
+    target_format: TargetFormat,
+    reverse_options: ReverseOptions,
+    input: PathBuf,
+}
+
+fn parse_args(args: Vec<String>) -> Result<Option<ReportArgs>, String> {
     let mut direction = Direction::SourceToCove;
     let mut source_format = None;
     let mut target_format = TargetFormat::Unspecified;
@@ -163,16 +197,18 @@ fn parse_args(
     let input = input.ok_or_else(|| "expected an input file".to_string())?;
     let format = match (direction, source_format) {
         (Direction::SourceToCove, Some(format)) => Some(format),
-        (Direction::SourceToCove, None) => Some(detect_source_format(&input)?),
+        (Direction::SourceToCove, None) => {
+            Some(detect_source_format(&input).map_err(|err| err.to_string())?)
+        }
         (Direction::CoveToSource, _) => None,
     };
-    Ok(Some((
+    Ok(Some(ReportArgs {
         direction,
-        format,
+        source_format: format,
         target_format,
         reverse_options,
         input,
-    )))
+    }))
 }
 
 fn parse_source_format(raw: &str) -> Result<SourceFormat, String> {
@@ -261,7 +297,7 @@ fn conversion_options(
             .to_string(),
         namespace: "interop".into(),
         source_identifier: Some(input.display().to_string()),
-        source_digest: Some(source_digest(source_bytes)?),
+        source_digest: Some(source_digest(source_bytes).map_err(|err| err.to_string())?),
         ..ParquetConversionOptions::default()
     })
 }
@@ -316,7 +352,7 @@ fn cove_to_source_report(
         "direction": "cove-to-source",
         "source_format": "cove",
         "source_identifier": input.display().to_string(),
-        "source_digest": source_digest(&bytes)?,
+        "source_digest": source_digest(&bytes).map_err(|err| err.to_string())?,
         "target_format": target_name,
         "conversion_policy_version": "cove-reference-v2.0",
         "validation_result": true,

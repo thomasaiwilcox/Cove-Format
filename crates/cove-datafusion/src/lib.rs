@@ -2,17 +2,46 @@
 //!
 //! Reference DataFusion SQL, FileFormat, and execution integration for COVE v2.
 
-#![allow(
-    clippy::derivable_impls,
-    clippy::field_reassign_with_default,
-    clippy::items_after_test_module,
-    clippy::needless_lifetimes,
-    clippy::needless_return,
-    clippy::redundant_closure,
-    clippy::too_many_arguments,
-    clippy::unnecessary_lazy_evaluations,
-    clippy::useless_conversion
-)]
+use std::{error::Error, fmt};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatafusionCliError {
+    message: String,
+}
+
+impl DatafusionCliError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for DatafusionCliError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl Error for DatafusionCliError {}
+
+impl From<String> for DatafusionCliError {
+    fn from(message: String) -> Self {
+        Self::new(message)
+    }
+}
+
+impl From<&str> for DatafusionCliError {
+    fn from(message: &str) -> Self {
+        Self::new(message)
+    }
+}
+
+impl From<crate::delta_snapshot::DeltaSnapshotError> for DatafusionCliError {
+    fn from(error: crate::delta_snapshot::DeltaSnapshotError) -> Self {
+        Self::new(error.to_string())
+    }
+}
 
 pub mod adapter_v53;
 pub mod bootstrap;
@@ -37,11 +66,3 @@ pub mod task_graph;
 pub mod arrow_export_cli;
 pub mod explain_pruning_cli;
 pub mod plan_cost_cli;
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn scaffold_loads() {
-        assert_eq!(crate::adapter_v53::VERSION, "v53");
-    }
-}

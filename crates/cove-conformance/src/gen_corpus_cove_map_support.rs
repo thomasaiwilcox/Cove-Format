@@ -4191,7 +4191,7 @@ fn write_canonical_json(value: &Value, out: &mut Vec<u8>) {
         Value::Bool(false) => out.extend_from_slice(b"false"),
         Value::Number(number) => out.extend_from_slice(number.to_string().as_bytes()),
         Value::String(value) => {
-            out.extend_from_slice(serde_json::to_string(value).unwrap().as_bytes());
+            out.extend_from_slice(Value::String(value.clone()).to_string().as_bytes());
         }
         Value::Array(values) => {
             out.push(b'[');
@@ -4214,7 +4214,7 @@ fn write_canonical_json(value: &Value, out: &mut Vec<u8>) {
                 if idx > 0 {
                     out.push(b',');
                 }
-                out.extend_from_slice(serde_json::to_string(key).unwrap().as_bytes());
+                out.extend_from_slice(Value::String((*key).clone()).to_string().as_bytes());
                 out.push(b':');
                 write_canonical_json(object.get(*key).unwrap(), out);
             }

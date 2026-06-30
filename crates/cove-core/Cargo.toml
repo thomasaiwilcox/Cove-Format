@@ -2,6 +2,7 @@
 name = "cove-core"
 version = "0.1.0"
 edition = "2021"
+rust-version.workspace = true
 description = "Core primitives for the Cove Format (COVE) v2.0"
 license = "MIT"
 autobins = false

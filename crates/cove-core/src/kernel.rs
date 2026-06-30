@@ -6,7 +6,11 @@
 //! MUST be able to fall back to the canonical decode path if a capability is
 //! missing.
 
-use crate::{constants::CoveEncodingKind, CoveError};
+use crate::{
+    constants::CoveEncodingKind,
+    wire::{read_u16_le_checked, read_u32_le_checked},
+    CoveError,
+};
 
 const KERNEL_CAPABILITY_ENTRY_LEN: usize = 18;
 
@@ -36,7 +40,7 @@ impl KernelCapabilities {
         if bytes.len() < 4 {
             return Err(CoveError::BufferTooShort);
         }
-        let count = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+        let count = read_u32_le_checked(bytes, 0)? as usize;
         let entries_bytes = count
             .checked_mul(KERNEL_CAPABILITY_ENTRY_LEN)
             .ok_or(CoveError::ArithOverflow)?;
@@ -54,7 +58,7 @@ impl KernelCapabilities {
         let mut entries = Vec::with_capacity(count);
         let mut pos = 4;
         for _ in 0..count {
-            let enc_raw = u16::from_le_bytes(bytes[pos..pos + 2].try_into().unwrap());
+            let enc_raw = read_u16_le_checked(bytes, pos)?;
             pos += 2;
             let encoding = CoveEncodingKind::from_u16(enc_raw)
                 .ok_or_else(|| CoveError::BadSection(format!("unknown encoding {enc_raw}")))?;

@@ -48,6 +48,7 @@ pub(crate) struct CoveFileOpener {
 }
 
 impl CoveFileOpener {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         object_store: Arc<dyn ObjectStore>,
         table_schema: TableSchema,

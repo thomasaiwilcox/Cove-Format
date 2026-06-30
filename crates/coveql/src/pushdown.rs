@@ -102,8 +102,6 @@ impl PushdownReport {
             .any(|decision| decision.outcome == PushdownOutcome::Applied)
         {
             self.outcome = PushdownOutcome::Applied;
-        } else if self.decisions.is_empty() {
-            self.outcome = PushdownOutcome::NoCandidates;
         } else {
             self.outcome = PushdownOutcome::NoCandidates;
         }

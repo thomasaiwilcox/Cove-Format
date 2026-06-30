@@ -548,10 +548,10 @@ fn validate_segment_rows_are_direct_latest(
     Ok(())
 }
 
-fn single_payload_page<'a>(
-    pages: &'a [cove_core::profile::cove_o::RetainedTemporalPropertyPage],
+fn single_payload_page(
+    pages: &[cove_core::profile::cove_o::RetainedTemporalPropertyPage],
     property_id: u32,
-) -> Result<&'a RetainedTemporalPropertyPage, BuildExecutionError> {
+) -> Result<&RetainedTemporalPropertyPage, BuildExecutionError> {
     let mut payload_pages = pages.iter().filter(|page| page.payload.is_some());
     let Some(page) = payload_pages.next() else {
         return Err(exec_error(

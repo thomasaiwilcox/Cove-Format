@@ -2,12 +2,14 @@
 name = "cove-convert-parquet"
 version = "0.1.0"
 edition = "2021"
+rust-version.workspace = true
 description = "Reference Parquet-to-COVE conversion CLI"
 license = "MIT"
 autobins = false
 
 [dependencies]
 cove-arrow = { path = "../cove-arrow" }
+cove-convert = { path = "../cove-convert" }
 cove-core = { path = "../cove-core" }
 cove-datafusion = { path = "../cove-datafusion" }
 arrow-csv = "58"

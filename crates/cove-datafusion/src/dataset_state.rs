@@ -720,6 +720,7 @@ impl FileMetadata {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_visibility(
         identity: FileIdentity,
         file_bytes: Option<Arc<Vec<u8>>>,
@@ -735,6 +736,7 @@ impl FileMetadata {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_visibility_and_feature_scope(
         identity: FileIdentity,
         file_bytes: Option<Arc<Vec<u8>>>,

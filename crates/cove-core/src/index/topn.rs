@@ -1,6 +1,9 @@
 //! Spec §36 — Top-N Zone Summary.
 
-use crate::CoveError;
+use crate::{
+    wire::{read_u16_le_checked, read_u32_le_checked, read_u64_le_checked},
+    CoveError,
+};
 
 use super::{checked_region, verify_checksum_field};
 
@@ -63,16 +66,16 @@ impl TopNSummary {
         let header = &bytes[..TOPN_ZONE_SUMMARY_LEN];
         let checksum = verify_checksum_field(header, 36)?;
         let direction = TopNDirection::from_u8(header[16]).ok_or(CoveError::BadIndex)?;
-        let payload_offset = u64::from_le_bytes(header[20..28].try_into().unwrap());
-        let payload_length = u64::from_le_bytes(header[28..36].try_into().unwrap());
+        let payload_offset = read_u64_le_checked(header, 20)?;
+        let payload_length = read_u64_le_checked(header, 28)?;
         let payload = checked_region(bytes, payload_offset, payload_length)?;
         Ok(Self {
-            table_id: u32::from_le_bytes(header[0..4].try_into().unwrap()),
-            column_id: u32::from_le_bytes(header[4..8].try_into().unwrap()),
-            segment_id: u32::from_le_bytes(header[8..12].try_into().unwrap()),
-            morsel_id: u32::from_le_bytes(header[12..16].try_into().unwrap()),
+            table_id: read_u32_le_checked(header, 0)?,
+            column_id: read_u32_le_checked(header, 4)?,
+            segment_id: read_u32_le_checked(header, 8)?,
+            morsel_id: read_u32_le_checked(header, 12)?,
             direction,
-            value_count: u16::from_le_bytes(header[17..19].try_into().unwrap()),
+            value_count: read_u16_le_checked(header, 17)?,
             flags: header[19],
             payload_offset,
             payload_length,

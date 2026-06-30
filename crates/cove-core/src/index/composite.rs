@@ -4,7 +4,10 @@
 //! contain at least one matching row. Lets the planner prune multi-column
 //! equality predicates without scanning each column's inverted index.
 
-use crate::CoveError;
+use crate::{
+    wire::{read_u16_le_checked, read_u32_le_checked, read_u64_le_checked},
+    CoveError,
+};
 
 use super::{checked_region, verify_checksum_field};
 
@@ -70,14 +73,14 @@ impl CompositeZoneIndexHeaderV1 {
         let transform_kind =
             CompositeTransformKind::from_u8(bytes[6]).ok_or(CoveError::BadIndex)?;
         Ok(Self {
-            table_id: u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
-            key_column_count: u16::from_le_bytes(bytes[4..6].try_into().unwrap()),
+            table_id: read_u32_le_checked(bytes, 0)?,
+            key_column_count: read_u16_le_checked(bytes, 4)?,
             transform_kind,
             flags: bytes[7],
-            zone_count: u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
-            key_columns_offset: u64::from_le_bytes(bytes[12..20].try_into().unwrap()),
-            entries_offset: u64::from_le_bytes(bytes[20..28].try_into().unwrap()),
-            entries_length: u64::from_le_bytes(bytes[28..36].try_into().unwrap()),
+            zone_count: read_u32_le_checked(bytes, 8)?,
+            key_columns_offset: read_u64_le_checked(bytes, 12)?,
+            entries_offset: read_u64_le_checked(bytes, 20)?,
+            entries_length: read_u64_le_checked(bytes, 28)?,
             checksum,
         })
     }
@@ -114,7 +117,7 @@ impl CompositeIndex {
         let key_column_bytes = checked_region(bytes, header.key_columns_offset, key_columns_len)?;
         let mut key_columns = Vec::with_capacity(header.key_column_count as usize);
         for chunk in key_column_bytes.chunks_exact(4) {
-            key_columns.push(u32::from_le_bytes(chunk.try_into().unwrap()));
+            key_columns.push(read_u32_le_checked(chunk, 0)?);
         }
         let entries = checked_region(bytes, header.entries_offset, header.entries_length)?;
         Ok(Self {

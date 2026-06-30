@@ -11,6 +11,11 @@ use cove_core::{
         CompressionCodec, CoveLogicalType, CovePhysicalKind, DigestAlgorithm,
         KNOWN_FEATURE_BITS_MASK, MAGIC_COVI, POSTSCRIPT_VERSION_V1, VERSION_MAJOR_V1,
     },
+    wire::{
+        read_array_checked as read_array, read_i64_le_checked as read_i64,
+        read_u16_le_checked as read_u16, read_u32_le_checked as read_u32,
+        read_u64_le_checked as read_u64, read_u8_checked as read_u8,
+    },
     CoveError,
 };
 use cove_coverage::{CoverageExactnessV2, CoverageGranularityV2, CoverageProofStrengthV2};
@@ -2349,8 +2354,8 @@ fn validate_row_ordinal_refs(
         return Err(CoveError::BadCovi);
     }
     let mut previous: Option<u32> = None;
-    for chunk in payload.chunks_exact(4) {
-        let row_ordinal_set_ref = u32::from_le_bytes(chunk.try_into().expect("chunk len checked"));
+    for offset in (0..payload.len()).step_by(4) {
+        let row_ordinal_set_ref = read_u32(payload, offset)?;
         if previous.is_some_and(|previous| row_ordinal_set_ref <= previous) {
             return Err(CoveError::BadCovi);
         }
@@ -2407,8 +2412,8 @@ fn validate_row_ordinal_set_payload(
                 return Err(CoveError::BadCovi);
             }
             let mut previous: Option<u32> = None;
-            for chunk in payload.chunks_exact(4) {
-                let value = u32::from_le_bytes(chunk.try_into().expect("chunk len checked"));
+            for offset in (0..payload.len()).step_by(4) {
+                let value = read_u32(payload, offset)?;
                 if u64::from(value) >= row_set.universe_row_count
                     || previous.is_some_and(|previous| value <= previous)
                 {
@@ -2422,8 +2427,8 @@ fn validate_row_ordinal_set_payload(
                 return Err(CoveError::BadCovi);
             }
             let mut previous: Option<u64> = None;
-            for chunk in payload.chunks_exact(8) {
-                let value = u64::from_le_bytes(chunk.try_into().expect("chunk len checked"));
+            for offset in (0..payload.len()).step_by(8) {
+                let value = read_u64(payload, offset)?;
                 if value >= row_set.universe_row_count
                     || previous.is_some_and(|previous| value <= previous)
                 {
@@ -3670,39 +3675,8 @@ fn validate_bool(value: u8) -> Result<(), CoveError> {
     }
 }
 
-fn read_u8(bytes: &[u8], offset: usize) -> Result<u8, CoveError> {
-    if offset >= bytes.len() {
-        return Err(CoveError::BufferTooShort);
-    }
-    Ok(bytes[offset])
-}
-
-fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, CoveError> {
-    Ok(u16::from_le_bytes(read_array(bytes, offset)?))
-}
-
-fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, CoveError> {
-    Ok(u32::from_le_bytes(read_array(bytes, offset)?))
-}
-
-fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, CoveError> {
-    Ok(u64::from_le_bytes(read_array(bytes, offset)?))
-}
-
-fn read_i64(bytes: &[u8], offset: usize) -> Result<i64, CoveError> {
-    Ok(i64::from_le_bytes(read_array(bytes, offset)?))
-}
-
 fn read_uuid(bytes: &[u8], offset: usize) -> Result<[u8; 16], CoveError> {
     read_array(bytes, offset)
-}
-
-fn read_array<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N], CoveError> {
-    let end = offset.checked_add(N).ok_or(CoveError::ArithOverflow)?;
-    if end > bytes.len() {
-        return Err(CoveError::BufferTooShort);
-    }
-    Ok(bytes[offset..end].try_into().unwrap())
 }
 
 #[cfg(test)]

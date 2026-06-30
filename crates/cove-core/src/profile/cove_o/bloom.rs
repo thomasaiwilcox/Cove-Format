@@ -1,4 +1,8 @@
-use crate::{checksum, CoveError};
+use crate::{
+    checksum,
+    wire::{read_i64_le_checked, read_u32_le_checked, read_u64_le_checked},
+    CoveError,
+};
 
 use super::TEMPORAL_BLOOM_ENTRY_LEN;
 
@@ -23,8 +27,8 @@ impl TemporalBloomIndex {
         if bytes.len() < 8 {
             return Err(CoveError::BufferTooShort);
         }
-        let entry_count = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
-        let flags = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+        let entry_count = read_u32_le_checked(bytes, 0)? as usize;
+        let flags = read_u32_le_checked(bytes, 4)?;
         let entries_len = entry_count
             .checked_mul(TEMPORAL_BLOOM_ENTRY_LEN)
             .ok_or(CoveError::ArithOverflow)?;
@@ -37,23 +41,21 @@ impl TemporalBloomIndex {
         let mut entries = Vec::with_capacity(entry_count);
         let mut pos = 8usize;
         for _ in 0..entry_count {
-            let segment_id = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
-            let time_bucket_start_us =
-                i64::from_le_bytes(bytes[pos + 4..pos + 12].try_into().unwrap());
-            let time_bucket_end_us =
-                i64::from_le_bytes(bytes[pos + 12..pos + 20].try_into().unwrap());
+            let segment_id = read_u32_le_checked(bytes, pos)?;
+            let time_bucket_start_us = read_i64_le_checked(bytes, pos + 4)?;
+            let time_bucket_end_us = read_i64_le_checked(bytes, pos + 12)?;
             if time_bucket_start_us > time_bucket_end_us {
                 return Err(CoveError::BadIndex);
             }
-            let checksum_field = u32::from_le_bytes(bytes[pos + 36..pos + 40].try_into().unwrap());
+            let checksum_field = read_u32_le_checked(bytes, pos + 36)?;
             let mut for_crc = [0u8; TEMPORAL_BLOOM_ENTRY_LEN];
             for_crc.copy_from_slice(&bytes[pos..pos + TEMPORAL_BLOOM_ENTRY_LEN]);
             for_crc[36..40].fill(0);
             if checksum::crc32c(&for_crc) != checksum_field {
                 return Err(CoveError::ChecksumMismatch);
             }
-            let filter_offset = u64::from_le_bytes(bytes[pos + 20..pos + 28].try_into().unwrap());
-            let filter_length = u64::from_le_bytes(bytes[pos + 28..pos + 36].try_into().unwrap());
+            let filter_offset = read_u64_le_checked(bytes, pos + 20)?;
+            let filter_length = read_u64_le_checked(bytes, pos + 28)?;
             let filter_end = filter_offset
                 .checked_add(filter_length)
                 .ok_or(CoveError::ArithOverflow)?;

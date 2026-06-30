@@ -36,6 +36,7 @@ use crate::checksum;
 use crate::constants::{DigestAlgorithm, MAGIC_COVM, POSTSCRIPT_VERSION_V1};
 use crate::digest::compute_digest;
 use crate::error::CoveError;
+use crate::wire;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -167,29 +168,29 @@ impl CovmHeaderV1 {
         if magic != MAGIC_COVM {
             return Err(CoveError::BadMagic);
         }
-        let header_len = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
+        let header_len = wire::read_u16_le_checked(bytes, 4)?;
         if header_len != COVM_HEADER_LEN {
             return Err(CoveError::BadSection(format!(
                 "COVM header_len must be {COVM_HEADER_LEN}, got {header_len}"
             )));
         }
-        let version_major = u16::from_le_bytes(bytes[6..8].try_into().unwrap());
-        let version_minor = u16::from_le_bytes(bytes[8..10].try_into().unwrap());
+        let version_major = wire::read_u16_le_checked(bytes, 6)?;
+        let version_minor = wire::read_u16_le_checked(bytes, 8)?;
         if version_major != COVM_VERSION_MAJOR_V1 {
             return Err(CoveError::BadVersion);
         }
-        let flags = u32::from_le_bytes(bytes[10..14].try_into().unwrap());
+        let flags = wire::read_u32_le_checked(bytes, 10)?;
         let mut dataset_id = [0u8; 16];
         dataset_id.copy_from_slice(&bytes[14..30]);
-        let table_count = u32::from_le_bytes(bytes[30..34].try_into().unwrap());
-        let file_count = u32::from_le_bytes(bytes[34..38].try_into().unwrap());
-        let created_at_us = i64::from_le_bytes(bytes[38..46].try_into().unwrap());
+        let table_count = wire::read_u32_le_checked(bytes, 30)?;
+        let file_count = wire::read_u32_le_checked(bytes, 34)?;
+        let created_at_us = wire::read_i64_le_checked(bytes, 38)?;
         let mut reserved = [0u8; 32];
         reserved.copy_from_slice(&bytes[46..78]);
         if reserved.iter().any(|b| *b != 0) {
             return Err(CoveError::ReservedNotZero);
         }
-        let checksum_field = u32::from_le_bytes(bytes[78..82].try_into().unwrap());
+        let checksum_field = wire::read_u32_le_checked(bytes, 78)?;
 
         let mut for_crc = [0u8; COVM_HEADER_LEN as usize];
         for_crc.copy_from_slice(bytes);
@@ -298,7 +299,7 @@ impl CovmFileEntryV1 {
         }
         let mut file_id = [0u8; 16];
         file_id.copy_from_slice(&bytes[0..16]);
-        let uri_len = u16::from_le_bytes(bytes[16..18].try_into().unwrap()) as usize;
+        let uri_len = wire::read_u16_le_checked(bytes, 16)? as usize;
         let mut pos = 18usize;
 
         let uri_end = pos.checked_add(uri_len).ok_or(CoveError::ArithOverflow)?;
@@ -314,13 +315,13 @@ impl CovmFileEntryV1 {
         if bytes.len() < pos + 8 + 4 + 2 + 2 {
             return Err(CoveError::BufferTooShort);
         }
-        let file_len = u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap());
+        let file_len = wire::read_u64_le_checked(bytes, pos)?;
         pos += 8;
-        let footer_crc32c = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+        let footer_crc32c = wire::read_u32_le_checked(bytes, pos)?;
         pos += 4;
-        let digest_algorithm = u16::from_le_bytes(bytes[pos..pos + 2].try_into().unwrap());
+        let digest_algorithm = wire::read_u16_le_checked(bytes, pos)?;
         pos += 2;
-        let digest_len = u16::from_le_bytes(bytes[pos..pos + 2].try_into().unwrap()) as usize;
+        let digest_len = wire::read_u16_le_checked(bytes, pos)? as usize;
         pos += 2;
 
         let digest_end = pos
@@ -335,15 +336,15 @@ impl CovmFileEntryV1 {
         if bytes.len() < pos + 8 + 4 + 4 + 4 + 4 {
             return Err(CoveError::BufferTooShort);
         }
-        let row_count = u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap());
+        let row_count = wire::read_u64_le_checked(bytes, pos)?;
         pos += 8;
-        let segment_count = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+        let segment_count = wire::read_u32_le_checked(bytes, pos)?;
         pos += 4;
-        let file_stats_ref = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+        let file_stats_ref = wire::read_u32_le_checked(bytes, pos)?;
         pos += 4;
-        let file_exact_set_ref = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+        let file_exact_set_ref = wire::read_u32_le_checked(bytes, pos)?;
         pos += 4;
-        let flags = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+        let flags = wire::read_u32_le_checked(bytes, pos)?;
         pos += 4;
 
         Ok((
@@ -432,9 +433,9 @@ impl CovmPostscriptV1 {
         let tail = &file_data[file_data.len() - total..];
 
         let n = COVM_POSTSCRIPT_LEN as usize;
-        let version = u16::from_le_bytes(tail[n..n + 2].try_into().unwrap());
-        let len = u16::from_le_bytes(tail[n + 2..n + 4].try_into().unwrap());
-        let magic: [u8; 4] = tail[n + 4..n + 8].try_into().unwrap();
+        let version = wire::read_u16_le_checked(tail, n)?;
+        let len = wire::read_u16_le_checked(tail, n + 2)?;
+        let magic = wire::read_array_checked::<4>(tail, n + 4)?;
 
         if magic != MAGIC_COVM {
             return Err(CoveError::BadMagic);
@@ -448,14 +449,14 @@ impl CovmPostscriptV1 {
             )));
         }
 
-        let payload: [u8; COVM_POSTSCRIPT_LEN as usize] = tail[..n].try_into().unwrap();
-        let header_offset = u64::from_le_bytes(payload[0..8].try_into().unwrap());
-        let header_len = u64::from_le_bytes(payload[8..16].try_into().unwrap());
-        let entries_offset = u64::from_le_bytes(payload[16..24].try_into().unwrap());
-        let entries_len = u64::from_le_bytes(payload[24..32].try_into().unwrap());
-        let file_len = u64::from_le_bytes(payload[32..40].try_into().unwrap());
-        let flags = u32::from_le_bytes(payload[40..44].try_into().unwrap());
-        let checksum_field = u32::from_le_bytes(payload[44..48].try_into().unwrap());
+        let payload = wire::read_array_checked::<{ COVM_POSTSCRIPT_LEN as usize }>(tail, 0)?;
+        let header_offset = wire::read_u64_le_checked(&payload, 0)?;
+        let header_len = wire::read_u64_le_checked(&payload, 8)?;
+        let entries_offset = wire::read_u64_le_checked(&payload, 16)?;
+        let entries_len = wire::read_u64_le_checked(&payload, 24)?;
+        let file_len = wire::read_u64_le_checked(&payload, 32)?;
+        let flags = wire::read_u32_le_checked(&payload, 40)?;
+        let checksum_field = wire::read_u32_le_checked(&payload, 44)?;
 
         let mut for_crc = payload;
         for_crc[44..48].fill(0);
@@ -681,18 +682,18 @@ impl CovmAiSidecarExtensionV1 {
         if bytes[0..4] != COVM_AI_SIDECAR_EXTENSION_MAGIC {
             return Err(CoveError::BadMagic);
         }
-        let version_major = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
-        let version_minor = u16::from_le_bytes(bytes[6..8].try_into().unwrap());
+        let version_major = wire::read_u16_le_checked(bytes, 4)?;
+        let version_minor = wire::read_u16_le_checked(bytes, 6)?;
         if version_major != COVM_AI_SIDECAR_EXTENSION_VERSION_MAJOR_V1 {
             return Err(CoveError::BadVersion);
         }
-        let flags = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
-        let ref_count = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
-        let extension_len = u32::from_le_bytes(bytes[16..20].try_into().unwrap()) as usize;
+        let flags = wire::read_u32_le_checked(bytes, 8)?;
+        let ref_count = wire::read_u32_le_checked(bytes, 12)? as usize;
+        let extension_len = wire::read_u32_le_checked(bytes, 16)? as usize;
         if extension_len < COVM_AI_SIDECAR_EXTENSION_HEADER_LEN || extension_len > bytes.len() {
             return Err(CoveError::OffsetRange);
         }
-        let checksum_field = u32::from_le_bytes(bytes[20..24].try_into().unwrap());
+        let checksum_field = wire::read_u32_le_checked(bytes, 20)?;
         let mut for_crc = bytes[..extension_len].to_vec();
         for_crc[20..24].fill(0);
         if checksum::crc32c(&for_crc) != checksum_field {
@@ -787,11 +788,7 @@ impl CovmDeltaArtifactRefV1 {
         let mut checksum_bytes = [0u8; COVM_DELTA_ARTIFACT_REF_LEN];
         checksum_bytes.copy_from_slice(bytes);
         checksum_bytes[COVM_DELTA_ARTIFACT_REF_LEN - 4..].fill(0);
-        let checksum_field = u32::from_le_bytes(
-            bytes[COVM_DELTA_ARTIFACT_REF_LEN - 4..COVM_DELTA_ARTIFACT_REF_LEN]
-                .try_into()
-                .unwrap(),
-        );
+        let checksum_field = wire::read_u32_le_checked(bytes, COVM_DELTA_ARTIFACT_REF_LEN - 4)?;
         if checksum::crc32c(&checksum_bytes) != checksum_field {
             return Err(CoveError::ChecksumMismatch);
         }
@@ -1088,12 +1085,8 @@ impl CovmDeltaChainExtensionV1 {
         let mut checksum_bytes = [0u8; COVM_DELTA_CHAIN_EXTENSION_HEADER_LEN];
         checksum_bytes.copy_from_slice(header);
         checksum_bytes[COVM_DELTA_CHAIN_EXTENSION_HEADER_LEN - 4..].fill(0);
-        let checksum_field = u32::from_le_bytes(
-            header
-                [COVM_DELTA_CHAIN_EXTENSION_HEADER_LEN - 4..COVM_DELTA_CHAIN_EXTENSION_HEADER_LEN]
-                .try_into()
-                .unwrap(),
-        );
+        let checksum_field =
+            wire::read_u32_le_checked(header, COVM_DELTA_CHAIN_EXTENSION_HEADER_LEN - 4)?;
         if checksum::crc32c(&checksum_bytes) != checksum_field {
             return Err(CoveError::ChecksumMismatch);
         }
@@ -1710,11 +1703,8 @@ impl DeltaChainSummaryEntryV1 {
         let mut checksum_bytes = [0u8; COVM_DELTA_CHAIN_SUMMARY_ENTRY_LEN];
         checksum_bytes.copy_from_slice(bytes);
         checksum_bytes[COVM_DELTA_CHAIN_SUMMARY_ENTRY_LEN - 4..].fill(0);
-        let checksum_field = u32::from_le_bytes(
-            bytes[COVM_DELTA_CHAIN_SUMMARY_ENTRY_LEN - 4..COVM_DELTA_CHAIN_SUMMARY_ENTRY_LEN]
-                .try_into()
-                .unwrap(),
-        );
+        let checksum_field =
+            wire::read_u32_le_checked(bytes, COVM_DELTA_CHAIN_SUMMARY_ENTRY_LEN - 4)?;
         if checksum::crc32c(&checksum_bytes) != checksum_field {
             return Err(CoveError::ChecksumMismatch);
         }
@@ -2038,12 +2028,8 @@ impl CovmDeltaChainSummaryV1 {
         let mut checksum_bytes = [0u8; COVM_DELTA_CHAIN_SUMMARY_HEADER_LEN as usize];
         checksum_bytes.copy_from_slice(header);
         checksum_bytes[COVM_DELTA_CHAIN_SUMMARY_HEADER_LEN as usize - 4..].fill(0);
-        let checksum_field = u32::from_le_bytes(
-            header[COVM_DELTA_CHAIN_SUMMARY_HEADER_LEN as usize - 4
-                ..COVM_DELTA_CHAIN_SUMMARY_HEADER_LEN as usize]
-                .try_into()
-                .unwrap(),
-        );
+        let checksum_field =
+            wire::read_u32_le_checked(header, COVM_DELTA_CHAIN_SUMMARY_HEADER_LEN as usize - 4)?;
         if checksum::crc32c(&checksum_bytes) != checksum_field {
             return Err(CoveError::ChecksumMismatch);
         }
@@ -2833,42 +2819,26 @@ fn put_bytes(buf: &mut [u8], pos: &mut usize, value: &[u8]) {
 }
 
 fn take_u16(bytes: &[u8], pos: &mut usize) -> Result<u16, CoveError> {
-    let end = (*pos).checked_add(2).ok_or(CoveError::ArithOverflow)?;
-    if end > bytes.len() {
-        return Err(CoveError::BufferTooShort);
-    }
-    let value = u16::from_le_bytes(bytes[*pos..end].try_into().unwrap());
-    *pos = end;
+    let value = wire::read_u16_le_checked(bytes, *pos)?;
+    *pos = (*pos).checked_add(2).ok_or(CoveError::ArithOverflow)?;
     Ok(value)
 }
 
 fn take_u32(bytes: &[u8], pos: &mut usize) -> Result<u32, CoveError> {
-    let end = (*pos).checked_add(4).ok_or(CoveError::ArithOverflow)?;
-    if end > bytes.len() {
-        return Err(CoveError::BufferTooShort);
-    }
-    let value = u32::from_le_bytes(bytes[*pos..end].try_into().unwrap());
-    *pos = end;
+    let value = wire::read_u32_le_checked(bytes, *pos)?;
+    *pos = (*pos).checked_add(4).ok_or(CoveError::ArithOverflow)?;
     Ok(value)
 }
 
 fn take_u64(bytes: &[u8], pos: &mut usize) -> Result<u64, CoveError> {
-    let end = (*pos).checked_add(8).ok_or(CoveError::ArithOverflow)?;
-    if end > bytes.len() {
-        return Err(CoveError::BufferTooShort);
-    }
-    let value = u64::from_le_bytes(bytes[*pos..end].try_into().unwrap());
-    *pos = end;
+    let value = wire::read_u64_le_checked(bytes, *pos)?;
+    *pos = (*pos).checked_add(8).ok_or(CoveError::ArithOverflow)?;
     Ok(value)
 }
 
 fn take_i64(bytes: &[u8], pos: &mut usize) -> Result<i64, CoveError> {
-    let end = (*pos).checked_add(8).ok_or(CoveError::ArithOverflow)?;
-    if end > bytes.len() {
-        return Err(CoveError::BufferTooShort);
-    }
-    let value = i64::from_le_bytes(bytes[*pos..end].try_into().unwrap());
-    *pos = end;
+    let value = wire::read_i64_le_checked(bytes, *pos)?;
+    *pos = (*pos).checked_add(8).ok_or(CoveError::ArithOverflow)?;
     Ok(value)
 }
 
@@ -2883,8 +2853,9 @@ fn take_bytes<'a>(bytes: &'a [u8], pos: &mut usize, len: usize) -> Result<&'a [u
 }
 
 fn take_array<const N: usize>(bytes: &[u8], pos: &mut usize) -> Result<[u8; N], CoveError> {
-    let slice = take_bytes(bytes, pos, N)?;
-    Ok(slice.try_into().unwrap())
+    let out = wire::read_array_checked(bytes, *pos)?;
+    *pos = (*pos).checked_add(N).ok_or(CoveError::ArithOverflow)?;
+    Ok(out)
 }
 
 fn covm_delta_required_digest_algorithm(

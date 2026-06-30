@@ -668,11 +668,8 @@ fn collect_association_exprs<'a>(
                 collect_association_exprs(arg, out);
             }
         }
-        ResolvedExpr::AggregateCall { arg, .. } => {
-            if let Some(arg) = arg {
-                collect_association_exprs(arg, out);
-            }
-        }
+        ResolvedExpr::AggregateCall { arg: Some(arg), .. } => collect_association_exprs(arg, out),
+        ResolvedExpr::AggregateCall { arg: None, .. } => {}
         ResolvedExpr::Conditional {
             predicate,
             then_expr,
@@ -803,10 +800,10 @@ fn association_valid_interval_contains(
 ) -> bool {
     let starts_before_or_at = valid_from
         .and_then(timestamp_micros_from_value)
-        .map_or(true, |from| from <= valid_at);
+        .is_none_or(|from| from <= valid_at);
     let ends_after = valid_to
         .and_then(timestamp_micros_from_value)
-        .map_or(true, |to| valid_at < to);
+        .is_none_or(|to| valid_at < to);
     starts_before_or_at && ends_after
 }
 

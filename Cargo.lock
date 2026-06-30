@@ -750,6 +750,7 @@ dependencies = [
  "coveql",
  "csv",
  "parquet",
+ "serde",
  "serde_json",
 ]
 
@@ -807,6 +808,7 @@ dependencies = [
  "arrow-schema",
  "bytes",
  "cove-arrow",
+ "cove-convert",
  "cove-core",
  "cove-datafusion",
  "orc-rust",

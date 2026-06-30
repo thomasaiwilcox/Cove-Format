@@ -1,17 +1,50 @@
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, fmt};
 
-use cove_core::profile::cove_o::{
-    reconstruct_object_states, CoveObjectReconstructionOptions, CoveObjectState, CoveObjectSurface,
+use cove_core::{
+    error::CoveError,
+    profile::cove_o::{
+        reconstruct_object_states, CoveObjectReconstructionOptions, CoveObjectState,
+        CoveObjectSurface,
+    },
 };
 
 use crate::kernel_predicate::SelectionVector;
+
+#[derive(Debug)]
+pub(crate) enum KernelReconstructError {
+    ObjectReconstruction(CoveError),
+}
+
+impl fmt::Display for KernelReconstructError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ObjectReconstruction(err) => {
+                write!(f, "kernel object reconstruction failed: {err}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for KernelReconstructError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ObjectReconstruction(err) => Some(err),
+        }
+    }
+}
+
+impl From<CoveError> for KernelReconstructError {
+    fn from(err: CoveError) -> Self {
+        Self::ObjectReconstruction(err)
+    }
+}
 
 pub(crate) fn reconstruct_selected_object_states(
     surface: &CoveObjectSurface,
     selection: &SelectionVector,
     options: &CoveObjectReconstructionOptions,
     retained_object_type_ids: &BTreeSet<u32>,
-) -> Result<(Vec<CoveObjectState>, usize, usize), String> {
+) -> Result<(Vec<CoveObjectState>, usize, usize), KernelReconstructError> {
     let mut selected_keys = selection
         .rows()
         .iter()
@@ -48,7 +81,6 @@ pub(crate) fn reconstruct_selected_object_states(
         embedded_function_ids: surface.embedded_function_ids.clone(),
         embedded_map_sections: surface.embedded_map_sections.clone(),
     };
-    let states = reconstruct_object_states(&selected_surface, options)
-        .map_err(|err| format!("kernel object reconstruction failed: {err}"))?;
+    let states = reconstruct_object_states(&selected_surface, options)?;
     Ok((states, candidate_object_keys, retained_record_chain_rows))
 }

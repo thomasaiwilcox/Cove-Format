@@ -610,6 +610,7 @@ enum CoveRecordBatchStreamInner {
 }
 
 impl CoveRecordBatchStream {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_streaming(
         schema: SchemaRef,
         state: Arc<DatasetState>,
@@ -663,6 +664,7 @@ impl CoveRecordBatchStream {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_buffered(
         schema: SchemaRef,
         state: Arc<DatasetState>,

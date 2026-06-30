@@ -6,7 +6,13 @@
 
 use std::cmp::Ordering;
 
-use crate::{canonical::validate_canonical_payload, checksum, constants::ValueTag, CoveError};
+use crate::{
+    canonical::validate_canonical_payload,
+    checksum,
+    constants::ValueTag,
+    wire::{read_u16_le_checked, read_u32_le_checked, read_u64_le_checked},
+    CoveError,
+};
 
 use super::{checked_region, verify_checksum_field};
 
@@ -332,24 +338,24 @@ impl AggregateEntry {
         let checksum = verify_checksum_field(bytes, 44)?;
         let synopsis_kind = SynopsisKind::from_u8(bytes[16]).ok_or(CoveError::BadIndex)?;
         let accuracy = SynopsisAccuracy::from_u8(bytes[18]).ok_or(CoveError::BadIndex)?;
-        let row_count = u32::from_le_bytes(bytes[20..24].try_into().unwrap());
-        let null_count = u32::from_le_bytes(bytes[24..28].try_into().unwrap());
+        let row_count = read_u32_le_checked(bytes, 20)?;
+        let null_count = read_u32_le_checked(bytes, 24)?;
         if null_count > row_count {
             return Err(CoveError::BadIndex);
         }
         Ok(Self {
-            table_id: u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
-            segment_id: u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
-            morsel_id: u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
-            column_id: u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
+            table_id: read_u32_le_checked(bytes, 0)?,
+            segment_id: read_u32_le_checked(bytes, 4)?,
+            morsel_id: read_u32_le_checked(bytes, 8)?,
+            column_id: read_u32_le_checked(bytes, 12)?,
             synopsis_kind,
             key_kind: bytes[17],
             accuracy,
             flags: bytes[19],
             row_count,
             null_count,
-            payload_offset: u64::from_le_bytes(bytes[28..36].try_into().unwrap()),
-            payload_length: u64::from_le_bytes(bytes[36..44].try_into().unwrap()),
+            payload_offset: read_u64_le_checked(bytes, 28)?,
+            payload_length: read_u64_le_checked(bytes, 36)?,
             checksum,
         })
     }
@@ -1052,8 +1058,8 @@ fn parse_payload(entry: &AggregateEntry, bytes: &[u8]) -> Result<AggregatePayloa
                 return Err(CoveError::BadIndex);
             }
             AggregatePayloadV2::BoolTrueFalseCounts {
-                true_count: u64::from_le_bytes(data[0..8].try_into().unwrap()),
-                false_count: u64::from_le_bytes(data[8..16].try_into().unwrap()),
+                true_count: read_u64_le_checked(data, 0)?,
+                false_count: read_u64_le_checked(data, 8)?,
             }
         }
         SynopsisKind::FileCodeHistogram => AggregatePayloadV2::FileCodeHistogram {
@@ -1122,8 +1128,8 @@ fn parse_payload_header(bytes: &[u8]) -> Result<(AggregatePayloadHeader, &[u8]),
         return Err(CoveError::BadVersion);
     }
     let kind = SynopsisKind::from_u8(bytes[4]).ok_or(CoveError::BadIndex)?;
-    let data_len = u32::from_le_bytes(bytes[20..24].try_into().unwrap());
-    let checksum = u32::from_le_bytes(bytes[24..28].try_into().unwrap());
+    let data_len = read_u32_le_checked(bytes, 20)?;
+    let checksum = read_u32_le_checked(bytes, 24)?;
     let data_len_usize = usize::try_from(data_len).map_err(|_| CoveError::OffsetRange)?;
     let expected_len = AGGREGATE_PAYLOAD_HEADER_LEN
         .checked_add(data_len_usize)
@@ -1139,10 +1145,10 @@ fn parse_payload_header(bytes: &[u8]) -> Result<(AggregatePayloadHeader, &[u8]),
     Ok((
         AggregatePayloadHeader {
             kind,
-            flags: u16::from_le_bytes(bytes[6..8].try_into().unwrap()),
-            item_count: u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
-            aux0: u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
-            aux1: u32::from_le_bytes(bytes[16..20].try_into().unwrap()),
+            flags: read_u16_le_checked(bytes, 6)?,
+            item_count: read_u32_le_checked(bytes, 8)?,
+            aux0: read_u32_le_checked(bytes, 12)?,
+            aux1: read_u32_le_checked(bytes, 16)?,
             data_len,
             checksum,
         },
@@ -1219,8 +1225,8 @@ fn parse_buckets(data: &[u8], item_count: u32) -> Result<Vec<HistogramBucket>, C
     let mut buckets = Vec::with_capacity(item_count as usize);
     for chunk in data.chunks_exact(16) {
         buckets.push(HistogramBucket {
-            key: u64::from_le_bytes(chunk[0..8].try_into().unwrap()),
-            count: u64::from_le_bytes(chunk[8..16].try_into().unwrap()),
+            key: read_u64_le_checked(chunk, 0)?,
+            count: read_u64_le_checked(chunk, 8)?,
         });
     }
     Ok(buckets)
@@ -1250,19 +1256,22 @@ impl<'a> Cursor<'a> {
         Ok(out)
     }
 
+    fn array<const N: usize>(&mut self) -> Result<[u8; N], CoveError> {
+        let mut out = [0u8; N];
+        out.copy_from_slice(self.bytes(N)?);
+        Ok(out)
+    }
+
     fn u16(&mut self) -> Result<u16, CoveError> {
-        let bytes: [u8; 2] = self.bytes(2)?.try_into().unwrap();
-        Ok(u16::from_le_bytes(bytes))
+        Ok(u16::from_le_bytes(self.array()?))
     }
 
     fn u32(&mut self) -> Result<u32, CoveError> {
-        let bytes: [u8; 4] = self.bytes(4)?.try_into().unwrap();
-        Ok(u32::from_le_bytes(bytes))
+        Ok(u32::from_le_bytes(self.array()?))
     }
 
     fn u64(&mut self) -> Result<u64, CoveError> {
-        let bytes: [u8; 8] = self.bytes(8)?.try_into().unwrap();
-        Ok(u64::from_le_bytes(bytes))
+        Ok(u64::from_le_bytes(self.array()?))
     }
 }
 

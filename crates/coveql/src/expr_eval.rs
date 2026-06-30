@@ -920,12 +920,11 @@ pub(crate) fn stable_value_key(value: &Value) -> String {
 }
 
 pub(crate) fn logical_value_key(value: &Value, logical_type: Option<&str>) -> String {
-    if (is_numeric_type(logical_type) || value.is_number()) && parse_decimal_value(value).is_some()
-    {
-        let decimal = parse_decimal_value(value)
-            .expect("checked above")
-            .normalized();
-        return format!("number:{}:{}", decimal.scale, decimal.value);
+    if is_numeric_type(logical_type) || value.is_number() {
+        if let Some(decimal) = parse_decimal_value(value) {
+            let decimal = decimal.normalized();
+            return format!("number:{}:{}", decimal.scale, decimal.value);
+        }
     }
     stable_value_key(value)
 }

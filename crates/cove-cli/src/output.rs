@@ -20,7 +20,11 @@ pub(crate) fn write_result(
 ) -> Result<(), String> {
     match format {
         OutputFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(value).unwrap());
+            println!(
+                "{}",
+                serde_json::to_string_pretty(value)
+                    .map_err(|error| format!("cannot serialize JSON output: {error}"))?
+            );
             Ok(())
         }
         OutputFormat::Jsonl => write_jsonl(value),
@@ -38,7 +42,7 @@ fn rows_array(value: &Value) -> Result<&[Value], String> {
 
 fn write_jsonl(value: &Value) -> Result<(), String> {
     for row in rows_array(value)? {
-        println!("{}", serde_json::to_string(row).unwrap());
+        println!("{row}");
     }
     Ok(())
 }

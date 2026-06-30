@@ -8,6 +8,11 @@ use crate::{
     feature_binding::{FeatureScopeV2, OperationKindV2, SectionFeatureBindingSectionV2},
     footer::{CoveFooter, CoveSectionEntryV1},
     header::CoveHeaderV1,
+    wire::{
+        read_array_checked as read_array, read_u16_le_checked as read_u16,
+        read_u32_le_checked as read_u32, read_u64_le_checked as read_u64,
+        read_u8_checked as read_u8,
+    },
     CoveError,
 };
 
@@ -1041,10 +1046,13 @@ fn read_words(bytes: &[u8]) -> Result<Vec<u64>, CoveError> {
             "feature word byte length is not a multiple of 8".into(),
         ));
     }
-    Ok(bytes
-        .chunks_exact(8)
-        .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
-        .collect())
+    let mut words = Vec::with_capacity(bytes.len() / 8);
+    for chunk in bytes.chunks_exact(8) {
+        let mut word_bytes = [0u8; 8];
+        word_bytes.copy_from_slice(chunk);
+        words.push(u64::from_le_bytes(word_bytes));
+    }
+    Ok(words)
 }
 
 fn verify_crc(bytes: &[u8], checksum_offset: usize, expected: u32) -> Result<(), CoveError> {
@@ -1054,33 +1062,6 @@ fn verify_crc(bytes: &[u8], checksum_offset: usize, expected: u32) -> Result<(),
         return Err(CoveError::ChecksumMismatch);
     }
     Ok(())
-}
-
-fn read_u8(bytes: &[u8], offset: usize) -> Result<u8, CoveError> {
-    if offset >= bytes.len() {
-        return Err(CoveError::BufferTooShort);
-    }
-    Ok(bytes[offset])
-}
-
-fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, CoveError> {
-    Ok(u16::from_le_bytes(read_array(bytes, offset)?))
-}
-
-fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, CoveError> {
-    Ok(u32::from_le_bytes(read_array(bytes, offset)?))
-}
-
-fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, CoveError> {
-    Ok(u64::from_le_bytes(read_array(bytes, offset)?))
-}
-
-fn read_array<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N], CoveError> {
-    let end = offset.checked_add(N).ok_or(CoveError::ArithOverflow)?;
-    if end > bytes.len() {
-        return Err(CoveError::BufferTooShort);
-    }
-    Ok(bytes[offset..end].try_into().unwrap())
 }
 
 #[cfg(test)]

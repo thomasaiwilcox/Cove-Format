@@ -326,6 +326,7 @@ impl CoveQlQueryBuilder {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn lookup_with_options(
         mut self,
         table_name: impl AsRef<str>,
@@ -868,6 +869,7 @@ impl CoveQlQueryBuilder {
         self
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn with_recursive_table_step(
         mut self,
         name: impl AsRef<str>,
@@ -1097,10 +1099,8 @@ impl CoveQlQueryBuilder {
     }
 
     pub fn explain(mut self, mode: ExplainMode) -> Self {
-        self.methods.push(format!(
-            "explain({})",
-            coveql_string_literal(explain_mode_name(mode))
-        ));
+        self.methods
+            .push(format!("explain({})", coveql_string_literal(mode.as_str())));
         self
     }
 
@@ -1492,16 +1492,5 @@ fn aggregate_function_name(name: AstAggregateName) -> &'static str {
         AstAggregateName::Avg => "avg",
         AstAggregateName::Min => "min",
         AstAggregateName::Max => "max",
-    }
-}
-
-fn explain_mode_name(mode: ExplainMode) -> &'static str {
-    match mode {
-        ExplainMode::Public => "public",
-        ExplainMode::Developer => "developer",
-        ExplainMode::Proof => "proof",
-        ExplainMode::Coded => "coded",
-        ExplainMode::Ai => "ai",
-        ExplainMode::Forensic => "forensic",
     }
 }

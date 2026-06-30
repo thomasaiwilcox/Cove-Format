@@ -22,7 +22,7 @@ impl PlainFixedPayload {
         let mut values = Vec::with_capacity(n);
         for i in 0..n {
             let off = i * 8;
-            values.push(i64::from_le_bytes(bytes[off..off + 8].try_into().unwrap()));
+            values.push(wire::read_i64_le_checked(bytes, off)?);
         }
         Ok(Self { values })
     }

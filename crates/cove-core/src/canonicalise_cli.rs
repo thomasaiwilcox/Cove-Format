@@ -1,4 +1,4 @@
-use std::{fs, path::PathBuf};
+use std::{error::Error, fmt, fs, path::PathBuf};
 
 use crate::{
     canonical::{validate_canonical_payload, CanonicalValue},
@@ -9,12 +9,45 @@ use crate::{
 };
 use serde_json::{json, Value};
 
-pub fn run(args: Vec<String>) -> Result<bool, String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicaliseCliError {
+    message: String,
+}
+
+impl CanonicaliseCliError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for CanonicaliseCliError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl Error for CanonicaliseCliError {}
+
+impl From<String> for CanonicaliseCliError {
+    fn from(message: String) -> Self {
+        Self::new(message)
+    }
+}
+
+impl From<&str> for CanonicaliseCliError {
+    fn from(message: &str) -> Self {
+        Self::new(message)
+    }
+}
+
+pub fn run(args: Vec<String>) -> Result<bool, CanonicaliseCliError> {
     let Some((command, rest)) = args.split_first() else {
         print_usage();
         return Ok(true);
     };
-    match command.as_str() {
+    let result = match command.as_str() {
         "validate-payload" => validate_payload(rest),
         "encode-json" => encode_json(rest),
         "check-domain" => check_file(rest, SectionKind::ColumnDomain, "domain"),
@@ -24,7 +57,8 @@ pub fn run(args: Vec<String>) -> Result<bool, String> {
             Ok(true)
         }
         _ => Err(format!("unknown command {command}")),
-    }
+    };
+    result.map_err(CanonicaliseCliError::from)
 }
 
 fn validate_payload(args: &[String]) -> Result<bool, String> {

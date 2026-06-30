@@ -10,6 +10,7 @@ use crate::explain::{
     execute_planned_scan, parse_filter_dsl, parse_projection_dsl, plan_bytes, plan_local_file,
     ExplainOptions, FilterDsl, FilterOp,
 };
+use crate::DatafusionCliError;
 use arrow_ipc::writer::FileWriter;
 use arrow_json::writer::{LineDelimited, WriterBuilder};
 use arrow_schema::SchemaRef;
@@ -40,31 +41,36 @@ struct DeltaExportOptions {
     plan_json: bool,
 }
 
-pub fn run(args: Vec<String>) -> Result<(), String> {
-    let Some((input, output, options, format, report, delta_options)) = parse_args(args)? else {
+pub fn run(args: Vec<String>) -> Result<(), DatafusionCliError> {
+    let Some(parsed) = parse_args(args)? else {
         print_usage();
         return Ok(());
     };
-    let input_bytes =
-        std::fs::read(&input).map_err(|err| format!("cannot read {}: {err}", input.display()))?;
+    let input_bytes = std::fs::read(&parsed.input)
+        .map_err(|err| format!("cannot read {}: {err}", parsed.input.display()))?;
     let delta_manifest = delta_chain_required(&input_bytes).unwrap_or(false);
     let mut delta_report = None;
     let mut delta_execution = None;
     let (source, schema, batches, rows, columns, decode_stats) = if delta_manifest {
-        let dataset = delta_options
+        let dataset = parsed
+            .delta_options
             .dataset
             .as_deref()
             .ok_or_else(|| "delta manifest export requires --dataset <dir>".to_string())?;
-        let snapshot = load_validated_delta_snapshot(&input, dataset, delta_options.request)?;
-        let plan_json = delta_snapshot_plan_json(Some(&input), &snapshot.plan, &snapshot.extension);
-        if delta_options.plan_json {
-            eprintln!("{}", serde_json::to_string_pretty(&plan_json).unwrap());
+        let snapshot =
+            load_validated_delta_snapshot(&parsed.input, dataset, parsed.delta_options.request)?;
+        let plan_json =
+            delta_snapshot_plan_json(Some(&parsed.input), &snapshot.plan, &snapshot.extension);
+        if parsed.delta_options.plan_json {
+            let text = serde_json::to_string_pretty(&plan_json)
+                .map_err(|err| format!("cannot serialize delta plan report: {err}"))?;
+            eprintln!("{text}");
         }
         delta_report = Some(plan_json);
-        if let Some(direct) = try_direct_delta_projection_export(&snapshot, &options)? {
+        if let Some(direct) = try_direct_delta_projection_export(&snapshot, &parsed.options)? {
             delta_execution = Some("direct_projection_surface");
             (
-                format!("{}#delta-projection-surface", input.display()),
+                format!("{}#delta-projection-surface", parsed.input.display()),
                 direct.schema,
                 direct.batches,
                 direct.rows,
@@ -74,9 +80,9 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
         } else {
             let materialized = materialize_validated_delta_snapshot(&snapshot)?;
             let planned = plan_bytes(
-                format!("{}#delta-snapshot", input.display()),
+                format!("{}#delta-snapshot", parsed.input.display()),
                 materialized.bytes,
-                options,
+                parsed.options,
             )
             .map_err(|err| err.to_string())?;
             let decoded = execute_planned_scan(&planned).map_err(|err| err.to_string())?;
@@ -93,10 +99,13 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
             )
         }
     } else {
-        if delta_options.request != CovmDeltaPruneRequest::default() || delta_options.plan_json {
+        if parsed.delta_options.request != CovmDeltaPruneRequest::default()
+            || parsed.delta_options.plan_json
+        {
             return Err("delta snapshot options require a COVM delta manifest input".into());
         }
-        let planned = plan_local_file(&input, options).map_err(|err| err.to_string())?;
+        let planned =
+            plan_local_file(&parsed.input, parsed.options).map_err(|err| err.to_string())?;
         let decoded = execute_planned_scan(&planned).map_err(|err| err.to_string())?;
         let schema = planned.plan.output_schema.clone();
         let rows = decoded.stats.rows_materialized;
@@ -110,18 +119,18 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
             decode_stats_json(&decoded.stats),
         )
     };
-    let bytes = match format {
+    let bytes = match parsed.format {
         OutputFormat::Ipc => write_ipc(&schema, &batches)?,
         OutputFormat::Json => write_json(&batches)?,
     };
-    durable::durable_replace(&output, &bytes)
-        .map_err(|err| format!("cannot durably publish {}: {err}", output.display()))?;
+    durable::durable_replace(&parsed.output, &bytes)
+        .map_err(|err| format!("cannot durably publish {}: {err}", parsed.output.display()))?;
 
     let report_json = json!({
         "version": 1,
         "source": source,
-        "output": output.display().to_string(),
-        "format": match format { OutputFormat::Ipc => "ipc", OutputFormat::Json => "json" },
+        "output": parsed.output.display().to_string(),
+        "format": match parsed.format { OutputFormat::Ipc => "ipc", OutputFormat::Json => "json" },
         "execution": "native_arrow_export",
         "delta_execution": delta_execution,
         "batches": batches.len(),
@@ -130,7 +139,7 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
         "decode_stats": decode_stats,
         "delta_snapshot": delta_report,
     });
-    if let Some(target) = report {
+    if let Some(target) = parsed.report {
         let text = serde_json::to_string_pretty(&report_json)
             .map_err(|err| format!("cannot serialize export report: {err}"))?;
         match target {
@@ -142,20 +151,17 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
     Ok(())
 }
 
-#[allow(clippy::type_complexity)]
-fn parse_args(
-    args: Vec<String>,
-) -> Result<
-    Option<(
-        PathBuf,
-        PathBuf,
-        ExplainOptions,
-        OutputFormat,
-        Option<ReportTarget>,
-        DeltaExportOptions,
-    )>,
-    String,
-> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExportArgs {
+    input: PathBuf,
+    output: PathBuf,
+    options: ExplainOptions,
+    format: OutputFormat,
+    report: Option<ReportTarget>,
+    delta_options: DeltaExportOptions,
+}
+
+fn parse_args(args: Vec<String>) -> Result<Option<ExportArgs>, String> {
     let mut options = ExplainOptions::default();
     let mut format = OutputFormat::Ipc;
     let mut report = None;
@@ -214,14 +220,14 @@ fn parse_args(
     if positional.len() != 2 {
         return Err("expected <input.cove> and <output.arrow|output.json>".into());
     }
-    Ok(Some((
-        positional.remove(0),
-        positional.remove(0),
+    Ok(Some(ExportArgs {
+        input: positional.remove(0),
+        output: positional.remove(0),
         options,
         format,
         report,
         delta_options,
-    )))
+    }))
 }
 
 struct DirectDeltaProjectionExport {
@@ -255,7 +261,8 @@ fn try_direct_delta_projection_export(
         catalog,
         &projection.projection_id,
         &projection_options,
-    )?;
+    )
+    .map_err(|err| err.to_string())?;
     let schema = batches
         .first()
         .map(arrow_array::RecordBatch::schema)
@@ -447,7 +454,7 @@ fn direct_projection_decode_stats(rows: usize) -> serde_json::Value {
 pub fn write_ipc(
     schema: &arrow_schema::SchemaRef,
     batches: &[arrow_array::RecordBatch],
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, DatafusionCliError> {
     let mut bytes = Vec::new();
     {
         let mut writer =
@@ -464,7 +471,7 @@ pub fn write_ipc(
     Ok(bytes)
 }
 
-pub fn write_json(batches: &[arrow_array::RecordBatch]) -> Result<Vec<u8>, String> {
+pub fn write_json(batches: &[arrow_array::RecordBatch]) -> Result<Vec<u8>, DatafusionCliError> {
     let mut writer = WriterBuilder::new()
         .with_explicit_nulls(true)
         .build::<_, LineDelimited>(Vec::new());

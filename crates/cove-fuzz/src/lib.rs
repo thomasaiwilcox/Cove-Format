@@ -6,7 +6,8 @@
 
 use std::{
     collections::BTreeSet,
-    fs,
+    error::Error,
+    fmt, fs,
     panic::{catch_unwind, AssertUnwindSafe},
     path::{Path, PathBuf},
 };
@@ -108,6 +109,26 @@ pub enum Command {
     Help,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandKind {
+    Smoke,
+    Corpus,
+    Parsers,
+    Encodings,
+}
+
+impl CommandKind {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "smoke" => Some(Self::Smoke),
+            "corpus" => Some(Self::Corpus),
+            "parsers" => Some(Self::Parsers),
+            "encodings" => Some(Self::Encodings),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CampaignStats {
     pub campaign: &'static str,
@@ -140,14 +161,56 @@ impl std::fmt::Display for FuzzFailure {
 
 impl std::error::Error for FuzzFailure {}
 
-pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<(), String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FuzzCliError {
+    Usage(String),
+    Campaign(FuzzFailure),
+}
+
+impl fmt::Display for FuzzCliError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Usage(message) => f.write_str(message),
+            Self::Campaign(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl Error for FuzzCliError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Usage(_) => None,
+            Self::Campaign(error) => Some(error),
+        }
+    }
+}
+
+impl From<String> for FuzzCliError {
+    fn from(message: String) -> Self {
+        Self::Usage(message)
+    }
+}
+
+impl From<&str> for FuzzCliError {
+    fn from(message: &str) -> Self {
+        Self::Usage(message.into())
+    }
+}
+
+impl From<FuzzFailure> for FuzzCliError {
+    fn from(error: FuzzFailure) -> Self {
+        Self::Campaign(error)
+    }
+}
+
+pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<(), FuzzCliError> {
     match parse_args(args)? {
         Command::Help => {
             print_usage();
             Ok(())
         }
         Command::Smoke { seed, mutations } => {
-            let stats = run_smoke(seed, mutations).map_err(|err| err.to_string())?;
+            let stats = run_smoke(seed, mutations)?;
             print_stats(&stats);
             Ok(())
         }
@@ -156,24 +219,24 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<(), String> {
             seed,
             mutations,
         } => {
-            let stats = run_corpus(&manifest, seed, mutations).map_err(|err| err.to_string())?;
+            let stats = run_corpus(&manifest, seed, mutations)?;
             print_stats(&stats);
             Ok(())
         }
         Command::Parsers { seed, mutations } => {
-            let stats = run_parsers(seed, mutations).map_err(|err| err.to_string())?;
+            let stats = run_parsers(seed, mutations)?;
             print_stats(&stats);
             Ok(())
         }
         Command::Encodings { seed, mutations } => {
-            let stats = run_encodings(seed, mutations).map_err(|err| err.to_string())?;
+            let stats = run_encodings(seed, mutations)?;
             print_stats(&stats);
             Ok(())
         }
     }
 }
 
-pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, String> {
+pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, FuzzCliError> {
     let mut command = None;
     let mut manifest = None;
     let mut seed = DEFAULT_SEED;
@@ -198,42 +261,43 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, Str
                         .map_err(|_| format!("invalid mutation count '{raw}'"))?,
                 );
             }
-            "smoke" | "corpus" | "parsers" | "encodings" => {
-                if command.replace(arg).is_some() {
-                    return Err("only one subcommand may be provided".into());
-                }
-            }
-            other if other.starts_with('-') => return Err(format!("unknown option {other}")),
-            path => {
-                if command.as_deref() != Some("corpus") {
-                    return Err(format!("unknown subcommand {path}"));
-                }
-                if manifest.replace(PathBuf::from(path)).is_some() {
-                    return Err("only one manifest path may be provided".into());
+            raw => {
+                if let Some(parsed) = CommandKind::parse(raw) {
+                    if command.replace(parsed).is_some() {
+                        return Err("only one subcommand may be provided".into());
+                    }
+                } else if raw.starts_with('-') {
+                    return Err(FuzzCliError::from(format!("unknown option {raw}")));
+                } else {
+                    if command != Some(CommandKind::Corpus) {
+                        return Err(FuzzCliError::from(format!("unknown subcommand {raw}")));
+                    }
+                    if manifest.replace(PathBuf::from(raw)).is_some() {
+                        return Err("only one manifest path may be provided".into());
+                    }
                 }
             }
         }
     }
 
-    match command.unwrap_or("smoke".to_string()).as_str() {
-        "smoke" => Ok(Command::Smoke {
+    match command.unwrap_or(CommandKind::Smoke) {
+        CommandKind::Smoke => Ok(Command::Smoke {
             seed,
             mutations: mutations.unwrap_or(SMOKE_MUTATIONS),
         }),
-        "corpus" => Ok(Command::Corpus {
+        CommandKind::Corpus => Ok(Command::Corpus {
             manifest: manifest.unwrap_or_else(|| PathBuf::from("conformance/manifest.jsonl")),
             seed,
             mutations: mutations.unwrap_or(CORPUS_MUTATIONS),
         }),
-        "parsers" => Ok(Command::Parsers {
+        CommandKind::Parsers => Ok(Command::Parsers {
             seed,
             mutations: mutations.unwrap_or(PARSER_MUTATIONS),
         }),
-        "encodings" => Ok(Command::Encodings {
+        CommandKind::Encodings => Ok(Command::Encodings {
             seed,
             mutations: mutations.unwrap_or(PARSER_MUTATIONS),
         }),
-        other => Err(format!("unknown subcommand {other}")),
     }
 }
 
@@ -577,11 +641,10 @@ fn run_encoding_parity(seed: u64, stats: &mut CampaignStats) -> Result<(), FuzzF
         })
     })?;
     assert_encoding("local-codebook-bit-packed", seed, 0, stats, || {
+        let indexes = BitPackedPayload::pack(&[0, 1, 2, 1, 0], 2)?;
         assert_parity::<LocalCodebook>(&LocalCodebookPayload {
             values: LocalCodebookValues::FileCode(vec![100, 200, 300]),
-            indexes: LocalIndexPayload::BitPacked(
-                BitPackedPayload::pack(&[0, 1, 2, 1, 0], 2).unwrap(),
-            ),
+            indexes: LocalIndexPayload::BitPacked(indexes),
         })
     })?;
     assert_encoding("local-codebook-rle", seed, 0, stats, || {
@@ -1095,7 +1158,7 @@ fn validate_file_dictionary_fixture(bytes: &[u8]) -> Result<(), CoveError> {
     if bytes.len() < 4 {
         return Err(CoveError::BufferTooShort);
     }
-    let index_len = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+    let index_len = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
     let split = 4usize
         .checked_add(index_len)
         .ok_or(CoveError::ArithOverflow)?;
@@ -1448,6 +1511,16 @@ mod tests {
     #[test]
     fn rejects_unknown_subcommand() {
         assert!(parse_args(["unknown".to_string()]).is_err());
+    }
+
+    #[test]
+    fn rejects_duplicate_subcommands() {
+        assert_eq!(
+            parse_args(["smoke".to_string(), "parsers".to_string()])
+                .unwrap_err()
+                .to_string(),
+            "only one subcommand may be provided"
+        );
     }
 
     #[test]

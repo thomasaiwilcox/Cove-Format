@@ -148,7 +148,7 @@ pub struct QuerySuggestion {
     pub description: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ExecuteArtifactOptions {
     pub parse_options: ParseOptions,
     pub resolve_options: ResolveOptions,
@@ -160,34 +160,15 @@ pub struct ExecuteArtifactOptions {
     pub manifest_scope_options: ManifestDatasetScopeOptions,
 }
 
-impl Default for ExecuteArtifactOptions {
-    fn default() -> Self {
-        Self {
-            parse_options: ParseOptions::default(),
-            resolve_options: ResolveOptions::default(),
-            plan_options: PlanOptions::default(),
-            execution_engine: ArtifactExecutionEngine::default(),
-            execution_options: ExecutionOptions::default(),
-            validation_options: ValidationOptions::default(),
-            manifest_members: Vec::new(),
-            manifest_scope_options: ManifestDatasetScopeOptions::default(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum ArtifactExecutionEngine {
+    #[default]
     Materialized,
     Physical {
         physical_options: PhysicalPlanOptions,
         kernel_options: KernelExecutionOptions,
     },
-}
-
-impl Default for ArtifactExecutionEngine {
-    fn default() -> Self {
-        Self::Materialized
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -1145,10 +1126,12 @@ fn parse_table_segment_index(
     TableSegmentIndex::parse(payload.as_ref())
 }
 
+type TableSegmentPayloadsById = BTreeMap<(u32, u32), (TableSegmentPayloadV1, Vec<u8>)>;
+
 fn parse_table_segment_payloads(
     bytes: &[u8],
     validated: &ValidatedCoveFile,
-) -> Result<BTreeMap<(u32, u32), (TableSegmentPayloadV1, Vec<u8>)>, CoveError> {
+) -> Result<TableSegmentPayloadsById, CoveError> {
     let mut out = BTreeMap::new();
     for entry in validated
         .footer
@@ -1564,52 +1547,40 @@ fn fixed_u8(bytes: &[u8]) -> Result<u8, CoveError> {
 }
 
 fn fixed_i16(bytes: &[u8]) -> Result<i16, CoveError> {
-    if bytes.len() != 2 {
-        return Err(CoveError::PageCorrupt);
-    }
-    Ok(i16::from_le_bytes(bytes.try_into().unwrap()))
+    Ok(i16::from_le_bytes(fixed_bytes(bytes)?))
 }
 
 fn fixed_u16(bytes: &[u8]) -> Result<u16, CoveError> {
-    if bytes.len() != 2 {
-        return Err(CoveError::PageCorrupt);
-    }
-    Ok(u16::from_le_bytes(bytes.try_into().unwrap()))
+    Ok(u16::from_le_bytes(fixed_bytes(bytes)?))
 }
 
 fn fixed_i32(bytes: &[u8]) -> Result<i32, CoveError> {
-    if bytes.len() != 4 {
-        return Err(CoveError::PageCorrupt);
-    }
-    Ok(i32::from_le_bytes(bytes.try_into().unwrap()))
+    Ok(i32::from_le_bytes(fixed_bytes(bytes)?))
 }
 
 fn fixed_u32(bytes: &[u8]) -> Result<u32, CoveError> {
-    if bytes.len() != 4 {
-        return Err(CoveError::PageCorrupt);
-    }
-    Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
+    Ok(u32::from_le_bytes(fixed_bytes(bytes)?))
 }
 
 fn fixed_i64(bytes: &[u8]) -> Result<i64, CoveError> {
-    if bytes.len() != 8 {
-        return Err(CoveError::PageCorrupt);
-    }
-    Ok(i64::from_le_bytes(bytes.try_into().unwrap()))
+    Ok(i64::from_le_bytes(fixed_bytes(bytes)?))
 }
 
 fn fixed_u64(bytes: &[u8]) -> Result<u64, CoveError> {
-    if bytes.len() != 8 {
-        return Err(CoveError::PageCorrupt);
-    }
-    Ok(u64::from_le_bytes(bytes.try_into().unwrap()))
+    Ok(u64::from_le_bytes(fixed_bytes(bytes)?))
 }
 
 fn fixed_i128(bytes: &[u8]) -> Result<i128, CoveError> {
-    if bytes.len() != 16 {
+    Ok(i128::from_le_bytes(fixed_bytes(bytes)?))
+}
+
+fn fixed_bytes<const N: usize>(bytes: &[u8]) -> Result<[u8; N], CoveError> {
+    if bytes.len() != N {
         return Err(CoveError::PageCorrupt);
     }
-    Ok(i128::from_le_bytes(bytes.try_into().unwrap()))
+    let mut out = [0u8; N];
+    out.copy_from_slice(bytes);
+    Ok(out)
 }
 
 #[cfg(test)]

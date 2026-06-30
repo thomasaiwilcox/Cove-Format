@@ -2159,7 +2159,9 @@ fn projection_logical_type_from_name(name: &str) -> Result<CoveLogicalType, Cove
 
 fn stable_projection_field_id(text: &str, fallback: u32) -> u32 {
     let digest = Sha256::digest(text.as_bytes());
-    let value = u32::from_le_bytes(digest[..4].try_into().unwrap());
+    let mut value_bytes = [0u8; 4];
+    value_bytes.copy_from_slice(&digest[..4]);
+    let value = u32::from_le_bytes(value_bytes);
     if value == 0 {
         fallback
     } else {
@@ -2579,15 +2581,15 @@ fn decode_stat_scalar_value(
             if scalar.bytes.len() != 8 {
                 return Err(CoveError::BadStats);
             }
-            Ok(DecodedPropertyValue::plain(json!(i64::from_le_bytes(
-                scalar.bytes[..8].try_into().unwrap()
-            ))))
+            Ok(DecodedPropertyValue::plain(json!(
+                wire::read_i64_le_checked(&scalar.bytes, 0)?
+            )))
         }
         StatKind::UInt64 => {
             if scalar.bytes.len() != 8 {
                 return Err(CoveError::BadStats);
             }
-            let value = u64::from_le_bytes(scalar.bytes[..8].try_into().unwrap());
+            let value = wire::read_u64_le_checked(&scalar.bytes, 0)?;
             if property.physical_kind == CovePhysicalKind::Boolean {
                 return match value {
                     0 => Ok(DecodedPropertyValue::plain(Value::Bool(false))),
@@ -2605,7 +2607,7 @@ fn decode_stat_scalar_value(
             if scalar.bytes.len() != 8 {
                 return Err(CoveError::BadStats);
             }
-            let value = f64::from_bits(u64::from_le_bytes(scalar.bytes[..8].try_into().unwrap()));
+            let value = f64::from_bits(wire::read_u64_le_checked(&scalar.bytes, 0)?);
             Number::from_f64(value)
                 .map(Value::Number)
                 .map(DecodedPropertyValue::plain)
@@ -2616,16 +2618,16 @@ fn decode_stat_scalar_value(
                 return Err(CoveError::BadStats);
             }
             Ok(DecodedPropertyValue::plain(Value::String(
-                i128::from_le_bytes(scalar.bytes[..16].try_into().unwrap()).to_string(),
+                wire::read_i128_le_checked(&scalar.bytes, 0)?.to_string(),
             )))
         }
         StatKind::DateDays => {
             if scalar.bytes.len() != 4 {
                 return Err(CoveError::BadStats);
             }
-            Ok(DecodedPropertyValue::plain(json!(i32::from_le_bytes(
-                scalar.bytes[..4].try_into().unwrap()
-            ))))
+            Ok(DecodedPropertyValue::plain(json!(
+                wire::read_i32_le_checked(&scalar.bytes, 0)?
+            )))
         }
         StatKind::FixedBytes => {
             decode_bytes_value(property, &scalar.bytes).map(DecodedPropertyValue::plain)
@@ -2657,14 +2659,14 @@ fn decode_bytes_value(property: &PropertyEntryV1, bytes: &[u8]) -> Result<Value,
                 if bytes.len() != 8 {
                     return Err(CoveError::PageCorrupt);
                 }
-                let value = i64::from_le_bytes(bytes.try_into().unwrap());
+                let value = wire::read_i64_le_checked(bytes, 0)?;
                 Ok(Value::String(value.to_string()))
             }
             CoveLogicalType::Decimal128 => {
                 if bytes.len() != 16 {
                     return Err(CoveError::PageCorrupt);
                 }
-                let value = i128::from_le_bytes(bytes.try_into().unwrap());
+                let value = wire::read_i128_le_checked(bytes, 0)?;
                 Ok(Value::String(value.to_string()))
             }
             _ => Ok(Value::String(hex_encode(bytes))),
@@ -2743,19 +2745,19 @@ fn decode_canonical_value_tag(
             if bytes.len() != 8 {
                 return Err(CoveError::BadFileCode);
             }
-            Ok(json!(i64::from_le_bytes(bytes.try_into().unwrap())))
+            Ok(json!(wire::read_i64_le_checked(bytes, 0)?))
         }
         ValueTag::UInt64 => {
             if bytes.len() != 8 {
                 return Err(CoveError::BadFileCode);
             }
-            Ok(json!(u64::from_le_bytes(bytes.try_into().unwrap())))
+            Ok(json!(wire::read_u64_le_checked(bytes, 0)?))
         }
         ValueTag::Float32Bits => {
             if bytes.len() != 4 {
                 return Err(CoveError::BadFileCode);
             }
-            Number::from_f64(f32::from_bits(u32::from_le_bytes(bytes.try_into().unwrap())) as f64)
+            Number::from_f64(f32::from_bits(wire::read_u32_le_checked(bytes, 0)?) as f64)
                 .map(Value::Number)
                 .ok_or(CoveError::BadFileCode)
         }
@@ -2763,18 +2765,16 @@ fn decode_canonical_value_tag(
             if bytes.len() != 8 {
                 return Err(CoveError::BadFileCode);
             }
-            Number::from_f64(f64::from_bits(u64::from_le_bytes(
-                bytes.try_into().unwrap(),
-            )))
-            .map(Value::Number)
-            .ok_or(CoveError::BadFileCode)
+            Number::from_f64(f64::from_bits(wire::read_u64_le_checked(bytes, 0)?))
+                .map(Value::Number)
+                .ok_or(CoveError::BadFileCode)
         }
         ValueTag::Decimal64 => {
             if bytes.len() != 8 {
                 return Err(CoveError::BadFileCode);
             }
             Ok(Value::String(
-                i64::from_le_bytes(bytes.try_into().unwrap()).to_string(),
+                wire::read_i64_le_checked(bytes, 0)?.to_string(),
             ))
         }
         ValueTag::Decimal128 => {
@@ -2782,14 +2782,14 @@ fn decode_canonical_value_tag(
                 return Err(CoveError::BadFileCode);
             }
             Ok(Value::String(
-                i128::from_le_bytes(bytes.try_into().unwrap()).to_string(),
+                wire::read_i128_le_checked(bytes, 0)?.to_string(),
             ))
         }
         ValueTag::DateDays => {
             if bytes.len() != 4 {
                 return Err(CoveError::BadFileCode);
             }
-            Ok(json!(i32::from_le_bytes(bytes.try_into().unwrap())))
+            Ok(json!(wire::read_i32_le_checked(bytes, 0)?))
         }
         ValueTag::Uuid => {
             if bytes.len() != 16 {
@@ -2868,22 +2868,22 @@ fn decode_canonical_payload_value(
         ValueTag::BoolTrue => Ok((Value::Bool(true), 0)),
         ValueTag::Int64 | ValueTag::TimestampMicros | ValueTag::TimestampNanos => {
             let payload = fixed_canonical_payload(bytes, 8)?;
-            Ok((json!(i64::from_le_bytes(payload.try_into().unwrap())), 8))
+            Ok((json!(wire::read_i64_le_checked(payload, 0)?), 8))
         }
         ValueTag::UInt64 => {
             let payload = fixed_canonical_payload(bytes, 8)?;
-            Ok((json!(u64::from_le_bytes(payload.try_into().unwrap())), 8))
+            Ok((json!(wire::read_u64_le_checked(payload, 0)?), 8))
         }
         ValueTag::Float32Bits => {
             let payload = fixed_canonical_payload(bytes, 4)?;
-            let value = f32::from_bits(u32::from_le_bytes(payload.try_into().unwrap())) as f64;
+            let value = f32::from_bits(wire::read_u32_le_checked(payload, 0)?) as f64;
             Number::from_f64(value)
                 .map(|value| (Value::Number(value), 4))
                 .ok_or(CoveError::BadFileCode)
         }
         ValueTag::Float64Bits => {
             let payload = fixed_canonical_payload(bytes, 8)?;
-            let value = f64::from_bits(u64::from_le_bytes(payload.try_into().unwrap()));
+            let value = f64::from_bits(wire::read_u64_le_checked(payload, 0)?);
             Number::from_f64(value)
                 .map(|value| (Value::Number(value), 8))
                 .ok_or(CoveError::BadFileCode)
@@ -2891,20 +2891,20 @@ fn decode_canonical_payload_value(
         ValueTag::Decimal64 => {
             let payload = fixed_canonical_payload(bytes, 8)?;
             Ok((
-                Value::String(i64::from_le_bytes(payload.try_into().unwrap()).to_string()),
+                Value::String(wire::read_i64_le_checked(payload, 0)?.to_string()),
                 8,
             ))
         }
         ValueTag::Decimal128 => {
             let payload = fixed_canonical_payload(bytes, 16)?;
             Ok((
-                Value::String(i128::from_le_bytes(payload.try_into().unwrap()).to_string()),
+                Value::String(wire::read_i128_le_checked(payload, 0)?.to_string()),
                 16,
             ))
         }
         ValueTag::DateDays => {
             let payload = fixed_canonical_payload(bytes, 4)?;
-            Ok((json!(i32::from_le_bytes(payload.try_into().unwrap())), 4))
+            Ok((json!(wire::read_i32_le_checked(payload, 0)?), 4))
         }
         ValueTag::Uuid => {
             let payload = fixed_canonical_payload(bytes, 16)?;

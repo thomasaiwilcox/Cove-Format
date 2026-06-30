@@ -51,6 +51,22 @@ use serde_json::{json, Map, Value};
 use super::*;
 
 mod encoding;
+mod expression;
+mod id;
+mod report;
+mod vocabulary;
+
+use expression::*;
+use id::RequestedProjectionId;
+use vocabulary::{ProjectionRowGrain, ProjectionTemporalMode};
+
+#[cfg(test)]
+pub(crate) use expression::property_by_name;
+pub(crate) use expression::run_fixture_path;
+pub(crate) use report::projection_catalog_json_value;
+pub(crate) use vocabulary::{
+    ProjectionCoviFilterReason, ProjectionCoviLineageStatus, ProjectionFilterPushdown,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProjectionFormat {
@@ -73,6 +89,7 @@ impl ProjectionFormat {
     }
 }
 
+#[must_use]
 #[derive(Debug, Clone, Default)]
 pub struct ProjectionBatchOptions {
     pub max_rows: Option<usize>,
@@ -82,6 +99,7 @@ pub struct ProjectionBatchOptions {
     pub candidate_projection_rows: Option<ProjectionCandidateRows>,
 }
 
+#[must_use]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProjectionCandidateRows {
     pub row_ordinals: BTreeSet<u64>,
@@ -152,6 +170,7 @@ struct ProjectionAccessPlan {
     needs_history_rows: bool,
 }
 
+#[must_use]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectionReadRequirements {
     pub requested_object_type_names: Vec<String>,
@@ -277,7 +296,7 @@ pub(crate) fn project_rows_with_source_states_output(
     projection_id: Option<&str>,
 ) -> Result<Vec<u8>, String> {
     let materialized = materialize_with_source_states(file, rows, source_states)?;
-    let model = ProjectionModel::from_materialized(&materialized);
+    let model = ProjectionModel::from_materialized(&materialized)?;
     let projection_catalog = projection_catalog(file)?
         .ok_or_else(|| "project requires a MAP_PROJECTION_CATALOG section".to_string())?;
     let function_ids = function_registry(file)?;
@@ -664,11 +683,8 @@ fn projection_column_object_property_lineage(
     projection_column_id: u32,
     object_types_by_name: &BTreeMap<&str, &ObjectTypeEntryV1>,
 ) -> Option<MapProjectionColumnLineage> {
-    let row_grain = projection.row_grain.as_deref()?;
-    if !matches!(
-        row_grain,
-        "one_row_per_object" | "one_row_per_event_object" | "one_row_per_object_as_of_time"
-    ) {
+    let row_grain = ProjectionRowGrain::parse(projection.row_grain.as_deref()?);
+    if !row_grain.is_some_and(ProjectionRowGrain::supports_object_property_lineage) {
         return None;
     }
     if column.conflict_policy != "canonical_value" || column.nested_shape.is_some() {
@@ -707,7 +723,9 @@ fn projection_column_object_property_lineage(
         projection_column_id,
         expression: expression.to_string(),
         transform: "identity".into(),
-        filter_pushdown: "projection_covi_prefilter".into(),
+        filter_pushdown: ProjectionFilterPushdown::ProjectionCoviPrefilter
+            .as_str()
+            .into(),
     })
 }
 
@@ -738,82 +756,6 @@ fn projection_property_lineage_type_supported(logical_type: CoveLogicalType) -> 
             | CoveLogicalType::Struct
             | CoveLogicalType::Map
     )
-}
-
-pub(crate) fn projection_catalog_json_value(catalog: &MapProjectionCatalog) -> Value {
-    json!({
-        "mapping_id": catalog.mapping_id,
-        "mapping_version": catalog.mapping_version,
-        "projections": catalog.projections.iter().map(projection_entry_json_value).collect::<Vec<_>>()
-    })
-}
-
-fn projection_entry_json_value(projection: &MapProjectionEntry) -> Value {
-    let mut value = json!({
-        "projection_id": projection.projection_id,
-        "assertion_ids": projection.assertion_ids,
-        "output_table": projection.output_table,
-        "row_grain": projection.row_grain,
-        "anchor": projection.anchor.as_ref().map(|anchor| json!({
-            "object_type": anchor.object_type,
-            "association_type": anchor.association_type,
-        })),
-        "temporal_mode": projection.temporal_mode,
-        "columns": projection.columns.iter().map(projection_column_json_value).collect::<Vec<_>>(),
-        "multi_value_policy": projection.multi_value_policy,
-        "missing_policy": projection.missing_policy,
-        "ordering": projection.ordering,
-        "evidence_policy": projection.evidence_policy,
-        "output_modes": projection.output_modes,
-    });
-    strip_null_json_fields(&mut value);
-    value
-}
-
-fn projection_column_json_value(column: &MapProjectionColumn) -> Value {
-    let mut value = json!({
-        "name": column.name,
-        "value": column.value,
-        "logical_type": column.logical_type,
-        "nested_shape": column.nested_shape,
-        "conflict_policy": column.conflict_policy,
-        "missing_policy": column.missing_policy,
-        "lineage": column.lineage.as_ref().map(projection_column_lineage_json_value),
-    });
-    strip_null_json_fields(&mut value);
-    value
-}
-
-fn projection_column_lineage_json_value(lineage: &MapProjectionColumnLineage) -> Value {
-    json!({
-        "source": lineage.source,
-        "object_type_id": lineage.object_type_id,
-        "object_type_name": lineage.object_type_name,
-        "property_id": lineage.property_id,
-        "property_name": lineage.property_name,
-        "projection_table_id": lineage.projection_table_id,
-        "projection_column_id": lineage.projection_column_id,
-        "expression": lineage.expression,
-        "transform": lineage.transform,
-        "filter_pushdown": lineage.filter_pushdown,
-    })
-}
-
-fn strip_null_json_fields(value: &mut Value) {
-    match value {
-        Value::Object(object) => {
-            for value in object.values_mut() {
-                strip_null_json_fields(value);
-            }
-            object.retain(|_, value| !value.is_null());
-        }
-        Value::Array(values) => {
-            for value in values {
-                strip_null_json_fields(value);
-            }
-        }
-        _ => {}
-    }
 }
 
 fn function_registry(file: &CovemapFile) -> Result<std::collections::BTreeSet<String>, String> {
@@ -860,7 +802,11 @@ fn compile_projection_access_plan(
     format: ProjectionFormat,
     options: &ProjectionBatchOptions,
 ) -> Result<ProjectionAccessPlan, String> {
-    let selected = select_projections(catalog, projection_id, format)?;
+    let selected = select_projections(
+        catalog,
+        projection_id.map(RequestedProjectionId::new),
+        format,
+    )?;
     let output_columns = required_projection_columns(options);
     let mut requested_property_names = BTreeSet::new();
     let mut requested_object_type_names = BTreeSet::new();
@@ -930,36 +876,35 @@ fn compile_projection_access_plan(
             include_association_object_types = true;
             requested_property_names.insert("association_type".into());
         }
-        match row_grain {
-            "one_row_per_object"
-            | "one_row_per_event_object"
-            | "one_row_per_object_as_of_time"
-            | "one_row_per_association"
-            | "one_row_per_link_object" => {
+        match ProjectionRowGrain::parse(row_grain) {
+            Some(
+                ProjectionRowGrain::Object
+                | ProjectionRowGrain::EventObject
+                | ProjectionRowGrain::ObjectAsOfTime
+                | ProjectionRowGrain::Association
+                | ProjectionRowGrain::LinkObject,
+            ) => {
                 include_records = true;
                 let temporal_mode = projection
                     .temporal_mode
                     .as_deref()
                     .unwrap_or("latest_committed");
-                if matches!(
-                    parse_projection_temporal_mode(temporal_mode),
-                    Some(
-                        ProjectionTemporalMode::LatestCommitted | ProjectionTemporalMode::ValidTime
-                    )
-                ) {
+                if ProjectionTemporalMode::parse(temporal_mode)
+                    .is_some_and(ProjectionTemporalMode::reads_reconstructed_rows_for_access)
+                {
                     needs_reconstructed_rows = true;
                 } else {
                     needs_history_rows = true;
                 }
             }
-            "one_row_per_property_version" => {
+            Some(ProjectionRowGrain::PropertyVersion) => {
                 include_records = true;
                 needs_history_rows = true;
             }
-            "one_row_per_evidence_assertion" => {
+            Some(ProjectionRowGrain::EvidenceAssertion) => {
                 include_evidence_index = true;
             }
-            _ => {
+            None => {
                 include_records = true;
                 needs_reconstructed_rows = true;
             }
@@ -984,7 +929,7 @@ fn compile_projection_access_plan(
 
 fn select_projections<'a>(
     catalog: &'a MapProjectionCatalog,
-    projection_id: Option<&str>,
+    projection_id: Option<RequestedProjectionId<'_>>,
     format: ProjectionFormat,
 ) -> Result<Vec<&'a MapProjectionEntry>, String> {
     let selected = catalog
@@ -992,13 +937,13 @@ fn select_projections<'a>(
         .iter()
         .filter(|projection| {
             projection_id
-                .map(|requested| projection.projection_id == requested)
+                .map(|requested| requested.matches_entry(projection))
                 .unwrap_or(true)
         })
         .collect::<Vec<_>>();
     if selected.is_empty() {
         return Err(match projection_id {
-            Some(id) => format!("projection_id '{id}' was not found"),
+            Some(id) => format!("projection_id '{}' was not found", id.as_str()),
             None => "projection catalog contains no projections".to_string(),
         });
     }
@@ -1218,7 +1163,11 @@ fn project_tables(
     options: &ProjectionBatchOptions,
 ) -> Result<Vec<ProjectedTable>, String> {
     let output_columns = required_projection_columns(options);
-    let selected = select_projections(catalog, projection_id, format)?;
+    let selected = select_projections(
+        catalog,
+        projection_id.map(RequestedProjectionId::new),
+        format,
+    )?;
 
     let mut tables = Vec::new();
     for projection in selected {
@@ -1287,7 +1236,11 @@ fn project_arrow_record_batches_from_surface(
     )?;
     let model = ProjectionModel::from_surface_with_access_plan(surface, &access_plan)
         .map_err(|err| err.to_string())?;
-    let selected = select_projections(catalog, Some(projection_id), ProjectionFormat::Arrow)?;
+    let selected = select_projections(
+        catalog,
+        Some(RequestedProjectionId::new(projection_id)),
+        ProjectionFormat::Arrow,
+    )?;
     let projection = match selected.as_slice() {
         [projection] => *projection,
         _ => return Err("Arrow projection output requires exactly one projection".into()),
@@ -1369,10 +1322,11 @@ fn object_projection_arrow_fast_path_plan(
     {
         return None;
     }
-    if !matches!(
-        access_projection.row_grain.as_deref(),
-        Some("one_row_per_object" | "one_row_per_event_object" | "one_row_per_object_as_of_time")
-    ) {
+    let row_grain = access_projection
+        .row_grain
+        .as_deref()
+        .and_then(ProjectionRowGrain::parse);
+    if !row_grain.is_some_and(ProjectionRowGrain::supports_object_property_lineage) {
         return None;
     }
     let anchor = access_projection.anchor.as_ref()?;
@@ -1556,7 +1510,11 @@ fn evidence_projection_arrow_fast_path_supported(
     projection: &MapProjectionEntry,
     projected_columns: &[ProjectedColumn],
 ) -> bool {
-    projection.row_grain.as_deref() == Some("one_row_per_evidence_assertion")
+    projection
+        .row_grain
+        .as_deref()
+        .and_then(ProjectionRowGrain::parse)
+        == Some(ProjectionRowGrain::EvidenceAssertion)
         && projection.columns.len() == projected_columns.len()
         && projection.columns.iter().all(|column| {
             column.value.starts_with("evidence.")
@@ -1957,20 +1915,22 @@ where
         .row_grain
         .as_deref()
         .ok_or_else(|| "projection row_grain is required".to_string())?;
-    match row_grain {
-        "one_row_per_object" | "one_row_per_event_object" | "one_row_per_object_as_of_time" => {
-            emit_object_projection_rows(model, projection, false, options, &mut emit)
-        }
-        "one_row_per_association" | "one_row_per_link_object" => {
+    match ProjectionRowGrain::parse(row_grain) {
+        Some(
+            ProjectionRowGrain::Object
+            | ProjectionRowGrain::EventObject
+            | ProjectionRowGrain::ObjectAsOfTime,
+        ) => emit_object_projection_rows(model, projection, false, options, &mut emit),
+        Some(ProjectionRowGrain::Association | ProjectionRowGrain::LinkObject) => {
             emit_object_projection_rows(model, projection, true, options, &mut emit)
         }
-        "one_row_per_property_version" => {
+        Some(ProjectionRowGrain::PropertyVersion) => {
             emit_property_version_projection_rows(model, projection, options, &mut emit)
         }
-        "one_row_per_evidence_assertion" => {
+        Some(ProjectionRowGrain::EvidenceAssertion) => {
             emit_evidence_projection_rows(model, projection, options, &mut emit)
         }
-        other => Err(format!("unsupported projection row_grain '{other}'")),
+        None => Err(format!("unsupported projection row_grain '{row_grain}'")),
     }
 }
 
@@ -2538,7 +2498,7 @@ enum ProjectionEvidenceEntry {
 }
 
 impl ProjectionModel {
-    fn from_materialized(materialized: &MaterializedModel) -> Self {
+    fn from_materialized(materialized: &MaterializedModel) -> Result<Self, String> {
         let type_flags = materialized
             .object_types
             .iter()
@@ -2577,9 +2537,8 @@ impl ProjectionModel {
             })
             .collect::<Vec<_>>();
         rows.sort_by_key(temporal_sort_key);
-        let reconstructed_rows = reconstruct_projection_rows_at_cut(&rows, |_| true)
-            .expect("materialized projection rows should not contain prev_ref chains");
-        Self {
+        let reconstructed_rows = reconstruct_projection_rows_at_cut(&rows, |_| true)?;
+        Ok(Self {
             rows,
             reconstructed_rows,
             evidence_entries: materialized
@@ -2588,7 +2547,7 @@ impl ProjectionModel {
                 .cloned()
                 .map(ProjectionEvidenceEntry::Json)
                 .collect(),
-        }
+        })
     }
 
     fn from_surface_with_access_plan(
@@ -2642,7 +2601,7 @@ impl ProjectionModel {
         &self,
         projection: &MapProjectionEntry,
     ) -> Result<Cow<'_, [ProjectionRow]>, String> {
-        match parse_projection_temporal_mode(
+        match ProjectionTemporalMode::parse(
             projection
                 .temporal_mode
                 .as_deref()
@@ -2687,49 +2646,6 @@ impl ProjectionModel {
             )),
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProjectionTemporalMode {
-    LatestCommitted,
-    FullHistory,
-    CommitOrder,
-    ValidTime,
-    ObservedTime,
-    AsOfTimestamp(i64),
-    AsOfCsn(u64),
-}
-
-fn parse_projection_temporal_mode(value: &str) -> Option<ProjectionTemporalMode> {
-    match value {
-        "latest_committed" => Some(ProjectionTemporalMode::LatestCommitted),
-        "full_history" => Some(ProjectionTemporalMode::FullHistory),
-        "commit_order" => Some(ProjectionTemporalMode::CommitOrder),
-        "valid_time" => Some(ProjectionTemporalMode::ValidTime),
-        "observed_time" => Some(ProjectionTemporalMode::ObservedTime),
-        _ => parse_temporal_cut_value(value),
-    }
-}
-
-fn parse_temporal_cut_value(value: &str) -> Option<ProjectionTemporalMode> {
-    for prefix in [
-        "as_of_timestamp_us:",
-        "as_of_timestamp_us=",
-        "timestamp_us:",
-        "timestamp_us=",
-        "as_of_time:",
-        "as_of_time=",
-    ] {
-        if let Some(raw) = value.strip_prefix(prefix) {
-            return raw.parse().ok().map(ProjectionTemporalMode::AsOfTimestamp);
-        }
-    }
-    for prefix in ["as_of_csn:", "as_of_csn=", "csn:", "csn="] {
-        if let Some(raw) = value.strip_prefix(prefix) {
-            return raw.parse().ok().map(ProjectionTemporalMode::AsOfCsn);
-        }
-    }
-    None
 }
 
 fn ensure_temporal_surface_fields(
@@ -3008,7 +2924,7 @@ fn validate_executable_projection(
         ));
     }
     let temporal_mode = projection.temporal_mode.as_deref().unwrap_or_default();
-    if parse_projection_temporal_mode(temporal_mode).is_none() {
+    if ProjectionTemporalMode::parse(temporal_mode).is_none() {
         return Err(format!(
             "projection '{}' uses unsupported temporal_mode '{temporal_mode}'",
             projection.projection_id
@@ -3401,17 +3317,21 @@ fn project_one(
         .row_grain
         .as_deref()
         .ok_or_else(|| "projection row_grain is required".to_string())?;
-    match row_grain {
-        "one_row_per_object" => project_object_rows(model, projection, false, options),
-        "one_row_per_event_object" | "one_row_per_object_as_of_time" => {
+    match ProjectionRowGrain::parse(row_grain) {
+        Some(ProjectionRowGrain::Object) => project_object_rows(model, projection, false, options),
+        Some(ProjectionRowGrain::EventObject | ProjectionRowGrain::ObjectAsOfTime) => {
             project_object_rows(model, projection, false, options)
         }
-        "one_row_per_association" | "one_row_per_link_object" => {
+        Some(ProjectionRowGrain::Association | ProjectionRowGrain::LinkObject) => {
             project_object_rows(model, projection, true, options)
         }
-        "one_row_per_property_version" => project_property_versions(model, projection, options),
-        "one_row_per_evidence_assertion" => project_evidence_rows(model, projection, options),
-        other => Err(format!("unsupported projection row_grain '{other}'")),
+        Some(ProjectionRowGrain::PropertyVersion) => {
+            project_property_versions(model, projection, options)
+        }
+        Some(ProjectionRowGrain::EvidenceAssertion) => {
+            project_evidence_rows(model, projection, options)
+        }
+        None => Err(format!("unsupported projection row_grain '{row_grain}'")),
     }
 }
 
@@ -3665,814 +3585,4 @@ fn candidate_projection_row_allowed(options: &ProjectionBatchOptions, row_ordina
         .as_ref()
         .map(|candidates| !candidates.is_empty() && candidates.contains(row_ordinal))
         .unwrap_or(true)
-}
-
-fn row_matches_projection_filters(row: &Map<String, Value>, filters: &[ProjectionFilter]) -> bool {
-    filters.iter().all(|filter| filter.matches(row))
-}
-
-impl ProjectionFilter {
-    fn column_name(&self) -> &str {
-        match self {
-            Self::Compare { column, .. }
-            | Self::InList { column, .. }
-            | Self::IsNull { column, .. } => column,
-        }
-    }
-
-    fn matches(&self, row: &Map<String, Value>) -> bool {
-        let value = row.get(self.column_name()).unwrap_or(&Value::Null);
-        projection_filter_matches_value(self, value)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn projection_not_equal_filter_matches_non_null_unequal_values_only() {
-        let filter = ProjectionFilter::Compare {
-            column: "status".into(),
-            op: ProjectionFilterOp::Ne,
-            literal: ProjectionFilterLiteral::Utf8("closed".into()),
-        };
-
-        let mut open = Map::new();
-        open.insert("status".into(), Value::String("open".into()));
-        assert!(row_matches_projection_filters(
-            &open,
-            std::slice::from_ref(&filter)
-        ));
-
-        let mut closed = Map::new();
-        closed.insert("status".into(), Value::String("closed".into()));
-        assert!(!row_matches_projection_filters(
-            &closed,
-            std::slice::from_ref(&filter)
-        ));
-
-        let mut null = Map::new();
-        null.insert("status".into(), Value::Null);
-        assert!(!row_matches_projection_filters(
-            &null,
-            std::slice::from_ref(&filter)
-        ));
-    }
-}
-
-fn projection_filter_matches_value(filter: &ProjectionFilter, value: &Value) -> bool {
-    match filter {
-        ProjectionFilter::Compare { op, literal, .. } => match op {
-            ProjectionFilterOp::Eq => projection_filter_eq(value, literal),
-            ProjectionFilterOp::Ne => {
-                projection_filter_cmp(value, literal).is_some_and(|ordering| !ordering.is_eq())
-            }
-            ProjectionFilterOp::Lt => {
-                projection_filter_cmp(value, literal).is_some_and(|ordering| ordering.is_lt())
-            }
-            ProjectionFilterOp::LtEq => {
-                projection_filter_cmp(value, literal).is_some_and(|ordering| !ordering.is_gt())
-            }
-            ProjectionFilterOp::Gt => {
-                projection_filter_cmp(value, literal).is_some_and(|ordering| ordering.is_gt())
-            }
-            ProjectionFilterOp::GtEq => {
-                projection_filter_cmp(value, literal).is_some_and(|ordering| !ordering.is_lt())
-            }
-        },
-        ProjectionFilter::InList { literals, .. } => {
-            !value.is_null()
-                && literals
-                    .iter()
-                    .any(|literal| projection_filter_eq(value, literal))
-        }
-        ProjectionFilter::IsNull { negated, .. } => {
-            let is_null = value.is_null();
-            if *negated {
-                !is_null
-            } else {
-                is_null
-            }
-        }
-    }
-}
-
-fn projection_filter_eq(value: &Value, literal: &ProjectionFilterLiteral) -> bool {
-    projection_filter_cmp(value, literal).is_some_and(|ordering| ordering.is_eq())
-}
-
-fn projection_filter_cmp(
-    value: &Value,
-    literal: &ProjectionFilterLiteral,
-) -> Option<std::cmp::Ordering> {
-    if value.is_null() {
-        return None;
-    }
-    match literal {
-        ProjectionFilterLiteral::Null => None,
-        ProjectionFilterLiteral::Boolean(literal) => {
-            value.as_bool().map(|value| value.cmp(literal))
-        }
-        ProjectionFilterLiteral::Int64(literal) => value
-            .as_i64()
-            .map(|value| value.cmp(literal))
-            .or_else(|| {
-                value
-                    .as_u64()
-                    .and_then(|value| i64::try_from(value).ok())
-                    .map(|value| value.cmp(literal))
-            })
-            .or_else(|| {
-                value
-                    .as_f64()
-                    .map(|value| value.total_cmp(&(*literal as f64)))
-            }),
-        ProjectionFilterLiteral::UInt64(literal) => value
-            .as_u64()
-            .map(|value| value.cmp(literal))
-            .or_else(|| {
-                value
-                    .as_i64()
-                    .and_then(|value| u64::try_from(value).ok())
-                    .map(|value| value.cmp(literal))
-            })
-            .or_else(|| {
-                value
-                    .as_f64()
-                    .map(|value| value.total_cmp(&(*literal as f64)))
-            }),
-        ProjectionFilterLiteral::Float64(literal) => {
-            value.as_f64().map(|value| value.total_cmp(literal))
-        }
-        ProjectionFilterLiteral::Utf8(literal) => {
-            value.as_str().map(|value| value.cmp(literal.as_str()))
-        }
-    }
-}
-
-fn reached_projection_limit(rows: &mut Vec<Value>, max_rows: Option<usize>) -> bool {
-    let Some(max_rows) = max_rows else {
-        return false;
-    };
-    if rows.len() > max_rows {
-        rows.truncate(max_rows);
-    }
-    rows.len() >= max_rows
-}
-
-fn projection_value(
-    model: &ProjectionModel,
-    projection: &MapProjectionEntry,
-    row: &ProjectionRow,
-    expression: &str,
-) -> Result<Value, String> {
-    match expression {
-        "goid" | "object.goid" | "Object.goid" | "association.goid" => {
-            return Ok(json!(hex_encode(&row.goid)));
-        }
-        "record.id" | "record.record_id" => return Ok(json!(hex_encode(&row.record_id))),
-        "record.kind" => return Ok(json!(record_kind_name(row.record_kind))),
-        "object.type_id" | "object_type_id" => return Ok(json!(row.object_type_id)),
-        "temporal.timestamp_us" | "timestamp_us" => return Ok(json!(row.timestamp_us)),
-        "temporal.csn" | "csn" => return Ok(json!(row.csn)),
-        "temporal.branch_key" | "branch_key" => return Ok(json!(row.branch_key)),
-        "object_type" | "object.type" | "Object.type" => return Ok(json!(row.object_type)),
-        "association.source_goid" => {
-            return Ok(projection_property_by_flag_or_name(
-                row,
-                PROPERTY_FLAG_ASSOCIATION_FROM_GOID,
-                "source_goid",
-            ))
-        }
-        "association.target_goid" => {
-            return Ok(projection_property_by_flag_or_name(
-                row,
-                PROPERTY_FLAG_ASSOCIATION_TO_GOID,
-                "target_goid",
-            ))
-        }
-        "association.association_type" => {
-            return Ok(projection_property_by_flag_or_name(
-                row,
-                PROPERTY_FLAG_ASSOCIATION_TYPE,
-                "association_type",
-            ))
-        }
-        "association.mapping_rule_id" => {
-            return Ok(projection_property_by_flag_or_name(
-                row,
-                PROPERTY_FLAG_MAPPING_RULE_REF,
-                "mapping_rule_id",
-            ))
-        }
-        "association.source_evidence_id" => {
-            return Ok(projection_property_by_flag_or_name(
-                row,
-                PROPERTY_FLAG_EVIDENCE_REF,
-                "source_evidence_id",
-            ))
-        }
-        "association.source_role" => return Ok(projection_property_by_name(row, "source_role")),
-        "association.target_role" => return Ok(projection_property_by_name(row, "target_role")),
-        "association.valid_from" => {
-            return Ok(projection_property_by_flag_or_name(
-                row,
-                PROPERTY_FLAG_ASSOCIATION_VALID_FROM,
-                "valid_from",
-            ))
-        }
-        "association.valid_to" => {
-            return Ok(projection_property_by_flag_or_name(
-                row,
-                PROPERTY_FLAG_ASSOCIATION_VALID_TO,
-                "valid_to",
-            ))
-        }
-        "association.observed_at" => {
-            return Ok(projection_property_by_flag_or_name(
-                row,
-                PROPERTY_FLAG_ASSOCIATION_OBSERVED_AT,
-                "observed_at",
-            ))
-        }
-        "association.cardinality_policy" => {
-            return Ok(projection_property_by_name(row, "cardinality_policy"))
-        }
-        _ => {}
-    }
-    if let Some(literal) = literal_value(expression) {
-        return Ok(literal);
-    }
-    if let Some(resolution) = parse_resolution_expression(expression) {
-        return resolution_expression_value(model, row, resolution, expression);
-    }
-    if let Some(value) = conditional_expression(model, projection, row, expression)? {
-        return Ok(value);
-    }
-    if let Some(inner) = expression
-        .strip_prefix("count(association(")
-        .and_then(|rest| rest.strip_suffix("))"))
-    {
-        let (association_type, endpoint_role) = parse_association_call_args(inner);
-        let count = associated_rows(model, projection, row, association_type, endpoint_role)?.len();
-        return Ok(json!(count));
-    }
-    if let Some((function, args)) = parse_function_call(expression) {
-        return projection_function_value(model, projection, row, function, &args);
-    }
-    if let Some(traversal) = parse_association_traversal(expression) {
-        let values = associated_rows(
-            model,
-            projection,
-            row,
-            traversal.association_type,
-            traversal.endpoint_role,
-        )?
-        .into_iter()
-        .map(|candidate| association_projection_value(&candidate, traversal.property_name))
-        .collect::<Vec<_>>();
-        return Ok(Value::Array(values));
-    }
-    let property_name = expression
-        .rsplit('.')
-        .next()
-        .ok_or_else(|| format!("unsupported projection expression '{expression}'"))?;
-    Ok(projection_property_by_name(row, property_name))
-}
-
-fn projection_function_value(
-    model: &ProjectionModel,
-    projection: &MapProjectionEntry,
-    row: &ProjectionRow,
-    function: &str,
-    args: &[String],
-) -> Result<Value, String> {
-    match function {
-        "identity" => unary_arg(model, projection, row, function, args),
-        "trim" => string_unary(model, projection, row, function, args, |value| {
-            value.trim().to_string()
-        }),
-        "lower" | "lowercase" => string_unary(model, projection, row, function, args, |value| {
-            value.to_ascii_lowercase()
-        }),
-        "upper" | "uppercase" => string_unary(model, projection, row, function, args, |value| {
-            value.to_ascii_uppercase()
-        }),
-        "exists" => {
-            let value = unary_arg(model, projection, row, function, args)?;
-            Ok(json!(
-                !value.is_null() && !matches!(&value, Value::Array(values) if values.is_empty())
-            ))
-        }
-        "coalesce" => {
-            for arg in args {
-                let value = projection_value(model, projection, row, arg)?;
-                if !value.is_null() {
-                    return Ok(value);
-                }
-            }
-            Ok(Value::Null)
-        }
-        "association" => {
-            if args.len() != 1 {
-                return Err("projection function 'association' expects one argument".into());
-            }
-            let (association_type, endpoint_role) = parse_association_call_args(&args[0]);
-            Ok(Value::Array(
-                associated_rows(model, projection, row, association_type, endpoint_role)?
-                    .into_iter()
-                    .map(|candidate| json!(hex_encode(&candidate.goid)))
-                    .collect(),
-            ))
-        }
-        "count" | "min" | "max" | "sum" | "avg" | "distinct_count" | "list" => {
-            aggregate_function_value(model, projection, row, function, args)
-        }
-        other => Err(format!("unsupported projection function '{other}'")),
-    }
-}
-
-fn unary_arg(
-    model: &ProjectionModel,
-    projection: &MapProjectionEntry,
-    row: &ProjectionRow,
-    function: &str,
-    args: &[String],
-) -> Result<Value, String> {
-    if args.len() != 1 {
-        return Err(format!(
-            "projection function '{function}' expects one argument"
-        ));
-    }
-    projection_value(model, projection, row, &args[0])
-}
-
-fn string_unary(
-    model: &ProjectionModel,
-    projection: &MapProjectionEntry,
-    row: &ProjectionRow,
-    function: &str,
-    args: &[String],
-    op: impl FnOnce(&str) -> String,
-) -> Result<Value, String> {
-    let value = unary_arg(model, projection, row, function, args)?;
-    Ok(value
-        .as_str()
-        .map(|text| json!(op(text)))
-        .unwrap_or(Value::Null))
-}
-
-fn aggregate_function_value(
-    model: &ProjectionModel,
-    projection: &MapProjectionEntry,
-    row: &ProjectionRow,
-    function: &str,
-    args: &[String],
-) -> Result<Value, String> {
-    if args.len() != 1 {
-        return Err(format!(
-            "projection aggregate '{function}' expects one argument"
-        ));
-    }
-    let values = if let Some(traversal) = parse_association_traversal(&args[0]) {
-        associated_rows(
-            model,
-            projection,
-            row,
-            traversal.association_type,
-            traversal.endpoint_role,
-        )?
-        .into_iter()
-        .map(|candidate| association_projection_value(&candidate, traversal.property_name))
-        .collect::<Vec<_>>()
-    } else if let Some((association_function, association_args)) = parse_function_call(&args[0]) {
-        if association_function == "association" && association_args.len() == 1 {
-            let (association_type, endpoint_role) =
-                parse_association_call_args(&association_args[0]);
-            associated_rows(model, projection, row, association_type, endpoint_role)?
-                .into_iter()
-                .map(|candidate| json!(hex_encode(&candidate.goid)))
-                .collect::<Vec<_>>()
-        } else {
-            vec![projection_value(model, projection, row, &args[0])?]
-        }
-    } else {
-        vec![projection_value(model, projection, row, &args[0])?]
-    };
-    match function {
-        "count" => Ok(json!(values
-            .iter()
-            .filter(|value| !value.is_null())
-            .count())),
-        "list" => Ok(Value::Array(values)),
-        "distinct_count" => {
-            let set = values
-                .into_iter()
-                .filter(|value| !value.is_null())
-                .map(|value| value.to_string())
-                .collect::<std::collections::BTreeSet<_>>();
-            Ok(json!(set.len()))
-        }
-        "min" => Ok(min_max_json(values, true)),
-        "max" => Ok(min_max_json(values, false)),
-        "sum" => Ok(json!(values
-            .into_iter()
-            .filter_map(json_number_f64)
-            .sum::<f64>())),
-        "avg" => {
-            let numbers = values
-                .into_iter()
-                .filter_map(json_number_f64)
-                .collect::<Vec<_>>();
-            if numbers.is_empty() {
-                Ok(Value::Null)
-            } else {
-                Ok(json!(numbers.iter().sum::<f64>() / numbers.len() as f64))
-            }
-        }
-        other => Err(format!("unsupported projection aggregate '{other}'")),
-    }
-}
-
-fn conditional_expression(
-    model: &ProjectionModel,
-    projection: &MapProjectionEntry,
-    row: &ProjectionRow,
-    expression: &str,
-) -> Result<Option<Value>, String> {
-    let Some((function, args)) = parse_function_call(expression) else {
-        return Ok(None);
-    };
-    if !matches!(function, "if" | "ifelse") {
-        return Ok(None);
-    }
-    if args.len() != 3 {
-        return Err(format!(
-            "projection conditional '{function}' expects three arguments"
-        ));
-    }
-    let condition = projection_condition(model, projection, row, &args[0])?;
-    Ok(Some(projection_value(
-        model,
-        projection,
-        row,
-        if condition { &args[1] } else { &args[2] },
-    )?))
-}
-
-fn projection_condition(
-    model: &ProjectionModel,
-    projection: &MapProjectionEntry,
-    row: &ProjectionRow,
-    expression: &str,
-) -> Result<bool, String> {
-    for op in ["==", "!=", ">=", "<=", ">", "<"] {
-        if let Some((left, right)) = expression.split_once(op) {
-            let left = projection_value(model, projection, row, left.trim())?;
-            let right = projection_value(model, projection, row, right.trim())?;
-            return Ok(compare_json_values(&left, &right, op));
-        }
-    }
-    Ok(json_truthy(&projection_value(
-        model, projection, row, expression,
-    )?))
-}
-
-fn associated_rows(
-    model: &ProjectionModel,
-    projection: &MapProjectionEntry,
-    row: &ProjectionRow,
-    association_type: &str,
-    endpoint_role: Option<&str>,
-) -> Result<Vec<ProjectionRow>, String> {
-    let mut rows = model
-        .rows_for_projection_for_aggregate()?
-        .into_iter()
-        .filter(|candidate| row_matches_association(candidate, association_type))
-        .filter(|candidate| association_endpoint_matches(candidate, row, endpoint_role))
-        .collect::<Vec<_>>();
-    sort_projection_rows_by_ordering(&mut rows, projection, Some(row))?;
-    Ok(rows)
-}
-
-fn association_endpoint_matches(
-    candidate: &ProjectionRow,
-    anchor: &ProjectionRow,
-    endpoint_role: Option<&str>,
-) -> bool {
-    let anchor_goid = json!(hex_encode(&anchor.goid));
-    let source_goid = projection_property_by_flag_or_name(
-        candidate,
-        PROPERTY_FLAG_ASSOCIATION_FROM_GOID,
-        "source_goid",
-    );
-    let target_goid = projection_property_by_flag_or_name(
-        candidate,
-        PROPERTY_FLAG_ASSOCIATION_TO_GOID,
-        "target_goid",
-    );
-    let Some(role) = endpoint_role.map(str::trim).filter(|role| !role.is_empty()) else {
-        return source_goid == anchor_goid;
-    };
-    match role {
-        "source" | "from" => source_goid == anchor_goid,
-        "target" | "to" => target_goid == anchor_goid,
-        other => {
-            (source_goid == anchor_goid
-                && projection_property_by_name(candidate, "source_role").as_str() == Some(other))
-                || (target_goid == anchor_goid
-                    && projection_property_by_name(candidate, "target_role").as_str()
-                        == Some(other))
-        }
-    }
-}
-
-fn association_projection_value(row: &ProjectionRow, property_name: &str) -> Value {
-    match property_name {
-        "goid" => json!(hex_encode(&row.goid)),
-        "source_goid" => projection_property_by_flag_or_name(
-            row,
-            PROPERTY_FLAG_ASSOCIATION_FROM_GOID,
-            "source_goid",
-        ),
-        "target_goid" => projection_property_by_flag_or_name(
-            row,
-            PROPERTY_FLAG_ASSOCIATION_TO_GOID,
-            "target_goid",
-        ),
-        "association_type" => projection_property_by_flag_or_name(
-            row,
-            PROPERTY_FLAG_ASSOCIATION_TYPE,
-            "association_type",
-        ),
-        other => projection_property_by_name(row, other),
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct AssociationTraversal<'a> {
-    association_type: &'a str,
-    endpoint_role: Option<&'a str>,
-    property_name: &'a str,
-}
-
-fn parse_association_traversal(expression: &str) -> Option<AssociationTraversal<'_>> {
-    let expression = expression.trim();
-    let rest = expression.strip_prefix("association(")?;
-    let (association_type, rest) = rest.split_once(").")?;
-    let (association_type, endpoint_role) = match association_type.split_once(',') {
-        Some((association_type, endpoint_role)) => {
-            (association_type.trim(), Some(endpoint_role.trim()))
-        }
-        None => (association_type.trim(), None),
-    };
-    (!association_type.is_empty() && !rest.trim().is_empty()).then_some(AssociationTraversal {
-        association_type,
-        endpoint_role: endpoint_role.filter(|role| !role.is_empty()),
-        property_name: rest.trim(),
-    })
-}
-
-fn parse_association_call_args(input: &str) -> (&str, Option<&str>) {
-    match input.split_once(',') {
-        Some((association_type, endpoint_role)) => (
-            association_type.trim(),
-            Some(endpoint_role.trim()).filter(|role| !role.is_empty()),
-        ),
-        None => (input.trim(), None),
-    }
-}
-
-fn parse_function_call(expression: &str) -> Option<(&str, Vec<String>)> {
-    let expression = expression.trim();
-    let open = expression.find('(')?;
-    if !expression.ends_with(')') {
-        return None;
-    }
-    let function = expression[..open].trim();
-    if function.is_empty()
-        || !function
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
-    {
-        return None;
-    }
-    let inner = &expression[open + 1..expression.len() - 1];
-    Some((function, split_args(inner)))
-}
-
-fn split_args(input: &str) -> Vec<String> {
-    let mut args = Vec::new();
-    let mut start = 0usize;
-    let mut depth = 0i32;
-    let mut quote = None;
-    let bytes = input.as_bytes();
-    for (index, ch) in input.char_indices() {
-        if let Some(active) = quote {
-            if ch == active && bytes.get(index.wrapping_sub(1)) != Some(&b'\\') {
-                quote = None;
-            }
-            continue;
-        }
-        match ch {
-            '\'' | '"' => quote = Some(ch),
-            '(' => depth += 1,
-            ')' => depth -= 1,
-            ',' if depth == 0 => {
-                args.push(input[start..index].trim().to_string());
-                start = index + 1;
-            }
-            _ => {}
-        }
-    }
-    let tail = input[start..].trim();
-    if !tail.is_empty() || !input.is_empty() {
-        args.push(tail.to_string());
-    }
-    args
-}
-
-fn literal_value(expression: &str) -> Option<Value> {
-    let expression = expression.trim();
-    if expression == "null" {
-        return Some(Value::Null);
-    }
-    if expression == "true" {
-        return Some(Value::Bool(true));
-    }
-    if expression == "false" {
-        return Some(Value::Bool(false));
-    }
-    if (expression.starts_with('"') && expression.ends_with('"'))
-        || (expression.starts_with('\'') && expression.ends_with('\''))
-    {
-        return Some(Value::String(
-            expression[1..expression.len() - 1].to_string(),
-        ));
-    }
-    if let Ok(value) = expression.parse::<i64>() {
-        return Some(json!(value));
-    }
-    if let Ok(value) = expression.parse::<f64>() {
-        return Some(json!(value));
-    }
-    None
-}
-
-fn min_max_json(values: Vec<Value>, min: bool) -> Value {
-    values
-        .into_iter()
-        .filter(|value| !value.is_null())
-        .min_by(|left, right| {
-            let ordering = compare_json_order(left, right);
-            if min {
-                ordering
-            } else {
-                ordering.reverse()
-            }
-        })
-        .unwrap_or(Value::Null)
-}
-
-fn compare_json_order(left: &Value, right: &Value) -> std::cmp::Ordering {
-    match (
-        json_number_f64(left.clone()),
-        json_number_f64(right.clone()),
-    ) {
-        (Some(left), Some(right)) => left.total_cmp(&right),
-        _ => left.to_string().cmp(&right.to_string()),
-    }
-}
-
-fn compare_json_values(left: &Value, right: &Value, op: &str) -> bool {
-    let ordering = compare_json_order(left, right);
-    match op {
-        "==" => left == right,
-        "!=" => left != right,
-        ">" => ordering.is_gt(),
-        ">=" => !ordering.is_lt(),
-        "<" => ordering.is_lt(),
-        "<=" => !ordering.is_gt(),
-        _ => false,
-    }
-}
-
-fn json_number_f64(value: Value) -> Option<f64> {
-    value.as_f64()
-}
-
-fn json_truthy(value: &Value) -> bool {
-    match value {
-        Value::Null => false,
-        Value::Bool(value) => *value,
-        Value::Number(value) => value.as_f64().is_some_and(|value| value != 0.0),
-        Value::String(value) => !value.is_empty(),
-        Value::Array(values) => !values.is_empty(),
-        Value::Object(values) => !values.is_empty(),
-    }
-}
-
-fn record_kind_name(kind: RecordKind) -> &'static str {
-    match kind {
-        RecordKind::Delta => "delta",
-        RecordKind::Snapshot => "snapshot",
-        RecordKind::ReservedLegacyMaterializedDelta => "reserved_legacy_materialized_delta",
-        RecordKind::Baseline => "baseline",
-        RecordKind::Tombstone => "tombstone",
-        _ => "unknown",
-    }
-}
-
-impl ProjectionModel {
-    fn rows_for_projection_for_aggregate(&self) -> Result<Vec<ProjectionRow>, String> {
-        Ok(self.reconstructed_rows.clone())
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn property_by_name(row: &ObjectRow, property_name: &str) -> Value {
-    row.properties
-        .values()
-        .find(|property| property.entry.property_name == property_name)
-        .map(|property| property.value.clone())
-        .unwrap_or(Value::Null)
-}
-
-fn projection_property_by_name(row: &ProjectionRow, property_name: &str) -> Value {
-    row.properties
-        .iter()
-        .find(|property| property.property_name == property_name)
-        .map(|property| property.value.clone())
-        .unwrap_or(Value::Null)
-}
-
-fn projection_property_ref_by_name<'a>(
-    row: &'a ProjectionRow,
-    property_name: &str,
-) -> Option<&'a Value> {
-    row.properties
-        .iter()
-        .find(|property| property.property_name == property_name)
-        .map(|property| &property.value)
-}
-
-fn projection_property_by_flag_or_name(
-    row: &ProjectionRow,
-    flag: u32,
-    property_name: &str,
-) -> Value {
-    row.properties
-        .iter()
-        .find(|property| property.flags & flag != 0)
-        .map(|property| property.value.clone())
-        .unwrap_or_else(|| projection_property_by_name(row, property_name))
-}
-
-fn row_matches_association(row: &ProjectionRow, association_type: &str) -> bool {
-    if row.object_type_flags & (OBJECT_TYPE_FLAG_ASSOCIATION_OBJECT | OBJECT_TYPE_FLAG_LINK_OBJECT)
-        != 0
-    {
-        let flagged = projection_property_by_flag_or_name(
-            row,
-            PROPERTY_FLAG_ASSOCIATION_TYPE,
-            "association_type",
-        );
-        if flagged.as_str() == Some(association_type) {
-            return true;
-        }
-        if row.object_type.strip_prefix("Association:") == Some(association_type) {
-            return true;
-        }
-    }
-    row.object_type == format!("Association:{association_type}")
-}
-
-pub fn run_fixture_path(path: &Path) -> Result<(), String> {
-    let bytes = fs::read(path).map_err(|err| format!("cannot read {}: {err}", path.display()))?;
-    let fixture: Value = serde_json::from_slice(&bytes)
-        .map_err(|err| format!("fixture {} is not valid JSON: {err}", path.display()))?;
-    let map = PathBuf::from(required_str(&fixture, "mapping")?);
-    let sources = fixture
-        .get("sources")
-        .and_then(Value::as_array)
-        .ok_or_else(|| "fixture.sources must be an array".to_string())?
-        .iter()
-        .map(|value| {
-            value
-                .as_str()
-                .map(PathBuf::from)
-                .ok_or_else(|| "fixture.sources entries must be strings".to_string())
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let file = parse_map(&map)?;
-    let rows = read_sources(&sources)?;
-    if let Some(expected_rows) = fixture.get("expected_projected_rows") {
-        let projected = project_rows(&file, &rows)?;
-        if &projected["rows"] != expected_rows {
-            return Err("fixture projected rows did not match".into());
-        }
-    }
-    println!("{}", json!({"ok": true, "fixture": path}));
-    Ok(())
 }

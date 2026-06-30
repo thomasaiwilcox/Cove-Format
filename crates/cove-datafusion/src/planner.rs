@@ -64,8 +64,8 @@ impl PartialEq for PredicateLiteral {
             (Self::Int64(left), Self::Int64(right)) => left == right,
             (Self::UInt64(left), Self::UInt64(right)) => left == right,
             (Self::Float64(left), Self::Float64(right)) => {
-                left.normalized_for_comparison().to_bits()
-                    == right.normalized_for_comparison().to_bits()
+                normalized_predicate_float(left).to_bits()
+                    == normalized_predicate_float(right).to_bits()
             }
             _ => false,
         }
@@ -74,17 +74,11 @@ impl PartialEq for PredicateLiteral {
 
 impl Eq for PredicateLiteral {}
 
-trait NormalizePredicateFloat {
-    fn normalized_for_comparison(self) -> Self;
-}
-
-impl NormalizePredicateFloat for f64 {
-    fn normalized_for_comparison(self) -> Self {
-        if self == 0.0 {
-            0.0
-        } else {
-            self
-        }
+fn normalized_predicate_float(value: f64) -> f64 {
+    if value == 0.0 {
+        0.0
+    } else {
+        value
     }
 }
 

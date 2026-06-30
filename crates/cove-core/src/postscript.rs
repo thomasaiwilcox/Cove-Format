@@ -22,6 +22,7 @@ use crate::{
         POSTSCRIPT_VERSION_V1, SECTION_SPEC_LEN,
     },
     error::CoveError,
+    wire::{read_array_checked, read_u16_le_checked, read_u32_le_checked, read_u64_le_checked},
 };
 
 // ── CoveSectionSpecV1 ───────────────────────────────────────────────────────────
@@ -78,15 +79,15 @@ impl CoveSectionSpecV1 {
         if buf.len() < SECTION_SPEC_SIZE {
             return Err(CoveError::BufferTooShort);
         }
-        let offset = u64::from_le_bytes(buf[0..8].try_into().unwrap());
-        let length = u64::from_le_bytes(buf[8..16].try_into().unwrap());
-        let uncompressed_length = u64::from_le_bytes(buf[16..24].try_into().unwrap());
+        let offset = read_u64_le_checked(buf, 0)?;
+        let length = read_u64_le_checked(buf, 8)?;
+        let uncompressed_length = read_u64_le_checked(buf, 16)?;
         let compression = buf[24];
         let encryption = buf[25];
         let alignment_log2 = buf[26];
         let flags = buf[27];
-        let crc32c = u32::from_le_bytes(buf[28..32].try_into().unwrap());
-        let reserved = u32::from_le_bytes(buf[32..36].try_into().unwrap());
+        let crc32c = read_u32_le_checked(buf, 28)?;
+        let reserved = read_u32_le_checked(buf, 32)?;
 
         if CompressionCodec::from_u8(compression).is_none() {
             return Err(CoveError::BadSection(format!(
@@ -205,20 +206,13 @@ impl CovePostscriptV1 {
         }
 
         let tail_start = file_len - POSTSCRIPT_TAIL_SIZE;
-        let magic: [u8; 4] = file_data[tail_start + 4..tail_start + 8]
-            .try_into()
-            .unwrap();
+        let magic = read_array_checked(file_data, tail_start + 4)?;
         if magic != MAGIC_COVE {
             return Err(CoveError::BadMagic);
         }
 
-        let ps_version =
-            u16::from_le_bytes(file_data[tail_start..tail_start + 2].try_into().unwrap());
-        let ps_len = u16::from_le_bytes(
-            file_data[tail_start + 2..tail_start + 4]
-                .try_into()
-                .unwrap(),
-        );
+        let ps_version = read_u16_le_checked(file_data, tail_start)?;
+        let ps_len = read_u16_le_checked(file_data, tail_start + 2)?;
 
         if ps_version != POSTSCRIPT_VERSION_V1 {
             return Err(CoveError::BadVersion);
@@ -248,22 +242,12 @@ impl CovePostscriptV1 {
             return Err(CoveError::BufferTooShort);
         }
         let tail_bytes = &tail_bytes[tail_bytes.len() - POSTSCRIPT_TOTAL_SIZE..];
-        let magic: [u8; 4] = tail_bytes[POSTSCRIPT_SIZE + 4..POSTSCRIPT_SIZE + 8]
-            .try_into()
-            .unwrap();
+        let magic = read_array_checked(tail_bytes, POSTSCRIPT_SIZE + 4)?;
         if magic != MAGIC_COVE {
             return Err(CoveError::BadMagic);
         }
-        let ps_version = u16::from_le_bytes(
-            tail_bytes[POSTSCRIPT_SIZE..POSTSCRIPT_SIZE + 2]
-                .try_into()
-                .unwrap(),
-        );
-        let ps_len = u16::from_le_bytes(
-            tail_bytes[POSTSCRIPT_SIZE + 2..POSTSCRIPT_SIZE + 4]
-                .try_into()
-                .unwrap(),
-        );
+        let ps_version = read_u16_le_checked(tail_bytes, POSTSCRIPT_SIZE)?;
+        let ps_len = read_u16_le_checked(tail_bytes, POSTSCRIPT_SIZE + 2)?;
         if ps_version != POSTSCRIPT_VERSION_V1 {
             return Err(CoveError::BadVersion);
         }
@@ -284,11 +268,7 @@ impl CovePostscriptV1 {
         let buf = &buf[..POSTSCRIPT_SIZE];
 
         // Verify checksum first.
-        let stored_crc = u32::from_le_bytes(
-            buf[PS_CHECKSUM_OFFSET..PS_CHECKSUM_OFFSET + 4]
-                .try_into()
-                .unwrap(),
-        );
+        let stored_crc = read_u32_le_checked(buf, PS_CHECKSUM_OFFSET)?;
         let mut check_buf = [0u8; POSTSCRIPT_SIZE];
         check_buf.copy_from_slice(buf);
         check_buf[PS_CHECKSUM_OFFSET..PS_CHECKSUM_OFFSET + 4].copy_from_slice(&[0, 0, 0, 0]);
@@ -296,13 +276,13 @@ impl CovePostscriptV1 {
             return Err(CoveError::ChecksumMismatch);
         }
 
-        let required_features = u64::from_le_bytes(buf[0..8].try_into().unwrap());
-        let optional_features = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+        let required_features = read_u64_le_checked(buf, 0)?;
+        let optional_features = read_u64_le_checked(buf, 8)?;
         let unknown_required = required_features & !KNOWN_FEATURE_BITS_MASK;
         if unknown_required != 0 {
             return Err(CoveError::UnknownRequiredFeature(unknown_required));
         }
-        let file_len = u64::from_le_bytes(buf[16..24].try_into().unwrap());
+        let file_len = read_u64_le_checked(buf, 16)?;
         let footer = CoveSectionSpecV1::parse(&buf[24..60])?;
 
         Ok(Self {

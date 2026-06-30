@@ -305,7 +305,8 @@ fn build_covx_or_covm_snapshot_sidecar(args: Vec<String>, covx: bool) -> Result<
     let dataset = dataset.ok_or_else(|| "--dataset <dir> is required".to_string())?;
     let output = output.ok_or_else(|| "--out <path> is required".to_string())?;
     let (_snapshot, materialized) =
-        cove_datafusion::delta_snapshot::materialize_delta_snapshot(&snapshot, &dataset, request)?;
+        cove_datafusion::delta_snapshot::materialize_delta_snapshot(&snapshot, &dataset, request)
+            .map_err(|error| error.to_string())?;
     let uri = snapshot_artifact_uri(&snapshot, request);
     let input = CovmInputArtifact {
         uri,
@@ -534,7 +535,8 @@ fn build_covi_snapshot_sidecar(args: Vec<String>) -> Result<(), String> {
     let dataset = dataset.ok_or_else(|| "--dataset <dir> is required".to_string())?;
     let output = output.ok_or_else(|| "--out <output.covi> is required".to_string())?;
     let (validated_snapshot, materialized) =
-        cove_datafusion::delta_snapshot::materialize_delta_snapshot(&snapshot, &dataset, request)?;
+        cove_datafusion::delta_snapshot::materialize_delta_snapshot(&snapshot, &dataset, request)
+            .map_err(|error| error.to_string())?;
     let algorithm = DigestAlgorithm::from_u16(validated_snapshot.extension.chain_digest_algorithm)
         .filter(|algorithm| *algorithm != DigestAlgorithm::None)
         .ok_or_else(|| "delta chain manifest has no usable chain digest".to_string())?;

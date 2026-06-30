@@ -7,10 +7,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-mod wire;
-
-use wire::*;
-
 use crate::{
     canonical, checksum,
     constants::{CoveLogicalType, DigestAlgorithm, ValueTag, MAGIC_COVEDELTA},
@@ -19,7 +15,7 @@ use crate::{
         cove_map::{MapEvidenceIndex, MapProjectionCatalog},
         cove_o::{ObjectTypeCatalog, RecordKind, TemporalSegmentData},
     },
-    CoveError,
+    wire, CoveError,
 };
 
 pub const COVEDELTA_VERSION_MAJOR_V1: u16 = 1;
@@ -1502,8 +1498,7 @@ impl DeltaSparsePatchRecordV1 {
             return Err(CoveError::BufferTooShort);
         }
         let record_bytes = &bytes[..record_len];
-        let checksum =
-            u32::from_le_bytes(record_bytes[record_len - 4..record_len].try_into().unwrap());
+        let checksum = wire::read_u32_le_checked(record_bytes, record_len - 4)?;
         let mut for_crc = record_bytes.to_vec();
         for_crc[record_len - 4..record_len].fill(0);
         if checksum::crc32c(&for_crc) != checksum {
@@ -2593,13 +2588,11 @@ impl CoveDeltaFile {
         if bytes[tail_start + 4..tail_start + 8] != MAGIC_COVEDELTA {
             return Err(CoveError::BadMagic);
         }
-        let postscript_version =
-            u16::from_le_bytes(bytes[tail_start..tail_start + 2].try_into().unwrap());
+        let postscript_version = wire::read_u16_le_checked(bytes, tail_start)?;
         if postscript_version != COVEDELTA_POSTSCRIPT_VERSION_V1 {
             return Err(CoveError::BadVersion);
         }
-        let postscript_len =
-            u16::from_le_bytes(bytes[tail_start + 2..tail_start + 4].try_into().unwrap());
+        let postscript_len = wire::read_u16_le_checked(bytes, tail_start + 2)?;
         if postscript_len != COVEDELTA_POSTSCRIPT_LEN {
             return Err(CoveError::BadSection(format!(
                 "COVEDELTA postscript_len must be {COVEDELTA_POSTSCRIPT_LEN}, got {postscript_len}"
@@ -3938,8 +3931,82 @@ fn covedelta_object_delta_requires_section_features(kind: CoveDeltaSectionKind) 
     )
 }
 
-#[cfg(test)]
-mod fixtures;
+fn checked_range(
+    offset: u64,
+    length: u64,
+    total_len: usize,
+) -> Result<std::ops::Range<usize>, CoveError> {
+    let start = usize::try_from(offset).map_err(|_| CoveError::ArithOverflow)?;
+    let len = usize::try_from(length).map_err(|_| CoveError::ArithOverflow)?;
+    let end = start.checked_add(len).ok_or(CoveError::ArithOverflow)?;
+    if end > total_len {
+        return Err(CoveError::BufferTooShort);
+    }
+    Ok(start..end)
+}
+
+fn put(buf: &mut [u8], pos: &mut usize, bytes: &[u8]) {
+    let end = *pos + bytes.len();
+    buf[*pos..end].copy_from_slice(bytes);
+    *pos = end;
+}
+
+fn put_u8(buf: &mut [u8], pos: &mut usize, value: u8) {
+    buf[*pos] = value;
+    *pos += 1;
+}
+
+fn put_u16(buf: &mut [u8], pos: &mut usize, value: u16) {
+    put(buf, pos, &value.to_le_bytes());
+}
+
+fn put_u32(buf: &mut [u8], pos: &mut usize, value: u32) {
+    put(buf, pos, &value.to_le_bytes());
+}
+
+fn put_u64(buf: &mut [u8], pos: &mut usize, value: u64) {
+    put(buf, pos, &value.to_le_bytes());
+}
+
+fn put_i64(buf: &mut [u8], pos: &mut usize, value: i64) {
+    put(buf, pos, &value.to_le_bytes());
+}
+
+fn take<'a>(bytes: &'a [u8], pos: &mut usize, len: usize) -> Result<&'a [u8], CoveError> {
+    let end = pos.checked_add(len).ok_or(CoveError::ArithOverflow)?;
+    if end > bytes.len() {
+        return Err(CoveError::BufferTooShort);
+    }
+    let out = &bytes[*pos..end];
+    *pos = end;
+    Ok(out)
+}
+
+fn take_array<const N: usize>(bytes: &[u8], pos: &mut usize) -> Result<[u8; N], CoveError> {
+    let mut out = [0u8; N];
+    out.copy_from_slice(take(bytes, pos, N)?);
+    Ok(out)
+}
+
+fn take_u8(bytes: &[u8], pos: &mut usize) -> Result<u8, CoveError> {
+    Ok(take(bytes, pos, 1)?[0])
+}
+
+fn take_u16(bytes: &[u8], pos: &mut usize) -> Result<u16, CoveError> {
+    Ok(u16::from_le_bytes(take_array::<2>(bytes, pos)?))
+}
+
+fn take_u32(bytes: &[u8], pos: &mut usize) -> Result<u32, CoveError> {
+    Ok(u32::from_le_bytes(take_array::<4>(bytes, pos)?))
+}
+
+fn take_u64(bytes: &[u8], pos: &mut usize) -> Result<u64, CoveError> {
+    Ok(u64::from_le_bytes(take_array::<8>(bytes, pos)?))
+}
+
+fn take_i64(bytes: &[u8], pos: &mut usize) -> Result<i64, CoveError> {
+    Ok(i64::from_le_bytes(take_array::<8>(bytes, pos)?))
+}
 
 #[cfg(test)]
 mod tests;

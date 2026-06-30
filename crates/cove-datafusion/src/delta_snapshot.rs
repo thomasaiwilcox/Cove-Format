@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeMap,
-    fs,
+    error::Error,
+    fmt, fs,
     path::{Path, PathBuf},
 };
 
@@ -28,8 +29,48 @@ use cove_core::{
         ObjectTypeEntryV1,
     },
     utility::hex_encode,
+    wire,
 };
 use serde_json::{json, Value};
+
+pub type DeltaSnapshotResult<T> = Result<T, DeltaSnapshotError>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeltaSnapshotError {
+    Io(String),
+    InvalidManifest(String),
+    InvalidExtension(String),
+    InvalidSummary(String),
+    InvalidChain(String),
+    Planning(String),
+    Materialization(String),
+    Surface(String),
+    Invariant(String),
+}
+
+impl DeltaSnapshotError {
+    fn message(&self) -> &str {
+        match self {
+            Self::Io(message)
+            | Self::InvalidManifest(message)
+            | Self::InvalidExtension(message)
+            | Self::InvalidSummary(message)
+            | Self::InvalidChain(message)
+            | Self::Planning(message)
+            | Self::Materialization(message)
+            | Self::Surface(message)
+            | Self::Invariant(message) => message,
+        }
+    }
+}
+
+impl fmt::Display for DeltaSnapshotError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.message())
+    }
+}
+
+impl Error for DeltaSnapshotError {}
 
 #[derive(Debug, Clone)]
 pub struct ManifestDeltaContext {
@@ -94,31 +135,32 @@ fn cove_object_delta_parent_identity(
     }
 }
 
-pub fn delta_chain_required(bytes: &[u8]) -> Result<bool, String> {
-    let manifest = CovmFile::parse_delta_aware(bytes)
-        .map_err(|error| format!("not a valid COVM manifest: {error}"))?;
+pub fn delta_chain_required(bytes: &[u8]) -> DeltaSnapshotResult<bool> {
+    let manifest = CovmFile::parse_delta_aware(bytes).map_err(|error| {
+        DeltaSnapshotError::InvalidManifest(format!("not a valid COVM manifest: {error}"))
+    })?;
     Ok(manifest.postscript.flags & COVM_POSTSCRIPT_FLAG_DELTA_CHAIN_REQUIRED != 0)
 }
 
 pub fn load_manifest_delta_context(
     manifest_path: &Path,
     extension_override: Option<&Path>,
-) -> Result<ManifestDeltaContext, String> {
+) -> DeltaSnapshotResult<ManifestDeltaContext> {
     let manifest_bytes = read_file(manifest_path)?;
     let manifest = CovmFile::parse_delta_aware(&manifest_bytes).map_err(|error| {
-        format!(
+        DeltaSnapshotError::InvalidManifest(format!(
             "{} is not a valid COVM manifest: {error}",
             manifest_path.display()
-        )
+        ))
     })?;
     let (extension, inline_summary_bytes, extension_source) = if let Some(path) = extension_override
     {
         let bytes = read_file(path)?;
         let extension = CovmDeltaChainExtensionV1::parse(&bytes).map_err(|error| {
-            format!(
+            DeltaSnapshotError::InvalidExtension(format!(
                 "{} is not a valid delta-chain extension: {error}",
                 path.display()
-            )
+            ))
         })?;
         (Some(extension), None, Some(path.display().to_string()))
     } else {
@@ -128,12 +170,16 @@ pub fn load_manifest_delta_context(
         } else {
             let extension_len = covm_delta_extension_encoded_len(region)?;
             if extension_len > region.len() {
-                return Err(
+                return Err(DeltaSnapshotError::InvalidExtension(
                     "COVM delta-chain extension extends past manifest extension region".into(),
-                );
+                ));
             }
-            let extension = CovmDeltaChainExtensionV1::parse(&region[..extension_len])
-                .map_err(|error| format!("manifest delta-chain extension is invalid: {error}"))?;
+            let extension =
+                CovmDeltaChainExtensionV1::parse(&region[..extension_len]).map_err(|error| {
+                    DeltaSnapshotError::InvalidExtension(format!(
+                        "manifest delta-chain extension is invalid: {error}"
+                    ))
+                })?;
             let summary = if extension_len < region.len() {
                 Some(region[extension_len..].to_vec())
             } else {
@@ -154,7 +200,7 @@ pub fn load_validated_delta_snapshot(
     manifest: &Path,
     dataset: &Path,
     request: CovmDeltaPruneRequest,
-) -> Result<ValidatedDeltaSnapshot, String> {
+) -> DeltaSnapshotResult<ValidatedDeltaSnapshot> {
     let context = load_manifest_delta_context(manifest, None)?;
     load_validated_delta_snapshot_from_context(&context, dataset, request)
 }
@@ -163,11 +209,15 @@ pub fn load_validated_delta_snapshot_from_context(
     context: &ManifestDeltaContext,
     dataset: &Path,
     request: CovmDeltaPruneRequest,
-) -> Result<ValidatedDeltaSnapshot, String> {
+) -> DeltaSnapshotResult<ValidatedDeltaSnapshot> {
     let extension = context
         .extension
         .as_ref()
-        .ok_or_else(|| "manifest does not contain a delta-chain extension".to_string())?
+        .ok_or_else(|| {
+            DeltaSnapshotError::InvalidManifest(
+                "manifest does not contain a delta-chain extension".into(),
+            )
+        })?
         .clone();
     let (base, deltas) = load_selected_artifacts(context, &extension, dataset)?;
     let summary = context
@@ -175,14 +225,20 @@ pub fn load_validated_delta_snapshot_from_context(
         .as_deref()
         .map(CovmDeltaChainSummaryV1::parse)
         .transpose()
-        .map_err(|error| format!("invalid delta chain summary: {error}"))?;
+        .map_err(|error| {
+            DeltaSnapshotError::InvalidSummary(format!("invalid delta chain summary: {error}"))
+        })?;
     if extension.chain_summary_kind != COVM_DELTA_CHAIN_SUMMARY_KIND_NONE && summary.is_none() {
-        return Err("delta chain requires an inline summary to plan snapshot reads".into());
+        return Err(DeltaSnapshotError::InvalidSummary(
+            "delta chain requires an inline summary to plan snapshot reads".into(),
+        ));
     }
     if let Some(summary) = &summary {
         summary
             .validate_against_delta_chain_extension(&extension)
-            .map_err(|error| format!("delta chain summary is stale: {error}"))?;
+            .map_err(|error| {
+                DeltaSnapshotError::InvalidSummary(format!("delta chain summary is stale: {error}"))
+            })?;
     }
     let delta_slices = deltas
         .iter()
@@ -194,7 +250,9 @@ pub fn load_validated_delta_snapshot_from_context(
         Some(base.bytes.as_slice()),
         &delta_slices,
     )
-    .map_err(|error| format!("selected delta chain is invalid: {error}"))?;
+    .map_err(|error| {
+        DeltaSnapshotError::InvalidChain(format!("selected delta chain is invalid: {error}"))
+    })?;
     let plan = plan_delta_snapshot(&extension, summary.as_ref(), request)?;
     Ok(ValidatedDeltaSnapshot {
         extension,
@@ -210,11 +268,11 @@ pub fn plan_delta_snapshot(
     extension: &CovmDeltaChainExtensionV1,
     summary: Option<&CovmDeltaChainSummaryV1>,
     request: CovmDeltaPruneRequest,
-) -> Result<DeltaSnapshotPlan, String> {
+) -> DeltaSnapshotResult<DeltaSnapshotPlan> {
     let decision = match summary {
-        Some(summary) => summary
-            .prune_delta_chain(request)
-            .map_err(|error| format!("cannot plan delta chain: {error}"))?,
+        Some(summary) => summary.prune_delta_chain(request).map_err(|error| {
+            DeltaSnapshotError::Planning(format!("cannot plan delta chain: {error}"))
+        })?,
         None if request == CovmDeltaPruneRequest::default() => CovmDeltaPruneDecision {
             selected_chain_ordinals: extension
                 .ordered_delta_artifact_refs
@@ -224,7 +282,9 @@ pub fn plan_delta_snapshot(
             skipped: Vec::new(),
         },
         None => {
-            return Err("delta snapshot pruning requires an inline delta chain summary".to_string())
+            return Err(DeltaSnapshotError::Planning(
+                "delta snapshot pruning requires an inline delta chain summary".into(),
+            ))
         }
     };
     let mut metrics = summary
@@ -260,7 +320,7 @@ pub fn plan_delta_snapshot(
 
 pub fn materialize_validated_delta_snapshot(
     snapshot: &ValidatedDeltaSnapshot,
-) -> Result<MaterializedSnapshot, String> {
+) -> DeltaSnapshotResult<MaterializedSnapshot> {
     let selected_prefix_len = selected_prefix_len(
         &snapshot.plan.decision.selected_chain_ordinals,
         snapshot.parsed_deltas.len(),
@@ -283,8 +343,12 @@ pub fn materialize_validated_delta_snapshot(
         states,
     } = reconstruct_validated_object_snapshot(snapshot)?;
     let state_count = states.len();
-    let bytes = cove_map::compact_cove_o_from_object_states(object_types, &states)
-        .map_err(|error| format!("cannot write reconstructed COVE-O snapshot: {error}"))?;
+    let bytes =
+        cove_map::compact_cove_o_from_object_states(object_types, &states).map_err(|error| {
+            DeltaSnapshotError::Materialization(format!(
+                "cannot write reconstructed COVE-O snapshot: {error}"
+            ))
+        })?;
     Ok(MaterializedSnapshot {
         bytes,
         state_count: Some(state_count),
@@ -302,7 +366,7 @@ pub fn direct_object_surface_support(
         Ok(len) => len,
         Err(error) => {
             return DirectDeltaObjectSurfaceSupport::RequiresMaterializedPlannerMetadata {
-                reason: error,
+                reason: error.to_string(),
             }
         }
     };
@@ -338,7 +402,7 @@ pub fn direct_object_surface_support(
 
 pub fn read_validated_delta_object_surface(
     snapshot: &ValidatedDeltaSnapshot,
-) -> Result<CoveObjectSurface, String> {
+) -> DeltaSnapshotResult<CoveObjectSurface> {
     let selected_prefix_len = selected_prefix_len(
         &snapshot.plan.decision.selected_chain_ordinals,
         snapshot.parsed_deltas.len(),
@@ -358,7 +422,11 @@ pub fn read_validated_delta_object_surface(
         .all(|delta| delta.sections.is_empty())
     {
         return read_object_surface_from_bytes_with_options(&snapshot.base.bytes, &read_options)
-            .map_err(|error| format!("cannot read selected COVE-O base object surface: {error}"));
+            .map_err(|error| {
+                DeltaSnapshotError::Surface(format!(
+                    "cannot read selected COVE-O base object surface: {error}"
+                ))
+            });
     }
     read_object_surface_from_base_and_delta_files_with_parent_identity(
         &snapshot.base.bytes,
@@ -368,12 +436,16 @@ pub fn read_validated_delta_object_surface(
         selected_deltas,
         &read_options,
     )
-    .map_err(|error| format!("cannot read selected COVE-O delta object surface: {error}"))
+    .map_err(|error| {
+        DeltaSnapshotError::Surface(format!(
+            "cannot read selected COVE-O delta object surface: {error}"
+        ))
+    })
 }
 
 pub fn reconstruct_validated_object_snapshot(
     snapshot: &ValidatedDeltaSnapshot,
-) -> Result<ReconstructedObjectSnapshot, String> {
+) -> DeltaSnapshotResult<ReconstructedObjectSnapshot> {
     let selected_prefix_len = selected_prefix_len(
         &snapshot.plan.decision.selected_chain_ordinals,
         snapshot.parsed_deltas.len(),
@@ -384,8 +456,13 @@ pub fn reconstruct_validated_object_snapshot(
         .iter()
         .all(|delta| delta.sections.is_empty())
     {
-        read_object_surface_from_bytes_with_options(&snapshot.base.bytes, &read_options)
-            .map_err(|error| format!("cannot read selected COVE-O base snapshot: {error}"))?
+        read_object_surface_from_bytes_with_options(&snapshot.base.bytes, &read_options).map_err(
+            |error| {
+                DeltaSnapshotError::Surface(format!(
+                    "cannot read selected COVE-O base snapshot: {error}"
+                ))
+            },
+        )?
     } else {
         read_object_surface_from_base_and_delta_files_with_parent_identity(
             &snapshot.base.bytes,
@@ -395,7 +472,11 @@ pub fn reconstruct_validated_object_snapshot(
             selected_deltas,
             &read_options,
         )
-        .map_err(|error| format!("cannot read selected COVE-O delta snapshot: {error}"))?
+        .map_err(|error| {
+            DeltaSnapshotError::Surface(format!(
+                "cannot read selected COVE-O delta snapshot: {error}"
+            ))
+        })?
     };
     let states = reconstruct_object_states(
         &surface,
@@ -404,7 +485,11 @@ pub fn reconstruct_validated_object_snapshot(
             ..CoveObjectReconstructionOptions::default()
         },
     )
-    .map_err(|error| format!("cannot reconstruct selected COVE-O object states: {error}"))?;
+    .map_err(|error| {
+        DeltaSnapshotError::Materialization(format!(
+            "cannot reconstruct selected COVE-O object states: {error}"
+        ))
+    })?;
     Ok(ReconstructedObjectSnapshot {
         object_types: surface.object_types,
         states,
@@ -415,7 +500,7 @@ pub fn materialize_delta_snapshot(
     manifest: &Path,
     dataset: &Path,
     request: CovmDeltaPruneRequest,
-) -> Result<(ValidatedDeltaSnapshot, MaterializedSnapshot), String> {
+) -> DeltaSnapshotResult<(ValidatedDeltaSnapshot, MaterializedSnapshot)> {
     let snapshot = load_validated_delta_snapshot(manifest, dataset, request)?;
     let materialized = materialize_validated_delta_snapshot(&snapshot)?;
     Ok((snapshot, materialized))
@@ -538,36 +623,39 @@ pub fn recommendation_name(
 
 fn temporal_cut_for_request(
     request: CovmDeltaPruneRequest,
-) -> Result<CoveObjectTemporalCut, String> {
+) -> DeltaSnapshotResult<CoveObjectTemporalCut> {
     if request.as_of_valid_time_us.is_some() {
-        return Err(
+        return Err(DeltaSnapshotError::Planning(
             "delta snapshot materialization does not yet support --as-of-valid-time-us".into(),
-        );
+        ));
     }
     match (request.as_of_csn, request.as_of_commit_timestamp_us) {
-        (Some(_), Some(_)) => Err(
+        (Some(_), Some(_)) => Err(DeltaSnapshotError::Planning(
             "delta snapshot materialization accepts only one of --as-of-csn or --as-of-commit-us"
                 .into(),
-        ),
+        )),
         (Some(csn), None) => Ok(CoveObjectTemporalCut::Csn(csn)),
         (None, Some(timestamp_us)) => Ok(CoveObjectTemporalCut::TimestampUs(timestamp_us)),
         (None, None) => Ok(CoveObjectTemporalCut::LatestCommitted),
     }
 }
 
-fn selected_prefix_len(selected: &[u32], total: usize) -> Result<usize, String> {
+fn selected_prefix_len(selected: &[u32], total: usize) -> DeltaSnapshotResult<usize> {
     for (index, ordinal) in selected.iter().enumerate() {
-        let expected =
-            u32::try_from(index + 1).map_err(|_| "selected delta ordinal overflows".to_string())?;
+        let expected = u32::try_from(index + 1).map_err(|_| {
+            DeltaSnapshotError::Materialization("selected delta ordinal overflows".into())
+        })?;
         if *ordinal != expected {
-            return Err(
+            return Err(DeltaSnapshotError::Materialization(
                 "delta snapshot materialization requires selected deltas to form a dense prefix"
                     .into(),
-            );
+            ));
         }
     }
     if selected.len() > total {
-        return Err("delta snapshot plan selected more deltas than were validated".into());
+        return Err(DeltaSnapshotError::Materialization(
+            "delta snapshot plan selected more deltas than were validated".into(),
+        ));
     }
     Ok(selected.len())
 }
@@ -576,14 +664,14 @@ fn load_selected_artifacts(
     context: &ManifestDeltaContext,
     extension: &CovmDeltaChainExtensionV1,
     dataset: &Path,
-) -> Result<(ArtifactBytes, Vec<ArtifactBytes>), String> {
+) -> DeltaSnapshotResult<(ArtifactBytes, Vec<ArtifactBytes>)> {
     let paths = artifact_uri_map(&context.manifest);
     let base = read_artifact_for_ref(dataset, &paths, &extension.base_artifact_ref, "base")?;
     let deltas = extension
         .ordered_delta_artifact_refs
         .iter()
         .map(|reference| read_artifact_for_ref(dataset, &paths, reference, "delta"))
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<DeltaSnapshotResult<Vec<_>>>()?;
     Ok((base, deltas))
 }
 
@@ -600,12 +688,12 @@ fn read_artifact_for_ref(
     paths: &BTreeMap<[u8; 16], String>,
     reference: &CovmDeltaArtifactRefV1,
     label: &str,
-) -> Result<ArtifactBytes, String> {
+) -> DeltaSnapshotResult<ArtifactBytes> {
     let uri = paths.get(&reference.artifact_id).ok_or_else(|| {
-        format!(
+        DeltaSnapshotError::InvalidManifest(format!(
             "manifest does not contain {label} artifact URI for {}",
             hex16(&reference.artifact_id)
-        )
+        ))
     })?;
     let path = dataset.join(uri);
     let bytes = read_file(&path)?;
@@ -615,57 +703,73 @@ fn read_artifact_for_ref(
 fn manifest_extension_region<'a>(
     manifest_bytes: &'a [u8],
     manifest: &CovmFile,
-) -> Result<&'a [u8], String> {
-    let entries_start = usize::try_from(manifest.postscript.entries_offset)
-        .map_err(|_| "COVM entries offset out of range".to_string())?;
-    let entries_len = usize::try_from(manifest.postscript.entries_len)
-        .map_err(|_| "COVM entries length out of range".to_string())?;
-    let entries_end = entries_start
-        .checked_add(entries_len)
-        .ok_or_else(|| "COVM entries range overflows".to_string())?;
+) -> DeltaSnapshotResult<&'a [u8]> {
+    let entries_start = usize::try_from(manifest.postscript.entries_offset).map_err(|_| {
+        DeltaSnapshotError::InvalidManifest("COVM entries offset out of range".into())
+    })?;
+    let entries_len = usize::try_from(manifest.postscript.entries_len).map_err(|_| {
+        DeltaSnapshotError::InvalidManifest("COVM entries length out of range".into())
+    })?;
+    let entries_end = entries_start.checked_add(entries_len).ok_or_else(|| {
+        DeltaSnapshotError::InvalidManifest("COVM entries range overflows".into())
+    })?;
     let postscript_total = COVM_POSTSCRIPT_LEN as usize + COVM_POSTSCRIPT_TAIL_SIZE;
     if manifest_bytes.len() < postscript_total {
-        return Err("COVM file too short for postscript".into());
+        return Err(DeltaSnapshotError::InvalidManifest(
+            "COVM file too short for postscript".into(),
+        ));
     }
     let postscript_start = manifest_bytes.len() - postscript_total;
     if entries_end > postscript_start {
-        return Err("COVM entries overlap postscript".into());
+        return Err(DeltaSnapshotError::InvalidManifest(
+            "COVM entries overlap postscript".into(),
+        ));
     }
     Ok(&manifest_bytes[entries_end..postscript_start])
 }
 
-fn covm_delta_extension_encoded_len(bytes: &[u8]) -> Result<usize, String> {
+fn covm_delta_extension_encoded_len(bytes: &[u8]) -> DeltaSnapshotResult<usize> {
     if bytes.len() < COVM_DELTA_CHAIN_EXTENSION_HEADER_LEN {
-        return Err("COVM delta-chain extension header is truncated".into());
+        return Err(DeltaSnapshotError::InvalidExtension(
+            "COVM delta-chain extension header is truncated".into(),
+        ));
     }
-    let ordered_delta_count = read_u32_at(bytes, 184)? as usize;
-    let chain_digest_len = read_u16_at(bytes, 206)? as usize;
-    let chain_summary_digest_len = read_u16_at(bytes, 240)? as usize;
+    let ordered_delta_count = read_delta_chain_u32(bytes, 184)? as usize;
+    let chain_digest_len = read_delta_chain_u16(bytes, 206)? as usize;
+    let chain_summary_digest_len = read_delta_chain_u16(bytes, 240)? as usize;
     COVM_DELTA_CHAIN_EXTENSION_HEADER_LEN
         .checked_add(
             ordered_delta_count
                 .checked_mul(COVM_DELTA_ARTIFACT_REF_LEN)
-                .ok_or_else(|| "COVM delta artifact ref length overflows".to_string())?,
+                .ok_or_else(|| {
+                    DeltaSnapshotError::InvalidExtension(
+                        "COVM delta artifact ref length overflows".into(),
+                    )
+                })?,
         )
         .and_then(|len| len.checked_add(chain_digest_len))
         .and_then(|len| len.checked_add(chain_summary_digest_len))
-        .ok_or_else(|| "COVM delta-chain extension length overflows".to_string())
+        .ok_or_else(|| {
+            DeltaSnapshotError::InvalidExtension(
+                "COVM delta-chain extension length overflows".into(),
+            )
+        })
 }
 
-fn read_u16_at(bytes: &[u8], offset: usize) -> Result<u16, String> {
-    let end = offset + 2;
-    if end > bytes.len() {
-        return Err("COVM delta-chain extension header is truncated".into());
-    }
-    Ok(u16::from_le_bytes(bytes[offset..end].try_into().unwrap()))
+fn read_delta_chain_u16(bytes: &[u8], offset: usize) -> DeltaSnapshotResult<u16> {
+    wire::read_u16_le_checked(bytes, offset).map_err(|_| {
+        DeltaSnapshotError::InvalidExtension(
+            "COVM delta-chain extension header is truncated".into(),
+        )
+    })
 }
 
-fn read_u32_at(bytes: &[u8], offset: usize) -> Result<u32, String> {
-    let end = offset + 4;
-    if end > bytes.len() {
-        return Err("COVM delta-chain extension header is truncated".into());
-    }
-    Ok(u32::from_le_bytes(bytes[offset..end].try_into().unwrap()))
+fn read_delta_chain_u32(bytes: &[u8], offset: usize) -> DeltaSnapshotResult<u32> {
+    wire::read_u32_le_checked(bytes, offset).map_err(|_| {
+        DeltaSnapshotError::InvalidExtension(
+            "COVM delta-chain extension header is truncated".into(),
+        )
+    })
 }
 
 fn selected_delta_bytes(extension: &CovmDeltaChainExtensionV1, selected: &[u32]) -> u64 {
@@ -685,6 +789,7 @@ fn hex16(bytes: &[u8; 16]) -> String {
     hex_encode(bytes)
 }
 
-fn read_file(path: &Path) -> Result<Vec<u8>, String> {
-    fs::read(path).map_err(|error| format!("cannot read {}: {error}", path.display()))
+fn read_file(path: &Path) -> DeltaSnapshotResult<Vec<u8>> {
+    fs::read(path)
+        .map_err(|error| DeltaSnapshotError::Io(format!("cannot read {}: {error}", path.display())))
 }

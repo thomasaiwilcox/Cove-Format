@@ -3,7 +3,10 @@
 //! Maps a FileCode to the bit-set of morsel ids that contain at least one row
 //! with that value. Useful for low-cardinality equality / `IN` predicates.
 
-use crate::CoveError;
+use crate::{
+    wire::{read_u32_le_checked, read_u64_le_checked},
+    CoveError,
+};
 
 use super::{checked_region, verify_checksum_field};
 
@@ -70,15 +73,15 @@ impl InvertedMorselIndexHeaderV1 {
             return Err(CoveError::ReservedNotZero);
         }
         Ok(Self {
-            table_id: u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
-            column_id: u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+            table_id: read_u32_le_checked(bytes, 0)?,
+            column_id: read_u32_le_checked(bytes, 4)?,
             key_kind,
             flags: bytes[9],
             representation: bytes[10],
             reserved: bytes[11],
-            entry_count: u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
-            entries_offset: u64::from_le_bytes(bytes[16..24].try_into().unwrap()),
-            bitmap_data_offset: u64::from_le_bytes(bytes[24..32].try_into().unwrap()),
+            entry_count: read_u32_le_checked(bytes, 12)?,
+            entries_offset: read_u64_le_checked(bytes, 16)?,
+            bitmap_data_offset: read_u64_le_checked(bytes, 24)?,
             checksum,
         })
     }
@@ -109,11 +112,11 @@ impl InvertedEntry {
             return Err(CoveError::BufferTooShort);
         }
         Ok(Self {
-            key: u64::from_le_bytes(bytes[0..8].try_into().unwrap()),
-            morsel_bitmap_offset: u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
-            morsel_bitmap_length: u32::from_le_bytes(bytes[16..20].try_into().unwrap()),
-            row_bitmap_offset: u64::from_le_bytes(bytes[20..28].try_into().unwrap()),
-            row_bitmap_length: u32::from_le_bytes(bytes[28..32].try_into().unwrap()),
+            key: read_u64_le_checked(bytes, 0)?,
+            morsel_bitmap_offset: read_u64_le_checked(bytes, 8)?,
+            morsel_bitmap_length: read_u32_le_checked(bytes, 16)?,
+            row_bitmap_offset: read_u64_le_checked(bytes, 20)?,
+            row_bitmap_length: read_u32_le_checked(bytes, 28)?,
         })
     }
 }

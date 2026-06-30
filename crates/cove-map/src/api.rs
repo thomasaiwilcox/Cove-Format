@@ -1,13 +1,14 @@
 use std::{
-    fs,
+    error::Error,
+    fmt, fs,
     path::{Path, PathBuf},
 };
 
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
-use cove_core::artifact::covemap::CovemapFile;
 use cove_core::profile::cove_map::MapProjectionCatalog;
 use cove_core::profile::cove_o::CoveObjectSurface;
+use cove_core::{artifact::covemap::CovemapFile, CoveError};
 use serde_json::{json, Value};
 
 use crate::{
@@ -22,12 +23,106 @@ use crate::{
         project_cove_o_path, project_cove_o_path_output, project_rows_with_source_states,
         project_rows_with_source_states_output, projection_catalog_from_cove_o_bytes_internal,
         projection_catalog_from_cove_o_path, projection_read_requirements,
-        projection_schema_from_descriptor, ProjectionBatchOptions, ProjectionFilter,
-        ProjectionFilterLiteral, ProjectionFilterOp, ProjectionFormat, ProjectionReadRequirements,
+        projection_schema_from_descriptor, ProjectionBatchOptions, ProjectionCoviFilterReason,
+        ProjectionCoviLineageStatus, ProjectionFilter, ProjectionFilterLiteral, ProjectionFilterOp,
+        ProjectionFilterPushdown, ProjectionFormat, ProjectionReadRequirements,
     },
     section_kind, MaterializedModel,
 };
 
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum MapApiError {
+    ReadMap {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    ParseMap {
+        path: PathBuf,
+        source: CoveError,
+    },
+    SourceInput {
+        message: String,
+    },
+    Materialization {
+        message: String,
+    },
+    Projection {
+        message: String,
+    },
+    Replay {
+        message: String,
+    },
+    InvalidInput {
+        message: String,
+    },
+}
+
+pub type MapApiResult<T> = Result<T, MapApiError>;
+
+impl fmt::Display for MapApiError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MapApiError::ReadMap { path, source } => {
+                write!(f, "cannot read {}: {source}", path.display())
+            }
+            MapApiError::ParseMap { path, source } => write!(f, "{}: {source}", path.display()),
+            MapApiError::SourceInput { message }
+            | MapApiError::Materialization { message }
+            | MapApiError::Projection { message }
+            | MapApiError::Replay { message }
+            | MapApiError::InvalidInput { message } => f.write_str(message),
+        }
+    }
+}
+
+impl Error for MapApiError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            MapApiError::ReadMap { source, .. } => Some(source),
+            MapApiError::ParseMap { source, .. } => Some(source),
+            MapApiError::SourceInput { .. }
+            | MapApiError::Materialization { .. }
+            | MapApiError::Projection { .. }
+            | MapApiError::Replay { .. }
+            | MapApiError::InvalidInput { .. } => None,
+        }
+    }
+}
+
+impl From<String> for MapApiError {
+    fn from(message: String) -> Self {
+        MapApiError::InvalidInput { message }
+    }
+}
+
+impl From<&str> for MapApiError {
+    fn from(message: &str) -> Self {
+        MapApiError::InvalidInput {
+            message: message.to_string(),
+        }
+    }
+}
+
+impl MapApiError {
+    fn source_input(message: String) -> Self {
+        Self::SourceInput { message }
+    }
+
+    fn materialization(message: String) -> Self {
+        Self::Materialization { message }
+    }
+
+    fn projection(message: String) -> Self {
+        Self::Projection { message }
+    }
+
+    fn replay(message: String) -> Self {
+        Self::Replay { message }
+    }
+}
+
+#[must_use]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectionDescriptor {
     pub projection_id: String,
@@ -36,6 +131,7 @@ pub struct ProjectionDescriptor {
     pub columns: Vec<ProjectionColumnDescriptor>,
 }
 
+#[must_use]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectionColumnDescriptor {
     pub name: String,
@@ -44,6 +140,7 @@ pub struct ProjectionColumnDescriptor {
     pub lineage: Option<ProjectionColumnLineageDescriptor>,
 }
 
+#[must_use]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectionColumnLineageDescriptor {
     pub source: String,
@@ -58,6 +155,7 @@ pub struct ProjectionColumnLineageDescriptor {
     pub filter_pushdown: String,
 }
 
+#[must_use]
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProjectionCoviFilterPlan {
     pub lookups: Vec<ProjectionCoviFilterLookup>,
@@ -65,6 +163,7 @@ pub struct ProjectionCoviFilterPlan {
     pub diagnostics: Vec<ProjectionCoviFilterDiagnostic>,
 }
 
+#[must_use]
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProjectionCoviFilterLookup {
     pub column: String,
@@ -74,6 +173,7 @@ pub struct ProjectionCoviFilterLookup {
     pub filter: ProjectionFilter,
 }
 
+#[must_use]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectionCoviFilterDiagnostic {
     pub column: String,
@@ -86,17 +186,18 @@ pub struct ProjectionCoviFilterDiagnostic {
     pub reason: String,
 }
 
-pub fn conversion_report_from_paths(map: &Path, sources: &[PathBuf]) -> Result<Value, String> {
-    Ok(materialize_from_paths(map, sources)?.conversion_report)
+pub fn conversion_report_from_paths(map: &Path, sources: &[PathBuf]) -> MapApiResult<Value> {
+    Ok(materialize_from_paths_for_api(map, sources)?.conversion_report)
 }
 
-pub fn verify_replay_report_from_paths(map: &Path, report: &Value) -> Result<Value, String> {
-    let file = parse_map(map)?;
+pub fn verify_replay_report_from_paths(map: &Path, report: &Value) -> MapApiResult<Value> {
+    let file = parse_map_for_api(map)?;
     crate::verify_replay_report(&file, report)
+        .map_err(|error| MapApiError::replay(error.to_string()))
 }
 
-pub fn conversion_summary_from_paths(map: &Path, sources: &[PathBuf]) -> Result<Value, String> {
-    let materialized = materialize_from_paths(map, sources)?;
+pub fn conversion_summary_from_paths(map: &Path, sources: &[PathBuf]) -> MapApiResult<Value> {
+    let materialized = materialize_from_paths_for_api(map, sources)?;
     Ok(json!({
         "report": materialized.conversion_report,
         "materialized_row_count": materialized.rows.len(),
@@ -107,25 +208,27 @@ pub fn conversion_summary_from_paths(map: &Path, sources: &[PathBuf]) -> Result<
     }))
 }
 
-pub fn candidate_matches_from_paths(map: &Path, sources: &[PathBuf]) -> Result<Value, String> {
-    let file = parse_map(map)?;
-    let inputs = read_source_inputs(sources)?;
-    validate_source_inputs(&file, &inputs.states)?;
-    candidate_matches(&file, &inputs.rows)
+pub fn candidate_matches_from_paths(map: &Path, sources: &[PathBuf]) -> MapApiResult<Value> {
+    let file = parse_map_for_api(map)?;
+    let inputs = read_source_inputs(sources).map_err(MapApiError::source_input)?;
+    validate_source_inputs(&file, &inputs.states).map_err(MapApiError::source_input)?;
+    candidate_matches(&file, &inputs.rows).map_err(MapApiError::materialization)
 }
 
-pub fn cove_o_from_paths(map: &Path, sources: &[PathBuf]) -> Result<Vec<u8>, String> {
-    let file = parse_map(map)?;
-    let inputs = read_source_inputs(sources)?;
-    validate_source_inputs(&file, &inputs.states)?;
+pub fn cove_o_from_paths(map: &Path, sources: &[PathBuf]) -> MapApiResult<Vec<u8>> {
+    let file = parse_map_for_api(map)?;
+    let inputs = read_source_inputs(sources).map_err(MapApiError::source_input)?;
+    validate_source_inputs(&file, &inputs.states).map_err(MapApiError::source_input)?;
     build_cove_o_with_source_states(&file, &inputs.rows, &inputs.states)
+        .map_err(MapApiError::materialization)
 }
 
-pub fn projected_rows_from_paths(map: &Path, sources: &[PathBuf]) -> Result<Value, String> {
-    let file = parse_map(map)?;
-    let inputs = read_source_inputs(sources)?;
-    validate_source_inputs(&file, &inputs.states)?;
+pub fn projected_rows_from_paths(map: &Path, sources: &[PathBuf]) -> MapApiResult<Value> {
+    let file = parse_map_for_api(map)?;
+    let inputs = read_source_inputs(sources).map_err(MapApiError::source_input)?;
+    validate_source_inputs(&file, &inputs.states).map_err(MapApiError::source_input)?;
     project_rows_with_source_states(&file, &inputs.rows, &inputs.states)
+        .map_err(MapApiError::projection)
 }
 
 pub fn projected_output_from_paths(
@@ -133,10 +236,10 @@ pub fn projected_output_from_paths(
     sources: &[PathBuf],
     format: ProjectionFormat,
     projection_id: Option<&str>,
-) -> Result<Vec<u8>, String> {
-    let file = parse_map(map)?;
-    let inputs = read_source_inputs(sources)?;
-    validate_source_inputs(&file, &inputs.states)?;
+) -> MapApiResult<Vec<u8>> {
+    let file = parse_map_for_api(map)?;
+    let inputs = read_source_inputs(sources).map_err(MapApiError::source_input)?;
+    validate_source_inputs(&file, &inputs.states).map_err(MapApiError::source_input)?;
     project_rows_with_source_states_output(
         &file,
         &inputs.rows,
@@ -144,13 +247,14 @@ pub fn projected_output_from_paths(
         format,
         projection_id,
     )
+    .map_err(MapApiError::projection)
 }
 
 pub fn projected_rows_from_cove_o_path(
     object: &Path,
     mapping: Option<&Path>,
-) -> Result<Value, String> {
-    project_cove_o_path(object, mapping)
+) -> MapApiResult<Value> {
+    project_cove_o_path(object, mapping).map_err(MapApiError::projection)
 }
 
 pub fn projected_output_from_cove_o_path(
@@ -158,8 +262,9 @@ pub fn projected_output_from_cove_o_path(
     mapping: Option<&Path>,
     format: ProjectionFormat,
     projection_id: Option<&str>,
-) -> Result<Vec<u8>, String> {
+) -> MapApiResult<Vec<u8>> {
     project_cove_o_path_output(object, mapping, format, projection_id)
+        .map_err(MapApiError::projection)
 }
 
 pub fn projected_output_from_cove_o_bytes(
@@ -167,8 +272,9 @@ pub fn projected_output_from_cove_o_bytes(
     mapping: Option<&Path>,
     format: ProjectionFormat,
     projection_id: Option<&str>,
-) -> Result<Vec<u8>, String> {
+) -> MapApiResult<Vec<u8>> {
     project_cove_o_bytes_output(object, mapping, format, projection_id, "<bytes>")
+        .map_err(MapApiError::projection)
 }
 
 pub fn projected_record_batch_from_cove_o_bytes(
@@ -176,8 +282,9 @@ pub fn projected_record_batch_from_cove_o_bytes(
     mapping: Option<&Path>,
     projection_id: &str,
     options: &ProjectionBatchOptions,
-) -> Result<RecordBatch, String> {
+) -> MapApiResult<RecordBatch> {
     project_cove_o_bytes_record_batch(object, mapping, projection_id, options, "<bytes>")
+        .map_err(MapApiError::projection)
 }
 
 pub fn projected_record_batches_from_cove_o_bytes(
@@ -185,8 +292,9 @@ pub fn projected_record_batches_from_cove_o_bytes(
     mapping: Option<&Path>,
     projection_id: &str,
     options: &ProjectionBatchOptions,
-) -> Result<Vec<RecordBatch>, String> {
+) -> MapApiResult<Vec<RecordBatch>> {
     project_cove_o_bytes_record_batches(object, mapping, projection_id, options, "<bytes>")
+        .map_err(MapApiError::projection)
 }
 
 pub fn projected_record_batches_from_cove_o_bytes_with_catalog(
@@ -195,7 +303,7 @@ pub fn projected_record_batches_from_cove_o_bytes_with_catalog(
     catalog: &MapProjectionCatalog,
     projection_id: &str,
     options: &ProjectionBatchOptions,
-) -> Result<Vec<RecordBatch>, String> {
+) -> MapApiResult<Vec<RecordBatch>> {
     project_cove_o_bytes_record_batches_with_catalog(
         object,
         mapping,
@@ -204,6 +312,7 @@ pub fn projected_record_batches_from_cove_o_bytes_with_catalog(
         options,
         "<bytes>",
     )
+    .map_err(MapApiError::projection)
 }
 
 pub fn projected_record_batches_from_cove_o_surface_with_catalog(
@@ -211,27 +320,30 @@ pub fn projected_record_batches_from_cove_o_surface_with_catalog(
     catalog: &MapProjectionCatalog,
     projection_id: &str,
     options: &ProjectionBatchOptions,
-) -> Result<Vec<RecordBatch>, String> {
+) -> MapApiResult<Vec<RecordBatch>> {
     crate::project::project_cove_o_surface_record_batches_with_catalog(
         surface,
         catalog,
         projection_id,
         options,
     )
+    .map_err(MapApiError::projection)
 }
 
 pub fn projection_catalog_from_cove_o_bytes(
     object: &[u8],
     mapping: Option<&Path>,
-) -> Result<MapProjectionCatalog, String> {
+) -> MapApiResult<MapProjectionCatalog> {
     projection_catalog_from_cove_o_bytes_internal(object, mapping, "<bytes>")
+        .map_err(MapApiError::projection)
 }
 
 pub fn projection_descriptors_from_cove_o_path(
     object: &Path,
     mapping: Option<&Path>,
-) -> Result<Vec<ProjectionDescriptor>, String> {
-    let catalog = projection_catalog_from_cove_o_path(object, mapping)?;
+) -> MapApiResult<Vec<ProjectionDescriptor>> {
+    let catalog =
+        projection_catalog_from_cove_o_path(object, mapping).map_err(MapApiError::projection)?;
     Ok(catalog
         .projections
         .into_iter()
@@ -266,8 +378,8 @@ pub fn projection_descriptors_from_cove_o_path(
         .collect())
 }
 
-pub fn projection_arrow_schema(descriptor: &ProjectionDescriptor) -> Result<SchemaRef, String> {
-    projection_schema_from_descriptor(descriptor)
+pub fn projection_arrow_schema(descriptor: &ProjectionDescriptor) -> MapApiResult<SchemaRef> {
+    projection_schema_from_descriptor(descriptor).map_err(MapApiError::projection)
 }
 
 pub fn projection_covi_filter_plan(
@@ -285,13 +397,13 @@ pub fn projection_covi_filter_plan(
     for filter in filters {
         let column_name = projection_filter_column(filter);
         let Some(column) = columns.get(column_name) else {
-            let reason = "column_not_found";
+            let reason = ProjectionCoviFilterReason::ColumnNotFound;
             unsupported_filters.push(format!("{column_name}: {reason}"));
             diagnostics.push(projection_covi_filter_diagnostic(
                 filter,
                 ProjectionCoviFilterDiagnosticParams {
                     column: column_name,
-                    lineage_status: "column_not_found",
+                    lineage_status: ProjectionCoviLineageStatus::ColumnNotFound,
                     logical_type: None,
                     eligible: false,
                     projection_table_id: None,
@@ -302,13 +414,13 @@ pub fn projection_covi_filter_plan(
             continue;
         };
         let Some(lineage) = &column.lineage else {
-            let reason = "missing_lineage";
+            let reason = ProjectionCoviFilterReason::MissingLineage;
             unsupported_filters.push(format!("{column_name}: {reason}"));
             diagnostics.push(projection_covi_filter_diagnostic(
                 filter,
                 ProjectionCoviFilterDiagnosticParams {
                     column: column_name,
-                    lineage_status: "missing",
+                    lineage_status: ProjectionCoviLineageStatus::Missing,
                     logical_type: Some(column.logical_type.clone()),
                     eligible: false,
                     projection_table_id: None,
@@ -320,15 +432,15 @@ pub fn projection_covi_filter_plan(
         };
         if lineage.source != "object_property"
             || lineage.transform != "identity"
-            || lineage.filter_pushdown != "projection_covi_prefilter"
+            || lineage.filter_pushdown != ProjectionFilterPushdown::ProjectionCoviPrefilter.as_str()
         {
-            let reason = "lineage_not_covi_eligible";
+            let reason = ProjectionCoviFilterReason::LineageNotCoviEligible;
             unsupported_filters.push(format!("{column_name}: {reason}"));
             diagnostics.push(projection_covi_filter_diagnostic(
                 filter,
                 ProjectionCoviFilterDiagnosticParams {
                     column: column_name,
-                    lineage_status: "ineligible",
+                    lineage_status: ProjectionCoviLineageStatus::Ineligible,
                     logical_type: Some(column.logical_type.clone()),
                     eligible: false,
                     projection_table_id: Some(lineage.projection_table_id),
@@ -344,7 +456,7 @@ pub fn projection_covi_filter_plan(
                 filter,
                 ProjectionCoviFilterDiagnosticParams {
                     column: column_name,
-                    lineage_status: "present",
+                    lineage_status: ProjectionCoviLineageStatus::Present,
                     logical_type: Some(column.logical_type.clone()),
                     eligible: false,
                     projection_table_id: Some(lineage.projection_table_id),
@@ -358,12 +470,12 @@ pub fn projection_covi_filter_plan(
             filter,
             ProjectionCoviFilterDiagnosticParams {
                 column: column_name,
-                lineage_status: "present",
+                lineage_status: ProjectionCoviLineageStatus::Present,
                 logical_type: Some(column.logical_type.clone()),
                 eligible: true,
                 projection_table_id: Some(lineage.projection_table_id),
                 projection_column_id: Some(lineage.projection_column_id),
-                reason: "eligible",
+                reason: ProjectionCoviFilterReason::Eligible,
             },
         ));
         lookups.push(ProjectionCoviFilterLookup {
@@ -389,30 +501,32 @@ fn projection_filter_column(filter: &ProjectionFilter) -> &str {
     }
 }
 
-fn projection_filter_shape_unsupported_reason(filter: &ProjectionFilter) -> Option<&'static str> {
+fn projection_filter_shape_unsupported_reason(
+    filter: &ProjectionFilter,
+) -> Option<ProjectionCoviFilterReason> {
     match filter {
         ProjectionFilter::Compare { op, literal, .. } => {
             if matches!(op, ProjectionFilterOp::Ne) {
-                Some("not_equal")
+                Some(ProjectionCoviFilterReason::NotEqual)
             } else if matches!(literal, ProjectionFilterLiteral::Null) {
-                Some("null_literal")
+                Some(ProjectionCoviFilterReason::NullLiteral)
             } else {
                 None
             }
         }
         ProjectionFilter::InList { literals, .. } => {
             if literals.is_empty() {
-                Some("empty_in_list")
+                Some(ProjectionCoviFilterReason::EmptyInList)
             } else if literals
                 .iter()
                 .any(|literal| matches!(literal, ProjectionFilterLiteral::Null))
             {
-                Some("null_literal")
+                Some(ProjectionCoviFilterReason::NullLiteral)
             } else {
                 None
             }
         }
-        ProjectionFilter::IsNull { .. } => Some("is_null"),
+        ProjectionFilter::IsNull { .. } => Some(ProjectionCoviFilterReason::IsNull),
     }
 }
 
@@ -423,23 +537,23 @@ fn projection_covi_filter_diagnostic(
     ProjectionCoviFilterDiagnostic {
         column: params.column.to_string(),
         op: projection_filter_op(filter).to_string(),
-        lineage_status: params.lineage_status.to_string(),
+        lineage_status: params.lineage_status.as_str().to_string(),
         logical_type: params.logical_type,
         eligible: params.eligible,
         projection_table_id: params.projection_table_id,
         projection_column_id: params.projection_column_id,
-        reason: params.reason.to_string(),
+        reason: params.reason.as_str().to_string(),
     }
 }
 
 struct ProjectionCoviFilterDiagnosticParams<'a> {
     column: &'a str,
-    lineage_status: &'a str,
+    lineage_status: ProjectionCoviLineageStatus,
     logical_type: Option<String>,
     eligible: bool,
     projection_table_id: Option<u32>,
     projection_column_id: Option<u32>,
-    reason: &'a str,
+    reason: ProjectionCoviFilterReason,
 }
 
 fn projection_filter_op(filter: &ProjectionFilter) -> &'static str {
@@ -461,13 +575,23 @@ pub fn projection_read_requirements_for_catalog(
     catalog: &cove_core::profile::cove_map::MapProjectionCatalog,
     projection_id: &str,
     options: &ProjectionBatchOptions,
-) -> Result<ProjectionReadRequirements, String> {
-    projection_read_requirements(catalog, projection_id, options)
+) -> MapApiResult<ProjectionReadRequirements> {
+    projection_read_requirements(catalog, projection_id, options).map_err(MapApiError::projection)
 }
 
 pub(crate) fn parse_map(path: &Path) -> Result<CovemapFile, String> {
-    let bytes = fs::read(path).map_err(|err| format!("cannot read {}: {err}", path.display()))?;
-    CovemapFile::parse_validated(&bytes).map_err(|err| format!("{}: {err}", path.display()))
+    parse_map_for_api(path).map_err(|err| err.to_string())
+}
+
+fn parse_map_for_api(path: &Path) -> MapApiResult<CovemapFile> {
+    let bytes = fs::read(path).map_err(|source| MapApiError::ReadMap {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    CovemapFile::parse_validated(&bytes).map_err(|source| MapApiError::ParseMap {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 pub(crate) fn preview(file: &CovemapFile) -> Value {
@@ -547,9 +671,54 @@ pub(crate) fn plan_keys(file: &CovemapFile, rows: &[SourceRow]) -> Value {
     })
 }
 
-fn materialize_from_paths(map: &Path, sources: &[PathBuf]) -> Result<MaterializedModel, String> {
-    let file = parse_map(map)?;
-    let inputs = read_source_inputs(sources)?;
-    validate_source_inputs(&file, &inputs.states)?;
+fn materialize_from_paths_for_api(
+    map: &Path,
+    sources: &[PathBuf],
+) -> MapApiResult<MaterializedModel> {
+    let file = parse_map_for_api(map)?;
+    let inputs = read_source_inputs(sources).map_err(MapApiError::source_input)?;
+    validate_source_inputs(&file, &inputs.states).map_err(MapApiError::source_input)?;
     materialize_with_source_states(&file, &inputs.rows, &inputs.states)
+        .map_err(MapApiError::materialization)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("{name}-{}", std::process::id()))
+    }
+
+    #[test]
+    fn public_api_reports_typed_map_parse_error() {
+        let path = temp_path("cove-map-invalid");
+        fs::write(&path, b"not a COVE-MAP file").unwrap();
+
+        let error = conversion_report_from_paths(&path, &[]).unwrap_err();
+        assert!(matches!(error, MapApiError::ParseMap { .. }));
+        assert!(error.to_string().contains("cove-map-invalid"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn projection_schema_reports_typed_validation_error() {
+        let descriptor = ProjectionDescriptor {
+            projection_id: "bad_projection".to_string(),
+            output_table: None,
+            output_modes: Vec::new(),
+            columns: vec![ProjectionColumnDescriptor {
+                name: "bad_column".to_string(),
+                logical_type: "not_a_cove_type".to_string(),
+                nested_shape: None,
+                lineage: None,
+            }],
+        };
+
+        let error = projection_arrow_schema(&descriptor).unwrap_err();
+        assert!(matches!(error, MapApiError::Projection { .. }));
+        assert!(error.to_string().contains("bad_column"));
+        assert!(error.to_string().contains("not_a_cove_type"));
+    }
 }

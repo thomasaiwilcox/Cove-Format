@@ -642,7 +642,8 @@ fn map_section(kind: SectionKind, mut value: Value) -> CovemapSection {
             Value::Number((kind as u16).into()),
         );
     }
-    let payload = serde_json::to_vec_pretty(&value).unwrap();
+    let payload =
+        serde_json::to_vec_pretty(&value).expect("serializing serde_json::Value cannot fail");
     CovemapSection {
         entry: CovemapSectionEntryV1 {
             section_id: kind as u32,

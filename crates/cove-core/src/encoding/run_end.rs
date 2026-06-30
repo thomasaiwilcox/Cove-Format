@@ -10,7 +10,7 @@
 //! stops. The first run covers rows `[0, run_end[0])`. Spec §20.3.3
 //! requires strictly increasing ends.
 
-use crate::CoveError;
+use crate::{wire, CoveError};
 
 use super::Encoding;
 
@@ -25,21 +25,26 @@ impl RunEndPayload {
         if bytes.len() < 4 {
             return Err(CoveError::BufferTooShort);
         }
-        let n = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
-        let need = 4 + n * 8 + n * 4;
+        let n = wire::read_u32_le_checked(bytes, 0)? as usize;
+        let value_bytes = n.checked_mul(8).ok_or(CoveError::ArithOverflow)?;
+        let end_bytes = n.checked_mul(4).ok_or(CoveError::ArithOverflow)?;
+        let need = 4usize
+            .checked_add(value_bytes)
+            .and_then(|bytes| bytes.checked_add(end_bytes))
+            .ok_or(CoveError::ArithOverflow)?;
         if bytes.len() < need {
             return Err(CoveError::BufferTooShort);
         }
         let mut values = Vec::with_capacity(n);
         for i in 0..n {
             let off = 4 + i * 8;
-            values.push(i64::from_le_bytes(bytes[off..off + 8].try_into().unwrap()));
+            values.push(wire::read_i64_le_checked(bytes, off)?);
         }
         let mut run_ends = Vec::with_capacity(n);
         let mut prev: u64 = 0;
         for i in 0..n {
             let off = 4 + n * 8 + i * 4;
-            let e = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
+            let e = wire::read_u32_le_checked(bytes, off)?;
             if (e as u64) <= prev {
                 return Err(CoveError::PageCorrupt);
             }

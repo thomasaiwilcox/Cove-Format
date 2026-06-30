@@ -32,12 +32,8 @@ impl EvidenceOptimizationReport {
         if roots.is_empty() && planned.dependencies.evidence_fields.is_empty() {
             return Self::default();
         }
-        let hidden_entry_filtering_applied = index.is_some_and(|index| {
-            index
-                .entries
-                .iter()
-                .any(|entry| evidence_entry_is_hidden(entry))
-        });
+        let hidden_entry_filtering_applied =
+            index.is_some_and(|index| index.entries.iter().any(evidence_entry_is_hidden));
         let visible_entries = index.map(|index| {
             index
                 .entries
@@ -191,6 +187,7 @@ impl EvidenceGrainIndexReport {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum EvidenceGrainKind {
     Object,
     Property,
@@ -202,6 +199,7 @@ pub enum EvidenceGrainKind {
     Edge,
     Path,
     Source,
+    #[default]
     Unknown,
 }
 
@@ -414,12 +412,6 @@ impl EvidenceGrainIndex {
     }
 }
 
-impl Default for EvidenceGrainKind {
-    fn default() -> Self {
-        Self::Unknown
-    }
-}
-
 impl From<AstEvidenceGrain> for EvidenceGrainKind {
     fn from(grain: AstEvidenceGrain) -> Self {
         match grain {
@@ -452,7 +444,7 @@ pub(crate) fn materialized_evidence_rows_for_plan(
     let rows = index
         .entries
         .iter()
-        .filter(|entry| root.map_or(true, |root| evidence_entry_matches_root(entry, root)))
+        .filter(|entry| root.is_none_or(|root| evidence_entry_matches_root(entry, root)))
         .map(evidence_entry_row)
         .map(ExecutionRow::Evidence)
         .collect();
@@ -533,10 +525,10 @@ fn materialized_target_matches(
             .and_then(current_row_goid)
             .is_some_and(|goid| materialized_str(row, "output_object_id") == Some(goid)),
         Some(ResolvedEvidenceTarget::Projection { projection_id }) => {
-            materialized_str(row, "projection_id").map_or(true, |value| value == projection_id)
+            materialized_str(row, "projection_id").is_none_or(|value| value == projection_id)
         }
         Some(ResolvedEvidenceTarget::TableRow { projection_id, .. }) => {
-            materialized_str(row, "projection_id").map_or(true, |value| value == projection_id)
+            materialized_str(row, "projection_id").is_none_or(|value| value == projection_id)
         }
         Some(ResolvedEvidenceTarget::TableColumn {
             projection_id,
@@ -548,7 +540,7 @@ fn materialized_target_matches(
             }
             materialized_str(row, "column_name")
                 .or_else(|| materialized_str(row, "property_name"))
-                .map_or(true, |value| value == column_name)
+                .is_none_or(|value| value == column_name)
         }
         Some(ResolvedEvidenceTarget::Property {
             object_type_id,
@@ -567,7 +559,7 @@ fn materialized_target_matches(
             {
                 return false;
             }
-            materialized_str(row, "property_name").map_or(true, |value| value == property_name)
+            materialized_str(row, "property_name").is_none_or(|value| value == property_name)
         }
         Some(ResolvedEvidenceTarget::AssociationType {
             object_type_id,
@@ -585,7 +577,7 @@ fn materialized_target_matches(
             }
             let target = materialized_str(row, "operation_target")
                 .or_else(|| materialized_str(row, "target_kind"));
-            target.map_or(true, |value| value == "association" || value == type_name)
+            target.is_none_or(|value| value == "association" || value == type_name)
         }
         Some(ResolvedEvidenceTarget::GraphEdge {
             object_type_id,
@@ -604,9 +596,8 @@ fn materialized_target_matches(
             }
             let target = materialized_str(row, "operation_target")
                 .or_else(|| materialized_str(row, "target_kind"));
-            target.map_or(true, |value| {
-                value == "edge" || value == "association" || value == type_name
-            })
+            target
+                .is_none_or(|value| value == "edge" || value == "association" || value == type_name)
         }
         Some(ResolvedEvidenceTarget::ObjectType {
             object_type_id,
@@ -631,7 +622,7 @@ fn materialized_target_matches(
             }
             let target = materialized_str(row, "operation_target")
                 .or_else(|| materialized_str(row, "target_kind"));
-            target.map_or(true, |value| value == "object" || value == type_name)
+            target.is_none_or(|value| value == "object" || value == type_name)
         }
         Some(ResolvedEvidenceTarget::GraphNode {
             object_type_id,
@@ -657,14 +648,12 @@ fn materialized_target_matches(
             }
             let target = materialized_str(row, "operation_target")
                 .or_else(|| materialized_str(row, "target_kind"));
-            target.map_or(true, |value| {
-                value == "node" || value == "object" || value == type_name
-            })
+            target.is_none_or(|value| value == "node" || value == "object" || value == type_name)
         }
         Some(ResolvedEvidenceTarget::GraphPath { .. }) => {
             let target = materialized_str(row, "operation_target")
                 .or_else(|| materialized_str(row, "target_kind"));
-            target.map_or(true, |value| value == "path")
+            target.is_none_or(|value| value == "path")
         }
     }
 }
@@ -731,11 +720,10 @@ fn target_matches(entry: &MapEvidenceEntry, target: Option<&ResolvedEvidenceTarg
     match target {
         None | Some(ResolvedEvidenceTarget::CurrentRoot) => true,
         Some(ResolvedEvidenceTarget::Projection { projection_id }) => {
-            metadata_str(entry, "projection_id")
-                .map_or(true, |value| value == projection_id.as_str())
+            metadata_str(entry, "projection_id").is_none_or(|value| value == projection_id.as_str())
         }
         Some(ResolvedEvidenceTarget::TableRow { projection_id, .. }) => {
-            metadata_str(entry, "projection_id").map_or(true, |value| value == projection_id)
+            metadata_str(entry, "projection_id").is_none_or(|value| value == projection_id)
         }
         Some(ResolvedEvidenceTarget::TableColumn {
             projection_id,
@@ -747,7 +735,7 @@ fn target_matches(entry: &MapEvidenceEntry, target: Option<&ResolvedEvidenceTarg
             }
             metadata_str(entry, "column_name")
                 .or_else(|| metadata_str(entry, "property_name"))
-                .map_or(true, |value| value == column_name)
+                .is_none_or(|value| value == column_name)
         }
         Some(ResolvedEvidenceTarget::Property {
             object_type_id,
@@ -766,8 +754,7 @@ fn target_matches(entry: &MapEvidenceEntry, target: Option<&ResolvedEvidenceTarg
             {
                 return false;
             }
-            metadata_str(entry, "property_name")
-                .map_or(true, |value| value == property_name.as_str())
+            metadata_str(entry, "property_name").is_none_or(|value| value == property_name.as_str())
         }
         Some(ResolvedEvidenceTarget::AssociationType {
             object_type_id,
@@ -785,9 +772,7 @@ fn target_matches(entry: &MapEvidenceEntry, target: Option<&ResolvedEvidenceTarg
             }
             let target = metadata_str(entry, "operation_target")
                 .or_else(|| metadata_str(entry, "target_kind"));
-            target.map_or(true, |value| {
-                value == "association" || value == type_name.as_str()
-            })
+            target.is_none_or(|value| value == "association" || value == type_name.as_str())
         }
         Some(ResolvedEvidenceTarget::GraphEdge {
             object_type_id,
@@ -806,7 +791,7 @@ fn target_matches(entry: &MapEvidenceEntry, target: Option<&ResolvedEvidenceTarg
             }
             let target = metadata_str(entry, "operation_target")
                 .or_else(|| metadata_str(entry, "target_kind"));
-            target.map_or(true, |value| {
+            target.is_none_or(|value| {
                 value == "edge" || value == "association" || value == type_name.as_str()
             })
         }
@@ -826,9 +811,7 @@ fn target_matches(entry: &MapEvidenceEntry, target: Option<&ResolvedEvidenceTarg
             }
             let target = metadata_str(entry, "operation_target")
                 .or_else(|| metadata_str(entry, "target_kind"));
-            target.map_or(true, |value| {
-                value == "object" || value == type_name.as_str()
-            })
+            target.is_none_or(|value| value == "object" || value == type_name.as_str())
         }
         Some(ResolvedEvidenceTarget::GraphNode {
             object_type_id,
@@ -847,14 +830,14 @@ fn target_matches(entry: &MapEvidenceEntry, target: Option<&ResolvedEvidenceTarg
             }
             let target = metadata_str(entry, "operation_target")
                 .or_else(|| metadata_str(entry, "target_kind"));
-            target.map_or(true, |value| {
+            target.is_none_or(|value| {
                 value == "node" || value == "object" || value == type_name.as_str()
             })
         }
         Some(ResolvedEvidenceTarget::GraphPath { .. }) => {
             let target = metadata_str(entry, "operation_target")
                 .or_else(|| metadata_str(entry, "target_kind"));
-            target.map_or(true, |value| value == "path")
+            target.is_none_or(|value| value == "path")
         }
     }
 }
@@ -945,11 +928,8 @@ fn collect_evidence_exprs<'a>(expr: &'a ResolvedExpr, out: &mut Vec<&'a Resolved
                 collect_evidence_exprs(arg, out);
             }
         }
-        ResolvedExpr::AggregateCall { arg, .. } => {
-            if let Some(arg) = arg {
-                collect_evidence_exprs(arg, out);
-            }
-        }
+        ResolvedExpr::AggregateCall { arg: Some(arg), .. } => collect_evidence_exprs(arg, out),
+        ResolvedExpr::AggregateCall { arg: None, .. } => {}
         ResolvedExpr::Conditional {
             predicate,
             then_expr,

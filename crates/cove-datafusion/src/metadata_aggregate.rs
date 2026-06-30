@@ -313,11 +313,11 @@ fn exact_synopsis_sum(
     accumulator.finish().map(Some)
 }
 
-fn exact_payload_entries_for_file<'a>(
-    file: &'a FileMetadata,
+fn exact_payload_entries_for_file(
+    file: &FileMetadata,
     column_id: u32,
     kind: SynopsisKind,
-) -> Result<Vec<(&'a AggregateEntry, &'a AggregatePayloadV2)>, CoveError> {
+) -> Result<Vec<(&AggregateEntry, &AggregatePayloadV2)>, CoveError> {
     let mut candidates = Vec::new();
     for synopsis in file.pruning().aggregates.iter() {
         for (index, entry) in synopsis.entries.iter().enumerate() {

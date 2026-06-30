@@ -22,7 +22,7 @@ pub mod inverted;
 pub mod lookup;
 pub mod topn;
 
-use crate::{checksum, CoveError};
+use crate::{checksum, wire::read_u32_le_checked, CoveError};
 
 pub(crate) fn verify_checksum_field(
     bytes: &[u8],
@@ -35,11 +35,7 @@ pub(crate) fn verify_checksum_field(
     {
         return Err(CoveError::BufferTooShort);
     }
-    let checksum_field = u32::from_le_bytes(
-        bytes[checksum_offset..checksum_offset + 4]
-            .try_into()
-            .unwrap(),
-    );
+    let checksum_field = read_u32_le_checked(bytes, checksum_offset)?;
     let mut for_crc = bytes.to_vec();
     for_crc[checksum_offset..checksum_offset + 4].fill(0);
     if checksum::crc32c(&for_crc) != checksum_field {

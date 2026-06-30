@@ -1,6 +1,7 @@
 use crate::{
     constants::{CoveLogicalType, CovePhysicalKind},
     types::{validate_logical_physical_pair_with_options, LogicalPhysicalOptions},
+    wire::{read_u16_le_checked, read_u32_le_checked},
     CoveError,
 };
 
@@ -51,8 +52,8 @@ impl ObjectTypeCatalog {
         if bytes.len() < 8 {
             return Err(CoveError::BufferTooShort);
         }
-        let type_count = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
-        let flags = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+        let type_count = read_u32_le_checked(bytes, 0)? as usize;
+        let flags = read_u32_le_checked(bytes, 4)?;
         let mut pos = 8usize;
         let mut types = Vec::with_capacity(type_count);
         for _ in 0..type_count {
@@ -145,15 +146,15 @@ impl ObjectTypeEntryV1 {
         if bytes.len() < 4 + 2 {
             return Err(CoveError::BufferTooShort);
         }
-        let object_type_id = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        let object_type_id = read_u32_le_checked(bytes, 0)?;
         let mut pos = 4usize;
         let type_name = read_str(bytes, &mut pos, "object type name")?;
         if bytes.len() < pos + 4 + 2 {
             return Err(CoveError::BufferTooShort);
         }
-        let flags = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+        let flags = read_u32_le_checked(bytes, pos)?;
         pos += 4;
-        let property_count = u16::from_le_bytes(bytes[pos..pos + 2].try_into().unwrap()) as usize;
+        let property_count = read_u16_le_checked(bytes, pos)? as usize;
         pos += 2;
         let mut properties = Vec::with_capacity(property_count);
         for _ in 0..property_count {
@@ -216,21 +217,21 @@ impl PropertyEntryV1 {
         if bytes.len() < 4 + 2 {
             return Err(CoveError::BufferTooShort);
         }
-        let property_id = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        let property_id = read_u32_le_checked(bytes, 0)?;
         let mut pos = 4usize;
         let property_name = read_str(bytes, &mut pos, "property name")?;
         if bytes.len() < pos + 2 + 1 + 1 + 2 + 4 {
             return Err(CoveError::BufferTooShort);
         }
-        let logical_raw = u16::from_le_bytes(bytes[pos..pos + 2].try_into().unwrap());
+        let logical_raw = read_u16_le_checked(bytes, pos)?;
         pos += 2;
         let physical_raw = bytes[pos];
         pos += 1;
         let nullable_raw = bytes[pos];
         pos += 1;
-        let collation_id = u16::from_le_bytes(bytes[pos..pos + 2].try_into().unwrap());
+        let collation_id = read_u16_le_checked(bytes, pos)?;
         pos += 2;
-        let flags = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+        let flags = read_u32_le_checked(bytes, pos)?;
         pos += 4;
         let logical_type = CoveLogicalType::from_u16(logical_raw).ok_or_else(|| {
             CoveError::BadSchema(format!(
@@ -279,10 +280,11 @@ impl PropertyEntryV1 {
 }
 
 fn read_str(bytes: &[u8], pos: &mut usize, what: &str) -> Result<String, CoveError> {
-    if *pos + 2 > bytes.len() {
+    let len_end = pos.checked_add(2).ok_or(CoveError::ArithOverflow)?;
+    if len_end > bytes.len() {
         return Err(CoveError::BufferTooShort);
     }
-    let len = u16::from_le_bytes(bytes[*pos..*pos + 2].try_into().unwrap()) as usize;
+    let len = read_u16_le_checked(bytes, *pos)? as usize;
     *pos += 2;
     let end = pos.checked_add(len).ok_or(CoveError::ArithOverflow)?;
     if end > bytes.len() {

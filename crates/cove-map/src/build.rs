@@ -116,6 +116,7 @@ impl MapBuildSectionCompression {
     }
 }
 
+#[must_use]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MapBuildOptions {
     pub out_dir: PathBuf,
@@ -145,12 +146,14 @@ impl MapBuildOptions {
     }
 }
 
+#[must_use]
 #[derive(Debug, Clone, PartialEq)]
 pub struct MapBuildResult {
     pub manifest: Value,
     pub report: Value,
 }
 
+#[must_use]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MapSemanticDeltaParent {
     pub dataset_id: [u8; 16],
@@ -160,6 +163,7 @@ pub struct MapSemanticDeltaParent {
     pub parent_ref: CovmDeltaArtifactRefV1,
 }
 
+#[must_use]
 #[derive(Debug, Clone, PartialEq)]
 pub struct MapSemanticDeltaBuildOptions {
     pub out: PathBuf,
@@ -174,6 +178,7 @@ pub struct MapSemanticDeltaBuildOptions {
     pub source_publish_range_us: Option<(i64, i64)>,
 }
 
+#[must_use]
 #[derive(Debug, Clone, PartialEq)]
 pub struct MapSemanticDeltaBuildResult {
     pub report: Value,
@@ -366,11 +371,16 @@ struct BuildReportContext<'a> {
     verification: Option<&'a Value>,
 }
 
+fn verification_errors_text(verification: &Value) -> String {
+    serde_json::to_string(&verification["errors"])
+        .unwrap_or_else(|error| format!("<could not serialize verification errors: {error}>"))
+}
+
 pub fn build_from_paths(
     map: &Path,
     sources: &[PathBuf],
     options: MapBuildOptions,
-) -> Result<MapBuildResult, String> {
+) -> crate::MapApiResult<MapBuildResult> {
     if sources.is_empty() {
         return Err("map build requires at least one source path".into());
     }
@@ -473,8 +483,9 @@ pub fn build_from_paths(
         {
             return Err(format!(
                 "map build verification failed: {}",
-                serde_json::to_string(&verification["errors"]).unwrap_or_default()
-            ));
+                verification_errors_text(&verification)
+            )
+            .into());
         }
         warnings.extend(verification_warning_strings(&verification));
         Some(verification)
@@ -555,7 +566,7 @@ pub fn build_from_cove_o_bytes(
     source_label: &str,
     object_bytes: Vec<u8>,
     options: MapBuildOptions,
-) -> Result<MapBuildResult, String> {
+) -> crate::MapApiResult<MapBuildResult> {
     let object_name = if let Some(name) = &options.object_name {
         validate_object_name(name)?;
         name.clone()
@@ -635,8 +646,9 @@ pub fn build_from_cove_o_bytes(
         {
             return Err(format!(
                 "map delta build verification failed: {}",
-                serde_json::to_string(&verification["errors"]).unwrap_or_default()
-            ));
+                verification_errors_text(&verification)
+            )
+            .into());
         }
         warnings.extend(verification_warning_strings(&verification));
         Some(verification)
@@ -705,7 +717,7 @@ pub fn build_semantic_delta_from_paths(
     map: &Path,
     sources: &[PathBuf],
     options: MapSemanticDeltaBuildOptions,
-) -> Result<MapSemanticDeltaBuildResult, String> {
+) -> crate::MapApiResult<MapSemanticDeltaBuildResult> {
     if sources.is_empty() {
         return Err("map semantic delta build requires at least one source path".into());
     }
@@ -713,7 +725,8 @@ pub fn build_semantic_delta_from_paths(
         return Err(format!(
             "{} already exists; pass --force to replace it",
             options.out.display()
-        ));
+        )
+        .into());
     }
     let built = build_semantic_delta_bytes_from_paths(map, sources, &options)?;
     durable::durable_replace(&options.out, &built.bytes)
@@ -1765,11 +1778,13 @@ fn fingerprint_ref(label: &str, payload: &[u8]) -> u32 {
     material.push(0);
     material.extend_from_slice(payload);
     let digest = compute_digest(DigestAlgorithm::Sha256, &material).unwrap_or_default();
-    let value = digest
-        .get(..4)
-        .and_then(|bytes| bytes.try_into().ok())
-        .map(u32::from_le_bytes)
-        .unwrap_or(1);
+    let value = if digest.len() >= 4 {
+        let mut raw = [0u8; 4];
+        raw.copy_from_slice(&digest[..4]);
+        u32::from_le_bytes(raw)
+    } else {
+        1
+    };
     if value == 0 {
         1
     } else {
@@ -2650,12 +2665,13 @@ pub fn publish_covm_from_bundle(
     bundle_dir: &Path,
     output: &Path,
     force: bool,
-) -> Result<Value, String> {
+) -> crate::MapApiResult<Value> {
     if output.exists() && !force {
         return Err(format!(
             "{} already exists; pass --force to replace it",
             output.display()
-        ));
+        )
+        .into());
     }
     let manifest_path = bundle_dir.join("map-build-manifest.json");
     let manifest_bytes = fs::read(&manifest_path)

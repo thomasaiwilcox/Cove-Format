@@ -11,7 +11,7 @@
 //! the same value (the encoder MUST coalesce them). The parser enforces
 //! both invariants so corrupt pages fail closed.
 
-use crate::CoveError;
+use crate::{wire, CoveError};
 
 use super::Encoding;
 
@@ -25,8 +25,11 @@ impl RlePayload {
         if bytes.len() < 4 {
             return Err(CoveError::BufferTooShort);
         }
-        let run_count = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
-        let need = 4 + run_count * 12;
+        let run_count = wire::read_u32_le_checked(bytes, 0)? as usize;
+        let need = run_count
+            .checked_mul(12)
+            .and_then(|bytes| bytes.checked_add(4))
+            .ok_or(CoveError::ArithOverflow)?;
         if bytes.len() < need {
             return Err(CoveError::BufferTooShort);
         }
@@ -35,8 +38,8 @@ impl RlePayload {
         let mut prev_value: Option<i64> = None;
         for i in 0..run_count {
             let off = 4 + i * 12;
-            let v = i64::from_le_bytes(bytes[off..off + 8].try_into().unwrap());
-            let len = u32::from_le_bytes(bytes[off + 8..off + 12].try_into().unwrap());
+            let v = wire::read_i64_le_checked(bytes, off)?;
+            let len = wire::read_u32_le_checked(bytes, off + 8)?;
             if len == 0 {
                 return Err(CoveError::PageCorrupt);
             }

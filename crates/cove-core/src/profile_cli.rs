@@ -1,4 +1,4 @@
-use std::{fs, path::PathBuf};
+use std::{error::Error, fmt, fs, path::PathBuf};
 
 use crate::{
     checksum,
@@ -15,12 +15,45 @@ use crate::{
 };
 use serde_json::json;
 
-pub fn run(args: Vec<String>) -> Result<bool, String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileCliError {
+    message: String,
+}
+
+impl ProfileCliError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for ProfileCliError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl Error for ProfileCliError {}
+
+impl From<String> for ProfileCliError {
+    fn from(message: String) -> Self {
+        Self::new(message)
+    }
+}
+
+impl From<&str> for ProfileCliError {
+    fn from(message: &str) -> Self {
+        Self::new(message)
+    }
+}
+
+pub fn run(args: Vec<String>) -> Result<bool, ProfileCliError> {
     let Some((command, rest)) = args.split_first() else {
         print_usage();
         return Ok(true);
     };
-    match command.as_str() {
+    let result = match command.as_str() {
         "inspect" => inspect(rest),
         "generate" => generate(rest),
         "validate-section" => validate_section(rest),
@@ -29,7 +62,8 @@ pub fn run(args: Vec<String>) -> Result<bool, String> {
             Ok(true)
         }
         _ => Err(format!("unknown command {command}")),
-    }
+    };
+    result.map_err(ProfileCliError::from)
 }
 
 fn inspect(args: &[String]) -> Result<bool, String> {
@@ -540,6 +574,6 @@ mod tests {
             "1".into(),
         ])
         .unwrap_err();
-        assert!(err.contains("unknown generate option"));
+        assert!(err.to_string().contains("unknown generate option"));
     }
 }
