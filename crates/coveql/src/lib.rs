@@ -37,6 +37,7 @@ mod evidence_opt;
 mod execution;
 mod explain;
 mod expr_eval;
+mod graph_execution;
 mod kernel_arrow;
 mod kernel_execution;
 mod kernel_metrics;

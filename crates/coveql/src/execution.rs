@@ -40,6 +40,11 @@ use crate::{
         number_to_f64, parse_decimal_value, stable_value_key, value_ordering_typed, EvalContext,
         ExactDecimal,
     },
+    graph_execution::{
+        self, GraphAlgorithmOutput, GraphAlgorithmSpec, GraphEdge, GraphEdgeId,
+        GraphExecutionBudget, GraphExecutionError, GraphNodeId, GraphPath, GraphTraversalLimits,
+        GraphTraversalRow, GraphTraversalSpec,
+    },
     materialized::{
         hex, window_function_key, ExecutionRow, MaterializedAssociationRow,
         MaterializedChangeDetail, MaterializedChangeDiffKind, MaterializedEvidenceRow,
@@ -3983,11 +3988,11 @@ fn execute_graph_traverse_surface_root(
         .iter()
         .filter(|row| row.object_type_id == root.object.object_type_id)
         .map(|row| {
-            let state = GraphPathState::new(row.goid.clone());
+            let state = GraphPath::new(GraphNodeId::new(row.goid.clone()));
             with_graph_path_state(namespace_graph_node_projection_row(row, root, true), &state)
         })
         .collect::<Vec<_>>();
-    let graph_context = GraphExecutionContext {
+    let graph_context = GraphMaterializedExecutionContext {
         root,
         visible_associations: &visible_associations,
         by_type_and_goid: &by_type_and_goid,
@@ -4020,7 +4025,7 @@ fn execute_graph_traverse_surface_root(
     finish_materialized_rows_with_context(rows, planned, options, started, &context)
 }
 
-struct GraphExecutionContext<'a> {
+struct GraphMaterializedExecutionContext<'a> {
     root: &'a crate::ResolvedGraphNodeRoot,
     visible_associations: &'a [MaterializedAssociationRow],
     by_type_and_goid: &'a BTreeMap<(u32, String), MaterializedObjectRow>,
@@ -4034,7 +4039,7 @@ struct GraphExecutionContext<'a> {
 fn apply_graph_algorithms(
     rows: Vec<MaterializedProjectionRow>,
     algorithms: &[crate::ResolvedGraphAlgorithm],
-    context: &GraphExecutionContext<'_>,
+    context: &GraphMaterializedExecutionContext<'_>,
 ) -> Result<Vec<MaterializedProjectionRow>, BuildExecutionError> {
     let mut rows = rows;
     for algorithm in algorithms {
@@ -4047,7 +4052,7 @@ fn apply_graph_algorithms(
 fn apply_graph_algorithm(
     rows: Vec<MaterializedProjectionRow>,
     algorithm: &crate::ResolvedGraphAlgorithm,
-    context: &GraphExecutionContext<'_>,
+    context: &GraphMaterializedExecutionContext<'_>,
 ) -> Result<Vec<MaterializedProjectionRow>, BuildExecutionError> {
     match algorithm.kind {
         GraphAlgorithmKind::AllPaths | GraphAlgorithmKind::KShortestPaths => {
@@ -4109,330 +4114,136 @@ fn apply_graph_algorithm(
         _ => {}
     }
 
-    let adjacency = GraphAdjacency::from_visible_associations(
-        context.visible_associations,
+    let edges = graph_visible_edges(
         algorithm.edge.as_ref(),
         algorithm.direction,
+        context.visible_associations,
         context.object_goids,
         context.visible_object_goids,
         context.planned,
     );
+    let adjacency = graph_execution::GraphAdjacency::from_edges(&edges);
     let start_nodes = rows
         .iter()
-        .filter_map(|row| graph_row_current_goid(row, context.root))
+        .filter_map(|row| graph_row_current_node_id(row, context.root))
         .collect::<BTreeSet<_>>();
-    let graph_nodes = graph_algorithm_nodes(&adjacency, &start_nodes);
-    let component_ids = if matches!(
-        algorithm.kind,
-        GraphAlgorithmKind::ConnectedComponents | GraphAlgorithmKind::Community
-    ) {
-        Some(graph_component_ids(&adjacency, algorithm.variant.as_str()))
-    } else {
-        None
-    };
-    let betweenness_scores =
-        if algorithm.kind == GraphAlgorithmKind::Centrality && algorithm.variant == "betweenness" {
-            Some(graph_betweenness_centrality_scores(
-                &adjacency,
-                &graph_nodes,
-            ))
-        } else {
-            None
-        };
-    let community_ids = if algorithm.kind == GraphAlgorithmKind::Community
-        && algorithm.variant == "label_propagation"
+    let target_nodes = graph_algorithm_target_nodes(algorithm, context);
+    let weighted_edges = if algorithm.kind == GraphAlgorithmKind::SpanningTree
+        && algorithm.variant == "min_weight"
     {
-        Some(graph_label_propagation_communities(
-            &adjacency,
-            &graph_nodes,
-            graph_algorithm_iterations(algorithm),
-        ))
+        graph_visible_weighted_edges(algorithm, context)?
     } else {
-        None
+        Vec::new()
     };
-    let spanning_forest = if algorithm.kind == GraphAlgorithmKind::SpanningTree {
-        Some(graph_spanning_forest(
-            &adjacency,
-            &graph_nodes,
-            algorithm,
-            context.visible_associations,
-            context.planned,
-            context.started,
-            context.options,
-        )?)
-    } else {
-        None
-    };
-    let pagerank_scores = if matches!(algorithm.kind, GraphAlgorithmKind::PageRank) {
-        Some(graph_pagerank_scores(&adjacency, &graph_nodes, algorithm))
-    } else {
-        None
-    };
-    let hits_scores = if matches!(algorithm.kind, GraphAlgorithmKind::Hits) {
-        Some(graph_hits_scores(&adjacency, &graph_nodes, algorithm))
-    } else {
-        None
-    };
+    let outputs = graph_execution::run_graph_algorithm(
+        &adjacency,
+        &start_nodes,
+        &graph_algorithm_spec(algorithm),
+        target_nodes.as_ref(),
+        &weighted_edges,
+        graph_execution_budget(context),
+    )
+    .map_err(map_graph_execution_error)?;
+
     let mut out = Vec::with_capacity(rows.len());
     for mut row in rows {
-        let Some(start) = graph_row_current_goid(&row, context.root) else {
+        let Some(start) = graph_row_current_node_id(&row, context.root) else {
             out.push(row);
             continue;
         };
-        let reachable = graph_reachable_distances(
-            &adjacency,
-            &start,
-            algorithm.max_depth.unwrap_or(algorithm.contract.max_depth),
-            algorithm.max_paths.unwrap_or(algorithm.contract.max_paths),
-            context.started,
-            context.options,
-        )?;
-        match algorithm.kind {
-            GraphAlgorithmKind::Reachable => {
-                row.values
-                    .insert("reachable".into(), json!(!reachable.is_empty()));
-                row.values
-                    .insert("reachable_count".into(), json!(reachable.len() as u64));
-            }
-            GraphAlgorithmKind::ShortestPath => {
-                let distance = shortest_target_distance(
-                    &reachable,
-                    algorithm.target.as_ref(),
-                    context.by_type_and_goid,
-                );
-                row.values.insert(
-                    "shortest_distance".into(),
-                    distance.map_or(Value::Null, |distance| json!(distance)),
-                );
-            }
-            GraphAlgorithmKind::ConnectedComponents => {
-                let component = component_ids
-                    .as_ref()
-                    .and_then(|components| components.get(&start))
-                    .copied()
-                    .unwrap_or(0);
-                row.values
-                    .insert("component_id".into(), json!(component as u64));
-            }
-            GraphAlgorithmKind::Degree => {
-                let out_degree = adjacency.outgoing.get(&start).map(Vec::len).unwrap_or(0);
-                let in_degree = adjacency.incoming.get(&start).map(Vec::len).unwrap_or(0);
-                let degree = match algorithm.variant.as_str() {
-                    "in" => in_degree,
-                    "total" => out_degree + in_degree,
-                    _ => out_degree,
-                };
-                row.values
-                    .insert("out_degree".into(), json!(out_degree as u64));
-                row.values
-                    .insert("in_degree".into(), json!(in_degree as u64));
-                row.values.insert("degree".into(), json!(degree as u64));
-            }
-            GraphAlgorithmKind::PageRank => {
-                let score = pagerank_scores
-                    .as_ref()
-                    .and_then(|scores| scores.get(&start))
-                    .copied()
-                    .unwrap_or(0.0);
-                row.values.insert("pagerank".into(), json!(score));
-            }
-            GraphAlgorithmKind::Hits => {
-                let (authority, hub) = hits_scores
-                    .as_ref()
-                    .and_then(|scores| scores.get(&start))
-                    .copied()
-                    .unwrap_or((0.0, 0.0));
-                row.values.insert("authority".into(), json!(authority));
-                row.values.insert("hub".into(), json!(hub));
-            }
-            GraphAlgorithmKind::Centrality => {
-                let score = match algorithm.variant.as_str() {
-                    "degree" => graph_degree_centrality(&adjacency, &start, graph_nodes.len()),
-                    "betweenness" => betweenness_scores
-                        .as_ref()
-                        .and_then(|scores| scores.get(&start))
-                        .copied()
-                        .unwrap_or(0.0),
-                    _ => graph_closeness_centrality(
-                        &adjacency,
-                        &start,
-                        graph_nodes.len(),
-                        algorithm,
-                        context.started,
-                        context.options,
-                    )?,
-                };
-                row.values.insert("centrality".into(), json!(score));
-            }
-            GraphAlgorithmKind::TriangleCount => {
-                row.values.insert(
-                    "triangle_count".into(),
-                    json!(triangle_count_for(&adjacency, &start) as u64),
-                );
-            }
-            GraphAlgorithmKind::ClusteringCoefficient => {
-                let coefficient = clustering_coefficient_for(&adjacency, &start);
-                row.values
-                    .insert("clustering_coefficient".into(), json!(coefficient));
-            }
-            GraphAlgorithmKind::Community => {
-                let community = community_ids
-                    .as_ref()
-                    .and_then(|communities| communities.get(&start))
-                    .copied()
-                    .or_else(|| {
-                        component_ids
-                            .as_ref()
-                            .and_then(|components| components.get(&start))
-                            .copied()
-                    })
-                    .unwrap_or_else(|| community_id_for(&start));
-                row.values
-                    .insert("community_id".into(), json!(community as u64));
-            }
-            GraphAlgorithmKind::SpanningTree => {
-                let (parent, depth) = spanning_forest
-                    .as_ref()
-                    .and_then(|forest| forest.get(&start))
-                    .cloned()
-                    .unwrap_or((None, 0));
-                row.values.insert(
-                    "tree_parent".into(),
-                    parent.map_or(Value::Null, Value::String),
-                );
-                row.values.insert("tree_depth".into(), json!(depth));
-            }
-            GraphAlgorithmKind::AllPaths | GraphAlgorithmKind::KShortestPaths => {
-                unreachable!("handled above")
-            }
+        if let Some(output) = outputs.get(&start) {
+            append_graph_algorithm_output(&mut row, output);
         }
         out.push(row);
     }
     Ok(out)
 }
 
-#[derive(Debug, Clone, Default)]
-struct GraphAdjacency {
-    outgoing: BTreeMap<String, Vec<String>>,
-    incoming: BTreeMap<String, Vec<String>>,
+fn append_graph_algorithm_output(
+    row: &mut MaterializedProjectionRow,
+    output: &GraphAlgorithmOutput,
+) {
+    match output {
+        GraphAlgorithmOutput::Reachable {
+            reachable,
+            reachable_count,
+        } => {
+            row.values.insert("reachable".into(), json!(*reachable));
+            row.values
+                .insert("reachable_count".into(), json!(*reachable_count as u64));
+        }
+        GraphAlgorithmOutput::ShortestPath { shortest_distance } => {
+            row.values.insert(
+                "shortest_distance".into(),
+                shortest_distance.map_or(Value::Null, |distance| json!(distance)),
+            );
+        }
+        GraphAlgorithmOutput::ConnectedComponent { component_id } => {
+            row.values
+                .insert("component_id".into(), json!(*component_id as u64));
+        }
+        GraphAlgorithmOutput::Degree {
+            out_degree,
+            in_degree,
+            degree,
+        } => {
+            row.values
+                .insert("out_degree".into(), json!(*out_degree as u64));
+            row.values
+                .insert("in_degree".into(), json!(*in_degree as u64));
+            row.values.insert("degree".into(), json!(*degree as u64));
+        }
+        GraphAlgorithmOutput::PageRank { pagerank } => {
+            row.values.insert("pagerank".into(), json!(*pagerank));
+        }
+        GraphAlgorithmOutput::Hits { authority, hub } => {
+            row.values.insert("authority".into(), json!(*authority));
+            row.values.insert("hub".into(), json!(*hub));
+        }
+        GraphAlgorithmOutput::Centrality { centrality } => {
+            row.values.insert("centrality".into(), json!(*centrality));
+        }
+        GraphAlgorithmOutput::TriangleCount { triangle_count } => {
+            row.values
+                .insert("triangle_count".into(), json!(*triangle_count as u64));
+        }
+        GraphAlgorithmOutput::ClusteringCoefficient {
+            clustering_coefficient,
+        } => {
+            row.values.insert(
+                "clustering_coefficient".into(),
+                json!(*clustering_coefficient),
+            );
+        }
+        GraphAlgorithmOutput::Community { community_id } => {
+            row.values
+                .insert("community_id".into(), json!(*community_id as u64));
+        }
+        GraphAlgorithmOutput::SpanningTree {
+            tree_parent,
+            tree_depth,
+        } => {
+            row.values.insert(
+                "tree_parent".into(),
+                tree_parent
+                    .as_ref()
+                    .map(|parent| Value::String(parent.as_str().to_string()))
+                    .unwrap_or(Value::Null),
+            );
+            row.values.insert("tree_depth".into(), json!(*tree_depth));
+        }
+    }
 }
 
-impl GraphAdjacency {
-    fn from_visible_associations(
-        associations: &[MaterializedAssociationRow],
-        edge: Option<&crate::ResolvedGraphEdgeRoot>,
-        direction: crate::AstAssociationDirection,
-        object_goids: &BTreeSet<String>,
-        visible_object_goids: &BTreeSet<String>,
-        planned: &PlannedQuery,
-    ) -> Self {
-        let mut graph = Self::default();
-        for association in associations {
-            if edge.as_ref().is_some_and(|edge| {
-                association.object_type_id != edge.association.object_type_id
-                    || !association_row_matches_temporal(
-                        association,
-                        &edge.association,
-                        association_valid_at(planned),
-                    )
-            }) {
-                continue;
-            }
-            let (Some(source), Some(target)) = (&association.source_goid, &association.target_goid)
-            else {
-                continue;
-            };
-            if (object_goids.contains(source) && !visible_object_goids.contains(source))
-                || (object_goids.contains(target) && !visible_object_goids.contains(target))
-            {
-                continue;
-            }
-            match direction {
-                crate::AstAssociationDirection::Out => graph.add_edge(source, target),
-                crate::AstAssociationDirection::In => graph.add_edge(target, source),
-                crate::AstAssociationDirection::Either => {
-                    graph.add_edge(source, target);
-                    graph.add_edge(target, source);
-                }
-            }
-        }
-        graph.normalize();
-        graph
+fn graph_algorithm_spec(algorithm: &crate::ResolvedGraphAlgorithm) -> GraphAlgorithmSpec {
+    GraphAlgorithmSpec {
+        kind: algorithm.kind,
+        variant: algorithm.variant.clone(),
+        max_depth: algorithm.max_depth.unwrap_or(algorithm.contract.max_depth),
+        max_paths: algorithm.max_paths.unwrap_or(algorithm.contract.max_paths),
+        max_iterations: graph_algorithm_iterations(algorithm),
+        tolerance: graph_algorithm_tolerance(algorithm),
     }
-
-    fn add_edge(&mut self, source: &str, target: &str) {
-        self.outgoing
-            .entry(source.to_string())
-            .or_default()
-            .push(target.to_string());
-        self.incoming
-            .entry(target.to_string())
-            .or_default()
-            .push(source.to_string());
-    }
-
-    fn normalize(&mut self) {
-        for targets in self.outgoing.values_mut() {
-            targets.sort();
-            targets.dedup();
-        }
-        for sources in self.incoming.values_mut() {
-            sources.sort();
-            sources.dedup();
-        }
-    }
-}
-
-fn graph_reachable_distances(
-    adjacency: &GraphAdjacency,
-    start: &str,
-    max_depth: u32,
-    max_paths: usize,
-    started: Instant,
-    options: &ExecutionOptions,
-) -> Result<BTreeMap<String, u32>, BuildExecutionError> {
-    let mut distances = BTreeMap::new();
-    let mut frontier = vec![(start.to_string(), 0u32)];
-    let mut seen = BTreeSet::from([start.to_string()]);
-    while let Some((node, depth)) = frontier.pop() {
-        check_time(&options.resource_budget, started)?;
-        if depth >= max_depth {
-            continue;
-        }
-        if let Some(targets) = adjacency.outgoing.get(&node) {
-            for target in targets {
-                if !seen.insert(target.clone()) {
-                    continue;
-                }
-                let next_depth = depth + 1;
-                distances.insert(target.clone(), next_depth);
-                if distances.len() > max_paths {
-                    return Err(resource_error(
-                        "maximum_graph_traversal_paths",
-                        distances.len(),
-                    ));
-                }
-                frontier.push((target.clone(), next_depth));
-            }
-        }
-    }
-    Ok(distances)
-}
-
-fn graph_algorithm_nodes(
-    adjacency: &GraphAdjacency,
-    start_nodes: &BTreeSet<String>,
-) -> BTreeSet<String> {
-    let mut nodes = start_nodes.clone();
-    for (source, targets) in &adjacency.outgoing {
-        nodes.insert(source.clone());
-        nodes.extend(targets.iter().cloned());
-    }
-    for (target, sources) in &adjacency.incoming {
-        nodes.insert(target.clone());
-        nodes.extend(sources.iter().cloned());
-    }
-    nodes
 }
 
 fn graph_algorithm_iterations(algorithm: &crate::ResolvedGraphAlgorithm) -> usize {
@@ -4451,545 +4262,73 @@ fn graph_algorithm_tolerance(algorithm: &crate::ResolvedGraphAlgorithm) -> f64 {
         .unwrap_or(1e-9)
 }
 
-fn graph_pagerank_scores(
-    adjacency: &GraphAdjacency,
-    nodes: &BTreeSet<String>,
+fn graph_algorithm_target_nodes(
     algorithm: &crate::ResolvedGraphAlgorithm,
-) -> BTreeMap<String, f64> {
-    let count = nodes.len();
-    if count == 0 {
-        return BTreeMap::new();
-    }
-    let damping = 0.85f64;
-    let base = (1.0 - damping) / count as f64;
-    let mut scores = nodes
-        .iter()
-        .map(|node| (node.clone(), 1.0 / count as f64))
-        .collect::<BTreeMap<_, _>>();
-    let tolerance = graph_algorithm_tolerance(algorithm);
-    for _ in 0..graph_algorithm_iterations(algorithm) {
-        let mut next = nodes
-            .iter()
-            .map(|node| (node.clone(), base))
-            .collect::<BTreeMap<_, _>>();
-        let mut sink_score = 0.0f64;
-        for node in nodes {
-            let score = *scores.get(node).unwrap_or(&0.0);
-            let outgoing = adjacency
-                .outgoing
-                .get(node)
-                .map(|targets| {
-                    targets
-                        .iter()
-                        .filter(|target| nodes.contains(*target))
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            if outgoing.is_empty() {
-                sink_score += score;
-                continue;
-            }
-            let share = damping * score / outgoing.len() as f64;
-            for target in outgoing {
-                *next.entry(target.clone()).or_insert(base) += share;
-            }
-        }
-        if sink_score > 0.0 {
-            let share = damping * sink_score / count as f64;
-            for value in next.values_mut() {
-                *value += share;
-            }
-        }
-        let delta = nodes
-            .iter()
-            .map(|node| {
-                (next.get(node).copied().unwrap_or(0.0) - scores.get(node).copied().unwrap_or(0.0))
-                    .abs()
-            })
-            .sum::<f64>();
-        scores = next;
-        if delta <= tolerance {
-            break;
-        }
-    }
-    scores
+    context: &GraphMaterializedExecutionContext<'_>,
+) -> Option<BTreeSet<GraphNodeId>> {
+    let target = algorithm.target.as_ref()?;
+    Some(
+        context
+            .by_type_and_goid
+            .keys()
+            .filter(|(object_type_id, _)| *object_type_id == target.object.object_type_id)
+            .map(|(_, goid)| GraphNodeId::new(goid.clone()))
+            .collect(),
+    )
 }
 
-fn graph_hits_scores(
-    adjacency: &GraphAdjacency,
-    nodes: &BTreeSet<String>,
-    algorithm: &crate::ResolvedGraphAlgorithm,
-) -> BTreeMap<String, (f64, f64)> {
-    if nodes.is_empty() {
-        return BTreeMap::new();
-    }
-    let mut authority = nodes
-        .iter()
-        .map(|node| (node.clone(), 1.0f64))
-        .collect::<BTreeMap<_, _>>();
-    let mut hub = authority.clone();
-    let tolerance = graph_algorithm_tolerance(algorithm);
-    for _ in 0..graph_algorithm_iterations(algorithm) {
-        let mut next_authority = BTreeMap::new();
-        for node in nodes {
-            let value = adjacency
-                .incoming
-                .get(node)
-                .into_iter()
-                .flat_map(|sources| sources.iter())
-                .filter(|source| nodes.contains(*source))
-                .map(|source| hub.get(source).copied().unwrap_or(0.0))
-                .sum::<f64>();
-            next_authority.insert(node.clone(), value);
+fn graph_visible_edges(
+    edge: Option<&crate::ResolvedGraphEdgeRoot>,
+    direction: crate::AstAssociationDirection,
+    associations: &[MaterializedAssociationRow],
+    object_goids: &BTreeSet<String>,
+    visible_object_goids: &BTreeSet<String>,
+    planned: &PlannedQuery,
+) -> Vec<GraphEdge> {
+    let mut edges = Vec::new();
+    for association in associations {
+        if !graph_edge_matches(association, edge, planned) {
+            continue;
         }
-        normalize_scores(&mut next_authority);
-        let mut next_hub = BTreeMap::new();
-        for node in nodes {
-            let value = adjacency
-                .outgoing
-                .get(node)
-                .into_iter()
-                .flat_map(|targets| targets.iter())
-                .filter(|target| nodes.contains(*target))
-                .map(|target| next_authority.get(target).copied().unwrap_or(0.0))
-                .sum::<f64>();
-            next_hub.insert(node.clone(), value);
+        let (Some(source), Some(target)) = (&association.source_goid, &association.target_goid)
+        else {
+            continue;
+        };
+        if (object_goids.contains(source) && !visible_object_goids.contains(source))
+            || (object_goids.contains(target) && !visible_object_goids.contains(target))
+        {
+            continue;
         }
-        normalize_scores(&mut next_hub);
-        let delta = nodes
-            .iter()
-            .map(|node| {
-                (next_authority.get(node).copied().unwrap_or(0.0)
-                    - authority.get(node).copied().unwrap_or(0.0))
-                .abs()
-                    + (next_hub.get(node).copied().unwrap_or(0.0)
-                        - hub.get(node).copied().unwrap_or(0.0))
-                    .abs()
-            })
-            .sum::<f64>();
-        authority = next_authority;
-        hub = next_hub;
-        if delta <= tolerance {
-            break;
+        for (source, target) in graph_oriented_edge_pairs(source, target, direction) {
+            edges.push(GraphEdge::new(
+                GraphEdgeId::new(association.goid.clone()),
+                source,
+                target,
+            ));
         }
     }
-    nodes
-        .iter()
-        .map(|node| {
-            (
-                node.clone(),
-                (
-                    authority.get(node).copied().unwrap_or(0.0),
-                    hub.get(node).copied().unwrap_or(0.0),
-                ),
+    edges
+}
+
+fn graph_edge_matches(
+    association: &MaterializedAssociationRow,
+    edge: Option<&crate::ResolvedGraphEdgeRoot>,
+    planned: &PlannedQuery,
+) -> bool {
+    edge.is_none_or(|edge| {
+        association.object_type_id == edge.association.object_type_id
+            && association_row_matches_temporal(
+                association,
+                &edge.association,
+                association_valid_at(planned),
             )
-        })
-        .collect()
-}
-
-fn normalize_scores(scores: &mut BTreeMap<String, f64>) {
-    let norm = scores
-        .values()
-        .map(|value| value * value)
-        .sum::<f64>()
-        .sqrt();
-    if norm <= f64::EPSILON {
-        return;
-    }
-    for value in scores.values_mut() {
-        *value /= norm;
-    }
-}
-
-fn shortest_target_distance(
-    reachable: &BTreeMap<String, u32>,
-    target: Option<&crate::ResolvedGraphNodeRoot>,
-    by_type_and_goid: &BTreeMap<(u32, String), MaterializedObjectRow>,
-) -> Option<u32> {
-    if let Some(target) = target {
-        reachable
-            .iter()
-            .filter(|(goid, _)| {
-                by_type_and_goid.contains_key(&(target.object.object_type_id, (*goid).clone()))
-            })
-            .map(|(_, distance)| *distance)
-            .min()
-    } else {
-        reachable.values().copied().min()
-    }
-}
-
-fn graph_closeness_centrality(
-    adjacency: &GraphAdjacency,
-    start: &str,
-    node_count: usize,
-    algorithm: &crate::ResolvedGraphAlgorithm,
-    started: Instant,
-    options: &ExecutionOptions,
-) -> Result<f64, BuildExecutionError> {
-    if node_count <= 1 {
-        return Ok(0.0);
-    }
-    let reachable = graph_reachable_distances(
-        adjacency,
-        start,
-        algorithm.max_depth.unwrap_or(algorithm.contract.max_depth),
-        algorithm.max_paths.unwrap_or(algorithm.contract.max_paths),
-        started,
-        options,
-    )?;
-    let distance_sum = reachable
-        .values()
-        .map(|distance| *distance as f64)
-        .sum::<f64>();
-    if distance_sum <= f64::EPSILON {
-        return Ok(0.0);
-    }
-    Ok(reachable.len() as f64 / distance_sum)
-}
-
-fn graph_component_ids(adjacency: &GraphAdjacency, kind: &str) -> BTreeMap<String, usize> {
-    if kind == "strong" {
-        return graph_strong_component_ids(adjacency);
-    }
-    graph_weak_component_ids(adjacency)
-}
-
-fn graph_weak_component_ids(adjacency: &GraphAdjacency) -> BTreeMap<String, usize> {
-    let mut nodes = BTreeSet::new();
-    for (source, targets) in &adjacency.outgoing {
-        nodes.insert(source.clone());
-        nodes.extend(targets.iter().cloned());
-    }
-    let mut components = BTreeMap::new();
-    let mut component_id = 0usize;
-    for node in nodes {
-        if components.contains_key(&node) {
-            continue;
-        }
-        component_id += 1;
-        let mut stack = vec![node.clone()];
-        while let Some(current) = stack.pop() {
-            if components.insert(current.clone(), component_id).is_some() {
-                continue;
-            }
-            if let Some(next) = adjacency.outgoing.get(&current) {
-                stack.extend(next.iter().cloned());
-            }
-            if let Some(prev) = adjacency.incoming.get(&current) {
-                stack.extend(prev.iter().cloned());
-            }
-        }
-    }
-    components
-}
-
-fn graph_strong_component_ids(adjacency: &GraphAdjacency) -> BTreeMap<String, usize> {
-    let nodes = graph_algorithm_nodes(adjacency, &BTreeSet::new());
-    let mut visited = BTreeSet::new();
-    let mut finish_order = Vec::new();
-    for node in &nodes {
-        graph_scc_finish_order(node, adjacency, &mut visited, &mut finish_order);
-    }
-    let mut components = BTreeMap::new();
-    let mut component_id = 0usize;
-    for node in finish_order.into_iter().rev() {
-        if components.contains_key(&node) {
-            continue;
-        }
-        component_id += 1;
-        let mut stack = vec![node];
-        while let Some(current) = stack.pop() {
-            if components.insert(current.clone(), component_id).is_some() {
-                continue;
-            }
-            if let Some(sources) = adjacency.incoming.get(&current) {
-                for source in sources.iter().rev() {
-                    if !components.contains_key(source) {
-                        stack.push(source.clone());
-                    }
-                }
-            }
-        }
-    }
-    components
-}
-
-fn graph_scc_finish_order(
-    node: &str,
-    adjacency: &GraphAdjacency,
-    visited: &mut BTreeSet<String>,
-    finish_order: &mut Vec<String>,
-) {
-    if !visited.insert(node.to_string()) {
-        return;
-    }
-    if let Some(targets) = adjacency.outgoing.get(node) {
-        for target in targets {
-            graph_scc_finish_order(target, adjacency, visited, finish_order);
-        }
-    }
-    finish_order.push(node.to_string());
-}
-
-fn graph_degree_centrality(adjacency: &GraphAdjacency, node: &str, node_count: usize) -> f64 {
-    if node_count <= 1 {
-        return 0.0;
-    }
-    let out_degree = adjacency.outgoing.get(node).map(Vec::len).unwrap_or(0);
-    let in_degree = adjacency.incoming.get(node).map(Vec::len).unwrap_or(0);
-    (out_degree + in_degree) as f64 / (node_count - 1) as f64
-}
-
-fn graph_betweenness_centrality_scores(
-    adjacency: &GraphAdjacency,
-    nodes: &BTreeSet<String>,
-) -> BTreeMap<String, f64> {
-    let mut scores = nodes
-        .iter()
-        .map(|node| (node.clone(), 0.0f64))
-        .collect::<BTreeMap<_, _>>();
-    for source in nodes {
-        let mut stack = Vec::<String>::new();
-        let mut predecessors = nodes
-            .iter()
-            .map(|node| (node.clone(), Vec::<String>::new()))
-            .collect::<BTreeMap<_, _>>();
-        let mut sigma = nodes
-            .iter()
-            .map(|node| (node.clone(), 0.0f64))
-            .collect::<BTreeMap<_, _>>();
-        let mut distance = nodes
-            .iter()
-            .map(|node| (node.clone(), -1i64))
-            .collect::<BTreeMap<_, _>>();
-        sigma.insert(source.clone(), 1.0);
-        distance.insert(source.clone(), 0);
-        let mut queue = std::collections::VecDeque::from([source.clone()]);
-        while let Some(current) = queue.pop_front() {
-            stack.push(current.clone());
-            let current_distance = distance.get(&current).copied().unwrap_or(-1);
-            for target in adjacency.outgoing.get(&current).into_iter().flatten() {
-                if !nodes.contains(target) {
-                    continue;
-                }
-                if distance.get(target).copied().unwrap_or(-1) < 0 {
-                    distance.insert(target.clone(), current_distance + 1);
-                    queue.push_back(target.clone());
-                }
-                if distance.get(target).copied().unwrap_or(-1) == current_distance + 1 {
-                    let current_sigma = sigma.get(&current).copied().unwrap_or(0.0);
-                    *sigma.entry(target.clone()).or_insert(0.0) += current_sigma;
-                    predecessors
-                        .entry(target.clone())
-                        .or_default()
-                        .push(current.clone());
-                }
-            }
-        }
-        let mut dependency = nodes
-            .iter()
-            .map(|node| (node.clone(), 0.0f64))
-            .collect::<BTreeMap<_, _>>();
-        while let Some(node) = stack.pop() {
-            for predecessor in predecessors.get(&node).into_iter().flatten() {
-                let numerator = sigma.get(predecessor).copied().unwrap_or(0.0);
-                let denominator = sigma.get(&node).copied().unwrap_or(0.0);
-                if denominator <= f64::EPSILON {
-                    continue;
-                }
-                let contribution =
-                    numerator / denominator * (1.0 + dependency.get(&node).copied().unwrap_or(0.0));
-                *dependency.entry(predecessor.clone()).or_insert(0.0) += contribution;
-            }
-            if &node != source {
-                *scores.entry(node.clone()).or_insert(0.0) +=
-                    dependency.get(&node).copied().unwrap_or(0.0);
-            }
-        }
-    }
-    scores
-}
-
-fn graph_label_propagation_communities(
-    adjacency: &GraphAdjacency,
-    nodes: &BTreeSet<String>,
-    max_iterations: usize,
-) -> BTreeMap<String, usize> {
-    let mut labels = nodes
-        .iter()
-        .enumerate()
-        .map(|(index, node)| (node.clone(), index + 1))
-        .collect::<BTreeMap<_, _>>();
-    for _ in 0..max_iterations.max(1) {
-        let mut changed = false;
-        let mut next = labels.clone();
-        for node in nodes {
-            let mut counts = BTreeMap::<usize, usize>::new();
-            for neighbor in adjacency
-                .outgoing
-                .get(node)
-                .into_iter()
-                .flatten()
-                .chain(adjacency.incoming.get(node).into_iter().flatten())
-            {
-                if let Some(label) = labels.get(neighbor) {
-                    *counts.entry(*label).or_insert(0) += 1;
-                }
-            }
-            let Some((label, _)) = counts.into_iter().max_by(
-                |(left_label, left_count), (right_label, right_count)| {
-                    left_count
-                        .cmp(right_count)
-                        .then_with(|| right_label.cmp(left_label))
-                },
-            ) else {
-                continue;
-            };
-            if next.get(node).copied() != Some(label) {
-                next.insert(node.clone(), label);
-                changed = true;
-            }
-        }
-        labels = next;
-        if !changed {
-            break;
-        }
-    }
-    labels
-}
-
-fn graph_spanning_forest(
-    adjacency: &GraphAdjacency,
-    nodes: &BTreeSet<String>,
-    algorithm: &crate::ResolvedGraphAlgorithm,
-    associations: &[MaterializedAssociationRow],
-    planned: &PlannedQuery,
-    started: Instant,
-    options: &ExecutionOptions,
-) -> Result<BTreeMap<String, (Option<String>, u32)>, BuildExecutionError> {
-    match algorithm.variant.as_str() {
-        "dfs" => Ok(graph_search_spanning_forest(adjacency, nodes, true)),
-        "min_weight" => graph_min_weight_spanning_forest(
-            nodes,
-            algorithm,
-            associations,
-            planned,
-            started,
-            options,
-        ),
-        _ => Ok(graph_search_spanning_forest(adjacency, nodes, false)),
-    }
-}
-
-fn graph_search_spanning_forest(
-    adjacency: &GraphAdjacency,
-    nodes: &BTreeSet<String>,
-    depth_first: bool,
-) -> BTreeMap<String, (Option<String>, u32)> {
-    let mut forest = BTreeMap::<String, (Option<String>, u32)>::new();
-    for root in nodes {
-        if forest.contains_key(root) {
-            continue;
-        }
-        forest.insert(root.clone(), (None, 0));
-        if depth_first {
-            let mut stack = vec![root.clone()];
-            while let Some(node) = stack.pop() {
-                let depth = forest.get(&node).map(|(_, depth)| *depth).unwrap_or(0);
-                let Some(targets) = adjacency.outgoing.get(&node) else {
-                    continue;
-                };
-                for target in targets.iter().rev() {
-                    if forest.contains_key(target) {
-                        continue;
-                    }
-                    forest.insert(target.clone(), (Some(node.clone()), depth + 1));
-                    stack.push(target.clone());
-                }
-            }
-        } else {
-            let mut queue = std::collections::VecDeque::from([root.clone()]);
-            while let Some(node) = queue.pop_front() {
-                let depth = forest.get(&node).map(|(_, depth)| *depth).unwrap_or(0);
-                let Some(targets) = adjacency.outgoing.get(&node) else {
-                    continue;
-                };
-                for target in targets {
-                    if forest.contains_key(target) {
-                        continue;
-                    }
-                    forest.insert(target.clone(), (Some(node.clone()), depth + 1));
-                    queue.push_back(target.clone());
-                }
-            }
-        }
-    }
-    forest
-}
-
-#[derive(Debug, Clone)]
-struct GraphWeightedEdge {
-    source: String,
-    target: String,
-    weight: f64,
-}
-
-fn graph_min_weight_spanning_forest(
-    nodes: &BTreeSet<String>,
-    algorithm: &crate::ResolvedGraphAlgorithm,
-    associations: &[MaterializedAssociationRow],
-    planned: &PlannedQuery,
-    started: Instant,
-    options: &ExecutionOptions,
-) -> Result<BTreeMap<String, (Option<String>, u32)>, BuildExecutionError> {
-    let mut disjoint = nodes
-        .iter()
-        .map(|node| (node.clone(), node.clone()))
-        .collect::<BTreeMap<_, _>>();
-    let mut edges = graph_visible_weighted_edges(nodes, algorithm, associations, planned)?;
-    edges.sort_by(|left, right| {
-        left.weight
-            .partial_cmp(&right.weight)
-            .unwrap_or(Ordering::Equal)
-            .then_with(|| left.source.cmp(&right.source))
-            .then_with(|| left.target.cmp(&right.target))
-    });
-    let mut tree = GraphAdjacency::default();
-    for edge in edges {
-        check_time(&options.resource_budget, started)?;
-        let source_root = graph_find_root(&mut disjoint, &edge.source);
-        let target_root = graph_find_root(&mut disjoint, &edge.target);
-        if source_root == target_root {
-            continue;
-        }
-        disjoint.insert(target_root, source_root);
-        tree.add_edge(&edge.source, &edge.target);
-        tree.add_edge(&edge.target, &edge.source);
-    }
-    tree.normalize();
-    Ok(graph_search_spanning_forest(&tree, nodes, false))
-}
-
-fn graph_find_root(parents: &mut BTreeMap<String, String>, node: &str) -> String {
-    let parent = parents
-        .get(node)
-        .cloned()
-        .unwrap_or_else(|| node.to_string());
-    if parent == node {
-        return parent;
-    }
-    let root = graph_find_root(parents, &parent);
-    parents.insert(node.to_string(), root.clone());
-    root
+    })
 }
 
 fn graph_visible_weighted_edges(
-    nodes: &BTreeSet<String>,
     algorithm: &crate::ResolvedGraphAlgorithm,
-    associations: &[MaterializedAssociationRow],
-    planned: &PlannedQuery,
-) -> Result<Vec<GraphWeightedEdge>, BuildExecutionError> {
+    context: &GraphMaterializedExecutionContext<'_>,
+) -> Result<Vec<graph_execution::GraphWeightedEdge>, BuildExecutionError> {
     let Some(weight_expr) = &algorithm.weight else {
         return Err(exec_error(
             "E_GRAPH_ALGORITHM",
@@ -4997,23 +4336,16 @@ fn graph_visible_weighted_edges(
             json!({}),
         ));
     };
-    let context = EvalContext::for_plan(&[], &[], planned);
+    let eval_context = EvalContext::for_plan(&[], &[], context.planned);
     let mut edges = Vec::new();
-    for association in associations {
-        if algorithm.edge.as_ref().is_some_and(|edge| {
-            association.object_type_id != edge.association.object_type_id
-                || !association_row_matches_temporal(
-                    association,
-                    &edge.association,
-                    association_valid_at(planned),
-                )
-        }) {
+    for association in context.visible_associations {
+        if !graph_edge_matches(association, algorithm.edge.as_ref(), context.planned) {
             continue;
         }
         let weight_value = eval_expr(
             weight_expr,
             &ExecutionRow::Association(association.clone()),
-            &context,
+            &eval_context,
         )
         .map_err(|err| {
             exec_error(
@@ -5045,13 +4377,19 @@ fn graph_visible_weighted_edges(
             continue;
         };
         for (source, target) in graph_oriented_edge_pairs(source, target, algorithm.direction) {
-            if nodes.contains(&source) && nodes.contains(&target) {
-                edges.push(GraphWeightedEdge {
-                    source,
-                    target,
-                    weight,
-                });
+            if context.object_goids.contains(source.as_str())
+                && !context.visible_object_goids.contains(source.as_str())
+            {
+                continue;
             }
+            if context.object_goids.contains(target.as_str())
+                && !context.visible_object_goids.contains(target.as_str())
+            {
+                continue;
+            }
+            edges.push(graph_execution::GraphWeightedEdge::new(
+                source, target, weight,
+            ));
         }
     }
     Ok(edges)
@@ -5061,90 +4399,82 @@ fn graph_oriented_edge_pairs(
     source: &str,
     target: &str,
     direction: crate::AstAssociationDirection,
-) -> Vec<(String, String)> {
+) -> Vec<(GraphNodeId, GraphNodeId)> {
     match direction {
-        crate::AstAssociationDirection::Out => vec![(source.to_string(), target.to_string())],
-        crate::AstAssociationDirection::In => vec![(target.to_string(), source.to_string())],
+        crate::AstAssociationDirection::Out => {
+            vec![(GraphNodeId::new(source), GraphNodeId::new(target))]
+        }
+        crate::AstAssociationDirection::In => {
+            vec![(GraphNodeId::new(target), GraphNodeId::new(source))]
+        }
         crate::AstAssociationDirection::Either => vec![
-            (source.to_string(), target.to_string()),
-            (target.to_string(), source.to_string()),
+            (GraphNodeId::new(source), GraphNodeId::new(target)),
+            (GraphNodeId::new(target), GraphNodeId::new(source)),
         ],
-    }
-}
-
-fn triangle_count_for(adjacency: &GraphAdjacency, node: &str) -> usize {
-    let Some(neighbors) = adjacency.outgoing.get(node) else {
-        return 0;
-    };
-    let neighbor_set = neighbors.iter().collect::<BTreeSet<_>>();
-    let mut count = 0usize;
-    for neighbor in neighbors {
-        if let Some(second_hop) = adjacency.outgoing.get(neighbor) {
-            count += second_hop
-                .iter()
-                .filter(|candidate| neighbor_set.contains(candidate))
-                .count();
-        }
-    }
-    count / 2
-}
-
-fn clustering_coefficient_for(adjacency: &GraphAdjacency, node: &str) -> f64 {
-    let degree = adjacency.outgoing.get(node).map(Vec::len).unwrap_or(0);
-    if degree < 2 {
-        return 0.0;
-    }
-    let triangles = triangle_count_for(adjacency, node) as f64;
-    let possible = (degree * (degree - 1) / 2) as f64;
-    triangles / possible
-}
-
-fn community_id_for(goid: &str) -> usize {
-    goid.as_bytes().iter().fold(0usize, |acc, byte| {
-        acc.wrapping_mul(31).wrapping_add(*byte as usize)
-    })
-}
-
-#[derive(Debug, Clone)]
-struct GraphPathState {
-    start_goid: String,
-    current_goid: String,
-    node_goids: Vec<String>,
-    edge_goids: Vec<String>,
-    depth: u32,
-}
-
-impl GraphPathState {
-    fn new(start_goid: String) -> Self {
-        Self {
-            start_goid: start_goid.clone(),
-            current_goid: start_goid.clone(),
-            node_goids: vec![start_goid],
-            edge_goids: Vec::new(),
-            depth: 0,
-        }
-    }
-
-    fn extend(&self, edge_goid: String, target_goid: String) -> Self {
-        let mut node_goids = self.node_goids.clone();
-        node_goids.push(target_goid.clone());
-        let mut edge_goids = self.edge_goids.clone();
-        edge_goids.push(edge_goid);
-        Self {
-            start_goid: self.start_goid.clone(),
-            current_goid: target_goid,
-            node_goids,
-            edge_goids,
-            depth: self.depth + 1,
-        }
     }
 }
 
 fn expand_graph_traversal_rows(
     rows: &[MaterializedProjectionRow],
     traversal: &crate::ResolvedGraphTraversal,
-    context: &GraphExecutionContext<'_>,
+    context: &GraphMaterializedExecutionContext<'_>,
 ) -> Result<Vec<MaterializedProjectionRow>, BuildExecutionError> {
+    let edges = graph_visible_edges(
+        Some(&traversal.edge),
+        traversal.direction,
+        context.visible_associations,
+        context.object_goids,
+        context.visible_object_goids,
+        context.planned,
+    );
+    let rows = rows
+        .iter()
+        .filter_map(|row| {
+            graph_row_path_state(row, context.root)
+                .map(|path| GraphTraversalRow::new(row.clone(), path))
+        })
+        .collect::<Vec<_>>();
+    let associations_by_goid = context
+        .visible_associations
+        .iter()
+        .map(|association| (association.goid.as_str(), association))
+        .collect::<BTreeMap<_, _>>();
+    let spec = graph_traversal_spec(traversal, context);
+    let expanded = graph_execution::expand_traversal_rows(
+        &rows,
+        &edges,
+        &spec,
+        graph_execution_budget(context),
+        |row, edge, path| {
+            let association = associations_by_goid.get(edge.edge_id().as_str())?;
+            let mut candidate = merge_lookup_projection_rows(
+                row,
+                &namespace_graph_edge_projection_row(association, &traversal.edge),
+            );
+            if let Some(target) = &traversal.target {
+                let target_row = context.by_type_and_goid.get(&(
+                    target.object.object_type_id,
+                    edge.target().as_str().to_string(),
+                ))?;
+                candidate = merge_lookup_projection_rows(
+                    &candidate,
+                    &namespace_graph_node_projection_row(target_row, target, false),
+                );
+            }
+            Some(with_graph_path_state(candidate, path))
+        },
+    )
+    .map_err(map_graph_execution_error)?;
+    Ok(expanded
+        .into_iter()
+        .map(GraphTraversalRow::into_payload)
+        .collect())
+}
+
+fn graph_traversal_spec(
+    traversal: &crate::ResolvedGraphTraversal,
+    context: &GraphMaterializedExecutionContext<'_>,
+) -> GraphTraversalSpec {
     let fanout_limit = traversal
         .contract
         .as_ref()
@@ -5193,176 +4523,51 @@ fn expand_graph_traversal_rows(
                 .resource_budget
                 .maximum_graph_traversal_frontier,
         );
-    let mut emitted = Vec::new();
-    let mut seen = BTreeSet::<String>::new();
-    if traversal.min_depth == 0 {
-        for row in rows {
-            if let Some(state) = graph_row_path_state(row, context.root) {
-                push_graph_emitted_row(
-                    row.clone(),
-                    &state,
-                    traversal.distinct,
-                    &mut seen,
-                    &mut emitted,
-                );
-            }
-        }
+    GraphTraversalSpec {
+        min_depth: traversal.min_depth,
+        max_depth: traversal.max_depth,
+        mode: traversal.mode,
+        distinct: traversal.distinct,
+        limits: GraphTraversalLimits {
+            max_fanout_per_node: fanout_limit,
+            max_paths: path_limit,
+            max_frontier: frontier_limit,
+        },
     }
-    let mut frontier = rows.to_vec();
-    for depth in 1..=traversal.max_depth {
-        check_time(&context.options.resource_budget, context.started)?;
-        let mut next = Vec::new();
-        for row in &frontier {
-            let Some(state) = graph_row_path_state(row, context.root) else {
-                continue;
-            };
-            let mut fanout = 0usize;
-            for association in context.visible_associations.iter().filter(|association| {
-                association.object_type_id == traversal.edge.association.object_type_id
-                    && association_row_matches_temporal(
-                        association,
-                        &traversal.edge.association,
-                        association_valid_at(context.planned),
-                    )
-            }) {
-                let Some((target_goid, source_matches)) =
-                    traversal_target_goid(&state.current_goid, association, traversal.direction)
-                else {
-                    continue;
-                };
-                if !source_matches
-                    || (context.object_goids.contains(&target_goid)
-                        && !context.visible_object_goids.contains(&target_goid))
-                {
-                    continue;
-                }
-                let edge_goid = association.goid.clone();
-                if !graph_traversal_mode_allows(&state, &edge_goid, &target_goid, traversal.mode) {
-                    continue;
-                }
-                fanout += 1;
-                if fanout > fanout_limit {
-                    return Err(resource_error("maximum_graph_traversal_fanout", fanout));
-                }
-                let mut candidate = merge_lookup_projection_rows(
-                    row,
-                    &namespace_graph_edge_projection_row(association, &traversal.edge),
-                );
-                if let Some(target) = &traversal.target {
-                    let Some(target_row) = context
-                        .by_type_and_goid
-                        .get(&(target.object.object_type_id, target_goid.clone()))
-                    else {
-                        continue;
-                    };
-                    candidate = merge_lookup_projection_rows(
-                        &candidate,
-                        &namespace_graph_node_projection_row(target_row, target, false),
-                    );
-                }
-                let next_state = state.extend(edge_goid, target_goid);
-                candidate = with_graph_path_state(candidate, &next_state);
-                if depth >= traversal.min_depth {
-                    push_graph_emitted_row(
-                        candidate.clone(),
-                        &next_state,
-                        traversal.distinct,
-                        &mut seen,
-                        &mut emitted,
-                    );
-                    if emitted.len() > path_limit {
-                        return Err(resource_error(
-                            "maximum_graph_traversal_paths",
-                            emitted.len(),
-                        ));
-                    }
-                }
-                next.push(candidate);
-                if next.len() > frontier_limit {
-                    return Err(resource_error(
-                        "maximum_graph_traversal_frontier",
-                        next.len(),
-                    ));
-                }
-            }
-        }
-        frontier = next;
-        if frontier.is_empty() {
-            break;
-        }
-    }
-    Ok(emitted)
-}
-
-fn graph_traversal_mode_allows(
-    state: &GraphPathState,
-    edge_goid: &str,
-    target_goid: &str,
-    mode: GraphTraversalMode,
-) -> bool {
-    match mode {
-        GraphTraversalMode::Walk => true,
-        GraphTraversalMode::Trail => !state.edge_goids.iter().any(|edge| edge == edge_goid),
-        GraphTraversalMode::SimplePath => {
-            !state.edge_goids.iter().any(|edge| edge == edge_goid)
-                && !state.node_goids.iter().any(|node| node == target_goid)
-        }
-    }
-}
-
-fn push_graph_emitted_row(
-    row: MaterializedProjectionRow,
-    state: &GraphPathState,
-    distinct: GraphTraversalDistinctPolicy,
-    seen: &mut BTreeSet<String>,
-    emitted: &mut Vec<MaterializedProjectionRow>,
-) {
-    let key = match distinct {
-        GraphTraversalDistinctPolicy::None => None,
-        GraphTraversalDistinctPolicy::Path => Some(format!(
-            "{}|{}",
-            state.start_goid,
-            state.edge_goids.join(">")
-        )),
-        GraphTraversalDistinctPolicy::EndNode => {
-            Some(format!("{}|{}", state.start_goid, state.current_goid))
-        }
-    };
-    if let Some(key) = key {
-        if !seen.insert(key) {
-            return;
-        }
-    }
-    emitted.push(row);
 }
 
 fn graph_row_path_state(
     row: &MaterializedProjectionRow,
     root: &crate::ResolvedGraphNodeRoot,
-) -> Option<GraphPathState> {
-    let current_goid = graph_row_current_goid(row, root)?;
+) -> Option<GraphPath> {
+    let current_goid = graph_row_current_node_id(row, root)?;
     let start_goid = row
         .values
         .get(GRAPH_PATH_START_GOID_FIELD)
         .and_then(Value::as_str)
-        .map(str::to_string)
+        .map(GraphNodeId::new)
         .unwrap_or_else(|| current_goid.clone());
     let node_goids = graph_string_array_field(row, GRAPH_PATH_NODE_GOIDS_FIELD)
+        .map(|values| values.into_iter().map(GraphNodeId::new).collect())
         .unwrap_or_else(|| vec![current_goid.clone()]);
-    let edge_goids = graph_string_array_field(row, GRAPH_PATH_EDGE_GOIDS_FIELD).unwrap_or_default();
+    let edge_goids = graph_string_array_field(row, GRAPH_PATH_EDGE_GOIDS_FIELD)
+        .unwrap_or_default()
+        .into_iter()
+        .map(GraphEdgeId::new)
+        .collect::<Vec<_>>();
     let depth = row
         .values
         .get(GRAPH_PATH_DEPTH_FIELD)
         .and_then(Value::as_u64)
         .and_then(|value| u32::try_from(value).ok())
         .unwrap_or(edge_goids.len() as u32);
-    Some(GraphPathState {
+    Some(GraphPath::from_parts(
         start_goid,
         current_goid,
         node_goids,
         edge_goids,
         depth,
-    })
+    ))
 }
 
 fn graph_string_array_field(row: &MaterializedProjectionRow, field: &str) -> Option<Vec<String>> {
@@ -5376,6 +4581,13 @@ fn graph_string_array_field(row: &MaterializedProjectionRow, field: &str) -> Opt
                 .map(str::to_string)
                 .collect::<Vec<_>>()
         })
+}
+
+fn graph_row_current_node_id(
+    row: &MaterializedProjectionRow,
+    root: &crate::ResolvedGraphNodeRoot,
+) -> Option<GraphNodeId> {
+    graph_row_current_goid(row, root).map(GraphNodeId::new)
 }
 
 fn graph_row_current_goid(
@@ -5419,20 +4631,20 @@ fn with_graph_current_goid(
 
 fn with_graph_path_state(
     mut row: MaterializedProjectionRow,
-    state: &GraphPathState,
+    state: &GraphPath,
 ) -> MaterializedProjectionRow {
-    row = with_graph_current_goid(row, &state.current_goid);
+    row = with_graph_current_goid(row, state.current_goid().as_str());
     row.values.insert(
         GRAPH_PATH_START_GOID_FIELD.into(),
-        Value::String(state.start_goid.clone()),
+        Value::String(state.start_goid().as_str().to_string()),
     );
     row.values.insert(
         GRAPH_PATH_NODE_GOIDS_FIELD.into(),
         Value::Array(
             state
-                .node_goids
+                .node_goids()
                 .iter()
-                .map(|goid| Value::String(goid.clone()))
+                .map(|goid| Value::String(goid.as_str().to_string()))
                 .collect(),
         ),
     );
@@ -5440,35 +4652,28 @@ fn with_graph_path_state(
         GRAPH_PATH_EDGE_GOIDS_FIELD.into(),
         Value::Array(
             state
-                .edge_goids
+                .edge_goids()
                 .iter()
-                .map(|goid| Value::String(goid.clone()))
+                .map(|goid| Value::String(goid.as_str().to_string()))
                 .collect(),
         ),
     );
     row.values
-        .insert(GRAPH_PATH_DEPTH_FIELD.into(), json!(state.depth));
+        .insert(GRAPH_PATH_DEPTH_FIELD.into(), json!(state.depth()));
     row
 }
 
-fn traversal_target_goid(
-    current_goid: &str,
-    association: &MaterializedAssociationRow,
-    direction: crate::AstAssociationDirection,
-) -> Option<(String, bool)> {
-    let source = association.source_goid.as_deref();
-    let target = association.target_goid.as_deref();
-    match direction {
-        crate::AstAssociationDirection::Out => Some((target?.to_string(), source? == current_goid)),
-        crate::AstAssociationDirection::In => Some((source?.to_string(), target? == current_goid)),
-        crate::AstAssociationDirection::Either => {
-            if source? == current_goid {
-                Some((target?.to_string(), true))
-            } else if target? == current_goid {
-                Some((source?.to_string(), true))
-            } else {
-                None
-            }
+fn graph_execution_budget(context: &GraphMaterializedExecutionContext<'_>) -> GraphExecutionBudget {
+    GraphExecutionBudget::new(
+        context.started,
+        context.options.resource_budget.maximum_execution_time_ms,
+    )
+}
+
+fn map_graph_execution_error(error: GraphExecutionError) -> BuildExecutionError {
+    match error {
+        GraphExecutionError::ResourceLimitExceeded { limit, actual } => {
+            resource_error(limit, actual)
         }
     }
 }
