@@ -1,3 +1,9 @@
+#![allow(
+    clippy::field_reassign_with_default,
+    clippy::too_many_arguments,
+    clippy::unnecessary_lazy_evaluations
+)]
+
 use super::materialize::{
     encoded_array_for_page, materialize_page_payload, materialize_page_payload_from_wire,
 };

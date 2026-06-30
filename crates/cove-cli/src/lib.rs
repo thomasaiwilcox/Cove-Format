@@ -413,56 +413,29 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, String>
         "query" => parse_query(args),
         "convert" => parse_convert(args),
         "validate" => Ok(Command::Validate { args }),
-        "vec"
-            if args
-                .first()
-                .is_some_and(|arg| arg == "-h" || arg == "--help") =>
-        {
-            Ok(Command::Help(HelpTopic::Vec))
-        }
-        "vec" => Ok(Command::Vector { args }),
-        "ai" if args
-            .first()
-            .is_some_and(|arg| arg == "-h" || arg == "--help") =>
-        {
-            Ok(Command::Help(HelpTopic::Ai))
-        }
-        "ai" => Ok(Command::Ai { args }),
-        "train"
-            if args
-                .first()
-                .is_some_and(|arg| arg == "-h" || arg == "--help") =>
-        {
-            Ok(Command::Help(HelpTopic::Train))
-        }
-        "train" => Ok(Command::Train { args }),
+        "vec" => Ok(parse_passthrough_or_help(args, HelpTopic::Vec, |args| {
+            Command::Vector { args }
+        })),
+        "ai" => Ok(parse_passthrough_or_help(args, HelpTopic::Ai, |args| {
+            Command::Ai { args }
+        })),
+        "train" => Ok(parse_passthrough_or_help(args, HelpTopic::Train, |args| {
+            Command::Train { args }
+        })),
         "dump" => Ok(Command::Dump { args }),
-        "map"
-            if args
-                .first()
-                .is_some_and(|arg| arg == "-h" || arg == "--help") =>
-        {
-            Ok(Command::Help(HelpTopic::Map))
-        }
-        "map" => Ok(Command::Map { args }),
+        "map" => Ok(parse_passthrough_or_help(args, HelpTopic::Map, |args| {
+            Command::Map { args }
+        })),
         "export" => parse_export(args),
         "perf" => parse_perf(args),
-        "sidecar"
-            if args
-                .first()
-                .is_some_and(|arg| arg == "-h" || arg == "--help") =>
-        {
-            Ok(Command::Help(HelpTopic::Sidecar))
-        }
-        "sidecar" => Ok(Command::Sidecar { args }),
-        "delta"
-            if args
-                .first()
-                .is_some_and(|arg| arg == "-h" || arg == "--help") =>
-        {
-            Ok(Command::Help(HelpTopic::Delta))
-        }
-        "delta" => Ok(Command::Delta { args }),
+        "sidecar" => Ok(parse_passthrough_or_help(
+            args,
+            HelpTopic::Sidecar,
+            |args| Command::Sidecar { args },
+        )),
+        "delta" => Ok(parse_passthrough_or_help(args, HelpTopic::Delta, |args| {
+            Command::Delta { args }
+        })),
         "digest" => parse_digest(args),
         "profile" => Ok(Command::Profile { args }),
         "canonicalise" | "canonicalize" => Ok(Command::Canonicalise { args }),
@@ -471,6 +444,22 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, String>
             usage(HelpTopic::Global)
         )),
     }
+}
+
+fn parse_passthrough_or_help(
+    args: Vec<String>,
+    help_topic: HelpTopic,
+    command: impl FnOnce(Vec<String>) -> Command,
+) -> Command {
+    if args.first().is_some_and(|arg| is_help_flag(arg)) {
+        Command::Help(help_topic)
+    } else {
+        command(args)
+    }
+}
+
+fn is_help_flag(arg: &str) -> bool {
+    arg == "-h" || arg == "--help"
 }
 
 fn parse_examples(args: Vec<String>) -> Result<Command, String> {
@@ -1508,14 +1497,16 @@ fn run_ai_import(mut args: Vec<String>) -> Result<(), String> {
                     &iter
                         .next()
                         .ok_or_else(|| "--schema requires a value".to_string())?,
-                )?;
+                )
+                .map_err(|err| err.to_string())?;
             }
             "--split-policy" => {
                 split_policy = AiSplitPolicy::parse(
                     &iter
                         .next()
                         .ok_or_else(|| "--split-policy requires a value".to_string())?,
-                )?;
+                )
+                .map_err(|err| err.to_string())?;
             }
             "--split-column" => {
                 split_column = Some(
@@ -1552,10 +1543,13 @@ fn run_ai_import(mut args: Vec<String>) -> Result<(), String> {
         "jsonl" => import_jsonl(&input, out.as_deref(), options),
         "parquet" => import_parquet(&input, out.as_deref(), options),
         "hf" => import_hf_dir(&input, out.as_deref(), options),
-        other => Err(format!(
-            "unknown ai import kind '{other}'; expected jsonl, parquet, or hf"
-        )),
-    }?;
+        other => {
+            return Err(format!(
+                "unknown ai import kind '{other}'; expected jsonl, parquet, or hf"
+            ))
+        }
+    }
+    .map_err(|err| err.to_string())?;
     println!(
         "{}",
         serde_json::to_string_pretty(&report)
@@ -1601,8 +1595,11 @@ fn run_ai_verify(args: Vec<String>) -> Result<(), String> {
             cove_ai: None,
             dataset_dir,
         },
-    )?;
-    let report = archive.verify(AiVerifyOptions { policy_report })?;
+    )
+    .map_err(|err| err.to_string())?;
+    let report = archive
+        .verify(AiVerifyOptions { policy_report })
+        .map_err(|err| err.to_string())?;
     if json_output {
         println!(
             "{}",
@@ -1690,8 +1687,9 @@ fn run_ai_stream(args: Vec<String>) -> Result<(), String> {
             include_payloads,
             policy_report: true,
         },
-    )?;
-    write_export_file(data, out)
+    )
+    .map_err(|err| err.to_string())?;
+    write_export_file(data, out).map_err(|err| err.to_string())
 }
 
 fn run_ai_diff(args: Vec<String>) -> Result<(), String> {
@@ -1727,7 +1725,7 @@ fn run_ai_diff(args: Vec<String>) -> Result<(), String> {
     }
     let old = old.ok_or_else(|| "ai diff requires <old.coveai>".to_string())?;
     let new = new.ok_or_else(|| "ai diff requires <new.coveai>".to_string())?;
-    let report = diff_archives(&old, &new, &key_field)?;
+    let report = diff_archives(&old, &new, &key_field).map_err(|err| err.to_string())?;
     let text = serde_json::to_string_pretty(&report)
         .map_err(|error| format!("cannot serialize AI diff report: {error}"))?;
     if let Some(report_path) = report_path {
@@ -2047,7 +2045,7 @@ fn write_tar_entry(out: &mut Vec<u8>, name: &str, data: &[u8]) -> Result<(), Str
     out.extend_from_slice(&header);
     out.extend_from_slice(data);
     let padding = (512 - (data.len() % 512)) % 512;
-    out.extend(std::iter::repeat(0u8).take(padding));
+    out.extend(std::iter::repeat_n(0u8, padding));
     Ok(())
 }
 
@@ -2440,6 +2438,7 @@ fn run_train_export(args: Vec<String>) -> Result<(), String> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn training_export_json(
     input: &Path,
     sidecar: &CoveAiFile,
@@ -3657,7 +3656,8 @@ fn run_showcase_ai_training(
     force: bool,
     json: bool,
 ) -> Result<(), String> {
-    let manifest = build_ai_training_showcase(out_dir, profile.as_str(), force)?;
+    let manifest = build_ai_training_showcase(out_dir, profile.as_str(), force)
+        .map_err(|err| err.to_string())?;
     if json {
         println!(
             "{}",
@@ -5352,5 +5352,66 @@ fn beginner_suggestion(code: &str) -> &'static str {
         }
         "E_PARSE" => "Check the CoveQL syntax or start from a suggested query.",
         _ => "Run with `--json-diagnostics` for structured diagnostic details.",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn pass_through_commands_route_first_arg_help_to_topic() {
+        for (command, topic) in [
+            ("vec", HelpTopic::Vec),
+            ("ai", HelpTopic::Ai),
+            ("train", HelpTopic::Train),
+            ("map", HelpTopic::Map),
+            ("sidecar", HelpTopic::Sidecar),
+            ("delta", HelpTopic::Delta),
+        ] {
+            assert_eq!(
+                parse_args(args(&[command, "--help"])).unwrap(),
+                Command::Help(topic)
+            );
+            assert_eq!(
+                parse_args(args(&[command, "-h"])).unwrap(),
+                Command::Help(topic)
+            );
+        }
+    }
+
+    #[test]
+    fn pass_through_commands_preserve_forwarded_arguments() {
+        assert_eq!(
+            parse_args(args(&["vec", "build", "--metric", "cosine"])).unwrap(),
+            Command::Vector {
+                args: args(&["build", "--metric", "cosine"])
+            }
+        );
+        assert_eq!(
+            parse_args(args(&["map", "project", "--format", "json"])).unwrap(),
+            Command::Map {
+                args: args(&["project", "--format", "json"])
+            }
+        );
+    }
+
+    #[test]
+    fn canonicalise_aliases_preserve_forwarded_arguments() {
+        let forwarded = args(&["digest", "--json"]);
+        assert_eq!(
+            parse_args(args(&["canonicalise", "digest", "--json"])).unwrap(),
+            Command::Canonicalise {
+                args: forwarded.clone()
+            }
+        );
+        assert_eq!(
+            parse_args(args(&["canonicalize", "digest", "--json"])).unwrap(),
+            Command::Canonicalise { args: forwarded }
+        );
     }
 }

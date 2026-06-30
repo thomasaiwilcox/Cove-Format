@@ -1,5 +1,6 @@
 use std::{
-    fs,
+    error::Error,
+    fmt, fs,
     io::{Cursor, Seek, SeekFrom},
     path::{Path, PathBuf},
     sync::Arc,
@@ -23,6 +24,69 @@ pub enum SourceFormat {
     ArrowIpc,
     Csv,
     Orc,
+}
+
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum ConvertError {
+    ReadFile {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    UnsupportedSourceFormat {
+        path: PathBuf,
+    },
+    ArrowIpc(String),
+    Csv(String),
+    Parquet(String),
+    Orc(String),
+    Digest(String),
+    Conversion(String),
+    Message(String),
+}
+
+impl fmt::Display for ConvertError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ConvertError::ReadFile { path, source } => {
+                write!(f, "cannot read {}: {source}", path.display())
+            }
+            ConvertError::UnsupportedSourceFormat { .. } => {
+                write!(
+                    f,
+                    "cannot detect source format; pass source_format explicitly"
+                )
+            }
+            ConvertError::ArrowIpc(message)
+            | ConvertError::Csv(message)
+            | ConvertError::Parquet(message)
+            | ConvertError::Orc(message)
+            | ConvertError::Digest(message)
+            | ConvertError::Conversion(message)
+            | ConvertError::Message(message) => f.write_str(message),
+        }
+    }
+}
+
+impl Error for ConvertError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            ConvertError::ReadFile { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
+
+impl From<String> for ConvertError {
+    fn from(message: String) -> Self {
+        ConvertError::Message(message)
+    }
+}
+
+impl From<&str> for ConvertError {
+    fn from(message: &str) -> Self {
+        ConvertError::Message(message.to_string())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,9 +120,12 @@ pub struct ConversionOptions {
 pub fn convert_file_to_cove(
     path: impl AsRef<Path>,
     options: ConversionOptions,
-) -> Result<ParquetConversionResult, String> {
+) -> Result<ParquetConversionResult, ConvertError> {
     let path = path.as_ref();
-    let bytes = fs::read(path).map_err(|err| format!("cannot read {}: {err}", path.display()))?;
+    let bytes = fs::read(path).map_err(|source| ConvertError::ReadFile {
+        path: path.to_path_buf(),
+        source,
+    })?;
     let format = match options.source_format {
         Some(format) => format,
         None => detect_source_format(path)?,
@@ -71,14 +138,13 @@ pub fn convert_bytes_to_cove(
     bytes: &[u8],
     format: SourceFormat,
     mut options: ConversionOptions,
-) -> Result<ParquetConversionResult, String> {
+) -> Result<ParquetConversionResult, ConvertError> {
     let source_id = source_id.into();
     options.source_format = Some(format);
     let cove_options = conversion_options_for_source(&source_id, bytes, format, options.cove)?;
     match format {
-        SourceFormat::Parquet => {
-            convert_parquet_bytes(bytes, &cove_options).map_err(|err| err.to_string())
-        }
+        SourceFormat::Parquet => convert_parquet_bytes(bytes, &cove_options)
+            .map_err(|err| ConvertError::Conversion(err.to_string())),
         SourceFormat::ArrowIpc => {
             let (schema, batches) = read_arrow_batches_from_bytes(bytes)?;
             convert_arrow_record_batches(
@@ -88,7 +154,7 @@ pub fn convert_bytes_to_cove(
                 batches,
                 &cove_options,
             )
-            .map_err(|err| err.to_string())
+            .map_err(|err| ConvertError::Conversion(err.to_string()))
         }
         SourceFormat::Csv => {
             let (schema, batches) = read_csv_batches_from_bytes(bytes, &options.csv)?;
@@ -99,7 +165,7 @@ pub fn convert_bytes_to_cove(
                 batches,
                 &cove_options,
             )
-            .map_err(|err| err.to_string())
+            .map_err(|err| ConvertError::Conversion(err.to_string()))
         }
         SourceFormat::Orc => {
             let (schema, batches) = read_orc_batches_from_bytes(bytes)?;
@@ -110,12 +176,12 @@ pub fn convert_bytes_to_cove(
                 batches,
                 &cove_options,
             )
-            .map_err(|err| err.to_string())
+            .map_err(|err| ConvertError::Conversion(err.to_string()))
         }
     }
 }
 
-pub fn detect_source_format(path: impl AsRef<Path>) -> Result<SourceFormat, String> {
+pub fn detect_source_format(path: impl AsRef<Path>) -> Result<SourceFormat, ConvertError> {
     match path
         .as_ref()
         .extension()
@@ -127,47 +193,61 @@ pub fn detect_source_format(path: impl AsRef<Path>) -> Result<SourceFormat, Stri
         Some("arrow" | "ipc" | "feather") => Ok(SourceFormat::ArrowIpc),
         Some("csv") => Ok(SourceFormat::Csv),
         Some("orc") => Ok(SourceFormat::Orc),
-        _ => Err("cannot detect source format; pass source_format explicitly".into()),
+        _ => Err(ConvertError::UnsupportedSourceFormat {
+            path: path.as_ref().to_path_buf(),
+        }),
     }
 }
 
 pub fn read_arrow_batches(
     path: impl AsRef<Path>,
-) -> Result<(arrow_schema::SchemaRef, Vec<arrow_array::RecordBatch>), String> {
-    let bytes = fs::read(path.as_ref())
-        .map_err(|err| format!("cannot read {}: {err}", path.as_ref().display()))?;
+) -> Result<(arrow_schema::SchemaRef, Vec<arrow_array::RecordBatch>), ConvertError> {
+    let path = path.as_ref();
+    let bytes = fs::read(path).map_err(|source| ConvertError::ReadFile {
+        path: path.to_path_buf(),
+        source,
+    })?;
     read_arrow_batches_from_bytes(&bytes)
 }
 
 pub fn read_parquet_batches(
     path: impl AsRef<Path>,
-) -> Result<(arrow_schema::SchemaRef, Vec<arrow_array::RecordBatch>), String> {
-    let bytes = fs::read(path.as_ref())
-        .map_err(|err| format!("cannot read {}: {err}", path.as_ref().display()))?;
+) -> Result<(arrow_schema::SchemaRef, Vec<arrow_array::RecordBatch>), ConvertError> {
+    let path = path.as_ref();
+    let bytes = fs::read(path).map_err(|source| ConvertError::ReadFile {
+        path: path.to_path_buf(),
+        source,
+    })?;
     read_parquet_batches_from_bytes(&bytes)
 }
 
 pub fn read_csv_batches(
     path: impl AsRef<Path>,
     options: &CsvReadOptions,
-) -> Result<(arrow_schema::SchemaRef, Vec<arrow_array::RecordBatch>), String> {
-    let bytes = fs::read(path.as_ref())
-        .map_err(|err| format!("cannot read {}: {err}", path.as_ref().display()))?;
+) -> Result<(arrow_schema::SchemaRef, Vec<arrow_array::RecordBatch>), ConvertError> {
+    let path = path.as_ref();
+    let bytes = fs::read(path).map_err(|source| ConvertError::ReadFile {
+        path: path.to_path_buf(),
+        source,
+    })?;
     read_csv_batches_from_bytes(&bytes, options)
 }
 
 pub fn read_orc_batches(
     path: impl AsRef<Path>,
-) -> Result<(arrow_schema::SchemaRef, Vec<arrow_array::RecordBatch>), String> {
-    let bytes = fs::read(path.as_ref())
-        .map_err(|err| format!("cannot read {}: {err}", path.as_ref().display()))?;
+) -> Result<(arrow_schema::SchemaRef, Vec<arrow_array::RecordBatch>), ConvertError> {
+    let path = path.as_ref();
+    let bytes = fs::read(path).map_err(|source| ConvertError::ReadFile {
+        path: path.to_path_buf(),
+        source,
+    })?;
     read_orc_batches_from_bytes(&bytes)
 }
 
-pub fn source_digest(bytes: &[u8]) -> Result<String, String> {
+pub fn source_digest(bytes: &[u8]) -> Result<String, ConvertError> {
     compute_digest(DigestAlgorithm::Sha256, bytes)
         .map(|digest| format!("sha256:{}", hex_encode(&digest)))
-        .map_err(|err| err.to_string())
+        .map_err(|err| ConvertError::Digest(err.to_string()))
 }
 
 pub fn schema_fingerprint(schema: &arrow_schema::SchemaRef) -> String {
@@ -182,7 +262,7 @@ fn conversion_options_for_source(
     bytes: &[u8],
     format: SourceFormat,
     mut cove: ParquetConversionOptions,
-) -> Result<ParquetConversionOptions, String> {
+) -> Result<ParquetConversionOptions, ConvertError> {
     let fallback = default_table_name(format);
     if cove.table_name == "parquet_import" || cove.table_name == fallback {
         cove.table_name = table_name_from_source(source_id).unwrap_or_else(|| fallback.to_string());
@@ -215,43 +295,44 @@ fn table_name_from_source(source_id: &str) -> Option<String> {
 
 pub fn read_arrow_batches_from_bytes(
     bytes: &[u8],
-) -> Result<(arrow_schema::SchemaRef, Vec<arrow_array::RecordBatch>), String> {
+) -> Result<(arrow_schema::SchemaRef, Vec<arrow_array::RecordBatch>), ConvertError> {
     if let Ok(reader) = FileReader::try_new(Cursor::new(bytes.to_vec()), None) {
         let schema = reader.schema();
         let batches = reader
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|err| format!("cannot read Arrow IPC file: {err}"))?;
+            .map_err(|err| ConvertError::ArrowIpc(format!("cannot read Arrow IPC file: {err}")))?;
         return Ok((schema, batches));
     }
 
-    let reader = StreamReader::try_new(Cursor::new(bytes.to_vec()), None)
-        .map_err(|err| format!("cannot read Arrow IPC file or stream: {err}"))?;
+    let reader = StreamReader::try_new(Cursor::new(bytes.to_vec()), None).map_err(|err| {
+        ConvertError::ArrowIpc(format!("cannot read Arrow IPC file or stream: {err}"))
+    })?;
     let schema = reader.schema();
     let batches = reader
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|err| format!("cannot read Arrow IPC stream: {err}"))?;
+        .map_err(|err| ConvertError::ArrowIpc(format!("cannot read Arrow IPC stream: {err}")))?;
     Ok((schema, batches))
 }
 
 pub fn read_parquet_batches_from_bytes(
     bytes: &[u8],
-) -> Result<(arrow_schema::SchemaRef, Vec<arrow_array::RecordBatch>), String> {
+) -> Result<(arrow_schema::SchemaRef, Vec<arrow_array::RecordBatch>), ConvertError> {
     let builder = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::copy_from_slice(bytes))
-        .map_err(|err| format!("cannot open parquet source: {err}"))?;
+        .map_err(|err| ConvertError::Parquet(format!("cannot open parquet source: {err}")))?;
     let schema = builder.schema().clone();
     let batches = builder
         .with_batch_size(4096)
         .build()
-        .map_err(|err| format!("cannot build parquet reader: {err}"))?
+        .map_err(|err| ConvertError::Parquet(format!("cannot build parquet reader: {err}")))?
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|err| format!("cannot read parquet batches: {err}"))?;
+        .map_err(|err| ConvertError::Parquet(format!("cannot read parquet batches: {err}")))?;
     Ok((schema, batches))
 }
 
 fn read_csv_batches_from_bytes(
     bytes: &[u8],
     options: &CsvReadOptions,
-) -> Result<(arrow_schema::SchemaRef, Vec<arrow_array::RecordBatch>), String> {
+) -> Result<(arrow_schema::SchemaRef, Vec<arrow_array::RecordBatch>), ConvertError> {
     let mut cursor = Cursor::new(bytes.to_vec());
     let format = CsvFormat::default()
         .with_header(options.has_header)
@@ -259,31 +340,60 @@ fn read_csv_batches_from_bytes(
         .with_truncated_rows(options.allow_truncated_rows);
     let (schema, _) = format
         .infer_schema(&mut cursor, options.infer_rows)
-        .map_err(|err| format!("cannot infer CSV schema: {err}"))?;
+        .map_err(|err| ConvertError::Csv(format!("cannot infer CSV schema: {err}")))?;
     cursor
         .seek(SeekFrom::Start(0))
-        .map_err(|err| format!("cannot rewind CSV buffer: {err}"))?;
+        .map_err(|err| ConvertError::Csv(format!("cannot rewind CSV buffer: {err}")))?;
     let schema = Arc::new(schema);
     let reader = CsvReaderBuilder::new(Arc::clone(&schema))
         .with_format(format)
         .with_batch_size(options.batch_size)
         .build(cursor)
-        .map_err(|err| format!("cannot build CSV reader: {err}"))?;
+        .map_err(|err| ConvertError::Csv(format!("cannot build CSV reader: {err}")))?;
     let batches = reader
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|err| format!("cannot read CSV batches: {err}"))?;
+        .map_err(|err| ConvertError::Csv(format!("cannot read CSV batches: {err}")))?;
     Ok((schema, batches))
 }
 
 pub fn read_orc_batches_from_bytes(
     bytes: &[u8],
-) -> Result<(arrow_schema::SchemaRef, Vec<arrow_array::RecordBatch>), String> {
+) -> Result<(arrow_schema::SchemaRef, Vec<arrow_array::RecordBatch>), ConvertError> {
     let builder = ArrowReaderBuilder::try_new(bytes::Bytes::copy_from_slice(bytes))
-        .map_err(|err| format!("cannot open ORC source: {err}"))?;
+        .map_err(|err| ConvertError::Orc(format!("cannot open ORC source: {err}")))?;
     let schema = builder.schema().clone();
     let reader = builder.with_batch_size(4096).build();
     let batches = reader
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|err| format!("cannot read ORC batches: {err}"))?;
+        .map_err(|err| ConvertError::Orc(format!("cannot read ORC batches: {err}")))?;
     Ok((schema, batches))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detect_source_format_reports_typed_unsupported_format() {
+        let error = detect_source_format("input.unknown").unwrap_err();
+        assert!(matches!(
+            error,
+            ConvertError::UnsupportedSourceFormat { .. }
+        ));
+        assert_eq!(
+            error.to_string(),
+            "cannot detect source format; pass source_format explicitly"
+        );
+    }
+
+    #[test]
+    fn read_batches_reports_typed_io_error() {
+        let path = Path::new("__cove_convert_missing_arrow_file__");
+        let error = read_arrow_batches(path).unwrap_err();
+        assert!(matches!(error, ConvertError::ReadFile { .. }));
+        assert!(error.to_string().contains("cannot read"));
+        assert!(error
+            .to_string()
+            .contains("__cove_convert_missing_arrow_file__"));
+    }
 }

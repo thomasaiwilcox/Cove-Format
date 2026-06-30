@@ -1,5 +1,7 @@
 //! DataFusion 53.x native key-only equi-join execution.
 
+#![allow(clippy::too_many_arguments)]
+
 use std::{any::Any, collections::HashMap, sync::Arc};
 
 use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};

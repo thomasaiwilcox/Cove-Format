@@ -38,58 +38,119 @@ pub struct CodedOperatorContract {
     pub fallback_boundary: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CodedOperatorName(String);
+
+impl CodedOperatorName {
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl From<&str> for CodedOperatorName {
+    fn from(value: &str) -> Self {
+        Self(value.to_string())
+    }
+}
+
+impl From<String> for CodedOperatorName {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CodedContractText(String);
+
+impl CodedContractText {
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl From<&str> for CodedContractText {
+    fn from(value: &str) -> Self {
+        Self(value.to_string())
+    }
+}
+
+impl From<String> for CodedContractText {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<&&str> for CodedContractText {
+    fn from(value: &&str) -> Self {
+        Self((*value).to_string())
+    }
+}
+
 impl CodedOperatorContract {
     fn new(
-        operator: impl Into<String>,
+        operator: impl Into<CodedOperatorName>,
         representation_class: CodedRepresentationClass,
         exact: bool,
         residual_required: bool,
-        reason: impl Into<String>,
+        reason: impl Into<CodedContractText>,
     ) -> Self {
         let operator = operator.into();
         let reason = reason.into();
         Self {
             contract_version: crate::CODED_OPERATOR_CONTRACT_VERSION.into(),
-            operator: operator.clone(),
+            operator: operator.clone().into_string(),
             representation_class,
             exact,
             residual_required,
             row_grain: "visible_rows_after_reconstruction".into(),
             proof_obligation: if exact {
-                format!("{operator} has an explicit CoveQL-equivalence proof for this shape")
+                format!(
+                    "{} has an explicit CoveQL-equivalence proof for this shape",
+                    operator.as_str()
+                )
             } else {
                 format!(
-                    "{operator} must prove row-grain, null, type, collation, and security semantics before becoming authoritative"
+                    "{} must prove row-grain, null, type, collation, and security semantics before becoming authoritative",
+                    operator.as_str()
                 )
             },
             required_metadata: Vec::new(),
-            residual_reason: residual_required.then(|| reason.clone()),
+            residual_reason: residual_required.then(|| reason.as_str().to_string()),
             fallback_boundary: residual_required
                 .then(|| "materialized_residual_verification".into()),
-            reason,
+            reason: reason.into_string(),
         }
     }
 
-    fn with_row_grain(mut self, row_grain: impl Into<String>) -> Self {
-        self.row_grain = row_grain.into();
+    fn with_row_grain(mut self, row_grain: impl Into<CodedContractText>) -> Self {
+        self.row_grain = row_grain.into().into_string();
         self
     }
 
-    fn with_proof_obligation(mut self, proof_obligation: impl Into<String>) -> Self {
-        self.proof_obligation = proof_obligation.into();
+    fn with_proof_obligation(mut self, proof_obligation: impl Into<CodedContractText>) -> Self {
+        self.proof_obligation = proof_obligation.into().into_string();
         self
     }
 
     fn with_required_metadata(mut self, required_metadata: &[&str]) -> Self {
         self.required_metadata = required_metadata
             .iter()
-            .map(|metadata| (*metadata).into())
+            .map(CodedContractText::from)
+            .map(CodedContractText::into_string)
             .collect();
         self
     }
 
-    fn with_fallback_boundary(mut self, fallback_boundary: impl Into<String>) -> Self {
-        self.fallback_boundary = Some(fallback_boundary.into());
+    fn with_fallback_boundary(mut self, fallback_boundary: impl Into<CodedContractText>) -> Self {
+        self.fallback_boundary = Some(fallback_boundary.into().into_string());
         self
     }
 }
@@ -3762,5 +3823,39 @@ fn expression_contains_association_or_evidence(expr: &ResolvedExpr) -> bool {
                 || expression_contains_association_or_evidence(else_expr)
         }
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn coded_operator_contract_serializes_existing_string_shape() {
+        let contract = CodedOperatorContract::new(
+            "root_scan",
+            CodedRepresentationClass::CodePure,
+            true,
+            false,
+            "exact coded root scan",
+        )
+        .with_row_grain("visible_rows_after_reconstruction")
+        .with_required_metadata(&["code_domains"])
+        .with_fallback_boundary("materialized_residual_verification");
+        let value = serde_json::to_value(&contract).unwrap();
+
+        assert_eq!(
+            value["contract_version"],
+            crate::CODED_OPERATOR_CONTRACT_VERSION
+        );
+        assert_eq!(value["operator"], "root_scan");
+        assert_eq!(value["representation_class"], "code_pure");
+        assert_eq!(value["row_grain"], "visible_rows_after_reconstruction");
+        assert_eq!(value["required_metadata"], json!(["code_domains"]));
+        assert_eq!(
+            value["fallback_boundary"],
+            "materialized_residual_verification"
+        );
     }
 }

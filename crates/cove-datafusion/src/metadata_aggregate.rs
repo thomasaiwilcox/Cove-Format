@@ -1,5 +1,7 @@
 //! Exact metadata aggregate proofs shared by native adapter code.
 
+#![allow(clippy::needless_lifetimes)]
+
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},

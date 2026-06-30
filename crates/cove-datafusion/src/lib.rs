@@ -2,18 +2,6 @@
 //!
 //! Reference DataFusion SQL, FileFormat, and execution integration for COVE v2.
 
-#![allow(
-    clippy::derivable_impls,
-    clippy::field_reassign_with_default,
-    clippy::items_after_test_module,
-    clippy::needless_lifetimes,
-    clippy::needless_return,
-    clippy::redundant_closure,
-    clippy::too_many_arguments,
-    clippy::unnecessary_lazy_evaluations,
-    clippy::useless_conversion
-)]
-
 pub mod adapter_v53;
 pub mod bootstrap;
 pub mod coverage_plan;
@@ -37,11 +25,3 @@ pub mod task_graph;
 pub mod arrow_export_cli;
 pub mod explain_pruning_cli;
 pub mod plan_cost_cli;
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn scaffold_loads() {
-        assert_eq!(crate::adapter_v53::VERSION, "v53");
-    }
-}

@@ -1,5 +1,7 @@
 //! DataFusion 53.x file opener glue.
 
+#![allow(clippy::too_many_arguments)]
+
 use std::{
     future::Future,
     ops::Range,

@@ -1,5 +1,7 @@
 //! DataFusion 53.x bounded file sink for direct COVE-T writes.
 
+#![allow(clippy::field_reassign_with_default)]
+
 use std::{any::Any, collections::BTreeMap, fmt, sync::Arc};
 
 use arrow_array::{Array, ArrayRef, BooleanArray, RecordBatch};

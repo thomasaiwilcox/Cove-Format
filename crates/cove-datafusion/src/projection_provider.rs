@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments)]
+
 #[cfg(feature = "covi")]
 use std::collections::BTreeSet;
 use std::{

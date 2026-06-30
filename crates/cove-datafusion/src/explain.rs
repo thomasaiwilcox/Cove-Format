@@ -1,5 +1,11 @@
 //! Public planning and reporting helpers for v2 utility CLIs.
 
+#![allow(
+    clippy::derivable_impls,
+    clippy::redundant_closure,
+    clippy::useless_conversion
+)]
+
 use std::{collections::BTreeSet, ops::Range, path::Path, sync::Arc};
 
 use cove_core::{

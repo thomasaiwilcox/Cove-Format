@@ -1,3 +1,5 @@
+#![allow(clippy::unnecessary_lazy_evaluations)]
+
 use cove_core::{
     encoding::local_codebook::{LocalCodebookPayload, LocalCodebookValues},
     native::{

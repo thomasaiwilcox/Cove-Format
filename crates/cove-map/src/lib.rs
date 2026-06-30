@@ -69,9 +69,10 @@ pub use api::{
     projected_record_batches_from_cove_o_surface_with_catalog, projected_rows_from_cove_o_path,
     projected_rows_from_paths, projection_arrow_schema, projection_catalog_from_cove_o_bytes,
     projection_covi_filter_plan, projection_descriptors_from_cove_o_path,
-    projection_read_requirements_for_catalog, verify_replay_report_from_paths,
-    ProjectionColumnDescriptor, ProjectionColumnLineageDescriptor, ProjectionCoviFilterDiagnostic,
-    ProjectionCoviFilterLookup, ProjectionCoviFilterPlan, ProjectionDescriptor,
+    projection_read_requirements_for_catalog, verify_replay_report_from_paths, MapApiError,
+    MapApiResult, ProjectionColumnDescriptor, ProjectionColumnLineageDescriptor,
+    ProjectionCoviFilterDiagnostic, ProjectionCoviFilterLookup, ProjectionCoviFilterPlan,
+    ProjectionDescriptor,
 };
 pub(crate) use api::{parse_map, plan_keys, preview};
 use build::verify_from_paths;

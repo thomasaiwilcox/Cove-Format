@@ -1,5 +1,7 @@
 //! DataFusion 53.x stream glue.
 
+#![allow(clippy::too_many_arguments)]
+
 use std::{
     collections::VecDeque,
     future::Future,

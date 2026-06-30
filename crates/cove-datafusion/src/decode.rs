@@ -1,5 +1,7 @@
 //! Decode and materialization kernels shared by execution modes.
 
+#![allow(clippy::too_many_arguments)]
+
 mod cache;
 mod materialize;
 mod morsels;

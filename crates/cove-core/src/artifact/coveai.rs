@@ -5361,6 +5361,7 @@ pub struct ObjectStateVectorBindingV1 {
 }
 
 impl ObjectStateVectorBindingV1 {
+    #[allow(clippy::too_many_arguments)]
     fn validate(
         &self,
         vector_space_ids: &BTreeSet<u32>,
@@ -5417,7 +5418,6 @@ impl ObjectStateVectorBindingV1 {
             digest_ref_ids,
             model_input_digest_refs,
         )?;
-        self.csn.checked_add(0).ok_or(CoveError::ArithOverflow)?;
         if !vector_ref_ids.contains(&self.vector_ref) {
             return Err(CoveError::BadSection(format!(
                 "ObjectStateVectorBinding {} references missing vector_ref {}",
@@ -5443,6 +5443,7 @@ pub struct TrainingSampleVectorBindingV1 {
 }
 
 impl TrainingSampleVectorBindingV1 {
+    #[allow(clippy::too_many_arguments)]
     fn validate(
         &self,
         vector_space_ids: &BTreeSet<u32>,
@@ -5530,6 +5531,7 @@ pub struct AssociationStateVectorBindingV1 {
 }
 
 impl AssociationStateVectorBindingV1 {
+    #[allow(clippy::too_many_arguments)]
     fn validate(
         &self,
         vector_space_ids: &BTreeSet<u32>,
@@ -5591,7 +5593,6 @@ impl AssociationStateVectorBindingV1 {
             digest_ref_ids,
             model_input_digest_refs,
         )?;
-        self.csn.checked_add(0).ok_or(CoveError::ArithOverflow)?;
         if !vector_ref_ids.contains(&self.vector_ref) {
             return Err(CoveError::BadSection(format!(
                 "AssociationStateVectorBinding {} references missing vector_ref {}",
@@ -5685,6 +5686,7 @@ pub struct MultimodalSequenceVectorBindingV1 {
 }
 
 impl MultimodalSequenceVectorBindingV1 {
+    #[allow(clippy::too_many_arguments)]
     fn validate(
         &self,
         vector_space_ids: &BTreeSet<u32>,
@@ -6936,7 +6938,8 @@ fn ai_validate_tensor_zero_copy_layout(
     if layout.memory_alignment_bytes > 1 {
         let alignment =
             usize::try_from(layout.memory_alignment_bytes).map_err(|_| CoveError::ArithOverflow)?;
-        if data.as_ptr().wrapping_add(byte_offset) as usize % alignment != 0 {
+        let address = data.as_ptr().wrapping_add(byte_offset) as usize;
+        if !address.is_multiple_of(alignment) {
             return Err(CoveError::BadSection(format!(
                 "AI tensor payload is not aligned to {} bytes",
                 layout.memory_alignment_bytes
@@ -7782,10 +7785,12 @@ fn ivf_pq_candidate_indices(
     Ok(coarse)
 }
 
+type IvfClusterBuild = (Vec<Vec<f32>>, Vec<Vec<usize>>);
+
 fn ivf_build_clusters(
     candidates: &[LoadedVectorSearchCandidate],
     metric: u8,
-) -> Result<(Vec<Vec<f32>>, Vec<Vec<usize>>), CoveError> {
+) -> Result<IvfClusterBuild, CoveError> {
     let cluster_count = floor_sqrt_usize(candidates.len()).clamp(1, 64);
     let dimension = candidates
         .first()
@@ -14923,6 +14928,75 @@ mod tests {
         );
         assert_eq!(
             parsed.descriptor_tables.training_sample_vector_bindings[0].model_input_digest_ref,
+            2
+        );
+    }
+
+    #[test]
+    fn descriptor_bundle_accepts_object_and_association_vector_bindings_with_max_csn() {
+        let (mut tables, payload_sections) = vector_descriptor_tables_with_payload();
+        add_model_input_digest(&mut tables, 2, AI_DIGEST_DOMAIN_MODEL_INPUT_BYTES);
+        tables
+            .object_state_vector_bindings
+            .push(ObjectStateVectorBindingV1 {
+                binding_id: 10,
+                vector_space_id: 1,
+                composition_profile_ref: 0,
+                file_ref: 0,
+                object_type_id: 7,
+                goid_ref: 0,
+                branch_ref: 0,
+                temporal_kind: 0,
+                csn: u64::MAX,
+                timestamp_us: i64::MAX,
+                property_dependency_fingerprint_ref: 0,
+                vector_ref: 1,
+                model_input_digest_ref: 2,
+                flags: 0,
+                checksum: 0,
+            });
+        tables
+            .association_state_vector_bindings
+            .push(AssociationStateVectorBindingV1 {
+                binding_id: 11,
+                vector_space_id: 1,
+                composition_profile_ref: 0,
+                file_ref: 0,
+                association_type_id: 9,
+                association_key_ref: 0,
+                branch_ref: 0,
+                temporal_kind: 0,
+                csn: u64::MAX,
+                timestamp_us: i64::MAX,
+                property_dependency_fingerprint_ref: 0,
+                vector_ref: 1,
+                model_input_digest_ref: 2,
+                flags: 0,
+                checksum: 0,
+            });
+
+        let bytes = write_coveai_descriptor_bundle(&CoveAiDescriptorBundleBuild {
+            artifact_id: [56u8; 16],
+            created_at_us: 943,
+            payload_sections,
+            descriptor_tables: tables,
+        })
+        .unwrap();
+        let parsed = CoveAiFile::parse(&bytes).unwrap();
+        assert_eq!(
+            parsed.descriptor_tables.object_state_vector_bindings[0].csn,
+            u64::MAX
+        );
+        assert_eq!(
+            parsed.descriptor_tables.association_state_vector_bindings[0].csn,
+            u64::MAX
+        );
+        assert_eq!(
+            parsed.descriptor_tables.object_state_vector_bindings[0].model_input_digest_ref,
+            2
+        );
+        assert_eq!(
+            parsed.descriptor_tables.association_state_vector_bindings[0].model_input_digest_ref,
             2
         );
     }

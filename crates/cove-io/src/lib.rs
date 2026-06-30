@@ -69,7 +69,8 @@ pub fn convert_file(
     input: impl AsRef<Path>,
     options: convert::ConversionOptions,
 ) -> Result<convert::ConversionResult, CoveError> {
-    convert::convert_file_to_cove(input, options).map_err(CoveError::BadSchema)
+    convert::convert_file_to_cove(input, options)
+        .map_err(|err| CoveError::BadSchema(err.to_string()))
 }
 
 pub fn convert_parquet_file(

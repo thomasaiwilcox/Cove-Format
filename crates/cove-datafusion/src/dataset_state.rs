@@ -1,5 +1,7 @@
 //! Immutable dataset metadata state shared across scans.
 
+#![allow(clippy::too_many_arguments)]
+
 mod construct;
 mod pruning;
 mod pruning_sections;

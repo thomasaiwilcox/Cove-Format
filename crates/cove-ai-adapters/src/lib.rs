@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
-    fs,
+    error::Error,
+    fmt, fs,
     io::Cursor,
     path::{Path, PathBuf},
     sync::Arc,
@@ -28,6 +29,7 @@ use cove_core::{
     constants::{DigestAlgorithm, PrimaryProfile, SectionKind},
     digest::compute_digest,
     durable::durable_replace,
+    CoveError,
 };
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use serde::{Deserialize, Serialize};
@@ -36,6 +38,63 @@ use serde_json::{json, Map, Value};
 const PAYLOAD_SECTION_ID: u32 = 10;
 const DEFAULT_TRAIN_PPM: u64 = 980_000;
 const DEFAULT_VALIDATION_PPM: u64 = 10_000;
+
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum AiAdapterError {
+    Io {
+        action: &'static str,
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    InvalidSidecar {
+        path: PathBuf,
+        source: CoveError,
+    },
+    Message(String),
+}
+
+impl fmt::Display for AiAdapterError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AiAdapterError::Io {
+                action,
+                path,
+                source,
+            } => write!(f, "cannot {action} {}: {source}", path.display()),
+            AiAdapterError::InvalidSidecar { path, source } => {
+                write!(
+                    f,
+                    "{} is not a valid COVE-AI sidecar: {source}",
+                    path.display()
+                )
+            }
+            AiAdapterError::Message(message) => f.write_str(message),
+        }
+    }
+}
+
+impl Error for AiAdapterError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            AiAdapterError::Io { source, .. } => Some(source),
+            AiAdapterError::InvalidSidecar { source, .. } => Some(source),
+            AiAdapterError::Message(_) => None,
+        }
+    }
+}
+
+impl From<String> for AiAdapterError {
+    fn from(message: String) -> Self {
+        AiAdapterError::Message(message)
+    }
+}
+
+impl From<&str> for AiAdapterError {
+    fn from(message: &str) -> Self {
+        AiAdapterError::Message(message.to_string())
+    }
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AiArchiveOpenOptions {
@@ -119,16 +178,16 @@ pub enum AiImportSchema {
 }
 
 impl AiImportSchema {
-    pub fn parse(value: &str) -> Result<Self, String> {
+    pub fn parse(value: &str) -> Result<Self, AiAdapterError> {
         match value {
             "instruction" => Ok(Self::Instruction),
             "chat" => Ok(Self::Chat),
             "pretrain" => Ok(Self::Pretrain),
             "preference" => Ok(Self::Preference),
             "rag" => Ok(Self::Rag),
-            other => Err(format!(
+            other => Err(AiAdapterError::Message(format!(
                 "unsupported AI import schema '{other}'; expected instruction, chat, pretrain, preference, or rag"
-            )),
+            ))),
         }
     }
 
@@ -150,12 +209,12 @@ pub enum AiSplitPolicy {
 }
 
 impl AiSplitPolicy {
-    pub fn parse(value: &str) -> Result<Self, String> {
+    pub fn parse(value: &str) -> Result<Self, AiAdapterError> {
         match value {
             "deterministic" => Ok(Self::Deterministic),
-            other => Err(format!(
+            other => Err(AiAdapterError::Message(format!(
                 "unsupported split policy '{other}'; only deterministic is implemented"
-            )),
+            ))),
         }
     }
 }
@@ -240,17 +299,22 @@ impl SplitName {
 }
 
 impl AiTrainingArchive {
-    pub fn open(path: impl AsRef<Path>, options: AiArchiveOpenOptions) -> Result<Self, String> {
+    pub fn open(
+        path: impl AsRef<Path>,
+        options: AiArchiveOpenOptions,
+    ) -> Result<Self, AiAdapterError> {
         let requested = path.as_ref();
         let sidecar_path = resolve_sidecar_path(requested, &options)?;
-        let bytes = fs::read(&sidecar_path)
-            .map_err(|error| format!("cannot read {}: {error}", sidecar_path.display()))?;
-        let sidecar = CoveAiFile::parse(&bytes).map_err(|error| {
-            format!(
-                "{} is not a valid COVE-AI sidecar: {error}",
-                sidecar_path.display()
-            )
+        let bytes = fs::read(&sidecar_path).map_err(|source| AiAdapterError::Io {
+            action: "read",
+            path: sidecar_path.clone(),
+            source,
         })?;
+        let sidecar =
+            CoveAiFile::parse(&bytes).map_err(|source| AiAdapterError::InvalidSidecar {
+                path: sidecar_path.clone(),
+                source,
+            })?;
         Ok(Self {
             path: sidecar_path,
             bytes,
@@ -258,12 +322,12 @@ impl AiTrainingArchive {
         })
     }
 
-    pub fn verify(&self, options: AiVerifyOptions) -> Result<Value, String> {
+    pub fn verify(&self, options: AiVerifyOptions) -> Result<Value, AiAdapterError> {
         let report = self.report(options)?;
-        serde_json::to_value(report).map_err(|error| error.to_string())
+        Ok(serde_json::to_value(report).map_err(|error| error.to_string())?)
     }
 
-    pub fn report(&self, options: AiVerifyOptions) -> Result<AiArchiveReport, String> {
+    pub fn report(&self, options: AiVerifyOptions) -> Result<AiArchiveReport, AiAdapterError> {
         let mut split_counts = BTreeMap::new();
         for sample in &self.sidecar.descriptor_tables.training_samples {
             let split = split_name_for_ref(sample.split_ref);
@@ -318,7 +382,10 @@ impl AiTrainingArchive {
         })
     }
 
-    pub fn training_samples(&self, options: AiSampleIteratorOptions) -> Result<Vec<Value>, String> {
+    pub fn training_samples(
+        &self,
+        options: AiSampleIteratorOptions,
+    ) -> Result<Vec<Value>, AiAdapterError> {
         let split_filter = options
             .split
             .as_deref()
@@ -349,7 +416,7 @@ impl AiTrainingArchive {
         Ok(rows)
     }
 
-    pub fn chunks(&self, include_text: bool) -> Result<Vec<Value>, String> {
+    pub fn chunks(&self, include_text: bool) -> Result<Vec<Value>, AiAdapterError> {
         let reader = AiPayloadReader::new(
             &self.bytes,
             &self.sidecar,
@@ -378,7 +445,7 @@ impl AiTrainingArchive {
             .collect())
     }
 
-    pub fn tokens(&self, include_payloads: bool) -> Result<Vec<Value>, String> {
+    pub fn tokens(&self, include_payloads: bool) -> Result<Vec<Value>, AiAdapterError> {
         let reader = AiPayloadReader::new(
             &self.bytes,
             &self.sidecar,
@@ -406,7 +473,7 @@ impl AiTrainingArchive {
             .collect())
     }
 
-    pub fn multimodal(&self, include_payloads: bool) -> Result<Vec<Value>, String> {
+    pub fn multimodal(&self, include_payloads: bool) -> Result<Vec<Value>, AiAdapterError> {
         let reader = AiPayloadReader::new(
             &self.bytes,
             &self.sidecar,
@@ -439,7 +506,7 @@ impl AiTrainingArchive {
             .collect())
     }
 
-    pub fn export(&self, options: AiExportOptions) -> Result<AiExportData, String> {
+    pub fn export(&self, options: AiExportOptions) -> Result<AiExportData, AiAdapterError> {
         let samples = self.training_samples(AiSampleIteratorOptions {
             split: options.split.clone(),
             include_payloads: options.include_payloads,
@@ -456,18 +523,21 @@ impl AiTrainingArchive {
             "samples": samples,
             "diagnostics": self.report(AiVerifyOptions { policy_report: options.policy_report })?.diagnostics,
         });
-        export_value(&report, &options.format)
+        Ok(export_value(&report, &options.format)?)
     }
 }
 
 pub fn open(
     path: impl AsRef<Path>,
     options: AiArchiveOpenOptions,
-) -> Result<AiTrainingArchive, String> {
+) -> Result<AiTrainingArchive, AiAdapterError> {
     AiTrainingArchive::open(path, options)
 }
 
-pub fn verify_archive(path: impl AsRef<Path>, options: AiVerifyOptions) -> Result<Value, String> {
+pub fn verify_archive(
+    path: impl AsRef<Path>,
+    options: AiVerifyOptions,
+) -> Result<Value, AiAdapterError> {
     AiTrainingArchive::open(path, AiArchiveOpenOptions::default())?.verify(options)
 }
 
@@ -475,10 +545,13 @@ pub fn import_jsonl(
     input: impl AsRef<Path>,
     out: Option<impl AsRef<Path>>,
     options: AiImportOptions,
-) -> Result<Value, String> {
+) -> Result<Value, AiAdapterError> {
     let input = input.as_ref();
-    let text = fs::read_to_string(input)
-        .map_err(|error| format!("cannot read {}: {error}", input.display()))?;
+    let text = fs::read_to_string(input).map_err(|source| AiAdapterError::Io {
+        action: "read",
+        path: input.to_path_buf(),
+        source,
+    })?;
     let mut rows = Vec::new();
     for (index, line) in text.lines().enumerate() {
         if line.trim().is_empty() {
@@ -493,26 +566,31 @@ pub fn import_jsonl(
         })?;
         rows.push(value);
     }
-    import_values(input, rows, out, options)
+    Ok(import_values(input, rows, out, options)?)
 }
 
 pub fn import_hf_dir(
     input_dir: impl AsRef<Path>,
     out: Option<impl AsRef<Path>>,
     options: AiImportOptions,
-) -> Result<Value, String> {
+) -> Result<Value, AiAdapterError> {
     let input_dir = input_dir.as_ref();
     let mut rows = Vec::new();
-    for entry in fs::read_dir(input_dir)
-        .map_err(|error| format!("cannot read {}: {error}", input_dir.display()))?
-    {
+    for entry in fs::read_dir(input_dir).map_err(|source| AiAdapterError::Io {
+        action: "read",
+        path: input_dir.to_path_buf(),
+        source,
+    })? {
         let entry = entry.map_err(|error| error.to_string())?;
         let path = entry.path();
         if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
             continue;
         }
-        let text = fs::read_to_string(&path)
-            .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+        let text = fs::read_to_string(&path).map_err(|source| AiAdapterError::Io {
+            action: "read",
+            path: path.clone(),
+            source,
+        })?;
         for (index, line) in text.lines().enumerate() {
             if line.trim().is_empty() {
                 continue;
@@ -528,46 +606,49 @@ pub fn import_hf_dir(
         }
     }
     if rows.is_empty() {
-        return Err(format!(
+        return Err(AiAdapterError::Message(format!(
             "{} did not contain any .jsonl records to import",
             input_dir.display()
-        ));
+        )));
     }
-    import_values(input_dir, rows, out, options)
+    Ok(import_values(input_dir, rows, out, options)?)
 }
 
 pub fn import_parquet(
     input: impl AsRef<Path>,
     out: Option<impl AsRef<Path>>,
     options: AiImportOptions,
-) -> Result<Value, String> {
+) -> Result<Value, AiAdapterError> {
     let input = input.as_ref();
-    let file = fs::File::open(input)
-        .map_err(|error| format!("cannot open {}: {error}", input.display()))?;
+    let file = fs::File::open(input).map_err(|source| AiAdapterError::Io {
+        action: "open",
+        path: input.to_path_buf(),
+        source,
+    })?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|error| {
         format!(
             "cannot read Parquet metadata from {}: {error}",
             input.display()
         )
     })?;
-    let mut reader = builder.build().map_err(|error| {
+    let reader = builder.build().map_err(|error| {
         format!(
             "cannot build Parquet row reader for {}: {error}",
             input.display()
         )
     })?;
     let mut rows = Vec::new();
-    while let Some(batch) = reader.next() {
+    for batch in reader {
         let batch = batch.map_err(|error| format!("Parquet batch read failed: {error}"))?;
         rows.extend(record_batch_to_json_rows(&batch)?);
     }
-    import_values(input, rows, out, options)
+    Ok(import_values(input, rows, out, options)?)
 }
 
 pub fn stream_archive(
     input: impl AsRef<Path>,
     options: AiExportOptions,
-) -> Result<AiExportData, String> {
+) -> Result<AiExportData, AiAdapterError> {
     let archive = AiTrainingArchive::open(input, AiArchiveOpenOptions::default())?;
     archive.export(options)
 }
@@ -576,7 +657,7 @@ pub fn diff_archives(
     old_path: impl AsRef<Path>,
     new_path: impl AsRef<Path>,
     key_field: &str,
-) -> Result<Value, String> {
+) -> Result<Value, AiAdapterError> {
     let old = AiTrainingArchive::open(old_path, AiArchiveOpenOptions::default())?;
     let new = AiTrainingArchive::open(new_path, AiArchiveOpenOptions::default())?;
     let old_samples = keyed_samples(&old, key_field)?;
@@ -612,14 +693,18 @@ pub fn build_ai_training_showcase(
     out_dir: impl AsRef<Path>,
     profile: &str,
     force: bool,
-) -> Result<Value, String> {
+) -> Result<Value, AiAdapterError> {
     let out_dir = out_dir.as_ref();
     prepare_output_dir(out_dir, force)?;
     let sample_count = match profile {
         "quick" => 8usize,
         "standard" => 128usize,
         "publication" => 512usize,
-        other => return Err(format!("unknown ai-training showcase profile '{other}'")),
+        other => {
+            return Err(AiAdapterError::Message(format!(
+                "unknown ai-training showcase profile '{other}'"
+            )))
+        }
     };
     let source_path = out_dir.join("training-source.jsonl");
     let mut source = String::new();
@@ -1183,7 +1268,7 @@ fn export_value(report: &Value, format: &str) -> Result<AiExportData, String> {
     })
 }
 
-pub fn write_export_file(data: AiExportData, out: Option<PathBuf>) -> Result<(), String> {
+pub fn write_export_file(data: AiExportData, out: Option<PathBuf>) -> Result<(), AiAdapterError> {
     if let Some(out) = out {
         durable_replace(&out, &data.bytes)
             .map_err(|error| format!("cannot write {}: {error}", out.display()))?;
@@ -1376,10 +1461,13 @@ fn keyed_samples(
     key_field: &str,
 ) -> Result<BTreeMap<String, Value>, String> {
     let mut keyed = BTreeMap::new();
-    for sample in archive.training_samples(AiSampleIteratorOptions {
-        split: None,
-        include_payloads: true,
-    })? {
+    for sample in archive
+        .training_samples(AiSampleIteratorOptions {
+            split: None,
+            include_payloads: true,
+        })
+        .map_err(|error| error.to_string())?
+    {
         let key = sample_key(&sample, key_field).unwrap_or_else(|| {
             sample
                 .get("sample_id")
@@ -1787,7 +1875,7 @@ fn write_tar_entry(out: &mut Vec<u8>, name: &str, data: &[u8]) -> Result<(), Str
     out.extend_from_slice(&header);
     out.extend_from_slice(data);
     let padding = (512 - (data.len() % 512)) % 512;
-    out.extend(std::iter::repeat(0u8).take(padding));
+    out.extend(std::iter::repeat_n(0u8, padding));
     Ok(())
 }
 
@@ -1869,6 +1957,29 @@ mod tests {
     }
 
     #[test]
+    fn import_schema_parse_reports_typed_error() {
+        let error = AiImportSchema::parse("made-up-schema").unwrap_err();
+        assert!(matches!(error, AiAdapterError::Message(_)));
+        assert!(error
+            .to_string()
+            .contains("unsupported AI import schema 'made-up-schema'"));
+    }
+
+    #[test]
+    fn import_jsonl_reports_typed_read_error() {
+        let error = import_jsonl(
+            "__cove_ai_adapters_missing_import.jsonl__",
+            None::<&Path>,
+            AiImportOptions::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(error, AiAdapterError::Io { action: "read", .. }));
+        assert!(error
+            .to_string()
+            .contains("cannot read __cove_ai_adapters_missing_import.jsonl__"));
+    }
+
+    #[test]
     fn import_builds_valid_payload_lease_archive() {
         let rows = vec![json!({
             "sample_id": "s1",
@@ -1920,6 +2031,50 @@ mod tests {
         assert!(std::str::from_utf8(lease.bytes)
             .unwrap()
             .contains("Summarize COVE-AI"));
+    }
+
+    #[test]
+    fn archive_export_reports_typed_format_error() {
+        let samples = vec![imported_sample_from_value(
+            0,
+            &json!({
+                "sample_id": "s1",
+                "instruction": "Summarize COVE-AI.",
+                "output": "COVE-AI records payload authority."
+            }),
+            &AiImportOptions {
+                artifact_id: Some([8u8; 16]),
+                created_at_us: Some(1),
+                ..AiImportOptions::default()
+            },
+        )
+        .unwrap()];
+        let bytes = build_training_sidecar(
+            &samples,
+            &AiImportOptions {
+                artifact_id: Some([8u8; 16]),
+                created_at_us: Some(1),
+                ..AiImportOptions::default()
+            },
+        )
+        .unwrap();
+        let sidecar = CoveAiFile::parse(&bytes).unwrap();
+        let archive = AiTrainingArchive {
+            path: PathBuf::from("memory.coveai"),
+            bytes,
+            sidecar,
+        };
+
+        let error = archive
+            .export(AiExportOptions {
+                format: "made-up-format".to_string(),
+                ..AiExportOptions::default()
+            })
+            .unwrap_err();
+        assert!(matches!(error, AiAdapterError::Message(_)));
+        assert!(error
+            .to_string()
+            .contains("unsupported AI export format 'made-up-format'"));
     }
 
     #[test]

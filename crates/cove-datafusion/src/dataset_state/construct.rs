@@ -1,3 +1,5 @@
+#![allow(clippy::field_reassign_with_default, clippy::too_many_arguments)]
+
 use std::sync::Arc;
 
 use cove_arrow::arrow::ArrowStringValidationPolicy;

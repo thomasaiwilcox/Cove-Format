@@ -255,7 +255,8 @@ fn try_direct_delta_projection_export(
         catalog,
         &projection.projection_id,
         &projection_options,
-    )?;
+    )
+    .map_err(|err| err.to_string())?;
     let schema = batches
         .first()
         .map(arrow_array::RecordBatch::schema)

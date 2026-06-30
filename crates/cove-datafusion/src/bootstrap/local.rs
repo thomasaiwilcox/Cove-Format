@@ -301,7 +301,7 @@ pub(super) async fn bootstrap_local_path_with_options(
         if covi.is_some() || stats.covi_sidecars_ignored != 0 || stats.covi_sidecars_stale != 0 {
             state = Arc::new(state.with_file_covi(0, covi, stats)?);
         }
-        return Ok(state);
+        Ok(state)
     }
     #[cfg(not(feature = "covi"))]
     Ok(state)

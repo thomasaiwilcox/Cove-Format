@@ -896,7 +896,8 @@ fn write_projection_parity_reports(
 ) -> Result<Vec<Value>, String> {
     fs::create_dir_all(parity_dir)
         .map_err(|err| format!("cannot create {}: {err}", parity_dir.display()))?;
-    let actual = projected_rows_from_cove_o_path(object_path, None)?;
+    let actual =
+        projected_rows_from_cove_o_path(object_path, None).map_err(|err| err.to_string())?;
     let mut reports = Vec::new();
     for projection_id in projection_ids {
         let expected_bytes = projected_output_from_cove_o_path(
@@ -904,7 +905,8 @@ fn write_projection_parity_reports(
             None,
             ProjectionFormat::Json,
             Some(projection_id),
-        )?;
+        )
+        .map_err(|err| err.to_string())?;
         let expected: Value = serde_json::from_slice(&expected_bytes)
             .map_err(|err| format!("cannot parse {projection_id} projection JSON: {err}"))?;
         let report = projection_parity_report(projection_id, &expected, &actual);

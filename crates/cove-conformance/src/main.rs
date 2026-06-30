@@ -2472,6 +2472,7 @@ fn validate_cove_map_replay_fixture(corpus: &Path, bytes: &[u8]) -> Result<(), C
         }
         Err(error) => {
             if let Some(expected) = value.get("expected_error_contains").and_then(Value::as_str) {
+                let error = error.to_string();
                 if !error.contains(expected) {
                     return Err(CoveError::BadSection(format!(
                         "unexpected cove-map replay error: {error}"

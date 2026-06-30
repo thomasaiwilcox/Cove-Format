@@ -1399,29 +1399,36 @@ fn run_ai_training_archive_case(corpus: &Path) -> Result<Value, String> {
             cove_ai: None,
             dataset_dir: Some(corpus.to_path_buf()),
         },
-    )?;
+    )
+    .map_err(|err| err.to_string())?;
     let verify_start = Instant::now();
-    let verify_report = archive.verify(AiVerifyOptions {
-        policy_report: true,
-    })?;
+    let verify_report = archive
+        .verify(AiVerifyOptions {
+            policy_report: true,
+        })
+        .map_err(|err| err.to_string())?;
     let verify_latency_ns = verify_start.elapsed().as_nanos() as u64;
 
     let stream_start = Instant::now();
-    let samples = archive.training_samples(AiSampleIteratorOptions {
-        split: Some("train".to_string()),
-        include_payloads: true,
-    })?;
+    let samples = archive
+        .training_samples(AiSampleIteratorOptions {
+            split: Some("train".to_string()),
+            include_payloads: true,
+        })
+        .map_err(|err| err.to_string())?;
     let stream_latency_ns = stream_start.elapsed().as_nanos() as u64;
     let payload_bytes_read = samples.iter().map(ai_payload_bytes_in_record).sum::<u64>();
 
     let export_start = Instant::now();
-    let export = archive.export(AiExportOptions {
-        format: "hf-jsonl".to_string(),
-        out: None,
-        split: Some("train".to_string()),
-        include_payloads: true,
-        policy_report: true,
-    })?;
+    let export = archive
+        .export(AiExportOptions {
+            format: "hf-jsonl".to_string(),
+            out: None,
+            split: Some("train".to_string()),
+            include_payloads: true,
+            policy_report: true,
+        })
+        .map_err(|err| err.to_string())?;
     let export_latency_ns = export_start.elapsed().as_nanos() as u64;
 
     let measured_samples = sample_count.max(1) as f64;
