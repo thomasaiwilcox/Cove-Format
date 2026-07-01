@@ -87,13 +87,15 @@ pub(super) fn try_ai_descriptor_metadata_executed_query(
         ));
     };
     let started = Instant::now();
-    let sidecar = CoveAiFile::parse(sidecar_bytes).map_err(|error| {
-        exec_error(
-            "E_AI_SIDECAR_INVALID",
-            format!("COVE-AI sidecar validation failed: {error}"),
-            json!({ "method": operation.method_name }),
-        )
-    })?;
+    let sidecar =
+        CoveAiFile::parse_for_operation(sidecar_bytes, operation.operation.operation_kind())
+            .map_err(|error| {
+                exec_error(
+                    "E_AI_SIDECAR_INVALID",
+                    format!("COVE-AI sidecar validation failed: {error}"),
+                    json!({ "method": operation.method_name }),
+                )
+            })?;
     let access_context = if include_payloads {
         CoveAiAccessContext::for_operation(operation.method_name.clone())
     } else {
@@ -1546,13 +1548,15 @@ pub(super) fn try_ai_embedding_executed_query(
         ));
     };
     let embedding_request = ai_embedding_request_args(operation)?;
-    let sidecar_summary = CoveAiFile::parse(sidecar_bytes).map_err(|error| {
-        exec_error(
-            "E_AI_SIDECAR_INVALID",
-            format!("COVE-AI sidecar validation failed: {error}"),
-            json!({ "method": operation.method_name }),
-        )
-    })?;
+    let sidecar_summary =
+        CoveAiFile::parse_for_operation(sidecar_bytes, operation.operation.operation_kind())
+            .map_err(|error| {
+                exec_error(
+                    "E_AI_SIDECAR_INVALID",
+                    format!("COVE-AI sidecar validation failed: {error}"),
+                    json!({ "method": operation.method_name }),
+                )
+            })?;
     let binding_count = sidecar_summary
         .descriptor_tables
         .filecode_vector_bindings
@@ -1730,13 +1734,15 @@ pub(super) fn try_ai_semantic_search_executed_query(
         ));
     };
     let search_plan = ai_vector_search_plan_args(operation)?;
-    let sidecar_summary = CoveAiFile::parse(sidecar_bytes).map_err(|error| {
-        exec_error(
-            "E_AI_SIDECAR_INVALID",
-            format!("COVE-AI sidecar validation failed: {error}"),
-            json!({ "method": operation.method_name }),
-        )
-    })?;
+    let sidecar_summary =
+        CoveAiFile::parse_for_operation(sidecar_bytes, operation.operation.operation_kind())
+            .map_err(|error| {
+                exec_error(
+                    "E_AI_SIDECAR_INVALID",
+                    format!("COVE-AI sidecar validation failed: {error}"),
+                    json!({ "method": operation.method_name }),
+                )
+            })?;
     let binding_count = sidecar_summary
         .descriptor_tables
         .filecode_vector_bindings

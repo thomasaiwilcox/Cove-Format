@@ -15,11 +15,20 @@ use std::{
 use cove_cache::CoverageCacheV2;
 use cove_codec::{CodecExtensionDescriptorV2, RegisteredEncodingEnvelopeV2};
 use cove_core::{
-    artifact::{covemap::CovemapFile, covm::CovmFile, covx::CovxFile},
+    artifact::{
+        coveai::{
+            write_coveai_artifact, AiPayloadEncodingV1, AiRequirednessScopeV1, CoveAiArtifactKind,
+            CoveAiFile, CoveAiWritableSection, AI_FLAG_PAYLOAD_CRC32C_PRESENT,
+            AI_FLAG_REQUIRED_RECORD, AI_RECORD_HEADER_LEN,
+        },
+        covemap::CovemapFile,
+        covm::CovmFile,
+        covx::CovxFile,
+    },
     checksum,
     collation::CollationRegistry,
     compression::{column_page_payload, encode_page_payload},
-    constants::CompressionCodec,
+    constants::{CompressionCodec, PrimaryProfile, SectionKind},
     dictionary::FileDictionary,
     digest::DigestManifest,
     domain::ColumnDomain,
@@ -42,7 +51,7 @@ use cove_core::{
         ExtensionIndexDescriptorV1, ExtensionLogicalTypeV1, ExtensionRegistry,
         ExtensionValidationContext,
     },
-    feature_binding::SectionFeatureBindingSectionV2,
+    feature_binding::{OperationKindV2, SectionFeatureBindingSectionV2},
     index::{
         aggregate::AggregateSynopsis, bloom::BloomFilterIndex, composite::CompositeIndex,
         exact_set::ExactSetIndex, inverted::InvertedMorselIndex, lookup::LookupIndex,
@@ -61,7 +70,7 @@ use cove_core::{
         cove_h::HarborMountHintsV1,
         cove_o::{ObjectTypeCatalog, TemporalBloomIndex, TemporalSegmentIndex},
     },
-    reader::{self, ValidationOptions},
+    reader::{self, OptionalPushdownPolicy, ValidationOptions},
     redaction::RedactionManifest,
     row_ref::RowRef,
     segment::{RowMorselDirectory, TableSegmentHeaderV1, TableSegmentIndex},
@@ -79,6 +88,7 @@ use cove_layout::{
     FastMetadataIndexV2, LayoutPlanV2, PageClusterDirectoryV2, ScanSplitIndexV2,
     ZeroCopyBufferMapV2,
 };
+use cove_profile_validation::EmbeddedOptionalProfileValidator;
 use cove_runtime::RuntimeCompatibilityHintV2;
 use serde_json::Value;
 
@@ -334,6 +344,7 @@ pub fn run_smoke(seed: u64, mutations: usize) -> Result<CampaignStats, FuzzFailu
     };
     bootstrap_truncation_campaign(seed, &mut stats)?;
     parser_seed_campaign(seed ^ 0x51A5_0001, mutations, true, &mut stats)?;
+    coveai_record_stream_campaign(seed ^ 0x51A5_00A1, mutations, &mut stats)?;
     encoding_campaign(seed ^ 0x51A5_0002, mutations, &mut stats)?;
     Ok(stats)
 }
@@ -345,6 +356,7 @@ pub fn run_parsers(seed: u64, mutations: usize) -> Result<CampaignStats, FuzzFai
         ..CampaignStats::default()
     };
     parser_seed_campaign(seed, mutations, false, &mut stats)?;
+    coveai_record_stream_campaign(seed ^ 0xC0A1_A100, mutations, &mut stats)?;
     Ok(stats)
 }
 
@@ -538,6 +550,307 @@ fn parser_seed_campaign(
             &bytes,
             stats,
         )?;
+    }
+    Ok(())
+}
+
+fn coveai_record_stream_campaign(
+    seed: u64,
+    mutations: usize,
+    stats: &mut CampaignStats,
+) -> Result<(), FuzzFailure> {
+    let mut mutator = Mutator::new(seed);
+    let cases = mutations.max(4) * 8;
+    for index in 0..cases {
+        let record_kind = 60_000 + (mutator.next_u64() % 4_000) as u16;
+        let record_version = match mutator.next_u64() % 5 {
+            0 => 1,
+            1 => 2,
+            2 => 3,
+            3 => 255,
+            _ => u16::MAX,
+        };
+        let local_id = mutator.next_u64() % 4;
+        let payload = coveai_fuzz_payload(&mut mutator);
+
+        let optional_flags = AI_FLAG_PAYLOAD_CRC32C_PRESENT
+            | if index % 3 == 0 {
+                1u32 << (4 + (mutator.next_u64() % 20))
+            } else {
+                0
+            };
+        let optional_record = coveai_fuzz_record(
+            record_kind,
+            record_version,
+            local_id,
+            optional_flags,
+            &payload,
+        );
+        let duplicate_optional = coveai_fuzz_artifact(
+            SectionKind::AiReferenceTables,
+            PrimaryProfile::CoveAiShared,
+            AiRequirednessScopeV1::AdvisoryOnly,
+            vec![optional_record.clone(), optional_record],
+        )
+        .map_err(|error| {
+            fuzz_failure(
+                stats.campaign,
+                "coveai-record-stream",
+                seed,
+                index,
+                "write-duplicate-optional",
+                error,
+            )
+        })?;
+        assert_coveai_structural(
+            "coveai-duplicate-unknown-optional",
+            seed,
+            index,
+            &duplicate_optional,
+            true,
+            stats,
+        )?;
+
+        let mut bad_crc_record = coveai_fuzz_record(
+            record_kind,
+            record_version,
+            local_id,
+            AI_FLAG_PAYLOAD_CRC32C_PRESENT,
+            &payload,
+        );
+        bad_crc_record[20] ^= 0x01;
+        let bad_crc = coveai_fuzz_artifact(
+            SectionKind::AiReferenceTables,
+            PrimaryProfile::CoveAiShared,
+            AiRequirednessScopeV1::AdvisoryOnly,
+            vec![bad_crc_record],
+        )
+        .map_err(|error| {
+            fuzz_failure(
+                stats.campaign,
+                "coveai-record-stream",
+                seed,
+                index,
+                "write-bad-crc",
+                error,
+            )
+        })?;
+        assert_coveai_structural(
+            "coveai-unknown-optional-bad-crc",
+            seed,
+            index,
+            &bad_crc,
+            false,
+            stats,
+        )?;
+
+        let required_record = coveai_fuzz_record(
+            record_kind,
+            record_version,
+            local_id,
+            AI_FLAG_REQUIRED_RECORD | AI_FLAG_PAYLOAD_CRC32C_PRESENT,
+            &payload,
+        );
+        let scoped_required = coveai_fuzz_artifact(
+            SectionKind::AiTrainingProfile,
+            PrimaryProfile::CoveTrain,
+            AiRequirednessScopeV1::ProfileRequired,
+            vec![required_record.clone(), required_record.clone()],
+        )
+        .map_err(|error| {
+            fuzz_failure(
+                stats.campaign,
+                "coveai-record-stream",
+                seed,
+                index,
+                "write-scoped-required",
+                error,
+            )
+        })?;
+        assert_coveai_structural(
+            "coveai-duplicate-scoped-required",
+            seed,
+            index,
+            &scoped_required,
+            true,
+            stats,
+        )?;
+        assert_coveai_operation(
+            "coveai-scoped-required-nonmatching-operation",
+            seed,
+            index,
+            &scoped_required,
+            OperationKindV2::AiEmbedding,
+            true,
+            stats,
+        )?;
+        assert_coveai_operation(
+            "coveai-scoped-required-matching-operation",
+            seed,
+            index,
+            &scoped_required,
+            OperationKindV2::AiTrainingSampleExport,
+            false,
+            stats,
+        )?;
+
+        let artifact_required = coveai_fuzz_artifact(
+            SectionKind::AiReferenceTables,
+            PrimaryProfile::CoveAiShared,
+            AiRequirednessScopeV1::ArtifactRequired,
+            vec![required_record],
+        )
+        .map_err(|error| {
+            fuzz_failure(
+                stats.campaign,
+                "coveai-record-stream",
+                seed,
+                index,
+                "write-artifact-required",
+                error,
+            )
+        })?;
+        assert_coveai_structural(
+            "coveai-artifact-required-unknown-record",
+            seed,
+            index,
+            &artifact_required,
+            false,
+            stats,
+        )?;
+    }
+    Ok(())
+}
+
+fn coveai_fuzz_payload(mutator: &mut Mutator) -> Vec<u8> {
+    let len = (mutator.next_u64() % 9) as usize;
+    (0..len).map(|_| mutator.next_u64() as u8).collect()
+}
+
+fn coveai_fuzz_record(
+    record_kind: u16,
+    record_version: u16,
+    local_id: u64,
+    flags: u32,
+    payload: &[u8],
+) -> Vec<u8> {
+    let record_len = AI_RECORD_HEADER_LEN + payload.len();
+    let mut out = vec![0u8; record_len];
+    out[0..2].copy_from_slice(&record_kind.to_le_bytes());
+    out[2..4].copy_from_slice(&record_version.to_le_bytes());
+    out[4..8].copy_from_slice(&(record_len as u32).to_le_bytes());
+    out[8..16].copy_from_slice(&local_id.to_le_bytes());
+    out[16..20].copy_from_slice(&flags.to_le_bytes());
+    out[AI_RECORD_HEADER_LEN..].copy_from_slice(payload);
+    let crc32c = checksum::crc32c(&out);
+    out[20..24].copy_from_slice(&crc32c.to_le_bytes());
+    out
+}
+
+fn coveai_fuzz_artifact(
+    section_kind: SectionKind,
+    profile_kind: PrimaryProfile,
+    requiredness_scope: AiRequirednessScopeV1,
+    records: Vec<Vec<u8>>,
+) -> Result<Vec<u8>, CoveError> {
+    write_coveai_artifact(
+        CoveAiArtifactKind::CoveAiBundle,
+        [0xA1; 16],
+        0xA1,
+        &[CoveAiWritableSection {
+            section_id: 1,
+            section_kind: section_kind as u32,
+            profile_kind: profile_kind as u8,
+            payload_encoding: AiPayloadEncodingV1::BinaryRecords,
+            requiredness_scope,
+            source_binding_ref: 0,
+            required_ai_features: 0,
+            optional_ai_features: 0,
+            feature_binding_ref: 0,
+            payload: records.concat(),
+        }],
+    )
+}
+
+fn assert_coveai_structural(
+    case: &str,
+    seed: u64,
+    mutation_index: usize,
+    bytes: &[u8],
+    expect_accept: bool,
+    stats: &mut CampaignStats,
+) -> Result<(), FuzzFailure> {
+    let parser = ParserKind::CoveAi;
+    let outcome = run_parser_once(
+        stats.campaign,
+        case,
+        seed,
+        mutation_index,
+        "coveai-structural",
+        &parser,
+        bytes,
+        stats,
+    )?;
+    if outcome.accepted != expect_accept {
+        return Err(FuzzFailure {
+            campaign: stats.campaign,
+            case: case.into(),
+            seed,
+            mutation_index,
+            operation: "coveai-structural".into(),
+            detail: if expect_accept {
+                outcome.detail.unwrap_or_else(|| "unexpected reject".into())
+            } else {
+                "unexpected accept".into()
+            },
+        });
+    }
+    Ok(())
+}
+
+fn assert_coveai_operation(
+    case: &str,
+    seed: u64,
+    mutation_index: usize,
+    bytes: &[u8],
+    operation: OperationKindV2,
+    expect_accept: bool,
+    stats: &mut CampaignStats,
+) -> Result<(), FuzzFailure> {
+    stats.cases_run += 1;
+    let parsed = catch_unwind(AssertUnwindSafe(|| {
+        CoveAiFile::parse_for_operation(bytes, operation)
+    }));
+    let accepted = match parsed {
+        Ok(Ok(_)) => true,
+        Ok(Err(_)) => {
+            stats.rejects_observed += 1;
+            false
+        }
+        Err(_) => {
+            return Err(FuzzFailure {
+                campaign: stats.campaign,
+                case: case.into(),
+                seed,
+                mutation_index,
+                operation: format!("coveai-operation:{operation:?}"),
+                detail: "panic".into(),
+            });
+        }
+    };
+    if accepted != expect_accept {
+        return Err(FuzzFailure {
+            campaign: stats.campaign,
+            case: case.into(),
+            seed,
+            mutation_index,
+            operation: format!("coveai-operation:{operation:?}"),
+            detail: if expect_accept {
+                "unexpected reject".into()
+            } else {
+                "unexpected accept".into()
+            },
+        });
     }
     Ok(())
 }
@@ -905,6 +1218,7 @@ fn fuzz_failure(
 #[derive(Debug, Clone)]
 enum ParserKind {
     Cove,
+    CoveAi,
     Covemap,
     Covx,
     Covm,
@@ -989,17 +1303,8 @@ impl ParserKind {
 
     fn parse(&self, bytes: &[u8]) -> Result<(), String> {
         match self {
-            Self::Cove => reader::validate_bytes_with_options(
-                bytes,
-                ValidationOptions {
-                    semantic: true,
-                    verify_digests: false,
-                    allow_unknown_optional_extensions: true,
-                    ..ValidationOptions::default()
-                },
-            )
-            .map(|_| ())
-            .map_err(to_string),
+            Self::Cove => validate_cove_fixture_like_conformance(bytes).map_err(to_string),
+            Self::CoveAi => CoveAiFile::parse(bytes).map(|_| ()).map_err(to_string),
             Self::Covemap => CovemapFile::parse(bytes)
                 .and_then(|file| file.validate_map_sections())
                 .map_err(to_string),
@@ -1154,6 +1459,26 @@ fn to_string(error: impl std::fmt::Display) -> String {
     error.to_string()
 }
 
+fn validate_cove_fixture_like_conformance(bytes: &[u8]) -> Result<(), CoveError> {
+    let report = reader::validate_bytes_with_options(
+        bytes,
+        ValidationOptions {
+            semantic: true,
+            verify_digests: false,
+            allow_unknown_optional_extensions: true,
+            optional_pushdown_policy: OptionalPushdownPolicy::FailOpen,
+        },
+    )?;
+    EmbeddedOptionalProfileValidator::default_builtins()
+        .validate_embedded_optional_profile_sections(
+            bytes,
+            &report,
+            OptionalPushdownPolicy::FailOpen,
+            None,
+            false,
+        )
+}
+
 fn validate_file_dictionary_fixture(bytes: &[u8]) -> Result<(), CoveError> {
     if bytes.len() < 4 {
         return Err(CoveError::BufferTooShort);
@@ -1195,6 +1520,10 @@ fn parser_seed_fixtures() -> Vec<ParserSeedFixture> {
         ParserSeedFixture {
             path: "conformance/covi/single_section_valid.covi",
             parser: ParserKind::Covi,
+        },
+        ParserSeedFixture {
+            path: "conformance/ai/coveai_full_descriptors_valid.coveai",
+            parser: ParserKind::CoveAi,
         },
         ParserSeedFixture {
             path: "conformance/accept/file_dictionary_valid.bin",
@@ -1335,6 +1664,7 @@ fn load_manifest(path: &Path) -> Result<Vec<ManifestEntry>, String> {
 fn parser_for_kind(entry: &ManifestEntry) -> Option<ParserKind> {
     let kind = match entry.kind.as_str() {
         "cove" => ParserKind::Cove,
+        "coveai" | "covev" => ParserKind::CoveAi,
         "covemap" => ParserKind::Covemap,
         "covx" => ParserKind::Covx,
         "covm" => ParserKind::Covm,
@@ -1563,6 +1893,18 @@ mod tests {
         let result = catch_parser_for_test(|| Err("expected reject".into()), &mut stats).unwrap();
         assert!(!result.accepted);
         assert_eq!(stats.rejects_observed, 1);
+    }
+
+    #[test]
+    fn coveai_record_stream_campaign_is_deterministic_and_nonpanicking() {
+        let mut stats = CampaignStats {
+            campaign: "test",
+            seed: 0xA1,
+            ..CampaignStats::default()
+        };
+        coveai_record_stream_campaign(0xA1, 2, &mut stats).unwrap();
+        assert!(stats.cases_run > 0);
+        assert!(stats.rejects_observed > 0);
     }
 
     #[test]

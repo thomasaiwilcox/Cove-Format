@@ -810,11 +810,12 @@ impl AiSectionFeatureBindingV1 {
                 self.binding_ref
             )));
         }
-        if self.required_ai_features & !AI_KNOWN_FEATURES_V1 != 0 {
-            return Err(CoveError::BadSection(format!(
-                "AiSectionFeatureBinding {} requires unknown COVE-AI features",
-                self.binding_ref
-            )));
+        if self.required_ai_features & !AI_KNOWN_FEATURES_V1 != 0
+            && scope == FeatureScopeV2::FileRequired
+        {
+            return Err(CoveError::UnknownRequiredFeature(
+                self.required_ai_features & !AI_KNOWN_FEATURES_V1,
+            ));
         }
         Ok(())
     }

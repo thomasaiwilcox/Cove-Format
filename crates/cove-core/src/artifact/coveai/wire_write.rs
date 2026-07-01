@@ -405,7 +405,8 @@ pub(super) fn covev_stored_vector_payload(
 pub(super) fn exact_flat_parse_covev_with_payload_access(
     artifact_bytes: &[u8],
 ) -> Result<CoveAiFile, CoveError> {
-    let sidecar = CoveAiFile::parse(artifact_bytes)?;
+    let sidecar =
+        CoveAiFile::parse_for_operation(artifact_bytes, OperationKindV2::AiSemanticSearch)?;
     if sidecar.artifact_kind != CoveAiArtifactKind::CoveVec {
         return Err(CoveError::BadSection(
             "exact flat FileCode vector search requires a COVE-VEC (.covev) artifact".into(),

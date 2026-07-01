@@ -662,7 +662,7 @@ struct AiSectionFeatureBindingV1 {
 Binary `AI_*` descriptor sections are arrays of length-delimited records using
 `AiRecordHeaderV1`. `record_len` includes the header and payload bytes.
 `record_version` MUST be 1 for V1 records. COVE-VEC vector-binding records
-`AI_VECTOR_BINDING` kinds 1 through 4 MAY use `record_version = 2` only for the
+`AI_VECTOR_BINDING` kinds 1 through 7 MAY use `record_version = 2` only for the
 append-only model-input identity layouts defined by COVE-VEC. Records MUST be
 wholly contained in the section payload and MUST NOT overlap. `local_id` is unique within
 `(section_kind, record_kind)` unless a section-specific rule uses a wider
