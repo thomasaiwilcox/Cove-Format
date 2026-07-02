@@ -167,10 +167,68 @@ pub struct AiSampleIteratorOptions {
     pub include_payloads: bool,
 }
 
+/// COVE-AI export format names accepted at CLI, Python, report, and file-output boundaries.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AiExportFormat {
+    /// Pretty JSON report export.
+    #[serde(rename = "json")]
+    Json,
+    /// JSON Lines sample export.
+    #[serde(rename = "jsonl")]
+    Jsonl,
+    /// Hugging Face-compatible JSON Lines sample export.
+    #[serde(rename = "hf-jsonl")]
+    HfJsonl,
+    /// Apache Arrow IPC file export.
+    #[serde(rename = "arrow")]
+    Arrow,
+    /// Apache Parquet file export.
+    #[serde(rename = "parquet")]
+    Parquet,
+    /// WebDataset tar export.
+    #[serde(rename = "webdataset")]
+    WebDataset,
+}
+
+impl AiExportFormat {
+    /// Parse a COVE-AI export format from its spec-facing string value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AiAdapterError::UnsupportedExportFormat`] when `value` is not
+    /// one of `json`, `jsonl`, `hf-jsonl`, `arrow`, `parquet`, or `webdataset`.
+    pub fn parse(value: &str) -> Result<Self, AiAdapterError> {
+        match value {
+            "json" => Ok(Self::Json),
+            "jsonl" => Ok(Self::Jsonl),
+            "hf-jsonl" => Ok(Self::HfJsonl),
+            "arrow" => Ok(Self::Arrow),
+            "parquet" => Ok(Self::Parquet),
+            "webdataset" => Ok(Self::WebDataset),
+            other => Err(AiAdapterError::UnsupportedExportFormat {
+                format: other.to_string(),
+            }),
+        }
+    }
+
+    /// Return the spec-facing string value for this export format.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Json => "json",
+            Self::Jsonl => "jsonl",
+            Self::HfJsonl => "hf-jsonl",
+            Self::Arrow => "arrow",
+            Self::Parquet => "parquet",
+            Self::WebDataset => "webdataset",
+        }
+    }
+}
+
 #[must_use]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AiExportOptions {
-    pub format: String,
+    pub format: AiExportFormat,
     pub out: Option<PathBuf>,
     pub split: Option<String>,
     pub include_payloads: bool,
@@ -180,7 +238,7 @@ pub struct AiExportOptions {
 impl Default for AiExportOptions {
     fn default() -> Self {
         Self {
-            format: "jsonl".to_string(),
+            format: AiExportFormat::Jsonl,
             out: None,
             split: None,
             include_payloads: false,
@@ -565,7 +623,7 @@ impl AiTrainingArchive {
         })?;
         let report = json!({
             "path": self.path.display().to_string(),
-            "format": options.format,
+            "format": options.format.as_str(),
             "split": options.split,
             "include_payloads": options.include_payloads,
             "policy_report": options.policy_report,
@@ -575,7 +633,7 @@ impl AiTrainingArchive {
             "samples": samples,
             "diagnostics": self.report(AiVerifyOptions { policy_report: options.policy_report })?.diagnostics,
         });
-        export_value(&report, &options.format)
+        export_value(&report, options.format)
     }
 }
 
@@ -811,7 +869,7 @@ pub fn build_ai_training_showcase(
     .map_err(|error| format!("cannot write verification report: {error}"))?;
     write_export_file(
         archive.export(AiExportOptions {
-            format: "hf-jsonl".to_string(),
+            format: AiExportFormat::HfJsonl,
             out: Some(out_dir.join("training.hf.jsonl")),
             include_payloads: true,
             ..AiExportOptions::default()
@@ -820,7 +878,7 @@ pub fn build_ai_training_showcase(
     )?;
     write_export_file(
         archive.export(AiExportOptions {
-            format: "parquet".to_string(),
+            format: AiExportFormat::Parquet,
             out: Some(out_dir.join("training.parquet")),
             include_payloads: true,
             ..AiExportOptions::default()
@@ -829,7 +887,7 @@ pub fn build_ai_training_showcase(
     )?;
     write_export_file(
         archive.export(AiExportOptions {
-            format: "webdataset".to_string(),
+            format: AiExportFormat::WebDataset,
             out: Some(out_dir.join("training.tar")),
             include_payloads: true,
             ..AiExportOptions::default()
@@ -1301,15 +1359,15 @@ fn push_payload_ref(
     Ok(payload_ref)
 }
 
-fn export_value(report: &Value, format: &str) -> Result<AiExportData, AiAdapterError> {
+fn export_value(report: &Value, format: AiExportFormat) -> Result<AiExportData, AiAdapterError> {
     let (media_type, bytes) = match format {
-        "json" => (
+        AiExportFormat::Json => (
             "application/json",
             serde_json::to_vec_pretty(report).map_err(|error| {
                 ai_export_error(format!("cannot serialize AI JSON export: {error}"))
             })?,
         ),
-        "jsonl" | "hf-jsonl" => {
+        AiExportFormat::Jsonl | AiExportFormat::HfJsonl => {
             let mut out = Vec::new();
             for sample in report
                 .get("samples")
@@ -1324,23 +1382,18 @@ fn export_value(report: &Value, format: &str) -> Result<AiExportData, AiAdapterE
             }
             ("application/x-ndjson", out)
         }
-        "arrow" => (
+        AiExportFormat::Arrow => (
             "application/vnd.apache.arrow.file",
             write_arrow_ipc(report).map_err(ai_export_error)?,
         ),
-        "parquet" => (
+        AiExportFormat::Parquet => (
             "application/vnd.apache.parquet",
             write_parquet(report).map_err(ai_export_error)?,
         ),
-        "webdataset" => (
+        AiExportFormat::WebDataset => (
             "application/x-tar",
             write_webdataset(report).map_err(ai_export_error)?,
         ),
-        other => {
-            return Err(AiAdapterError::UnsupportedExportFormat {
-                format: other.to_string(),
-            })
-        }
     };
     Ok(AiExportData {
         media_type,
@@ -2132,43 +2185,24 @@ mod tests {
     }
 
     #[test]
-    fn archive_export_reports_typed_format_error() {
-        let samples = vec![imported_sample_from_value(
-            0,
-            &json!({
-                "sample_id": "s1",
-                "instruction": "Summarize COVE-AI.",
-                "output": "COVE-AI records payload authority."
-            }),
-            &AiImportOptions {
-                artifact_id: Some([8u8; 16]),
-                created_at_us: Some(1),
-                ..AiImportOptions::default()
-            },
-        )
-        .unwrap()];
-        let bytes = build_training_sidecar(
-            &samples,
-            &AiImportOptions {
-                artifact_id: Some([8u8; 16]),
-                created_at_us: Some(1),
-                ..AiImportOptions::default()
-            },
-        )
-        .unwrap();
-        let sidecar = CoveAiFile::parse(&bytes).unwrap();
-        let archive = AiTrainingArchive {
-            path: PathBuf::from("memory.coveai"),
-            bytes,
-            sidecar,
-        };
+    fn ai_export_format_parse_accepts_spec_strings() {
+        for (value, expected) in [
+            ("json", AiExportFormat::Json),
+            ("jsonl", AiExportFormat::Jsonl),
+            ("hf-jsonl", AiExportFormat::HfJsonl),
+            ("arrow", AiExportFormat::Arrow),
+            ("parquet", AiExportFormat::Parquet),
+            ("webdataset", AiExportFormat::WebDataset),
+        ] {
+            let parsed = AiExportFormat::parse(value).unwrap();
+            assert_eq!(parsed, expected);
+            assert_eq!(parsed.as_str(), value);
+        }
+    }
 
-        let error = archive
-            .export(AiExportOptions {
-                format: "made-up-format".to_string(),
-                ..AiExportOptions::default()
-            })
-            .unwrap_err();
+    #[test]
+    fn ai_export_format_parse_reports_typed_format_error() {
+        let error = AiExportFormat::parse("made-up-format").unwrap_err();
         assert!(matches!(
             error,
             AiAdapterError::UnsupportedExportFormat { .. }

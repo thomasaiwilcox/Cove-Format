@@ -13,8 +13,8 @@ use std::{
 use arrow_array::{ArrayRef, BooleanArray, Int64Array, RecordBatch, StringArray};
 use arrow_ipc::reader::{FileReader, StreamReader};
 use cove_ai_adapters::{
-    import_jsonl, open as open_ai_archive, AiArchiveOpenOptions, AiExportOptions, AiImportOptions,
-    AiImportSchema, AiSampleIteratorOptions, AiVerifyOptions,
+    import_jsonl, open as open_ai_archive, AiArchiveOpenOptions, AiExportFormat, AiExportOptions,
+    AiImportOptions, AiImportSchema, AiSampleIteratorOptions, AiVerifyOptions,
 };
 use cove_arrow::convert::{
     convert_arrow_record_batches, ParquetAccelerationPolicy, ParquetAggregatePolicy,

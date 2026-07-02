@@ -13,7 +13,8 @@ use cove::{explain_policy_for_mode, ExplainMode, PreparedQueryTextOptions, Query
 use cove_ai_adapters::{
     build_ai_training_showcase, diff_archives, import_hf_dir, import_jsonl, import_parquet,
     open as open_ai_archive, stream_archive, write_export_file, AiArchiveOpenOptions,
-    AiExportOptions, AiImportOptions, AiImportSchema, AiSplitPolicy, AiVerifyOptions,
+    AiExportFormat, AiExportOptions, AiImportOptions, AiImportSchema, AiSplitPolicy,
+    AiVerifyOptions,
 };
 use cove_core::{
     artifact::{

@@ -196,10 +196,22 @@ impl fmt::Display for QueryTextError {
 
 impl Error for QueryTextError {}
 
+/// Read and validate a COVE file for ordinary facade use.
+///
+/// # Errors
+///
+/// Returns a [`CoveError`] if the file cannot be read or validation rejects its
+/// wire layout, required features, table catalog, or semantic metadata.
 pub fn validate_file(path: impl AsRef<Path>) -> Result<ValidatedCoveFile, CoveError> {
     reader::read_file(path.as_ref())
 }
 
+/// Inspect mounted COVE file metadata without returning the mounted sections.
+///
+/// # Errors
+///
+/// Returns a [`CoveError`] if the file cannot be read or mounting rejects the
+/// header, footer, section directory, tables, or required feature set.
 pub fn inspect_file(path: impl AsRef<Path>) -> Result<FileInspection, CoveError> {
     let bytes = fs::read(path)?;
     let mounted = mount::mount_cove_file(&bytes, MountOptions::default(), None)?;
@@ -215,11 +227,23 @@ pub fn inspect_file(path: impl AsRef<Path>) -> Result<FileInspection, CoveError>
     })
 }
 
+/// Mount a COVE file for table-oriented reads.
+///
+/// # Errors
+///
+/// Returns a [`CoveError`] if the file cannot be read or the mount process
+/// rejects the COVE header, footer, sections, or table catalog.
 pub fn read_table(path: impl AsRef<Path>) -> Result<MountedCoveFile, CoveError> {
     let bytes = fs::read(path)?;
     mount::mount_cove_file(&bytes, MountOptions::default(), None)
 }
 
+/// Durably publish a scan-profile COVE table using the supplied writer.
+///
+/// # Errors
+///
+/// Returns a [`CoveError`] if the writer cannot serialize a valid COVE table or
+/// durable publication to the target path fails.
 pub fn write_table(
     path: impl AsRef<Path>,
     writer: &ScanProfileCoveWriter,
@@ -227,6 +251,12 @@ pub fn write_table(
     writer.publish_durable(path.as_ref()).map(|_| ())
 }
 
+/// Convert a supported source file into a COVE conversion result.
+///
+/// # Errors
+///
+/// Returns a [`CoveError`] if the source cannot be read, its schema cannot be
+/// converted into the COVE model, or the conversion result cannot be produced.
 pub fn convert_file(
     input: impl AsRef<Path>,
     options: convert::ConversionOptions,
@@ -235,6 +265,12 @@ pub fn convert_file(
         .map_err(|err| CoveError::BadSchema(err.to_string()))
 }
 
+/// Convert a Parquet source file into a COVE conversion result.
+///
+/// # Errors
+///
+/// Returns a [`CoveError`] if the Parquet file cannot be read, digested, parsed,
+/// or converted into the requested COVE layout.
 pub fn convert_parquet_file(
     input: impl AsRef<Path>,
     mut options: convert::convert::ParquetConversionOptions,
@@ -253,6 +289,12 @@ pub fn conversion_report(result: &convert::convert::ParquetConversionResult) -> 
     result.report.to_json_value()
 }
 
+/// Discover CoveQL query surfaces from a COVE artifact file.
+///
+/// # Errors
+///
+/// Returns a [`CoveFacadeError`] if the file cannot be read before surface
+/// discovery is performed.
 pub fn discover_query_surfaces_file(
     path: impl AsRef<Path>,
 ) -> Result<QuerySurfaceDiscovery, CoveFacadeError> {
@@ -270,6 +312,12 @@ pub fn discover_query_surfaces_bytes(bytes: &[u8]) -> QuerySurfaceDiscovery {
     coveql::discover_query_surfaces(bytes, QuerySurfaceDiscoveryOptions::default())
 }
 
+/// Suggest CoveQL queries for the surfaces discovered in a COVE artifact file.
+///
+/// # Errors
+///
+/// Returns a [`CoveFacadeError`] if the file cannot be read before query
+/// surface discovery and suggestion generation.
 pub fn suggest_queries_for_file(
     path: impl AsRef<Path>,
 ) -> Result<Vec<QuerySuggestion>, CoveFacadeError> {
@@ -282,6 +330,13 @@ pub fn suggest_queries_for_bytes(bytes: &[u8]) -> Vec<QuerySuggestion> {
     coveql::suggest_queries(&discovery)
 }
 
+/// Execute a CoveQL query against a COVE artifact file.
+///
+/// # Errors
+///
+/// Returns a [`CoveFacadeError`] if the file cannot be read, query text
+/// preparation fails, or CoveQL parsing, planning, policy resolution, or
+/// execution fails.
 pub fn query_file(
     path: impl AsRef<Path>,
     query: impl AsRef<str>,
@@ -291,6 +346,12 @@ pub fn query_file(
     query_bytes(&bytes, query, options)
 }
 
+/// Execute a CoveQL query against in-memory COVE artifact bytes.
+///
+/// # Errors
+///
+/// Returns a [`CoveFacadeError`] if query text preparation fails or CoveQL
+/// parsing, planning, policy resolution, or execution fails.
 pub fn query_bytes(
     bytes: &[u8],
     query: impl AsRef<str>,
@@ -307,6 +368,12 @@ pub fn query_bytes(
     Ok(QueryResult { executed })
 }
 
+/// Execute a CoveQL explain query against a COVE artifact file.
+///
+/// # Errors
+///
+/// Returns a [`CoveFacadeError`] if the file cannot be read, query text
+/// preparation fails, or CoveQL explain execution fails.
 pub fn explain_query_file(
     path: impl AsRef<Path>,
     query: impl AsRef<str>,
@@ -316,6 +383,12 @@ pub fn explain_query_file(
     explain_query_bytes(&bytes, query, options)
 }
 
+/// Execute a CoveQL explain query against in-memory COVE artifact bytes.
+///
+/// # Errors
+///
+/// Returns a [`CoveFacadeError`] if query text preparation fails or CoveQL
+/// parsing, planning, policy resolution, or explain execution fails.
 pub fn explain_query_bytes(
     bytes: &[u8],
     query: impl AsRef<str>,
@@ -353,6 +426,12 @@ pub fn explain_policy_for_mode(mode: ExplainMode) -> ExplainDisclosurePolicy {
     }
 }
 
+/// Prepare user query text by applying facade-level `take` and explain options.
+///
+/// # Errors
+///
+/// Returns a [`QueryTextError`] if the requested query text options are invalid,
+/// such as a non-positive `take` value.
 pub fn prepare_query_text(
     query: &str,
     options: PreparedQueryTextOptions,

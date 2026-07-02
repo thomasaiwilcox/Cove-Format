@@ -189,16 +189,19 @@ fn run_ai_verify(args: Vec<String>) -> Result<(), String> {
 fn run_ai_stream(args: Vec<String>) -> Result<(), String> {
     let mut input = None;
     let mut out = None;
-    let mut format = "jsonl".to_string();
+    let mut format = AiExportFormat::Jsonl;
     let mut split = None;
     let mut include_payloads = false;
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--format" => {
-                format = iter
-                    .next()
-                    .ok_or_else(|| "--format requires a value".to_string())?;
+                format = AiExportFormat::parse(
+                    &iter
+                        .next()
+                        .ok_or_else(|| "--format requires a value".to_string())?,
+                )
+                .map_err(|err| err.to_string())?;
             }
             "--split" => {
                 split =
@@ -228,8 +231,15 @@ fn run_ai_stream(args: Vec<String>) -> Result<(), String> {
         }
     }
     let input = input.ok_or_else(|| "ai stream requires a sidecar or manifest".to_string())?;
-    if matches!(format.as_str(), "arrow" | "parquet" | "webdataset") && out.is_none() {
-        return Err(format!("ai stream --format {format} requires --out"));
+    if matches!(
+        format,
+        AiExportFormat::Arrow | AiExportFormat::Parquet | AiExportFormat::WebDataset
+    ) && out.is_none()
+    {
+        return Err(format!(
+            "ai stream --format {} requires --out",
+            format.as_str()
+        ));
     }
     let data = stream_archive(
         &input,
@@ -294,7 +304,7 @@ fn run_ai_export(args: Vec<String>) -> Result<(), String> {
     let mut kind: Option<String> = None;
     let mut input: Option<PathBuf> = None;
     let mut out: Option<PathBuf> = None;
-    let mut format = "json".to_string();
+    let mut format = AiExportFormat::Json;
     let mut include_payloads = false;
     let mut policy_report = false;
 
@@ -304,18 +314,12 @@ fn run_ai_export(args: Vec<String>) -> Result<(), String> {
             "--include-payloads" => include_payloads = true,
             "--policy-report" => policy_report = true,
             "--format" => {
-                format = iter
-                    .next()
-                    .ok_or_else(|| "--format requires a value".to_string())?;
-                if !matches!(
-                    format.as_str(),
-                    "json" | "jsonl" | "hf-jsonl" | "arrow" | "parquet" | "webdataset"
-                ) {
-                    return Err(
-                        "--format must be json, jsonl, hf-jsonl, arrow, parquet, or webdataset"
-                            .into(),
-                    );
-                }
+                format = AiExportFormat::parse(
+                    &iter
+                        .next()
+                        .ok_or_else(|| "--format requires a value".to_string())?,
+                )
+                .map_err(|err| err.to_string())?;
             }
             "--out" => {
                 let value = iter
@@ -356,13 +360,13 @@ fn run_ai_export(args: Vec<String>) -> Result<(), String> {
     let value = ai_export_json_value(
         &input,
         &kind,
-        &format,
+        format.as_str(),
         include_payloads,
         policy_report,
         &sidecar,
         &reader,
     )?;
-    write_ai_export_output(&value, &format, out)
+    write_ai_export_output(&value, format.as_str(), out)
 }
 
 fn ai_export_jsonl(value: &serde_json::Value) -> String {
@@ -491,11 +495,12 @@ fn ai_export_record_batch(value: &serde_json::Value) -> Result<RecordBatch, Stri
     .map_err(|error| format!("cannot build AI export Arrow batch: {error}"))
 }
 
-fn ai_export_records(value: &serde_json::Value) -> Result<&Vec<serde_json::Value>, String> {
+fn ai_export_records(value: &serde_json::Value) -> Result<&[serde_json::Value], String> {
     value
         .get("records")
         .or_else(|| value.get("samples"))
         .and_then(|records| records.as_array())
+        .map(Vec::as_slice)
         .ok_or_else(|| "AI export value missing records or samples array".to_string())
 }
 
@@ -851,4 +856,3 @@ fn cli_payload_ref_json(
         }),
     }
 }
-

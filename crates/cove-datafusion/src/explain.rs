@@ -224,7 +224,7 @@ fn plan_state(state: Arc<DatasetState>, options: ExplainOptions) -> Result<Plann
         .map(|columns| resolve_projection(&state, columns))
         .transpose()?;
     let filters = build_filter_plans(&state, &options.filters)?;
-    let mut plan = plan_scan(&state, projection.as_ref(), filters)?;
+    let mut plan = plan_scan(&state, projection.as_deref(), filters)?;
     if let Some(top_n) = options.top_n {
         let column_index = resolve_column(&state, &top_n.column)?;
         plan.topn_hint = Some(TopNScanHint {

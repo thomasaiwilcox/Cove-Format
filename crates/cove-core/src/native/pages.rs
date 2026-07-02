@@ -1115,6 +1115,12 @@ pub(super) fn intersect_words_auto(left: &mut [u64], right: &[u64]) -> NativeKer
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+/// # Safety
+///
+/// Callers must dispatch this only when AVX2 is available. `right` must contain
+/// at least `left.len()` words, and `left` must be the exclusive mutable bitmap
+/// buffer being intersected. The function handles unaligned vector accesses and
+/// delegates any non-vector tail to the scalar implementation.
 pub(super) unsafe fn intersect_words_avx2(left: &mut [u64], right: &[u64]) {
     use std::arch::x86_64::{__m256i, _mm256_and_si256, _mm256_loadu_si256, _mm256_storeu_si256};
 
@@ -1137,6 +1143,12 @@ pub(super) unsafe fn intersect_words_avx2(left: &mut [u64], right: &[u64]) {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+/// # Safety
+///
+/// Callers must dispatch this only when AVX2 is available. `rows` must be an
+/// exclusive mutable row buffer, and appending the 64 dense row ids starting at
+/// `base` must be valid for the current scan morsel. The function reserves and
+/// initializes all appended slots before extending the vector length.
 pub(super) unsafe fn append_dense_u32_rows_avx2(rows: &mut Vec<u32>, base: u32) {
     use std::arch::x86_64::{
         __m256i, _mm256_add_epi32, _mm256_set1_epi32, _mm256_setr_epi32, _mm256_storeu_si256,
@@ -1160,6 +1172,12 @@ pub(super) unsafe fn append_dense_u32_rows_avx2(rows: &mut Vec<u32>, base: u32) 
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+/// # Safety
+///
+/// Callers must dispatch this only when AVX2 is available. `out` must have a
+/// word capacity covering `values.len()` rows and must be exclusively mutable;
+/// the bitmap may already contain set bits that are ORed with membership
+/// matches. Unaligned loads and scalar tail handling are internal.
 pub(super) unsafe fn filter_local_u8_membership_avx2(
     values: &[u8],
     needles: &[u8],
@@ -1192,6 +1210,12 @@ pub(super) unsafe fn filter_local_u8_membership_avx2(
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+/// # Safety
+///
+/// Callers must dispatch this only when AVX2 is available. `out` must have a
+/// word capacity covering `values.len()` rows and must be exclusively mutable;
+/// the bitmap may already contain set bits that are ORed with membership
+/// matches. Unaligned loads and scalar tail handling are internal.
 pub(super) unsafe fn filter_local_u16_membership_avx2(
     values: &[u16],
     needles: &[u16],
@@ -1224,6 +1248,12 @@ pub(super) unsafe fn filter_local_u16_membership_avx2(
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+/// # Safety
+///
+/// Callers must dispatch this only when AVX2 is available. `out` must have a
+/// word capacity covering `values.len()` rows and must be exclusively mutable;
+/// the bitmap may already contain set bits that are ORed with membership
+/// matches. Unaligned loads and scalar tail handling are internal.
 pub(super) unsafe fn filter_local_u32_membership_avx2(
     values: &[u32],
     needles: &[u32],
@@ -1268,6 +1298,12 @@ pub(super) fn avx2_u16_lane_mask(byte_mask: u32) -> u64 {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+/// # Safety
+///
+/// Callers must dispatch this only when AVX2 is available. `bytes` must contain
+/// at least `row_count * 8` initialized little-endian bytes, and `out` must have
+/// a word capacity covering `row_count` rows with exclusive mutable access.
+/// Unaligned loads and scalar tail handling are internal.
 pub(super) unsafe fn filter_u64_le_eq_avx2(
     bytes: &[u8],
     row_count: usize,
@@ -1299,6 +1335,12 @@ pub(super) unsafe fn filter_u64_le_eq_avx2(
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+/// # Safety
+///
+/// Callers must dispatch this only when AVX2 is available. `bytes` must contain
+/// at least `row_count * 4` initialized little-endian bytes, and `out` must have
+/// a word capacity covering `row_count` rows with exclusive mutable access.
+/// Unaligned loads and scalar tail handling are internal.
 pub(super) unsafe fn filter_u32_le_eq_avx2(
     bytes: &[u8],
     row_count: usize,
@@ -1330,6 +1372,12 @@ pub(super) unsafe fn filter_u32_le_eq_avx2(
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+/// # Safety
+///
+/// Callers must dispatch this only when AVX2 is available. `bytes` must contain
+/// at least `row_count * 8` initialized little-endian bytes, and `out` must have
+/// a word capacity covering `row_count` rows with exclusive mutable access.
+/// Unaligned loads and scalar tail handling are internal.
 pub(super) unsafe fn filter_i64_le_cmp_avx2(
     bytes: &[u8],
     row_count: usize,
@@ -1383,6 +1431,13 @@ pub(super) unsafe fn filter_i64_le_cmp_avx2(
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+/// # Safety
+///
+/// Callers must dispatch this only when AVX2 is available. `bytes` must contain
+/// at least `row_count * 8` initialized little-endian bytes, and `out` must have
+/// a word capacity covering `row_count` rows with exclusive mutable access.
+/// Bounds must be normalized by the caller to the native predicate semantics;
+/// unaligned loads and scalar tail handling are internal.
 pub(super) unsafe fn filter_i64_le_range_avx2(
     bytes: &[u8],
     row_count: usize,
@@ -1441,6 +1496,13 @@ pub(super) unsafe fn filter_i64_le_range_avx2(
 }
 
 #[cfg(target_arch = "aarch64")]
+/// # Safety
+///
+/// AArch64 NEON is a baseline target feature for this implementation. `rows`
+/// must be an exclusive mutable row buffer, and appending the 64 dense row ids
+/// starting at `base` must be valid for the current scan morsel. The function
+/// reserves and initializes all appended slots before extending the vector
+/// length.
 pub(super) unsafe fn append_dense_u32_rows_neon(rows: &mut Vec<u32>, base: u32) {
     use std::arch::aarch64::{uint32x4_t, vaddq_u32, vdupq_n_u32, vld1q_u32, vst1q_u32};
 
@@ -1464,6 +1526,13 @@ pub(super) unsafe fn append_dense_u32_rows_neon(rows: &mut Vec<u32>, base: u32) 
 }
 
 #[cfg(target_arch = "aarch64")]
+/// # Safety
+///
+/// AArch64 NEON is a baseline target feature for this implementation. `out`
+/// must have a word capacity covering `values.len()` rows and must be
+/// exclusively mutable; the bitmap may already contain set bits that are ORed
+/// with membership matches. Unaligned loads and scalar tail handling are
+/// internal.
 pub(super) unsafe fn filter_local_u8_membership_neon(
     values: &[u8],
     needles: &[u8],
@@ -1502,6 +1571,13 @@ pub(super) unsafe fn filter_local_u8_membership_neon(
 }
 
 #[cfg(target_arch = "aarch64")]
+/// # Safety
+///
+/// AArch64 NEON is a baseline target feature for this implementation. `out`
+/// must have a word capacity covering `values.len()` rows and must be
+/// exclusively mutable; the bitmap may already contain set bits that are ORed
+/// with membership matches. Unaligned loads and scalar tail handling are
+/// internal.
 pub(super) unsafe fn filter_local_u16_membership_neon(
     values: &[u16],
     needles: &[u16],
@@ -1536,6 +1612,13 @@ pub(super) unsafe fn filter_local_u16_membership_neon(
 }
 
 #[cfg(target_arch = "aarch64")]
+/// # Safety
+///
+/// AArch64 NEON is a baseline target feature for this implementation. `out`
+/// must have a word capacity covering `values.len()` rows and must be
+/// exclusively mutable; the bitmap may already contain set bits that are ORed
+/// with membership matches. Unaligned loads and scalar tail handling are
+/// internal.
 pub(super) unsafe fn filter_local_u32_membership_neon(
     values: &[u32],
     needles: &[u32],
@@ -1570,6 +1653,13 @@ pub(super) unsafe fn filter_local_u32_membership_neon(
 }
 
 #[cfg(target_arch = "aarch64")]
+/// # Safety
+///
+/// AArch64 NEON is a baseline target feature for this implementation. `right`
+/// must contain at least `left.len()` words, and `left` must be the exclusive
+/// mutable bitmap buffer being intersected. The function handles unaligned
+/// vector accesses and delegates any non-vector tail to the scalar
+/// implementation.
 pub(super) unsafe fn intersect_words_neon(left: &mut [u64], right: &[u64]) {
     use std::arch::aarch64::{uint64x2_t, vandq_u64, vld1q_u64, vst1q_u64};
 
@@ -1591,6 +1681,12 @@ pub(super) unsafe fn intersect_words_neon(left: &mut [u64], right: &[u64]) {
 }
 
 #[cfg(target_arch = "aarch64")]
+/// # Safety
+///
+/// AArch64 NEON is a baseline target feature for this implementation. `bytes`
+/// must contain at least `row_count * 8` initialized little-endian bytes, and
+/// `out` must have a word capacity covering `row_count` rows with exclusive
+/// mutable access. Unaligned loads and scalar tail handling are internal.
 pub(super) unsafe fn filter_u64_le_eq_neon(
     bytes: &[u8],
     row_count: usize,
@@ -1619,6 +1715,12 @@ pub(super) unsafe fn filter_u64_le_eq_neon(
 }
 
 #[cfg(target_arch = "aarch64")]
+/// # Safety
+///
+/// AArch64 NEON is a baseline target feature for this implementation. `bytes`
+/// must contain at least `row_count * 4` initialized little-endian bytes, and
+/// `out` must have a word capacity covering `row_count` rows with exclusive
+/// mutable access. Unaligned loads and scalar tail handling are internal.
 pub(super) unsafe fn filter_u32_le_eq_neon(
     bytes: &[u8],
     row_count: usize,
@@ -1649,6 +1751,12 @@ pub(super) unsafe fn filter_u32_le_eq_neon(
 }
 
 #[cfg(target_arch = "aarch64")]
+/// # Safety
+///
+/// AArch64 NEON is a baseline target feature for this implementation. `bytes`
+/// must contain at least `row_count * 8` initialized little-endian bytes, and
+/// `out` must have a word capacity covering `row_count` rows with exclusive
+/// mutable access. Unaligned loads and scalar tail handling are internal.
 pub(super) unsafe fn filter_i64_le_cmp_neon(
     bytes: &[u8],
     row_count: usize,
@@ -1695,6 +1803,13 @@ pub(super) unsafe fn filter_i64_le_cmp_neon(
 }
 
 #[cfg(target_arch = "aarch64")]
+/// # Safety
+///
+/// AArch64 NEON is a baseline target feature for this implementation. `bytes`
+/// must contain at least `row_count * 8` initialized little-endian bytes, and
+/// `out` must have a word capacity covering `row_count` rows with exclusive
+/// mutable access. Bounds must be normalized by the caller to the native
+/// predicate semantics; unaligned loads and scalar tail handling are internal.
 pub(super) unsafe fn filter_i64_le_range_neon(
     bytes: &[u8],
     row_count: usize,

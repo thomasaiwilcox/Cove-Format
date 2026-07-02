@@ -15,9 +15,36 @@ pub const ALP_FLOAT_CODEC_IDENTITY: (&str, &str, u16, u16) =
 pub const FASTLANES_INTEGER_CODEC_IDENTITY: (&str, &str, u16, u16) =
     ("org.coveformat.codec", "fastlanes-integer", 2, 0);
 
-pub trait RegisteredCodec {
+mod sealed {
+    pub trait Sealed {}
+
+    impl Sealed for super::StableRegisteredCodec {}
+}
+
+/// Stable COVE-CX registered codec implementation supported by this facade.
+///
+/// This trait is sealed because it represents the stable registered codec set
+/// defined by COVE-CX. It is not an extension point and does not replace
+/// [`cove_core::codec::RegisteredCodecResolver`] for resolving codec descriptors
+/// while reading COVE files.
+pub trait RegisteredCodec: sealed::Sealed {
+    /// Return the COVE-CX descriptor for this stable codec.
     fn descriptor(&self) -> CodecExtensionDescriptorV2;
+
+    /// Encode a logical page using this stable registered codec.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`CoveError`] when the page cannot be represented by the
+    /// selected codec or the registered codec envelope cannot be produced.
     fn encode(&self, page: &LogicalPage) -> Result<Vec<u8>, CoveError>;
+
+    /// Decode a stable registered codec payload into a logical page.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`CoveError`] when the payload is malformed, unsupported for
+    /// the selected codec, or fails COVE-CX fallback validation invariants.
     fn decode(&self, payload: &[u8]) -> Result<LogicalPage, CoveError>;
 }
 
@@ -176,6 +203,16 @@ impl cove_core::codec::RegisteredCodecResolver for CodecRegistry {
     }
 }
 
+/// Validate that a stable COVE-CX registered payload decodes to its fallback page.
+///
+/// This helper is intentionally limited to the sealed stable registered codecs
+/// exposed by this crate. Resolver integration for file reading belongs to
+/// [`cove_core::codec::RegisteredCodecResolver`].
+///
+/// # Errors
+///
+/// Returns a [`CoveError`] if the registered payload cannot be decoded or its
+/// decoded page is not byte-for-byte equivalent to the fallback page.
 pub fn validate_fallback_equivalence<C: RegisteredCodec>(
     codec: &C,
     registered_payload: &[u8],

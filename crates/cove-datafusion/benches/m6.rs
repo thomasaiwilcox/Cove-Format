@@ -1545,7 +1545,7 @@ fn decode_planned(
     projection: Option<Vec<usize>>,
     filters: Vec<FilterPlan>,
 ) -> cove_datafusion::decode::DecodedScan {
-    let plan = plan_scan(state, projection.as_ref(), filters).expect("scan plan");
+    let plan = plan_scan(state, projection.as_deref(), filters).expect("scan plan");
     decode_scan(state, &plan).expect("scan decode")
 }
 

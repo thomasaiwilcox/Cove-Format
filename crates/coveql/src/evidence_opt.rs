@@ -365,7 +365,7 @@ impl EvidenceGrainIndex {
         &self,
         current_row: &ExecutionRow,
         root: &ResolvedEvidenceRoot,
-    ) -> Option<&Vec<usize>> {
+    ) -> Option<&[usize]> {
         match root.target.as_ref()? {
             ResolvedEvidenceTarget::CurrentRoot => current_row_goid(current_row).and_then(|goid| {
                 self.by_object.get(&(
@@ -409,6 +409,7 @@ impl EvidenceGrainIndex {
                 })
             }
         }
+        .map(Vec::as_slice)
     }
 }
 

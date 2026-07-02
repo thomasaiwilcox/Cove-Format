@@ -514,11 +514,11 @@ pub struct ScanCandidateRowRange {
 /// to pruning code through page-index metadata.
 pub fn plan_scan(
     state: &DatasetState,
-    projection: Option<&Vec<usize>>,
+    projection: Option<&[usize]>,
     mut filters: PredicateProgram,
 ) -> Result<ScanPlan, CoveError> {
     let scan_projection = projection
-        .cloned()
+        .map(<[usize]>::to_vec)
         .unwrap_or_else(|| state.full_projection());
     validate_column_indexes(state, "scan projection", &scan_projection)?;
 

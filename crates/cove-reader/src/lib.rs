@@ -6,6 +6,12 @@ pub use cove_core::{
     artifact, constants, dictionary, footer, header, mount, profile, reader, table, CoveError,
 };
 
+/// Validate a COVE file with the reader facade's default validation profile.
+///
+/// # Errors
+///
+/// Returns a [`CoveError`] if the file cannot be read or if COVE validation
+/// rejects its wire structure, semantic metadata, or feature declarations.
 pub fn validate_file(path: impl AsRef<Path>) -> Result<reader::ValidationReport, CoveError> {
     validate_file_with_options(
         path,
@@ -18,6 +24,12 @@ pub fn validate_file(path: impl AsRef<Path>) -> Result<reader::ValidationReport,
     )
 }
 
+/// Validate a COVE file using explicit reader validation options.
+///
+/// # Errors
+///
+/// Returns a [`CoveError`] if the file cannot be read or validation fails under
+/// the requested digest, feature, or semantic validation options.
 pub fn validate_file_with_options(
     path: impl AsRef<Path>,
     options: reader::ValidationOptions,
@@ -26,6 +38,12 @@ pub fn validate_file_with_options(
     reader::validate_bytes_with_options(&data, options)
 }
 
+/// Mount a COVE file for inspection and table access.
+///
+/// # Errors
+///
+/// Returns a [`CoveError`] if the file cannot be read or mounting rejects the
+/// header, footer, section directory, table catalog, or required features.
 pub fn inspect_file(path: impl AsRef<Path>) -> Result<mount::MountedCoveFile, CoveError> {
     let data = fs::read(path)?;
     mount::mount_cove_file(&data, mount::MountOptions::default(), None)
