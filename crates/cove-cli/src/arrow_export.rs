@@ -1,22 +1,21 @@
 use std::path::PathBuf;
 
-use crate::decode::DecodeStats;
-use crate::delta_snapshot::{
-    delta_chain_required, delta_snapshot_plan_json, load_validated_delta_snapshot,
-    materialize_validated_delta_snapshot, read_validated_delta_object_surface,
-    ValidatedDeltaSnapshot,
-};
-use crate::explain::{
-    execute_planned_scan, parse_filter_dsl, parse_projection_dsl, plan_bytes, plan_local_file,
-    ExplainOptions, FilterDsl, FilterOp,
-};
-use crate::DatafusionCliError;
 use arrow_ipc::writer::FileWriter;
 use arrow_json::writer::{LineDelimited, WriterBuilder};
 use arrow_schema::SchemaRef;
 use cove_core::artifact::covm::CovmDeltaPruneRequest;
 use cove_core::durable;
 use cove_core::profile::cove_map::{MapProjectionCatalog, MapProjectionEntry};
+use cove_datafusion::decode::DecodeStats;
+use cove_datafusion::delta_snapshot::{
+    delta_chain_required, delta_snapshot_plan_json, load_validated_delta_snapshot,
+    materialize_validated_delta_snapshot, read_validated_delta_object_surface,
+    ValidatedDeltaSnapshot,
+};
+use cove_datafusion::explain::{
+    execute_planned_scan, parse_filter_dsl, parse_projection_dsl, plan_bytes, plan_local_file,
+    ExplainOptions, FilterDsl, FilterOp,
+};
 use cove_map::{
     ProjectionBatchOptions, ProjectionFilter, ProjectionFilterLiteral, ProjectionFilterOp,
 };
@@ -41,7 +40,7 @@ struct DeltaExportOptions {
     plan_json: bool,
 }
 
-pub fn run(args: Vec<String>) -> Result<(), DatafusionCliError> {
+pub(crate) fn run(args: Vec<String>) -> Result<(), String> {
     let Some(parsed) = parse_args(args)? else {
         print_usage();
         return Ok(());
@@ -58,7 +57,8 @@ pub fn run(args: Vec<String>) -> Result<(), DatafusionCliError> {
             .as_deref()
             .ok_or_else(|| "delta manifest export requires --dataset <dir>".to_string())?;
         let snapshot =
-            load_validated_delta_snapshot(&parsed.input, dataset, parsed.delta_options.request)?;
+            load_validated_delta_snapshot(&parsed.input, dataset, parsed.delta_options.request)
+                .map_err(|error| error.to_string())?;
         let plan_json =
             delta_snapshot_plan_json(Some(&parsed.input), &snapshot.plan, &snapshot.extension);
         if parsed.delta_options.plan_json {
@@ -78,7 +78,8 @@ pub fn run(args: Vec<String>) -> Result<(), DatafusionCliError> {
                 direct_projection_decode_stats(direct.rows),
             )
         } else {
-            let materialized = materialize_validated_delta_snapshot(&snapshot)?;
+            let materialized = materialize_validated_delta_snapshot(&snapshot)
+                .map_err(|error| error.to_string())?;
             let planned = plan_bytes(
                 format!("{}#delta-snapshot", parsed.input.display()),
                 materialized.bytes,
@@ -454,7 +455,7 @@ fn direct_projection_decode_stats(rows: usize) -> serde_json::Value {
 pub fn write_ipc(
     schema: &arrow_schema::SchemaRef,
     batches: &[arrow_array::RecordBatch],
-) -> Result<Vec<u8>, DatafusionCliError> {
+) -> Result<Vec<u8>, String> {
     let mut bytes = Vec::new();
     {
         let mut writer =
@@ -471,7 +472,7 @@ pub fn write_ipc(
     Ok(bytes)
 }
 
-pub fn write_json(batches: &[arrow_array::RecordBatch]) -> Result<Vec<u8>, DatafusionCliError> {
+pub fn write_json(batches: &[arrow_array::RecordBatch]) -> Result<Vec<u8>, String> {
     let mut writer = WriterBuilder::new()
         .with_explicit_nulls(true)
         .build::<_, LineDelimited>(Vec::new());

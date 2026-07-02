@@ -93,6 +93,9 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --locked
 
+      - name: Check facade examples
+        run: cargo check -p cove --examples --locked
+
   docs:
     name: docs
     runs-on: ubuntu-latest

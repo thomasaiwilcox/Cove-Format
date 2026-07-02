@@ -5,7 +5,7 @@ members = [
     "crates/cove-writer",
     "crates/cove-convert",
     "crates/cove-engine",
-    "crates/cove-io",
+    "crates/cove",
     "crates/cove-harbor",
     "crates/cove-arrow",
     "crates/cove-datafusion",

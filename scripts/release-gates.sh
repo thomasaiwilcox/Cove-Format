@@ -16,6 +16,9 @@ EOF
 quick_gate() {
     cargo fmt --check
     sh scripts/check-cove-boundaries.sh
+    sh scripts/module-size-report.sh > /dev/null
+    cargo test -p cove
+    cargo check -p cove --examples
     cargo test -p cove-cli
     cargo run -p cove-conformance --bin gen-corpus -- --check
     cargo run -p cove-conformance --bin gen-capability-matrix -- --check
@@ -26,6 +29,9 @@ quick_gate() {
 full_gate() {
     cargo fmt --check
     sh scripts/check-cove-boundaries.sh
+    sh scripts/module-size-report.sh > /dev/null
+    cargo test -p cove
+    cargo check -p cove --examples
     cargo test --workspace
     cargo run -p cove-codec --bin cove-codec-validate -- conformance/codecs/codec_descriptor_valid.bin > /dev/null
     cargo run -p cove-codec --bin cove-codec-validate -- conformance/codecs/registered_encoding_envelope_valid.bin > /dev/null

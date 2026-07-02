@@ -1,9 +1,9 @@
 [package]
-name = "cove-io"
+name = "cove"
 version = "0.1.0"
 edition = "2021"
 rust-version.workspace = true
-description = "Stable Rust facade for COVE v2 read, write, artifact, validation, and conversion APIs"
+description = "Canonical Rust facade for COVE v2 application, reader, writer, conversion, and query APIs"
 license = "MIT"
 
 [dependencies]
@@ -11,4 +11,10 @@ cove-core = { path = "../cove-core" }
 cove-reader = { path = "../cove-reader" }
 cove-writer = { path = "../cove-writer" }
 cove-convert = { path = "../cove-convert" }
+cove-engine = { path = "../cove-engine" }
+coveql = { path = "../coveql" }
 serde_json = "1"
+
+[[example]]
+name = "app_workflow"
+path = "examples/app_workflow.rs"
