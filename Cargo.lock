@@ -897,6 +897,7 @@ dependencies = [
  "cove-coverage",
  "cove-index",
  "cove-layout",
+ "cove-profile-validation",
  "cove-runtime",
  "serde_json",
 ]

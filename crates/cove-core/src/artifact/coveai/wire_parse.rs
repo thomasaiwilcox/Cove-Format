@@ -125,6 +125,16 @@ pub(super) fn parse_ai_records(
         }
         let record_bytes = &payload[cursor..end];
         let header = AiRecordHeaderV1::parse(record_bytes)?;
+        if should_skip_record_for_unknown_optional_flags(&header)? {
+            headers.push(header);
+            cursor = end;
+            continue;
+        }
+        if !ai_record_kind_known(entry.section_kind, header.record_kind) {
+            headers.push(header);
+            cursor = end;
+            continue;
+        }
         if !local_ids.insert((header.record_kind, header.local_id)) {
             return Err(CoveError::BadSection(format!(
                 "duplicate COVE-AI local_id {} for record_kind {} in section {}",
@@ -149,7 +159,9 @@ pub(super) fn parse_known_record(
     payload: &[u8],
     tables: &mut AiDescriptorTablesV1,
 ) -> Result<(), CoveError> {
-    if !ai_record_version_supported(section_kind, header.record_kind, header.record_version) {
+    if ai_record_kind_known(section_kind, header.record_kind)
+        && !ai_record_version_supported(section_kind, header.record_kind, header.record_version)
+    {
         return Err(CoveError::BadSection(format!(
             "unsupported COVE-AI record_version {} for record kind {} in section kind {}",
             header.record_version, header.record_kind, section_kind
@@ -368,15 +380,57 @@ pub(super) fn parse_known_record(
         (k, 1) if k == SectionKind::AiVectorIndex as u32 => {
             tables.vector_indexes.push(parse_vector_index(payload)?);
         }
-        _ if header.flags & AI_FLAG_REQUIRED_RECORD != 0 => {
-            return Err(CoveError::BadSection(format!(
-                "unsupported required COVE-AI record kind {} in section kind {}",
-                header.record_kind, section_kind
-            )));
-        }
         _ => {}
     }
     Ok(())
+}
+
+pub(super) fn should_skip_record_for_unknown_optional_flags(
+    header: &AiRecordHeaderV1,
+) -> Result<bool, CoveError> {
+    let unknown_flags = header.flags & !AI_KNOWN_RECORD_FLAGS_V1;
+    if unknown_flags == 0 {
+        return Ok(false);
+    }
+    if header.flags & AI_FLAG_REQUIRED_RECORD != 0 {
+        return Err(CoveError::BadSection(format!(
+            "required COVE-AI record kind {} carries unassigned flags 0x{unknown_flags:08x}",
+            header.record_kind
+        )));
+    }
+    Ok(true)
+}
+
+pub(super) fn ai_record_kind_known(section_kind: u32, record_kind: u16) -> bool {
+    match section_kind {
+        k if k == SectionKind::AiCompanionArtifactRef as u32 => record_kind == 1,
+        k if k == SectionKind::AiSourceBinding as u32 => record_kind == 1,
+        k if k == SectionKind::AiReferenceTables as u32 => matches!(record_kind, 1..=6),
+        k if k == SectionKind::AiPrivacySummary as u32 => record_kind == 1,
+        k if k == SectionKind::AiPayloadIntegrity as u32 => record_kind == 1,
+        k if k == SectionKind::AiSectionFeatureBinding as u32 => record_kind == 1,
+        k if k == SectionKind::AiChunkProfile as u32 => record_kind == 1,
+        k if k == SectionKind::AiTextChunkIndex as u32 => record_kind == 1,
+        k if k == SectionKind::AiTokenizerProfile as u32 => record_kind == 1,
+        k if k == SectionKind::AiTokenBlock as u32 => record_kind == 1,
+        k if k == SectionKind::AiTokenizedSpan as u32 => record_kind == 1,
+        k if k == SectionKind::AiTokenSequencePack as u32 => record_kind == 1,
+        k if k == SectionKind::AiTrainingProfile as u32 => record_kind == 1,
+        k if k == SectionKind::AiTrainingSampleIndex as u32 => record_kind == 1,
+        k if k == SectionKind::AiTrainingSplitDedupEpoch as u32 => matches!(record_kind, 1..=3),
+        k if k == SectionKind::AiLabelPreference as u32 => matches!(record_kind, 1..=2),
+        k if k == SectionKind::AiGeneratorProvenance as u32 => matches!(record_kind, 1..=4),
+        k if k == SectionKind::AiTensorLayout as u32 => matches!(record_kind, 1..=2),
+        k if k == SectionKind::AiAssetManifest as u32 => record_kind == 1,
+        k if k == SectionKind::AiMultimodalSequence as u32 => matches!(record_kind, 1..=2),
+        k if k == SectionKind::AiVectorSpace as u32 => matches!(record_kind, 1..=2),
+        k if k == SectionKind::AiVectorBinding as u32 => matches!(record_kind, 1..=7),
+        k if k == SectionKind::AiVectorPayloadBlock as u32 => record_kind == 1,
+        k if k == SectionKind::AiVectorDirectory as u32 => record_kind == 1,
+        k if k == SectionKind::AiVectorComposition as u32 => matches!(record_kind, 1..=3),
+        k if k == SectionKind::AiVectorIndex as u32 => record_kind == 1,
+        _ => false,
+    }
 }
 
 pub(super) fn ai_record_version_supported(

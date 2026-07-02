@@ -934,6 +934,364 @@ pub(super) fn covev_require_model_input_identity_reject_fixture(mut bytes: Vec<u
     bytes
 }
 
+pub(super) fn ai_raw_record(
+    record_kind: u16,
+    record_version: u16,
+    local_id: u64,
+    flags: u32,
+    payload: &[u8],
+) -> Vec<u8> {
+    let record_len = 24usize.checked_add(payload.len()).unwrap();
+    let mut out = vec![0u8; record_len];
+    out[0..2].copy_from_slice(&record_kind.to_le_bytes());
+    out[2..4].copy_from_slice(&record_version.to_le_bytes());
+    out[4..8].copy_from_slice(&(record_len as u32).to_le_bytes());
+    out[8..16].copy_from_slice(&local_id.to_le_bytes());
+    out[16..20].copy_from_slice(&flags.to_le_bytes());
+    out[24..].copy_from_slice(payload);
+    let crc = checksum::crc32c(&out);
+    out[20..24].copy_from_slice(&crc.to_le_bytes());
+    out
+}
+
+pub(super) fn require_ai_feature_on_section(
+    mut bytes: Vec<u8>,
+    section_kind: SectionKind,
+    requiredness_scope: AiRequirednessScopeV1,
+    required_feature: u64,
+) -> Vec<u8> {
+    let postscript_start =
+        bytes.len() - COVEAI_POSTSCRIPT_TAIL_SIZE - usize::from(COVEAI_POSTSCRIPT_LEN);
+    let header_offset = u64::from_le_bytes(
+        bytes[postscript_start + 24..postscript_start + 32]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let section_count = u32::from_le_bytes(
+        bytes[header_offset + 46..header_offset + 50]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let directory_start = header_offset + usize::from(COVEAI_HEADER_LEN);
+    let mut found = false;
+    for index in 0..section_count {
+        let entry_offset = directory_start + index * usize::from(COVEAI_SECTION_ENTRY_LEN);
+        let actual_kind = u32::from_le_bytes(
+            bytes[entry_offset + 4..entry_offset + 8]
+                .try_into()
+                .unwrap(),
+        );
+        if actual_kind == section_kind as u32 {
+            bytes[entry_offset + 34] = requiredness_scope as u8;
+            let feature_offset = entry_offset + 40;
+            let mut required_ai_features = u64::from_le_bytes(
+                bytes[feature_offset..feature_offset + 8]
+                    .try_into()
+                    .unwrap(),
+            );
+            required_ai_features |= required_feature;
+            bytes[feature_offset..feature_offset + 8]
+                .copy_from_slice(&required_ai_features.to_le_bytes());
+            found = true;
+        }
+    }
+    assert!(found);
+
+    let directory_len = section_count * usize::from(COVEAI_SECTION_ENTRY_LEN);
+    let directory_crc = checksum::crc32c(&bytes[directory_start..directory_start + directory_len]);
+    bytes[header_offset + 62..header_offset + 66].copy_from_slice(&directory_crc.to_le_bytes());
+    bytes[header_offset + 66..header_offset + 70].fill(0);
+    let header_crc =
+        checksum::crc32c(&bytes[header_offset..header_offset + usize::from(COVEAI_HEADER_LEN)]);
+    bytes[header_offset + 66..header_offset + 70].copy_from_slice(&header_crc.to_le_bytes());
+    bytes
+}
+
+pub(super) fn coveai_operation_scoped_unknown_required_accept_fixture() -> Vec<u8> {
+    let unknown_required = 1u64 << 63;
+    let mut tables = AiDescriptorTablesV1::default();
+    tables
+        .section_feature_bindings
+        .push(AiSectionFeatureBindingV1 {
+            binding_ref: 1,
+            section_id: 1,
+            scope: FeatureScopeV2::OperationRequired as u8,
+            profile_kind: PrimaryProfile::CoveVec as u8,
+            operation_kind: OperationKindV2::AiEmbedding as u16,
+            required_ai_features: unknown_required,
+            optional_ai_features: 0,
+            target_local_ref: 0,
+            flags: 0,
+            crc32c: 0,
+        });
+    write_coveai_descriptor_bundle(&CoveAiDescriptorBundleBuild {
+        artifact_id: [87u8; 16],
+        created_at_us: 87,
+        payload_sections: vec![CoveAiWritableSection {
+            section_id: 1,
+            section_kind: SectionKind::AiPayloadBytes as u32,
+            profile_kind: PrimaryProfile::CoveVec as u8,
+            payload_encoding: AiPayloadEncodingV1::OpaqueBytes,
+            requiredness_scope: AiRequirednessScopeV1::AdvisoryOnly,
+            source_binding_ref: 0,
+            required_ai_features: 0,
+            optional_ai_features: 0,
+            feature_binding_ref: 0,
+            payload: vec![0],
+        }],
+        descriptor_tables: tables,
+    })
+    .unwrap()
+}
+
+pub(super) fn coveai_unknown_optional_future_record_accept_fixture() -> Vec<u8> {
+    write_coveai_artifact(
+        CoveAiArtifactKind::CoveAiBundle,
+        [88u8; 16],
+        88,
+        &[CoveAiWritableSection {
+            section_id: 1,
+            section_kind: SectionKind::AiReferenceTables as u32,
+            profile_kind: PrimaryProfile::CoveAiShared as u8,
+            payload_encoding: AiPayloadEncodingV1::BinaryRecords,
+            requiredness_scope: AiRequirednessScopeV1::AdvisoryOnly,
+            source_binding_ref: 0,
+            required_ai_features: 0,
+            optional_ai_features: 0,
+            feature_binding_ref: 0,
+            payload: ai_raw_record(60_000, 3, 1, AI_FLAG_PAYLOAD_CRC32C_PRESENT, &[]),
+        }],
+    )
+    .unwrap()
+}
+
+pub(super) fn coveai_duplicate_unknown_optional_record_accept_fixture() -> Vec<u8> {
+    let record = ai_raw_record(60_020, 1, 7, AI_FLAG_PAYLOAD_CRC32C_PRESENT, &[]);
+    write_coveai_artifact(
+        CoveAiArtifactKind::CoveAiBundle,
+        [93u8; 16],
+        93,
+        &[CoveAiWritableSection {
+            section_id: 1,
+            section_kind: SectionKind::AiReferenceTables as u32,
+            profile_kind: PrimaryProfile::CoveAiShared as u8,
+            payload_encoding: AiPayloadEncodingV1::BinaryRecords,
+            requiredness_scope: AiRequirednessScopeV1::AdvisoryOnly,
+            source_binding_ref: 0,
+            required_ai_features: 0,
+            optional_ai_features: 0,
+            feature_binding_ref: 0,
+            payload: [record.as_slice(), record.as_slice()].concat(),
+        }],
+    )
+    .unwrap()
+}
+
+pub(super) fn coveai_duplicate_scoped_required_unknown_record_accept_fixture() -> Vec<u8> {
+    let record = ai_raw_record(
+        60_021,
+        1,
+        1,
+        AI_FLAG_REQUIRED_RECORD | AI_FLAG_PAYLOAD_CRC32C_PRESENT,
+        &[],
+    );
+    write_coveai_artifact(
+        CoveAiArtifactKind::CoveAiBundle,
+        [94u8; 16],
+        94,
+        &[CoveAiWritableSection {
+            section_id: 1,
+            section_kind: SectionKind::AiTrainingProfile as u32,
+            profile_kind: PrimaryProfile::CoveTrain as u8,
+            payload_encoding: AiPayloadEncodingV1::BinaryRecords,
+            requiredness_scope: AiRequirednessScopeV1::ProfileRequired,
+            source_binding_ref: 0,
+            required_ai_features: 0,
+            optional_ai_features: 0,
+            feature_binding_ref: 0,
+            payload: [record.as_slice(), record.as_slice()].concat(),
+        }],
+    )
+    .unwrap()
+}
+
+pub(super) fn coveai_unknown_optional_record_bad_crc_reject_fixture() -> Vec<u8> {
+    let mut record = ai_raw_record(60_022, 3, 1, AI_FLAG_PAYLOAD_CRC32C_PRESENT, &[]);
+    record[20] ^= 0x01;
+    write_coveai_artifact(
+        CoveAiArtifactKind::CoveAiBundle,
+        [95u8; 16],
+        95,
+        &[CoveAiWritableSection {
+            section_id: 1,
+            section_kind: SectionKind::AiReferenceTables as u32,
+            profile_kind: PrimaryProfile::CoveAiShared as u8,
+            payload_encoding: AiPayloadEncodingV1::BinaryRecords,
+            requiredness_scope: AiRequirednessScopeV1::AdvisoryOnly,
+            source_binding_ref: 0,
+            required_ai_features: 0,
+            optional_ai_features: 0,
+            feature_binding_ref: 0,
+            payload: record,
+        }],
+    )
+    .unwrap()
+}
+
+pub(super) fn coveai_scoped_required_unknown_record_accept_fixture() -> Vec<u8> {
+    write_coveai_artifact(
+        CoveAiArtifactKind::CoveAiBundle,
+        [91u8; 16],
+        91,
+        &[CoveAiWritableSection {
+            section_id: 1,
+            section_kind: SectionKind::AiTrainingProfile as u32,
+            profile_kind: PrimaryProfile::CoveTrain as u8,
+            payload_encoding: AiPayloadEncodingV1::BinaryRecords,
+            requiredness_scope: AiRequirednessScopeV1::ProfileRequired,
+            source_binding_ref: 0,
+            required_ai_features: 0,
+            optional_ai_features: 0,
+            feature_binding_ref: 0,
+            payload: ai_raw_record(
+                60_001,
+                1,
+                1,
+                AI_FLAG_REQUIRED_RECORD | AI_FLAG_PAYLOAD_CRC32C_PRESENT,
+                &[],
+            ),
+        }],
+    )
+    .unwrap()
+}
+
+pub(super) fn coveai_artifact_required_unknown_record_reject_fixture() -> Vec<u8> {
+    write_coveai_artifact(
+        CoveAiArtifactKind::CoveAiBundle,
+        [92u8; 16],
+        92,
+        &[CoveAiWritableSection {
+            section_id: 1,
+            section_kind: SectionKind::AiReferenceTables as u32,
+            profile_kind: PrimaryProfile::CoveAiShared as u8,
+            payload_encoding: AiPayloadEncodingV1::BinaryRecords,
+            requiredness_scope: AiRequirednessScopeV1::ArtifactRequired,
+            source_binding_ref: 0,
+            required_ai_features: 0,
+            optional_ai_features: 0,
+            feature_binding_ref: 0,
+            payload: ai_raw_record(
+                60_002,
+                1,
+                1,
+                AI_FLAG_REQUIRED_RECORD | AI_FLAG_PAYLOAD_CRC32C_PRESENT,
+                &[],
+            ),
+        }],
+    )
+    .unwrap()
+}
+
+pub(super) fn coveai_required_record_unassigned_flags_reject_fixture() -> Vec<u8> {
+    write_coveai_artifact(
+        CoveAiArtifactKind::CoveAiBundle,
+        [89u8; 16],
+        89,
+        &[CoveAiWritableSection {
+            section_id: 1,
+            section_kind: SectionKind::AiReferenceTables as u32,
+            profile_kind: PrimaryProfile::CoveAiShared as u8,
+            payload_encoding: AiPayloadEncodingV1::BinaryRecords,
+            requiredness_scope: AiRequirednessScopeV1::AdvisoryOnly,
+            source_binding_ref: 0,
+            required_ai_features: 0,
+            optional_ai_features: 0,
+            feature_binding_ref: 0,
+            payload: ai_raw_record(
+                1,
+                1,
+                1,
+                AI_FLAG_REQUIRED_RECORD | AI_FLAG_PAYLOAD_CRC32C_PRESENT | (1 << 31),
+                &[],
+            ),
+        }],
+    )
+    .unwrap()
+}
+
+pub(super) fn coveai_external_asset_digest_required_reject_fixture() -> Vec<u8> {
+    let mut tables = AiDescriptorTablesV1::default();
+    tables.payload_refs.push(AiPayloadRefEntryV1 {
+        payload_ref: 1,
+        storage_kind: AiStorageKindV1::SectionDecodedRelative as u8,
+        media_type_ref: 0,
+        section_id: 1,
+        uri_ref: 0,
+        payload_offset: 0,
+        section_payload_offset: 0,
+        payload_length: 3,
+        decoded_length: 3,
+        integrity_ref: 0,
+        flags: 0,
+        crc32c: 0,
+    });
+    tables.strings.push(AiStringEntryV1 {
+        string_ref: 1,
+        utf8_byte_length: 3,
+        payload_ref: 1,
+        flags: 0,
+        crc32c: 0,
+    });
+    tables.assets.push(AiAssetRefV1 {
+        asset_ref_id: 1,
+        parent_asset_ref: 0,
+        asset_kind: 0,
+        uri_ref: 1,
+        embedded_section_ref: 0,
+        media_type_ref: 0,
+        byte_length: 0,
+        digest_ref: 0,
+        width: 64,
+        height: 64,
+        duration_us: 0,
+        sample_rate_hz: 0,
+        channel_count: 0,
+        decode_profile_ref: 0,
+        preprocessing_profile_ref: 0,
+        transform_profile_ref: 0,
+        transform_digest_ref: 0,
+        tensor_layout_ref: 0,
+        license_ref: 0,
+        policy_ref: 0,
+        flags: 0,
+        checksum: 0,
+    });
+    let bytes = write_coveai_descriptor_bundle(&CoveAiDescriptorBundleBuild {
+        artifact_id: [90u8; 16],
+        created_at_us: 90,
+        payload_sections: vec![CoveAiWritableSection {
+            section_id: 1,
+            section_kind: SectionKind::AiPayloadBytes as u32,
+            profile_kind: PrimaryProfile::CoveAiShared as u8,
+            payload_encoding: AiPayloadEncodingV1::OpaqueBytes,
+            requiredness_scope: AiRequirednessScopeV1::AdvisoryOnly,
+            source_binding_ref: 0,
+            required_ai_features: 0,
+            optional_ai_features: 0,
+            feature_binding_ref: 0,
+            payload: b"uri".to_vec(),
+        }],
+        descriptor_tables: tables,
+    })
+    .unwrap();
+    require_ai_feature_on_section(
+        bytes,
+        SectionKind::AiAssetManifest,
+        AiRequirednessScopeV1::SectionRequired,
+        AI_FEATURE_EXTERNAL_ASSET_DIGEST_REQUIRED,
+    )
+}
+
 pub(super) fn write_ai_fixtures(writer: &mut CorpusWriter<'_>) {
     let root = writer.root;
     let entries = &mut *writer.entries;
@@ -1337,6 +1695,123 @@ pub(super) fn write_ai_fixtures(writer: &mut CorpusWriter<'_>) {
             &["§83"],
         ),
         coveai_companion_ref,
+    );
+
+    write_fixture(
+        root,
+        entries,
+        fixture(
+            "ai/coveai_operation_scoped_unknown_required_accept.coveai",
+            "coveai",
+            "accept",
+            None,
+            &["§83"],
+        ),
+        coveai_operation_scoped_unknown_required_accept_fixture(),
+    );
+
+    write_fixture(
+        root,
+        entries,
+        fixture(
+            "ai/coveai_unknown_optional_future_record_accept.coveai",
+            "coveai",
+            "accept",
+            None,
+            &["§83"],
+        ),
+        coveai_unknown_optional_future_record_accept_fixture(),
+    );
+
+    write_fixture(
+        root,
+        entries,
+        fixture(
+            "ai/coveai_duplicate_unknown_optional_record_accept.coveai",
+            "coveai",
+            "accept",
+            None,
+            &["§83"],
+        ),
+        coveai_duplicate_unknown_optional_record_accept_fixture(),
+    );
+
+    write_fixture(
+        root,
+        entries,
+        fixture(
+            "ai/coveai_duplicate_scoped_required_unknown_record_accept.coveai",
+            "coveai",
+            "accept",
+            None,
+            &["§83"],
+        ),
+        coveai_duplicate_scoped_required_unknown_record_accept_fixture(),
+    );
+
+    write_fixture(
+        root,
+        entries,
+        fixture(
+            "ai/coveai_unknown_optional_record_bad_crc_reject.coveai",
+            "coveai",
+            "reject",
+            Some("COVE_E_CHECKSUM_MISMATCH"),
+            &["§83", "§76"],
+        ),
+        coveai_unknown_optional_record_bad_crc_reject_fixture(),
+    );
+
+    write_fixture(
+        root,
+        entries,
+        fixture(
+            "ai/coveai_scoped_required_unknown_record_accept.coveai",
+            "coveai",
+            "accept",
+            None,
+            &["§83"],
+        ),
+        coveai_scoped_required_unknown_record_accept_fixture(),
+    );
+
+    write_fixture(
+        root,
+        entries,
+        fixture(
+            "ai/coveai_artifact_required_unknown_record_reject.coveai",
+            "coveai",
+            "reject",
+            Some("COVE_E_BAD_SECTION"),
+            &["§83", "§76"],
+        ),
+        coveai_artifact_required_unknown_record_reject_fixture(),
+    );
+
+    write_fixture(
+        root,
+        entries,
+        fixture(
+            "ai/coveai_required_record_unassigned_flags_reject.coveai",
+            "coveai",
+            "reject",
+            Some("COVE_E_BAD_SECTION"),
+            &["§83", "§76"],
+        ),
+        coveai_required_record_unassigned_flags_reject_fixture(),
+    );
+
+    write_fixture(
+        root,
+        entries,
+        fixture(
+            "ai/coveai_external_asset_digest_required_reject.coveai",
+            "coveai",
+            "reject",
+            Some("COVE_E_BAD_SECTION"),
+            &["§83", "§76"],
+        ),
+        coveai_external_asset_digest_required_reject_fixture(),
     );
 
     let duplicate_ai_sections = [

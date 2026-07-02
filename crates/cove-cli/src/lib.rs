@@ -40,6 +40,7 @@ use cove_core::{
     },
     checksum, compression,
     constants::{SectionKind, MAGIC_COVEAI, MAGIC_COVEMAP, MAGIC_COVEV},
+    feature_binding::OperationKindV2,
     profile::{
         cove_map::{parse_embedded_section, EmbeddedMapSection},
         cove_o::CoveObjectSurface,
@@ -1833,7 +1834,7 @@ fn run_ai_export(args: Vec<String>) -> Result<(), String> {
     let input = input.ok_or_else(|| "ai export requires <sidecar>".to_string())?;
     let bytes =
         fs::read(&input).map_err(|error| format!("cannot read {}: {error}", input.display()))?;
-    let sidecar = CoveAiFile::parse(&bytes)
+    let sidecar = CoveAiFile::parse_for_operation(&bytes, OperationKindV2::AiTrainingSampleExport)
         .map_err(|error| format!("{}: invalid COVE-AI sidecar: {error}", input.display()))?;
     let reader = AiPayloadReader::new(
         &bytes,

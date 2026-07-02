@@ -393,7 +393,10 @@ pub fn ai_tensor_zero_copy_view<'a>(
     tensor_layout_id: u32,
     payload_ref: u32,
 ) -> Result<AiTensorZeroCopyView<'a>, CoveError> {
-    let sidecar = parse_ai_sidecar_with_payload_access(artifact_bytes)?;
+    let sidecar = parse_ai_sidecar_for_operation_with_payload_access(
+        artifact_bytes,
+        OperationKindV2::AiMultimodalSequenceRead,
+    )?;
     let layout = sidecar
         .descriptor_tables
         .tensor_layouts
@@ -753,7 +756,10 @@ pub fn ai_embedding(
     artifact_bytes: &[u8],
     request: &AiEmbeddingRequest,
 ) -> Result<AiEmbeddingResult, CoveError> {
-    let sidecar = parse_ai_sidecar_with_payload_access(artifact_bytes)?;
+    let sidecar = parse_ai_sidecar_for_operation_with_payload_access(
+        artifact_bytes,
+        OperationKindV2::AiEmbedding,
+    )?;
     let (target_kind, file_code, vector_space, vector_entry) =
         resolve_embedding_request(&sidecar, request)?;
     let values = vector_entry_values_as_f32(artifact_bytes, &sidecar, vector_space, vector_entry)?;
@@ -776,7 +782,10 @@ pub fn ai_vector_search(
     if plan.top_k == 0 {
         return Ok(Vec::new());
     }
-    let sidecar = parse_ai_sidecar_with_payload_access(artifact_bytes)?;
+    let sidecar = parse_ai_sidecar_for_operation_with_payload_access(
+        artifact_bytes,
+        OperationKindV2::AiSemanticSearch,
+    )?;
     let (query_space, query_values) = resolve_vector_query(artifact_bytes, &sidecar, plan)?;
     let selected_index = select_vector_index(&sidecar, query_space, plan.index);
     let loaded_candidates =
@@ -837,10 +846,11 @@ pub fn ai_vector_search(
     Ok(results)
 }
 
-pub(super) fn parse_ai_sidecar_with_payload_access(
+pub(super) fn parse_ai_sidecar_for_operation_with_payload_access(
     artifact_bytes: &[u8],
+    operation: OperationKindV2,
 ) -> Result<CoveAiFile, CoveError> {
-    let sidecar = CoveAiFile::parse(artifact_bytes)?;
+    let sidecar = CoveAiFile::parse_for_operation(artifact_bytes, operation)?;
     if sidecar.payload_access != AiPayloadAccessState::StructurallyAllowed {
         return Err(CoveError::BadSection(
             "direct AI payload access is policy-blocked: missing AI_PRIVACY_SUMMARY".into(),

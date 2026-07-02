@@ -261,8 +261,23 @@ fn vector_binding_artifact_sections(
             .unwrap(),
         ));
     }
+    if !tables.assets.is_empty() {
+        payload_sections.push(coveai_binary_section(
+            106,
+            SectionKind::AiAssetManifest,
+            PrimaryProfile::CoveVec,
+            encode_records(
+                tables
+                    .assets
+                    .iter()
+                    .cloned()
+                    .map(|record| encode_ai_asset_ref(record).unwrap()),
+            )
+            .unwrap(),
+        ));
+    }
     let mut vector_binding_section = coveai_binary_section(
-        106,
+        107,
         SectionKind::AiVectorBinding,
         PrimaryProfile::CoveVec,
         encode_records(vector_binding_records).unwrap(),
@@ -1051,6 +1066,101 @@ fn descriptor_bundle_serializes_ai_section_feature_binding() {
 }
 
 #[test]
+fn operation_scoped_unknown_ai_features_defer_until_matching_operation() {
+    let unknown_required = 1u64 << 63;
+    let mut tables = AiDescriptorTablesV1::default();
+    tables
+        .section_feature_bindings
+        .push(AiSectionFeatureBindingV1 {
+            binding_ref: 1,
+            section_id: 1,
+            scope: FeatureScopeV2::OperationRequired as u8,
+            profile_kind: PrimaryProfile::CoveVec as u8,
+            operation_kind: OperationKindV2::AiEmbedding as u16,
+            required_ai_features: unknown_required,
+            optional_ai_features: 0,
+            target_local_ref: 0,
+            flags: 0,
+            crc32c: 0,
+        });
+
+    let bytes = write_coveai_descriptor_bundle(&CoveAiDescriptorBundleBuild {
+        artifact_id: [129u8; 16],
+        created_at_us: 1_016,
+        payload_sections: vec![coveai_payload_section(
+            1,
+            SectionKind::AiPayloadBytes,
+            PrimaryProfile::CoveVec,
+            vec![0],
+        )],
+        descriptor_tables: tables,
+    })
+    .unwrap();
+
+    CoveAiFile::parse(&bytes).unwrap();
+    CoveAiFile::parse_for_operation(&bytes, OperationKindV2::AiSemanticSearch).unwrap();
+    assert!(matches!(
+        CoveAiFile::parse_for_operation(&bytes, OperationKindV2::AiEmbedding),
+        Err(CoveError::UnknownRequiredFeature(bits)) if bits == unknown_required
+    ));
+}
+
+#[test]
+fn section_required_unknown_ai_features_only_reject_needed_sections() {
+    let unknown_required = 1u64 << 63;
+    let mut vector_index = coveai_binary_section(
+        1,
+        SectionKind::AiVectorIndex,
+        PrimaryProfile::CoveVec,
+        encode_records([encode_ai_record(60_010, 1, 0, Vec::new()).unwrap()]).unwrap(),
+    );
+    vector_index.requiredness_scope = AiRequirednessScopeV1::SectionRequired;
+    vector_index.required_ai_features = unknown_required;
+
+    let bytes = write_coveai_artifact(
+        CoveAiArtifactKind::CoveAiBundle,
+        [142u8; 16],
+        1_032,
+        &[vector_index],
+    )
+    .unwrap();
+
+    CoveAiFile::parse(&bytes).unwrap();
+    CoveAiFile::parse_for_operation(&bytes, OperationKindV2::AiEmbedding).unwrap();
+    assert!(matches!(
+        CoveAiFile::parse_for_operation(&bytes, OperationKindV2::AiInspect),
+        Err(CoveError::UnknownRequiredFeature(bits)) if bits == unknown_required
+    ));
+}
+
+#[test]
+fn section_required_unknown_ai_features_reject_needed_sections() {
+    let unknown_required = 1u64 << 63;
+    let mut vector_binding = coveai_binary_section(
+        1,
+        SectionKind::AiVectorBinding,
+        PrimaryProfile::CoveVec,
+        encode_records([encode_ai_record(60_011, 1, 0, Vec::new()).unwrap()]).unwrap(),
+    );
+    vector_binding.requiredness_scope = AiRequirednessScopeV1::SectionRequired;
+    vector_binding.required_ai_features = unknown_required;
+
+    let bytes = write_coveai_artifact(
+        CoveAiArtifactKind::CoveAiBundle,
+        [143u8; 16],
+        1_033,
+        &[vector_binding],
+    )
+    .unwrap();
+
+    CoveAiFile::parse(&bytes).unwrap();
+    assert!(matches!(
+        CoveAiFile::parse_for_operation(&bytes, OperationKindV2::AiEmbedding),
+        Err(CoveError::UnknownRequiredFeature(bits)) if bits == unknown_required
+    ));
+}
+
+#[test]
 fn descriptor_bundle_rejects_ai_section_feature_binding_self_target() {
     let mut tables = AiDescriptorTablesV1::default();
     tables
@@ -1077,6 +1187,320 @@ fn descriptor_bundle_rejects_ai_section_feature_binding_self_target() {
         }),
         Err(CoveError::BadSection(message))
             if message.contains("must not target AI_SECTION_FEATURE_BINDING")
+    ));
+}
+
+#[test]
+fn unknown_optional_ai_record_with_future_version_is_skipped() {
+    let bytes = write_coveai_artifact(
+        CoveAiArtifactKind::CoveAiBundle,
+        [130u8; 16],
+        1_017,
+        &[coveai_binary_section(
+            1,
+            SectionKind::AiReferenceTables,
+            PrimaryProfile::CoveAiShared,
+            encode_records([encode_ai_record_with_version(
+                60_000,
+                3,
+                1,
+                AI_FLAG_PAYLOAD_CRC32C_PRESENT,
+                Vec::new(),
+            )
+            .unwrap()])
+            .unwrap(),
+        )],
+    )
+    .unwrap();
+
+    let parsed = CoveAiFile::parse(&bytes).unwrap();
+    assert_eq!(parsed.sections[0].record_headers.len(), 1);
+    assert!(parsed.descriptor_tables.strings.is_empty());
+}
+
+#[test]
+fn duplicate_unknown_optional_ai_records_are_skipped() {
+    let record = encode_ai_record(60_020, 7, AI_FLAG_PAYLOAD_CRC32C_PRESENT, Vec::new()).unwrap();
+    let bytes = write_coveai_artifact(
+        CoveAiArtifactKind::CoveAiBundle,
+        [144u8; 16],
+        1_034,
+        &[coveai_binary_section(
+            1,
+            SectionKind::AiReferenceTables,
+            PrimaryProfile::CoveAiShared,
+            encode_records([record.clone(), record]).unwrap(),
+        )],
+    )
+    .unwrap();
+
+    let parsed = CoveAiFile::parse(&bytes).unwrap();
+    assert_eq!(parsed.sections[0].record_headers.len(), 2);
+    assert!(parsed.descriptor_tables.strings.is_empty());
+}
+
+#[test]
+fn duplicate_unknown_required_ai_records_defer_until_matching_scope() {
+    let record = encode_ai_record(
+        60_021,
+        1,
+        AI_FLAG_REQUIRED_RECORD | AI_FLAG_PAYLOAD_CRC32C_PRESENT,
+        Vec::new(),
+    )
+    .unwrap();
+    let mut section = coveai_binary_section(
+        1,
+        SectionKind::AiTrainingProfile,
+        PrimaryProfile::CoveTrain,
+        encode_records([record.clone(), record]).unwrap(),
+    );
+    section.requiredness_scope = AiRequirednessScopeV1::ProfileRequired;
+
+    let bytes = write_coveai_artifact(
+        CoveAiArtifactKind::CoveAiBundle,
+        [145u8; 16],
+        1_035,
+        &[section],
+    )
+    .unwrap();
+
+    CoveAiFile::parse(&bytes).unwrap();
+    CoveAiFile::parse_for_operation(&bytes, OperationKindV2::AiEmbedding).unwrap();
+    assert!(matches!(
+        CoveAiFile::parse_for_operation(&bytes, OperationKindV2::AiTrainingSampleExport),
+        Err(CoveError::BadSection(message))
+            if message.contains("unsupported required COVE-AI record kind 60021")
+    ));
+}
+
+#[test]
+fn unknown_optional_ai_record_bad_crc_rejects_before_skip() {
+    let mut record =
+        encode_ai_record_with_version(60_022, 3, 1, AI_FLAG_PAYLOAD_CRC32C_PRESENT, Vec::new())
+            .unwrap();
+    record[20] ^= 0x01;
+
+    let bytes = write_coveai_artifact(
+        CoveAiArtifactKind::CoveAiBundle,
+        [146u8; 16],
+        1_036,
+        &[coveai_binary_section(
+            1,
+            SectionKind::AiReferenceTables,
+            PrimaryProfile::CoveAiShared,
+            encode_records([record]).unwrap(),
+        )],
+    )
+    .unwrap();
+
+    assert!(matches!(
+        CoveAiFile::parse(&bytes),
+        Err(CoveError::ChecksumMismatch)
+    ));
+}
+
+#[test]
+fn required_ai_record_with_unassigned_flags_rejects() {
+    let bytes = write_coveai_artifact(
+        CoveAiArtifactKind::CoveAiBundle,
+        [131u8; 16],
+        1_018,
+        &[coveai_binary_section(
+            1,
+            SectionKind::AiReferenceTables,
+            PrimaryProfile::CoveAiShared,
+            encode_records([encode_ai_record(
+                1,
+                1,
+                AI_FLAG_REQUIRED_RECORD | AI_FLAG_PAYLOAD_CRC32C_PRESENT | (1 << 31),
+                Vec::new(),
+            )
+            .unwrap()])
+            .unwrap(),
+        )],
+    )
+    .unwrap();
+
+    assert!(matches!(
+        CoveAiFile::parse(&bytes),
+        Err(CoveError::BadSection(message)) if message.contains("unassigned flags")
+    ));
+}
+
+#[test]
+fn required_unknown_ai_record_kind_defers_until_matching_scope() {
+    let mut section = coveai_binary_section(
+        1,
+        SectionKind::AiTrainingProfile,
+        PrimaryProfile::CoveTrain,
+        encode_records([encode_ai_record(
+            60_001,
+            1,
+            AI_FLAG_REQUIRED_RECORD | AI_FLAG_PAYLOAD_CRC32C_PRESENT,
+            Vec::new(),
+        )
+        .unwrap()])
+        .unwrap(),
+    );
+    section.requiredness_scope = AiRequirednessScopeV1::ProfileRequired;
+
+    let bytes = write_coveai_artifact(
+        CoveAiArtifactKind::CoveAiBundle,
+        [140u8; 16],
+        1_030,
+        &[section],
+    )
+    .unwrap();
+
+    CoveAiFile::parse(&bytes).unwrap();
+    CoveAiFile::parse_for_operation(&bytes, OperationKindV2::AiEmbedding).unwrap();
+    assert!(matches!(
+        CoveAiFile::parse_for_operation(&bytes, OperationKindV2::AiTrainingSampleExport),
+        Err(CoveError::BadSection(message))
+            if message.contains("unsupported required COVE-AI record kind 60001")
+    ));
+}
+
+#[test]
+fn artifact_required_unknown_ai_record_kind_rejects_structural_parse() {
+    let mut section = coveai_binary_section(
+        1,
+        SectionKind::AiReferenceTables,
+        PrimaryProfile::CoveAiShared,
+        encode_records([encode_ai_record(
+            60_002,
+            1,
+            AI_FLAG_REQUIRED_RECORD | AI_FLAG_PAYLOAD_CRC32C_PRESENT,
+            Vec::new(),
+        )
+        .unwrap()])
+        .unwrap(),
+    );
+    section.requiredness_scope = AiRequirednessScopeV1::ArtifactRequired;
+
+    let bytes = write_coveai_artifact(
+        CoveAiArtifactKind::CoveAiBundle,
+        [141u8; 16],
+        1_031,
+        &[section],
+    )
+    .unwrap();
+
+    assert!(matches!(
+        CoveAiFile::parse(&bytes),
+        Err(CoveError::BadSection(message))
+            if message.contains("unsupported required COVE-AI record kind 60002")
+    ));
+}
+
+#[test]
+fn external_asset_digest_required_rejects_uri_asset_without_digest() {
+    let mut asset = test_asset_ref();
+    asset.asset_kind = 0;
+    asset.uri_ref = 1;
+    asset.tensor_layout_ref = 0;
+    asset.digest_ref = 0;
+
+    let mut asset_section = coveai_binary_section(
+        3,
+        SectionKind::AiAssetManifest,
+        PrimaryProfile::CoveMmseq,
+        encode_records([encode_ai_asset_ref(asset).unwrap()]).unwrap(),
+    );
+    asset_section.requiredness_scope = AiRequirednessScopeV1::SectionRequired;
+    asset_section.required_ai_features = AI_FEATURE_EXTERNAL_ASSET_DIGEST_REQUIRED;
+
+    let bytes = write_coveai_artifact(
+        CoveAiArtifactKind::CoveAiBundle,
+        [132u8; 16],
+        1_019,
+        &[
+            coveai_payload_section(
+                1,
+                SectionKind::AiPayloadBytes,
+                PrimaryProfile::CoveAiShared,
+                b"uri".to_vec(),
+            ),
+            coveai_binary_section(
+                2,
+                SectionKind::AiReferenceTables,
+                PrimaryProfile::CoveAiShared,
+                encode_records([
+                    encode_payload_ref_entry(AiPayloadRefEntryV1 {
+                        payload_ref: 1,
+                        storage_kind: AiStorageKindV1::SectionDecodedRelative as u8,
+                        media_type_ref: 0,
+                        section_id: 1,
+                        uri_ref: 0,
+                        payload_offset: 0,
+                        section_payload_offset: 0,
+                        payload_length: 3,
+                        decoded_length: 3,
+                        integrity_ref: 0,
+                        flags: 0,
+                        crc32c: 0,
+                    })
+                    .unwrap(),
+                    encode_string_entry(AiStringEntryV1 {
+                        string_ref: 1,
+                        utf8_byte_length: 3,
+                        payload_ref: 1,
+                        flags: 0,
+                        crc32c: 0,
+                    })
+                    .unwrap(),
+                ])
+                .unwrap(),
+            ),
+            asset_section,
+        ],
+    )
+    .unwrap();
+
+    assert!(matches!(
+        CoveAiFile::parse(&bytes),
+        Err(CoveError::BadSection(message))
+            if message.contains("requires external AiAssetRef 1 to carry digest_ref")
+    ));
+}
+
+#[test]
+fn external_asset_digest_required_rejects_asset_binding_without_digest() {
+    let (mut tables, payload_sections) = vector_descriptor_tables_with_payload();
+    let mut asset = test_asset_ref();
+    asset.tensor_layout_ref = 0;
+    asset.digest_ref = 0;
+    tables.assets.push(asset);
+
+    let binding = AssetVectorBindingV1 {
+        binding_id: 50,
+        vector_space_id: 1,
+        asset_ref: 1,
+        transform_ref: 0,
+        asset_digest_ref: 0,
+        vector_ref: 2,
+        model_input_digest_ref: 0,
+        flags: 0,
+        checksum: 0,
+    };
+    let sections = vector_binding_artifact_sections(
+        &tables,
+        payload_sections,
+        vec![encode_asset_vector_binding(binding).unwrap()],
+        AI_FEATURE_EXTERNAL_ASSET_DIGEST_REQUIRED,
+    );
+    let bytes = write_coveai_artifact(
+        CoveAiArtifactKind::CoveAiBundle,
+        [133u8; 16],
+        1_020,
+        &sections,
+    )
+    .unwrap();
+
+    assert!(matches!(
+        CoveAiFile::parse(&bytes),
+        Err(CoveError::BadSection(message))
+            if message.contains("requires AssetVectorBinding 50 to carry asset_digest_ref")
     ));
 }
 

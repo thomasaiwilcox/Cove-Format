@@ -13,5 +13,6 @@ cove-codec = { path = "../cove-codec" }
 cove-coverage = { path = "../cove-coverage" }
 cove-index = { path = "../cove-index" }
 cove-layout = { path = "../cove-layout" }
+cove-profile-validation = { path = "../cove-profile-validation" }
 cove-runtime = { path = "../cove-runtime" }
 serde_json = "1"

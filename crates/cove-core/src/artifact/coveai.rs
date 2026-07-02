@@ -83,6 +83,10 @@ pub const AI_FLAG_REQUIRED_RECORD: u32 = 1 << 0;
 pub const AI_FLAG_PAYLOAD_CRC32C_PRESENT: u32 = 1 << 1;
 pub const AI_FLAG_POLICY_PROTECTED: u32 = 1 << 2;
 pub const AI_FLAG_REVOKED: u32 = 1 << 3;
+pub const AI_KNOWN_RECORD_FLAGS_V1: u32 = AI_FLAG_REQUIRED_RECORD
+    | AI_FLAG_PAYLOAD_CRC32C_PRESENT
+    | AI_FLAG_POLICY_PROTECTED
+    | AI_FLAG_REVOKED;
 
 const AI_DIGEST_DOMAIN_MODEL_INPUT_BYTES: u8 = 4;
 
@@ -433,13 +437,16 @@ impl CoveAiSectionEntryV1 {
                 self.payload_encoding
             )));
         }
-        if AiRequirednessScopeV1::from_u8(self.requiredness_scope).is_none() {
-            return Err(CoveError::BadSection(format!(
-                "unknown COVE-AI requiredness scope {}",
-                self.requiredness_scope
-            )));
-        }
-        if self.required_ai_features & !AI_KNOWN_FEATURES_V1 != 0 {
+        let requiredness_scope = AiRequirednessScopeV1::from_u8(self.requiredness_scope)
+            .ok_or_else(|| {
+                CoveError::BadSection(format!(
+                    "unknown COVE-AI requiredness scope {}",
+                    self.requiredness_scope
+                ))
+            })?;
+        if self.required_ai_features & !AI_KNOWN_FEATURES_V1 != 0
+            && requiredness_scope == AiRequirednessScopeV1::ArtifactRequired
+        {
             return Err(CoveError::UnknownRequiredFeature(
                 self.required_ai_features & !AI_KNOWN_FEATURES_V1,
             ));
@@ -463,6 +470,28 @@ impl CoveAiSectionEntryV1 {
 pub struct CoveAiSection {
     pub entry: CoveAiSectionEntryV1,
     pub record_headers: Vec<AiRecordHeaderV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CoveAiFeatureScopeRequest {
+    pub requested_profile: Option<PrimaryProfile>,
+    pub requested_operation: Option<OperationKindV2>,
+    pub needed_section_ids: BTreeSet<u32>,
+}
+
+impl CoveAiFeatureScopeRequest {
+    pub fn for_operation(operation: OperationKindV2) -> Self {
+        Self {
+            requested_profile: ai_profile_for_operation(operation),
+            requested_operation: Some(operation),
+            needed_section_ids: BTreeSet::new(),
+        }
+    }
+
+    pub fn with_needed_section(mut self, section_id: u32) -> Self {
+        self.needed_section_ids.insert(section_id);
+        self
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -568,14 +597,253 @@ impl CoveAiFile {
         let payload_access =
             payload_access_state(&sections, !descriptor_tables.privacy_summaries.is_empty());
 
-        Ok(Self {
+        let sidecar = Self {
             artifact_kind,
             postscript,
             header,
             sections,
             descriptor_tables,
             payload_access,
-        })
+        };
+        sidecar.validate_required_features_for_request(&CoveAiFeatureScopeRequest::default())?;
+        Ok(sidecar)
+    }
+
+    pub fn parse_for_operation(data: &[u8], operation: OperationKindV2) -> Result<Self, CoveError> {
+        let sidecar = Self::parse(data)?;
+        let mut request = CoveAiFeatureScopeRequest::for_operation(operation);
+        for section in &sidecar.sections {
+            if ai_section_needed_for_operation(section.entry.section_kind, operation) {
+                request.needed_section_ids.insert(section.entry.section_id);
+            }
+        }
+        sidecar.validate_required_features_for_request(&request)?;
+        Ok(sidecar)
+    }
+
+    pub fn validate_required_features_for_request(
+        &self,
+        request: &CoveAiFeatureScopeRequest,
+    ) -> Result<(), CoveError> {
+        for section in &self.sections {
+            let unknown_required = section.entry.required_ai_features & !AI_KNOWN_FEATURES_V1;
+            if unknown_required != 0 && section_requiredness_intersects(&section.entry, request) {
+                return Err(CoveError::UnknownRequiredFeature(unknown_required));
+            }
+            for header in &section.record_headers {
+                if header.flags & AI_FLAG_REQUIRED_RECORD != 0
+                    && !ai_record_kind_known(section.entry.section_kind, header.record_kind)
+                    && section_requiredness_intersects(&section.entry, request)
+                {
+                    return Err(CoveError::BadSection(format!(
+                        "unsupported required COVE-AI record kind {} in section kind {}",
+                        header.record_kind, section.entry.section_kind
+                    )));
+                }
+            }
+        }
+        for binding in &self.descriptor_tables.section_feature_bindings {
+            let unknown_required = binding.required_ai_features & !AI_KNOWN_FEATURES_V1;
+            if unknown_required != 0 && binding_requiredness_intersects(binding, request) {
+                return Err(CoveError::UnknownRequiredFeature(unknown_required));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn ai_profile_for_operation(operation: OperationKindV2) -> Option<PrimaryProfile> {
+    match operation {
+        OperationKindV2::AiInspect => Some(PrimaryProfile::CoveAiShared),
+        OperationKindV2::AiChunkProjection | OperationKindV2::AiRagContext => {
+            Some(PrimaryProfile::CoveChunk)
+        }
+        OperationKindV2::AiTokenProjection => Some(PrimaryProfile::CoveTok),
+        OperationKindV2::AiEmbedding | OperationKindV2::AiSemanticSearch => {
+            Some(PrimaryProfile::CoveVec)
+        }
+        OperationKindV2::AiTrainingSampleExport | OperationKindV2::AiGeneratorAudit => {
+            Some(PrimaryProfile::CoveTrain)
+        }
+        OperationKindV2::AiMultimodalSequenceRead => Some(PrimaryProfile::CoveMmseq),
+        _ => None,
+    }
+}
+
+fn ai_section_needed_for_operation(section_kind: u32, operation: OperationKindV2) -> bool {
+    if ai_shared_section_needed_for_operation(section_kind, operation) {
+        return true;
+    }
+    match operation {
+        OperationKindV2::AiInspect => ai_section_kind_known(section_kind),
+        OperationKindV2::AiChunkProjection => matches!(
+            section_kind,
+            k if k == SectionKind::AiChunkProfile as u32
+                || k == SectionKind::AiTextChunkIndex as u32
+        ),
+        OperationKindV2::AiTokenProjection => matches!(
+            section_kind,
+            k if k == SectionKind::AiTokenizerProfile as u32
+                || k == SectionKind::AiTokenBlock as u32
+                || k == SectionKind::AiTokenizedSpan as u32
+                || k == SectionKind::AiTokenSequencePack as u32
+        ),
+        OperationKindV2::AiEmbedding => ai_vector_payload_section_kind(section_kind),
+        OperationKindV2::AiSemanticSearch => ai_vector_payload_section_kind(section_kind),
+        OperationKindV2::AiRagContext => {
+            ai_vector_payload_section_kind(section_kind)
+                || matches!(
+                    section_kind,
+                    k if k == SectionKind::AiChunkProfile as u32
+                        || k == SectionKind::AiTextChunkIndex as u32
+                )
+        }
+        OperationKindV2::AiTrainingSampleExport => matches!(
+            section_kind,
+            k if k == SectionKind::AiTrainingProfile as u32
+                || k == SectionKind::AiTrainingSampleIndex as u32
+                || k == SectionKind::AiTrainingSplitDedupEpoch as u32
+                || k == SectionKind::AiLabelPreference as u32
+        ),
+        OperationKindV2::AiMultimodalSequenceRead => matches!(
+            section_kind,
+            k if k == SectionKind::AiTensorLayout as u32
+                || k == SectionKind::AiAssetManifest as u32
+                || k == SectionKind::AiMultimodalSequence as u32
+        ),
+        OperationKindV2::AiGeneratorAudit => matches!(
+            section_kind,
+            k if k == SectionKind::AiTrainingProfile as u32
+                || k == SectionKind::AiTrainingSampleIndex as u32
+                || k == SectionKind::AiLabelPreference as u32
+                || k == SectionKind::AiGeneratorProvenance as u32
+        ),
+        _ => false,
+    }
+}
+
+fn ai_shared_section_needed_for_operation(section_kind: u32, operation: OperationKindV2) -> bool {
+    if !matches!(
+        operation,
+        OperationKindV2::AiInspect
+            | OperationKindV2::AiChunkProjection
+            | OperationKindV2::AiTokenProjection
+            | OperationKindV2::AiEmbedding
+            | OperationKindV2::AiSemanticSearch
+            | OperationKindV2::AiRagContext
+            | OperationKindV2::AiTrainingSampleExport
+            | OperationKindV2::AiMultimodalSequenceRead
+            | OperationKindV2::AiGeneratorAudit
+    ) {
+        return false;
+    }
+    matches!(
+        section_kind,
+        k if k == SectionKind::AiCompanionArtifactRef as u32
+            || k == SectionKind::AiSourceBinding as u32
+            || k == SectionKind::AiReferenceTables as u32
+            || k == SectionKind::AiPayloadIntegrity as u32
+            || k == SectionKind::AiPrivacySummary as u32
+            || k == SectionKind::AiSectionFeatureBinding as u32
+            || k == SectionKind::AiPayloadBytes as u32
+    )
+}
+
+fn ai_vector_payload_section_kind(section_kind: u32) -> bool {
+    matches!(
+        section_kind,
+        k if k == SectionKind::AiVectorSpace as u32
+            || k == SectionKind::AiVectorBinding as u32
+            || k == SectionKind::AiVectorPayloadBlock as u32
+            || k == SectionKind::AiVectorDirectory as u32
+    )
+}
+
+fn ai_section_kind_known(section_kind: u32) -> bool {
+    matches!(
+        section_kind,
+        k if k == SectionKind::AiCompanionArtifactRef as u32
+            || k == SectionKind::AiSourceBinding as u32
+            || k == SectionKind::AiChunkProfile as u32
+            || k == SectionKind::AiTextChunkIndex as u32
+            || k == SectionKind::AiTokenizerProfile as u32
+            || k == SectionKind::AiTokenBlock as u32
+            || k == SectionKind::AiTokenizedSpan as u32
+            || k == SectionKind::AiTokenSequencePack as u32
+            || k == SectionKind::AiVectorSpace as u32
+            || k == SectionKind::AiVectorBinding as u32
+            || k == SectionKind::AiVectorPayloadBlock as u32
+            || k == SectionKind::AiVectorComposition as u32
+            || k == SectionKind::AiVectorIndex as u32
+            || k == SectionKind::AiTensorLayout as u32
+            || k == SectionKind::AiAssetManifest as u32
+            || k == SectionKind::AiMultimodalSequence as u32
+            || k == SectionKind::AiTrainingProfile as u32
+            || k == SectionKind::AiTrainingSampleIndex as u32
+            || k == SectionKind::AiTrainingSplitDedupEpoch as u32
+            || k == SectionKind::AiLabelPreference as u32
+            || k == SectionKind::AiGeneratorProvenance as u32
+            || k == SectionKind::AiReferenceTables as u32
+            || k == SectionKind::AiPayloadIntegrity as u32
+            || k == SectionKind::AiPrivacySummary as u32
+            || k == SectionKind::AiSectionFeatureBinding as u32
+            || k == SectionKind::AiVectorDirectory as u32
+            || k == SectionKind::AiPayloadBytes as u32
+    )
+}
+
+fn section_requiredness_intersects(
+    entry: &CoveAiSectionEntryV1,
+    request: &CoveAiFeatureScopeRequest,
+) -> bool {
+    let Some(scope) = AiRequirednessScopeV1::from_u8(entry.requiredness_scope) else {
+        return false;
+    };
+    match scope {
+        AiRequirednessScopeV1::ArtifactRequired => true,
+        AiRequirednessScopeV1::SectionRequired => {
+            request.needed_section_ids.contains(&entry.section_id)
+        }
+        AiRequirednessScopeV1::ProfileRequired => {
+            profile_kind_intersects_request(entry.profile_kind, request)
+        }
+        AiRequirednessScopeV1::OperationRequired => {
+            request.requested_operation.is_some()
+                && profile_kind_intersects_request(entry.profile_kind, request)
+        }
+        AiRequirednessScopeV1::AdvisoryOnly | AiRequirednessScopeV1::Extension => false,
+    }
+}
+
+fn binding_requiredness_intersects(
+    binding: &AiSectionFeatureBindingV1,
+    request: &CoveAiFeatureScopeRequest,
+) -> bool {
+    let Some(scope) = FeatureScopeV2::from_u8(binding.scope) else {
+        return false;
+    };
+    match scope {
+        FeatureScopeV2::FileRequired => true,
+        FeatureScopeV2::SectionRequired => request.needed_section_ids.contains(&binding.section_id),
+        FeatureScopeV2::PageRequired => request.needed_section_ids.contains(&binding.section_id),
+        FeatureScopeV2::ProfileRequired => {
+            profile_kind_intersects_request(binding.profile_kind, request)
+        }
+        FeatureScopeV2::OperationRequired => request
+            .requested_operation
+            .is_some_and(|operation| binding.operation_kind == operation as u16),
+        FeatureScopeV2::AdvisoryOnly => false,
+    }
+}
+
+fn profile_kind_intersects_request(profile_kind: u8, request: &CoveAiFeatureScopeRequest) -> bool {
+    let Some(requested_profile) = request.requested_profile else {
+        return false;
+    };
+    match PrimaryProfile::from_u8(profile_kind) {
+        Some(PrimaryProfile::Mixed | PrimaryProfile::CoveAiShared) => true,
+        Some(profile) => profile == requested_profile,
+        None => false,
     }
 }
 
@@ -1336,6 +1604,7 @@ impl AiDescriptorTablesV1 {
                 &vector_ref_ids,
             )?;
         }
+        self.validate_external_asset_digest_requirement(sections, artifact_required_ai_features)?;
         for binding in &self.multimodal_sequence_vector_bindings {
             binding.validate(
                 &vector_space_ids,
@@ -1367,6 +1636,79 @@ impl AiDescriptorTablesV1 {
             index.validate(&self.vector_spaces, &payload_ref_ids, &policy_ref_ids)?;
         }
         Ok(())
+    }
+
+    fn validate_external_asset_digest_requirement(
+        &self,
+        sections: &[CoveAiSection],
+        artifact_required_ai_features: u64,
+    ) -> Result<(), CoveError> {
+        if !self.ai_feature_required_anywhere(
+            sections,
+            artifact_required_ai_features,
+            AI_FEATURE_EXTERNAL_ASSET_DIGEST_REQUIRED,
+        ) {
+            return Ok(());
+        }
+
+        for source_binding in &self.source_bindings {
+            if matches!(
+                source_binding.source_kind,
+                AI_SOURCE_KIND_EXTERNAL_ASSET | AI_SOURCE_KIND_EXTERNAL_DATASET
+            ) && source_binding.source_file_digest_ref == 0
+            {
+                return Err(CoveError::BadSection(format!(
+                    "AI_FEATURE_EXTERNAL_ASSET_DIGEST_REQUIRED requires AiSourceBinding {} external source to carry source_file_digest_ref",
+                    source_binding.source_binding_id
+                )));
+            }
+        }
+
+        let assets_by_ref = self
+            .assets
+            .iter()
+            .map(|asset| (asset.asset_ref_id, asset))
+            .collect::<BTreeMap<_, _>>();
+
+        for asset in &self.assets {
+            if asset.asset_kind == 0 && asset.digest_ref == 0 {
+                return Err(CoveError::BadSection(format!(
+                    "AI_FEATURE_EXTERNAL_ASSET_DIGEST_REQUIRED requires external AiAssetRef {} to carry digest_ref",
+                    asset.asset_ref_id
+                )));
+            }
+        }
+
+        for binding in &self.asset_vector_bindings {
+            let asset_digest_ref = assets_by_ref
+                .get(&binding.asset_ref)
+                .map(|asset| asset.digest_ref)
+                .unwrap_or_default();
+            if binding.asset_digest_ref == 0 && asset_digest_ref == 0 {
+                return Err(CoveError::BadSection(format!(
+                    "AI_FEATURE_EXTERNAL_ASSET_DIGEST_REQUIRED requires AssetVectorBinding {} to carry asset_digest_ref or reference an asset digest",
+                    binding.binding_id
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn ai_feature_required_anywhere(
+        &self,
+        sections: &[CoveAiSection],
+        artifact_required_ai_features: u64,
+        feature: u64,
+    ) -> bool {
+        artifact_required_ai_features & feature != 0
+            || sections
+                .iter()
+                .any(|section| section.entry.required_ai_features & feature != 0)
+            || self
+                .section_feature_bindings
+                .iter()
+                .any(|binding| binding.required_ai_features & feature != 0)
     }
 
     fn validate_text_chunks(
