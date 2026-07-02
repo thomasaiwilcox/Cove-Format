@@ -129,7 +129,7 @@ pub(super) fn write_covev_filecode_vectors_inner(
             flags: 0,
             crc32c: 0,
         })?,
-    ])?;
+    ]);
 
     let privacy_summary = encode_records([encode_privacy_summary(AiPrivacySummaryEntryV1 {
         privacy_summary_ref: 1,
@@ -143,7 +143,7 @@ pub(super) fn write_covev_filecode_vectors_inner(
         disclosure_state: 0,
         flags: 0,
         crc32c: 0,
-    })?])?;
+    })?]);
 
     let payload_integrity = encode_records([encode_payload_integrity(AiPayloadIntegrityV1 {
         integrity_ref: 1,
@@ -155,7 +155,7 @@ pub(super) fn write_covev_filecode_vectors_inner(
         digest_ref: 1,
         payload_crc32c: vector_payload_crc32c,
         flags: 0,
-    })?])?;
+    })?]);
 
     let vector_space = encode_records([encode_vector_space(VectorSpaceDescriptorV1 {
         vector_space_id: 1,
@@ -179,7 +179,7 @@ pub(super) fn write_covev_filecode_vectors_inner(
         reserved: 0,
         flags: 0,
         checksum: 0,
-    })?])?;
+    })?]);
 
     let vector_payload_block =
         encode_records([encode_vector_payload_block(VectorPayloadBlockHeaderV1 {
@@ -200,7 +200,7 @@ pub(super) fn write_covev_filecode_vectors_inner(
             payload_length: 0,
             integrity_ref: 1,
             checksum: 0,
-        })?])?;
+        })?]);
 
     let mut vector_entries = Vec::with_capacity(build.file_codes.len());
     let mut filecode_bindings = Vec::with_capacity(build.file_codes.len());
@@ -283,13 +283,13 @@ pub(super) fn write_covev_filecode_vectors_inner(
             7,
             SectionKind::AiVectorDirectory,
             PrimaryProfile::CoveVec,
-            encode_records(vector_entries)?,
+            encode_records(vector_entries),
         ),
         coveai_binary_section(
             8,
             SectionKind::AiVectorBinding,
             PrimaryProfile::CoveVec,
-            encode_records(filecode_bindings)?,
+            encode_records(filecode_bindings),
         ),
     ];
     if let Some(index_kind) = options.index_kind {
@@ -317,7 +317,7 @@ pub(super) fn write_covev_filecode_vectors_inner(
                 quantization_error_profile_ref: 0,
                 payload_ref: 0,
                 checksum: 0,
-            })?])?,
+            })?]),
         ));
     }
 
@@ -1041,7 +1041,7 @@ pub fn write_coveai_descriptor_bundle(
             section_id,
             section_kind,
             profile_kind,
-            encode_records(records)?,
+            encode_records(records),
         ));
         Ok(())
     };
@@ -1493,21 +1493,19 @@ pub(super) fn optional_features_for_ai_section(section_kind: SectionKind) -> u64
     }
 }
 
-pub(super) fn encode_records(
-    records: impl IntoIterator<Item = Vec<u8>>,
-) -> Result<Vec<u8>, CoveError> {
+pub(super) fn encode_records(records: impl IntoIterator<Item = Vec<u8>>) -> Vec<u8> {
     let mut out = Vec::new();
     for record in records {
         out.extend_from_slice(&record);
     }
-    Ok(out)
+    out
 }
 
 pub(super) fn encode_ai_record(
     record_kind: u16,
     local_id: u64,
     flags: u32,
-    payload: Vec<u8>,
+    payload: &[u8],
 ) -> Result<Vec<u8>, CoveError> {
     encode_ai_record_with_version(record_kind, 1, local_id, flags, payload)
 }
@@ -1517,7 +1515,7 @@ pub(super) fn encode_ai_record_with_version(
     record_version: u16,
     local_id: u64,
     flags: u32,
-    payload: Vec<u8>,
+    payload: &[u8],
 ) -> Result<Vec<u8>, CoveError> {
     let record_len = AI_RECORD_HEADER_LEN
         .checked_add(payload.len())
@@ -1529,7 +1527,7 @@ pub(super) fn encode_ai_record_with_version(
     put_u32(&mut out, 4, record_len_u32);
     put_u64(&mut out, 8, local_id);
     put_u32(&mut out, 16, flags);
-    out[AI_RECORD_HEADER_LEN..].copy_from_slice(&payload);
+    out[AI_RECORD_HEADER_LEN..].copy_from_slice(payload);
     let crc32c = checksum_with_zeroed_field(&out, 20)?;
     put_u32(&mut out, 20, crc32c);
     Ok(out)
@@ -1570,7 +1568,7 @@ pub(super) fn encode_string_entry(record: AiStringEntryV1) -> Result<Vec<u8>, Co
         1,
         u64::from(record.string_ref),
         AI_FLAG_PAYLOAD_CRC32C_PRESENT,
-        payload,
+        &payload,
     )
 }
 
@@ -1587,7 +1585,7 @@ pub(super) fn encode_digest_entry(record: AiDigestEntryV1) -> Result<Vec<u8>, Co
         2,
         u64::from(record.digest_ref),
         AI_FLAG_PAYLOAD_CRC32C_PRESENT,
-        payload,
+        &payload,
     )
 }
 
@@ -1609,7 +1607,7 @@ pub(super) fn encode_companion_artifact_ref(
         1,
         u64::from(record.artifact_ref),
         AI_FLAG_PAYLOAD_CRC32C_PRESENT,
-        payload,
+        &payload,
     )
 }
 
@@ -1634,7 +1632,7 @@ pub(super) fn encode_source_binding(record: AiSourceBindingV1) -> Result<Vec<u8>
         1,
         u64::from(record.source_binding_id),
         AI_FLAG_PAYLOAD_CRC32C_PRESENT,
-        payload,
+        &payload,
     )
 }
 
@@ -1656,7 +1654,7 @@ pub(super) fn encode_payload_ref_entry(record: AiPayloadRefEntryV1) -> Result<Ve
         3,
         u64::from(record.payload_ref),
         AI_FLAG_PAYLOAD_CRC32C_PRESENT,
-        payload,
+        &payload,
     )
 }
 
@@ -1673,7 +1671,7 @@ pub(super) fn encode_policy_ref_entry(record: AiPolicyRefEntryV1) -> Result<Vec<
         4,
         u64::from(record.policy_ref),
         AI_FLAG_PAYLOAD_CRC32C_PRESENT,
-        payload,
+        &payload,
     )
 }
 
@@ -1695,7 +1693,7 @@ pub(super) fn encode_source_span_entry(record: AiSourceSpanEntryV1) -> Result<Ve
         5,
         u64::from(record.source_span_ref),
         AI_FLAG_PAYLOAD_CRC32C_PRESENT,
-        payload,
+        &payload,
     )
 }
 
@@ -1714,7 +1712,7 @@ pub(super) fn encode_transform_entry(record: AiTransformEntryV1) -> Result<Vec<u
         6,
         u64::from(record.transform_ref),
         AI_FLAG_PAYLOAD_CRC32C_PRESENT,
-        payload,
+        &payload,
     )
 }
 
@@ -1737,7 +1735,7 @@ pub(super) fn encode_privacy_summary(
         1,
         u64::from(record.privacy_summary_ref),
         AI_FLAG_PAYLOAD_CRC32C_PRESENT,
-        payload,
+        &payload,
     )
 }
 
@@ -1752,7 +1750,7 @@ pub(super) fn encode_payload_integrity(record: AiPayloadIntegrityV1) -> Result<V
     put_u32(&mut payload, 14, record.digest_ref);
     put_u32(&mut payload, 18, record.payload_crc32c);
     put_u32(&mut payload, 22, record.flags);
-    encode_ai_record(1, u64::from(record.integrity_ref), 0, payload)
+    encode_ai_record(1, u64::from(record.integrity_ref), 0, &payload)
 }
 
 pub(super) fn encode_section_feature_binding(
@@ -1773,7 +1771,7 @@ pub(super) fn encode_section_feature_binding(
         1,
         u64::from(record.binding_ref),
         AI_FLAG_PAYLOAD_CRC32C_PRESENT,
-        payload,
+        &payload,
     )
 }
 
@@ -1802,7 +1800,7 @@ pub(super) fn encode_chunk_profile(record: ChunkProfileV1) -> Result<Vec<u8>, Co
         1,
         u64::from(record.chunk_profile_id),
         AI_FLAG_PAYLOAD_CRC32C_PRESENT,
-        payload,
+        &payload,
     )
 }
 
@@ -1835,7 +1833,7 @@ pub(super) fn encode_text_chunk_entry(record: TextChunkEntryV1) -> Result<Vec<u8
     put_u32(&mut payload, 140, record.policy_ref);
     put_u32(&mut payload, 144, record.flags);
     let payload = with_payload_crc32c(payload, 148)?;
-    encode_ai_record(1, record.chunk_id, AI_FLAG_PAYLOAD_CRC32C_PRESENT, payload)
+    encode_ai_record(1, record.chunk_id, AI_FLAG_PAYLOAD_CRC32C_PRESENT, &payload)
 }
 
 pub(super) fn encode_tokenizer_profile(record: TokenizerProfileV1) -> Result<Vec<u8>, CoveError> {
@@ -1871,7 +1869,7 @@ pub(super) fn encode_tokenizer_profile(record: TokenizerProfileV1) -> Result<Vec
         1,
         u64::from(record.tokenizer_profile_id),
         AI_FLAG_PAYLOAD_CRC32C_PRESENT,
-        payload,
+        &payload,
     )
 }
 
@@ -1892,7 +1890,7 @@ pub(super) fn encode_token_block(record: TokenBlockHeaderV1) -> Result<Vec<u8>, 
         1,
         u64::from(record.token_block_id),
         AI_FLAG_PAYLOAD_CRC32C_PRESENT,
-        payload,
+        &payload,
     )
 }
 
@@ -1912,7 +1910,7 @@ pub(super) fn encode_tokenized_span(record: TokenizedSpanV1) -> Result<Vec<u8>, 
         1,
         record.tokenized_span_id,
         AI_FLAG_PAYLOAD_CRC32C_PRESENT,
-        payload,
+        &payload,
     )
 }
 
@@ -1940,7 +1938,7 @@ pub(super) fn encode_token_sequence_pack(
         1,
         record.sequence_pack_id,
         AI_FLAG_PAYLOAD_CRC32C_PRESENT,
-        payload,
+        &payload,
     )
 }
 
@@ -1970,7 +1968,7 @@ pub(super) fn encode_training_profile(record: TrainingProfileV1) -> Result<Vec<u
         1,
         u64::from(record.training_profile_id),
         AI_FLAG_PAYLOAD_CRC32C_PRESENT,
-        payload,
+        &payload,
     )
 }
 
@@ -2002,7 +2000,12 @@ pub(super) fn encode_training_sample_entry(
     put_u64(&mut payload, 105, record.label_generator_provenance_ref);
     put_u32(&mut payload, 113, record.flags);
     let payload = with_payload_crc32c(payload, 117)?;
-    encode_ai_record(1, record.sample_id, AI_FLAG_PAYLOAD_CRC32C_PRESENT, payload)
+    encode_ai_record(
+        1,
+        record.sample_id,
+        AI_FLAG_PAYLOAD_CRC32C_PRESENT,
+        &payload,
+    )
 }
 
 pub(super) fn encode_dataset_split(record: DatasetSplitV1) -> Result<Vec<u8>, CoveError> {
@@ -2026,7 +2029,7 @@ pub(super) fn encode_dataset_split(record: DatasetSplitV1) -> Result<Vec<u8>, Co
         1,
         u64::from(record.split_id),
         AI_FLAG_PAYLOAD_CRC32C_PRESENT,
-        payload,
+        &payload,
     )
 }
 
@@ -2046,7 +2049,7 @@ pub(super) fn encode_dedup_group(record: DedupGroupV1) -> Result<Vec<u8>, CoveEr
         2,
         record.dedup_group_id,
         AI_FLAG_PAYLOAD_CRC32C_PRESENT,
-        payload,
+        &payload,
     )
 }
 
@@ -2070,7 +2073,7 @@ pub(super) fn encode_training_epoch_plan(
         3,
         record.epoch_plan_id,
         AI_FLAG_PAYLOAD_CRC32C_PRESENT,
-        payload,
+        &payload,
     )
 }
 
@@ -2089,7 +2092,7 @@ pub(super) fn encode_training_label_entry(
     put_u32(&mut payload, 34, record.policy_ref);
     put_u32(&mut payload, 38, record.flags);
     let payload = with_payload_crc32c(payload, 42)?;
-    encode_ai_record(1, record.label_id, AI_FLAG_PAYLOAD_CRC32C_PRESENT, payload)
+    encode_ai_record(1, record.label_id, AI_FLAG_PAYLOAD_CRC32C_PRESENT, &payload)
 }
 
 pub(super) fn encode_preference_pair_entry(
@@ -2112,7 +2115,7 @@ pub(super) fn encode_preference_pair_entry(
         2,
         record.preference_pair_id,
         AI_FLAG_PAYLOAD_CRC32C_PRESENT,
-        payload,
+        &payload,
     )
 }
 
@@ -2141,7 +2144,7 @@ pub(super) fn encode_generator_provenance(
         1,
         record.generator_provenance_id,
         AI_FLAG_PAYLOAD_CRC32C_PRESENT,
-        payload,
+        &payload,
     )
 }
 
@@ -2165,7 +2168,7 @@ pub(super) fn encode_model_actor(record: ModelActorDescriptorV1) -> Result<Vec<u
         2,
         u64::from(record.model_actor_id),
         AI_FLAG_PAYLOAD_CRC32C_PRESENT,
-        payload,
+        &payload,
     )
 }
 
@@ -2188,7 +2191,7 @@ pub(super) fn encode_generation_decoding_profile(
         3,
         u64::from(record.decoding_profile_id),
         AI_FLAG_PAYLOAD_CRC32C_PRESENT,
-        payload,
+        &payload,
     )
 }
 
@@ -2207,7 +2210,7 @@ pub(super) fn encode_human_review(record: HumanReviewEntryV1) -> Result<Vec<u8>,
         4,
         u64::from(record.human_review_id),
         AI_FLAG_PAYLOAD_CRC32C_PRESENT,
-        payload,
+        &payload,
     )
 }
 
@@ -2236,7 +2239,7 @@ pub(super) fn encode_tensor_layout(record: TensorLayoutDescriptorV1) -> Result<V
         1,
         u64::from(record.tensor_layout_id),
         AI_FLAG_PAYLOAD_CRC32C_PRESENT,
-        payload,
+        &payload,
     )
 }
 
@@ -2258,7 +2261,7 @@ pub(super) fn encode_device_transfer_hint(
         2,
         u64::from(record.transfer_hint_id),
         AI_FLAG_PAYLOAD_CRC32C_PRESENT,
-        payload,
+        &payload,
     )
 }
 
@@ -2290,7 +2293,7 @@ pub(super) fn encode_ai_asset_ref(record: AiAssetRefV1) -> Result<Vec<u8>, CoveE
         1,
         record.asset_ref_id,
         AI_FLAG_PAYLOAD_CRC32C_PRESENT,
-        payload,
+        &payload,
     )
 }
 
@@ -2319,7 +2322,7 @@ pub(super) fn encode_multimodal_sequence_pack(
         1,
         record.sequence_pack_id,
         AI_FLAG_PAYLOAD_CRC32C_PRESENT,
-        payload,
+        &payload,
     )
 }
 
@@ -2351,7 +2354,7 @@ pub(super) fn encode_multimodal_sequence_element(
         2,
         record.element_id,
         AI_FLAG_PAYLOAD_CRC32C_PRESENT,
-        payload,
+        &payload,
     )
 }
 
@@ -2382,7 +2385,7 @@ pub(super) fn encode_vector_space(record: VectorSpaceDescriptorV1) -> Result<Vec
         1,
         u64::from(record.vector_space_id),
         AI_FLAG_PAYLOAD_CRC32C_PRESENT,
-        payload,
+        &payload,
     )
 }
 
@@ -2408,7 +2411,7 @@ pub(super) fn encode_vector_space_compatibility(
         2,
         u64::from(record.compatibility_id),
         AI_FLAG_PAYLOAD_CRC32C_PRESENT,
-        payload,
+        &payload,
     )
 }
 
@@ -2451,7 +2454,7 @@ pub(super) fn encode_filecode_vector_binding(
         record_version,
         record.binding_id,
         AI_FLAG_PAYLOAD_CRC32C_PRESENT,
-        payload,
+        &payload,
     )
 }
 
@@ -2485,7 +2488,7 @@ pub(super) fn encode_chunk_vector_binding(
         record_version,
         record.binding_id,
         AI_FLAG_PAYLOAD_CRC32C_PRESENT,
-        payload,
+        &payload,
     )
 }
 
@@ -2524,7 +2527,7 @@ pub(super) fn encode_object_state_vector_binding(
         record_version,
         record.binding_id,
         AI_FLAG_PAYLOAD_CRC32C_PRESENT,
-        payload,
+        &payload,
     )
 }
 
@@ -2558,7 +2561,7 @@ pub(super) fn encode_training_sample_vector_binding(
         record_version,
         record.binding_id,
         AI_FLAG_PAYLOAD_CRC32C_PRESENT,
-        payload,
+        &payload,
     )
 }
 
@@ -2597,7 +2600,7 @@ pub(super) fn encode_association_state_vector_binding(
         record_version,
         record.binding_id,
         AI_FLAG_PAYLOAD_CRC32C_PRESENT,
-        payload,
+        &payload,
     )
 }
 
@@ -2630,7 +2633,7 @@ pub(super) fn encode_asset_vector_binding(
         record_version,
         record.binding_id,
         AI_FLAG_PAYLOAD_CRC32C_PRESENT,
-        payload,
+        &payload,
     )
 }
 
@@ -2663,7 +2666,7 @@ pub(super) fn encode_multimodal_sequence_vector_binding(
         record_version,
         record.binding_id,
         AI_FLAG_PAYLOAD_CRC32C_PRESENT,
-        payload,
+        &payload,
     )
 }
 
@@ -2692,7 +2695,7 @@ pub(super) fn encode_vector_payload_block(
         1,
         u64::from(record.block_id),
         AI_FLAG_PAYLOAD_CRC32C_PRESENT,
-        payload,
+        &payload,
     )
 }
 
@@ -2710,7 +2713,7 @@ pub(super) fn encode_vector_entry(record: VectorEntryV1) -> Result<Vec<u8>, Cove
         1,
         record.vector_ref,
         AI_FLAG_PAYLOAD_CRC32C_PRESENT,
-        payload,
+        &payload,
     )
 }
 
@@ -2737,7 +2740,7 @@ pub(super) fn encode_vector_composition_profile(
         1,
         u64::from(record.composition_profile_id),
         AI_FLAG_PAYLOAD_CRC32C_PRESENT,
-        payload,
+        &payload,
     )
 }
 
@@ -2759,7 +2762,7 @@ pub(super) fn encode_vector_composition_component(
         2,
         u64::from(record.component_id),
         AI_FLAG_PAYLOAD_CRC32C_PRESENT,
-        payload,
+        &payload,
     )
 }
 
@@ -2785,7 +2788,7 @@ pub(super) fn encode_vector_arithmetic_profile(
         3,
         u64::from(record.arithmetic_profile_id),
         AI_FLAG_PAYLOAD_CRC32C_PRESENT,
-        payload,
+        &payload,
     )
 }
 
@@ -2813,6 +2816,6 @@ pub(super) fn encode_vector_index(record: VectorIndexDescriptorV1) -> Result<Vec
         1,
         u64::from(record.vector_index_id),
         AI_FLAG_PAYLOAD_CRC32C_PRESENT,
-        payload,
+        &payload,
     )
 }

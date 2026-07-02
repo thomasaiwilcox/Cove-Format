@@ -883,6 +883,9 @@ fn append_dense_u32_rows_avx2_dispatch(
     }
 }
 
+// Keep the dispatch contract identical across architectures; this returns
+// `Some` on AArch64 and `None` elsewhere.
+#[allow(clippy::unnecessary_wraps)]
 fn append_dense_u32_rows_neon_dispatch(
     rows: &mut Vec<u32>,
     base: u32,

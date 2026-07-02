@@ -159,7 +159,7 @@ async fn sql_filter_uses_matched_coverage_metadata_for_morsel_pruning() {
         },
         "name = 'gamma'",
     );
-    let plan = plan_scan(&state, Some(&vec![0, 1]), vec![filter]).unwrap();
+    let plan = plan_scan(&state, Some(&[0, 1]), vec![filter]).unwrap();
     assert!(plan.coverage_expr.is_some());
     let decoded = decode_scan(&state, &plan).unwrap();
     assert_eq!(decoded.stats.morsels_pruned, 1);
@@ -200,7 +200,7 @@ async fn coverage_metadata_bad_checksum_fails_open() {
         },
         "name = 'gamma'",
     );
-    let plan = plan_scan(&state, Some(&vec![0, 1]), vec![filter]).unwrap();
+    let plan = plan_scan(&state, Some(&[0, 1]), vec![filter]).unwrap();
     let decoded = decode_scan(&state, &plan).unwrap();
     assert_eq!(decoded.stats.morsels_pruned, 0);
 
@@ -240,7 +240,7 @@ async fn coverage_metadata_stale_snapshot_fails_open() {
         },
         "name = 'gamma'",
     );
-    let plan = plan_scan(&state, Some(&vec![0, 1]), vec![filter]).unwrap();
+    let plan = plan_scan(&state, Some(&[0, 1]), vec![filter]).unwrap();
     let decoded = decode_scan(&state, &plan).unwrap();
     assert_eq!(decoded.stats.morsels_pruned, 0);
 
@@ -296,7 +296,7 @@ fn sibling_coverage_cache_is_explicit_and_records_planner_hits() {
         },
         "name = 'gamma'",
     );
-    let plan = plan_scan(&cached_state, Some(&vec![0, 1]), vec![filter]).unwrap();
+    let plan = plan_scan(&cached_state, Some(&[0, 1]), vec![filter]).unwrap();
     let cache_stats = cached_state.coverage_cache().runtime_stats();
     assert_eq!(cache_stats.hits, 1);
     assert_eq!(cache_stats.misses, 0);

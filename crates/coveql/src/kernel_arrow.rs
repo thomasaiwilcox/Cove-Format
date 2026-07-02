@@ -76,7 +76,7 @@ fn selected_execution_rows_to_owned_record_batch(
                         .map_err(|err| KernelArrowError::ExpressionEvaluation(err.message))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            values_to_array(&values)?
+            values_to_array(&values)
         };
         fields.push(Field::new(&name, array.data_type().clone(), true));
         arrays.push(array);
@@ -137,7 +137,7 @@ pub(crate) fn json_rows_to_owned_record_batch(
     let arrays = fields
         .iter()
         .map(|field| build_array(rows, field))
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Vec<_>>();
     let schema = Arc::new(Schema::new(
         fields
             .iter()
@@ -167,7 +167,7 @@ fn ordered_fields(rows: &[Value]) -> Vec<String> {
     out
 }
 
-fn build_array(rows: &[Value], field: &str) -> Result<ArrayRef, KernelArrowError> {
+fn build_array(rows: &[Value], field: &str) -> ArrayRef {
     let values = rows
         .iter()
         .map(|row| {
@@ -181,53 +181,53 @@ fn build_array(rows: &[Value], field: &str) -> Result<ArrayRef, KernelArrowError
     values_to_array(&values)
 }
 
-fn values_to_array(values: &[Value]) -> Result<ArrayRef, KernelArrowError> {
+fn values_to_array(values: &[Value]) -> ArrayRef {
     if values
         .iter()
         .all(|value| value.is_null() || value.as_bool().is_some())
     {
-        return Ok(Arc::new(BooleanArray::from(
+        return Arc::new(BooleanArray::from(
             values
                 .iter()
                 .map(|value| value.as_bool())
                 .collect::<Vec<_>>(),
-        )));
+        ));
     }
     if values
         .iter()
         .all(|value| value.is_null() || value.as_i64().is_some())
     {
-        return Ok(Arc::new(Int64Array::from(
+        return Arc::new(Int64Array::from(
             values
                 .iter()
                 .map(|value| value.as_i64())
                 .collect::<Vec<_>>(),
-        )));
+        ));
     }
     if values
         .iter()
         .all(|value| value.is_null() || value.as_u64().is_some())
     {
-        return Ok(Arc::new(UInt64Array::from(
+        return Arc::new(UInt64Array::from(
             values
                 .iter()
                 .map(|value| value.as_u64())
                 .collect::<Vec<_>>(),
-        )));
+        ));
     }
     if values
         .iter()
         .all(|value| value.is_null() || value.as_f64().is_some())
     {
-        return Ok(Arc::new(Float64Array::from(
+        return Arc::new(Float64Array::from(
             values
                 .iter()
                 .map(|value| value.as_f64())
                 .collect::<Vec<_>>(),
-        )));
+        ));
     }
 
-    Ok(Arc::new(StringArray::from(
+    Arc::new(StringArray::from(
         values
             .iter()
             .map(|value| {
@@ -240,7 +240,7 @@ fn values_to_array(values: &[Value]) -> Result<ArrayRef, KernelArrowError> {
                 }
             })
             .collect::<Vec<_>>(),
-    )))
+    ))
 }
 
 fn output_name_for_expr(expr: &ResolvedExpr) -> String {

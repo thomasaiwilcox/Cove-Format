@@ -117,7 +117,7 @@ impl FileOpener for CoveFileOpener {
                 )));
             }
             let lowered_filters = lower_physical_filters(&state, &physical_filters);
-            let plan = plan_scan(&state, projection.as_ref(), lowered_filters.filters)
+            let plan = plan_scan(&state, projection.as_deref(), lowered_filters.filters)
                 .map_err(cove_to_datafusion)?;
             let (sender, receiver) = mpsc::unbounded_channel();
             let handle = tokio::runtime::Handle::current();
@@ -127,7 +127,7 @@ impl FileOpener for CoveFileOpener {
                     let mut sink = UnboundedDecodeSink::new(sender.clone(), output_adapter);
                     match decode_scan_with_reader_to_sink(&state, &plan, &reader, &mut sink).await {
                         Ok(stats) => {
-                            decode_metrics.record_decode(stats);
+                            decode_metrics.record_decode(&stats);
                             let _ = sender.send(DecodeStreamEvent::Finished);
                         }
                         Err(error) => {

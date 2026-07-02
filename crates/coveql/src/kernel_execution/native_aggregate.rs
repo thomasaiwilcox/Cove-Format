@@ -1016,7 +1016,7 @@ pub(super) fn finish_native_direct_numeric_aggregate(
     match aggregate {
         AstAggregateName::Sum if saw_float => Ok(json!(float_sum)),
         AstAggregateName::Avg if saw_float => Ok(json!(float_sum / count as f64)),
-        AstAggregateName::Sum => exact_sum
+        AstAggregateName::Sum => Ok(exact_sum
             .ok_or_else(|| {
                 exec_error(
                     "E_KERNEL_AGGREGATE",
@@ -1024,9 +1024,8 @@ pub(super) fn finish_native_direct_numeric_aggregate(
                     json!({ "aggregate": aggregate_operator_name(aggregate) }),
                 )
             })?
-            .to_json_sum()
-            .map_err(|message| exec_error("E_KERNEL_AGGREGATE", message, json!({}))),
-        AstAggregateName::Avg => exact_sum
+            .to_json_sum()),
+        AstAggregateName::Avg => Ok(exact_sum
             .ok_or_else(|| {
                 exec_error(
                     "E_KERNEL_AGGREGATE",
@@ -1042,8 +1041,7 @@ pub(super) fn finish_native_direct_numeric_aggregate(
                     json!({ "aggregate": aggregate_operator_name(aggregate) }),
                 )
             })?
-            .to_json_sum()
-            .map_err(|message| exec_error("E_KERNEL_AGGREGATE", message, json!({}))),
+            .to_json_sum()),
         _ => Err(exec_error(
             "E_KERNEL_AGGREGATE",
             "native numeric aggregate received a nonnumeric aggregate",

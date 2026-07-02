@@ -462,7 +462,7 @@ impl CoveFileMetrics {
         }
     }
 
-    pub(crate) fn record_decode(&self, stats: DecodeStats) {
+    pub(crate) fn record_decode(&self, stats: &DecodeStats) {
         self.files_considered.add(stats.files_considered);
         self.files_pruned.add(stats.files_pruned);
         self.files_validated.add(stats.files_validated);

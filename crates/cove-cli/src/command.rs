@@ -1,0 +1,88 @@
+pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<(), CliError> {
+    let result: Result<(), String> = match parse_args(args).map_err(CliError::usage)? {
+        Command::Help(topic) => {
+            print_usage(topic);
+            Ok(())
+        }
+        Command::Examples { json } => run_examples(json),
+        Command::Doctor { file, json } => run_doctor(&file, json),
+        Command::Inspect {
+            file,
+            queries,
+            json,
+            performance,
+            ai,
+        } => run_inspect(&file, queries, json, performance, ai),
+        Command::Optimize {
+            file,
+            out_dir,
+            full,
+            json,
+        } => run_optimize(&file, out_dir.as_deref(), full, json),
+        Command::ShowcaseCustomer360 {
+            out_dir,
+            profile,
+            force,
+            json,
+        } => run_showcase_customer360(&out_dir, profile, force, json),
+        Command::ShowcaseProofSuite {
+            out_dir,
+            profile,
+            scenario,
+            force,
+            json,
+        } => run_showcase_proof_suite(&out_dir, profile, scenario, force, json),
+        Command::ShowcaseAiTraining {
+            out_dir,
+            profile,
+            force,
+            json,
+        } => run_showcase_ai_training(&out_dir, profile, force, json),
+        Command::Query(command) => run_query(
+            command.file.as_deref(),
+            &command.query,
+            QueryCommandOptions {
+                query_file: command.query_file,
+                format: command.format,
+                take: command.take,
+                explain: command.explain,
+                mapping: command.mapping,
+                members: command.members,
+                dataset: command.dataset,
+                engine: command.engine,
+                batch_size: command.batch_size,
+                graph_budget: command.graph_budget,
+                enable_graph_traversal: command.enable_graph_traversal,
+                allow_index_only: command.allow_index_only,
+                allow_zero_copy: command.allow_zero_copy,
+                physical_sidecars: command.physical_sidecars,
+                external_tables: command.external_tables,
+                no_auto_sidecars: command.no_auto_sidecars,
+                strict_performance: command.strict_performance,
+                perf_report: command.perf_report,
+                json_diagnostics: command.json_diagnostics,
+                delta_request: command.delta_request,
+                delta_plan: command.delta_plan,
+                delta_plan_json: command.delta_plan_json,
+                max_cell_width: command.max_cell_width,
+            },
+        ),
+        Command::Convert { format, args } => run_convert(format, args),
+        Command::Validate { args } => run_validate(args),
+        Command::Vector { args } => run_vec(args),
+        Command::Ai { args } => run_ai(args),
+        Command::Train { args } => run_train(args),
+        Command::InspectDetailed { args } => run_inspect_detailed(args),
+        Command::Dump { args } => cove_dump::run_cli(args).map_err(|error| error.to_string()),
+        Command::Map { args } => run_map(args),
+        Command::Export { format, args } => run_export(format, args),
+        Command::Perf { command, args } => run_perf(command, args),
+        Command::Sidecar { args } => run_sidecar(args),
+        Command::Delta { args } => run_delta(args),
+        Command::Digest { args } => run_digest(args),
+        Command::Profile { args } => run_profile(args),
+        Command::Canonicalise { args } => run_canonicalise(args),
+    };
+    result.map_err(CliError::from)
+}
+

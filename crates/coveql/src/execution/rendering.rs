@@ -53,7 +53,7 @@ pub(super) fn finish_materialized_rows_with_context(
             started,
         );
     }
-    sort_rows(&mut rows, planned, context)?;
+    sort_rows(&mut rows, planned, context);
     let rows = apply_skip_take(rows, planned);
     let output_rows = rows.len();
     match &planned.resolved.output_mode {

@@ -148,6 +148,12 @@ pub struct PreparedEncodedArray<'a> {
 }
 
 impl<'a> PreparedEncodedArray<'a> {
+    /// Prepares page-scoped access for repeated row reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoveError`] if variable-width offsets cannot be decoded or if
+    /// a transform/container encoding cannot be decoded at page scope.
     pub fn new(array: &'a EncodedArray<'a>) -> Result<Self, CoveError> {
         let repr = match array.encoding {
             CoveEncodingKind::PlainVarint => PreparedArrayRepr::VariableOffsets(
@@ -186,6 +192,12 @@ impl<'a> PreparedEncodedArray<'a> {
         self.array
     }
 
+    /// Decodes the value at `row` through the prepared page representation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoveError::OffsetRange`] when `row` is outside the page, or a
+    /// decoding error if the prepared offset/value representation is malformed.
     pub fn decode_row(&self, row: u64) -> Result<CoveArrayValue<'a>, CoveError> {
         if row >= self.array.row_count {
             return Err(CoveError::OffsetRange);
@@ -230,6 +242,12 @@ impl<'a> PreparedEncodedArray<'a> {
         }
     }
 
+    /// Decodes selected rows in the order supplied by `selected_rows`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoveError::OffsetRange`] for any row outside the page, or any
+    /// error reported while decoding a selected value.
     pub fn decode_selected_rows(
         &self,
         selected_rows: &[u32],
@@ -241,6 +259,12 @@ impl<'a> PreparedEncodedArray<'a> {
         Ok(out)
     }
 
+    /// Decodes all rows in page order through the prepared representation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoveError`] if row count conversion fails or any row cannot be
+    /// decoded from the prepared representation.
     pub fn decode_all_rows(&self) -> Result<Vec<CoveArrayValue<'a>>, CoveError> {
         match &self.repr {
             PreparedArrayRepr::DecodedValues(values) => Ok(values.clone()),
@@ -318,10 +342,12 @@ impl<'a> EncodedArray<'a> {
     /// same page should call [`EncodedArray::prepare`] once and then read
     /// through [`PreparedEncodedArray`].
     ///
-    /// Returns [`CoveArrayValue::Null`] if the row is null.
+    /// # Errors
+    ///
     /// Returns [`CoveError::OffsetRange`] if `row >= row_count`.
-    /// Returns [`CoveError::UnsupportedEncoding`] for transform/container encodings
-    /// not representable as standalone row values.
+    /// Returns [`CoveError::UnsupportedEncoding`] for transform/container
+    /// encodings not representable as standalone row values. Other
+    /// [`CoveError`] variants are returned when the encoded value is malformed.
     pub fn decode_row(&self, row: u64) -> Result<CoveArrayValue<'_>, CoveError> {
         if row >= self.row_count {
             return Err(CoveError::OffsetRange);
@@ -333,6 +359,11 @@ impl<'a> EncodedArray<'a> {
     }
 
     /// Prepares page-scoped access for repeated row reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoveError`] if variable-width offsets cannot be decoded or if
+    /// a transform/container encoding cannot be decoded at page scope.
     pub fn prepare(&'a self) -> Result<PreparedEncodedArray<'a>, CoveError> {
         PreparedEncodedArray::new(self)
     }
@@ -341,11 +372,17 @@ impl<'a> EncodedArray<'a> {
     ///
     /// This provides a page-scoped path for row-wise consumers so transform
     /// encodings are parsed and decoded once per page instead of once per row.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoveError`] if the page payload is malformed, row counts cannot
+    /// be represented on this platform, or a transform/container decoder reports
+    /// an invalid encoding.
     pub fn decode_all_rows(&self) -> Result<Vec<CoveArrayValue<'_>>, CoveError> {
         match self.encoding {
             CoveEncodingKind::LocalCodebook => {
                 let payload = LocalCodebookPayload::parse(self.data)?;
-                self.values_from_local_codebook_values(payload.decode_values()?)
+                self.values_from_local_codebook_values(&payload.decode_values()?)
             }
             CoveEncodingKind::Rle => {
                 let payload = RlePayload::parse(self.data)?;
@@ -484,31 +521,31 @@ impl<'a> EncodedArray<'a> {
             }
             CoveEncodingKind::Rle => {
                 let payload = RlePayload::parse(self.data)?;
-                self.value_from_i64_vec(row, Rle::fast_decode(&payload)?)
+                self.value_from_i64_slice(row, &Rle::fast_decode(&payload)?)
             }
             CoveEncodingKind::RunEnd => {
                 let payload = RunEndPayload::parse(self.data)?;
-                self.value_from_i64_vec(row, RunEnd::fast_decode(&payload)?)
+                self.value_from_i64_slice(row, &RunEnd::fast_decode(&payload)?)
             }
             CoveEncodingKind::BitPacked => {
                 let payload = BitPackedPayload::parse(self.data)?;
-                self.value_from_i64_vec(row, BitPacked::fast_decode(&payload)?)
+                self.value_from_i64_slice(row, &BitPacked::fast_decode(&payload)?)
             }
             CoveEncodingKind::Delta => {
                 let payload = DeltaPayload::parse(self.data)?;
-                self.value_from_i64_vec(row, Delta::fast_decode(&payload)?)
+                self.value_from_i64_slice(row, &Delta::fast_decode(&payload)?)
             }
             CoveEncodingKind::FrameOfReference => {
                 let payload = ForPayload::parse(self.data)?;
-                self.value_from_i64_vec(row, FrameOfReference::fast_decode(&payload)?)
+                self.value_from_i64_slice(row, &FrameOfReference::fast_decode(&payload)?)
             }
             CoveEncodingKind::PatchedBase => {
                 let payload = PatchedBasePayload::parse(self.data)?;
-                self.value_from_i64_vec(row, PatchedBase::fast_decode(&payload)?)
+                self.value_from_i64_slice(row, &PatchedBase::fast_decode(&payload)?)
             }
             CoveEncodingKind::Sparse => {
                 let payload = SparsePayload::parse(self.data)?;
-                self.value_from_i64_vec(row, Sparse::fast_decode(&payload)?)
+                self.value_from_i64_slice(row, &Sparse::fast_decode(&payload)?)
             }
             CoveEncodingKind::Canonical => self.decode_canonical_row(row),
             CoveEncodingKind::Sequence
@@ -556,7 +593,7 @@ impl<'a> EncodedArray<'a> {
 
     fn values_from_local_codebook_values(
         &self,
-        values: Vec<LocalCodebookValue>,
+        values: &[LocalCodebookValue],
     ) -> Result<Vec<CoveArrayValue<'_>>, CoveError> {
         if values.len() != expected_row_count(self.row_count)? {
             return Err(CoveError::PageCorrupt);
@@ -665,10 +702,10 @@ impl<'a> EncodedArray<'a> {
         Ok(out)
     }
 
-    fn value_from_i64_vec(
+    fn value_from_i64_slice(
         &self,
         row: u64,
-        values: Vec<i64>,
+        values: &[i64],
     ) -> Result<CoveArrayValue<'_>, CoveError> {
         if values.len() != expected_row_count(self.row_count)? {
             return Err(CoveError::PageCorrupt);

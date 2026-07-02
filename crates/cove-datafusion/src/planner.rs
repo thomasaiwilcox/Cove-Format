@@ -514,11 +514,11 @@ pub struct ScanCandidateRowRange {
 /// to pruning code through page-index metadata.
 pub fn plan_scan(
     state: &DatasetState,
-    projection: Option<&Vec<usize>>,
+    projection: Option<&[usize]>,
     mut filters: PredicateProgram,
 ) -> Result<ScanPlan, CoveError> {
     let scan_projection = projection
-        .cloned()
+        .map(<[usize]>::to_vec)
         .unwrap_or_else(|| state.full_projection());
     validate_column_indexes(state, "scan projection", &scan_projection)?;
 
@@ -593,9 +593,7 @@ pub(crate) fn covi_candidates_for_filters(
             CoviLookupRequestV2::membership(
                 state.table().table_id,
                 column.column_id,
-                keys.into_iter()
-                    .map(CoviLookupKeyV2::CanonicalValueBytes)
-                    .collect::<Vec<_>>(),
+                keys.into_iter().map(CoviLookupKeyV2::CanonicalValueBytes),
             )
         };
         let Ok(candidates) = covi.lookup(&request) else {
@@ -646,7 +644,7 @@ fn lookup_keys_for_predicate(
                 let tag = value_tag_for_logical(column.logical)?;
                 canonical_values
                     .iter()
-                    .map(|value| tagged_key(tag, value.clone()))
+                    .map(|value| tagged_key(tag, value))
                     .collect::<Vec<_>>()
             };
             Some((*column_index, keys))
@@ -815,14 +813,14 @@ fn value_tag_for_logical(logical: CoveLogicalType) -> Option<ValueTag> {
 fn tagged_canonical(value: CanonicalValue<'_>) -> Result<Vec<u8>, CoveError> {
     let tag = value.value_tag();
     let payload = value.encode()?;
-    Ok(tagged_key(tag, payload))
+    Ok(tagged_key(tag, &payload))
 }
 
 #[cfg(feature = "covi")]
-fn tagged_key(tag: ValueTag, payload: Vec<u8>) -> Vec<u8> {
+fn tagged_key(tag: ValueTag, payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(2 + payload.len());
     wire::append_u64_leb128(&mut out, tag as u64);
-    out.extend_from_slice(&payload);
+    out.extend_from_slice(payload);
     out
 }
 
@@ -1074,7 +1072,7 @@ mod tests {
     #[cfg(feature = "covi")]
     #[test]
     fn covi_canonical_keys_use_varint_value_tags() {
-        let key = tagged_key(ValueTag::Utf8, vec![3, b'f', b'o', b'o']);
+        let key = tagged_key(ValueTag::Utf8, &[3, b'f', b'o', b'o']);
         let (tag, consumed) = wire::decode_u64_leb128(&key).unwrap();
         assert_eq!(tag, ValueTag::Utf8 as u64);
         assert_eq!(consumed, 1);
@@ -1090,8 +1088,8 @@ mod tests {
     #[cfg(feature = "covi")]
     #[test]
     fn bool_filecode_covi_keys_preserve_truth_value_tags() {
-        let false_key = tagged_key(ValueTag::BoolFalse, Vec::new());
-        let true_key = tagged_key(ValueTag::BoolTrue, Vec::new());
+        let false_key = tagged_key(ValueTag::BoolFalse, &[]);
+        let true_key = tagged_key(ValueTag::BoolTrue, &[]);
         assert_ne!(false_key, true_key);
         assert_eq!(false_key, vec![ValueTag::BoolFalse as u8]);
         assert_eq!(true_key, vec![ValueTag::BoolTrue as u8]);

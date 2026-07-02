@@ -207,6 +207,13 @@ for basic interoperability:
 
 Key paths:
 
+- [`crates/cove`](./crates/cove): package `cove`, the canonical app-facing
+  Rust facade for validation, inspection, read/write, conversion, query, and
+  explain workflows.
+- [`CONTRIBUTING.md`](./CONTRIBUTING.md): contributor setup, common gates, and
+  boundary rules.
+- [`docs/developer/architecture.md`](./docs/developer/architecture.md): crate
+  layers and ownership model for maintainers and downstream developers.
 - [`crates/coveql`](./crates/coveql): parser, resolver, planner,
   materialized/coded execution, explain output, Arrow output, and DataFusion
   integration.
@@ -771,6 +778,54 @@ For a faster compile-and-smoke pass:
 ```sh
 cargo bench -p cove-datafusion --features parquet-compare --bench m6 -- --sample-size 10 --warm-up-time 0.1 --measurement-time 0.1
 ```
+
+## Crate Map
+
+| Start here when... | Crate |
+| --- | --- |
+| Building an app on COVE | `cove` |
+| Implementing baseline reads or validation | `cove-reader`, `cove-core` |
+| Writing COVE files | `cove-writer` |
+| Registering COVE with an engine | `cove-engine`, `cove-datafusion` |
+| Working on CoveQL semantics | `coveql` |
+| Working on deterministic mapping | `cove-map` |
+| Working on Arrow, Parquet, CSV, or ORC interop | `cove-arrow`, `cove-convert` |
+| Working on conformance evidence | `cove-conformance`, `cove-fuzz` |
+
+## Rust Facade Quick Start
+
+For application code, start with the `cove` crate and its prelude:
+
+```rust
+use cove::prelude::*;
+
+let discovery = discover_query_surfaces_file("people.cove")?;
+let result = query_file(
+    "people.cove",
+    "table(people).select(id, name)",
+    QueryOptions {
+        take: Some(10),
+        ..QueryOptions::default()
+    },
+)?;
+let rows = result.result_json()?;
+
+let explain = explain_query_file(
+    "people.cove",
+    "table(people).select(id, name)",
+    ExplainOptions {
+        mode: ExplainMode::Developer,
+        ..ExplainOptions::default()
+    },
+)?;
+println!(
+    "{} rows, explain bytes={}",
+    rows.as_array().map_or(0, Vec::len),
+    explain.text.len()
+);
+```
+
+The runnable version is [`crates/cove/examples/app_workflow.rs`](./crates/cove/examples/app_workflow.rs).
 
 ## Design Principles
 

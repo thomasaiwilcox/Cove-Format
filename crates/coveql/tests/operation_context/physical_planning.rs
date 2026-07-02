@@ -1054,7 +1054,7 @@ fn physical_optional_metadata_fail_open_and_strict_modes() {
         .iter()
         .any(|fallback| fallback.source == "cove_coverage"));
 
-    options.optional_metadata_fail_open = false;
+    options.metadata.optional_metadata_fail_open = false;
     let err = build_physical_plan(
         &minimal_object_file(),
         planned,

@@ -153,7 +153,7 @@ pub(super) fn try_native_direct_projection_result(
     let filtered_rows = native_direct_projection_filter_rows(rows, planned)?;
     let filtered_row_count = filtered_rows.len();
     let mut sorted_rows = filtered_rows;
-    sort_rows(&mut sorted_rows, planned, &context)?;
+    sort_rows(&mut sorted_rows, planned, &context);
     let projected_rows = apply_skip_take(sorted_rows, planned);
 
     let json_rows = if let Some(select) = &planned.resolved.method_chain.select {

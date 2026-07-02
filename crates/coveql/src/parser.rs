@@ -5,6 +5,20 @@ use crate::{
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
+/// Parses COVEQL query text into a canonical parsed query.
+///
+/// # Errors
+///
+/// Returns one or more [`CoveQlDiagnostic`] values when the query exceeds the
+/// configured resource budget, cannot be lexed or parsed, omits a required
+/// language version, uses an unsupported language version, or fails canonical
+/// profile validation.
+///
+/// # Panics
+///
+/// Panics only if the already-parsed canonical AST cannot be serialized for its
+/// stable hash. That indicates an internal serialization bug in the AST types,
+/// not invalid query text.
 pub fn parse_query(
     text: &str,
     options: ParseOptions,
@@ -48,7 +62,7 @@ pub fn parse_query(
 
     let query_text_fingerprint = sha256_hex(lexed.canonical_token_stream.as_bytes());
     let mut parser = Parser::new(lexed.tokens);
-    let prefix_explain = parser.parse_prefix_explain()?;
+    let prefix_explain = parser.parse_prefix_explain();
     let root = parser.parse_root()?;
     let root_alias = parser.parse_optional_alias()?;
     let mut methods = Vec::new();
@@ -621,15 +635,13 @@ impl Parser {
         Self { tokens, pos: 0 }
     }
 
-    fn parse_prefix_explain(
-        &mut self,
-    ) -> Result<Option<Spanned<AstMethod>>, Vec<CoveQlDiagnostic>> {
+    fn parse_prefix_explain(&mut self) -> Option<Spanned<AstMethod>> {
         let start = self.current().span.start;
         let TokenKind::Identifier(value, _) = &self.current().kind else {
-            return Ok(None);
+            return None;
         };
         if !value.eq_ignore_ascii_case("EXPLAIN") {
-            return Ok(None);
+            return None;
         }
         self.advance();
         let mode = self
@@ -638,10 +650,10 @@ impl Parser {
                 self.advance();
             })
             .unwrap_or(ExplainMode::Public);
-        Ok(Some(Spanned::new(
+        Some(Spanned::new(
             AstMethod::Explain(mode),
             SourceSpan::new(start, self.previous_span_end()),
-        )))
+        ))
     }
 
     fn parse_root(&mut self) -> Result<Spanned<AstRoot>, Vec<CoveQlDiagnostic>> {

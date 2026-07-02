@@ -21,6 +21,22 @@ fi
 [ -f crates/cove-arrow/src/arrow.rs ] || fail "missing cove-arrow Arrow interop module"
 [ -f crates/cove-arrow/src/parquet.rs ] || fail "missing cove-arrow Parquet interop module"
 
+if ! grep -q '^name = "cove"$' crates/cove/Cargo.toml; then
+    fail "crates/cove must publish the canonical app-facing package as cove"
+fi
+
+if grep -nE '^[[:space:]]*(cove-cli|datafusion|datafusion-datasource)[[:space:]]*=' crates/cove/Cargo.toml; then
+    fail "the cove facade must not depend on cove-cli or DataFusion directly"
+fi
+
+if grep -RInE '(^|[^[:alnum:]_])datafusion::|use[[:space:]]+datafusion(::|[[:space:]])' crates/cove/src; then
+    fail "the cove facade must reach DataFusion through cove-engine/cove-datafusion APIs, not direct imports"
+fi
+
+if grep -RInE 'println!|eprintln!' crates/cove/src; then
+    fail "the cove facade must expose typed results, not terminal output"
+fi
+
 if grep -RInE '(arrow-(array|buffer|schema)[^"]*"54"|parquet[^"]*"54")' Cargo.toml crates/*/Cargo.toml; then
     fail "Arrow and Parquet consumers must be on the Arrow 58 line"
 fi

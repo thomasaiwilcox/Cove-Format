@@ -16,8 +16,11 @@ harness = false
 
 [dependencies]
 arrow-array = "58"
+arrow-ipc = "58"
+arrow-json = "58"
 arrow-schema = "58"
 cove-cache = { path = "../cove-cache" }
+cove = { path = "../cove" }
 cove-ai-adapters = { path = "../cove-ai-adapters" }
 cove-convert-parquet = { path = "../cove-convert-parquet" }
 cove-core = { path = "../cove-core" }

@@ -122,14 +122,14 @@ impl PredicatePlanning {
     pub(crate) fn from_predicate_with_dataset(
         predicate: Option<&ResolvedPredicate>,
         root: &ResolvedRoot,
-        security_scope: String,
+        security_scope: &str,
         dataset: &crate::DatasetScopeContext,
     ) -> Self {
         let Some(predicate) = predicate else {
             return Self::default();
         };
         let mut planning = Self::default();
-        let form = classify_predicate_for_dataset(predicate, root, &security_scope, dataset);
+        let form = classify_predicate_for_dataset(predicate, root, security_scope, dataset);
         planning.record(form);
         planning
     }

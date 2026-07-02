@@ -33,24 +33,73 @@ use vocabulary::PhysicalTemporalGrain;
 
 pub type PhysicalPlanFingerprint = String;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Options for physical planning over optional COVE sidecars.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PhysicalPlanOptions {
-    pub enable_coverage_candidates: bool,
-    pub enable_covi_candidates: bool,
-    pub enable_covx_candidates: bool,
-    pub enable_layout_candidates: bool,
-    pub enable_cache_candidates: bool,
-    pub enable_execution_code_candidates: bool,
-    pub enable_index_only_candidates: bool,
-    pub allow_index_only_answers: bool,
-    pub enable_zero_copy_candidates: bool,
-    pub allow_zero_copy_output: bool,
-    pub allow_file_code_literal_candidates: bool,
-    pub optional_metadata_fail_open: bool,
+    /// Candidate families the planner may consider.
+    pub candidates: PhysicalCandidateOptions,
+    /// Output forms the caller permits the physical plan to return.
+    pub outputs: PhysicalOutputOptions,
+    /// Policy for invalid optional physical metadata.
+    pub metadata: PhysicalMetadataOptions,
+    /// Optional sidecar bytes supplied alongside the primary artifact.
     pub sidecars: PhysicalSidecarInputs,
 }
 
-impl Default for PhysicalPlanOptions {
+impl PhysicalPlanOptions {
+    /// Permit index-only answers when security policy also allows them.
+    pub fn with_index_only_answers(mut self, allow: bool) -> Self {
+        self.outputs.allow_index_only_answers = allow;
+        self
+    }
+
+    /// Permit zero-copy Arrow output when requested and validated.
+    pub fn with_zero_copy_output(mut self, allow: bool) -> Self {
+        self.outputs.allow_zero_copy_output = allow;
+        self
+    }
+
+    /// Permit literal file-code keys in generated execution candidates.
+    pub fn with_file_code_literal_candidates(mut self, allow: bool) -> Self {
+        self.outputs.allow_file_code_literal_candidates = allow;
+        self
+    }
+
+    /// Choose whether invalid optional physical metadata is ignored or rejected.
+    pub fn with_optional_metadata_fail_open(mut self, fail_open: bool) -> Self {
+        self.metadata.optional_metadata_fail_open = fail_open;
+        self
+    }
+
+    /// Attach physical sidecar inputs to the plan request.
+    pub fn with_sidecars(mut self, sidecars: PhysicalSidecarInputs) -> Self {
+        self.sidecars = sidecars;
+        self
+    }
+}
+
+/// Candidate sidecar families and execution strategies the planner may inspect.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PhysicalCandidateOptions {
+    /// Permit COVE coverage proof candidates.
+    pub enable_coverage_candidates: bool,
+    /// Permit COVE-I index candidates.
+    pub enable_covi_candidates: bool,
+    /// Permit COVX index candidates.
+    pub enable_covx_candidates: bool,
+    /// Permit physical layout candidates.
+    pub enable_layout_candidates: bool,
+    /// Permit cache compatibility candidates.
+    pub enable_cache_candidates: bool,
+    /// Permit execution-code candidates.
+    pub enable_execution_code_candidates: bool,
+    /// Permit index-only answer candidates.
+    pub enable_index_only_candidates: bool,
+    /// Permit zero-copy Arrow candidates.
+    pub enable_zero_copy_candidates: bool,
+}
+
+impl Default for PhysicalCandidateOptions {
     fn default() -> Self {
         Self {
             enable_coverage_candidates: true,
@@ -60,12 +109,33 @@ impl Default for PhysicalPlanOptions {
             enable_cache_candidates: true,
             enable_execution_code_candidates: true,
             enable_index_only_candidates: true,
-            allow_index_only_answers: false,
             enable_zero_copy_candidates: true,
-            allow_zero_copy_output: false,
-            allow_file_code_literal_candidates: false,
+        }
+    }
+}
+
+/// Physical outputs and generated candidate forms that require explicit caller permission.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PhysicalOutputOptions {
+    /// Allow exact answers from validated index-only metadata.
+    pub allow_index_only_answers: bool,
+    /// Allow validated zero-copy Arrow buffers to be returned.
+    pub allow_zero_copy_output: bool,
+    /// Allow generated execution candidates to use literal file-code keys.
+    pub allow_file_code_literal_candidates: bool,
+}
+
+/// Validation policy for optional physical metadata supplied to the planner.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PhysicalMetadataOptions {
+    /// Continue planning when optional physical metadata is invalid.
+    pub optional_metadata_fail_open: bool,
+}
+
+impl Default for PhysicalMetadataOptions {
+    fn default() -> Self {
+        Self {
             optional_metadata_fail_open: true,
-            sidecars: PhysicalSidecarInputs::default(),
         }
     }
 }
@@ -419,26 +489,27 @@ pub fn build_physical_plan(
 ) -> Result<PhysicalPlannedQuery, BuildPhysicalPlanError> {
     let normal_forms = build_predicate_normal_forms(
         &planned,
-        options.enable_coverage_candidates,
-        options.enable_execution_code_candidates,
+        options.candidates.enable_coverage_candidates,
+        options.candidates.enable_execution_code_candidates,
     );
     let reports = validate_sidecars(
         bytes,
         &planned,
         &options.sidecars,
         SidecarPlanningFlags {
-            enable_coverage: options.enable_coverage_candidates,
-            enable_covi: options.enable_covi_candidates,
-            enable_covx: options.enable_covx_candidates,
-            enable_layout: options.enable_layout_candidates,
-            enable_cache: options.enable_cache_candidates,
-            enable_execution_code: options.enable_execution_code_candidates,
-            enable_zero_copy_candidates: options.enable_zero_copy_candidates,
-            allow_file_code_literal_candidates: options.allow_file_code_literal_candidates,
+            enable_coverage: options.candidates.enable_coverage_candidates,
+            enable_covi: options.candidates.enable_covi_candidates,
+            enable_covx: options.candidates.enable_covx_candidates,
+            enable_layout: options.candidates.enable_layout_candidates,
+            enable_cache: options.candidates.enable_cache_candidates,
+            enable_execution_code: options.candidates.enable_execution_code_candidates,
+            enable_index_only_candidates: options.candidates.enable_index_only_candidates,
+            enable_zero_copy_candidates: options.candidates.enable_zero_copy_candidates,
+            allow_file_code_literal_candidates: options.outputs.allow_file_code_literal_candidates,
         },
         &validation_options,
     );
-    if !options.optional_metadata_fail_open
+    if !options.metadata.optional_metadata_fail_open
         && reports
             .sidecar_validations
             .iter()
@@ -481,9 +552,9 @@ pub fn build_physical_plan(
         physical_plan,
         diagnostics,
         sidecars: options.sidecars,
-        allow_index_only_answers: options.allow_index_only_answers,
-        allow_zero_copy_output: options.allow_zero_copy_output,
-        allow_file_code_literal_candidates: options.allow_file_code_literal_candidates,
+        allow_index_only_answers: options.outputs.allow_index_only_answers,
+        allow_zero_copy_output: options.outputs.allow_zero_copy_output,
+        allow_file_code_literal_candidates: options.outputs.allow_file_code_literal_candidates,
         proof_validation_report: reports.proofs,
         index_capability_report: reports.index,
         layout_range_plan: reports.layout,

@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use cove_ai_adapters::{
-    open as open_archive, write_export_file, AiArchiveOpenOptions, AiExportOptions,
+    open as open_archive, write_export_file, AiArchiveOpenOptions, AiExportFormat, AiExportOptions,
     AiSampleIteratorOptions, AiVerifyOptions,
 };
 use pyo3::{
@@ -80,8 +80,9 @@ impl PyTrainingArchive {
         include_payloads: Option<bool>,
     ) -> PyResult<Py<PyAny>> {
         let archive = self.open_native()?;
+        let format = AiExportFormat::parse(format.as_deref().unwrap_or("jsonl")).map_err(py_error)?;
         let options = AiExportOptions {
-            format: format.unwrap_or_else(|| "jsonl".to_string()),
+            format,
             out: out.as_ref().map(PathBuf::from),
             split,
             include_payloads: include_payloads.unwrap_or(false),

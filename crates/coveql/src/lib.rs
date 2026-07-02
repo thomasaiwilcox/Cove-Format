@@ -156,7 +156,8 @@ pub use materialized::{
 pub use parser::parse_query;
 pub use physical_plan::{
     build_physical_plan, parse_resolve_plan_and_build_physical_plan, BuildPhysicalPlanError,
-    CoveOPhysicalPlan, PhysicalNodeId, PhysicalOperatorContract, PhysicalPlanDiagnostic,
+    CoveOPhysicalPlan, PhysicalCandidateOptions, PhysicalMetadataOptions, PhysicalNodeId,
+    PhysicalOperatorContract, PhysicalOutputOptions, PhysicalPlanDiagnostic,
     PhysicalPlanFingerprint, PhysicalPlanNode, PhysicalPlanNodeKind, PhysicalPlanOptions,
     PhysicalPlannedQuery,
 };
@@ -1908,7 +1909,7 @@ pub fn build_manifest_dataset_scope_context(
     validate_manifest_security_scope(&options)?;
     validate_manifest_code_domain_bridge_proofs(&options)?;
     let manifest = CovmFile::parse(manifest_bytes)
-        .map_err(|error| validation_error(error, "dataset_manifest"))?;
+        .map_err(|error| validation_error(&error, "dataset_manifest"))?;
     if manifest.files.len() != members.len() {
         return Err(manifest_scope_error(format!(
             "COVM member count mismatch: manifest lists {} files, caller provided {}",
@@ -1954,7 +1955,7 @@ pub fn build_manifest_dataset_scope_context(
         used_members[member_index] = true;
 
         let validated = validate_bytes(member.bytes)
-            .map_err(|error| validation_error(error, "dataset_member"))?;
+            .map_err(|error| validation_error(&error, "dataset_member"))?;
         let file = ValidatedFileIdentity::from(&validated);
         if let Some(schema_fingerprint) =
             object_catalog_schema_fingerprint(member.bytes, &validated)?
@@ -2008,10 +2009,10 @@ pub fn build_manifest_dataset_scope_context(
                 ))
             })?;
         let digest = compute_digest(digest_algorithm, member.bytes)
-            .map_err(|error| validation_error(error, "dataset_member_digest"))?;
+            .map_err(|error| validation_error(&error, "dataset_member_digest"))?;
         entry
             .verify_against(&file.file_id, file.file_len, file.footer_crc32c, &digest)
-            .map_err(|error| validation_error(error, "dataset_manifest"))?;
+            .map_err(|error| validation_error(&error, "dataset_manifest"))?;
 
         if file_has_dictionary(&validated) {
             dictionary_epochs.push(DictionaryEpochContext {
@@ -2388,7 +2389,7 @@ pub fn build_operation_context(
             feature_use.clone(),
             &validator,
         )
-        .map_err(|error| validation_error(error, "validation"))?;
+        .map_err(|error| validation_error(&error, "validation"))?;
 
         if first_report.is_none() {
             first_report = Some(report.clone());
@@ -2410,7 +2411,7 @@ pub fn build_operation_context(
         )
     })?;
     let feature_scope_table = feature_scope_table_for_feature_use(bytes, &first_report.validated)
-        .map_err(|error| validation_error(error, "validation"))?;
+        .map_err(|error| validation_error(&error, "validation"))?;
 
     for ignored in &first_report.ignored_optional_sections {
         fallbacks.push(FallbackReport {
@@ -3150,11 +3151,7 @@ fn check_usize(
 ) -> Result<(), BuildOperationContextError> {
     if let Some(value) = value {
         if value > limit {
-            return Err(resource_budget_error(
-                field,
-                value.to_string(),
-                limit.to_string(),
-            ));
+            return Err(resource_budget_error(field, value as u128, limit as u128));
         }
     }
     Ok(())
@@ -3169,8 +3166,8 @@ fn check_u32(
         if value > limit {
             return Err(resource_budget_error(
                 field,
-                value.to_string(),
-                limit.to_string(),
+                u128::from(value),
+                u128::from(limit),
             ));
         }
     }
@@ -3186,15 +3183,15 @@ fn check_u64(
         if value > limit {
             return Err(resource_budget_error(
                 field,
-                value.to_string(),
-                limit.to_string(),
+                u128::from(value),
+                u128::from(limit),
             ));
         }
     }
     Ok(())
 }
 
-fn resource_budget_error(field: &str, value: String, limit: String) -> BuildOperationContextError {
+fn resource_budget_error(field: &str, value: u128, limit: u128) -> BuildOperationContextError {
     BuildOperationContextError::single(
         CoveQlDiagnostic::error(
             "E_RESOURCE_BUDGET_EXCEEDED",
@@ -3208,8 +3205,8 @@ fn resource_budget_error(field: &str, value: String, limit: String) -> BuildOper
     )
 }
 
-fn validation_error(error: CoveError, phase: &'static str) -> BuildOperationContextError {
-    let code = diagnostic_code_for_error(&error);
+fn validation_error(error: &CoveError, phase: &'static str) -> BuildOperationContextError {
+    let code = diagnostic_code_for_error(error);
     let message = error.to_string();
     BuildOperationContextError::single(
         CoveQlDiagnostic::error(code, message.clone(), phase),
@@ -3507,9 +3504,9 @@ fn object_catalog_schema_fingerprint(
         return Ok(None);
     };
     let payload = compression::section_payload(bytes, section)
-        .map_err(|error| validation_error(error, "dataset_member_schema"))?;
+        .map_err(|error| validation_error(&error, "dataset_member_schema"))?;
     let catalog = ObjectTypeCatalog::parse(payload.as_ref())
-        .map_err(|error| validation_error(error, "dataset_member_schema"))?;
+        .map_err(|error| validation_error(&error, "dataset_member_schema"))?;
     let mut hasher = Sha256::new();
     hasher.update(catalog.flags.to_le_bytes());
     let mut types = catalog.types.iter().collect::<Vec<_>>();
@@ -3554,9 +3551,9 @@ fn semantic_map_identity_fingerprint(
             continue;
         }
         let payload = compression::section_payload(bytes, section)
-            .map_err(|error| validation_error(error, "dataset_member_semantic_map"))?;
+            .map_err(|error| validation_error(&error, "dataset_member_semantic_map"))?;
         let embedded = parse_embedded_section(kind, payload.as_ref())
-            .map_err(|error| validation_error(error, "dataset_member_semantic_map"))?;
+            .map_err(|error| validation_error(&error, "dataset_member_semantic_map"))?;
         let (mapping_id, mapping_version) = embedded_map_identity(&embedded);
         identities.push((
             kind as u16,
@@ -3638,9 +3635,9 @@ fn projection_catalog_schema_fingerprint(
         return Ok(None);
     };
     let payload = compression::section_payload(bytes, section)
-        .map_err(|error| validation_error(error, "dataset_member_projection_catalog"))?;
+        .map_err(|error| validation_error(&error, "dataset_member_projection_catalog"))?;
     let catalog = MapProjectionCatalog::parse(payload.as_ref())
-        .map_err(|error| validation_error(error, "dataset_member_projection_catalog"))?;
+        .map_err(|error| validation_error(&error, "dataset_member_projection_catalog"))?;
     let mut hasher = Sha256::new();
     hash_string(&mut hasher, &catalog.mapping_id);
     hash_string(&mut hasher, &catalog.mapping_version);

@@ -395,7 +395,7 @@ fn physical_form(
             .code_domain_id
             .as_ref()
             .map(|domain| physical_code_domain(domain, form, planned)),
-        operator: operator_name(&form.kind),
+        operator: Some(operator_name(&form.kind)),
         literal_count: literal_count(&form.kind),
         exact,
         proof_state: form.representation.proof_state,
@@ -730,18 +730,18 @@ fn is_numeric_datetime(logical_type: Option<&str>) -> bool {
     )
 }
 
-fn operator_name(kind: &LogicalPredicateKind) -> Option<String> {
+fn operator_name(kind: &LogicalPredicateKind) -> String {
     match kind {
-        LogicalPredicateKind::Compare { op, .. } => Some(format!("{op:?}")),
-        LogicalPredicateKind::InList { .. } => Some("in".into()),
+        LogicalPredicateKind::Compare { op, .. } => format!("{op:?}"),
+        LogicalPredicateKind::InList { .. } => "in".into(),
         LogicalPredicateKind::NullCheck { negated, .. } => {
-            Some(if *negated { "is_not_null" } else { "is_null" }.into())
+            if *negated { "is_not_null" } else { "is_null" }.into()
         }
-        LogicalPredicateKind::Exists { .. } => Some("exists".into()),
-        LogicalPredicateKind::BoolExpr { .. } => Some("bool".into()),
-        LogicalPredicateKind::Not(_) => Some("not".into()),
-        LogicalPredicateKind::And(_) => Some("and".into()),
-        LogicalPredicateKind::Or(_) => Some("or".into()),
+        LogicalPredicateKind::Exists { .. } => "exists".into(),
+        LogicalPredicateKind::BoolExpr { .. } => "bool".into(),
+        LogicalPredicateKind::Not(_) => "not".into(),
+        LogicalPredicateKind::And(_) => "and".into(),
+        LogicalPredicateKind::Or(_) => "or".into(),
     }
 }
 

@@ -135,7 +135,7 @@ pub(crate) fn export_reviewed_decisions(file: &CovemapFile) -> Result<Value, Str
         Some(section) => {
             let payload: Value = serde_json::from_slice(&section.payload)
                 .map_err(|err| format!("invalid MAP_RESOLUTION_CATALOG JSON: {err}"))?;
-            reviewed_decisions_array(&payload)?.clone()
+            reviewed_decisions_array(&payload)?.to_vec()
         }
         None => Vec::new(),
     };
@@ -237,10 +237,11 @@ fn decision_id(decision: &Value) -> Result<&str, String> {
         .ok_or_else(|| "reviewed_decision missing non-empty decision_id".to_string())
 }
 
-fn reviewed_decisions_array(payload: &Value) -> Result<&Vec<Value>, String> {
+fn reviewed_decisions_array(payload: &Value) -> Result<&[Value], String> {
     payload
         .get("reviewed_decisions")
         .and_then(Value::as_array)
+        .map(Vec::as_slice)
         .ok_or_else(|| "MAP_RESOLUTION_CATALOG missing reviewed_decisions array".to_string())
 }
 
@@ -329,14 +330,14 @@ fn review_item_from_candidate(candidate: &Value) -> Result<Value, String> {
         "same_object_decision_template": decision_template(
             candidate_match_id,
             "same_object",
-            left_ref.clone(),
-            right_ref.clone()
+            &left_ref,
+            &right_ref
         ),
         "do_not_merge_decision_template": decision_template(
             candidate_match_id,
             "do_not_merge",
-            left_ref,
-            right_ref
+            &left_ref,
+            &right_ref
         )
     }))
 }
@@ -363,7 +364,12 @@ fn review_member(member: &Value) -> Value {
     })
 }
 
-fn decision_template(candidate_match_id: &str, decision: &str, left: Value, right: Value) -> Value {
+fn decision_template(
+    candidate_match_id: &str,
+    decision: &str,
+    left: &Value,
+    right: &Value,
+) -> Value {
     json!({
         "decision_id": format!("review:{candidate_match_id}:{decision}"),
         "decision": decision,

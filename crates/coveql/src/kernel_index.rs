@@ -22,6 +22,7 @@ pub(super) fn try_index_only_executed_query(
     let planned = &physical.planned;
     let security = &planned.resolved.operation_context.security;
     if !physical.allow_index_only_answers
+        || physical.index_capability_report.index_only_candidates == 0
         || !security.index_only_answer_permission
         || security.metadata_disclosure_policy != MetadataDisclosurePolicy::AllowProtected
         || security.aggregate_disclosure_policy == AggregateDisclosurePolicy::AllowMaterializedOnly
@@ -71,9 +72,7 @@ pub(super) fn try_index_only_executed_query(
     if object_type_id != root.object_type_id {
         return Ok(None);
     }
-    let Some(aggregate_kind) = covi_index_only_aggregate_kind(*name) else {
-        return Ok(None);
-    };
+    let aggregate_kind = covi_index_only_aggregate_kind(*name);
     let Some(answer) =
         index_only_answer_from_sidecars(physical, object_type_id, property_id, aggregate_kind)?
     else {
@@ -168,15 +167,15 @@ fn index_only_sum_avg_path_is_supported(path: &ResolvedPath) -> bool {
     )
 }
 
-fn covi_index_only_aggregate_kind(name: AstAggregateName) -> Option<CoviAggregateKindV2> {
+fn covi_index_only_aggregate_kind(name: AstAggregateName) -> CoviAggregateKindV2 {
     match name {
-        AstAggregateName::Count => Some(CoviAggregateKindV2::Count),
-        AstAggregateName::Exists => Some(CoviAggregateKindV2::Exists),
-        AstAggregateName::DistinctCount => Some(CoviAggregateKindV2::DistinctCount),
-        AstAggregateName::Min => Some(CoviAggregateKindV2::Min),
-        AstAggregateName::Max => Some(CoviAggregateKindV2::Max),
-        AstAggregateName::Sum => Some(CoviAggregateKindV2::Sum),
-        AstAggregateName::Avg => Some(CoviAggregateKindV2::Avg),
+        AstAggregateName::Count => CoviAggregateKindV2::Count,
+        AstAggregateName::Exists => CoviAggregateKindV2::Exists,
+        AstAggregateName::DistinctCount => CoviAggregateKindV2::DistinctCount,
+        AstAggregateName::Min => CoviAggregateKindV2::Min,
+        AstAggregateName::Max => CoviAggregateKindV2::Max,
+        AstAggregateName::Sum => CoviAggregateKindV2::Sum,
+        AstAggregateName::Avg => CoviAggregateKindV2::Avg,
     }
 }
 
@@ -302,7 +301,7 @@ fn index_only_sum_avg_json_value(
                 };
                 Ok(json!(sum / answer.non_null_count as f64))
             } else {
-                parse_decimal_value(&sum)
+                Ok(parse_decimal_value(&sum)
                     .ok_or_else(|| {
                         exec_error(
                             "E_INDEX_ONLY_UNSAFE",
@@ -318,8 +317,7 @@ fn index_only_sum_avg_json_value(
                             json!({ "logical_type": logical_type }),
                         )
                     })?
-                    .to_json_sum()
-                    .map_err(|message| exec_error("E_INDEX_ONLY_UNSAFE", message, json!({})))
+                    .to_json_sum())
             }
         }
         _ => Err(exec_error(

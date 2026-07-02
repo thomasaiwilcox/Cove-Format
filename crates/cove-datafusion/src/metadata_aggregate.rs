@@ -137,7 +137,7 @@ pub fn exact_unfiltered_aggregate_synopses(
     state: &DatasetState,
     requests: &[(usize, MetadataSynopsisAggregateKind)],
 ) -> Result<Option<MetadataAggregatePlan>, CoveError> {
-    if requests.is_empty() || !aggregate_synopsis_fast_paths_are_safe(state)? {
+    if requests.is_empty() || !aggregate_synopsis_fast_paths_are_safe(state) {
         return Ok(None);
     }
     let mut values = Vec::with_capacity(requests.len());
@@ -151,10 +151,14 @@ pub fn exact_unfiltered_aggregate_synopses(
             MetadataSynopsisAggregateKind::Min | MetadataSynopsisAggregateKind::Max => {
                 exact_synopsis_min_max(state, *column_index, *aggregate_kind)?
             }
-            MetadataSynopsisAggregateKind::Sum => exact_synopsis_sum(state, *column_index, false)?,
-            MetadataSynopsisAggregateKind::Avg => exact_synopsis_sum(state, *column_index, true)?,
+            MetadataSynopsisAggregateKind::Sum => {
+                exact_synopsis_sum(state, *column_index, SumOutputMode::Sum)?
+            }
+            MetadataSynopsisAggregateKind::Avg => {
+                exact_synopsis_sum(state, *column_index, SumOutputMode::Avg)?
+            }
         };
-        let Some(canonical_value) = value else {
+        let Some(canonical_value) = value.into_plan_value() else {
             return Ok(None);
         };
         values.push(MetadataAggregateValue {
@@ -176,18 +180,54 @@ pub fn exact_unfiltered_aggregate_synopses(
     }))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MetadataAggregateOutcome {
+    Unavailable,
+    SqlNull,
+    Canonical(Vec<u8>),
+}
+
+impl MetadataAggregateOutcome {
+    fn into_plan_value(self) -> Option<Option<Vec<u8>>> {
+        match self {
+            Self::Unavailable => None,
+            Self::SqlNull => Some(None),
+            Self::Canonical(value) => Some(Some(value)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SumOutputMode {
+    Sum,
+    Avg,
+}
+
+impl SumOutputMode {
+    fn synopsis_kind(self) -> SynopsisKind {
+        match self {
+            Self::Sum => SynopsisKind::Sum,
+            Self::Avg => SynopsisKind::SumAndCount,
+        }
+    }
+
+    fn is_avg(self) -> bool {
+        matches!(self, Self::Avg)
+    }
+}
+
 fn exact_synopsis_min_max(
     state: &DatasetState,
     column_index: usize,
     aggregate_kind: MetadataSynopsisAggregateKind,
-) -> Result<Option<Option<Vec<u8>>>, CoveError> {
+) -> Result<MetadataAggregateOutcome, CoveError> {
     let column = state
         .table()
         .columns
         .get(column_index)
         .ok_or_else(|| CoveError::BadSchema("min/max column out of bounds".into()))?;
     if column.logical == CoveLogicalType::Bool {
-        return Ok(None);
+        return Ok(MetadataAggregateOutcome::Unavailable);
     }
     let mut best: Option<TaggedCanonicalValue> = None;
     let mut covered_rows = 0u64;
@@ -195,7 +235,7 @@ fn exact_synopsis_min_max(
     for file in state.files() {
         let entries = exact_payload_entries_for_file(file, column.column_id, SynopsisKind::MinMax)?;
         if entries.is_empty() {
-            return Ok(None);
+            return Ok(MetadataAggregateOutcome::Unavailable);
         }
         for (entry, payload) in entries {
             covered_rows = covered_rows
@@ -205,12 +245,12 @@ fn exact_synopsis_min_max(
                 .checked_add(entry.non_null_count()?)
                 .ok_or(CoveError::ArithOverflow)?;
             let AggregatePayloadV2::MinMax { min, max } = payload else {
-                return Ok(None);
+                return Ok(MetadataAggregateOutcome::Unavailable);
             };
             let candidate = match aggregate_kind {
                 MetadataSynopsisAggregateKind::Min => min,
                 MetadataSynopsisAggregateKind::Max => max,
-                _ => return Ok(None),
+                _ => return Ok(MetadataAggregateOutcome::Unavailable),
             };
             let Some(candidate) = candidate else {
                 continue;
@@ -233,37 +273,33 @@ fn exact_synopsis_min_max(
         }
     }
     if covered_rows != state.table().row_count {
-        return Ok(None);
+        return Ok(MetadataAggregateOutcome::Unavailable);
     }
-    Ok(Some(if non_null_rows == 0 {
-        None
+    Ok(if non_null_rows == 0 {
+        MetadataAggregateOutcome::SqlNull
     } else {
-        Some(best.ok_or(CoveError::BadIndex)?.payload)
-    }))
+        MetadataAggregateOutcome::Canonical(best.ok_or(CoveError::BadIndex)?.payload)
+    })
 }
 
 fn exact_synopsis_sum(
     state: &DatasetState,
     column_index: usize,
-    as_avg: bool,
-) -> Result<Option<Option<Vec<u8>>>, CoveError> {
+    mode: SumOutputMode,
+) -> Result<MetadataAggregateOutcome, CoveError> {
     let column = state
         .table()
         .columns
         .get(column_index)
         .ok_or_else(|| CoveError::BadSchema("sum column out of bounds".into()))?;
-    let kind = if as_avg {
-        SynopsisKind::SumAndCount
-    } else {
-        SynopsisKind::Sum
-    };
+    let kind = mode.synopsis_kind();
     let mut covered_rows = 0u64;
     let mut non_null_rows = 0u64;
     let mut accumulator = SumAccumulator::default();
     for file in state.files() {
         let entries = exact_payload_entries_for_file(file, column.column_id, kind)?;
         if entries.is_empty() {
-            return Ok(None);
+            return Ok(MetadataAggregateOutcome::Unavailable);
         }
         for (entry, payload) in entries {
             covered_rows = covered_rows
@@ -273,7 +309,7 @@ fn exact_synopsis_sum(
                 AggregatePayloadV2::Sum {
                     overflow_policy,
                     sum,
-                } if !as_avg
+                } if !mode.is_avg()
                     && *overflow_policy == NumericAggregateOverflowPolicy::CheckedExact =>
                 {
                     (entry.non_null_count()?, sum)
@@ -282,13 +318,15 @@ fn exact_synopsis_sum(
                     overflow_policy,
                     non_null_count,
                     sum,
-                } if as_avg && *overflow_policy == NumericAggregateOverflowPolicy::CheckedExact => {
+                } if mode.is_avg()
+                    && *overflow_policy == NumericAggregateOverflowPolicy::CheckedExact =>
+                {
                     (*non_null_count, sum)
                 }
-                _ => return Ok(None),
+                _ => return Ok(MetadataAggregateOutcome::Unavailable),
             };
             if declared_count != entry.non_null_count()? {
-                return Ok(None);
+                return Ok(MetadataAggregateOutcome::Unavailable);
             }
             non_null_rows = non_null_rows
                 .checked_add(declared_count)
@@ -298,19 +336,24 @@ fn exact_synopsis_sum(
         }
     }
     if covered_rows != state.table().row_count {
-        return Ok(None);
+        return Ok(MetadataAggregateOutcome::Unavailable);
     }
-    if as_avg {
+    if mode.is_avg() {
         if non_null_rows == 0 {
-            return Ok(Some(None));
+            return Ok(MetadataAggregateOutcome::SqlNull);
         }
         let avg = accumulator.as_f64()? / non_null_rows as f64;
-        return Ok(Some(Some(avg.to_bits().to_le_bytes().to_vec())));
+        return Ok(MetadataAggregateOutcome::Canonical(
+            avg.to_bits().to_le_bytes().to_vec(),
+        ));
     }
     if non_null_rows == 0 {
-        return Ok(Some(None));
+        return Ok(MetadataAggregateOutcome::SqlNull);
     }
-    accumulator.finish().map(Some)
+    match accumulator.finish()? {
+        Some(value) => Ok(MetadataAggregateOutcome::Canonical(value)),
+        None => Ok(MetadataAggregateOutcome::SqlNull),
+    }
 }
 
 fn exact_payload_entries_for_file(
@@ -363,7 +406,10 @@ fn select_exact_coverage_entries<'a>(
         .filter(|(entry, _)| entry.segment_id != u32::MAX && entry.morsel_id == u32::MAX)
         .collect::<Vec<_>>();
     if !segment_level.is_empty() {
-        return select_segment_coverage_entries(file.segments(), segment_level);
+        return Ok(select_segment_coverage_entries(
+            file.segments(),
+            segment_level,
+        ));
     }
 
     let morsel_level = candidates
@@ -376,27 +422,27 @@ fn select_exact_coverage_entries<'a>(
 fn select_segment_coverage_entries<'a>(
     segments: &[TableSegmentIndexEntryV1],
     entries: Vec<(&'a AggregateEntry, &'a AggregatePayloadV2)>,
-) -> Result<Vec<(&'a AggregateEntry, &'a AggregatePayloadV2)>, CoveError> {
+) -> Vec<(&'a AggregateEntry, &'a AggregatePayloadV2)> {
     if entries.len() != segments.len() {
-        return Ok(Vec::new());
+        return Vec::new();
     }
     let mut by_segment = BTreeMap::new();
     for item in entries {
         if by_segment.insert(item.0.segment_id, item).is_some() {
-            return Ok(Vec::new());
+            return Vec::new();
         }
     }
     let mut selected = Vec::with_capacity(segments.len());
     for segment in segments {
         let Some(item) = by_segment.remove(&segment.segment_id) else {
-            return Ok(Vec::new());
+            return Vec::new();
         };
         if item.0.row_count != segment.row_count {
-            return Ok(Vec::new());
+            return Vec::new();
         }
         selected.push(item);
     }
-    Ok(selected)
+    selected
 }
 
 fn select_morsel_coverage_entries<'a>(
@@ -932,7 +978,7 @@ pub fn exact_filecode_filtered_count(
     column_index: usize,
     canonical_keys: &[Vec<u8>],
 ) -> Result<Option<MetadataAggregatePlan>, CoveError> {
-    if canonical_keys.is_empty() || !filecode_fast_paths_are_safe(state, column_index)? {
+    if canonical_keys.is_empty() || !filecode_fast_paths_are_safe(state, column_index) {
         return Ok(None);
     }
     if let Some(plan) =
@@ -1044,7 +1090,7 @@ pub fn exact_filecode_group_counts(
     state: &DatasetState,
     column_index: usize,
 ) -> Result<Option<MetadataAggregatePlan>, CoveError> {
-    if !filecode_fast_paths_are_safe(state, column_index)? {
+    if !filecode_fast_paths_are_safe(state, column_index) {
         return Ok(None);
     }
     let column = state
@@ -1251,31 +1297,28 @@ pub fn canonical_utf8(canonical: &[u8]) -> Result<String, CoveError> {
         .map_err(|_| CoveError::BadSection("canonical Utf8 payload is not UTF-8".into()))
 }
 
-fn filecode_fast_paths_are_safe(
-    state: &DatasetState,
-    column_index: usize,
-) -> Result<bool, CoveError> {
+fn filecode_fast_paths_are_safe(state: &DatasetState, column_index: usize) -> bool {
     for file in state.files() {
         let Some(column) = file.table().columns.get(column_index) else {
-            return Ok(false);
+            return false;
         };
         if column.physical != CovePhysicalKind::FileCode
             || !file.visibility().is_all()
             || file.has_redaction()
         {
-            return Ok(false);
+            return false;
         }
     }
-    Ok(true)
+    true
 }
 
-fn aggregate_synopsis_fast_paths_are_safe(state: &DatasetState) -> Result<bool, CoveError> {
+fn aggregate_synopsis_fast_paths_are_safe(state: &DatasetState) -> bool {
     for file in state.files() {
         if !file.visibility().is_all() || file.has_redaction() {
-            return Ok(false);
+            return false;
         }
     }
-    Ok(true)
+    true
 }
 
 #[cfg(test)]
@@ -1326,6 +1369,33 @@ mod tests {
     }
 
     #[test]
+    fn metadata_aggregate_outcome_preserves_three_states() {
+        assert_eq!(
+            MetadataAggregateOutcome::Unavailable.into_plan_value(),
+            None
+        );
+        assert_eq!(
+            MetadataAggregateOutcome::SqlNull.into_plan_value(),
+            Some(None)
+        );
+        assert_eq!(
+            MetadataAggregateOutcome::Canonical(vec![1, 2, 3]).into_plan_value(),
+            Some(Some(vec![1, 2, 3]))
+        );
+    }
+
+    #[test]
+    fn sum_output_mode_selects_expected_synopsis_kind() {
+        assert_eq!(SumOutputMode::Sum.synopsis_kind(), SynopsisKind::Sum);
+        assert_eq!(
+            SumOutputMode::Avg.synopsis_kind(),
+            SynopsisKind::SumAndCount
+        );
+        assert!(!SumOutputMode::Sum.is_avg());
+        assert!(SumOutputMode::Avg.is_avg());
+    }
+
+    #[test]
     fn segment_coverage_rejects_duplicates_even_when_rows_sum() {
         let segments = vec![segment(10, 0, 4), segment(20, 4, 4)];
         let first = count_entry(10, u32::MAX, 4);
@@ -1336,8 +1406,7 @@ mod tests {
                 (&first, &AggregatePayloadV2::None),
                 (&duplicate, &AggregatePayloadV2::None),
             ],
-        )
-        .unwrap();
+        );
         assert!(selected.is_empty());
     }
 
@@ -1352,8 +1421,7 @@ mod tests {
                 (&first, &AggregatePayloadV2::None),
                 (&second, &AggregatePayloadV2::None),
             ],
-        )
-        .unwrap();
+        );
         assert_eq!(selected.len(), 2);
     }
 

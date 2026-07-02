@@ -211,7 +211,7 @@ pub(super) fn run_ai_training_archive_case(corpus: &Path) -> Result<Value, Strin
     let export_start = Instant::now();
     let export = archive
         .export(AiExportOptions {
-            format: "hf-jsonl".to_string(),
+            format: AiExportFormat::HfJsonl,
             out: None,
             split: Some("train".to_string()),
             include_payloads: true,

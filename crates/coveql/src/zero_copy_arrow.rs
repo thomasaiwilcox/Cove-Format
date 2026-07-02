@@ -49,13 +49,13 @@ pub(crate) fn try_execute_retained_zero_copy_arrow(
     }
     let started = Instant::now();
     if let Some(reason) = zero_copy_blocking_reason(physical, options) {
-        return zero_copy_fallback_or_reject(planned, reason);
+        return zero_copy_fallback_or_reject(planned, &reason);
     }
 
     let Some(map_bytes) = physical.sidecars.zero_copy_buffer_map_bytes.as_deref() else {
         return zero_copy_fallback_or_reject(
             planned,
-            "COVE-L zero-copy buffer map was not supplied".into(),
+            "COVE-L zero-copy buffer map was not supplied",
         );
     };
     let map = match ZeroCopyBufferMapV2::parse(map_bytes) {
@@ -63,7 +63,7 @@ pub(crate) fn try_execute_retained_zero_copy_arrow(
         Err(error) => {
             return zero_copy_fallback_or_reject(
                 planned,
-                format!("COVE-L zero-copy buffer map parse failed: {error}"),
+                &format!("COVE-L zero-copy buffer map parse failed: {error}"),
             )
         }
     };
@@ -80,20 +80,20 @@ pub(crate) fn try_execute_retained_zero_copy_arrow(
         Err(error) => {
             return zero_copy_fallback_or_reject(
                 planned,
-                format!("retained COVE-O zero-copy read failed: {error}"),
+                &format!("retained COVE-O zero-copy read failed: {error}"),
             )
         }
     };
     let expected_dictionary_semantics =
         match zero_copy_dictionary_semantics_for_projection(&retained.segments, physical) {
             Ok(semantics) => semantics,
-            Err(reason) => return zero_copy_fallback_or_reject(planned, reason),
+            Err(reason) => return zero_copy_fallback_or_reject(planned, &reason),
         };
     let file_dictionary =
         if expected_dictionary_semantics == ZeroCopyDictionarySemanticsV2::FileCodeDictionary {
             match zero_copy_file_dictionary(input.as_slice()) {
                 Ok(dictionary) => Some(dictionary),
-                Err(reason) => return zero_copy_fallback_or_reject(planned, reason),
+                Err(reason) => return zero_copy_fallback_or_reject(planned, &reason),
             }
         } else {
             None
@@ -114,7 +114,7 @@ pub(crate) fn try_execute_retained_zero_copy_arrow(
     ) {
         return zero_copy_fallback_or_reject(
             planned,
-            format!("COVE-L zero-copy map did not validate against COVE-O pages: {error}"),
+            &format!("COVE-L zero-copy map did not validate against COVE-O pages: {error}"),
         );
     }
 
@@ -313,11 +313,11 @@ fn retained_object_projection_batch(
         }
         let validity = payload
             .buffer_bytes(PageBufferKind::NullBitmap)
-            .map_err(|error| zero_copy_page_error(property_id, error))?
+            .map_err(|error| zero_copy_page_error(property_id, &error))?
             .map(|bytes| ValidityBitmap::new(bytes, u64::from(page.index_entry.row_count)));
         let values = payload
             .buffer_bytes(PageBufferKind::Values)
-            .map_err(|error| zero_copy_page_error(property_id, error))?
+            .map_err(|error| zero_copy_page_error(property_id, &error))?
             .ok_or_else(|| {
                 exec_error(
                     "E_ZERO_COPY_UNSUPPORTED",
@@ -606,7 +606,7 @@ fn object_authority(
 
 fn zero_copy_fallback_or_reject(
     planned: &crate::PlannedQuery,
-    reason: String,
+    reason: &str,
 ) -> Result<Option<ExecutedQuery>, BuildExecutionError> {
     if planned.resolved.operation_context.request.fallback_policy
         == FallbackPolicy::RejectOnFallback
@@ -621,7 +621,7 @@ fn zero_copy_fallback_or_reject(
     }
 }
 
-fn zero_copy_page_error(property_id: u32, error: CoveError) -> BuildExecutionError {
+fn zero_copy_page_error(property_id: u32, error: &CoveError) -> BuildExecutionError {
     exec_error(
         "E_ZERO_COPY_UNSUPPORTED",
         format!("retained zero-copy property page read failed: {error}"),

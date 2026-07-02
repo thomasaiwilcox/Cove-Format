@@ -362,7 +362,7 @@ impl ExecutionPlan for CoveNativeI64JoinExec {
             &right.lane,
             &mut stats,
         )?;
-        CoveFileMetrics::new(&self.metrics, partition).record_decode(stats);
+        CoveFileMetrics::new(&self.metrics, partition).record_decode(&stats);
         Ok(Box::pin(MemoryStream::try_new(
             vec![batch],
             Arc::clone(&self.schema),
@@ -532,7 +532,7 @@ impl ExecutionPlan for CoveNativeFileCodeJoinExec {
             &right.lane,
             &mut stats,
         )?;
-        CoveFileMetrics::new(&self.metrics, partition).record_decode(stats);
+        CoveFileMetrics::new(&self.metrics, partition).record_decode(&stats);
         Ok(Box::pin(MemoryStream::try_new(
             vec![batch],
             Arc::clone(&self.schema),

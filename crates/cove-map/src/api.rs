@@ -186,16 +186,34 @@ pub struct ProjectionCoviFilterDiagnostic {
     pub reason: String,
 }
 
+/// Materializes source inputs through a COVE-M map and returns the conversion report.
+///
+/// # Errors
+///
+/// Returns [`MapApiError`] if the map cannot be read or parsed, source inputs
+/// cannot be read or validated, or materialization fails.
 pub fn conversion_report_from_paths(map: &Path, sources: &[PathBuf]) -> MapApiResult<Value> {
     Ok(materialize_from_paths_for_api(map, sources)?.conversion_report)
 }
 
+/// Verifies that a conversion report replays against a COVE-M map.
+///
+/// # Errors
+///
+/// Returns [`MapApiError`] if the map cannot be read or parsed, or the replay
+/// report does not validate against the mapping.
 pub fn verify_replay_report_from_paths(map: &Path, report: &Value) -> MapApiResult<Value> {
     let file = parse_map_for_api(map)?;
     crate::verify_replay_report(&file, report)
         .map_err(|error| MapApiError::replay(error.to_string()))
 }
 
+/// Materializes source inputs and returns a compact conversion summary.
+///
+/// # Errors
+///
+/// Returns [`MapApiError`] if the map cannot be read or parsed, source inputs
+/// cannot be read or validated, or materialization fails.
 pub fn conversion_summary_from_paths(map: &Path, sources: &[PathBuf]) -> MapApiResult<Value> {
     let materialized = materialize_from_paths_for_api(map, sources)?;
     Ok(json!({
@@ -208,6 +226,12 @@ pub fn conversion_summary_from_paths(map: &Path, sources: &[PathBuf]) -> MapApiR
     }))
 }
 
+/// Computes candidate matches for source rows using a COVE-M map.
+///
+/// # Errors
+///
+/// Returns [`MapApiError`] if the map cannot be read or parsed, source inputs
+/// cannot be read or validated, or candidate materialization fails.
 pub fn candidate_matches_from_paths(map: &Path, sources: &[PathBuf]) -> MapApiResult<Value> {
     let file = parse_map_for_api(map)?;
     let inputs = read_source_inputs(sources).map_err(MapApiError::source_input)?;
@@ -215,6 +239,12 @@ pub fn candidate_matches_from_paths(map: &Path, sources: &[PathBuf]) -> MapApiRe
     candidate_matches(&file, &inputs.rows).map_err(MapApiError::materialization)
 }
 
+/// Builds a COVE-O object from source rows and a COVE-M map.
+///
+/// # Errors
+///
+/// Returns [`MapApiError`] if the map cannot be read or parsed, source inputs
+/// cannot be read or validated, or COVE-O materialization fails.
 pub fn cove_o_from_paths(map: &Path, sources: &[PathBuf]) -> MapApiResult<Vec<u8>> {
     let file = parse_map_for_api(map)?;
     let inputs = read_source_inputs(sources).map_err(MapApiError::source_input)?;
@@ -223,6 +253,12 @@ pub fn cove_o_from_paths(map: &Path, sources: &[PathBuf]) -> MapApiResult<Vec<u8
         .map_err(MapApiError::materialization)
 }
 
+/// Projects source rows through a COVE-M map and returns JSON rows.
+///
+/// # Errors
+///
+/// Returns [`MapApiError`] if the map cannot be read or parsed, source inputs
+/// cannot be read or validated, or projection fails.
 pub fn projected_rows_from_paths(map: &Path, sources: &[PathBuf]) -> MapApiResult<Value> {
     let file = parse_map_for_api(map)?;
     let inputs = read_source_inputs(sources).map_err(MapApiError::source_input)?;
@@ -231,6 +267,13 @@ pub fn projected_rows_from_paths(map: &Path, sources: &[PathBuf]) -> MapApiResul
         .map_err(MapApiError::projection)
 }
 
+/// Projects source rows through a COVE-M map into a requested output format.
+///
+/// # Errors
+///
+/// Returns [`MapApiError`] if the map cannot be read or parsed, source inputs
+/// cannot be read or validated, the projection id is unknown, or output
+/// encoding fails.
 pub fn projected_output_from_paths(
     map: &Path,
     sources: &[PathBuf],
@@ -250,6 +293,12 @@ pub fn projected_output_from_paths(
     .map_err(MapApiError::projection)
 }
 
+/// Projects a COVE-O object path into JSON rows.
+///
+/// # Errors
+///
+/// Returns [`MapApiError`] if the COVE-O object or optional mapping cannot be
+/// read, validated, or projected.
 pub fn projected_rows_from_cove_o_path(
     object: &Path,
     mapping: Option<&Path>,
@@ -257,6 +306,12 @@ pub fn projected_rows_from_cove_o_path(
     project_cove_o_path(object, mapping).map_err(MapApiError::projection)
 }
 
+/// Projects a COVE-O object path into a requested output format.
+///
+/// # Errors
+///
+/// Returns [`MapApiError`] if the COVE-O object or optional mapping cannot be
+/// read, validated, or projected, or if output encoding fails.
 pub fn projected_output_from_cove_o_path(
     object: &Path,
     mapping: Option<&Path>,
@@ -267,6 +322,13 @@ pub fn projected_output_from_cove_o_path(
         .map_err(MapApiError::projection)
 }
 
+/// Projects COVE-O object bytes into a requested output format.
+///
+/// # Errors
+///
+/// Returns [`MapApiError`] if the bytes are not a valid COVE-O object, the
+/// optional mapping cannot be read, the projection id is unknown, or output
+/// encoding fails.
 pub fn projected_output_from_cove_o_bytes(
     object: &[u8],
     mapping: Option<&Path>,
@@ -277,6 +339,13 @@ pub fn projected_output_from_cove_o_bytes(
         .map_err(MapApiError::projection)
 }
 
+/// Projects COVE-O object bytes into one Arrow record batch.
+///
+/// # Errors
+///
+/// Returns [`MapApiError`] if the bytes are not a valid COVE-O object, the
+/// optional mapping cannot be read, the projection id is unknown, or Arrow
+/// batch construction fails.
 pub fn projected_record_batch_from_cove_o_bytes(
     object: &[u8],
     mapping: Option<&Path>,
@@ -287,6 +356,13 @@ pub fn projected_record_batch_from_cove_o_bytes(
         .map_err(MapApiError::projection)
 }
 
+/// Projects COVE-O object bytes into Arrow record batches.
+///
+/// # Errors
+///
+/// Returns [`MapApiError`] if the bytes are not a valid COVE-O object, the
+/// optional mapping cannot be read, the projection id is unknown, or Arrow
+/// batch construction fails.
 pub fn projected_record_batches_from_cove_o_bytes(
     object: &[u8],
     mapping: Option<&Path>,
@@ -297,6 +373,13 @@ pub fn projected_record_batches_from_cove_o_bytes(
         .map_err(MapApiError::projection)
 }
 
+/// Projects COVE-O object bytes into Arrow batches using a supplied catalog.
+///
+/// # Errors
+///
+/// Returns [`MapApiError`] if the bytes are not a valid COVE-O object, the
+/// optional mapping cannot be read, the projection id is unknown in `catalog`,
+/// or Arrow batch construction fails.
 pub fn projected_record_batches_from_cove_o_bytes_with_catalog(
     object: &[u8],
     mapping: Option<&Path>,
@@ -315,6 +398,12 @@ pub fn projected_record_batches_from_cove_o_bytes_with_catalog(
     .map_err(MapApiError::projection)
 }
 
+/// Projects an already-decoded COVE-O surface into Arrow batches.
+///
+/// # Errors
+///
+/// Returns [`MapApiError`] if the projection id is unknown in `catalog` or
+/// Arrow batch construction fails.
 pub fn projected_record_batches_from_cove_o_surface_with_catalog(
     surface: &CoveObjectSurface,
     catalog: &MapProjectionCatalog,
@@ -330,6 +419,12 @@ pub fn projected_record_batches_from_cove_o_surface_with_catalog(
     .map_err(MapApiError::projection)
 }
 
+/// Builds the projection catalog for COVE-O object bytes.
+///
+/// # Errors
+///
+/// Returns [`MapApiError`] if the bytes are not a valid COVE-O object, the
+/// optional mapping cannot be read, or projection catalog construction fails.
 pub fn projection_catalog_from_cove_o_bytes(
     object: &[u8],
     mapping: Option<&Path>,
@@ -338,6 +433,12 @@ pub fn projection_catalog_from_cove_o_bytes(
         .map_err(MapApiError::projection)
 }
 
+/// Describes projections available for a COVE-O object path.
+///
+/// # Errors
+///
+/// Returns [`MapApiError`] if the COVE-O object or optional mapping cannot be
+/// read, validated, or converted into a projection catalog.
 pub fn projection_descriptors_from_cove_o_path(
     object: &Path,
     mapping: Option<&Path>,
@@ -378,6 +479,12 @@ pub fn projection_descriptors_from_cove_o_path(
         .collect())
 }
 
+/// Converts a projection descriptor into an Arrow schema.
+///
+/// # Errors
+///
+/// Returns [`MapApiError`] if the descriptor contains a projection shape that
+/// cannot be represented as an Arrow schema.
 pub fn projection_arrow_schema(descriptor: &ProjectionDescriptor) -> MapApiResult<SchemaRef> {
     projection_schema_from_descriptor(descriptor).map_err(MapApiError::projection)
 }
@@ -571,6 +678,12 @@ fn projection_filter_op(filter: &ProjectionFilter) -> &'static str {
     }
 }
 
+/// Computes the COVE-O read requirements for one catalog projection.
+///
+/// # Errors
+///
+/// Returns [`MapApiError`] if `projection_id` is unknown or its read
+/// requirements cannot be derived from the catalog/options.
 pub fn projection_read_requirements_for_catalog(
     catalog: &cove_core::profile::cove_map::MapProjectionCatalog,
     projection_id: &str,

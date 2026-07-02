@@ -393,7 +393,7 @@ impl CoveStreamMetrics {
         }
     }
 
-    fn record_decode(&self, stats: DecodeStats) {
+    fn record_decode(&self, stats: &DecodeStats) {
         self.files_considered.add(stats.files_considered);
         self.files_pruned.add(stats.files_pruned);
         self.files_validated.add(stats.files_validated);
@@ -645,7 +645,7 @@ impl CoveRecordBatchStream {
             match result {
                 Ok(mut stats) => {
                     stats.add_decode(dynamic_stats);
-                    decode_metrics.record_decode(stats);
+                    decode_metrics.record_decode(&stats);
                     let _ = sender.blocking_send(DecodeStreamEvent::Finished);
                 }
                 Err(error) => {
@@ -691,7 +691,7 @@ impl CoveRecordBatchStream {
                 scan_cache,
             )?;
             decoded.stats.add_decode(dynamic_stats);
-            decode_metrics.record_decode(decoded.stats);
+            decode_metrics.record_decode(&decoded.stats);
             Ok(decoded.batches)
         });
         Self {

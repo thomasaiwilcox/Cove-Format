@@ -6,6 +6,12 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use super::*;
 
 /// Convert Parquet bytes into a semantically valid COVE-T scan-profile file.
+///
+/// # Errors
+///
+/// Returns [`CoveError`] if conversion options are invalid, the Parquet reader
+/// cannot be opened or read, Arrow batches cannot be converted to COVE-T
+/// columns, or the resulting COVE sections cannot be encoded.
 pub fn convert_parquet_bytes(
     bytes: &[u8],
     options: &ParquetConversionOptions,
@@ -50,6 +56,12 @@ pub fn convert_parquet_bytes(
 /// Convert Arrow record batches into a semantically valid COVE-T scan-profile
 /// file using the same writer, statistics, dictionary, and acceleration path as
 /// the Parquet converter.
+///
+/// # Errors
+///
+/// Returns [`CoveError`] if conversion options are invalid, Arrow schemas or
+/// batches cannot be represented as COVE-T columns, acceleration sidecars cannot
+/// be built, or the resulting COVE sections cannot be encoded.
 pub fn convert_arrow_record_batches<I>(
     source_format: impl Into<String>,
     source_schema_fingerprint: String,

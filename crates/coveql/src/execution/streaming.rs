@@ -174,7 +174,7 @@ impl MaterializedRowStreamState {
             &source.object_rows,
             &planned,
         );
-        sort_rows(&mut source.rows, &planned, &context)?;
+        sort_rows(&mut source.rows, &planned, &context);
         Ok(Self {
             planned,
             options,

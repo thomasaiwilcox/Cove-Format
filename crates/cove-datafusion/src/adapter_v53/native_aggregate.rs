@@ -453,7 +453,7 @@ impl ExecutionPlan for CoveNativeBoolI64GroupAggregateExec {
             &self.filter_plan,
         )
         .map_err(crate::adapter_v53::cove_to_datafusion)?;
-        CoveFileMetrics::new(&self.metrics, partition).record_decode(scan.stats);
+        CoveFileMetrics::new(&self.metrics, partition).record_decode(&scan.stats);
         let batch = native_bool_i64_group_aggregate_batch(
             Arc::clone(&self.schema),
             &self.requests,
@@ -605,7 +605,7 @@ impl ExecutionPlan for CoveNativeI64I64GroupAggregateExec {
             &self.filter_plan,
         )
         .map_err(crate::adapter_v53::cove_to_datafusion)?;
-        CoveFileMetrics::new(&self.metrics, partition).record_decode(scan.stats);
+        CoveFileMetrics::new(&self.metrics, partition).record_decode(&scan.stats);
         let batch = native_i64_i64_group_aggregate_batch(
             Arc::clone(&self.schema),
             &self.requests,
@@ -759,7 +759,7 @@ impl ExecutionPlan for CoveNativeFileCodeI64GroupAggregateExec {
             &self.filter_plan,
         )
         .map_err(crate::adapter_v53::cove_to_datafusion)?;
-        CoveFileMetrics::new(&self.metrics, partition).record_decode(scan.stats);
+        CoveFileMetrics::new(&self.metrics, partition).record_decode(&scan.stats);
         let batch = native_filecode_i64_group_aggregate_batch(
             Arc::clone(&self.schema),
             &self.requests,
@@ -937,7 +937,7 @@ fn native_aggregate_batch(
         {
             let scan = native_i64_aggregate_scan(state, request.column_index, filter_plan)
                 .map_err(crate::adapter_v53::cove_to_datafusion)?;
-            CoveFileMetrics::new(metrics, partition).record_decode(scan.stats);
+            CoveFileMetrics::new(metrics, partition).record_decode(&scan.stats);
             entry.insert(scan);
         }
     }

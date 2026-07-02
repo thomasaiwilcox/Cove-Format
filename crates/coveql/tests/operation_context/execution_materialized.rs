@@ -1960,14 +1960,12 @@ fn retained_physical_zero_copy_arrow_uses_cove_l_object_page_owner() {
         ParseOptions::default(),
         resolve_options,
         PlanOptions::default(),
-        PhysicalPlanOptions {
-            allow_zero_copy_output: true,
-            sidecars: PhysicalSidecarInputs {
+        PhysicalPlanOptions::default()
+            .with_zero_copy_output(true)
+            .with_sidecars(PhysicalSidecarInputs {
                 zero_copy_buffer_map_bytes: Some(metric_zero_copy_map()),
                 ..PhysicalSidecarInputs::default()
-            },
-            ..PhysicalPlanOptions::default()
-        },
+            }),
         ExecutionOptions::default(),
         KernelExecutionOptions::default(),
         validation_options(),
@@ -2046,14 +2044,12 @@ fn retained_physical_zero_copy_arrow_reuses_numcode_values_with_null_bitmap() {
         ParseOptions::default(),
         resolve_options,
         PlanOptions::default(),
-        PhysicalPlanOptions {
-            allow_zero_copy_output: true,
-            sidecars: PhysicalSidecarInputs {
+        PhysicalPlanOptions::default()
+            .with_zero_copy_output(true)
+            .with_sidecars(PhysicalSidecarInputs {
                 zero_copy_buffer_map_bytes: Some(nullable_metric_zero_copy_map()),
                 ..PhysicalSidecarInputs::default()
-            },
-            ..PhysicalPlanOptions::default()
-        },
+            }),
         ExecutionOptions::default(),
         KernelExecutionOptions::default(),
         validation_options(),
@@ -2118,14 +2114,12 @@ fn retained_physical_zero_copy_arrow_reuses_fixed_bytes_values() {
         ParseOptions::default(),
         resolve_options,
         PlanOptions::default(),
-        PhysicalPlanOptions {
-            allow_zero_copy_output: true,
-            sidecars: PhysicalSidecarInputs {
+        PhysicalPlanOptions::default()
+            .with_zero_copy_output(true)
+            .with_sidecars(PhysicalSidecarInputs {
                 zero_copy_buffer_map_bytes: Some(uid_fixed_bytes_zero_copy_map()),
                 ..PhysicalSidecarInputs::default()
-            },
-            ..PhysicalPlanOptions::default()
-        },
+            }),
         ExecutionOptions::default(),
         KernelExecutionOptions::default(),
         validation_options(),
@@ -2188,14 +2182,12 @@ fn retained_physical_zero_copy_arrow_reuses_nullable_fixed_bytes_values() {
         ParseOptions::default(),
         resolve_options,
         PlanOptions::default(),
-        PhysicalPlanOptions {
-            allow_zero_copy_output: true,
-            sidecars: PhysicalSidecarInputs {
+        PhysicalPlanOptions::default()
+            .with_zero_copy_output(true)
+            .with_sidecars(PhysicalSidecarInputs {
                 zero_copy_buffer_map_bytes: Some(nullable_uid_fixed_bytes_zero_copy_map()),
                 ..PhysicalSidecarInputs::default()
-            },
-            ..PhysicalPlanOptions::default()
-        },
+            }),
         ExecutionOptions::default(),
         KernelExecutionOptions::default(),
         validation_options(),
@@ -2253,14 +2245,12 @@ fn retained_physical_zero_copy_arrow_exports_bool_page_without_materialized_fall
         ParseOptions::default(),
         resolve_options,
         PlanOptions::default(),
-        PhysicalPlanOptions {
-            allow_zero_copy_output: true,
-            sidecars: PhysicalSidecarInputs {
+        PhysicalPlanOptions::default()
+            .with_zero_copy_output(true)
+            .with_sidecars(PhysicalSidecarInputs {
                 zero_copy_buffer_map_bytes: Some(active_bool_zero_copy_map()),
                 ..PhysicalSidecarInputs::default()
-            },
-            ..PhysicalPlanOptions::default()
-        },
+            }),
         ExecutionOptions::default(),
         KernelExecutionOptions::default(),
         validation_options(),
@@ -2310,14 +2300,12 @@ fn retained_physical_zero_copy_arrow_exports_filecode_dictionary_page() {
         ParseOptions::default(),
         resolve_options,
         PlanOptions::default(),
-        PhysicalPlanOptions {
-            allow_zero_copy_output: true,
-            sidecars: PhysicalSidecarInputs {
+        PhysicalPlanOptions::default()
+            .with_zero_copy_output(true)
+            .with_sidecars(PhysicalSidecarInputs {
                 zero_copy_buffer_map_bytes: Some(name_filecode_zero_copy_map()),
                 ..PhysicalSidecarInputs::default()
-            },
-            ..PhysicalPlanOptions::default()
-        },
+            }),
         ExecutionOptions::default(),
         KernelExecutionOptions::default(),
         validation_options(),

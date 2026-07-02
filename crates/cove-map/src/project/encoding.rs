@@ -358,8 +358,7 @@ where
                     .transpose()
             })
         })
-        .collect::<Vec<_>>();
-    let converted = converted.into_iter().collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(Arc::new(A::from(converted)) as ArrayRef)
 }
 

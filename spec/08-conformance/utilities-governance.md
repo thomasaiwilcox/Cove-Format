@@ -55,7 +55,7 @@ Developer-only tools such as **cove-bench**, **cove-fuzz**, **cove-conformance**
 - **Python:** cove.read_table(), cove.scan(), cove.to_arrow(), cove.to_polars().
 - **Java / Scala:** Table-format and engine adapters where JVM ecosystem integration is required.
 - **Go:** Lightweight validation, inspection, and service-side read bindings.
-- **Rust:** cove-core, cove-io, cove-arrow, cove-datafusion, cove-engine.
+- **Rust:** cove-core, cove, cove-arrow, cove-datafusion, cove-engine.
 - **WASM / embedded:** Optional lightweight COVE-Core/COVE-T validation and projection readers with optional profiles disabled by default.
 - **Harbor:** Optional COVE-H direct leased-code mount support.
 

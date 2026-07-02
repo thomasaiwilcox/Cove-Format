@@ -1677,7 +1677,7 @@ pub(super) fn signed_literal_canonical_value(
             })
         }
         CoveLogicalType::Int32 | CoveLogicalType::DateDays => {
-            let _ = i32::try_from(value).map_err(|_| {
+            let value32 = i32::try_from(value).map_err(|_| {
                 exec_error(
                     "E_COVI_LOOKUP_UNSAFE",
                     "signed literal does not fit int32 index key domain",
@@ -1685,7 +1685,7 @@ pub(super) fn signed_literal_canonical_value(
                 )
             })?;
             if logical == CoveLogicalType::DateDays {
-                Some(CanonicalValue::DateDays(value as i32))
+                Some(CanonicalValue::DateDays(value32))
             } else {
                 Some(CanonicalValue::Int {
                     width: 4,

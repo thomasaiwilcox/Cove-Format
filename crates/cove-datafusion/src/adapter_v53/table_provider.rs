@@ -105,7 +105,7 @@ impl TableProvider for CoveTableProvider {
                 filter.display
             )));
         }
-        let mut plan = plan_scan(&self.state, projection, filter_plans)
+        let mut plan = plan_scan(&self.state, projection.map(Vec::as_slice), filter_plans)
             .map_err(crate::adapter_v53::cove_to_datafusion)?;
         plan.topn_hint = self.topn_hint;
         CoveExec::try_new_with_fetch(Arc::clone(&self.state), plan, limit)

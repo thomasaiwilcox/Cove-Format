@@ -111,17 +111,17 @@ fn read_jsonl(path: &Path, bytes: &[u8], source_id: &str) -> Result<Vec<SourceRo
 fn read_parquet(path: &Path, bytes: &[u8], source_id: &str) -> Result<Vec<SourceRow>, String> {
     let (_schema, batches) =
         read_parquet_batches_from_bytes(bytes).map_err(|err| err.to_string())?;
-    source_rows_from_record_batches(path, source_id, batches)
+    source_rows_from_record_batches(path, source_id, &batches)
 }
 
 fn read_orc(path: &Path, bytes: &[u8], source_id: &str) -> Result<Vec<SourceRow>, String> {
     let (_schema, batches) = read_orc_batches_from_bytes(bytes).map_err(|err| err.to_string())?;
-    source_rows_from_record_batches(path, source_id, batches)
+    source_rows_from_record_batches(path, source_id, &batches)
 }
 
 fn read_arrow_ipc(path: &Path, bytes: &[u8], source_id: &str) -> Result<Vec<SourceRow>, String> {
     let (_schema, batches) = read_arrow_batches_from_bytes(bytes).map_err(|err| err.to_string())?;
-    source_rows_from_record_batches(path, source_id, batches)
+    source_rows_from_record_batches(path, source_id, &batches)
 }
 
 #[cfg(test)]
@@ -178,12 +178,12 @@ fn utf8_source_text<'a>(path: &Path, bytes: &'a [u8], format: &str) -> Result<&'
 fn source_rows_from_record_batches(
     path: &Path,
     source_id: &str,
-    batches: Vec<RecordBatch>,
+    batches: &[RecordBatch],
 ) -> Result<Vec<SourceRow>, String> {
     let mut writer = WriterBuilder::new()
         .with_explicit_nulls(true)
         .build::<_, LineDelimited>(Vec::new());
-    for batch in &batches {
+    for batch in batches {
         writer
             .write(batch)
             .map_err(|err| format!("cannot encode {} rows as JSON: {err}", path.display()))?;

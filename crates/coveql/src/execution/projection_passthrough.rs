@@ -719,21 +719,19 @@ pub(super) fn projection_compare_filter(
     right: &ResolvedExpr,
 ) -> Option<ProjectionFilter> {
     if let (Some(path), ResolvedExpr::Literal(literal)) = (projection_path(left), right) {
-        return projection_filter_op(op).and_then(|op| {
-            Some(ProjectionFilter::Compare {
-                column: projection_column(path),
-                op,
-                literal: projection_filter_literal(literal)?,
-            })
+        let op = projection_filter_op(op);
+        return Some(ProjectionFilter::Compare {
+            column: projection_column(path),
+            op,
+            literal: projection_filter_literal(literal)?,
         });
     }
     if let (ResolvedExpr::Literal(literal), Some(path)) = (left, projection_path(right)) {
-        return projection_filter_op(invert_compare_op(op)).and_then(|op| {
-            Some(ProjectionFilter::Compare {
-                column: projection_column(path),
-                op,
-                literal: projection_filter_literal(literal)?,
-            })
+        let op = projection_filter_op(invert_compare_op(op));
+        return Some(ProjectionFilter::Compare {
+            column: projection_column(path),
+            op,
+            literal: projection_filter_literal(literal)?,
         });
     }
     None
@@ -762,14 +760,14 @@ pub(super) fn projection_column(path: &ResolvedPath) -> String {
     }
 }
 
-pub(super) fn projection_filter_op(op: AstCompareOp) -> Option<ProjectionFilterOp> {
+pub(super) fn projection_filter_op(op: AstCompareOp) -> ProjectionFilterOp {
     match op {
-        AstCompareOp::Eq => Some(ProjectionFilterOp::Eq),
-        AstCompareOp::Ne => Some(ProjectionFilterOp::Ne),
-        AstCompareOp::Lt => Some(ProjectionFilterOp::Lt),
-        AstCompareOp::Le => Some(ProjectionFilterOp::LtEq),
-        AstCompareOp::Gt => Some(ProjectionFilterOp::Gt),
-        AstCompareOp::Ge => Some(ProjectionFilterOp::GtEq),
+        AstCompareOp::Eq => ProjectionFilterOp::Eq,
+        AstCompareOp::Ne => ProjectionFilterOp::Ne,
+        AstCompareOp::Lt => ProjectionFilterOp::Lt,
+        AstCompareOp::Le => ProjectionFilterOp::LtEq,
+        AstCompareOp::Gt => ProjectionFilterOp::Gt,
+        AstCompareOp::Ge => ProjectionFilterOp::GtEq,
     }
 }
 

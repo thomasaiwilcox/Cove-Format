@@ -183,7 +183,7 @@ fn vector_binding_artifact_sections(
             100,
             SectionKind::AiReferenceTables,
             PrimaryProfile::CoveAiShared,
-            encode_records(reference_records).unwrap(),
+            encode_records(reference_records),
         ));
     }
     if !tables.chunk_profiles.is_empty() {
@@ -197,8 +197,7 @@ fn vector_binding_artifact_sections(
                     .iter()
                     .cloned()
                     .map(|record| encode_chunk_profile(record).unwrap()),
-            )
-            .unwrap(),
+            ),
         ));
     }
     if !tables.text_chunks.is_empty() {
@@ -212,8 +211,7 @@ fn vector_binding_artifact_sections(
                     .iter()
                     .cloned()
                     .map(|record| encode_text_chunk_entry(record).unwrap()),
-            )
-            .unwrap(),
+            ),
         ));
     }
     if !tables.vector_spaces.is_empty() {
@@ -227,8 +225,7 @@ fn vector_binding_artifact_sections(
                     .iter()
                     .cloned()
                     .map(|record| encode_vector_space(record).unwrap()),
-            )
-            .unwrap(),
+            ),
         ));
     }
     if !tables.vector_payload_blocks.is_empty() {
@@ -242,8 +239,7 @@ fn vector_binding_artifact_sections(
                     .iter()
                     .cloned()
                     .map(|record| encode_vector_payload_block(record).unwrap()),
-            )
-            .unwrap(),
+            ),
         ));
     }
     if !tables.vector_entries.is_empty() {
@@ -257,8 +253,7 @@ fn vector_binding_artifact_sections(
                     .iter()
                     .cloned()
                     .map(|record| encode_vector_entry(record).unwrap()),
-            )
-            .unwrap(),
+            ),
         ));
     }
     if !tables.assets.is_empty() {
@@ -272,15 +267,14 @@ fn vector_binding_artifact_sections(
                     .iter()
                     .cloned()
                     .map(|record| encode_ai_asset_ref(record).unwrap()),
-            )
-            .unwrap(),
+            ),
         ));
     }
     let mut vector_binding_section = coveai_binary_section(
         107,
         SectionKind::AiVectorBinding,
         PrimaryProfile::CoveVec,
-        encode_records(vector_binding_records).unwrap(),
+        encode_records(vector_binding_records),
     );
     vector_binding_section.required_ai_features = vector_binding_required_ai_features;
     payload_sections.push(vector_binding_section);
@@ -512,8 +506,7 @@ fn rejects_companion_ref_missing_artifact_digest() {
                     crc32c: 0,
                 })
                 .unwrap(),
-            ])
-            .unwrap(),
+            ]),
         ),
         coveai_binary_section(
             3,
@@ -531,8 +524,7 @@ fn rejects_companion_ref_missing_artifact_digest() {
                 flags: 0,
                 crc32c: 0,
             })
-            .unwrap()])
-            .unwrap(),
+            .unwrap()]),
         ),
     ];
     let bytes = write_coveai_artifact(CoveAiArtifactKind::CoveAiBundle, [22u8; 16], 909, &sections)
@@ -1112,7 +1104,7 @@ fn section_required_unknown_ai_features_only_reject_needed_sections() {
         1,
         SectionKind::AiVectorIndex,
         PrimaryProfile::CoveVec,
-        encode_records([encode_ai_record(60_010, 1, 0, Vec::new()).unwrap()]).unwrap(),
+        encode_records([encode_ai_record(60_010, 1, 0, &[]).unwrap()]),
     );
     vector_index.requiredness_scope = AiRequirednessScopeV1::SectionRequired;
     vector_index.required_ai_features = unknown_required;
@@ -1140,7 +1132,7 @@ fn section_required_unknown_ai_features_reject_needed_sections() {
         1,
         SectionKind::AiVectorBinding,
         PrimaryProfile::CoveVec,
-        encode_records([encode_ai_record(60_011, 1, 0, Vec::new()).unwrap()]).unwrap(),
+        encode_records([encode_ai_record(60_011, 1, 0, &[]).unwrap()]),
     );
     vector_binding.requiredness_scope = AiRequirednessScopeV1::SectionRequired;
     vector_binding.required_ai_features = unknown_required;
@@ -1205,10 +1197,9 @@ fn unknown_optional_ai_record_with_future_version_is_skipped() {
                 3,
                 1,
                 AI_FLAG_PAYLOAD_CRC32C_PRESENT,
-                Vec::new(),
+                &[],
             )
-            .unwrap()])
-            .unwrap(),
+            .unwrap()]),
         )],
     )
     .unwrap();
@@ -1220,7 +1211,7 @@ fn unknown_optional_ai_record_with_future_version_is_skipped() {
 
 #[test]
 fn duplicate_unknown_optional_ai_records_are_skipped() {
-    let record = encode_ai_record(60_020, 7, AI_FLAG_PAYLOAD_CRC32C_PRESENT, Vec::new()).unwrap();
+    let record = encode_ai_record(60_020, 7, AI_FLAG_PAYLOAD_CRC32C_PRESENT, &[]).unwrap();
     let bytes = write_coveai_artifact(
         CoveAiArtifactKind::CoveAiBundle,
         [144u8; 16],
@@ -1229,7 +1220,7 @@ fn duplicate_unknown_optional_ai_records_are_skipped() {
             1,
             SectionKind::AiReferenceTables,
             PrimaryProfile::CoveAiShared,
-            encode_records([record.clone(), record]).unwrap(),
+            encode_records([record.clone(), record]),
         )],
     )
     .unwrap();
@@ -1245,14 +1236,14 @@ fn duplicate_unknown_required_ai_records_defer_until_matching_scope() {
         60_021,
         1,
         AI_FLAG_REQUIRED_RECORD | AI_FLAG_PAYLOAD_CRC32C_PRESENT,
-        Vec::new(),
+        &[],
     )
     .unwrap();
     let mut section = coveai_binary_section(
         1,
         SectionKind::AiTrainingProfile,
         PrimaryProfile::CoveTrain,
-        encode_records([record.clone(), record]).unwrap(),
+        encode_records([record.clone(), record]),
     );
     section.requiredness_scope = AiRequirednessScopeV1::ProfileRequired;
 
@@ -1276,8 +1267,7 @@ fn duplicate_unknown_required_ai_records_defer_until_matching_scope() {
 #[test]
 fn unknown_optional_ai_record_bad_crc_rejects_before_skip() {
     let mut record =
-        encode_ai_record_with_version(60_022, 3, 1, AI_FLAG_PAYLOAD_CRC32C_PRESENT, Vec::new())
-            .unwrap();
+        encode_ai_record_with_version(60_022, 3, 1, AI_FLAG_PAYLOAD_CRC32C_PRESENT, &[]).unwrap();
     record[20] ^= 0x01;
 
     let bytes = write_coveai_artifact(
@@ -1288,7 +1278,7 @@ fn unknown_optional_ai_record_bad_crc_rejects_before_skip() {
             1,
             SectionKind::AiReferenceTables,
             PrimaryProfile::CoveAiShared,
-            encode_records([record]).unwrap(),
+            encode_records([record]),
         )],
     )
     .unwrap();
@@ -1313,10 +1303,9 @@ fn required_ai_record_with_unassigned_flags_rejects() {
                 1,
                 1,
                 AI_FLAG_REQUIRED_RECORD | AI_FLAG_PAYLOAD_CRC32C_PRESENT | (1 << 31),
-                Vec::new(),
+                &[],
             )
-            .unwrap()])
-            .unwrap(),
+            .unwrap()]),
         )],
     )
     .unwrap();
@@ -1337,10 +1326,9 @@ fn required_unknown_ai_record_kind_defers_until_matching_scope() {
             60_001,
             1,
             AI_FLAG_REQUIRED_RECORD | AI_FLAG_PAYLOAD_CRC32C_PRESENT,
-            Vec::new(),
+            &[],
         )
-        .unwrap()])
-        .unwrap(),
+        .unwrap()]),
     );
     section.requiredness_scope = AiRequirednessScopeV1::ProfileRequired;
 
@@ -1371,10 +1359,9 @@ fn artifact_required_unknown_ai_record_kind_rejects_structural_parse() {
             60_002,
             1,
             AI_FLAG_REQUIRED_RECORD | AI_FLAG_PAYLOAD_CRC32C_PRESENT,
-            Vec::new(),
+            &[],
         )
-        .unwrap()])
-        .unwrap(),
+        .unwrap()]),
     );
     section.requiredness_scope = AiRequirednessScopeV1::ArtifactRequired;
 
@@ -1405,7 +1392,7 @@ fn external_asset_digest_required_rejects_uri_asset_without_digest() {
         3,
         SectionKind::AiAssetManifest,
         PrimaryProfile::CoveMmseq,
-        encode_records([encode_ai_asset_ref(asset).unwrap()]).unwrap(),
+        encode_records([encode_ai_asset_ref(asset).unwrap()]),
     );
     asset_section.requiredness_scope = AiRequirednessScopeV1::SectionRequired;
     asset_section.required_ai_features = AI_FEATURE_EXTERNAL_ASSET_DIGEST_REQUIRED;
@@ -1449,8 +1436,7 @@ fn external_asset_digest_required_rejects_uri_asset_without_digest() {
                         crc32c: 0,
                     })
                     .unwrap(),
-                ])
-                .unwrap(),
+                ]),
             ),
             asset_section,
         ],
@@ -2264,19 +2250,15 @@ fn rejects_v2_vector_binding_with_zero_model_input_digest_ref() {
     put_u64(&mut payload, 32, 1);
     put_u32(&mut payload, 40, 0);
     put_u32(&mut payload, 44, 0);
-    let record = encode_ai_record_with_version(
-        2,
-        2,
-        10,
-        AI_FLAG_PAYLOAD_CRC32C_PRESENT,
-        with_payload_crc32c(payload, 48).unwrap(),
-    )
-    .unwrap();
+    let payload_with_crc = with_payload_crc32c(payload, 48).unwrap();
+    let record =
+        encode_ai_record_with_version(2, 2, 10, AI_FLAG_PAYLOAD_CRC32C_PRESENT, &payload_with_crc)
+            .unwrap();
     let sections = vec![coveai_binary_section(
         1,
         SectionKind::AiVectorBinding,
         PrimaryProfile::CoveVec,
-        encode_records([record]).unwrap(),
+        encode_records([record]),
     )];
     let bytes = write_coveai_artifact(CoveAiArtifactKind::CoveAiBundle, [51u8; 16], 938, &sections)
         .unwrap();
@@ -3400,8 +3382,7 @@ fn rejects_token_block_payload_too_short() {
             crc32c: 0,
         })
         .unwrap(),
-    ])
-    .unwrap();
+    ]);
 
     let bytes = write_coveai_artifact(CoveAiArtifactKind::CoveAiBundle, [40u8; 16], 927, &sections)
         .unwrap();
@@ -3993,7 +3974,7 @@ fn chunk_sections_with_profile(
             1,
             SectionKind::AiChunkProfile,
             PrimaryProfile::CoveChunk,
-            encode_records([encode_chunk_profile(chunk_profile).unwrap()]).unwrap(),
+            encode_records([encode_chunk_profile(chunk_profile).unwrap()]),
         ),
         coveai_payload_section(
             3,
@@ -4056,8 +4037,7 @@ fn chunk_sections_with_profile(
                     crc32c: 0,
                 })
                 .unwrap(),
-            ])
-            .unwrap(),
+            ]),
         ),
         coveai_binary_section(
             5,
@@ -4080,8 +4060,7 @@ fn chunk_sections_with_profile(
                 flags: 0,
                 crc32c: 0,
             })
-            .unwrap()])
-            .unwrap(),
+            .unwrap()]),
         ),
         coveai_binary_section(
             2,
@@ -4091,8 +4070,7 @@ fn chunk_sections_with_profile(
                 text_chunks
                     .into_iter()
                     .map(|chunk| encode_text_chunk_entry(chunk).unwrap()),
-            )
-            .unwrap(),
+            ),
         ),
     ]
 }
@@ -4166,14 +4144,13 @@ fn vector_index_sections(index: VectorIndexDescriptorV1) -> Vec<CoveAiWritableSe
                 flags: 0,
                 checksum: 0,
             })
-            .unwrap()])
-            .unwrap(),
+            .unwrap()]),
         ),
         coveai_binary_section(
             51,
             SectionKind::AiVectorIndex,
             PrimaryProfile::CoveVec,
-            encode_records([encode_vector_index(index).unwrap()]).unwrap(),
+            encode_records([encode_vector_index(index).unwrap()]),
         ),
     ]
 }
@@ -4265,8 +4242,7 @@ fn token_sections_with_profile(
                     crc32c: 0,
                 })
                 .unwrap(),
-            ])
-            .unwrap(),
+            ]),
         ),
         coveai_binary_section(
             12,
@@ -4285,14 +4261,13 @@ fn token_sections_with_profile(
                 flags: 0,
                 crc32c: 0,
             })
-            .unwrap()])
-            .unwrap(),
+            .unwrap()]),
         ),
         coveai_binary_section(
             13,
             SectionKind::AiTokenizerProfile,
             PrimaryProfile::CoveTok,
-            encode_records([encode_tokenizer_profile(tokenizer_profile).unwrap()]).unwrap(),
+            encode_records([encode_tokenizer_profile(tokenizer_profile).unwrap()]),
         ),
         coveai_binary_section(
             14,
@@ -4311,20 +4286,19 @@ fn token_sections_with_profile(
                 integrity_ref: 0,
                 checksum: 0,
             })
-            .unwrap()])
-            .unwrap(),
+            .unwrap()]),
         ),
         coveai_binary_section(
             15,
             SectionKind::AiTokenizedSpan,
             PrimaryProfile::CoveTok,
-            encode_records([encode_tokenized_span(tokenized_span).unwrap()]).unwrap(),
+            encode_records([encode_tokenized_span(tokenized_span).unwrap()]),
         ),
         coveai_binary_section(
             16,
             SectionKind::AiTokenSequencePack,
             PrimaryProfile::CoveTok,
-            encode_records([encode_token_sequence_pack(sequence_pack).unwrap()]).unwrap(),
+            encode_records([encode_token_sequence_pack(sequence_pack).unwrap()]),
         ),
     ]
 }
@@ -4435,7 +4409,7 @@ fn training_sections_with_records(
             20,
             SectionKind::AiTrainingProfile,
             PrimaryProfile::CoveTrain,
-            encode_records([encode_training_profile(profile).unwrap()]).unwrap(),
+            encode_records([encode_training_profile(profile).unwrap()]),
         ));
     }
     sections.push(coveai_binary_section(
@@ -4446,14 +4420,13 @@ fn training_sections_with_records(
             encode_dataset_split(split).unwrap(),
             encode_dedup_group(dedup_group).unwrap(),
             encode_training_epoch_plan(epoch_plan).unwrap(),
-        ])
-        .unwrap(),
+        ]),
     ));
     sections.push(coveai_binary_section(
         22,
         SectionKind::AiTrainingSampleIndex,
         PrimaryProfile::CoveTrain,
-        encode_records([encode_training_sample_entry(sample).unwrap()]).unwrap(),
+        encode_records([encode_training_sample_entry(sample).unwrap()]),
     ));
     sections
 }
@@ -4617,7 +4590,7 @@ fn provenance_sections_with_label_pair(
             30,
             SectionKind::AiGeneratorProvenance,
             PrimaryProfile::CoveTrain,
-            encode_records(generator_records).unwrap(),
+            encode_records(generator_records),
         ),
         coveai_binary_section(
             31,
@@ -4626,8 +4599,7 @@ fn provenance_sections_with_label_pair(
             encode_records([
                 encode_training_label_entry(label).unwrap(),
                 encode_preference_pair_entry(pair).unwrap(),
-            ])
-            .unwrap(),
+            ]),
         ),
     ]
 }
@@ -4767,15 +4739,14 @@ fn phase7_sections_with_tensor(
         encode_records([
             encode_tensor_layout(tensor_layout).unwrap(),
             encode_device_transfer_hint(transfer_hint).unwrap(),
-        ])
-        .unwrap(),
+        ]),
     )];
     if include_asset {
         sections.push(coveai_binary_section(
             41,
             SectionKind::AiAssetManifest,
             PrimaryProfile::CoveMmseq,
-            encode_records([encode_ai_asset_ref(test_asset_ref()).unwrap()]).unwrap(),
+            encode_records([encode_ai_asset_ref(test_asset_ref()).unwrap()]),
         ));
     }
     sections.push(coveai_binary_section(
@@ -4788,8 +4759,7 @@ fn phase7_sections_with_tensor(
                     .into_iter()
                     .map(|element| encode_multimodal_sequence_element(element).unwrap()),
             ),
-        )
-        .unwrap(),
+        ),
     ));
     sections
 }
@@ -4812,7 +4782,7 @@ fn phase7_sections_with_asset(
             41,
             SectionKind::AiAssetManifest,
             PrimaryProfile::CoveMmseq,
-            encode_records([encode_ai_asset_ref(asset).unwrap()]).unwrap(),
+            encode_records([encode_ai_asset_ref(asset).unwrap()]),
         ),
     );
     sections
