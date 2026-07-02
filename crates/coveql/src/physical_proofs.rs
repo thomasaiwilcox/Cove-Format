@@ -125,6 +125,7 @@ pub(crate) struct SidecarPlanningFlags {
     pub enable_layout: bool,
     pub enable_cache: bool,
     pub enable_execution_code: bool,
+    pub enable_index_only_candidates: bool,
     pub enable_zero_copy_candidates: bool,
     pub allow_file_code_literal_candidates: bool,
 }
@@ -309,6 +310,7 @@ fn index_report(
             inputs.covi_artifact_bytes.as_deref(),
             planned,
             flags.allow_file_code_literal_candidates,
+            flags.enable_index_only_candidates,
             &mut report,
             true,
         );
@@ -323,6 +325,7 @@ fn index_report(
             inputs.covx_artifact_bytes.as_deref(),
             planned,
             flags.allow_file_code_literal_candidates,
+            flags.enable_index_only_candidates,
             &mut report,
             false,
         );
@@ -335,6 +338,7 @@ fn validate_covi_like(
     bytes: Option<&[u8]>,
     planned: &PlannedQuery,
     allow_file_code_keys: bool,
+    enable_index_only_candidates: bool,
     report: &mut IndexCapabilityReport,
     covi: bool,
 ) {
@@ -357,7 +361,11 @@ fn validate_covi_like(
         Ok(validated) => {
             let artifact = validated.artifact();
             let lookup_candidates = artifact.index_roots.len();
-            let index_only_candidates = artifact.index_only_capabilities.len();
+            let index_only_candidates = if enable_index_only_candidates {
+                artifact.index_only_capabilities.len()
+            } else {
+                0
+            };
             report.lookup_candidates += lookup_candidates;
             report.index_only_candidates += index_only_candidates;
             report.exact_candidates += artifact
@@ -493,45 +501,113 @@ fn zero_copy_report(
         }
     );
     if !flags.enable_zero_copy_candidates {
-        return ZeroCopyEligibilityReport {
-            requested,
-            reason: "zero-copy candidate planning disabled by physical plan options".into(),
-            fallbacks: vec![PhysicalFallbackReport::new(
-                "cove_l",
-                "zero-copy candidate planning disabled",
-            )],
-            ..ZeroCopyEligibilityReport::default()
-        };
+        return ZeroCopyDecision::CandidatePlanningDisabled { requested }.into_report();
     }
-    let permitted = planned
+    let permitted_by_security = planned
         .resolved
         .operation_context
         .security
         .zero_copy_permission;
     let Some(bytes) = inputs.zero_copy_buffer_map_bytes.as_deref() else {
-        return ZeroCopyEligibilityReport {
+        return ZeroCopyDecision::BufferMapMissing {
             requested,
-            permitted_by_security: permitted,
-            reason: "zero-copy buffer map not supplied".into(),
-            fallbacks: vec![PhysicalFallbackReport::new(
-                "cove_l",
-                "zero-copy buffer map missing; owned Arrow buffers remain required",
-            )],
-            ..ZeroCopyEligibilityReport::default()
-        };
+            permitted_by_security,
+        }
+        .into_report();
     };
     match ZeroCopyBufferMapV2::parse(bytes) {
-        Ok(map) => match validate_zero_copy_map_for_file(file_bytes, planned, map, validation_options) {
-            Ok((target_count, entry_count)) => ZeroCopyEligibilityReport {
+        Ok(map) => {
+            match validate_zero_copy_map_for_file(file_bytes, planned, map, validation_options) {
+                Ok((target_count, entry_count)) => ZeroCopyDecision::Validated {
+                    requested,
+                    permitted_by_security,
+                    target_count,
+                    entry_count,
+                },
+                Err(reason) => ZeroCopyDecision::AuthorityValidationFailed {
+                    requested,
+                    permitted_by_security,
+                    reason,
+                },
+            }
+            .into_report()
+        }
+        Err(error) => ZeroCopyDecision::BufferMapParseFailed {
+            requested,
+            permitted_by_security,
+            reason: error.to_string(),
+        }
+        .into_report(),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ZeroCopyDecision {
+    CandidatePlanningDisabled {
+        requested: bool,
+    },
+    BufferMapMissing {
+        requested: bool,
+        permitted_by_security: bool,
+    },
+    Validated {
+        requested: bool,
+        permitted_by_security: bool,
+        target_count: usize,
+        entry_count: usize,
+    },
+    AuthorityValidationFailed {
+        requested: bool,
+        permitted_by_security: bool,
+        reason: String,
+    },
+    BufferMapParseFailed {
+        requested: bool,
+        permitted_by_security: bool,
+        reason: String,
+    },
+}
+
+impl ZeroCopyDecision {
+    fn into_report(self) -> ZeroCopyEligibilityReport {
+        match self {
+            Self::CandidatePlanningDisabled { requested } => ZeroCopyEligibilityReport {
                 requested,
-                candidate: requested && permitted,
-                permitted_by_security: permitted,
+                reason: "zero-copy candidate planning disabled by physical plan options".into(),
+                fallbacks: vec![PhysicalFallbackReport::new(
+                    "cove_l",
+                    "zero-copy candidate planning disabled",
+                )],
+                ..ZeroCopyEligibilityReport::default()
+            },
+            Self::BufferMapMissing {
+                requested,
+                permitted_by_security,
+            } => ZeroCopyEligibilityReport {
+                requested,
+                permitted_by_security,
+                reason: "zero-copy buffer map not supplied".into(),
+                fallbacks: vec![PhysicalFallbackReport::new(
+                    "cove_l",
+                    "zero-copy buffer map missing; owned Arrow buffers remain required",
+                )],
+                ..ZeroCopyEligibilityReport::default()
+            },
+            Self::Validated {
+                requested,
+                permitted_by_security,
+                target_count,
+                entry_count,
+            } => ZeroCopyEligibilityReport {
+                requested,
+                candidate: requested && permitted_by_security,
+                permitted_by_security,
                 layout_candidate_validated: true,
-                compatible: requested && permitted,
+                compatible: requested && permitted_by_security,
                 reason: format!(
                     "zero-copy map authority validated with {target_count} targets and {entry_count} entries"
                 ),
-                fallbacks: if requested && permitted {
+                fallbacks: if requested && permitted_by_security {
                     Vec::new()
                 } else {
                     vec![PhysicalFallbackReport::new(
@@ -540,29 +616,39 @@ fn zero_copy_report(
                     )]
                 },
             },
-            Err(reason) => ZeroCopyEligibilityReport {
+            Self::AuthorityValidationFailed {
                 requested,
-                permitted_by_security: permitted,
-                layout_candidate_validated: false,
-                compatible: false,
-                reason: format!("zero-copy map authority validation failed: {reason}"),
+                permitted_by_security,
+                reason,
+            } => {
+                ZeroCopyEligibilityReport {
+                    requested,
+                    permitted_by_security,
+                    layout_candidate_validated: false,
+                    compatible: false,
+                    reason: format!("zero-copy map authority validation failed: {reason}"),
+                    fallbacks: vec![PhysicalFallbackReport::new(
+                        "cove_l",
+                        "zero-copy map did not validate against table layout",
+                    )],
+                    ..ZeroCopyEligibilityReport::default()
+                }
+            },
+            Self::BufferMapParseFailed {
+                requested,
+                permitted_by_security,
+                reason,
+            } => ZeroCopyEligibilityReport {
+                requested,
+                permitted_by_security,
+                reason: format!("zero-copy buffer map parse failed: {reason}"),
                 fallbacks: vec![PhysicalFallbackReport::new(
                     "cove_l",
-                    "zero-copy map did not validate against table layout",
+                    "invalid zero-copy buffer map ignored",
                 )],
                 ..ZeroCopyEligibilityReport::default()
             },
-        },
-        Err(error) => ZeroCopyEligibilityReport {
-            requested,
-            permitted_by_security: permitted,
-            reason: format!("zero-copy buffer map parse failed: {error}"),
-            fallbacks: vec![PhysicalFallbackReport::new(
-                "cove_l",
-                "invalid zero-copy buffer map ignored",
-            )],
-            ..ZeroCopyEligibilityReport::default()
-        },
+        }
     }
 }
 

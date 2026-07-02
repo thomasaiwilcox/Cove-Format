@@ -22,6 +22,7 @@ pub(super) fn try_index_only_executed_query(
     let planned = &physical.planned;
     let security = &planned.resolved.operation_context.security;
     if !physical.allow_index_only_answers
+        || physical.index_capability_report.index_only_candidates == 0
         || !security.index_only_answer_permission
         || security.metadata_disclosure_policy != MetadataDisclosurePolicy::AllowProtected
         || security.aggregate_disclosure_policy == AggregateDisclosurePolicy::AllowMaterializedOnly

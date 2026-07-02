@@ -660,14 +660,12 @@ fn index_only_count_executes_only_after_compare_match() {
         index_only_answer_permission: true,
         ..SecurityContext::default()
     };
-    let physical_options = PhysicalPlanOptions {
-        allow_index_only_answers: true,
-        sidecars: PhysicalSidecarInputs {
+    let physical_options = PhysicalPlanOptions::default()
+        .with_index_only_answers(true)
+        .with_sidecars(PhysicalSidecarInputs {
             covi_artifact_bytes: Some(covi),
             ..PhysicalSidecarInputs::default()
-        },
-        ..PhysicalPlanOptions::default()
-    };
+        });
     let kernel = parse_resolve_plan_build_physical_and_execute_query(
         &bytes,
         "Person.select(n: count(active))",
@@ -710,6 +708,59 @@ fn index_only_count_executes_only_after_compare_match() {
 }
 
 #[test]
+fn disabled_index_only_candidate_planning_suppresses_index_only_answers() {
+    let bytes = minimal_object_file();
+    let covi = object_property_count_covi(&bytes, 0);
+    let mut resolve_options = json_resolve_options();
+    resolve_options.security = SecurityContext {
+        aggregate_disclosure_policy: AggregateDisclosurePolicy::AllowExact,
+        metadata_disclosure_policy: MetadataDisclosurePolicy::AllowProtected,
+        index_only_answer_permission: true,
+        ..SecurityContext::default()
+    };
+    let mut physical_options = PhysicalPlanOptions::default()
+        .with_index_only_answers(true)
+        .with_sidecars(PhysicalSidecarInputs {
+            covi_artifact_bytes: Some(covi),
+            ..PhysicalSidecarInputs::default()
+        });
+    physical_options.candidates.enable_index_only_candidates = false;
+
+    let kernel = parse_resolve_plan_build_physical_and_execute_query(
+        &bytes,
+        "Person.select(n: count(active))",
+        ParseOptions::default(),
+        resolve_options,
+        PlanOptions::default(),
+        physical_options,
+        ExecutionOptions::default(),
+        KernelExecutionOptions {
+            mode: KernelExecutionMode::CompareWithMaterialized,
+            ..KernelExecutionOptions::default()
+        },
+        validation_options(),
+    )
+    .unwrap();
+
+    let CoveQlExecutionResult::JsonRows(rows) = &kernel.executed.result else {
+        panic!("expected JSON rows");
+    };
+    assert_eq!(rows.as_slice(), [json!({"n": 0})]);
+    assert_eq!(
+        kernel
+            .physical
+            .index_capability_report
+            .index_only_candidates,
+        0
+    );
+    assert!(!kernel
+        .executed
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "W_INDEX_ONLY_ANSWER_EXECUTED"));
+}
+
+#[test]
 fn index_only_exists_and_distinct_count_use_validated_payloads() {
     let bytes = minimal_object_file();
     let covi = object_property_index_only_covi(
@@ -737,14 +788,12 @@ fn index_only_exists_and_distinct_count_use_validated_payloads() {
             ParseOptions::default(),
             resolve_options.clone(),
             PlanOptions::default(),
-            PhysicalPlanOptions {
-                allow_index_only_answers: true,
-                sidecars: PhysicalSidecarInputs {
+            PhysicalPlanOptions::default()
+                .with_index_only_answers(true)
+                .with_sidecars(PhysicalSidecarInputs {
                     covi_artifact_bytes: Some(covi.clone()),
                     ..PhysicalSidecarInputs::default()
-                },
-                ..PhysicalPlanOptions::default()
-            },
+                }),
             ExecutionOptions::default(),
             KernelExecutionOptions {
                 mode: KernelExecutionMode::CompareWithMaterialized,
@@ -801,14 +850,12 @@ fn index_only_sum_and_avg_use_validated_numeric_payloads() {
             ParseOptions::default(),
             resolve_options.clone(),
             PlanOptions::default(),
-            PhysicalPlanOptions {
-                allow_index_only_answers: true,
-                sidecars: PhysicalSidecarInputs {
+            PhysicalPlanOptions::default()
+                .with_index_only_answers(true)
+                .with_sidecars(PhysicalSidecarInputs {
                     covi_artifact_bytes: Some(covi.clone()),
                     ..PhysicalSidecarInputs::default()
-                },
-                ..PhysicalPlanOptions::default()
-            },
+                }),
             ExecutionOptions::default(),
             KernelExecutionOptions {
                 mode: KernelExecutionMode::CompareWithMaterialized,
@@ -845,14 +892,12 @@ fn covi_empty_lookup_short_circuits_only_after_compare_match() {
         index_only_answer_permission: true,
         ..SecurityContext::default()
     };
-    let physical_options = PhysicalPlanOptions {
-        allow_index_only_answers: true,
-        sidecars: PhysicalSidecarInputs {
+    let physical_options = PhysicalPlanOptions::default()
+        .with_index_only_answers(true)
+        .with_sidecars(PhysicalSidecarInputs {
             covi_artifact_bytes: Some(covi),
             ..PhysicalSidecarInputs::default()
-        },
-        ..PhysicalPlanOptions::default()
-    };
+        });
     let kernel = parse_resolve_plan_build_physical_and_execute_query(
         &bytes,
         "Person.where(active == true).select(active)",

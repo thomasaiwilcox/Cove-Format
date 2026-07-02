@@ -554,12 +554,10 @@ fn configure_execution_engine(
     if !physical_requested {
         return Ok(());
     }
-    let physical_options = PhysicalPlanOptions {
-        allow_index_only_answers: options.allow_index_only,
-        allow_zero_copy_output: options.allow_zero_copy,
-        sidecars: physical_sidecars_from_paths(physical_sidecars)?,
-        ..Default::default()
-    };
+    let physical_options = PhysicalPlanOptions::default()
+        .with_index_only_answers(options.allow_index_only)
+        .with_zero_copy_output(options.allow_zero_copy)
+        .with_sidecars(physical_sidecars_from_paths(physical_sidecars)?);
 
     let kernel_options = KernelExecutionOptions {
         batch_size: options.batch_size,
@@ -926,4 +924,3 @@ fn format_artifact_query_error(error: ExecuteArtifactQueryError, json_diagnostic
         other => other.to_string(),
     }
 }
-

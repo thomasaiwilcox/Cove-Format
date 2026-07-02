@@ -140,6 +140,39 @@ impl From<&str> for AiAdapterError {
     }
 }
 
+#[derive(Debug)]
+enum AiImportBuildError {
+    InvalidInput(String),
+    Descriptor(String),
+    Digest(String),
+    Manifest(String),
+    OutputWrite { path: PathBuf, message: String },
+}
+
+impl fmt::Display for AiImportBuildError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidInput(message)
+            | Self::Descriptor(message)
+            | Self::Digest(message)
+            | Self::Manifest(message) => f.write_str(message),
+            Self::OutputWrite { path, message } => {
+                write!(f, "cannot write {}: {message}", path.display())
+            }
+        }
+    }
+}
+
+impl Error for AiImportBuildError {}
+
+impl From<AiImportBuildError> for AiAdapterError {
+    fn from(error: AiImportBuildError) -> Self {
+        AiAdapterError::InvalidInput {
+            message: error.to_string(),
+        }
+    }
+}
+
 #[must_use]
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AiArchiveOpenOptions {
@@ -1080,17 +1113,17 @@ fn import_values(
     rows: &[Value],
     out: Option<&Path>,
     options: &AiImportOptions,
-) -> Result<Value, String> {
+) -> Result<Value, AiImportBuildError> {
     let mut samples = Vec::with_capacity(rows.len());
     let mut seen = BTreeSet::new();
     let mut diagnostics = Vec::new();
     for (index, row) in rows.iter().enumerate() {
         let sample = imported_sample_from_value(index, row, options)?;
         if !seen.insert(sample.sample_id_text.clone()) {
-            return Err(format!(
+            return Err(AiImportBuildError::InvalidInput(format!(
                 "duplicate AI training sample id '{}'",
                 sample.sample_id_text
-            ));
+            )));
         }
         diagnostics.extend(sample.diagnostics.iter().cloned());
         samples.push(sample);
@@ -1114,19 +1147,29 @@ fn import_values(
         return Ok(report);
     }
     let out = out
-        .ok_or_else(|| "AI import requires --out unless --dry-run is used".to_string())?
+        .ok_or_else(|| {
+            AiImportBuildError::InvalidInput(
+                "AI import requires --out unless --dry-run is used".to_string(),
+            )
+        })?
         .to_path_buf();
     let bytes = build_training_sidecar(&samples, options)?;
-    durable_replace(&out, &bytes)
-        .map_err(|error| format!("cannot write {}: {error}", out.display()))?;
-    let sidecar = CoveAiFile::parse(&bytes)
-        .map_err(|error| format!("internal error: imported sidecar did not validate: {error}"))?;
+    durable_replace(&out, &bytes).map_err(|error| AiImportBuildError::OutputWrite {
+        path: out.clone(),
+        message: error.to_string(),
+    })?;
+    let sidecar = CoveAiFile::parse(&bytes).map_err(|error| {
+        AiImportBuildError::Descriptor(format!(
+            "internal error: imported sidecar did not validate: {error}"
+        ))
+    })?;
     let mut full_report = report;
     full_report["out"] = json!(out.display().to_string());
     full_report["artifact_id"] = json!(hex_bytes(&sidecar.header.artifact_id));
     full_report["payload_access"] = json!(format!("{:?}", sidecar.payload_access));
     if options.publish_covm {
-        let covm_path = publish_import_covm(input_path, &out, &bytes, options.created_at_us)?;
+        let covm_path = publish_import_covm(input_path, &out, &bytes, options.created_at_us)
+            .map_err(AiImportBuildError::Manifest)?;
         full_report["covm"] = json!(covm_path.display().to_string());
     }
     Ok(full_report)
@@ -1136,7 +1179,7 @@ fn imported_sample_from_value(
     index: usize,
     row: &Value,
     options: &AiImportOptions,
-) -> Result<ImportedSample, String> {
+) -> Result<ImportedSample, AiImportBuildError> {
     let sample_id_text = row
         .get("sample_id")
         .or_else(|| row.get("id"))
@@ -1154,7 +1197,11 @@ fn imported_sample_from_value(
         None => deterministic_split(&sample_id_text, row)?,
     };
     let mut diagnostics = Vec::new();
-    let (input, target, mut metadata) = match options.schema {
+    let ImportedPayloadParts {
+        input,
+        target,
+        mut metadata,
+    } = match options.schema {
         AiImportSchema::Instruction => instruction_payloads(&sample_id_text, row, &mut diagnostics),
         AiImportSchema::Chat => chat_payloads(&sample_id_text, row, &mut diagnostics),
         AiImportSchema::Pretrain => pretrain_payloads(&sample_id_text, row, &mut diagnostics),
@@ -1181,56 +1228,71 @@ fn imported_sample_from_value(
         sample_id,
         schema: options.schema,
         split,
-        input: serde_json::to_vec(&input)
-            .map_err(|error| format!("cannot serialize AI sample input: {error}"))?,
-        target: serde_json::to_vec(&target)
-            .map_err(|error| format!("cannot serialize AI sample target: {error}"))?,
-        metadata: serde_json::to_vec(&metadata)
-            .map_err(|error| format!("cannot serialize AI sample metadata: {error}"))?,
+        input: serde_json::to_vec(&input).map_err(|error| {
+            AiImportBuildError::InvalidInput(format!("cannot serialize AI sample input: {error}"))
+        })?,
+        target: serde_json::to_vec(&target).map_err(|error| {
+            AiImportBuildError::InvalidInput(format!("cannot serialize AI sample target: {error}"))
+        })?,
+        metadata: serde_json::to_vec(&metadata).map_err(|error| {
+            AiImportBuildError::InvalidInput(format!(
+                "cannot serialize AI sample metadata: {error}"
+            ))
+        })?,
         diagnostics,
     })
+}
+
+#[derive(Debug, Clone)]
+struct ImportedPayloadParts {
+    input: Value,
+    target: Value,
+    metadata: Value,
 }
 
 fn instruction_payloads(
     sample_id: &str,
     row: &Value,
     diagnostics: &mut Vec<AiWithheldDiagnostic>,
-) -> (Value, Value, Value) {
-    let instruction = string_field(row, "instruction", sample_id, diagnostics);
+) -> ImportedPayloadParts {
+    let instruction =
+        required_string_or_diagnostic_placeholder(row, "instruction", sample_id, diagnostics);
     let input = row.get("input").cloned().unwrap_or(Value::Null);
-    let output = required_value(row, "output", sample_id, diagnostics);
-    (
-        json!({ "instruction": instruction, "input": input }),
-        json!({ "output": output }),
-        metadata_from_row(row),
-    )
+    let output = required_value_or_diagnostic_placeholder(row, "output", sample_id, diagnostics);
+    ImportedPayloadParts {
+        input: json!({ "instruction": instruction, "input": input }),
+        target: json!({ "output": output }),
+        metadata: metadata_from_row(row),
+    }
 }
 
 fn chat_payloads(
     sample_id: &str,
     row: &Value,
     diagnostics: &mut Vec<AiWithheldDiagnostic>,
-) -> (Value, Value, Value) {
+) -> ImportedPayloadParts {
     let messages = row
         .get("messages")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
     if messages.is_empty() {
-        diagnostics.push(AiWithheldDiagnostic {
-            code: "COVE_AI_IMPORT_MALFORMED_CHAT".to_string(),
-            sample_id: Some(sample_id.to_string()),
-            message: "chat schema requires messages[]".to_string(),
-        });
+        push_import_diagnostic(
+            diagnostics,
+            "COVE_AI_IMPORT_MALFORMED_CHAT",
+            sample_id,
+            "chat schema requires messages[]",
+        );
     }
     for message in &messages {
         let role = message.get("role").and_then(Value::as_str).unwrap_or("");
         if !matches!(role, "system" | "user" | "assistant" | "tool") {
-            diagnostics.push(AiWithheldDiagnostic {
-                code: "COVE_AI_IMPORT_MALFORMED_CHAT_ROLE".to_string(),
-                sample_id: Some(sample_id.to_string()),
-                message: format!("unsupported chat role '{role}'"),
-            });
+            push_import_diagnostic(
+                diagnostics,
+                "COVE_AI_IMPORT_MALFORMED_CHAT_ROLE",
+                sample_id,
+                format!("unsupported chat role '{role}'"),
+            );
         }
     }
     let target = messages
@@ -1239,67 +1301,74 @@ fn chat_payloads(
         .find(|message| message.get("role").and_then(Value::as_str) == Some("assistant"))
         .cloned()
         .unwrap_or_else(|| {
-            diagnostics.push(AiWithheldDiagnostic {
-                code: "COVE_AI_IMPORT_MISSING_CHAT_TARGET".to_string(),
-                sample_id: Some(sample_id.to_string()),
-                message: "chat row has no assistant response".to_string(),
-            });
+            push_import_diagnostic(
+                diagnostics,
+                "COVE_AI_IMPORT_MISSING_CHAT_TARGET",
+                sample_id,
+                "chat row has no assistant response",
+            );
             Value::Null
         });
-    (
-        json!({ "messages": messages }),
-        json!({ "assistant": target }),
-        metadata_from_row(row),
-    )
+    ImportedPayloadParts {
+        input: json!({ "messages": messages }),
+        target: json!({ "assistant": target }),
+        metadata: metadata_from_row(row),
+    }
 }
 
 fn pretrain_payloads(
     sample_id: &str,
     row: &Value,
     diagnostics: &mut Vec<AiWithheldDiagnostic>,
-) -> (Value, Value, Value) {
-    let text = string_field(row, "text", sample_id, diagnostics);
-    (json!({ "text": text }), Value::Null, metadata_from_row(row))
+) -> ImportedPayloadParts {
+    let text = required_string_or_diagnostic_placeholder(row, "text", sample_id, diagnostics);
+    ImportedPayloadParts {
+        input: json!({ "text": text }),
+        target: Value::Null,
+        metadata: metadata_from_row(row),
+    }
 }
 
 fn preference_payloads(
     sample_id: &str,
     row: &Value,
     diagnostics: &mut Vec<AiWithheldDiagnostic>,
-) -> (Value, Value, Value) {
-    let prompt = required_value(row, "prompt", sample_id, diagnostics);
-    let chosen = required_value(row, "chosen", sample_id, diagnostics);
-    let rejected = required_value(row, "rejected", sample_id, diagnostics);
-    (
-        json!({ "prompt": prompt }),
-        json!({ "chosen": chosen, "rejected": rejected }),
-        metadata_from_row(row),
-    )
+) -> ImportedPayloadParts {
+    let prompt = required_value_or_diagnostic_placeholder(row, "prompt", sample_id, diagnostics);
+    let chosen = required_value_or_diagnostic_placeholder(row, "chosen", sample_id, diagnostics);
+    let rejected =
+        required_value_or_diagnostic_placeholder(row, "rejected", sample_id, diagnostics);
+    ImportedPayloadParts {
+        input: json!({ "prompt": prompt }),
+        target: json!({ "chosen": chosen, "rejected": rejected }),
+        metadata: metadata_from_row(row),
+    }
 }
 
 fn rag_payloads(
     sample_id: &str,
     row: &Value,
     diagnostics: &mut Vec<AiWithheldDiagnostic>,
-) -> (Value, Value, Value) {
-    let query = required_value(row, "query", sample_id, diagnostics);
+) -> ImportedPayloadParts {
+    let query = required_value_or_diagnostic_placeholder(row, "query", sample_id, diagnostics);
     let context = row.get("context").cloned().unwrap_or_else(|| {
-        diagnostics.push(AiWithheldDiagnostic {
-            code: "COVE_AI_IMPORT_MISSING_RAG_CONTEXT".to_string(),
-            sample_id: Some(sample_id.to_string()),
-            message: "rag schema requires context[]".to_string(),
-        });
+        push_import_diagnostic(
+            diagnostics,
+            "COVE_AI_IMPORT_MISSING_RAG_CONTEXT",
+            sample_id,
+            "rag schema requires context[]",
+        );
         Value::Array(Vec::new())
     });
-    let answer = required_value(row, "answer", sample_id, diagnostics);
-    (
-        json!({ "query": query, "context": context }),
-        json!({ "answer": answer }),
-        metadata_from_row(row),
-    )
+    let answer = required_value_or_diagnostic_placeholder(row, "answer", sample_id, diagnostics);
+    ImportedPayloadParts {
+        input: json!({ "query": query, "context": context }),
+        target: json!({ "answer": answer }),
+        metadata: metadata_from_row(row),
+    }
 }
 
-fn string_field(
+fn required_string_or_diagnostic_placeholder(
     row: &Value,
     field: &str,
     sample_id: &str,
@@ -1309,29 +1378,44 @@ fn string_field(
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| {
-            diagnostics.push(AiWithheldDiagnostic {
-                code: "COVE_AI_IMPORT_MISSING_PAYLOAD_FIELD".to_string(),
-                sample_id: Some(sample_id.to_string()),
-                message: format!("missing required string field '{field}'"),
-            });
+            push_import_diagnostic(
+                diagnostics,
+                "COVE_AI_IMPORT_MISSING_PAYLOAD_FIELD",
+                sample_id,
+                format!("missing required string field '{field}'"),
+            );
             String::new()
         })
 }
 
-fn required_value(
+fn required_value_or_diagnostic_placeholder(
     row: &Value,
     field: &str,
     sample_id: &str,
     diagnostics: &mut Vec<AiWithheldDiagnostic>,
 ) -> Value {
     row.get(field).cloned().unwrap_or_else(|| {
-        diagnostics.push(AiWithheldDiagnostic {
-            code: "COVE_AI_IMPORT_MISSING_PAYLOAD_FIELD".to_string(),
-            sample_id: Some(sample_id.to_string()),
-            message: format!("missing required field '{field}'"),
-        });
+        push_import_diagnostic(
+            diagnostics,
+            "COVE_AI_IMPORT_MISSING_PAYLOAD_FIELD",
+            sample_id,
+            format!("missing required field '{field}'"),
+        );
         Value::Null
     })
+}
+
+fn push_import_diagnostic(
+    diagnostics: &mut Vec<AiWithheldDiagnostic>,
+    code: &'static str,
+    sample_id: &str,
+    message: impl Into<String>,
+) {
+    diagnostics.push(AiWithheldDiagnostic {
+        code: code.to_string(),
+        sample_id: Some(sample_id.to_string()),
+        message: message.into(),
+    });
 }
 
 fn metadata_from_row(row: &Value) -> Value {
@@ -1347,7 +1431,7 @@ fn metadata_from_row(row: &Value) -> Value {
 fn build_training_sidecar(
     samples: &[ImportedSample],
     options: &AiImportOptions,
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, AiImportBuildError> {
     let mut payload = Vec::new();
     let mut tables = AiDescriptorTablesV1::default();
     let mut next_payload_ref = 1u32;
@@ -1478,7 +1562,9 @@ fn build_training_sidecar(
         payload_sections: vec![payload_section],
         descriptor_tables: tables,
     })
-    .map_err(|error| format!("cannot write COVE-AI descriptor bundle: {error}"))
+    .map_err(|error| {
+        AiImportBuildError::Descriptor(format!("cannot write COVE-AI descriptor bundle: {error}"))
+    })
 }
 
 fn push_payload_ref(
@@ -1486,14 +1572,14 @@ fn push_payload_ref(
     tables: &mut AiDescriptorTablesV1,
     next_payload_ref: &mut u32,
     bytes: &[u8],
-) -> Result<u32, String> {
+) -> Result<u32, AiImportBuildError> {
     if bytes.is_empty() {
         return Ok(0);
     }
     let payload_ref = *next_payload_ref;
     *next_payload_ref = next_payload_ref
         .checked_add(1)
-        .ok_or_else(|| "too many AI payload refs".to_string())?;
+        .ok_or_else(|| AiImportBuildError::Descriptor("too many AI payload refs".to_string()))?;
     let offset = payload.len() as u64;
     payload.extend_from_slice(bytes);
     tables.payload_refs.push(AiPayloadRefEntryV1 {
@@ -2020,14 +2106,15 @@ fn covm_source_uri(input_path: &Path, sidecar_path: &Path) -> String {
     source_abs.to_string_lossy().to_string()
 }
 
-fn deterministic_split(sample_id: &str, row: &Value) -> Result<SplitName, String> {
+fn deterministic_split(sample_id: &str, row: &Value) -> Result<SplitName, AiImportBuildError> {
     let key = if sample_id.starts_with("sample-") {
         canonical_json(row)
     } else {
         sample_id.to_string()
     };
-    let digest = compute_digest(DigestAlgorithm::Sha256, key.as_bytes())
-        .map_err(|error| format!("cannot digest AI split key: {error}"))?;
+    let digest = compute_digest(DigestAlgorithm::Sha256, key.as_bytes()).map_err(|error| {
+        AiImportBuildError::Digest(format!("cannot digest AI split key: {error}"))
+    })?;
     let mut first = [0u8; 8];
     first.copy_from_slice(&digest[..8]);
     let bucket = u64::from_le_bytes(first) % 1_000_000;
@@ -2040,25 +2127,26 @@ fn deterministic_split(sample_id: &str, row: &Value) -> Result<SplitName, String
     })
 }
 
-fn sample_id_u64(sample_id: &str, row: &Value) -> Result<u64, String> {
+fn sample_id_u64(sample_id: &str, row: &Value) -> Result<u64, AiImportBuildError> {
     if let Some(value) = row.get("sample_id").and_then(Value::as_u64) {
         return Ok(value.max(1));
     }
     let digest = compute_digest(DigestAlgorithm::Sha256, sample_id.as_bytes())
-        .map_err(|error| format!("cannot digest sample id: {error}"))?;
+        .map_err(|error| AiImportBuildError::Digest(format!("cannot digest sample id: {error}")))?;
     let mut first = [0u8; 8];
     first.copy_from_slice(&digest[..8]);
     Ok(u64::from_le_bytes(first).max(1))
 }
 
-fn artifact_id_from_samples(samples: &[ImportedSample]) -> Result<[u8; 16], String> {
+fn artifact_id_from_samples(samples: &[ImportedSample]) -> Result<[u8; 16], AiImportBuildError> {
     let mut material = String::new();
     for sample in samples {
         material.push_str(&sample.sample_id_text);
         material.push('\n');
     }
-    let digest = compute_digest(DigestAlgorithm::Sha256, material.as_bytes())
-        .map_err(|error| format!("cannot digest AI artifact id: {error}"))?;
+    let digest = compute_digest(DigestAlgorithm::Sha256, material.as_bytes()).map_err(|error| {
+        AiImportBuildError::Digest(format!("cannot digest AI artifact id: {error}"))
+    })?;
     let mut artifact_id = [0u8; 16];
     artifact_id.copy_from_slice(&digest[..16]);
     Ok(artifact_id)
@@ -2264,7 +2352,7 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert!(error.contains("duplicate"));
+        assert!(error.to_string().contains("duplicate"));
     }
 
     #[test]
@@ -2354,6 +2442,35 @@ mod tests {
         assert!(std::str::from_utf8(lease.bytes)
             .unwrap()
             .contains("Summarize COVE-AI"));
+    }
+
+    #[test]
+    fn import_missing_required_payload_fields_uses_placeholders_and_diagnostics() {
+        let sample = imported_sample_from_value(
+            0,
+            &json!({ "sample_id": "missing-instruction-output" }),
+            &AiImportOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(sample.sample_id_text, "missing-instruction-output");
+        assert_eq!(
+            sample
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == "COVE_AI_IMPORT_MISSING_PAYLOAD_FIELD")
+                .count(),
+            2
+        );
+
+        let input: Value = serde_json::from_slice(&sample.input).unwrap();
+        let target: Value = serde_json::from_slice(&sample.target).unwrap();
+        let metadata: Value = serde_json::from_slice(&sample.metadata).unwrap();
+        assert_eq!(input["instruction"], "");
+        assert_eq!(input["input"], Value::Null);
+        assert_eq!(target["output"], Value::Null);
+        assert_eq!(metadata["sample_id"], "missing-instruction-output");
+        assert_eq!(metadata["schema"], "instruction");
     }
 
     #[test]

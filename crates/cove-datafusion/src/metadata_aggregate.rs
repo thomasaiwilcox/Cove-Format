@@ -151,10 +151,14 @@ pub fn exact_unfiltered_aggregate_synopses(
             MetadataSynopsisAggregateKind::Min | MetadataSynopsisAggregateKind::Max => {
                 exact_synopsis_min_max(state, *column_index, *aggregate_kind)?
             }
-            MetadataSynopsisAggregateKind::Sum => exact_synopsis_sum(state, *column_index, false)?,
-            MetadataSynopsisAggregateKind::Avg => exact_synopsis_sum(state, *column_index, true)?,
+            MetadataSynopsisAggregateKind::Sum => {
+                exact_synopsis_sum(state, *column_index, SumOutputMode::Sum)?
+            }
+            MetadataSynopsisAggregateKind::Avg => {
+                exact_synopsis_sum(state, *column_index, SumOutputMode::Avg)?
+            }
         };
-        let Some(canonical_value) = value else {
+        let Some(canonical_value) = value.into_plan_value() else {
             return Ok(None);
         };
         values.push(MetadataAggregateValue {
@@ -176,18 +180,54 @@ pub fn exact_unfiltered_aggregate_synopses(
     }))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MetadataAggregateOutcome {
+    Unavailable,
+    SqlNull,
+    Canonical(Vec<u8>),
+}
+
+impl MetadataAggregateOutcome {
+    fn into_plan_value(self) -> Option<Option<Vec<u8>>> {
+        match self {
+            Self::Unavailable => None,
+            Self::SqlNull => Some(None),
+            Self::Canonical(value) => Some(Some(value)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SumOutputMode {
+    Sum,
+    Avg,
+}
+
+impl SumOutputMode {
+    fn synopsis_kind(self) -> SynopsisKind {
+        match self {
+            Self::Sum => SynopsisKind::Sum,
+            Self::Avg => SynopsisKind::SumAndCount,
+        }
+    }
+
+    fn is_avg(self) -> bool {
+        matches!(self, Self::Avg)
+    }
+}
+
 fn exact_synopsis_min_max(
     state: &DatasetState,
     column_index: usize,
     aggregate_kind: MetadataSynopsisAggregateKind,
-) -> Result<Option<Option<Vec<u8>>>, CoveError> {
+) -> Result<MetadataAggregateOutcome, CoveError> {
     let column = state
         .table()
         .columns
         .get(column_index)
         .ok_or_else(|| CoveError::BadSchema("min/max column out of bounds".into()))?;
     if column.logical == CoveLogicalType::Bool {
-        return Ok(None);
+        return Ok(MetadataAggregateOutcome::Unavailable);
     }
     let mut best: Option<TaggedCanonicalValue> = None;
     let mut covered_rows = 0u64;
@@ -195,7 +235,7 @@ fn exact_synopsis_min_max(
     for file in state.files() {
         let entries = exact_payload_entries_for_file(file, column.column_id, SynopsisKind::MinMax)?;
         if entries.is_empty() {
-            return Ok(None);
+            return Ok(MetadataAggregateOutcome::Unavailable);
         }
         for (entry, payload) in entries {
             covered_rows = covered_rows
@@ -205,12 +245,12 @@ fn exact_synopsis_min_max(
                 .checked_add(entry.non_null_count()?)
                 .ok_or(CoveError::ArithOverflow)?;
             let AggregatePayloadV2::MinMax { min, max } = payload else {
-                return Ok(None);
+                return Ok(MetadataAggregateOutcome::Unavailable);
             };
             let candidate = match aggregate_kind {
                 MetadataSynopsisAggregateKind::Min => min,
                 MetadataSynopsisAggregateKind::Max => max,
-                _ => return Ok(None),
+                _ => return Ok(MetadataAggregateOutcome::Unavailable),
             };
             let Some(candidate) = candidate else {
                 continue;
@@ -233,37 +273,33 @@ fn exact_synopsis_min_max(
         }
     }
     if covered_rows != state.table().row_count {
-        return Ok(None);
+        return Ok(MetadataAggregateOutcome::Unavailable);
     }
-    Ok(Some(if non_null_rows == 0 {
-        None
+    Ok(if non_null_rows == 0 {
+        MetadataAggregateOutcome::SqlNull
     } else {
-        Some(best.ok_or(CoveError::BadIndex)?.payload)
-    }))
+        MetadataAggregateOutcome::Canonical(best.ok_or(CoveError::BadIndex)?.payload)
+    })
 }
 
 fn exact_synopsis_sum(
     state: &DatasetState,
     column_index: usize,
-    as_avg: bool,
-) -> Result<Option<Option<Vec<u8>>>, CoveError> {
+    mode: SumOutputMode,
+) -> Result<MetadataAggregateOutcome, CoveError> {
     let column = state
         .table()
         .columns
         .get(column_index)
         .ok_or_else(|| CoveError::BadSchema("sum column out of bounds".into()))?;
-    let kind = if as_avg {
-        SynopsisKind::SumAndCount
-    } else {
-        SynopsisKind::Sum
-    };
+    let kind = mode.synopsis_kind();
     let mut covered_rows = 0u64;
     let mut non_null_rows = 0u64;
     let mut accumulator = SumAccumulator::default();
     for file in state.files() {
         let entries = exact_payload_entries_for_file(file, column.column_id, kind)?;
         if entries.is_empty() {
-            return Ok(None);
+            return Ok(MetadataAggregateOutcome::Unavailable);
         }
         for (entry, payload) in entries {
             covered_rows = covered_rows
@@ -273,7 +309,7 @@ fn exact_synopsis_sum(
                 AggregatePayloadV2::Sum {
                     overflow_policy,
                     sum,
-                } if !as_avg
+                } if !mode.is_avg()
                     && *overflow_policy == NumericAggregateOverflowPolicy::CheckedExact =>
                 {
                     (entry.non_null_count()?, sum)
@@ -282,13 +318,15 @@ fn exact_synopsis_sum(
                     overflow_policy,
                     non_null_count,
                     sum,
-                } if as_avg && *overflow_policy == NumericAggregateOverflowPolicy::CheckedExact => {
+                } if mode.is_avg()
+                    && *overflow_policy == NumericAggregateOverflowPolicy::CheckedExact =>
+                {
                     (*non_null_count, sum)
                 }
-                _ => return Ok(None),
+                _ => return Ok(MetadataAggregateOutcome::Unavailable),
             };
             if declared_count != entry.non_null_count()? {
-                return Ok(None);
+                return Ok(MetadataAggregateOutcome::Unavailable);
             }
             non_null_rows = non_null_rows
                 .checked_add(declared_count)
@@ -298,19 +336,24 @@ fn exact_synopsis_sum(
         }
     }
     if covered_rows != state.table().row_count {
-        return Ok(None);
+        return Ok(MetadataAggregateOutcome::Unavailable);
     }
-    if as_avg {
+    if mode.is_avg() {
         if non_null_rows == 0 {
-            return Ok(Some(None));
+            return Ok(MetadataAggregateOutcome::SqlNull);
         }
         let avg = accumulator.as_f64()? / non_null_rows as f64;
-        return Ok(Some(Some(avg.to_bits().to_le_bytes().to_vec())));
+        return Ok(MetadataAggregateOutcome::Canonical(
+            avg.to_bits().to_le_bytes().to_vec(),
+        ));
     }
     if non_null_rows == 0 {
-        return Ok(Some(None));
+        return Ok(MetadataAggregateOutcome::SqlNull);
     }
-    accumulator.finish().map(Some)
+    match accumulator.finish()? {
+        Some(value) => Ok(MetadataAggregateOutcome::Canonical(value)),
+        None => Ok(MetadataAggregateOutcome::SqlNull),
+    }
 }
 
 fn exact_payload_entries_for_file(
@@ -1323,6 +1366,33 @@ mod tests {
             stats_ref: 0,
             checksum: 0,
         }
+    }
+
+    #[test]
+    fn metadata_aggregate_outcome_preserves_three_states() {
+        assert_eq!(
+            MetadataAggregateOutcome::Unavailable.into_plan_value(),
+            None
+        );
+        assert_eq!(
+            MetadataAggregateOutcome::SqlNull.into_plan_value(),
+            Some(None)
+        );
+        assert_eq!(
+            MetadataAggregateOutcome::Canonical(vec![1, 2, 3]).into_plan_value(),
+            Some(Some(vec![1, 2, 3]))
+        );
+    }
+
+    #[test]
+    fn sum_output_mode_selects_expected_synopsis_kind() {
+        assert_eq!(SumOutputMode::Sum.synopsis_kind(), SynopsisKind::Sum);
+        assert_eq!(
+            SumOutputMode::Avg.synopsis_kind(),
+            SynopsisKind::SumAndCount
+        );
+        assert!(!SumOutputMode::Sum.is_avg());
+        assert!(SumOutputMode::Avg.is_avg());
     }
 
     #[test]

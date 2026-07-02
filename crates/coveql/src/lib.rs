@@ -156,7 +156,8 @@ pub use materialized::{
 pub use parser::parse_query;
 pub use physical_plan::{
     build_physical_plan, parse_resolve_plan_and_build_physical_plan, BuildPhysicalPlanError,
-    CoveOPhysicalPlan, PhysicalNodeId, PhysicalOperatorContract, PhysicalPlanDiagnostic,
+    CoveOPhysicalPlan, PhysicalCandidateOptions, PhysicalMetadataOptions, PhysicalNodeId,
+    PhysicalOperatorContract, PhysicalOutputOptions, PhysicalPlanDiagnostic,
     PhysicalPlanFingerprint, PhysicalPlanNode, PhysicalPlanNodeKind, PhysicalPlanOptions,
     PhysicalPlannedQuery,
 };
