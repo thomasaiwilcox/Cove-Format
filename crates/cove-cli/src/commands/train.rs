@@ -28,12 +28,14 @@ fn run_train_export(args: Vec<String>) -> Result<(), String> {
     let mut epoch_plan_filter: Option<u64> = None;
     let mut include_payloads = false;
     let mut policy_report = false;
+    let mut strict_training = false;
 
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--include-payloads" => include_payloads = true,
             "--policy-report" => policy_report = true,
+            "--strict-training" => strict_training = true,
             "--format" => {
                 format = iter
                     .next()
@@ -92,6 +94,15 @@ fn run_train_export(args: Vec<String>) -> Result<(), String> {
     }
     let sidecar = CoveAiFile::parse(&bytes)
         .map_err(|error| format!("{}: invalid COVE-AI sidecar: {error}", input.display()))?;
+    if strict_training {
+        open_ai_archive(&input, AiArchiveOpenOptions::default())
+            .map_err(|err| err.to_string())?
+            .verify(AiVerifyOptions {
+                policy_report: true,
+                strict_training: true,
+            })
+            .map_err(|err| err.to_string())?;
+    }
     let payload_reader = AiPayloadReader::new(
         &bytes,
         &sidecar,
@@ -461,4 +472,3 @@ fn cove_vec_quantization_kind(value: &str) -> Result<u8, String> {
         )),
     }
 }
-

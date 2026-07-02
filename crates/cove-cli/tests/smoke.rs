@@ -2476,6 +2476,9 @@ fn query_coveql_ai_descriptor_methods_smoke() {
 fn ai_training_archive_adoption_workflows_smoke() {
     let source = temp_file("training-adoption-source.jsonl");
     let archive = temp_file("training-adoption.coveai");
+    let mapped_source = temp_file("training-adoption-mapped-source.jsonl");
+    let mapped_archive = temp_file("training-adoption-mapped.coveai");
+    let mapping_file = temp_file("training-adoption-mapping.json");
     let stream_out = temp_file("training-adoption-stream.jsonl");
     let diff_report = temp_file("training-adoption-diff.json");
     let showcase_dir = temp_file("ai-training-showcase");
@@ -2544,6 +2547,108 @@ fn ai_training_archive_adoption_workflows_smoke() {
     );
     let verify_json: serde_json::Value = serde_json::from_str(&verify_stdout).unwrap();
     assert_eq!(verify_json["training_sample_count"], serde_json::json!(1));
+
+    fs::write(
+        &mapped_source,
+        [
+            serde_json::json!({
+                "sample_id": "mapped-1",
+                "instruction": "Explain mapped COVE-AI training archives.",
+                "output": "Mapped imports preserve richer training metadata.",
+                "split": "train",
+                "dedup": "mapped-source-1",
+                "labels": [{"label": "accepted", "confidence": 0.9}],
+                "generator": {"provider": "local", "model": "fixture-model", "version": "1"},
+                "review": {"role": "reviewer", "rating": 1.0}
+            })
+            .to_string(),
+            serde_json::json!({
+                "sample_id": "mapped-2",
+                "instruction": "Explain strict COVE-AI verification.",
+                "output": "Strict verification requires replay metadata.",
+                "split": "validation",
+                "dedup": "mapped-source-2",
+                "generator": {"provider": "local", "model": "fixture-model", "version": "1"}
+            })
+            .to_string(),
+        ]
+        .join("\n")
+            + "\n",
+    )
+    .unwrap();
+    fs::write(
+        &mapping_file,
+        serde_json::json!({
+            "split_field": "split",
+            "dedup_key_field": "dedup",
+            "labels_field": "labels",
+            "generator_field": "generator",
+            "human_review_field": "review",
+            "epoch_plan": {"enabled": true, "seed": 42}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let mapped_import = run_cove(&[
+        "ai",
+        "import",
+        "jsonl",
+        mapped_source.to_str().unwrap(),
+        "--out",
+        mapped_archive.to_str().unwrap(),
+        "--schema",
+        "instruction",
+        "--mapping",
+        mapping_file.to_str().unwrap(),
+    ]);
+    assert!(
+        mapped_import.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&mapped_import.stdout),
+        String::from_utf8_lossy(&mapped_import.stderr)
+    );
+    let mapped_verify = run_cove(&[
+        "ai",
+        "verify",
+        mapped_archive.to_str().unwrap(),
+        "--json",
+        "--policy-report",
+        "--strict-training",
+    ]);
+    let mapped_verify_stdout = String::from_utf8_lossy(&mapped_verify.stdout);
+    assert!(
+        mapped_verify.status.success(),
+        "stdout={mapped_verify_stdout}\nstderr={}",
+        String::from_utf8_lossy(&mapped_verify.stderr)
+    );
+    let mapped_verify_json: serde_json::Value =
+        serde_json::from_str(&mapped_verify_stdout).unwrap();
+    assert_eq!(
+        mapped_verify_json["replayability"],
+        serde_json::json!("replayable")
+    );
+    assert_eq!(
+        mapped_verify_json["training_label_count"],
+        serde_json::json!(1)
+    );
+    assert_eq!(
+        mapped_verify_json["generator_provenance_count"],
+        serde_json::json!(2)
+    );
+    let mapped_train_export = run_cove(&[
+        "train",
+        "export",
+        mapped_archive.to_str().unwrap(),
+        "--strict-training",
+        "--format",
+        "json",
+    ]);
+    assert!(
+        mapped_train_export.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&mapped_train_export.stdout),
+        String::from_utf8_lossy(&mapped_train_export.stderr)
+    );
 
     let covm_archive = archive.with_extension("covm");
     let verify_covm = run_cove(&[

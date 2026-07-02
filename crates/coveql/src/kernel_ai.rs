@@ -1787,12 +1787,6 @@ pub(super) fn try_ai_semantic_search_executed_query(
             }),
         )
     })?;
-    let rows = ai_semantic_search_rows(
-        method_name,
-        &search_plan,
-        &results,
-        exact_semantic_authority,
-    );
     let vector_exact = results.iter().all(|result| result.exact);
     let fallback_used = results.iter().any(|result| result.fallback_used);
     let selected_index = results
@@ -1803,6 +1797,21 @@ pub(super) fn try_ai_semantic_search_executed_query(
         .first()
         .map(|result| result.result_authority.clone())
         .unwrap_or_else(|| result_authority.to_string());
+    let ai_operation_context = ai_vector_operation_context(
+        method_name,
+        &search_plan,
+        &sidecar_summary,
+        &results,
+        exact_semantic_authority,
+        binding_count,
+    );
+    let rows = ai_semantic_search_rows(
+        method_name,
+        &search_plan,
+        &results,
+        exact_semantic_authority,
+        &ai_operation_context,
+    );
     let result = CoveQlExecutionResult::JsonRows(rows);
     let row_counts = ExecutionRowCounts {
         input_rows: binding_count,
@@ -1845,9 +1854,34 @@ pub(super) fn try_ai_semantic_search_executed_query(
             "fallback_used": fallback_used,
             "semantic_exact": exact_semantic_authority,
             "result_authority": selected_result_authority.clone(),
+            "ai_operation_context": ai_operation_context.clone(),
             "materialized_baseline_available": false,
         }),
     ));
+    if fallback_used {
+        diagnostics.push(exec_warning(
+            "W_AI_VECTOR_INDEX_FALLBACK",
+            "CoveQL-AI vector search used exact-flat fallback because the requested or advertised index was unavailable for authoritative execution",
+            json!({
+                "method": method_name,
+                "requested_index": search_plan.index.as_str(),
+                "selected_index": selected_index.clone(),
+                "result_authority": selected_result_authority.clone(),
+                "ai_operation_context": ai_operation_context.clone(),
+            }),
+        ));
+    }
+    if !exact_semantic_authority {
+        diagnostics.push(exec_warning(
+            "W_AI_ADVISORY_RANKING_AUTHORITY",
+            "CoveQL-AI advisory ranking method returned vector-backed candidates without persisted hybrid/rerank authority",
+            json!({
+                "method": method_name,
+                "advisory_reason": "no_persisted_hybrid_or_rerank_authority",
+                "ai_operation_context": ai_operation_context.clone(),
+            }),
+        ));
+    }
     if mode == KernelExecutionMode::CompareWithMaterialized {
         diagnostics.push(exec_warning(
             "W_AI_NO_MATERIALIZED_BASELINE",
@@ -1892,6 +1926,7 @@ pub(super) fn try_ai_semantic_search_executed_query(
             "semantic_exact": exact_semantic_authority,
             "fallback_used": fallback_used,
             "result_authority": selected_result_authority,
+            "ai_operation_context": ai_operation_context,
             "fallback_boundary": Value::Null,
             "materialized_baseline_available": false,
         }),
@@ -2448,11 +2483,171 @@ fn ai_argument_string(value: &ResolvedAiArgumentValue) -> Option<String> {
     }
 }
 
+fn ai_vector_operation_context(
+    method_name: &str,
+    search_plan: &AiVectorSearchPlan,
+    sidecar: &CoveAiFile,
+    results: &[AiVectorSearchResult],
+    exact_semantic_authority: bool,
+    binding_count: usize,
+) -> Value {
+    let vector_exact = results.iter().all(|result| result.exact);
+    let semantic_exact = exact_semantic_authority && vector_exact;
+    let fallback_used = results.iter().any(|result| result.fallback_used);
+    let selected_index = results
+        .first()
+        .map(|result| result.selected_index.as_str())
+        .unwrap_or_else(|| search_plan.index.as_str());
+    let mut selected_indexes = BTreeSet::new();
+    for result in results {
+        selected_indexes.insert(result.selected_index.as_str());
+    }
+    if selected_indexes.is_empty() {
+        selected_indexes.insert(selected_index);
+    }
+    let fallback_reason = if fallback_used {
+        let selected = selected_indexes
+            .iter()
+            .copied()
+            .collect::<Vec<_>>()
+            .join(",");
+        if selected.contains("_unavailable_exact_flat_fallback") {
+            json!("requested_index_unavailable_exact_flat_fallback")
+        } else if selected.contains("_candidate_metadata_exact_flat_fallback") {
+            json!("candidate_metadata_exact_flat_fallback")
+        } else {
+            json!("exact_flat_fallback")
+        }
+    } else {
+        Value::Null
+    };
+    let result_authority = if exact_semantic_authority {
+        results
+            .first()
+            .map(|result| result.result_authority.as_str())
+            .unwrap_or("ExactOptimizedKernel")
+    } else {
+        "RuntimeAdvisory"
+    };
+
+    json!({
+        "method": method_name,
+        "query_file_code": search_plan.query_file_code,
+        "query_vector_ref": search_plan.query_vector_ref,
+        "top_k": search_plan.top_k,
+        "target": search_plan.target_kind.as_str(),
+        "requested_index": search_plan.index.as_str(),
+        "selected_index": selected_index,
+        "selected_indexes": selected_indexes.into_iter().collect::<Vec<_>>(),
+        "result_count": results.len(),
+        "vector_exact": vector_exact,
+        "semantic_exact": semantic_exact,
+        "fallback_used": fallback_used,
+        "fallback_reason": fallback_reason,
+        "result_authority": result_authority,
+        "advisory_method": !exact_semantic_authority,
+        "advisory_reason": if exact_semantic_authority {
+            Value::Null
+        } else {
+            json!("no_persisted_hybrid_or_rerank_authority")
+        },
+        "materialized_baseline_available": false,
+        "artifact_id": hex(&sidecar.header.artifact_id),
+        "payload_access": ai_payload_access_label(sidecar),
+        "vector_space_count": sidecar.descriptor_tables.vector_spaces.len(),
+        "vector_index_count": sidecar.descriptor_tables.vector_indexes.len(),
+        "vector_binding_count": binding_count,
+        "vector_spaces": sidecar.descriptor_tables.vector_spaces.iter().map(|space| json!({
+            "vector_space_id": space.vector_space_id,
+            "dimension_count": space.dimension_count,
+            "element_type": ai_vector_element_type_name(space.element_type),
+            "element_type_code": space.element_type,
+            "metric": ai_vector_metric_name(space.metric),
+            "metric_code": space.metric,
+            "normalization_policy": space.normalization_policy,
+            "quantization_policy": space.quantization_policy,
+            "deterministic": space.deterministic != 0,
+            "approximate": space.approximate != 0,
+            "reproducibility_class": space.reproducibility_class,
+        })).collect::<Vec<_>>(),
+        "vector_indexes": sidecar.descriptor_tables.vector_indexes.iter().map(|index| json!({
+            "vector_index_id": index.vector_index_id,
+            "vector_space_id": index.vector_space_id,
+            "index_kind": ai_vector_index_kind_name(index.index_kind),
+            "index_kind_code": index.index_kind,
+            "exactness_kind": index.exactness_kind,
+            "false_negative_policy": index.false_negative_policy,
+            "metric": ai_vector_metric_name(index.metric),
+            "metric_code": index.metric,
+            "dimension_count": index.dimension_count,
+            "indexed_binding_kind": index.indexed_binding_kind,
+            "result_authority": ai_vector_index_result_authority(index.index_kind, index.exactness_kind, index.false_negative_policy),
+        })).collect::<Vec<_>>(),
+    })
+}
+
+fn ai_vector_index_kind_name(value: u8) -> &'static str {
+    match value {
+        0 => "exact_flat",
+        1 => "hnsw",
+        2 => "ivf_flat",
+        3 => "ivf_pq",
+        4 => "diskann",
+        5 => "vamana",
+        6 => "pq",
+        7 => "scalar_quantized",
+        8 => "extension_candidate",
+        255 => "extension",
+        _ => "unknown",
+    }
+}
+
+fn ai_vector_metric_name(value: u8) -> &'static str {
+    match value {
+        0 => "unspecified",
+        1 => "cosine",
+        2 => "dot",
+        3 => "l2",
+        4 => "l1",
+        255 => "extension",
+        _ => "unknown",
+    }
+}
+
+fn ai_vector_element_type_name(value: u8) -> &'static str {
+    match value {
+        0 => "float32",
+        1 => "float16",
+        2 => "bfloat16",
+        3 => "int8",
+        4 => "uint8",
+        5 => "int16",
+        6 => "float64",
+        255 => "extension",
+        _ => "unknown",
+    }
+}
+
+fn ai_vector_index_result_authority(
+    index_kind: u8,
+    exactness_kind: u8,
+    false_negative_policy: u8,
+) -> &'static str {
+    if exactness_kind == 0 && false_negative_policy == 0 {
+        "ExactOptimizedKernel"
+    } else if index_kind == 0 {
+        "ExactFlatFallback"
+    } else {
+        "ApproximateInternalAnn"
+    }
+}
+
 fn ai_semantic_search_rows(
     method_name: &str,
     search_plan: &AiVectorSearchPlan,
     results: &[AiVectorSearchResult],
     exact_semantic_authority: bool,
+    ai_operation_context: &Value,
 ) -> Vec<Value> {
     results
         .iter()
@@ -2493,6 +2688,7 @@ fn ai_semantic_search_rows(
                 } else {
                     json!("no_persisted_hybrid_or_rerank_authority")
                 },
+                "ai_operation_context": ai_operation_context,
             })
         })
         .collect()

@@ -1409,12 +1409,104 @@ fn coveql_ai_similar_executes_exact_flat_filecode_sidecar() {
     assert_eq!(rows[0]["file_code"], json!(10));
     assert_eq!(rows[0]["rank"], json!(1));
     assert_eq!(rows[0]["exact"], json!(true));
+    assert_eq!(rows[0]["ai_operation_context"]["method"], json!("similar"));
+    assert_eq!(
+        rows[0]["ai_operation_context"]["selected_index"],
+        json!("exact_flat")
+    );
+    assert_eq!(rows[0]["ai_operation_context"]["vector_exact"], json!(true));
+    assert_eq!(
+        rows[0]["ai_operation_context"]["semantic_exact"],
+        json!(true)
+    );
+    assert_eq!(
+        rows[0]["ai_operation_context"]["vector_space_count"],
+        json!(1)
+    );
+    assert_eq!(
+        rows[0]["ai_operation_context"]["vector_binding_count"],
+        json!(3)
+    );
     assert_eq!(rows[1]["file_code"], json!(20));
     assert!(executed
         .executed
         .diagnostics
         .iter()
         .any(|diagnostic| diagnostic.code == "W_AI_EXACT_FLAT_VECTOR_SCAN_EXECUTED"));
+    assert_eq!(
+        executed.kernel_report.decision.safe_details["ai_operation_context"]["result_authority"],
+        json!("ExactOptimizedKernel")
+    );
+}
+
+#[test]
+fn coveql_ai_similar_requested_ann_falls_back_to_exact_flat() {
+    let mut vector_payload = Vec::new();
+    for value in [1.0f32, 0.0, 0.0, 0.8, 0.2, 0.0, -1.0, 0.0, 0.0] {
+        vector_payload.extend_from_slice(&value.to_le_bytes());
+    }
+    let covev = write_covev_filecode_vectors(&CoveVecFileCodeVectorBuild {
+        artifact_id: [44u8; 16],
+        created_at_us: 1_002,
+        dimension_count: 3,
+        file_codes: vec![10, 20, 30],
+        vector_payload,
+    })
+    .unwrap();
+
+    let mut resolve_options = ResolveOptions::default();
+    resolve_options.table_authorities.insert(
+        "people".into(),
+        registered_people_table_authority(
+            coveql::TableSurfaceAuthorityKind::MaterializedTable,
+            coveql::TableExecutionAuthority::MaterializedRows {
+                rows: people_rows(&[("a", true)]),
+            },
+        ),
+    );
+    let mut physical_options = PhysicalPlanOptions::default();
+    physical_options.sidecars.cove_ai_artifact_bytes = Some(covev);
+
+    let executed = parse_resolve_plan_build_physical_and_execute_query(
+        &minimal_object_file(),
+        "# profiles: table, ai\ntable(people).similar(fileCode: 10, k: 2, index: \"hnsw\")",
+        ParseOptions::default(),
+        resolve_options,
+        PlanOptions::default(),
+        physical_options,
+        ExecutionOptions::default(),
+        KernelExecutionOptions::default(),
+        validation_options(),
+    )
+    .unwrap();
+
+    let CoveQlExecutionResult::JsonRows(rows) = executed.executed.result else {
+        panic!("expected JSON rows from CoveQL-AI semantic search");
+    };
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["requested_index"], json!("hnsw"));
+    assert_eq!(rows[0]["fallback_used"], json!(true));
+    assert_eq!(
+        rows[0]["index_kind"],
+        json!("hnsw_unavailable_exact_flat_fallback")
+    );
+    assert_eq!(
+        rows[0]["ai_operation_context"]["fallback_used"],
+        json!(true)
+    );
+    assert_eq!(
+        rows[0]["ai_operation_context"]["fallback_reason"],
+        json!("requested_index_unavailable_exact_flat_fallback")
+    );
+    assert_eq!(
+        rows[0]["ai_operation_context"]["result_authority"],
+        json!("ExactFlatFallback")
+    );
+    assert!(executed
+        .executed
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "W_AI_VECTOR_INDEX_FALLBACK"));
 }
 
 #[test]
@@ -1722,11 +1814,28 @@ fn coveql_ai_hybrid_and_rerank_execute_advisory_vector_scan() {
             rows[0]["advisory_reason"],
             json!("no_persisted_hybrid_or_rerank_authority")
         );
+        assert_eq!(
+            rows[0]["ai_operation_context"]["advisory_method"],
+            json!(true)
+        );
+        assert_eq!(
+            rows[0]["ai_operation_context"]["semantic_exact"],
+            json!(false)
+        );
+        assert_eq!(
+            rows[0]["ai_operation_context"]["advisory_reason"],
+            json!("no_persisted_hybrid_or_rerank_authority")
+        );
         assert!(executed
             .executed
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.code == "W_AI_ADVISORY_VECTOR_SCAN_EXECUTED"));
+        assert!(executed
+            .executed
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "W_AI_ADVISORY_RANKING_AUTHORITY"));
     }
 }
 

@@ -166,6 +166,29 @@ fn run_ai_inspect(file: &Path, bytes: &[u8], json: bool) -> Result<(), String> {
                 "privacy_summary_count": explain.privacy_summary_count,
                 "supported_indexes": explain.supported_indexes,
                 "stale_or_withheld": explain.stale_or_withheld,
+                "fallback_actions": explain.fallback_actions,
+                "vector_spaces": explain.vector_spaces.iter().map(|space| serde_json::json!({
+                    "vector_space_id": space.vector_space_id,
+                    "dimension_count": space.dimension_count,
+                    "element_type": space.element_type,
+                    "metric": space.metric,
+                    "normalization_policy": space.normalization_policy,
+                    "quantization_policy": space.quantization_policy,
+                    "deterministic": space.deterministic,
+                    "approximate": space.approximate,
+                    "reproducibility_class": space.reproducibility_class,
+                })).collect::<Vec<_>>(),
+                "vector_indexes": explain.vector_indexes.iter().map(|index| serde_json::json!({
+                    "vector_index_id": index.vector_index_id,
+                    "vector_space_id": index.vector_space_id,
+                    "index_kind": index.index_kind,
+                    "exactness_kind": index.exactness_kind,
+                    "false_negative_policy": index.false_negative_policy,
+                    "metric": index.metric,
+                    "dimension_count": index.dimension_count,
+                    "indexed_binding_kind": index.indexed_binding_kind,
+                    "result_authority": index.result_authority,
+                })).collect::<Vec<_>>(),
             });
             let records = serde_json::json!({
                 "source_bindings": sidecar.descriptor_tables.source_bindings.len(),
@@ -264,6 +287,33 @@ fn run_ai_inspect(file: &Path, bytes: &[u8], json: bool) -> Result<(), String> {
             println!(
                 "Supported index descriptors: {}",
                 explain.supported_indexes.join(", ")
+            );
+        }
+        if !explain.fallback_actions.is_empty() {
+            println!("Fallback actions: {}", explain.fallback_actions.join(", "));
+        }
+        for space in &explain.vector_spaces {
+            println!(
+                "Vector space {}: dim={} metric={} element_type={} deterministic={} approximate={} reproducibility_class={}",
+                space.vector_space_id,
+                space.dimension_count,
+                space.metric,
+                space.element_type,
+                space.deterministic,
+                space.approximate,
+                space.reproducibility_class
+            );
+        }
+        for index in &explain.vector_indexes {
+            println!(
+                "Vector index {}: kind={} space={} dim={} authority={} exactness={} false_negative_policy={}",
+                index.vector_index_id,
+                index.index_kind,
+                index.vector_space_id,
+                index.dimension_count,
+                index.result_authority,
+                index.exactness_kind,
+                index.false_negative_policy
             );
         }
         if !explain.stale_or_withheld.is_empty() {
@@ -653,4 +703,3 @@ fn hex_bytes(bytes: &[u8]) -> String {
     }
     out
 }
-

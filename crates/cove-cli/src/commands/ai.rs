@@ -33,6 +33,7 @@ fn run_ai_import(mut args: Vec<String>) -> Result<(), String> {
     let mut schema = AiImportSchema::Instruction;
     let mut split_policy = AiSplitPolicy::Deterministic;
     let mut split_column = None;
+    let mut mapping: Option<AiImportMapping> = None;
     let mut dry_run = false;
     let mut publish_covm = false;
 
@@ -67,6 +68,17 @@ fn run_ai_import(mut args: Vec<String>) -> Result<(), String> {
                         .ok_or_else(|| "--split-column requires a column name".to_string())?,
                 );
             }
+            "--mapping" => {
+                let path = PathBuf::from(
+                    iter.next()
+                        .ok_or_else(|| "--mapping requires a JSON path".to_string())?,
+                );
+                let text = fs::read_to_string(&path)
+                    .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+                mapping = Some(serde_json::from_str(&text).map_err(|error| {
+                    format!("cannot parse AI import mapping {}: {error}", path.display())
+                })?);
+            }
             "--dry-run" => dry_run = true,
             "--publish-covm" => publish_covm = true,
             "-h" | "--help" => {
@@ -88,6 +100,7 @@ fn run_ai_import(mut args: Vec<String>) -> Result<(), String> {
         schema,
         split_policy,
         split_column,
+        mapping,
         dry_run,
         publish_covm,
         ..AiImportOptions::default()
@@ -114,12 +127,14 @@ fn run_ai_import(mut args: Vec<String>) -> Result<(), String> {
 fn run_ai_verify(args: Vec<String>) -> Result<(), String> {
     let mut input = None;
     let mut policy_report = false;
+    let mut strict_training = false;
     let mut json_output = false;
     let mut dataset_dir: Option<PathBuf> = None;
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--policy-report" => policy_report = true,
+            "--strict-training" => strict_training = true,
             "--json" => json_output = true,
             "--dataset" => {
                 dataset_dir =
@@ -151,7 +166,10 @@ fn run_ai_verify(args: Vec<String>) -> Result<(), String> {
     )
     .map_err(|err| err.to_string())?;
     let report = archive
-        .verify(AiVerifyOptions { policy_report })
+        .verify(AiVerifyOptions {
+            policy_report,
+            strict_training,
+        })
         .map_err(|err| err.to_string())?;
     if json_output {
         println!(
