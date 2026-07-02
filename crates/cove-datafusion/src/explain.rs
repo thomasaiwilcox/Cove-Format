@@ -641,7 +641,7 @@ fn canonical_literal(
             tagged_canonical_literal(CanonicalValue::Float64(parse_f64(value)?))
         }
         CoveLogicalType::DateDays => {
-            tagged_canonical_literal(CanonicalValue::DateDays(parse_i64(value)? as i32))
+            tagged_canonical_literal(CanonicalValue::DateDays(parse_i32(value, "date_days")?))
         }
         CoveLogicalType::TimestampMicros => {
             tagged_canonical_literal(CanonicalValue::TimestampMicros(parse_i64(value)?))
@@ -711,6 +711,12 @@ fn parse_i64(value: &str) -> Result<i64, CoveError> {
     value
         .parse::<i64>()
         .map_err(|_| CoveError::BadSchema(format!("literal {value:?} is not an i64")))
+}
+
+fn parse_i32(value: &str, label: &str) -> Result<i32, CoveError> {
+    let parsed = parse_i64(value)?;
+    i32::try_from(parsed)
+        .map_err(|_| CoveError::BadSchema(format!("{label} literal {value:?} is out of i32 range")))
 }
 
 fn parse_u64(value: &str) -> Result<u64, CoveError> {
@@ -1167,6 +1173,25 @@ mod tests {
     #[test]
     fn parses_hex_byte_literal() {
         assert_eq!(parse_bytes_literal("0x0aFF").unwrap(), vec![10, 255]);
+    }
+
+    #[test]
+    fn date_days_canonical_literal_rejects_out_of_i32_range() {
+        let err = match canonical_literal(CoveLogicalType::DateDays, "2147483648") {
+            Ok(_) => panic!("expected out-of-range date_days literal to fail"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("date_days literal"));
+        assert!(err.to_string().contains("out of i32 range"));
+    }
+
+    #[test]
+    fn date_days_canonical_literal_preserves_i32_boundaries() {
+        let min = canonical_literal(CoveLogicalType::DateDays, "-2147483648").unwrap();
+        assert_eq!(min.payload, i32::MIN.to_le_bytes());
+
+        let max = canonical_literal(CoveLogicalType::DateDays, "2147483647").unwrap();
+        assert_eq!(max.payload, i32::MAX.to_le_bytes());
     }
 
     #[test]

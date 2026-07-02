@@ -188,7 +188,9 @@ fn encode_value(logical: CoveLogicalType, value: &Value) -> Result<(ValueTag, Ve
             })?;
             CanonicalValue::Decimal128(parsed).encode()
         }
-        CoveLogicalType::DateDays => CanonicalValue::DateDays(json_i64(value)? as i32).encode(),
+        CoveLogicalType::DateDays => {
+            CanonicalValue::DateDays(json_i32(value, "DateDays")?).encode()
+        }
         CoveLogicalType::TimestampMicros => {
             CanonicalValue::TimestampMicros(json_i64(value)?).encode()
         }
@@ -331,6 +333,12 @@ fn json_i64(value: &Value) -> Result<i64, CoveError> {
         .ok_or_else(|| CoveError::BadSection("JSON value must be an i64".into()))
 }
 
+fn json_i32(value: &Value, label: &str) -> Result<i32, CoveError> {
+    let parsed = json_i64(value)?;
+    i32::try_from(parsed)
+        .map_err(|_| CoveError::BadSection(format!("{label} JSON value must fit in i32")))
+}
+
 fn json_u64(value: &Value) -> Result<u64, CoveError> {
     value
         .as_u64()
@@ -413,4 +421,29 @@ fn print_usage() {
     eprintln!(
         "usage: cove canonicalise validate-payload --tag <tag> --hex <payload> | encode-json --logical <type> --value <json> | check-domain <file.cove> | check-trust <file.cove>"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encode_json_date_days_rejects_out_of_i32_range() {
+        let err =
+            encode_value(CoveLogicalType::DateDays, &json!(i64::from(i32::MAX) + 1)).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("DateDays JSON value must fit in i32"));
+    }
+
+    #[test]
+    fn encode_json_date_days_preserves_i32_boundaries() {
+        let (tag, min_payload) = encode_value(CoveLogicalType::DateDays, &json!(i32::MIN)).unwrap();
+        assert_eq!(tag, ValueTag::DateDays);
+        assert_eq!(min_payload, i32::MIN.to_le_bytes());
+
+        let (tag, max_payload) = encode_value(CoveLogicalType::DateDays, &json!(i32::MAX)).unwrap();
+        assert_eq!(tag, ValueTag::DateDays);
+        assert_eq!(max_payload, i32::MAX.to_le_bytes());
+    }
 }
