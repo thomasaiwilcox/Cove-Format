@@ -247,7 +247,7 @@ fn dictionary_values_to_arrow_array(
 ) -> Result<ArrayRef, CoveError> {
     let options = filecode_dictionary_value_export_options(options);
     let mut report = ArrowExportReport::default();
-    match arrow_data_type_with_report(logical, &options, &mut report)? {
+    match arrow_data_type_with_report(logical, options, &mut report)? {
         DataType::Boolean => Ok(Arc::new(BooleanArray::from(collect_bool(values)?))),
         DataType::Int8 => Ok(Arc::new(Int8Array::from(collect_i64(
             logical,

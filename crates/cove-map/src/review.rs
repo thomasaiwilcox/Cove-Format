@@ -330,14 +330,14 @@ fn review_item_from_candidate(candidate: &Value) -> Result<Value, String> {
         "same_object_decision_template": decision_template(
             candidate_match_id,
             "same_object",
-            left_ref.clone(),
-            right_ref.clone()
+            &left_ref,
+            &right_ref
         ),
         "do_not_merge_decision_template": decision_template(
             candidate_match_id,
             "do_not_merge",
-            left_ref,
-            right_ref
+            &left_ref,
+            &right_ref
         )
     }))
 }
@@ -364,7 +364,12 @@ fn review_member(member: &Value) -> Value {
     })
 }
 
-fn decision_template(candidate_match_id: &str, decision: &str, left: Value, right: Value) -> Value {
+fn decision_template(
+    candidate_match_id: &str,
+    decision: &str,
+    left: &Value,
+    right: &Value,
+) -> Value {
     json!({
         "decision_id": format!("review:{candidate_match_id}:{decision}"),
         "decision": decision,

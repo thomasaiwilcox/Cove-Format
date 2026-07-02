@@ -243,9 +243,15 @@ pub fn parse_conversion_args(
     }))
 }
 
+/// Publishes a conversion result and any generated sidecars to disk.
+///
+/// # Errors
+///
+/// Returns [`ConvertCliError`] if the main COVE file, optional COVX sidecar,
+/// optional COVM sidecar, or optional JSON report cannot be durably written.
 pub fn publish_conversion_result(
     command: ConversionCommand,
-    result: ParquetConversionResult,
+    result: &ParquetConversionResult,
 ) -> Result<(), ConvertCliError> {
     publish_bytes(&command.output, &result.cove_bytes)?;
     if let Some(covx_bytes) = &result.covx_bytes {

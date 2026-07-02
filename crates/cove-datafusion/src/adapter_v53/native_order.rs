@@ -215,7 +215,7 @@ impl ExecutionPlan for CoveNativeI64OrderExec {
             self.fetch,
         )
         .map_err(crate::adapter_v53::cove_to_datafusion)?;
-        CoveFileMetrics::new(&self.metrics, partition).record_decode(scan.stats);
+        CoveFileMetrics::new(&self.metrics, partition).record_decode(&scan.stats);
         let batch = native_i64_order_batch(Arc::clone(&self.schema), scan.values)?;
         Ok(Box::pin(MemoryStream::try_new(
             vec![batch],

@@ -9,6 +9,7 @@ use std::{
     fmt, fs,
     io::Cursor,
     path::{Path, PathBuf},
+    str::FromStr,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -225,6 +226,14 @@ impl AiExportFormat {
     }
 }
 
+impl FromStr for AiExportFormat {
+    type Err = AiAdapterError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse(value)
+    }
+}
+
 #[must_use]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AiExportOptions {
@@ -284,6 +293,12 @@ pub enum AiImportSchema {
 }
 
 impl AiImportSchema {
+    /// Parse an AI import schema from its spec-facing string value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AiAdapterError::UnsupportedImportSchema`] when `value` is not
+    /// one of `instruction`, `chat`, `pretrain`, `preference`, or `rag`.
     pub fn parse(value: &str) -> Result<Self, AiAdapterError> {
         match value {
             "instruction" => Ok(Self::Instruction),
@@ -308,6 +323,14 @@ impl AiImportSchema {
     }
 }
 
+impl FromStr for AiImportSchema {
+    type Err = AiAdapterError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse(value)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum AiSplitPolicy {
@@ -315,6 +338,12 @@ pub enum AiSplitPolicy {
 }
 
 impl AiSplitPolicy {
+    /// Parse an AI split policy from its spec-facing string value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AiAdapterError::UnsupportedSplitPolicy`] when `value` is not
+    /// `deterministic`.
     pub fn parse(value: &str) -> Result<Self, AiAdapterError> {
         match value {
             "deterministic" => Ok(Self::Deterministic),
@@ -322,6 +351,14 @@ impl AiSplitPolicy {
                 policy: other.to_string(),
             }),
         }
+    }
+}
+
+impl FromStr for AiSplitPolicy {
+    type Err = AiAdapterError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse(value)
     }
 }
 
@@ -409,6 +446,13 @@ impl SplitName {
 }
 
 impl AiTrainingArchive {
+    /// Open a COVE-AI training archive from a sidecar or manifest path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AiAdapterError`] if the sidecar path cannot be resolved, the
+    /// sidecar cannot be read, or the bytes do not parse as a valid COVE-AI
+    /// archive.
     pub fn open(
         path: impl AsRef<Path>,
         options: AiArchiveOpenOptions,
@@ -432,11 +476,24 @@ impl AiTrainingArchive {
         })
     }
 
+    /// Verify the archive and return a JSON verification report.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AiAdapterError`] if archive reporting fails or the typed report
+    /// cannot be serialized to JSON.
     pub fn verify(&self, options: AiVerifyOptions) -> Result<Value, AiAdapterError> {
         let report = self.report(options)?;
         Ok(serde_json::to_value(report).map_err(|error| error.to_string())?)
     }
 
+    /// Build a typed verification report for the archive.
+    ///
+    /// # Errors
+    ///
+    /// This report construction does not currently fail; payload disclosure
+    /// failures are captured as diagnostics in the returned report. The `Result`
+    /// shape is kept aligned with the JSON verification API.
     pub fn report(&self, options: AiVerifyOptions) -> Result<AiArchiveReport, AiAdapterError> {
         let mut split_counts = BTreeMap::new();
         for sample in &self.sidecar.descriptor_tables.training_samples {
@@ -492,6 +549,11 @@ impl AiTrainingArchive {
         })
     }
 
+    /// Return training sample descriptor rows, optionally materializing payloads.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AiAdapterError`] if the requested split name is unsupported.
     pub fn training_samples(
         &self,
         options: AiSampleIteratorOptions,
@@ -526,6 +588,12 @@ impl AiTrainingArchive {
         Ok(rows)
     }
 
+    /// Return COVE-AI text chunk descriptor rows.
+    ///
+    /// # Errors
+    ///
+    /// This descriptor traversal does not currently fail, but the `Result`
+    /// shape is kept aligned with the other adapter read APIs.
     pub fn chunks(&self, include_text: bool) -> Result<Vec<Value>, AiAdapterError> {
         let reader = AiPayloadReader::new(
             &self.bytes,
@@ -555,6 +623,12 @@ impl AiTrainingArchive {
             .collect())
     }
 
+    /// Return COVE-AI token block descriptor rows.
+    ///
+    /// # Errors
+    ///
+    /// This descriptor traversal does not currently fail, but the `Result`
+    /// shape is kept aligned with the other adapter read APIs.
     pub fn tokens(&self, include_payloads: bool) -> Result<Vec<Value>, AiAdapterError> {
         let reader = AiPayloadReader::new(
             &self.bytes,
@@ -583,6 +657,12 @@ impl AiTrainingArchive {
             .collect())
     }
 
+    /// Return COVE-AI multimodal sequence descriptor rows.
+    ///
+    /// # Errors
+    ///
+    /// This descriptor traversal does not currently fail, but the `Result`
+    /// shape is kept aligned with the other adapter read APIs.
     pub fn multimodal(&self, include_payloads: bool) -> Result<Vec<Value>, AiAdapterError> {
         let reader = AiPayloadReader::new(
             &self.bytes,
@@ -616,6 +696,12 @@ impl AiTrainingArchive {
             .collect())
     }
 
+    /// Export training samples and report metadata in the requested AI format.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AiAdapterError`] if sample collection, JSON serialization,
+    /// Arrow/Parquet writing, or WebDataset tar construction fails.
     pub fn export(&self, options: AiExportOptions) -> Result<AiExportData, AiAdapterError> {
         let samples = self.training_samples(AiSampleIteratorOptions {
             split: options.split.clone(),
@@ -637,6 +723,12 @@ impl AiTrainingArchive {
     }
 }
 
+/// Open a COVE-AI archive from a sidecar or manifest path.
+///
+/// # Errors
+///
+/// Returns [`AiAdapterError`] if path resolution, file reading, or sidecar
+/// parsing fails.
 pub fn open(
     path: impl AsRef<Path>,
     options: AiArchiveOpenOptions,
@@ -644,6 +736,12 @@ pub fn open(
     AiTrainingArchive::open(path, options)
 }
 
+/// Verify a COVE-AI archive and return a JSON report.
+///
+/// # Errors
+///
+/// Returns [`AiAdapterError`] if the archive cannot be opened or verification
+/// report construction fails.
 pub fn verify_archive(
     path: impl AsRef<Path>,
     options: AiVerifyOptions,
@@ -651,6 +749,12 @@ pub fn verify_archive(
     AiTrainingArchive::open(path, AiArchiveOpenOptions::default())?.verify(options)
 }
 
+/// Import instruction, chat, pretrain, preference, or RAG samples from JSONL.
+///
+/// # Errors
+///
+/// Returns [`AiAdapterError`] if the input cannot be read, a row is invalid
+/// JSON, sample conversion fails, or the output sidecar cannot be published.
 pub fn import_jsonl(
     input: impl AsRef<Path>,
     out: Option<impl AsRef<Path>>,
@@ -676,9 +780,21 @@ pub fn import_jsonl(
         })?;
         rows.push(value);
     }
-    Ok(import_values(input, rows, out, options)?)
+    Ok(import_values(
+        input,
+        &rows,
+        out.as_ref().map(AsRef::as_ref),
+        &options,
+    )?)
 }
 
+/// Import Hugging Face-style JSONL records from a directory.
+///
+/// # Errors
+///
+/// Returns [`AiAdapterError`] if the directory cannot be read, any JSONL file
+/// cannot be read or parsed, no records are present, sample conversion fails, or
+/// the output sidecar cannot be published.
 pub fn import_hf_dir(
     input_dir: impl AsRef<Path>,
     out: Option<impl AsRef<Path>>,
@@ -691,7 +807,11 @@ pub fn import_hf_dir(
         path: input_dir.to_path_buf(),
         source,
     })? {
-        let entry = entry.map_err(|error| error.to_string())?;
+        let entry = entry.map_err(|source| AiAdapterError::Io {
+            action: "read",
+            path: input_dir.to_path_buf(),
+            source,
+        })?;
         let path = entry.path();
         if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
             continue;
@@ -723,9 +843,21 @@ pub fn import_hf_dir(
             ),
         });
     }
-    Ok(import_values(input_dir, rows, out, options)?)
+    Ok(import_values(
+        input_dir,
+        &rows,
+        out.as_ref().map(AsRef::as_ref),
+        &options,
+    )?)
 }
 
+/// Import AI training records from a Parquet file.
+///
+/// # Errors
+///
+/// Returns [`AiAdapterError`] if the file cannot be opened, Parquet metadata or
+/// batches cannot be read, sample conversion fails, or the output sidecar cannot
+/// be published.
 pub fn import_parquet(
     input: impl AsRef<Path>,
     out: Option<impl AsRef<Path>>,
@@ -754,9 +886,20 @@ pub fn import_parquet(
         let batch = batch.map_err(|error| format!("Parquet batch read failed: {error}"))?;
         rows.extend(record_batch_to_json_rows(&batch)?);
     }
-    Ok(import_values(input, rows, out, options)?)
+    Ok(import_values(
+        input,
+        &rows,
+        out.as_ref().map(AsRef::as_ref),
+        &options,
+    )?)
 }
 
+/// Open and export a COVE-AI archive in one step.
+///
+/// # Errors
+///
+/// Returns [`AiAdapterError`] if the archive cannot be opened or export
+/// serialization fails.
 pub fn stream_archive(
     input: impl AsRef<Path>,
     options: AiExportOptions,
@@ -765,6 +908,12 @@ pub fn stream_archive(
     archive.export(options)
 }
 
+/// Diff two COVE-AI archives by a key field.
+///
+/// # Errors
+///
+/// Returns [`AiAdapterError`] if either archive cannot be opened or sample
+/// collection for the requested key field fails.
 pub fn diff_archives(
     old_path: impl AsRef<Path>,
     new_path: impl AsRef<Path>,
@@ -801,6 +950,13 @@ pub fn diff_archives(
     }))
 }
 
+/// Build a deterministic COVE-AI training archive showcase.
+///
+/// # Errors
+///
+/// Returns [`AiAdapterError`] if the output directory is invalid, fixture
+/// generation fails, archive import or verification fails, or showcase export
+/// files cannot be written.
 pub fn build_ai_training_showcase(
     out_dir: impl AsRef<Path>,
     profile: &str,
@@ -921,15 +1077,15 @@ pub fn build_ai_training_showcase(
 
 fn import_values(
     input_path: &Path,
-    rows: Vec<Value>,
-    out: Option<impl AsRef<Path>>,
-    options: AiImportOptions,
+    rows: &[Value],
+    out: Option<&Path>,
+    options: &AiImportOptions,
 ) -> Result<Value, String> {
     let mut samples = Vec::with_capacity(rows.len());
     let mut seen = BTreeSet::new();
     let mut diagnostics = Vec::new();
     for (index, row) in rows.iter().enumerate() {
-        let sample = imported_sample_from_value(index, row, &options)?;
+        let sample = imported_sample_from_value(index, row, options)?;
         if !seen.insert(sample.sample_id_text.clone()) {
             return Err(format!(
                 "duplicate AI training sample id '{}'",
@@ -958,11 +1114,9 @@ fn import_values(
         return Ok(report);
     }
     let out = out
-        .as_ref()
         .ok_or_else(|| "AI import requires --out unless --dry-run is used".to_string())?
-        .as_ref()
         .to_path_buf();
-    let bytes = build_training_sidecar(&samples, &options)?;
+    let bytes = build_training_sidecar(&samples, options)?;
     durable_replace(&out, &bytes)
         .map_err(|error| format!("cannot write {}: {error}", out.display()))?;
     let sidecar = CoveAiFile::parse(&bytes)
@@ -1006,7 +1160,7 @@ fn imported_sample_from_value(
         AiImportSchema::Pretrain => pretrain_payloads(&sample_id_text, row, &mut diagnostics),
         AiImportSchema::Preference => preference_payloads(&sample_id_text, row, &mut diagnostics),
         AiImportSchema::Rag => rag_payloads(&sample_id_text, row, &mut diagnostics),
-    }?;
+    };
     metadata["sample_id"] = json!(sample_id_text);
     metadata["schema"] = json!(options.schema.as_str());
     metadata["split"] = json!(split.as_str());
@@ -1041,22 +1195,22 @@ fn instruction_payloads(
     sample_id: &str,
     row: &Value,
     diagnostics: &mut Vec<AiWithheldDiagnostic>,
-) -> Result<(Value, Value, Value), String> {
+) -> (Value, Value, Value) {
     let instruction = string_field(row, "instruction", sample_id, diagnostics);
     let input = row.get("input").cloned().unwrap_or(Value::Null);
     let output = required_value(row, "output", sample_id, diagnostics);
-    Ok((
+    (
         json!({ "instruction": instruction, "input": input }),
         json!({ "output": output }),
         metadata_from_row(row),
-    ))
+    )
 }
 
 fn chat_payloads(
     sample_id: &str,
     row: &Value,
     diagnostics: &mut Vec<AiWithheldDiagnostic>,
-) -> Result<(Value, Value, Value), String> {
+) -> (Value, Value, Value) {
     let messages = row
         .get("messages")
         .and_then(Value::as_array)
@@ -1092,42 +1246,42 @@ fn chat_payloads(
             });
             Value::Null
         });
-    Ok((
+    (
         json!({ "messages": messages }),
         json!({ "assistant": target }),
         metadata_from_row(row),
-    ))
+    )
 }
 
 fn pretrain_payloads(
     sample_id: &str,
     row: &Value,
     diagnostics: &mut Vec<AiWithheldDiagnostic>,
-) -> Result<(Value, Value, Value), String> {
+) -> (Value, Value, Value) {
     let text = string_field(row, "text", sample_id, diagnostics);
-    Ok((json!({ "text": text }), Value::Null, metadata_from_row(row)))
+    (json!({ "text": text }), Value::Null, metadata_from_row(row))
 }
 
 fn preference_payloads(
     sample_id: &str,
     row: &Value,
     diagnostics: &mut Vec<AiWithheldDiagnostic>,
-) -> Result<(Value, Value, Value), String> {
+) -> (Value, Value, Value) {
     let prompt = required_value(row, "prompt", sample_id, diagnostics);
     let chosen = required_value(row, "chosen", sample_id, diagnostics);
     let rejected = required_value(row, "rejected", sample_id, diagnostics);
-    Ok((
+    (
         json!({ "prompt": prompt }),
         json!({ "chosen": chosen, "rejected": rejected }),
         metadata_from_row(row),
-    ))
+    )
 }
 
 fn rag_payloads(
     sample_id: &str,
     row: &Value,
     diagnostics: &mut Vec<AiWithheldDiagnostic>,
-) -> Result<(Value, Value, Value), String> {
+) -> (Value, Value, Value) {
     let query = required_value(row, "query", sample_id, diagnostics);
     let context = row.get("context").cloned().unwrap_or_else(|| {
         diagnostics.push(AiWithheldDiagnostic {
@@ -1138,11 +1292,11 @@ fn rag_payloads(
         Value::Array(Vec::new())
     });
     let answer = required_value(row, "answer", sample_id, diagnostics);
-    Ok((
+    (
         json!({ "query": query, "context": context }),
         json!({ "answer": answer }),
         metadata_from_row(row),
-    ))
+    )
 }
 
 fn string_field(
@@ -1408,9 +1562,18 @@ fn ai_export_error(message: impl Into<String>) -> AiAdapterError {
     }
 }
 
-pub fn write_export_file(data: AiExportData, out: Option<PathBuf>) -> Result<(), AiAdapterError> {
+/// Write exported AI data to a file or stdout.
+///
+/// # Errors
+///
+/// Returns [`AiAdapterError`] if durable file publication fails.
+pub fn write_export_file(
+    data: AiExportData,
+    out: Option<impl AsRef<Path>>,
+) -> Result<(), AiAdapterError> {
     if let Some(out) = out {
-        durable_replace(&out, &data.bytes)
+        let out = out.as_ref();
+        durable_replace(out, &data.bytes)
             .map_err(|error| format!("cannot write {}: {error}", out.display()))?;
     } else {
         print!("{}", String::from_utf8_lossy(&data.bytes));
@@ -2093,9 +2256,9 @@ mod tests {
         ];
         let error = import_values(
             Path::new("memory.jsonl"),
-            rows,
+            &rows,
             None::<&Path>,
-            AiImportOptions {
+            &AiImportOptions {
                 dry_run: true,
                 ..AiImportOptions::default()
             },
@@ -2106,6 +2269,15 @@ mod tests {
 
     #[test]
     fn import_schema_parse_reports_typed_error() {
+        assert_eq!(
+            "instruction".parse::<AiImportSchema>().unwrap(),
+            AiImportSchema::Instruction
+        );
+        assert_eq!(
+            "deterministic".parse::<AiSplitPolicy>().unwrap(),
+            AiSplitPolicy::Deterministic
+        );
+
         let error = AiImportSchema::parse("made-up-schema").unwrap_err();
         assert!(matches!(
             error,
@@ -2140,9 +2312,9 @@ mod tests {
         })];
         let report = import_values(
             Path::new("memory.jsonl"),
-            rows,
+            &rows,
             None::<&Path>,
-            AiImportOptions {
+            &AiImportOptions {
                 dry_run: false,
                 artifact_id: Some([7u8; 16]),
                 created_at_us: Some(1),
@@ -2196,6 +2368,7 @@ mod tests {
         ] {
             let parsed = AiExportFormat::parse(value).unwrap();
             assert_eq!(parsed, expected);
+            assert_eq!(value.parse::<AiExportFormat>().unwrap(), expected);
             assert_eq!(parsed.as_str(), value);
         }
     }

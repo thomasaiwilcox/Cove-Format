@@ -165,7 +165,7 @@ impl ExecutionPlan for CoveNativeCountExec {
         }
         let scan = native_row_count_scan(&self.state, &self.filter_plan)
             .map_err(crate::adapter_v53::cove_to_datafusion)?;
-        CoveFileMetrics::new(&self.metrics, partition).record_decode(scan.stats);
+        CoveFileMetrics::new(&self.metrics, partition).record_decode(&scan.stats);
         let batch = native_count_batch(Arc::clone(&self.schema), scan.count)?;
         Ok(Box::pin(MemoryStream::try_new(
             vec![batch],

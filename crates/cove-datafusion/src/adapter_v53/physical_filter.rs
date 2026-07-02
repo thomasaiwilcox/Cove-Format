@@ -92,7 +92,7 @@ fn lower_expr(expr: &dyn PhysicalExpr) -> Option<LowerExpr> {
         )?)));
     }
     if let Some(binary) = expr.as_any().downcast_ref::<BinaryExpr>() {
-        let op = lower_operator(binary.op())?;
+        let op = lower_operator(*binary.op())?;
         return Some(LowerExpr::Binary {
             left: Box::new(lower_expr(binary.left().as_ref())?),
             op,
@@ -122,7 +122,7 @@ fn lower_expr(expr: &dyn PhysicalExpr) -> Option<LowerExpr> {
     None
 }
 
-fn lower_operator(op: &Operator) -> Option<LowerOperator> {
+fn lower_operator(op: Operator) -> Option<LowerOperator> {
     match op {
         Operator::Eq => Some(LowerOperator::Eq),
         Operator::NotEq => Some(LowerOperator::NotEq),

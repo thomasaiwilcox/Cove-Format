@@ -743,6 +743,9 @@ pub(super) fn filter_local_u8_membership_avx2_dispatch(
     }
 }
 
+// Keep the dispatch contract identical across architectures; this returns
+// `Some` on AArch64 and `None` elsewhere.
+#[allow(clippy::unnecessary_wraps)]
 pub(super) fn filter_local_u8_membership_neon_dispatch(
     values: &[u8],
     needles: &[u8],
@@ -792,6 +795,9 @@ pub(super) fn filter_local_u16_membership_avx2_dispatch(
     }
 }
 
+// Keep the dispatch contract identical across architectures; this returns
+// `Some` on AArch64 and `None` elsewhere.
+#[allow(clippy::unnecessary_wraps)]
 pub(super) fn filter_local_u16_membership_neon_dispatch(
     values: &[u16],
     needles: &[u16],
@@ -841,6 +847,9 @@ pub(super) fn filter_local_u32_membership_avx2_dispatch(
     }
 }
 
+// Keep the dispatch contract identical across architectures; this returns
+// `Some` on AArch64 and `None` elsewhere.
+#[allow(clippy::unnecessary_wraps)]
 pub(super) fn filter_local_u32_membership_neon_dispatch(
     values: &[u32],
     needles: &[u32],
@@ -972,6 +981,9 @@ pub(super) fn filter_i64_le_range_avx2_dispatch(
     }
 }
 
+// Keep the dispatch contract identical across architectures; this returns
+// `Some` on AArch64 and `None` elsewhere.
+#[allow(clippy::unnecessary_wraps)]
 pub(super) fn filter_u64_le_eq_neon_dispatch(
     bytes: &[u8],
     row_count: usize,
@@ -995,6 +1007,9 @@ pub(super) fn filter_u64_le_eq_neon_dispatch(
     }
 }
 
+// Keep the dispatch contract identical across architectures; this returns
+// `Some` on AArch64 and `None` elsewhere.
+#[allow(clippy::unnecessary_wraps)]
 pub(super) fn filter_u32_le_eq_neon_dispatch(
     bytes: &[u8],
     row_count: usize,
@@ -1018,6 +1033,9 @@ pub(super) fn filter_u32_le_eq_neon_dispatch(
     }
 }
 
+// Keep the dispatch contract identical across architectures; this returns
+// `Some` on AArch64 and `None` elsewhere.
+#[allow(clippy::unnecessary_wraps)]
 pub(super) fn filter_i64_le_cmp_neon_dispatch(
     bytes: &[u8],
     row_count: usize,
@@ -1043,6 +1061,9 @@ pub(super) fn filter_i64_le_cmp_neon_dispatch(
     }
 }
 
+// Keep the dispatch contract identical across architectures; this returns
+// `Some` on AArch64 and `None` elsewhere.
+#[allow(clippy::unnecessary_wraps)]
 pub(super) fn filter_i64_le_range_neon_dispatch(
     bytes: &[u8],
     row_count: usize,

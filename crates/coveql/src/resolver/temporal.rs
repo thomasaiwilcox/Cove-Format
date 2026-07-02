@@ -11,7 +11,7 @@ pub(super) fn temporal_for_as_of(
             role_binding: None,
         }),
         AstTimeBound::Timestamp { role, timestamp } => {
-            let (role, role_binding) = temporal_role(*role, resolve_options)?;
+            let (role, role_binding) = temporal_role(*role, resolve_options);
             Ok(TemporalContext {
                 mode: TemporalMode::AsOfTimestampMicros(
                     timestamp_micros(timestamp, &resolve_options.security)?.0,
@@ -26,13 +26,13 @@ pub(super) fn temporal_for_as_of(
 pub(super) fn temporal_role(
     role: AstTimeRole,
     resolve_options: &ResolveOptions,
-) -> Result<(TemporalRole, Option<String>), BuildResolvedQueryError> {
+) -> (TemporalRole, Option<String>) {
     let resolved = match role {
         AstTimeRole::Time | AstTimeRole::CommitTime => {
-            return Ok((TemporalRole::CommitTime, None));
+            return (TemporalRole::CommitTime, None);
         }
         AstTimeRole::AssociationValidTime => {
-            return Ok((TemporalRole::AssociationValidTime, None));
+            return (TemporalRole::AssociationValidTime, None);
         }
         AstTimeRole::ValidTime => TemporalRole::ValidTime,
         AstTimeRole::ObservedTime => TemporalRole::ObservedTime,
@@ -42,7 +42,7 @@ pub(super) fn temporal_role(
         .temporal_role_bindings
         .contains_key(&resolved)
         .then(|| resolve_options.temporal_role_bindings[&resolved].clone());
-    Ok((resolved, binding))
+    (resolved, binding)
 }
 
 pub(super) fn branch_for_selector(
@@ -197,7 +197,7 @@ impl Resolver {
         match bound {
             AstChangeBound::Csn(value) => Ok(ResolvedTimeBound::Csn(*value)),
             AstChangeBound::Timestamp { role, timestamp } => {
-                let (role, binding) = temporal_role(*role, &self.options)?;
+                let (role, binding) = temporal_role(*role, &self.options);
                 let (timestamp_micros, canonical_rfc3339) =
                     timestamp_micros(timestamp, &self.options.security)?;
                 Ok(ResolvedTimeBound::TimestampMicros {

@@ -308,11 +308,10 @@ pub(super) fn numeric_aggregate(
     match name {
         AstAggregateName::Sum if saw_float => Ok(json!(float_sum)),
         AstAggregateName::Avg if saw_float => Ok(json!(float_sum / count as f64)),
-        AstAggregateName::Sum => exact_sum
+        AstAggregateName::Sum => Ok(exact_sum
             .ok_or_else(|| exec_error("E_AGGREGATE", "empty numeric accumulator", json!({})))?
-            .to_json_sum()
-            .map_err(|message| exec_error("E_AGGREGATE", message, json!({}))),
-        AstAggregateName::Avg => exact_sum
+            .to_json_sum()),
+        AstAggregateName::Avg => Ok(exact_sum
             .ok_or_else(|| exec_error("E_AGGREGATE", "empty numeric accumulator", json!({})))?
             .checked_div_u64(count as u64)
             .ok_or_else(|| {
@@ -322,8 +321,7 @@ pub(super) fn numeric_aggregate(
                     json!({}),
                 )
             })?
-            .to_json_sum()
-            .map_err(|message| exec_error("E_AGGREGATE", message, json!({}))),
+            .to_json_sum()),
         _ => unreachable!("guarded by caller"),
     }
 }
@@ -357,7 +355,7 @@ pub(crate) fn sort_rows(
     rows: &mut [ExecutionRow],
     planned: &PlannedQuery,
     context: &EvalContext<'_>,
-) -> Result<(), BuildExecutionError> {
+) {
     let Some(order) = &planned.resolved.method_chain.order_by else {
         if planned.logical_plan.default_ordering_applied {
             let fields = default_sort_fields(planned);
@@ -369,7 +367,7 @@ pub(crate) fn sort_rows(
                     })
             });
         }
-        return Ok(());
+        return;
     };
     let logical_type = expr_logical_type(&order.expr);
     let collation_id = expr_collation_id(&order.expr);
@@ -387,7 +385,6 @@ pub(crate) fn sort_rows(
         .then_with(|| compare_manifest_member_order(left, right, planned))
         .then_with(|| stable_value_key(&left.to_json()).cmp(&stable_value_key(&right.to_json())))
     });
-    Ok(())
 }
 
 pub(super) fn compare_manifest_member_order(

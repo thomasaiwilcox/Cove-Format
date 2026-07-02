@@ -321,7 +321,7 @@ impl ExecutionPlan for CoveNativeGroupCountExec {
                     &self.filter_plan,
                 )
                 .map_err(crate::adapter_v53::cove_to_datafusion)?;
-                CoveFileMetrics::new(&self.metrics, partition).record_decode(scan.stats);
+                CoveFileMetrics::new(&self.metrics, partition).record_decode(&scan.stats);
                 native_group_count_batch(Arc::clone(&self.schema), scan.groups)?
             }
             (NativeGroupKeyKind::I64, NativeI64GroupOutput::Distinct) => {
@@ -331,7 +331,7 @@ impl ExecutionPlan for CoveNativeGroupCountExec {
                     &self.filter_plan,
                 )
                 .map_err(crate::adapter_v53::cove_to_datafusion)?;
-                CoveFileMetrics::new(&self.metrics, partition).record_decode(scan.stats);
+                CoveFileMetrics::new(&self.metrics, partition).record_decode(&scan.stats);
                 native_group_distinct_batch(Arc::clone(&self.schema), scan.groups)?
             }
             (NativeGroupKeyKind::Bool, NativeI64GroupOutput::Count) => {
@@ -341,7 +341,7 @@ impl ExecutionPlan for CoveNativeGroupCountExec {
                     &self.filter_plan,
                 )
                 .map_err(crate::adapter_v53::cove_to_datafusion)?;
-                CoveFileMetrics::new(&self.metrics, partition).record_decode(scan.stats);
+                CoveFileMetrics::new(&self.metrics, partition).record_decode(&scan.stats);
                 native_bool_group_count_batch(Arc::clone(&self.schema), scan.groups)?
             }
             (NativeGroupKeyKind::Bool, NativeI64GroupOutput::Distinct) => {
@@ -351,7 +351,7 @@ impl ExecutionPlan for CoveNativeGroupCountExec {
                     &self.filter_plan,
                 )
                 .map_err(crate::adapter_v53::cove_to_datafusion)?;
-                CoveFileMetrics::new(&self.metrics, partition).record_decode(scan.stats);
+                CoveFileMetrics::new(&self.metrics, partition).record_decode(&scan.stats);
                 native_bool_group_distinct_batch(Arc::clone(&self.schema), scan.groups)?
             }
             (NativeGroupKeyKind::FileCodeUtf8, NativeI64GroupOutput::Count) => {
@@ -361,7 +361,7 @@ impl ExecutionPlan for CoveNativeGroupCountExec {
                     &self.filter_plan,
                 )
                 .map_err(crate::adapter_v53::cove_to_datafusion)?;
-                CoveFileMetrics::new(&self.metrics, partition).record_decode(scan.stats);
+                CoveFileMetrics::new(&self.metrics, partition).record_decode(&scan.stats);
                 native_filecode_group_count_batch(Arc::clone(&self.schema), scan.groups)?
             }
             (NativeGroupKeyKind::FileCodeUtf8, NativeI64GroupOutput::Distinct) => {
@@ -371,7 +371,7 @@ impl ExecutionPlan for CoveNativeGroupCountExec {
                     &self.filter_plan,
                 )
                 .map_err(crate::adapter_v53::cove_to_datafusion)?;
-                CoveFileMetrics::new(&self.metrics, partition).record_decode(scan.stats);
+                CoveFileMetrics::new(&self.metrics, partition).record_decode(&scan.stats);
                 native_filecode_group_distinct_batch(Arc::clone(&self.schema), scan.groups)?
             }
         };

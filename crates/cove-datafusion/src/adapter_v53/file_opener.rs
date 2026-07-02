@@ -127,7 +127,7 @@ impl FileOpener for CoveFileOpener {
                     let mut sink = UnboundedDecodeSink::new(sender.clone(), output_adapter);
                     match decode_scan_with_reader_to_sink(&state, &plan, &reader, &mut sink).await {
                         Ok(stats) => {
-                            decode_metrics.record_decode(stats);
+                            decode_metrics.record_decode(&stats);
                             let _ = sender.send(DecodeStreamEvent::Finished);
                         }
                         Err(error) => {

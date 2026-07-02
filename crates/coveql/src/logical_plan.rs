@@ -404,7 +404,7 @@ pub fn build_logical_plan(
     let predicate_plan = PredicatePlanning::from_predicate_with_dataset(
         resolved.method_chain.where_predicate.as_ref(),
         &resolved.root,
-        security_scope(&resolved),
+        &security_scope(&resolved),
         &resolved.operation_context.dataset,
     );
     validate_sort(&resolved, &options)?;

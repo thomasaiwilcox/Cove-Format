@@ -279,7 +279,7 @@ fn encoded_array_to_arrow_with_options_and_owner(
             });
         }
     }
-    let arrow_type = arrow_data_type_with_report(array.logical, &options, &mut report)?;
+    let arrow_type = arrow_data_type_with_report(array.logical, options, &mut report)?;
     if let Some(array_ref) = try_direct_byte_array(
         array,
         &arrow_type,
@@ -363,7 +363,7 @@ pub fn encoded_array_to_arrow_with_row_selection_options_and_owner(
             });
         }
     }
-    let arrow_type = arrow_data_type_with_report(array.logical, &options, &mut report)?;
+    let arrow_type = arrow_data_type_with_report(array.logical, options, &mut report)?;
     if let Some(array_ref) = try_direct_byte_array_for_selection(
         array,
         selection,
@@ -3437,7 +3437,7 @@ pub fn arrow_data_type_for_export_options(
     options: ArrowExportOptions,
 ) -> Result<ArrowExportResult<DataType>, CoveError> {
     let mut report = ArrowExportReport::default();
-    let value = arrow_data_type_with_report(logical, &options, &mut report)?;
+    let value = arrow_data_type_with_report(logical, options, &mut report)?;
     Ok(ArrowExportResult { value, report })
 }
 
@@ -3553,14 +3553,14 @@ fn arrow_data_type_for_nested_schema_node_with_report(
             } else {
                 options
             };
-            arrow_data_type_with_report(node.logical, &scalar_options, report)
+            arrow_data_type_with_report(node.logical, scalar_options, report)
         }
     }
 }
 
 fn arrow_data_type_with_report(
     logical: CoveLogicalType,
-    options: &ArrowExportOptions,
+    options: ArrowExportOptions,
     report: &mut ArrowExportReport,
 ) -> Result<DataType, CoveError> {
     match logical {

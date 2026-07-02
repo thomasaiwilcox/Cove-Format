@@ -137,7 +137,7 @@ pub fn exact_unfiltered_aggregate_synopses(
     state: &DatasetState,
     requests: &[(usize, MetadataSynopsisAggregateKind)],
 ) -> Result<Option<MetadataAggregatePlan>, CoveError> {
-    if requests.is_empty() || !aggregate_synopsis_fast_paths_are_safe(state)? {
+    if requests.is_empty() || !aggregate_synopsis_fast_paths_are_safe(state) {
         return Ok(None);
     }
     let mut values = Vec::with_capacity(requests.len());
@@ -363,7 +363,10 @@ fn select_exact_coverage_entries<'a>(
         .filter(|(entry, _)| entry.segment_id != u32::MAX && entry.morsel_id == u32::MAX)
         .collect::<Vec<_>>();
     if !segment_level.is_empty() {
-        return select_segment_coverage_entries(file.segments(), segment_level);
+        return Ok(select_segment_coverage_entries(
+            file.segments(),
+            segment_level,
+        ));
     }
 
     let morsel_level = candidates
@@ -376,27 +379,27 @@ fn select_exact_coverage_entries<'a>(
 fn select_segment_coverage_entries<'a>(
     segments: &[TableSegmentIndexEntryV1],
     entries: Vec<(&'a AggregateEntry, &'a AggregatePayloadV2)>,
-) -> Result<Vec<(&'a AggregateEntry, &'a AggregatePayloadV2)>, CoveError> {
+) -> Vec<(&'a AggregateEntry, &'a AggregatePayloadV2)> {
     if entries.len() != segments.len() {
-        return Ok(Vec::new());
+        return Vec::new();
     }
     let mut by_segment = BTreeMap::new();
     for item in entries {
         if by_segment.insert(item.0.segment_id, item).is_some() {
-            return Ok(Vec::new());
+            return Vec::new();
         }
     }
     let mut selected = Vec::with_capacity(segments.len());
     for segment in segments {
         let Some(item) = by_segment.remove(&segment.segment_id) else {
-            return Ok(Vec::new());
+            return Vec::new();
         };
         if item.0.row_count != segment.row_count {
-            return Ok(Vec::new());
+            return Vec::new();
         }
         selected.push(item);
     }
-    Ok(selected)
+    selected
 }
 
 fn select_morsel_coverage_entries<'a>(
@@ -932,7 +935,7 @@ pub fn exact_filecode_filtered_count(
     column_index: usize,
     canonical_keys: &[Vec<u8>],
 ) -> Result<Option<MetadataAggregatePlan>, CoveError> {
-    if canonical_keys.is_empty() || !filecode_fast_paths_are_safe(state, column_index)? {
+    if canonical_keys.is_empty() || !filecode_fast_paths_are_safe(state, column_index) {
         return Ok(None);
     }
     if let Some(plan) =
@@ -1044,7 +1047,7 @@ pub fn exact_filecode_group_counts(
     state: &DatasetState,
     column_index: usize,
 ) -> Result<Option<MetadataAggregatePlan>, CoveError> {
-    if !filecode_fast_paths_are_safe(state, column_index)? {
+    if !filecode_fast_paths_are_safe(state, column_index) {
         return Ok(None);
     }
     let column = state
@@ -1251,31 +1254,28 @@ pub fn canonical_utf8(canonical: &[u8]) -> Result<String, CoveError> {
         .map_err(|_| CoveError::BadSection("canonical Utf8 payload is not UTF-8".into()))
 }
 
-fn filecode_fast_paths_are_safe(
-    state: &DatasetState,
-    column_index: usize,
-) -> Result<bool, CoveError> {
+fn filecode_fast_paths_are_safe(state: &DatasetState, column_index: usize) -> bool {
     for file in state.files() {
         let Some(column) = file.table().columns.get(column_index) else {
-            return Ok(false);
+            return false;
         };
         if column.physical != CovePhysicalKind::FileCode
             || !file.visibility().is_all()
             || file.has_redaction()
         {
-            return Ok(false);
+            return false;
         }
     }
-    Ok(true)
+    true
 }
 
-fn aggregate_synopsis_fast_paths_are_safe(state: &DatasetState) -> Result<bool, CoveError> {
+fn aggregate_synopsis_fast_paths_are_safe(state: &DatasetState) -> bool {
     for file in state.files() {
         if !file.visibility().is_all() || file.has_redaction() {
-            return Ok(false);
+            return false;
         }
     }
-    Ok(true)
+    true
 }
 
 #[cfg(test)]
@@ -1336,8 +1336,7 @@ mod tests {
                 (&first, &AggregatePayloadV2::None),
                 (&duplicate, &AggregatePayloadV2::None),
             ],
-        )
-        .unwrap();
+        );
         assert!(selected.is_empty());
     }
 
@@ -1352,8 +1351,7 @@ mod tests {
                 (&first, &AggregatePayloadV2::None),
                 (&second, &AggregatePayloadV2::None),
             ],
-        )
-        .unwrap();
+        );
         assert_eq!(selected.len(), 2);
     }
 

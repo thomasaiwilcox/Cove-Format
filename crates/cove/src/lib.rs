@@ -140,6 +140,12 @@ pub struct QueryResult {
 }
 
 impl QueryResult {
+    /// Return the query result payload as JSON.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`CoveFacadeError`] if the executed query result cannot be
+    /// represented as the facade JSON result shape.
     pub fn result_json(&self) -> Result<serde_json::Value, CoveFacadeError> {
         self.executed.result_json().map_err(CoveFacadeError::from)
     }

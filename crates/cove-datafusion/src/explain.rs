@@ -402,7 +402,7 @@ pub fn cost_report(planned: &PlannedScan, observed: Option<DecodeStats>) -> Plan
         .iter()
         .map(|range| range.end.saturating_sub(range.start))
         .sum::<u64>();
-    let observed_json = observed.map(decode_stats_json);
+    let observed_json = observed.map(|stats| decode_stats_json(&stats));
     PlanCostReport {
         version: 1,
         source: state.source().to_string(),
@@ -988,7 +988,7 @@ fn synthetic_report_morsels(
         .collect()
 }
 
-fn decode_stats_json(stats: DecodeStats) -> Value {
+fn decode_stats_json(stats: &DecodeStats) -> Value {
     let mut out = serde_json::Map::new();
     macro_rules! insert_stat {
         ($name:literal, $value:expr) => {
@@ -1234,7 +1234,7 @@ mod tests {
             ..DecodeStats::default()
         };
 
-        let value = decode_stats_json(stats);
+        let value = decode_stats_json(&stats);
 
         assert_eq!(value["native_lane_predicates"], 2);
         assert_eq!(value["native_lane_predicate_rows_seen"], 128);
@@ -1256,7 +1256,7 @@ mod tests {
             ..DecodeStats::default()
         };
 
-        let value = decode_stats_json(stats);
+        let value = decode_stats_json(&stats);
 
         assert_eq!(value["native_aggregate_kernels"], 3);
         assert_eq!(value["native_aggregate_rows_seen"], 192);
@@ -1278,7 +1278,7 @@ mod tests {
             ..DecodeStats::default()
         };
 
-        let value = decode_stats_json(stats);
+        let value = decode_stats_json(&stats);
 
         assert_eq!(value["native_group_kernels"], 2);
         assert_eq!(value["native_group_rows_seen"], 64);
@@ -1298,7 +1298,7 @@ mod tests {
             ..DecodeStats::default()
         };
 
-        let value = decode_stats_json(stats);
+        let value = decode_stats_json(&stats);
 
         assert_eq!(value["native_count_scans"], 4);
         assert_eq!(value["native_count_rows_seen"], 256);
@@ -1316,7 +1316,7 @@ mod tests {
             ..DecodeStats::default()
         };
 
-        let value = decode_stats_json(stats);
+        let value = decode_stats_json(&stats);
 
         assert_eq!(value["native_sort_kernels"], 2);
         assert_eq!(value["native_sort_rows_seen"], 128);
@@ -1338,7 +1338,7 @@ mod tests {
             ..DecodeStats::default()
         };
 
-        let value = decode_stats_json(stats);
+        let value = decode_stats_json(&stats);
 
         assert_eq!(value["native_join_kernels"], 2);
         assert_eq!(value["native_join_rows_seen"], 96);

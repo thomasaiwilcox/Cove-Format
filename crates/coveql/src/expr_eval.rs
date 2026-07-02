@@ -756,7 +756,7 @@ pub(crate) struct ExactDecimal {
 }
 
 impl ExactDecimal {
-    pub(crate) fn to_json_sum(self) -> Result<Value, String> {
+    pub(crate) fn to_json_sum(self) -> Value {
         decimal_to_json_value(self.value, self.scale)
     }
 
@@ -876,13 +876,13 @@ fn rescale_decimal(value: i128, from_scale: u32, to_scale: u32) -> Option<i128> 
     value.checked_mul(pow10(to_scale - from_scale)?)
 }
 
-fn decimal_to_json_value(value: i128, scale: u32) -> Result<Value, String> {
+fn decimal_to_json_value(value: i128, scale: u32) -> Value {
     if scale == 0 {
         if let Ok(value) = i64::try_from(value) {
-            return Ok(json!(value));
+            return json!(value);
         }
         if let Ok(value) = u64::try_from(value) {
-            return Ok(json!(value));
+            return json!(value);
         }
     }
     let negative = value < 0;
@@ -904,7 +904,7 @@ fn decimal_to_json_value(value: i128, scale: u32) -> Result<Value, String> {
     if negative {
         digits.insert(0, '-');
     }
-    Ok(Value::String(digits))
+    Value::String(digits)
 }
 
 fn pow10(power: u32) -> Option<i128> {

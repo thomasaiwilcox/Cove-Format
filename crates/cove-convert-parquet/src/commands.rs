@@ -95,7 +95,7 @@ pub fn run_parquet(args: impl IntoIterator<Item = String>) -> Result<(), Convert
             message: err.to_string(),
         }
     })?;
-    Ok(publish_conversion_result(command, result)?)
+    Ok(publish_conversion_result(command, &result)?)
 }
 
 pub fn run_arrow(args: impl IntoIterator<Item = String>) -> Result<(), ConvertParquetError> {
@@ -116,7 +116,7 @@ pub fn run_arrow(args: impl IntoIterator<Item = String>) -> Result<(), ConvertPa
             ..ConversionOptions::default()
         },
     )?;
-    Ok(publish_conversion_result(command, result)?)
+    Ok(publish_conversion_result(command, &result)?)
 }
 
 pub fn run_orc(args: impl IntoIterator<Item = String>) -> Result<(), ConvertParquetError> {
@@ -133,7 +133,7 @@ pub fn run_orc(args: impl IntoIterator<Item = String>) -> Result<(), ConvertParq
             ..ConversionOptions::default()
         },
     )?;
-    Ok(publish_conversion_result(command, result)?)
+    Ok(publish_conversion_result(command, &result)?)
 }
 
 pub fn run_csv(args: impl IntoIterator<Item = String>) -> Result<(), ConvertParquetError> {
@@ -151,7 +151,7 @@ pub fn run_csv(args: impl IntoIterator<Item = String>) -> Result<(), ConvertParq
             csv: csv_options,
         },
     )?;
-    Ok(publish_conversion_result(command, result)?)
+    Ok(publish_conversion_result(command, &result)?)
 }
 
 pub fn run_report(args: impl IntoIterator<Item = String>) -> Result<(), ConvertParquetError> {

@@ -1868,6 +1868,14 @@ pub struct CoviRowRangePostingV2 {
 impl CoviRowRangePostingV2 {
     pub const LEN: usize = 40;
 
+    /// Parses one COVI row-range posting from its fixed-width wire bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoveError::BufferTooShort`] if `bytes` is shorter than
+    /// [`Self::LEN`], [`CoveError::ChecksumMismatch`] if the posting CRC does
+    /// not match, [`CoveError::BadCovi`] for a zero row count, or
+    /// [`CoveError::ArithOverflow`] if `row_start + row_count` overflows.
     pub fn parse(bytes: &[u8]) -> Result<Self, CoveError> {
         if bytes.len() < Self::LEN {
             return Err(CoveError::BufferTooShort);
@@ -1890,6 +1898,12 @@ impl CoviRowRangePostingV2 {
         Ok(item)
     }
 
+    /// Serializes this row-range posting with a fresh checksum.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoveError::BadCovi`] if `row_count` is zero, or
+    /// [`CoveError::ArithOverflow`] if `row_start + row_count` overflows.
     pub fn serialize(&self) -> Result<[u8; Self::LEN], CoveError> {
         if self.row_count == 0 {
             return Err(CoveError::BadCovi);
@@ -1922,6 +1936,14 @@ pub struct CoviByteRangePostingV2 {
 impl CoviByteRangePostingV2 {
     pub const LEN: usize = 32;
 
+    /// Parses one COVI byte-range posting from its fixed-width wire bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoveError::BufferTooShort`] if `bytes` is shorter than
+    /// [`Self::LEN`], [`CoveError::ChecksumMismatch`] if the posting CRC does
+    /// not match, [`CoveError::BadCovi`] for a zero length, or
+    /// [`CoveError::ArithOverflow`] if `offset + length` overflows.
     pub fn parse(bytes: &[u8]) -> Result<Self, CoveError> {
         if bytes.len() < Self::LEN {
             return Err(CoveError::BufferTooShort);
@@ -1942,6 +1964,12 @@ impl CoviByteRangePostingV2 {
         Ok(item)
     }
 
+    /// Serializes this byte-range posting with a fresh checksum.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoveError::BadCovi`] if `length` is zero, or
+    /// [`CoveError::ArithOverflow`] if `offset + length` overflows.
     pub fn serialize(&self) -> Result<[u8; Self::LEN], CoveError> {
         if self.length == 0 {
             return Err(CoveError::BadCovi);

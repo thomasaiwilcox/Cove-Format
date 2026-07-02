@@ -501,7 +501,7 @@ fn property_compare_candidate(
 ) -> Option<CoveObjectPropertyPredicateCandidate> {
     let path = resolved_property_path(left)?;
     let literal = resolved_literal(right)?;
-    property_candidate(path, property_compare_op(op)?, Some(literal))
+    property_candidate(path, property_compare_op(op), Some(literal))
 }
 
 fn resolved_property_path(expr: &ResolvedExpr) -> Option<&crate::ResolvedPath> {
@@ -592,15 +592,15 @@ fn property_candidate_is_proven_exact(
     }
 }
 
-fn property_compare_op(op: AstCompareOp) -> Option<CoveObjectPropertyPredicateOp> {
-    Some(match op {
+fn property_compare_op(op: AstCompareOp) -> CoveObjectPropertyPredicateOp {
+    match op {
         AstCompareOp::Eq => CoveObjectPropertyPredicateOp::Eq,
         AstCompareOp::Ne => CoveObjectPropertyPredicateOp::Ne,
         AstCompareOp::Lt => CoveObjectPropertyPredicateOp::Lt,
         AstCompareOp::Le => CoveObjectPropertyPredicateOp::LtEq,
         AstCompareOp::Gt => CoveObjectPropertyPredicateOp::Gt,
         AstCompareOp::Ge => CoveObjectPropertyPredicateOp::GtEq,
-    })
+    }
 }
 
 fn flip_compare_op(op: AstCompareOp) -> AstCompareOp {

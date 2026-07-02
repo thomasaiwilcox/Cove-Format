@@ -1204,6 +1204,12 @@ pub fn coveql_identifier(value: &str) -> String {
     out
 }
 
+/// Quotes `value` as a COVEQL string literal.
+///
+/// # Panics
+///
+/// Panics only if JSON string serialization fails for a Rust string slice,
+/// which would indicate a bug in the serializer rather than invalid input.
 pub fn coveql_string_literal(value: &str) -> String {
     serde_json::to_string(value).expect("serializing a string literal cannot fail")
 }

@@ -207,6 +207,14 @@ impl DeltaBranchIdentityV1 {
         buf
     }
 
+    /// Parses a delta branch identity record from fixed-width wire bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoveError::BufferTooShort`] if `bytes` is too short,
+    /// [`CoveError::ChecksumMismatch`] if the record checksum does not match,
+    /// or the validation errors documented by [`Self::validate`] when the
+    /// decoded identity violates COVEDELTA branch-identity invariants.
     pub fn parse(bytes: &[u8]) -> Result<Self, CoveError> {
         if bytes.len() < DELTA_BRANCH_IDENTITY_LEN {
             return Err(CoveError::BufferTooShort);
@@ -238,6 +246,13 @@ impl DeltaBranchIdentityV1 {
         Ok(identity)
     }
 
+    /// Validates COVEDELTA branch-identity invariants.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoveError::ReservedNotZero`] when reserved flags are set, or
+    /// [`CoveError::BadSection`] when the branch identity kind and its required
+    /// value/hash references are inconsistent.
     pub fn validate(&self) -> Result<(), CoveError> {
         if self.flags != 0 {
             return Err(CoveError::ReservedNotZero);
