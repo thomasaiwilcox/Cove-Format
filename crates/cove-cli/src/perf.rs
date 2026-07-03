@@ -5,6 +5,9 @@ use cove_datafusion::explain::{
     ExplainOptions,
 };
 
+const EXPLAIN_PRUNING_USAGE: &str = "usage: cove perf explain-pruning [--columns a,b] [--filter column=<name|index>,op=<eq|in|lt|lte|gt|gte|is-null|is-not-null>,value=<literal|a|b>] [--top-n column=<name|index>,fetch=<n>,desc=<bool>] <input.cove>";
+const PLAN_COST_USAGE: &str = "usage: cove perf plan-cost [--execute] [--columns a,b] [--filter column=<name|index>,op=<eq|in|lt|lte|gt|gte|is-null|is-not-null>,value=<literal|a|b>] [--top-n column=<name|index>,fetch=<n>,desc=<bool>] <input.cove>";
+
 pub(crate) fn run_explain_pruning(args: Vec<String>) -> Result<(), String> {
     let Some((input, options)) = parse_explain_args(args)? else {
         print_explain_pruning_usage();
@@ -109,13 +112,22 @@ fn next_value(iter: &mut impl Iterator<Item = String>, option: &str) -> Result<S
 }
 
 fn print_explain_pruning_usage() {
-    eprintln!(
-        "usage: cove perf explain-pruning [--columns a,b] [--filter column=<name|index>,op=<eq|lt|lte|gt|gte|is-null|is-not-null>,value=<literal>] [--top-n column=<name|index>,fetch=<n>,desc=<bool>] <input.cove>"
-    );
+    eprintln!("{EXPLAIN_PRUNING_USAGE}");
 }
 
 fn print_plan_cost_usage() {
-    eprintln!(
-        "usage: cove perf plan-cost [--execute] [--columns a,b] [--filter column=<name|index>,op=<eq|lt|lte|gt|gte|is-null|is-not-null>,value=<literal>] [--top-n column=<name|index>,fetch=<n>,desc=<bool>] <input.cove>"
-    );
+    eprintln!("{PLAN_COST_USAGE}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn usage_mentions_in_filter_syntax() {
+        for usage in [EXPLAIN_PRUNING_USAGE, PLAN_COST_USAGE] {
+            assert!(usage.contains("op=<eq|in|lt"));
+            assert!(usage.contains("value=<literal|a|b>"));
+        }
+    }
 }
