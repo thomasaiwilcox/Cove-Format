@@ -21,6 +21,7 @@ use cove_core::{
             COVM_POSTSCRIPT_TAIL_SIZE,
         },
     },
+    manifest_path::resolve_manifest_relative_path,
     profile::cove_o::{
         read_object_surface_from_base_and_delta_files_with_parent_identity,
         read_object_surface_from_bytes_with_options, reconstruct_object_states,
@@ -695,7 +696,8 @@ fn read_artifact_for_ref(
             hex16(&reference.artifact_id)
         ))
     })?;
-    let path = dataset.join(uri);
+    let path = resolve_manifest_relative_path(dataset, uri)
+        .map_err(|error| DeltaSnapshotError::InvalidManifest(error.to_string()))?;
     let bytes = read_file(&path)?;
     Ok(ArtifactBytes { path, bytes })
 }

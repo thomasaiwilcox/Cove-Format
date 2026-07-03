@@ -11,6 +11,7 @@ use cove_core::{
     },
     constants::DigestAlgorithm,
     digest::compute_digest,
+    manifest_path::resolve_manifest_relative_path,
     CoveError,
 };
 
@@ -102,15 +103,7 @@ enum CovmEntryFreshness {
 }
 
 fn resolve_covm_uri(manifest_dir: &Path, uri: &str) -> Result<PathBuf, CoveError> {
-    if let Some(rest) = uri.strip_prefix("file://") {
-        return Ok(PathBuf::from(rest));
-    }
-    let path = Path::new(uri);
-    if path.is_absolute() {
-        Ok(path.to_path_buf())
-    } else {
-        Ok(manifest_dir.join(path))
-    }
+    resolve_manifest_relative_path(manifest_dir, uri)
 }
 
 fn validate_covm_entry(

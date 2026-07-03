@@ -1030,6 +1030,22 @@ async fn covm_registration_reads_multiple_relative_files() {
 
 #[cfg(feature = "covm")]
 #[tokio::test]
+async fn covm_registration_rejects_member_uri_that_escapes_manifest_dir() {
+    let dir = make_temp_dir("covm_member_escape");
+    let path = dir.join("part1.cove");
+    fs::write(&path, primitive_events_file()).unwrap();
+    let manifest = dir.join("dataset.covm");
+    write_covm_manifest(&manifest, vec![covm_entry_for_path("../part1.cove", &path)]);
+
+    let err = cove_table_from_covm_path(&manifest)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("parent-directory"), "{err}");
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(feature = "covm")]
+#[tokio::test]
 async fn covm_rejects_schema_mismatch() {
     let dir = make_temp_dir("covm_schema_mismatch");
     let first = dir.join("part1.cove");

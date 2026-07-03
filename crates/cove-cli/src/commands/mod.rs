@@ -29,6 +29,7 @@ use cove_core::{
     checksum, compression,
     constants::{SectionKind, MAGIC_COVEAI, MAGIC_COVEMAP, MAGIC_COVEV},
     feature_binding::OperationKindV2,
+    manifest_path::resolve_manifest_relative_path,
     profile::{
         cove_map::{parse_embedded_section, EmbeddedMapSection},
         cove_o::CoveObjectSurface,

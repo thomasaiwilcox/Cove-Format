@@ -316,7 +316,7 @@ fn discover_covm_referenced_ai_sidecar(
     }
     let mut last_error = None;
     for reference in &extension.refs {
-        let path = resolve_covm_ai_sidecar_path(input, dataset, &reference.uri);
+        let path = resolve_covm_ai_sidecar_path(input, dataset, &reference.uri)?;
         let sidecar_bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
             Err(error) => {
@@ -343,21 +343,20 @@ fn discover_covm_referenced_ai_sidecar(
     Ok(None)
 }
 
-fn resolve_covm_ai_sidecar_path(input: &Path, dataset: Option<&Path>, uri: &str) -> PathBuf {
-    let raw = PathBuf::from(uri);
-    if raw.is_absolute() {
-        return raw;
-    }
+fn resolve_covm_ai_sidecar_path(
+    input: &Path,
+    dataset: Option<&Path>,
+    uri: &str,
+) -> Result<PathBuf, String> {
     if let Some(dataset) = dataset {
-        let candidate = dataset.join(&raw);
+        let candidate =
+            resolve_manifest_relative_path(dataset, uri).map_err(|error| error.to_string())?;
         if candidate.is_file() {
-            return candidate;
+            return Ok(candidate);
         }
     }
-    input
-        .parent()
-        .map(|parent| parent.join(&raw))
-        .unwrap_or(raw)
+    let base = input.parent().unwrap_or_else(|| Path::new("."));
+    resolve_manifest_relative_path(base, uri).map_err(|error| error.to_string())
 }
 
 fn ai_sidecar_candidates(input: &Path) -> Vec<PathBuf> {
@@ -639,7 +638,8 @@ fn manifest_members_for(
             if members.iter().any(|member| member.source == entry.uri) {
                 continue;
             }
-            let path = dataset_dir.join(&entry.uri);
+            let path = resolve_manifest_relative_path(dataset_dir, &entry.uri)
+                .map_err(|error| error.to_string())?;
             members.push(QueryArtifactMember {
                 source: entry.uri,
                 bytes: fs::read(&path)

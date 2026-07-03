@@ -39,6 +39,7 @@ use cove_core::{
     constants::{DigestAlgorithm, PrimaryProfile, SectionKind},
     digest::compute_digest,
     durable::durable_replace,
+    manifest_path::resolve_manifest_relative_path,
     CoveError,
 };
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -3025,7 +3026,8 @@ fn resolve_sidecar_path(path: &Path, options: &AiArchiveOpenOptions) -> Result<P
                 .to_path_buf()
         });
         validate_covm_source_member_bytes(&base, &manifest, reference)?;
-        let sidecar_path = base.join(&reference.uri);
+        let sidecar_path = resolve_manifest_relative_path(&base, &reference.uri)
+            .map_err(|error| error.to_string())?;
         let sidecar_bytes = fs::read(&sidecar_path)
             .map_err(|error| format!("cannot read {}: {error}", sidecar_path.display()))?;
         reference
@@ -3052,7 +3054,8 @@ fn validate_covm_source_member_bytes(
         .iter()
         .find(|entry| entry.file_id == reference.source_file_id)
         .ok_or_else(|| "COVM AI sidecar source member is missing".to_string())?;
-    let source_path = base.join(&entry.uri);
+    let source_path =
+        resolve_manifest_relative_path(base, &entry.uri).map_err(|error| error.to_string())?;
     let bytes = fs::read(&source_path).map_err(|error| {
         format!(
             "cannot read COVM AI source member {}: {error}",
@@ -3727,5 +3730,66 @@ mod tests {
         fs::write(&remote_source, b"{}\n").unwrap();
         assert_eq!(covm_source_uri(&sibling_source, &sidecar), "samples.jsonl");
         assert!(Path::new(&covm_source_uri(&remote_source, &sidecar)).is_absolute());
+    }
+
+    #[test]
+    fn covm_archive_open_rejects_source_member_escape() {
+        let root =
+            std::env::temp_dir().join(format!("cove-ai-adapters-covm-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let source = cove_core::writer::MinimalCoveWriter::write_empty_file().unwrap();
+        let validated = cove_core::reader::validate_bytes(&source).unwrap();
+        let entry = CovmFileEntryV1 {
+            file_id: validated.header.file_id,
+            uri: "../source.cove".into(),
+            file_len: validated.postscript.file_len,
+            footer_crc32c: validated.postscript.footer.crc32c,
+            digest_algorithm: DigestAlgorithm::None as u16,
+            digest: Vec::new(),
+            row_count: 0,
+            segment_count: 0,
+            file_stats_ref: 0,
+            file_exact_set_ref: 0,
+            flags: 0,
+        };
+        let manifest = CovmFile {
+            header: CovmHeaderV1::new([0xAC; 16], 1, 1, 1),
+            files: vec![entry.clone()],
+            postscript: cove_core::artifact::covm::CovmPostscriptV1 {
+                header_offset: 0,
+                header_len: 0,
+                entries_offset: 0,
+                entries_len: 0,
+                file_len: 0,
+                flags: 0,
+                checksum: 0,
+            },
+        };
+        let extension = CovmAiSidecarExtensionV1 {
+            flags: 0,
+            refs: vec![CovmAiSidecarRefV1::new(
+                entry.file_id,
+                CoveAiArtifactKind::CoveAiBundle,
+                "training.coveai".into(),
+                b"sidecar-bytes",
+            )
+            .unwrap()],
+        };
+        let manifest_bytes = manifest
+            .serialize_with_extension_region(&extension.serialize().unwrap())
+            .unwrap();
+        let manifest_path = root.join("training.covm");
+        fs::write(&manifest_path, manifest_bytes).unwrap();
+
+        let err = resolve_sidecar_path(
+            &manifest_path,
+            &AiArchiveOpenOptions {
+                cove_ai: None,
+                dataset_dir: Some(root.clone()),
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("parent-directory"), "{err}");
+        fs::remove_dir_all(root).unwrap();
     }
 }

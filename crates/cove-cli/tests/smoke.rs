@@ -1116,6 +1116,36 @@ fn query_covm_manifest_registers_cove_t_member_tables() {
 }
 
 #[test]
+fn query_covm_dataset_rejects_manifest_member_escape() {
+    let member = cove_t_events_bytes();
+    let manifest = covm_manifest_for_members(&[("../events.cove", &member)]);
+    let manifest_path = temp_file("dataset-escape.covm");
+    fs::write(&manifest_path, manifest).unwrap();
+
+    let output = run_cove(&[
+        "query",
+        manifest_path.to_str().unwrap(),
+        "--dataset",
+        manifest_path.parent().unwrap().to_str().unwrap(),
+        "--format",
+        "jsonl",
+        "table(events).take(1)",
+    ]);
+
+    assert!(
+        !output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("parent-directory"),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn query_covm_manifest_auto_discovers_digest_bound_ai_sidecar_ref() {
     let member = cove_t_events_bytes();
     let validated = validate_bytes(&member).unwrap();
@@ -3604,6 +3634,8 @@ fn delta_cli_commands_validate_plan_and_publish_delta_chains() {
     let base = temp_file("delta-cli-base.cove");
     let delta = temp_file("delta-cli-delta.covedelta");
     let manifest = temp_file("delta-cli-chain.covm");
+    let dataset_dir = base.parent().expect("temp file has parent").to_path_buf();
+    let dataset_arg = dataset_dir.to_str().unwrap();
     let base_bytes = cove_t_events_bytes();
     fs::write(&base, &base_bytes).unwrap();
     let first_delta_bytes = simple_delta_bytes_for_base_with_snapshot(&base_bytes, [0xB0; 16]);
@@ -3662,7 +3694,7 @@ fn delta_cli_commands_validate_plan_and_publish_delta_chains() {
         "validate",
         manifest.to_str().unwrap(),
         "--dataset",
-        "/",
+        dataset_arg,
         "--json",
     ]);
     assert!(
@@ -3681,7 +3713,7 @@ fn delta_cli_commands_validate_plan_and_publish_delta_chains() {
         "plan",
         manifest.to_str().unwrap(),
         "--dataset",
-        "/",
+        dataset_arg,
         "--as-of-csn",
         "1",
         "--json",
@@ -3701,7 +3733,7 @@ fn delta_cli_commands_validate_plan_and_publish_delta_chains() {
         "graph",
         manifest.to_str().unwrap(),
         "--dataset",
-        "/",
+        dataset_arg,
     ]);
     assert!(
         graph.status.success(),
@@ -3761,7 +3793,7 @@ fn delta_cli_commands_validate_plan_and_publish_delta_chains() {
         "validate",
         extended_manifest.to_str().unwrap(),
         "--dataset",
-        "/",
+        dataset_arg,
         "--json",
     ]);
     assert!(
@@ -3777,7 +3809,7 @@ fn delta_cli_commands_validate_plan_and_publish_delta_chains() {
         "reconstruct",
         manifest.to_str().unwrap(),
         "--dataset",
-        "/",
+        dataset_arg,
         "--out",
         reconstructed.to_str().unwrap(),
         "--json",
@@ -3800,7 +3832,7 @@ fn delta_cli_commands_validate_plan_and_publish_delta_chains() {
         "compact",
         manifest.to_str().unwrap(),
         "--dataset",
-        "/",
+        dataset_arg,
         "--out",
         compacted.to_str().unwrap(),
         "--publish-covm",
@@ -3854,7 +3886,7 @@ fn delta_cli_commands_validate_plan_and_publish_delta_chains() {
         "query",
         object_manifest.to_str().unwrap(),
         "--dataset",
-        "/",
+        dataset_arg,
         "--delta-plan",
         "--perf-report",
         "--format",
@@ -3896,7 +3928,7 @@ fn delta_cli_commands_validate_plan_and_publish_delta_chains() {
         "--report",
         "-",
         "--dataset",
-        "/",
+        dataset_arg,
         "--perf-report",
         object_manifest.to_str().unwrap(),
         object_query_export.to_str().unwrap(),
@@ -3951,7 +3983,7 @@ fn delta_cli_commands_validate_plan_and_publish_delta_chains() {
         "query",
         graph_manifest.to_str().unwrap(),
         "--dataset",
-        "/",
+        dataset_arg,
         "--perf-report",
         "--format",
         "jsonl",
@@ -3981,7 +4013,7 @@ fn delta_cli_commands_validate_plan_and_publish_delta_chains() {
         "--report",
         "-",
         "--dataset",
-        "/",
+        dataset_arg,
         "--columns",
         "score,status",
         "--filter",
@@ -4022,7 +4054,7 @@ fn delta_cli_commands_validate_plan_and_publish_delta_chains() {
         "query",
         object_manifest.to_str().unwrap(),
         "--dataset",
-        "/",
+        dataset_arg,
         "--source-publish-range",
         "1:2",
         "object(Thing).select(active)",
@@ -4043,7 +4075,7 @@ fn delta_cli_commands_validate_plan_and_publish_delta_chains() {
         object_manifest.to_str().unwrap(),
         source_publish_export.to_str().unwrap(),
         "--dataset",
-        "/",
+        dataset_arg,
         "--source-publish-range",
         "1:2",
     ]);
@@ -4086,7 +4118,7 @@ fn delta_cli_commands_validate_plan_and_publish_delta_chains() {
         "query",
         source_publish_manifest.to_str().unwrap(),
         "--dataset",
-        "/",
+        dataset_arg,
         "--source-publish-range",
         "12:18",
         "--perf-report",
@@ -4120,7 +4152,7 @@ fn delta_cli_commands_validate_plan_and_publish_delta_chains() {
         "--report",
         "-",
         "--dataset",
-        "/",
+        dataset_arg,
         "--source-publish-range",
         "12:18",
         source_publish_manifest.to_str().unwrap(),
@@ -4151,7 +4183,7 @@ fn delta_cli_commands_validate_plan_and_publish_delta_chains() {
         "--snapshot",
         object_manifest.to_str().unwrap(),
         "--dataset",
-        "/",
+        dataset_arg,
         "--out",
         snapshot_covi.to_str().unwrap(),
         "--object-properties",
@@ -4229,7 +4261,7 @@ fn delta_cli_commands_validate_plan_and_publish_delta_chains() {
         "--snapshot",
         object_manifest.to_str().unwrap(),
         "--dataset",
-        "/",
+        dataset_arg,
         "--out",
         snapshot_covm.to_str().unwrap(),
     ]);
@@ -4267,7 +4299,7 @@ fn delta_cli_commands_validate_plan_and_publish_delta_chains() {
         "--snapshot",
         object_manifest.to_str().unwrap(),
         "--dataset",
-        "/",
+        dataset_arg,
         "--out",
         snapshot_covx.to_str().unwrap(),
     ]);
@@ -4301,7 +4333,7 @@ fn delta_cli_commands_validate_plan_and_publish_delta_chains() {
         "build",
         object_manifest.to_str().unwrap(),
         "--dataset",
-        "/",
+        dataset_arg,
         "--out-dir",
         map_delta_bundle.to_str().unwrap(),
         "--projection-output",
@@ -4336,7 +4368,7 @@ fn delta_cli_commands_validate_plan_and_publish_delta_chains() {
         "--base",
         graph_manifest.to_str().unwrap(),
         "--dataset",
-        "/",
+        dataset_arg,
         "--mapping",
         sample_path("people.covemap").to_str().unwrap(),
         "--out",
@@ -4415,7 +4447,7 @@ fn delta_cli_commands_validate_plan_and_publish_delta_chains() {
         "--base",
         graph_manifest.to_str().unwrap(),
         "--dataset",
-        "/",
+        dataset_arg,
         "--mapping",
         sample_path("people.covemap").to_str().unwrap(),
         "--out",
@@ -4486,7 +4518,7 @@ fn delta_cli_commands_validate_plan_and_publish_delta_chains() {
         "query",
         semantic_map_update_manifest.to_str().unwrap(),
         "--dataset",
-        "/",
+        dataset_arg,
         "--format",
         "jsonl",
         "object(Person).where(score >= 50).select(score, status, nickname)",
@@ -4526,7 +4558,7 @@ fn delta_cli_commands_validate_plan_and_publish_delta_chains() {
         "validate",
         semantic_map_manifest.to_str().unwrap(),
         "--dataset",
-        "/",
+        dataset_arg,
         "--json",
     ]);
     assert!(
@@ -4539,7 +4571,7 @@ fn delta_cli_commands_validate_plan_and_publish_delta_chains() {
         "query",
         semantic_map_manifest.to_str().unwrap(),
         "--dataset",
-        "/",
+        dataset_arg,
         "--format",
         "jsonl",
         "object(Person).where(score >= 40).select(score, status, nickname)",
@@ -4561,7 +4593,7 @@ fn delta_cli_commands_validate_plan_and_publish_delta_chains() {
         "checkpoint",
         object_manifest.to_str().unwrap(),
         "--dataset",
-        "/",
+        dataset_arg,
         "--out",
         checkpoint.to_str().unwrap(),
         "--summary-out",

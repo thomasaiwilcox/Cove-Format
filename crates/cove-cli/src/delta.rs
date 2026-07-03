@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeMap,
     fs,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -38,6 +38,7 @@ use cove_core::{
     constants::{DigestAlgorithm, MAGIC_COVEDELTA},
     digest::compute_digest,
     durable,
+    manifest_path::resolve_manifest_relative_path,
     profile::cove_o::{
         read_object_surface_from_base_and_delta_files_with_parent_identity,
         read_object_surface_from_bytes_with_options, reconstruct_object_states,
@@ -1387,9 +1388,12 @@ fn run_chain_extend(command: ChainExtendCommand) -> Result<(), String> {
         .as_ref()
         .ok_or_else(|| "manifest does not contain a delta-chain extension".to_string())?;
     let names = artifact_uri_map(&context.manifest);
+    let manifest_dir = command.manifest.parent().unwrap_or_else(|| Path::new("."));
     let base_path = names
         .get(&extension.base_artifact_ref.artifact_id)
-        .map(PathBuf::from)
+        .map(|uri| resolve_manifest_relative_path(manifest_dir, uri))
+        .transpose()
+        .map_err(|error| error.to_string())?
         .ok_or_else(|| "manifest does not include the selected base artifact URI".to_string())?;
     let mut delta_paths = extension
         .ordered_delta_artifact_refs
@@ -1397,7 +1401,9 @@ fn run_chain_extend(command: ChainExtendCommand) -> Result<(), String> {
         .map(|reference| {
             names
                 .get(&reference.artifact_id)
-                .map(PathBuf::from)
+                .map(|uri| resolve_manifest_relative_path(manifest_dir, uri))
+                .transpose()
+                .map_err(|error| error.to_string())?
                 .ok_or_else(|| {
                     format!(
                         "manifest does not include delta artifact URI for {}",
@@ -1470,8 +1476,9 @@ fn run_compact(command: CompactCommand) -> Result<(), String> {
 
     let mut published_covm = None;
     if let Some(path) = &command.publish_covm {
+        let uri = covm_member_uri_for_manifest(path, &command.out)?;
         let artifact = CovmInputArtifact {
-            uri: command.out.display().to_string(),
+            uri,
             bytes: &materialized.bytes,
         };
         let (manifest_bytes, _report) = build_covm_artifact_from_bytes(path, &[artifact])
@@ -1671,6 +1678,7 @@ fn run_publish(command: PublishCommand) -> Result<(), String> {
 
     let extension = extension_with_summary_binding(extension, summary_bytes.as_deref())?;
     let manifest_bytes = build_delta_covm_bytes(
+        &command.out,
         &base_identity,
         &deltas,
         &extension,
@@ -2199,7 +2207,7 @@ fn read_artifact_for_ref(
             hex16(&reference.artifact_id)
         )
     })?;
-    let path = dataset.join(uri);
+    let path = resolve_manifest_relative_path(dataset, uri).map_err(|error| error.to_string())?;
     let bytes = read_file(&path)?;
     Ok(ArtifactBytes { path, bytes })
 }
@@ -2505,15 +2513,26 @@ fn extension_with_summary_binding(
 }
 
 fn build_delta_covm_bytes(
+    manifest: &Path,
     base: &ArtifactBytesWithRef,
     deltas: &[PublishedDelta],
     extension: &CovmDeltaChainExtensionV1,
     summary_bytes: Option<&[u8]>,
 ) -> Result<Vec<u8>, String> {
     let mut files = Vec::with_capacity(deltas.len() + 1);
-    files.push(covm_entry_from_ref(&base.reference, &base.path, 0, 0));
+    files.push(covm_entry_from_ref(
+        &base.reference,
+        covm_member_uri_for_manifest(manifest, &base.path)?,
+        0,
+        0,
+    ));
     for delta in deltas {
-        files.push(covm_entry_from_ref(&delta.reference, &delta.path, 0, 0));
+        files.push(covm_entry_from_ref(
+            &delta.reference,
+            covm_member_uri_for_manifest(manifest, &delta.path)?,
+            0,
+            0,
+        ));
     }
     let header = CovmHeaderV1::new(
         extension.dataset_id,
@@ -2565,13 +2584,13 @@ fn build_delta_covm_bytes(
 
 fn covm_entry_from_ref(
     reference: &CovmDeltaArtifactRefV1,
-    path: &Path,
+    uri: String,
     row_count: u64,
     segment_count: u32,
 ) -> CovmFileEntryV1 {
     CovmFileEntryV1 {
         file_id: reference.artifact_id,
-        uri: path.display().to_string(),
+        uri,
         file_len: reference.file_len,
         footer_crc32c: reference.footer_crc32c,
         digest_algorithm: reference.digest_algorithm,
@@ -2582,6 +2601,56 @@ fn covm_entry_from_ref(
         file_exact_set_ref: 0,
         flags: 0,
     }
+}
+
+fn covm_member_uri_for_manifest(manifest: &Path, artifact: &Path) -> Result<String, String> {
+    let manifest_dir = manifest.parent().unwrap_or_else(|| Path::new("."));
+    let manifest_dir = fs::canonicalize(manifest_dir).map_err(|error| {
+        format!(
+            "cannot resolve manifest directory {}: {error}",
+            manifest_dir.display()
+        )
+    })?;
+    let artifact = fs::canonicalize(artifact).map_err(|error| {
+        format!(
+            "cannot resolve artifact path {}: {error}",
+            artifact.display()
+        )
+    })?;
+    let relative = artifact.strip_prefix(&manifest_dir).map_err(|_| {
+        format!(
+            "artifact {} must be under manifest directory {}",
+            artifact.display(),
+            manifest_dir.display()
+        )
+    })?;
+    let uri = portable_relative_uri(relative)?;
+    resolve_manifest_relative_path(&manifest_dir, &uri).map_err(|error| error.to_string())?;
+    Ok(uri)
+}
+
+fn portable_relative_uri(path: &Path) -> Result<String, String> {
+    let mut parts = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => {
+                let part = part.to_str().ok_or_else(|| {
+                    format!("manifest member path is not UTF-8: {}", path.display())
+                })?;
+                parts.push(part);
+            }
+            _ => {
+                return Err(format!(
+                    "manifest member path must be relative: {}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    if parts.is_empty() {
+        return Err("manifest member path must name a file".into());
+    }
+    Ok(parts.join("/"))
 }
 
 fn covedelta_json(

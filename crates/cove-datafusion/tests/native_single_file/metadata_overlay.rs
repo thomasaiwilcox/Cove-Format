@@ -1000,6 +1000,25 @@ async fn m5_metadata_filecode_count_uses_cove_metadata_exec() {
 }
 
 #[tokio::test]
+async fn m4e_overlay_rejects_uri_scheme_paths() {
+    let path = write_temp_cove("m4e_overlay_file_uri", primitive_events_file());
+    let snapshot = CoveOverlaySnapshot {
+        snapshot_id: "overlay-file-uri".into(),
+        files: vec![OverlayFile {
+            uri: format!("file://{}", path.display()).into(),
+            expected_identity: None,
+            visibility: RowVisibility::All,
+        }],
+    };
+    let ctx = SessionContext::new();
+    let err = register_cove_overlay_snapshot(&ctx, "events", snapshot, CoveTableOptions::default())
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("URI scheme"), "{err}");
+    fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
 async fn m5_metadata_filecode_group_by_counts_logical_values_across_files() {
     let dir = make_temp_dir("m5_group_overlay");
     let first = dir.join("part1.cove");
