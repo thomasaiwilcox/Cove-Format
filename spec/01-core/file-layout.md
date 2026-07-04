@@ -28,6 +28,7 @@
 │   - Top-N summaries                                         │
 │   - digest manifests                                        │
 │   - trust/redaction manifests                               │
+│   - query discovery manifests                               │
 ├─────────────────────────────────────────────────────────────┤
 │ Footer                                                      │
 │   - binary section directory                                │
@@ -76,6 +77,7 @@ struct CoveHeaderV2 {
     // 9=COVE-R runtime compatibility carrier
     // 10=COVE-COVERAGE coverage metadata carrier
     // 11=COVE-I secondary index carrier
+    // 12=COVE-QD query discovery metadata carrier
 
     endianness: u8,              // 1=little-endian
 
@@ -130,6 +132,7 @@ enum ProducerScopeKind {
 - Header `required_features` are **always file-required**. An unknown bit in the header low-word `required_features` MUST cause rejection during bootstrap. There is no scoped-requiredness escape hatch for header-required bits.
 - Operation-, profile-, section-, and page-scoped requiredness MUST be expressed through section entries, page flags/envelopes, profile descriptors, `PROFILE_CAPABILITY_MATRIX`, or `SECTION_FEATURE_BINDING`, not by placing unknown or operation-only bits in the header `required_features`.
 - Writers SHOULD place optional profile-presence bits such as COVE-MAP, COVE-H, COVE-L, COVE-R, COVX, COVE-I, and COVE-CACHE references in `optional_features` unless ordinary baseline file parsing or selected logical decode truly requires them.
+- Writers MUST place `FEATURE_QUERY_DISCOVERY_METADATA` in `optional_features` when embedding advisory query-discovery metadata in ordinary data artifacts.
 - Writers MUST NOT place operation-only requirements, such as mapping replay, trust-chain verification, Harbor mount, projection readback, runtime adapter selection, index-only answering, or zero-copy export, in header `required_features`. Doing so makes the whole file unreadable to readers that do not know the bit.
 - if `feature_set_section_id != 0`, the referenced `EXTENDED_FEATURE_SET` section MUST be validated before any extended required feature is acted on.
 - `feature_set_section_id`, `profile_capability_section_id`, and `fast_metadata_section_id` are bootstrap **section identifiers**, not byte offsets and not replacements for the footer section directory. A reader still discovers authoritative section offsets through the postscript and footer. If a referenced optional section is absent, corrupt, or unsupported, a reader MUST fall back to ordinary footer/section parsing unless the section is marked required for the requested operation.
@@ -191,6 +194,7 @@ enum ProducerScopeKind {
 | 0x0000_0040_0000_0000 | FEATURE_SECONDARY_INDEX_ARTIFACT | Dataset or file references a COVE-I `.covi` secondary index artifact. |
 | 0x0000_0080_0000_0000 | FEATURE_INDEX_ONLY_CAPABILITY | File or companion artifact declares exact or approximate index-only query-answer capabilities. |
 | 0x0000_0100_0000_0000 | FEATURE_COVERAGE_CACHE_HINTS | File or manifest may reference a runtime/local COVE-CACHE compatibility or invalidation surface. |
+| 0x0000_0200_0000_0000 | FEATURE_QUERY_DISCOVERY_METADATA | File, manifest, or catalog may contain advisory COVE-QD query-discovery metadata. |
 
 **Rules:**
 - Readers MUST reject unknown header `required_features` bits unconditionally during bootstrap.
@@ -202,6 +206,7 @@ enum ProducerScopeKind {
 - COVE-L layout, scan-split, page-cluster, zero-copy, and runtime compatibility metadata MUST be optional unless the requested operation explicitly asks for that metadata.
 - COVE-COVERAGE metadata MUST be validated before use. Unknown optional coverage metadata MUST be ignored and MUST NOT be used for pruning.
 - COVE-I secondary index artifacts and COVE-CACHE coverage caches MUST be optional and snapshot-bound. Unsupported, stale, or corrupt index/cache metadata MUST be ignored for ordinary reads.
+- COVE-QD query-discovery metadata MUST be optional, advisory, and freshness-bound. Unsupported, stale, corrupt, or policy-incompatible COVE-QD metadata MUST be ignored for ordinary reads and MUST NOT create roots, fields, policies, sidecars, or query authority.
 - If `FEATURE_EXTENDED_FEATURE_SET` is set, readers MUST validate the extended feature set before accepting or rejecting unknown extended required features.
 
 ### 11.1 COVE-O Delta Artifact Feature Bits
@@ -306,7 +311,7 @@ enum FeatureScope {
 - A `PageRequired` unknown feature MUST cause rejection only when the reader needs that page for projection, predicate evaluation, reconstruction, or validation.
 - A `ProfileRequired` unknown feature MUST cause rejection only when the reader claims or requests that profile.
 - An `OperationRequired` unknown feature MUST cause rejection only for the operation that requires it.
-- Ordinary COVE-T reads MUST NOT fail solely because optional COVE-MAP, COVE-H, COVE-L, COVE-R, COVX, COVE-I, COVM, or COVE-CACHE metadata is unsupported, stale, corrupt, or missing.
+- Ordinary COVE-T reads MUST NOT fail solely because optional COVE-MAP, COVE-H, COVE-L, COVE-R, COVX, COVE-I, COVM, COVE-CACHE, or COVE-QD metadata is unsupported, stale, corrupt, or missing.
 - If a registered codec is required to decode a projected page and no valid fallback exists, that codec is `PageRequired` and the page operation MUST reject when unsupported.
 - If COVE-MAP metadata is required only for replay, conversion, explanation, or projection readback, ordinary COVE-T/COVE-O decoding MUST remain possible without it.
 - If a trust-chain, redaction, digest, COVE-I index-only answer, COVX kernel, COVE-L zero-copy map, COVE-R runtime adapter, or COVE-CACHE entry is requested by operation or policy, unsupported required features reject that operation only.
@@ -581,6 +586,7 @@ struct CoveSectionEntryV2 {
     // 9=COVE-R
     // 10=COVE-COVERAGE
     // 11=COVE-I
+    // 12=COVE-QD
 
     flags: u8,
 
@@ -684,9 +690,26 @@ struct CoveSectionEntryV2 {
 | 67 | MAP_CONVERSION_REPORT | COVE-MAP | Conversion diagnostics, conflicts, candidate matches, rejected rows, and fidelity report. |
 | 68 | MAP_PROJECTION_CATALOG | COVE-MAP | Object-and-association to table projection definitions and read-surface declarations. |
 | 69 | MAP_RESOLUTION_CATALOG | COVE-MAP | Resolver catalogs, normalisation pipelines, candidate rules, and reviewed resolution decisions. |
+| 90 | QUERY_DISCOVERY_MANIFEST | COVE-QD | Canonical UTF-8 JSON using schema `cove.query_discovery.v1`. |
 | 255 | VENDOR_EXTENSION | shared | Reserved extension section. |
 
 MAP_* section payloads are COVE-MAP profile payloads whose standard schema is defined by Section 70. The authoritative reusable mapping definition normally lives in a `.covemap` artifact. MAP_* sections embedded in a `.cove` file are intended for mapping evidence, projection catalogs, conversion reports, identity-equivalence indexes, or embedded mapping snapshots tied to that file or dataset state; they MUST NOT silently override an explicitly referenced reusable mapping definition unless a required profile or extension defines that authority rule. A writer MUST NOT place MAP_* sections in an ordinary COVE file unless it advertises FEATURE_SEMANTIC_MAP and the payload conforms to the COVE-MAP v2 schema or to a registered required extension. General COVE readers MUST ignore optional MAP_* sections for ordinary COVE-T or COVE-O reads. COVE-MAP-aware tools MUST validate MAP_* payload schemas, source fingerprints, function registries, and evidence references before using them for conversion, replay, projection, or explanation.
+
+`QUERY_DISCOVERY_MANIFEST` is the optional COVE-QD section.
+
+**COVE-QD section rules:**
+- The payload is canonical UTF-8 JSON using schema `cove.query_discovery.v1`,
+  with no duplicate object keys.
+- Writers embedding this section in ordinary data artifacts MUST set
+  `FEATURE_QUERY_DISCOVERY_METADATA` in `optional_features` and MUST NOT set
+  that bit in file-level `required_features`.
+- A reader that does not implement COVE-QD MUST be able to skip the section
+  using ordinary section-directory and feature-requiredness rules.
+- COVE-QD metadata is advisory only. It MUST NOT override table, object,
+  mapping, evidence, AI, sidecar, policy, or CoveQL execution authority.
+- COVE-QD-aware tools MUST validate source binding, policy scope,
+  canonicalization, manifest schema, and CoveQL roots/templates before using
+  the section to guide query generation.
 
 `.covedelta` artifacts use an artifact-local `section_kind` namespace in `CoveDeltaSectionDirectoryEntryV1`. These values are not global `.cove` section-kind IDs. A delta `section_id` is a unique section instance ID within the `.covedelta` artifact; `section_kind` identifies the local delta payload schema.
 

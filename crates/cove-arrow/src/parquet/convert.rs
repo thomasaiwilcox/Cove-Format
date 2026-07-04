@@ -168,9 +168,12 @@ where
             writer.push_column_domain(&domain)?;
             domain_count += 1;
         }
-        if let Some(zone_stats) =
-            build_zone_stats(&columns, &segment_layouts, options.morsel_row_count)?
-        {
+        if let Some(zone_stats) = build_zone_stats(
+            &columns,
+            dictionary.as_ref(),
+            &segment_layouts,
+            options.morsel_row_count,
+        )? {
             writer.push_zone_stats(&zone_stats)?;
             notes.push(format!(
                 "Recomputed {} morsel-level zone-stat entries from decoded Arrow values",

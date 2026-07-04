@@ -4,8 +4,9 @@ use crate::{
         FEATURE_COLUMN_DOMAINS, FEATURE_COMPOSITE_ZONES, FEATURE_COVERAGE_METADATA,
         FEATURE_EXACT_SETS, FEATURE_FAST_METADATA_INDEX, FEATURE_INDEX_ONLY_CAPABILITY,
         FEATURE_INVERTED_INDEXES, FEATURE_LAYOUT_PLAN, FEATURE_LOOKUP_INDEXES,
-        FEATURE_PAGE_CLUSTER_DIRECTORY, FEATURE_RUNTIME_COMPATIBILITY_HINTS,
-        FEATURE_SCAN_SPLIT_INDEX, FEATURE_TOPN_SUMMARIES, FEATURE_ZERO_COPY_BUFFER_MAP,
+        FEATURE_PAGE_CLUSTER_DIRECTORY, FEATURE_QUERY_DISCOVERY_METADATA,
+        FEATURE_RUNTIME_COMPATIBILITY_HINTS, FEATURE_SCAN_SPLIT_INDEX, FEATURE_TOPN_SUMMARIES,
+        FEATURE_ZERO_COPY_BUFFER_MAP,
     },
     feature_binding::OperationKindV2,
     feature_scope::FeatureUseRequestV2,
@@ -68,6 +69,7 @@ pub(super) fn is_optional_advisory_section(kind: SectionKind) -> bool {
             | SectionKind::PredicateNormalForm
             | SectionKind::CoverageProofRecord
             | SectionKind::IndexOnlyCapability
+            | SectionKind::QueryDiscoveryManifest
             | SectionKind::RuntimeCompatibilityHints
     )
 }
@@ -109,6 +111,7 @@ pub(super) fn is_embedded_optional_profile_section(kind: SectionKind) -> bool {
     is_layout_section(kind)
         || is_coverage_section(kind)
         || is_ai_section(kind)
+        || is_query_discovery_section(kind)
         || matches!(
             kind,
             SectionKind::IndexOnlyCapability | SectionKind::RuntimeCompatibilityHints
@@ -180,6 +183,7 @@ fn allowed_profiles_for_section(section: SectionKind) -> &'static [u8] {
         SectionKind::MapAiProfileCatalog
         | SectionKind::MapAiTemplateCatalog
         | SectionKind::MapAiTrainingPolicyCatalog => &[17],
+        SectionKind::QueryDiscoveryManifest => &[12],
         SectionKind::AiCompanionArtifactRef
         | SectionKind::AiSourceBinding
         | SectionKind::AiReferenceTables
@@ -272,6 +276,7 @@ fn profile_requires_section(profile: u8, kind: SectionKind) -> bool {
         }
         Some(PrimaryProfile::CoverageMetadata) => is_coverage_section(kind),
         Some(PrimaryProfile::SecondaryIndex) => kind == SectionKind::IndexOnlyCapability,
+        Some(PrimaryProfile::QueryDiscovery) => is_query_discovery_section(kind),
         Some(PrimaryProfile::CoveAiShared) => is_ai_shared_section(kind),
         Some(PrimaryProfile::CoveMapAi) => is_map_ai_section(kind),
         Some(PrimaryProfile::CoveChunk) => is_ai_shared_section(kind) || is_chunk_section(kind),
@@ -305,6 +310,7 @@ fn section_owning_feature_bit(kind: SectionKind) -> u64 {
         | SectionKind::PredicateNormalForm
         | SectionKind::CoverageProofRecord => FEATURE_COVERAGE_METADATA,
         SectionKind::IndexOnlyCapability => FEATURE_INDEX_ONLY_CAPABILITY,
+        SectionKind::QueryDiscoveryManifest => FEATURE_QUERY_DISCOVERY_METADATA,
         SectionKind::RuntimeCompatibilityHints => FEATURE_RUNTIME_COMPATIBILITY_HINTS,
         _ => 0,
     }
@@ -369,6 +375,10 @@ fn is_object_section(kind: SectionKind) -> bool {
 
 fn is_harbor_section(kind: SectionKind) -> bool {
     kind == SectionKind::HarborMountHints
+}
+
+fn is_query_discovery_section(kind: SectionKind) -> bool {
+    kind == SectionKind::QueryDiscoveryManifest
 }
 
 fn is_map_section(kind: SectionKind) -> bool {

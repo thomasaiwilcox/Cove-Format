@@ -359,6 +359,35 @@ pub struct AiExplainReport {
     pub privacy_summary_count: usize,
     pub stale_or_withheld: Vec<String>,
     pub supported_indexes: Vec<String>,
+    pub vector_spaces: Vec<AiExplainVectorSpace>,
+    pub vector_indexes: Vec<AiExplainVectorIndex>,
+    pub fallback_actions: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AiExplainVectorSpace {
+    pub vector_space_id: u32,
+    pub dimension_count: u32,
+    pub element_type: u8,
+    pub metric: u8,
+    pub normalization_policy: u8,
+    pub quantization_policy: u8,
+    pub deterministic: u8,
+    pub approximate: u8,
+    pub reproducibility_class: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AiExplainVectorIndex {
+    pub vector_index_id: u32,
+    pub vector_space_id: u32,
+    pub index_kind: String,
+    pub exactness_kind: u8,
+    pub false_negative_policy: u8,
+    pub metric: u8,
+    pub dimension_count: u32,
+    pub indexed_binding_kind: u8,
+    pub result_authority: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -451,6 +480,7 @@ pub fn ai_tensor_zero_copy_view<'a>(
 
 pub fn ai_explain_report(sidecar: &CoveAiFile) -> AiExplainReport {
     let mut stale_or_withheld = Vec::new();
+    let mut fallback_actions = Vec::new();
     if sidecar.payload_access == AiPayloadAccessState::PolicyBlockedMissingPrivacySummary {
         stale_or_withheld.push("payload_access_blocked_missing_privacy_summary".to_string());
     }
@@ -460,6 +490,57 @@ pub fn ai_explain_report(sidecar: &CoveAiFile) -> AiExplainReport {
         .iter()
         .map(|index| vector_index_kind_name(index.index_kind).to_string())
         .collect();
+    let vector_spaces = sidecar
+        .descriptor_tables
+        .vector_spaces
+        .iter()
+        .map(|space| AiExplainVectorSpace {
+            vector_space_id: space.vector_space_id,
+            dimension_count: space.dimension_count,
+            element_type: space.element_type,
+            metric: space.metric,
+            normalization_policy: space.normalization_policy,
+            quantization_policy: space.quantization_policy,
+            deterministic: space.deterministic,
+            approximate: space.approximate,
+            reproducibility_class: space.reproducibility_class,
+        })
+        .collect::<Vec<_>>();
+    let vector_indexes = sidecar
+        .descriptor_tables
+        .vector_indexes
+        .iter()
+        .map(|index| {
+            let (result_authority, fallback_action) =
+                if index.exactness_kind == 0 && index.false_negative_policy == 0 {
+                    ("ExactOptimizedKernel", None)
+                } else if index.index_kind == 0 {
+                    (
+                        "ExactFlatFallback",
+                        Some(format!(
+                            "{}_candidate_metadata_exact_flat_fallback",
+                            vector_index_kind_name(index.index_kind)
+                        )),
+                    )
+                } else {
+                    ("ApproximateInternalAnn", None)
+                };
+            if let Some(action) = fallback_action {
+                fallback_actions.push(action);
+            }
+            AiExplainVectorIndex {
+                vector_index_id: index.vector_index_id,
+                vector_space_id: index.vector_space_id,
+                index_kind: vector_index_kind_name(index.index_kind).to_string(),
+                exactness_kind: index.exactness_kind,
+                false_negative_policy: index.false_negative_policy,
+                metric: index.metric,
+                dimension_count: index.dimension_count,
+                indexed_binding_kind: index.indexed_binding_kind,
+                result_authority: result_authority.to_string(),
+            }
+        })
+        .collect::<Vec<_>>();
     AiExplainReport {
         artifact_kind: sidecar.artifact_kind,
         artifact_id: sidecar.header.artifact_id,
@@ -470,6 +551,9 @@ pub fn ai_explain_report(sidecar: &CoveAiFile) -> AiExplainReport {
         privacy_summary_count: sidecar.descriptor_tables.privacy_summaries.len(),
         stale_or_withheld,
         supported_indexes,
+        vector_spaces,
+        vector_indexes,
+        fallback_actions,
     }
 }
 

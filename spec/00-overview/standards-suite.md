@@ -3,7 +3,7 @@
 >
 > **Non-reduction rule:** This is not a micro-spec, summary, or reduced profile. The document remains a full specification. Implementation staging and future split documents are conformance and organisation tools only; they MUST NOT reduce the normative detail below the original.
 >
-> **Document model:** This combined specification is written as one document for review and implementation, but each major part is designed to split cleanly into a standalone full standard: COVE-Core, COVE-T, COVE-COVERAGE, COVE-A, COVE-I, COVE-E, COVE-H, COVE-O, COVE-MAP, COVE-CX, COVE-L, COVE-R, COVE-CACHE, COVE-Interop, and COVE-Conformance.
+> **Document model:** This combined specification is written as one document for review and implementation, but each major part is designed to split cleanly into a standalone full standard: COVE-Core, COVE-T, COVE-COVERAGE, COVE-A, COVE-I, COVE-E, COVE-H, COVE-O, COVE-MAP, COVE-CX, COVE-L, COVE-R, COVE-CACHE, COVE-QD, COVE-Interop, and COVE-Conformance.
 
 **COVE:** Canonical Offline Value Encoding
 Cove Format is a Canonical Offline Value Encoding: an immutable,
@@ -36,10 +36,10 @@ artifacts, optional secondary indexes, and engine-local execution mappings.
 | Version | 2.0 full-detail combined specification |
 | Byte Order | Little-endian throughout; no byte-order negotiation in v2 |
 | Mutability | Immutable / write-once-read-many |
-| Primary Purpose | Engine-neutral queryable offline/archive format with optional engine execution profiles, optional semantic source-to-object/association conversion, registered lossless codec extensions, optional coverage proofs, optional secondary indexes, optional layout/split planning metadata, optional runtime/local coverage caches, and optional runtime registry interoperability hints |
+| Primary Purpose | Engine-neutral queryable offline/archive format with optional engine execution profiles, optional semantic source-to-object/association conversion, registered lossless codec extensions, optional coverage proofs, optional secondary indexes, optional layout/split planning metadata, optional runtime/local coverage caches, optional query-discovery metadata, and optional runtime registry interoperability hints |
 | Compatibility Posture | COVE uses `COV2` magic and major version 2. Legacy pre-2 artifacts are outside this standard and are not part of the active reference implementation. |
 | V2 Identity Rule | Catalog/schema, canonical logical values, predicate-proof metadata, validated coverage proofs used for pruning or metadata-only answers, COVE-O truth, COVE-MAP mapping/replay truth when requested, COVM publication state, and digest/trust/redaction surfaces remain authoritative. Codec, layout, zero-copy, COVX acceleration, writer cost metadata, and runtime-registry additions are non-authoritative unless explicitly required for decode or for the requested operation. |
-| Standards Suite Rule | COVE-Core and COVE-T are the first public implementation target, but not a smaller spec. Other profiles, including COVE-COVERAGE, COVE-I, COVE-CACHE, COVE-MAP, COVE-CX, and COVE-L, are optional standards with explicit feature bits, fallback behaviour, validation boundaries, conformance claims, and full normative detail when defined. |
+| Standards Suite Rule | COVE-Core and COVE-T are the first public implementation target, but not a smaller spec. Other profiles, including COVE-COVERAGE, COVE-I, COVE-CACHE, COVE-MAP, COVE-CX, COVE-L, and COVE-QD, are optional standards with explicit feature bits, fallback behaviour, validation boundaries, conformance claims, and full normative detail when defined. |
 
 The generated capability matrix in `conformance/capability_matrix.md` is the implementation-status record for this workspace. It distinguishes fully gated conformance from partial, unit-only, and vector-family scoped implementation evidence.
 
@@ -69,8 +69,9 @@ This combined specification is intentionally one document for design review and 
 | Part 11 | COVE-L | Layout planning, scan splits, page clusters, fast metadata indexes, zero-copy buffer maps, and object-store range planning. |
 | Part 12 | COVE-R | Runtime/session registry guidance and optional runtime compatibility hints. |
 | Part 13 | COVE-CACHE | Optional mutable runtime/local predicate coverage cache with snapshot-bound validity and explicit non-authority. |
-| Part 14 | COVE-Interop | Arrow, Parquet/ORC/CSV/Arrow IPC conversion, lakehouse integration, external visibility overlays, and publication rules. |
-| Part 15 | COVE-Conformance | Reader/writer levels, conformance vectors, negative corpora, registries, governance, and benchmark methodology. |
+| Part 14 | COVE-QD | Optional query-discovery profile for advisory CoveQL roots, surfaces, templates, examples, policy, and sidecar requirements. |
+| Part 15 | COVE-Interop | Arrow, Parquet/ORC/CSV/Arrow IPC conversion, lakehouse integration, external visibility overlays, and publication rules. |
+| Part 16 | COVE-Conformance | Reader/writer levels, conformance vectors, negative corpora, registries, governance, and benchmark methodology. |
 
 ### 0.1 Full-Detail Specification Rule
 
@@ -211,7 +212,7 @@ A COVE coverage artifact may over-include data, but it MUST NOT under-include da
 - Coverage metadata MUST be interpreted under the declared logical type, collation, null semantics, canonicalisation rules, and feature/profile version.
 - A coverage provider MUST NOT silently substitute physical-code comparisons for logical comparisons unless the encoding explicitly declares them safe.
 - Ignoring coverage metadata MUST preserve logical correctness; it may only reduce performance.
-- COVE-Core and COVE-T remain decodable without COVE-I, COVX, COVM, COVE-MAP, or any runtime-local COVE-CACHE state unless a requested operation explicitly requires one of those optional surfaces.
+- COVE-Core and COVE-T remain decodable without COVE-I, COVX, COVM, COVE-MAP, COVE-QD, or any runtime-local COVE-CACHE state unless a requested operation explicitly requires one of those optional surfaces.
 
 
 ## 1. Specification Status
@@ -233,10 +234,11 @@ COVE means Canonical Offline Value Encoding.
 - **COVE-R:** Optional runtime registry/session interoperability guidance and artifacts. COVE-R describes how implementations advertise supported codec, profile, index, kernel, FFI, and engine-adapter capabilities without making runtime state part of COVE logical truth.
 - **COVE-I:** Optional secondary index artifact profile and `.covi` artifact for value-to-fragment, path-to-fragment, dimensional-bucket, row-range, and index-only access metadata.
 - **COVE-CACHE:** Optional mutable runtime/local coverage-cache profile for snapshot-bound predicate containment and coverage reuse. COVE-CACHE is never canonical file truth.
+- **COVE-QD:** Optional query-discovery profile for advisory CoveQL query roots, surfaces, templates, examples, policy scopes, diagnostics, and sidecar requirements. COVE-QD helps tools generate CoveQL but never becomes query, policy, sidecar, or archive truth.
 - **COVX:** Optional accelerator sidecar.
 - **COVM:** Optional dataset manifest.
-A conforming COVE reader MUST be able to validate and read COVE files without COVX, COVM, COVE-I, COVE-CACHE, or COVE-MAP.
-COVX, COVM, and COVE-I are optional acceleration, planning, index, or manifest artifacts. COVE-CACHE is optional runtime/local state, not canonical file truth. None of these surfaces may change the logical meaning of referenced COVE files. COVE-MAP artifacts MUST NOT change the logical meaning of already materialised COVE files; they define how source data is converted, replayed, explained, or re-materialised into new COVE outputs.
+A conforming COVE reader MUST be able to validate and read COVE files without COVX, COVM, COVE-I, COVE-CACHE, COVE-QD, or COVE-MAP.
+COVX, COVM, and COVE-I are optional acceleration, planning, index, or manifest artifacts. COVE-CACHE is optional runtime/local state, not canonical file truth. COVE-QD is optional advisory query-discovery metadata, not query execution authority. None of these surfaces may change the logical meaning of referenced COVE files. COVE-MAP artifacts MUST NOT change the logical meaning of already materialised COVE files; they define how source data is converted, replayed, explained, or re-materialised into new COVE outputs.
 
 ### 1.1 Profile Maturity and Conformance Surface
 
@@ -426,5 +428,6 @@ Let specialised codecs, coverage proofs, indexes, caches, and layout plans accel
 | COVE-R | Runtime Registry Guidance | Library and adapter implementers | Explicit session/registry model for codecs, kernels, profiles, engine adapters, FFI, and capability discovery. |
 | COVE-I | Secondary Index Profile | Archive/query/index builders | Optional secondary index artifacts, root indexes, value/path/dimensional mappings, and index-only access declarations. |
 | COVE-CACHE | Runtime Coverage Cache Profile | Engine/runtime implementers | Optional snapshot-bound mutable predicate coverage cache for local planning reuse; never canonical truth. |
+| COVE-QD | Query Discovery Profile | Tooling, catalog, SDK, UI, and agent implementers | Optional advisory CoveQL query-discovery metadata: roots, surfaces, templates, examples, policy, diagnostics, and sidecar requirements. |
 
 ---

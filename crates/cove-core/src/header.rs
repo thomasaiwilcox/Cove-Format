@@ -335,11 +335,11 @@ mod tests {
     fn unknown_required_feature_rejected() {
         let mut hdr = minimal_header();
         // Set a bit far beyond the defined range.
-        hdr.required_features = FEATURE_TABLE_PROFILE | 0x0000_0200_0000_0000;
+        hdr.required_features = FEATURE_TABLE_PROFILE | 0x0000_0400_0000_0000;
         let bytes = hdr.serialize();
         assert_eq!(
             CoveHeaderV1::parse(&bytes),
-            Err(CoveError::UnknownRequiredFeature(0x0000_0200_0000_0000))
+            Err(CoveError::UnknownRequiredFeature(0x0000_0400_0000_0000))
         );
     }
 

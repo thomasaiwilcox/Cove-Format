@@ -1,5 +1,5 @@
 use super::*;
-use crate::constants::FEATURE_REGISTERED_ENCODINGS;
+use crate::constants::{FEATURE_QUERY_DISCOVERY_METADATA, FEATURE_REGISTERED_ENCODINGS};
 
 impl ScanPageSpec {
     pub fn new(row_count: u32, payload: Vec<u8>) -> Self {
@@ -641,6 +641,7 @@ fn profile_feature_bit(profile: u8) -> u64 {
         Some(PrimaryProfile::RuntimeCompatibility) => FEATURE_RUNTIME_COMPATIBILITY_HINTS,
         Some(PrimaryProfile::CoverageMetadata) => FEATURE_COVERAGE_METADATA,
         Some(PrimaryProfile::SecondaryIndex) => FEATURE_SECONDARY_INDEX_ARTIFACT,
+        Some(PrimaryProfile::QueryDiscovery) => FEATURE_QUERY_DISCOVERY_METADATA,
         Some(PrimaryProfile::CoveAiShared)
         | Some(PrimaryProfile::CoveMapAi)
         | Some(PrimaryProfile::CoveChunk)
@@ -649,6 +650,14 @@ fn profile_feature_bit(profile: u8) -> u64 {
         | Some(PrimaryProfile::CoveMmseq)
         | Some(PrimaryProfile::CoveTrain)
         | Some(PrimaryProfile::CoveQlAi) => 0,
+    }
+}
+
+fn extra_section_required_profile_bit(section: &SectionPayload) -> u64 {
+    if SectionKind::from_u16(section.section_kind) == Some(SectionKind::QueryDiscoveryManifest) {
+        0
+    } else {
+        profile_feature_bit(section.profile)
     }
 }
 
@@ -973,7 +982,7 @@ impl ScanProfileCoveWriter {
         inner.metadata_json = self.metadata_json.clone();
         let extra_required_features = self.extra_sections.iter().fold(0u64, |bits, section| {
             bits | section.required_features
-                | profile_feature_bit(section.profile)
+                | extra_section_required_profile_bit(section)
                 | if matches!(
                     SectionKind::from_u16(section.section_kind),
                     Some(SectionKind::FileDictionaryIndex | SectionKind::FileDictionaryPayload)

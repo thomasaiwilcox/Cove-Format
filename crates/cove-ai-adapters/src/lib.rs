@@ -21,11 +21,15 @@ use arrow_schema::{DataType, Field, Schema};
 use cove_core::{
     artifact::{
         coveai::{
-            write_coveai_descriptor_bundle, AiDescriptorTablesV1, AiPayloadAccessState,
-            AiPayloadEncodingV1, AiPayloadReader, AiPayloadRefEntryV1, AiPrivacySummaryEntryV1,
-            AiRequirednessScopeV1, AiStorageKindV1, CoveAiAccessContext, CoveAiArtifactKind,
-            CoveAiDescriptorBundleBuild, CoveAiFile, CoveAiWritableSection, DatasetSplitV1,
-            TrainingProfileV1, TrainingSampleEntryV1,
+            write_coveai_descriptor_bundle, AiDescriptorTablesV1, AiDigestEntryV1,
+            AiPayloadAccessState, AiPayloadEncodingV1, AiPayloadReader, AiPayloadRefEntryV1,
+            AiPolicyRefEntryV1, AiPrivacySummaryEntryV1, AiRequirednessScopeV1, AiStorageKindV1,
+            AiStringEntryV1, CoveAiAccessContext, CoveAiArtifactKind, CoveAiDescriptorBundleBuild,
+            CoveAiFile, CoveAiWritableSection, DatasetSplitV1, DedupGroupV1,
+            GenerationDecodingProfileV1, GeneratorProvenanceV1, HumanReviewEntryV1,
+            ModelActorDescriptorV1, PreferencePairEntryV1, TrainingEpochPlanV1,
+            TrainingLabelEntryV1, TrainingProfileV1, TrainingSampleEntryV1,
+            AI_POLICY_KIND_DISCLOSURE, AI_POLICY_KIND_LICENSE,
         },
         covm::{
             CovmAiSidecarExtensionV1, CovmAiSidecarRefV1, CovmFile, CovmFileEntryV1, CovmHeaderV1,
@@ -35,6 +39,7 @@ use cove_core::{
     constants::{DigestAlgorithm, PrimaryProfile, SectionKind},
     digest::compute_digest,
     durable::durable_replace,
+    manifest_path::resolve_manifest_relative_path,
     CoveError,
 };
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -184,12 +189,14 @@ pub struct AiArchiveOpenOptions {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AiVerifyOptions {
     pub policy_report: bool,
+    pub strict_training: bool,
 }
 
 impl Default for AiVerifyOptions {
     fn default() -> Self {
         Self {
             policy_report: true,
+            strict_training: false,
         }
     }
 }
@@ -295,6 +302,7 @@ pub struct AiImportOptions {
     pub schema: AiImportSchema,
     pub split_policy: AiSplitPolicy,
     pub split_column: Option<String>,
+    pub mapping: Option<AiImportMapping>,
     pub dry_run: bool,
     pub publish_covm: bool,
     pub artifact_id: Option<[u8; 16]>,
@@ -307,12 +315,38 @@ impl Default for AiImportOptions {
             schema: AiImportSchema::Instruction,
             split_policy: AiSplitPolicy::Deterministic,
             split_column: None,
+            mapping: None,
             dry_run: false,
             publish_covm: false,
             artifact_id: None,
             created_at_us: None,
         }
     }
+}
+
+#[must_use]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AiImportMapping {
+    pub split_field: Option<String>,
+    pub quality_score_ppm_field: Option<String>,
+    pub sample_weight_ppm_field: Option<String>,
+    pub dedup_key_field: Option<String>,
+    pub policy_field: Option<String>,
+    pub license_field: Option<String>,
+    pub source_ref_field: Option<String>,
+    pub evidence_field: Option<String>,
+    pub labels_field: Option<String>,
+    pub generator_field: Option<String>,
+    pub human_review_field: Option<String>,
+    pub epoch_plan: Option<AiImportEpochPlanMapping>,
+}
+
+#[must_use]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AiImportEpochPlanMapping {
+    pub enabled: bool,
+    pub seed: Option<u64>,
+    pub split: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -403,7 +437,14 @@ pub struct AiArchiveReport {
     pub artifact_kind: String,
     pub payload_access: String,
     pub training_sample_count: usize,
+    pub training_label_count: usize,
+    pub preference_pair_count: usize,
+    pub dedup_group_count: usize,
+    pub generator_provenance_count: usize,
+    pub epoch_plan_count: usize,
     pub split_counts: BTreeMap<String, usize>,
+    pub replayability: String,
+    pub contamination_risk_count: usize,
     pub withheld_count: usize,
     pub diagnostics: Vec<AiWithheldDiagnostic>,
 }
@@ -438,6 +479,16 @@ struct ImportedSample {
     sample_id: u64,
     schema: AiImportSchema,
     split: SplitName,
+    quality_score_ppm: u32,
+    sample_weight_ppm: u32,
+    dedup_key: Option<String>,
+    policy: Option<Value>,
+    license: Option<Value>,
+    source_ref: Option<Value>,
+    evidence: Option<Value>,
+    labels: Vec<Value>,
+    generator: Option<Value>,
+    human_review: Option<Value>,
     input: Vec<u8>,
     target: Vec<u8>,
     metadata: Vec<u8>,
@@ -566,6 +617,17 @@ impl AiTrainingArchive {
                 }
             }
         }
+        let quality = training_quality_diagnostics(&self.sidecar);
+        diagnostics.extend(quality.diagnostics);
+        if options.strict_training
+            && diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code.starts_with("COVE_AI_TRAINING_STRICT_"))
+        {
+            return Err(AiAdapterError::InvalidInput {
+                message: "strict COVE-AI training verification failed; rerun without --strict-training or inspect the JSON diagnostics".to_string(),
+            });
+        }
         Ok(AiArchiveReport {
             path: self.path.clone(),
             artifact_id: hex_bytes(&self.sidecar.header.artifact_id),
@@ -576,7 +638,14 @@ impl AiTrainingArchive {
             .to_string(),
             payload_access: format!("{:?}", self.sidecar.payload_access),
             training_sample_count: self.sidecar.descriptor_tables.training_samples.len(),
+            training_label_count: self.sidecar.descriptor_tables.training_labels.len(),
+            preference_pair_count: self.sidecar.descriptor_tables.preference_pairs.len(),
+            dedup_group_count: self.sidecar.descriptor_tables.dedup_groups.len(),
+            generator_provenance_count: self.sidecar.descriptor_tables.generator_provenance.len(),
+            epoch_plan_count: self.sidecar.descriptor_tables.training_epoch_plans.len(),
             split_counts,
+            replayability: quality.replayability,
+            contamination_risk_count: quality.contamination_risk_count,
             withheld_count: diagnostics.len(),
             diagnostics,
         })
@@ -619,6 +688,65 @@ impl AiTrainingArchive {
             ));
         }
         Ok(rows)
+    }
+
+    /// Return the number of training samples matching an optional split filter.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AiAdapterError`] if the requested split name is unsupported.
+    pub fn training_sample_count(&self, split: Option<&str>) -> Result<usize, AiAdapterError> {
+        let split_filter = split.map(parse_split_filter).transpose()?;
+        Ok(self
+            .sidecar
+            .descriptor_tables
+            .training_samples
+            .iter()
+            .filter(|sample| split_filter.is_none_or(|split| sample.split_ref == split.id()))
+            .count())
+    }
+
+    /// Return one training sample by filtered ordinal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AiAdapterError`] if the requested split name is unsupported.
+    pub fn training_sample_at(
+        &self,
+        index: usize,
+        options: AiSampleIteratorOptions,
+    ) -> Result<Option<Value>, AiAdapterError> {
+        let split_filter = options
+            .split
+            .as_deref()
+            .map(parse_split_filter)
+            .transpose()?;
+        let reader = AiPayloadReader::new(
+            &self.bytes,
+            &self.sidecar,
+            if options.include_payloads {
+                CoveAiAccessContext::for_operation("ai_training_sample_at")
+            } else {
+                CoveAiAccessContext::descriptor_only("ai_training_sample_at")
+            },
+        );
+        let mut ordinal = 0usize;
+        for sample in &self.sidecar.descriptor_tables.training_samples {
+            if let Some(split) = split_filter {
+                if sample.split_ref != split.id() {
+                    continue;
+                }
+            }
+            if ordinal == index {
+                return Ok(Some(training_sample_value(
+                    sample,
+                    options.include_payloads,
+                    &reader,
+                )));
+            }
+            ordinal += 1;
+        }
+        Ok(None)
     }
 
     /// Return COVE-AI text chunk descriptor rows.
@@ -750,7 +878,7 @@ impl AiTrainingArchive {
             "payload_access": format!("{:?}", self.sidecar.payload_access),
             "sample_count": samples.len(),
             "samples": samples,
-            "diagnostics": self.report(AiVerifyOptions { policy_report: options.policy_report })?.diagnostics,
+            "diagnostics": self.report(AiVerifyOptions { policy_report: options.policy_report, strict_training: false })?.diagnostics,
         });
         export_value(&report, options.format)
     }
@@ -1048,6 +1176,7 @@ pub fn build_ai_training_showcase(
     let archive = AiTrainingArchive::open(&sidecar_path, AiArchiveOpenOptions::default())?;
     let verify_report = archive.verify(AiVerifyOptions {
         policy_report: true,
+        strict_training: false,
     })?;
     fs::write(
         out_dir.join("verification-report.json"),
@@ -1180,15 +1309,17 @@ fn imported_sample_from_value(
     row: &Value,
     options: &AiImportOptions,
 ) -> Result<ImportedSample, AiImportBuildError> {
+    let mapping = options.mapping.as_ref();
     let sample_id_text = row
         .get("sample_id")
         .or_else(|| row.get("id"))
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| format!("sample-{index:012}"));
-    let split = match options
-        .split_column
-        .as_deref()
+    let split_field = mapping
+        .and_then(|mapping| mapping.split_field.as_deref())
+        .or(options.split_column.as_deref());
+    let split = match split_field
         .and_then(|column| row.get(column))
         .and_then(Value::as_str)
         .and_then(SplitName::parse)
@@ -1196,6 +1327,67 @@ fn imported_sample_from_value(
         Some(split) => split,
         None => deterministic_split(&sample_id_text, row)?,
     };
+    let quality_score_ppm = mapped_u32_ppm(
+        row,
+        mapping.and_then(|mapping| mapping.quality_score_ppm_field.as_deref()),
+        &["quality_score_ppm", "quality_ppm", "quality_score"],
+        1_000_000,
+    )?;
+    let sample_weight_ppm = mapped_u32_ppm(
+        row,
+        mapping.and_then(|mapping| mapping.sample_weight_ppm_field.as_deref()),
+        &["sample_weight_ppm", "weight_ppm", "sample_weight"],
+        1_000_000,
+    )?;
+    let dedup_key = mapped_value(
+        row,
+        mapping.and_then(|mapping| mapping.dedup_key_field.as_deref()),
+        &["dedup_key", "dedup_group", "source_hash"],
+    )
+    .map(value_to_key);
+    let policy = mapped_value(
+        row,
+        mapping.and_then(|mapping| mapping.policy_field.as_deref()),
+        &["policy"],
+    )
+    .cloned();
+    let license = mapped_value(
+        row,
+        mapping.and_then(|mapping| mapping.license_field.as_deref()),
+        &["license"],
+    )
+    .cloned();
+    let source_ref = mapped_value(
+        row,
+        mapping.and_then(|mapping| mapping.source_ref_field.as_deref()),
+        &["source_ref", "source_refs", "source"],
+    )
+    .cloned();
+    let evidence = mapped_value(
+        row,
+        mapping.and_then(|mapping| mapping.evidence_field.as_deref()),
+        &["evidence"],
+    )
+    .cloned();
+    let labels = mapped_value(
+        row,
+        mapping.and_then(|mapping| mapping.labels_field.as_deref()),
+        &["labels", "label"],
+    )
+    .map(labels_from_value)
+    .unwrap_or_default();
+    let generator = mapped_value(
+        row,
+        mapping.and_then(|mapping| mapping.generator_field.as_deref()),
+        &["generator"],
+    )
+    .cloned();
+    let human_review = mapped_value(
+        row,
+        mapping.and_then(|mapping| mapping.human_review_field.as_deref()),
+        &["human_review"],
+    )
+    .cloned();
     let mut diagnostics = Vec::new();
     let ImportedPayloadParts {
         input,
@@ -1228,6 +1420,16 @@ fn imported_sample_from_value(
         sample_id,
         schema: options.schema,
         split,
+        quality_score_ppm,
+        sample_weight_ppm,
+        dedup_key,
+        policy,
+        license,
+        source_ref,
+        evidence,
+        labels,
+        generator,
+        human_review,
         input: serde_json::to_vec(&input).map_err(|error| {
             AiImportBuildError::InvalidInput(format!("cannot serialize AI sample input: {error}"))
         })?,
@@ -1420,12 +1622,80 @@ fn push_import_diagnostic(
 
 fn metadata_from_row(row: &Value) -> Value {
     let mut metadata = Map::new();
-    for key in ["generator", "policy", "labels", "source_refs"] {
+    for key in [
+        "generator",
+        "policy",
+        "labels",
+        "source_refs",
+        "license",
+        "evidence",
+        "dedup_key",
+        "quality_score_ppm",
+        "sample_weight_ppm",
+        "human_review",
+    ] {
         if let Some(value) = row.get(key) {
             metadata.insert(key.to_string(), value.clone());
         }
     }
     Value::Object(metadata)
+}
+
+fn mapped_value<'a>(
+    row: &'a Value,
+    mapped_field: Option<&str>,
+    conventional_fields: &[&str],
+) -> Option<&'a Value> {
+    mapped_field
+        .and_then(|field| row.get(field))
+        .or_else(|| conventional_fields.iter().find_map(|field| row.get(*field)))
+}
+
+fn mapped_u32_ppm(
+    row: &Value,
+    mapped_field: Option<&str>,
+    conventional_fields: &[&str],
+    default: u32,
+) -> Result<u32, AiImportBuildError> {
+    let Some(value) = mapped_value(row, mapped_field, conventional_fields) else {
+        return Ok(default);
+    };
+    let ppm = match value {
+        Value::Number(number) => {
+            if let Some(raw) = number.as_u64() {
+                raw
+            } else if let Some(raw) = number.as_f64() {
+                if raw <= 1.0 {
+                    (raw.max(0.0) * 1_000_000.0).round() as u64
+                } else {
+                    raw.round() as u64
+                }
+            } else {
+                return Err(AiImportBuildError::InvalidInput(
+                    "AI ppm field must be a non-negative number".to_string(),
+                ));
+            }
+        }
+        _ => {
+            return Err(AiImportBuildError::InvalidInput(
+                "AI ppm field must be numeric".to_string(),
+            ));
+        }
+    };
+    if ppm > 1_000_000 {
+        return Err(AiImportBuildError::InvalidInput(format!(
+            "AI ppm field exceeds 1_000_000: {ppm}"
+        )));
+    }
+    Ok(ppm as u32)
+}
+
+fn labels_from_value(value: &Value) -> Vec<Value> {
+    match value {
+        Value::Array(values) => values.clone(),
+        Value::Null => Vec::new(),
+        other => vec![other.clone()],
+    }
 }
 
 fn build_training_sidecar(
@@ -1435,7 +1705,102 @@ fn build_training_sidecar(
     let mut payload = Vec::new();
     let mut tables = AiDescriptorTablesV1::default();
     let mut next_payload_ref = 1u32;
+    let mut next_string_ref = 1u32;
+    let mut next_digest_ref = 1u32;
+    let mut next_policy_ref = 1u32;
+    let mut next_label_id = 1u64;
+    let mut next_model_actor_id = 1u32;
+    let mut next_decoding_profile_id = 1u32;
+    let mut next_human_review_id = 1u32;
+    let mut model_actors = BTreeMap::<String, u32>::new();
+    let mut decoding_profiles = BTreeMap::<String, u32>::new();
+    let mut dedup_groups = BTreeMap::<String, u32>::new();
     let mut sample_records = Vec::with_capacity(samples.len());
+    for sample in samples {
+        if let Some(key) = &sample.dedup_key {
+            if !dedup_groups.contains_key(key) {
+                let next_group_id = u32::try_from(dedup_groups.len() + 1).map_err(|_| {
+                    AiImportBuildError::Descriptor("too many AI dedup groups".to_string())
+                })?;
+                dedup_groups.insert(key.clone(), next_group_id);
+            }
+        }
+    }
+    let epoch_plan_enabled = options
+        .mapping
+        .as_ref()
+        .and_then(|mapping| mapping.epoch_plan.as_ref())
+        .is_some_and(|epoch| epoch.enabled);
+    let mut split_source_snapshot_ref = 0;
+    let mut split_hash_function_ref = 0;
+    let mut split_grouping_ref = 0;
+    let mut split_filter_policy_ref = 0;
+    let mut split_ordering_policy_ref = 0;
+    let mut split_dedup_policy_ref = 0;
+    let mut epoch_rng_algorithm_ref = 0;
+    let mut epoch_permutation_function_ref = 0;
+    if epoch_plan_enabled {
+        split_source_snapshot_ref = push_json_payload_ref(
+            &mut payload,
+            &mut tables,
+            &mut next_payload_ref,
+            &json!({
+                "kind": "cove-ai-import-sample-set",
+                "artifact_material": samples.iter().map(|sample| sample.sample_id_text.as_str()).collect::<Vec<_>>()
+            }),
+        )?;
+        split_hash_function_ref = push_json_payload_ref(
+            &mut payload,
+            &mut tables,
+            &mut next_payload_ref,
+            &json!({"hash": "sha256", "input": "sample_id_or_canonical_json"}),
+        )?;
+        split_grouping_ref = push_json_payload_ref(
+            &mut payload,
+            &mut tables,
+            &mut next_payload_ref,
+            &json!({"grouping": "dedup_key_when_present"}),
+        )?;
+        split_filter_policy_ref = push_policy_ref(
+            &mut payload,
+            &mut tables,
+            &mut next_payload_ref,
+            &mut next_digest_ref,
+            &mut next_policy_ref,
+            AI_POLICY_KIND_DISCLOSURE,
+            &json!({"filter": "all-imported-samples"}),
+        )?;
+        split_ordering_policy_ref = push_policy_ref(
+            &mut payload,
+            &mut tables,
+            &mut next_payload_ref,
+            &mut next_digest_ref,
+            &mut next_policy_ref,
+            AI_POLICY_KIND_DISCLOSURE,
+            &json!({"ordering": "stable-sample-id"}),
+        )?;
+        split_dedup_policy_ref = push_policy_ref(
+            &mut payload,
+            &mut tables,
+            &mut next_payload_ref,
+            &mut next_digest_ref,
+            &mut next_policy_ref,
+            AI_POLICY_KIND_DISCLOSURE,
+            &json!({"dedup": "dedup_key-groups-when-present"}),
+        )?;
+        epoch_rng_algorithm_ref = push_json_payload_ref(
+            &mut payload,
+            &mut tables,
+            &mut next_payload_ref,
+            &json!({"rng": "deterministic-stable-sort", "seeded": true}),
+        )?;
+        epoch_permutation_function_ref = push_json_payload_ref(
+            &mut payload,
+            &mut tables,
+            &mut next_payload_ref,
+            &json!({"permutation": "split-then-sample-id"}),
+        )?;
+    }
     for sample in samples {
         let input_ref = push_payload_ref(
             &mut payload,
@@ -1455,29 +1820,179 @@ fn build_training_sidecar(
             &mut next_payload_ref,
             &sample.metadata,
         )?;
+        let source_ref = sample
+            .source_ref
+            .as_ref()
+            .map(|value| {
+                push_json_payload_ref(&mut payload, &mut tables, &mut next_payload_ref, value)
+            })
+            .transpose()?
+            .unwrap_or(0);
+        let evidence_ref = sample
+            .evidence
+            .as_ref()
+            .map(|value| {
+                push_json_payload_ref(&mut payload, &mut tables, &mut next_payload_ref, value)
+            })
+            .transpose()?
+            .unwrap_or(0);
+        let policy_ref = sample
+            .policy
+            .as_ref()
+            .map(|value| {
+                push_policy_ref(
+                    &mut payload,
+                    &mut tables,
+                    &mut next_payload_ref,
+                    &mut next_digest_ref,
+                    &mut next_policy_ref,
+                    AI_POLICY_KIND_DISCLOSURE,
+                    value,
+                )
+            })
+            .transpose()?
+            .unwrap_or(0);
+        let license_ref = sample
+            .license
+            .as_ref()
+            .map(|value| {
+                push_policy_ref(
+                    &mut payload,
+                    &mut tables,
+                    &mut next_payload_ref,
+                    &mut next_digest_ref,
+                    &mut next_policy_ref,
+                    AI_POLICY_KIND_LICENSE,
+                    value,
+                )
+            })
+            .transpose()?
+            .unwrap_or(0);
+        let human_review_ref = sample
+            .human_review
+            .as_ref()
+            .map(|value| {
+                push_human_review(
+                    &mut payload,
+                    &mut tables,
+                    &mut next_payload_ref,
+                    &mut next_string_ref,
+                    &mut next_human_review_id,
+                    value,
+                    policy_ref,
+                )
+            })
+            .transpose()?
+            .unwrap_or(0);
+        let generator_provenance_ref = sample
+            .generator
+            .as_ref()
+            .map(|value| {
+                push_generator_provenance(
+                    &mut payload,
+                    &mut tables,
+                    &mut next_payload_ref,
+                    &mut next_string_ref,
+                    &mut next_model_actor_id,
+                    &mut next_decoding_profile_id,
+                    &mut model_actors,
+                    &mut decoding_profiles,
+                    value,
+                    sample.sample_id,
+                    human_review_ref,
+                    policy_ref,
+                )
+            })
+            .transpose()?
+            .unwrap_or(0);
+        let mut first_label_ref = 0u32;
+        for label in &sample.labels {
+            let label_id = next_label_id;
+            next_label_id = next_label_id.checked_add(1).ok_or_else(|| {
+                AiImportBuildError::Descriptor("too many AI training labels".to_string())
+            })?;
+            if first_label_ref == 0 {
+                first_label_ref = u32::try_from(label_id).unwrap_or(0);
+            }
+            let label_payload_ref =
+                push_json_payload_ref(&mut payload, &mut tables, &mut next_payload_ref, label)?;
+            tables.training_labels.push(TrainingLabelEntryV1 {
+                label_id,
+                label_kind: mapped_u8(label, "label_kind").unwrap_or(0),
+                label_authority: mapped_u8(label, "label_authority").unwrap_or(0),
+                label_payload_ref,
+                generator_provenance_ref,
+                human_review_ref,
+                confidence_ppm: mapped_ppm_value(
+                    label
+                        .get("confidence_ppm")
+                        .or_else(|| label.get("confidence")),
+                )?,
+                evidence_ref,
+                policy_ref,
+                flags: 0,
+                checksum: 0,
+            });
+        }
+        if sample.schema == AiImportSchema::Preference {
+            push_preference_pair_from_sample(
+                &mut payload,
+                &mut tables,
+                &mut next_payload_ref,
+                sample,
+                generator_provenance_ref,
+                human_review_ref,
+                evidence_ref,
+                policy_ref,
+            )?;
+        }
         sample_records.push(TrainingSampleEntryV1 {
             sample_id: sample.sample_id,
             training_profile_id: 1,
             example_kind: example_kind(sample.schema),
             split_ref: sample.split.id(),
-            source_ref: 0,
-            evidence_ref: 0,
+            source_ref,
+            evidence_ref,
             input_ref,
             target_ref,
-            label_ref: 0,
+            label_ref: first_label_ref,
             metadata_ref,
             token_sequence_pack_ref: 0,
             multimodal_sequence_pack_ref: 0,
             vector_ref: 0,
-            quality_score_ppm: 1_000_000,
-            sample_weight_ppm: 1_000_000,
-            dedup_group_ref: 0,
-            license_ref: 0,
-            policy_ref: 0,
+            quality_score_ppm: sample.quality_score_ppm,
+            sample_weight_ppm: sample.sample_weight_ppm,
+            dedup_group_ref: sample
+                .dedup_key
+                .as_ref()
+                .and_then(|key| dedup_groups.get(key).copied())
+                .unwrap_or(0),
+            license_ref,
+            policy_ref,
             teacher_model_ref: 0,
-            generator_provenance_ref: 0,
-            judge_generator_provenance_ref: 0,
-            label_generator_provenance_ref: 0,
+            generator_provenance_ref,
+            judge_generator_provenance_ref: generator_provenance_ref,
+            label_generator_provenance_ref: generator_provenance_ref,
+            flags: 0,
+            checksum: 0,
+        });
+    }
+    for (key, group_id) in &dedup_groups {
+        let canonical = samples
+            .iter()
+            .filter(|sample| sample.dedup_key.as_ref() == Some(key))
+            .map(|sample| sample.sample_id)
+            .min()
+            .unwrap_or(0);
+        tables.dedup_groups.push(DedupGroupV1 {
+            dedup_group_id: u64::from(*group_id),
+            dedup_policy_ref: split_dedup_policy_ref,
+            canonical_member_sample_id: canonical,
+            similarity_kind: 0,
+            dedup_authority: 0,
+            confidence_ppm: 1_000_000,
+            first_member_ref: 0,
+            member_count: 0,
             flags: 0,
             checksum: 0,
         });
@@ -1506,13 +2021,22 @@ fn build_training_sidecar(
         tokenizer_profile_ref: 0,
         vector_space_ref: 0,
         multimodal_sequence_profile_ref: 0,
-        split_policy_ref: 0,
+        split_policy_ref: split_filter_policy_ref,
         sampling_policy_ref: 0,
-        dedup_policy_ref: 0,
+        dedup_policy_ref: split_dedup_policy_ref,
         quality_policy_ref: 0,
-        license_policy_ref: 0,
+        license_policy_ref: tables
+            .policies
+            .iter()
+            .find(|policy| policy.policy_kind == AI_POLICY_KIND_LICENSE)
+            .map(|policy| policy.policy_ref)
+            .unwrap_or(0),
         redaction_policy_ref: 0,
-        default_generator_provenance_ref: 0,
+        default_generator_provenance_ref: tables
+            .generator_provenance
+            .first()
+            .map(|record| record.generator_provenance_id)
+            .unwrap_or(0),
         reproducibility_class: 1,
         flags: 0,
         checksum: 0,
@@ -1526,19 +2050,56 @@ fn build_training_sidecar(
             split_id: split.id(),
             split_name_ref: 0,
             split_method: 1,
-            source_snapshot_ref: 0,
-            filter_policy_ref: 0,
-            seed: 0,
-            hash_function_ref: 0,
+            source_snapshot_ref: split_source_snapshot_ref,
+            filter_policy_ref: split_filter_policy_ref,
+            seed: options
+                .mapping
+                .as_ref()
+                .and_then(|mapping| mapping.epoch_plan.as_ref())
+                .and_then(|epoch| epoch.seed)
+                .unwrap_or(0),
+            hash_function_ref: split_hash_function_ref,
             stratification_path_ref: 0,
-            grouping_ref: 0,
-            ordering_policy_ref: 0,
-            dedup_policy_ref: 0,
+            grouping_ref: split_grouping_ref,
+            ordering_policy_ref: split_ordering_policy_ref,
+            dedup_policy_ref: split_dedup_policy_ref,
             sample_count: count as u64,
             first_sample_ref: 0,
             flags: 0,
             checksum: 0,
         });
+    }
+    if epoch_plan_enabled {
+        let selected_split = options
+            .mapping
+            .as_ref()
+            .and_then(|mapping| mapping.epoch_plan.as_ref())
+            .and_then(|epoch| epoch.split.as_deref())
+            .and_then(SplitName::parse);
+        for split in [SplitName::Train, SplitName::Validation, SplitName::Test] {
+            if selected_split.is_some_and(|selected| selected != split) {
+                continue;
+            }
+            tables.training_epoch_plans.push(TrainingEpochPlanV1 {
+                epoch_plan_id: u64::from(split.id()),
+                training_profile_id: 1,
+                split_ref: split.id(),
+                seed: options
+                    .mapping
+                    .as_ref()
+                    .and_then(|mapping| mapping.epoch_plan.as_ref())
+                    .and_then(|epoch| epoch.seed)
+                    .unwrap_or(0),
+                permutation_kind: 1,
+                rng_algorithm_ref: epoch_rng_algorithm_ref,
+                permutation_function_ref: epoch_permutation_function_ref,
+                shard_count: 0,
+                first_shard_ref: 0,
+                shard_ref_count: 0,
+                flags: 0,
+                checksum: 0,
+            });
+        }
     }
     tables.training_samples = sample_records;
     let payload_section = CoveAiWritableSection {
@@ -1597,6 +2158,416 @@ fn push_payload_ref(
         crc32c: checksum::crc32c(bytes),
     });
     Ok(payload_ref)
+}
+
+fn push_json_payload_ref(
+    payload: &mut Vec<u8>,
+    tables: &mut AiDescriptorTablesV1,
+    next_payload_ref: &mut u32,
+    value: &Value,
+) -> Result<u32, AiImportBuildError> {
+    let bytes = serde_json::to_vec(value).map_err(|error| {
+        AiImportBuildError::InvalidInput(format!("cannot serialize AI mapped payload: {error}"))
+    })?;
+    push_payload_ref(payload, tables, next_payload_ref, &bytes)
+}
+
+fn push_digest_ref(
+    payload: &mut Vec<u8>,
+    tables: &mut AiDescriptorTablesV1,
+    next_payload_ref: &mut u32,
+    next_digest_ref: &mut u32,
+    bytes: &[u8],
+) -> Result<u32, AiImportBuildError> {
+    let digest = compute_digest(DigestAlgorithm::Sha256, bytes).map_err(|error| {
+        AiImportBuildError::Digest(format!("cannot digest AI mapped payload: {error}"))
+    })?;
+    let digest_payload_ref = push_payload_ref(payload, tables, next_payload_ref, &digest)?;
+    let digest_ref = *next_digest_ref;
+    *next_digest_ref = next_digest_ref
+        .checked_add(1)
+        .ok_or_else(|| AiImportBuildError::Descriptor("too many AI digest refs".to_string()))?;
+    tables.digests.push(AiDigestEntryV1 {
+        digest_ref,
+        digest_algorithm: DigestAlgorithm::Sha256 as u16,
+        digest_len: digest.len() as u16,
+        digest_payload_ref,
+        domain_hint: 0,
+        flags: 0,
+        crc32c: 0,
+    });
+    Ok(digest_ref)
+}
+
+fn push_policy_ref(
+    payload: &mut Vec<u8>,
+    tables: &mut AiDescriptorTablesV1,
+    next_payload_ref: &mut u32,
+    next_digest_ref: &mut u32,
+    next_policy_ref: &mut u32,
+    policy_kind: u8,
+    value: &Value,
+) -> Result<u32, AiImportBuildError> {
+    let bytes = serde_json::to_vec(value).map_err(|error| {
+        AiImportBuildError::InvalidInput(format!("cannot serialize AI policy payload: {error}"))
+    })?;
+    let payload_ref = push_payload_ref(payload, tables, next_payload_ref, &bytes)?;
+    let digest_ref = push_digest_ref(payload, tables, next_payload_ref, next_digest_ref, &bytes)?;
+    let policy_ref = *next_policy_ref;
+    *next_policy_ref = next_policy_ref
+        .checked_add(1)
+        .ok_or_else(|| AiImportBuildError::Descriptor("too many AI policy refs".to_string()))?;
+    tables.policies.push(AiPolicyRefEntryV1 {
+        policy_ref,
+        policy_kind,
+        authority_ref: 0,
+        payload_ref,
+        digest_ref,
+        flags: 0,
+        crc32c: 0,
+    });
+    Ok(policy_ref)
+}
+
+fn push_string_ref(
+    payload: &mut Vec<u8>,
+    tables: &mut AiDescriptorTablesV1,
+    next_payload_ref: &mut u32,
+    next_string_ref: &mut u32,
+    value: &str,
+) -> Result<u32, AiImportBuildError> {
+    if value.is_empty() {
+        return Ok(0);
+    }
+    let string_ref = *next_string_ref;
+    *next_string_ref = next_string_ref
+        .checked_add(1)
+        .ok_or_else(|| AiImportBuildError::Descriptor("too many AI string refs".to_string()))?;
+    let payload_ref = push_payload_ref(payload, tables, next_payload_ref, value.as_bytes())?;
+    tables.strings.push(AiStringEntryV1 {
+        string_ref,
+        utf8_byte_length: value.len() as u32,
+        payload_ref,
+        flags: 0,
+        crc32c: 0,
+    });
+    Ok(string_ref)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_generator_provenance(
+    payload: &mut Vec<u8>,
+    tables: &mut AiDescriptorTablesV1,
+    next_payload_ref: &mut u32,
+    next_string_ref: &mut u32,
+    next_model_actor_id: &mut u32,
+    next_decoding_profile_id: &mut u32,
+    model_actors: &mut BTreeMap<String, u32>,
+    decoding_profiles: &mut BTreeMap<String, u32>,
+    value: &Value,
+    source_sample_ref: u64,
+    human_review_ref: u32,
+    policy_ref: u32,
+) -> Result<u64, AiImportBuildError> {
+    let model_actor_ref = push_model_actor(
+        payload,
+        tables,
+        next_payload_ref,
+        next_string_ref,
+        next_model_actor_id,
+        model_actors,
+        value,
+        policy_ref,
+    )?;
+    let decoding_profile_ref = push_decoding_profile(
+        tables,
+        next_decoding_profile_id,
+        decoding_profiles,
+        value.get("decoding").unwrap_or(value),
+    )?;
+    let prompt_template_ref = value
+        .get("prompt_template")
+        .or_else(|| value.get("prompt_template_id"))
+        .map(|payload_value| {
+            push_json_payload_ref(payload, tables, next_payload_ref, payload_value)
+        })
+        .transpose()?
+        .unwrap_or(0);
+    let generator_id = source_sample_ref.max(1);
+    tables.generator_provenance.push(GeneratorProvenanceV1 {
+        generator_provenance_id: generator_id,
+        generator_kind: 1,
+        model_actor_ref,
+        prompt_template_ref,
+        decoding_profile_ref,
+        toolchain_ref: 0,
+        source_input_ref: 0,
+        source_context_ref: 0,
+        source_sample_ref,
+        parent_generator_provenance_ref: 0,
+        generation_time_us: value
+            .get("generation_time_us")
+            .and_then(Value::as_i64)
+            .unwrap_or(0),
+        confidence_ppm: mapped_ppm_value(
+            value
+                .get("confidence_ppm")
+                .or_else(|| value.get("confidence")),
+        )?,
+        human_review_ref,
+        policy_ref,
+        reproducibility_class: reproducibility_class_from_value(value.get("reproducibility_class")),
+        flags: 0,
+        checksum: 0,
+    });
+    Ok(generator_id)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_model_actor(
+    payload: &mut Vec<u8>,
+    tables: &mut AiDescriptorTablesV1,
+    next_payload_ref: &mut u32,
+    next_string_ref: &mut u32,
+    next_model_actor_id: &mut u32,
+    model_actors: &mut BTreeMap<String, u32>,
+    value: &Value,
+    policy_ref: u32,
+) -> Result<u32, AiImportBuildError> {
+    let namespace = string_field(value, &["namespace", "model_namespace"]).unwrap_or("default");
+    let name = string_field(value, &["model", "model_name", "name"]).unwrap_or("unknown-model");
+    let version = string_field(value, &["version", "model_version"]).unwrap_or("");
+    let provider = string_field(value, &["provider"]).unwrap_or("");
+    let endpoint = string_field(value, &["endpoint"]).unwrap_or("");
+    let key = format!("{namespace}\0{name}\0{version}\0{provider}\0{endpoint}");
+    if let Some(id) = model_actors.get(&key) {
+        return Ok(*id);
+    }
+    let model_actor_id = *next_model_actor_id;
+    *next_model_actor_id = next_model_actor_id
+        .checked_add(1)
+        .ok_or_else(|| AiImportBuildError::Descriptor("too many AI model actors".to_string()))?;
+    let model_namespace_ref = push_string_ref(
+        payload,
+        tables,
+        next_payload_ref,
+        next_string_ref,
+        namespace,
+    )?;
+    let model_name_ref = push_string_ref(payload, tables, next_payload_ref, next_string_ref, name)?;
+    let model_version_ref =
+        push_string_ref(payload, tables, next_payload_ref, next_string_ref, version)?;
+    let provider_ref =
+        push_string_ref(payload, tables, next_payload_ref, next_string_ref, provider)?;
+    let endpoint_ref =
+        push_string_ref(payload, tables, next_payload_ref, next_string_ref, endpoint)?;
+    let model_family_ref = push_string_ref(
+        payload,
+        tables,
+        next_payload_ref,
+        next_string_ref,
+        string_field(value, &["family", "model_family"]).unwrap_or(""),
+    )?;
+    tables.model_actors.push(ModelActorDescriptorV1 {
+        model_actor_id,
+        model_namespace_ref,
+        model_name_ref,
+        model_version_ref,
+        model_checkpoint_digest_ref: 0,
+        provider_ref,
+        endpoint_ref,
+        endpoint_version_ref: 0,
+        model_family_ref,
+        modality_mask: 1,
+        license_ref: 0,
+        policy_ref,
+        flags: 0,
+        checksum: 0,
+    });
+    model_actors.insert(key, model_actor_id);
+    Ok(model_actor_id)
+}
+
+fn push_decoding_profile(
+    tables: &mut AiDescriptorTablesV1,
+    next_decoding_profile_id: &mut u32,
+    decoding_profiles: &mut BTreeMap<String, u32>,
+    value: &Value,
+) -> Result<u32, AiImportBuildError> {
+    if !value.is_object() {
+        return Ok(0);
+    }
+    let key = canonical_json(value);
+    if let Some(id) = decoding_profiles.get(&key) {
+        return Ok(*id);
+    }
+    let decoding_profile_id = *next_decoding_profile_id;
+    *next_decoding_profile_id = next_decoding_profile_id.checked_add(1).ok_or_else(|| {
+        AiImportBuildError::Descriptor("too many AI decoding profiles".to_string())
+    })?;
+    tables
+        .generation_decoding_profiles
+        .push(GenerationDecodingProfileV1 {
+            decoding_profile_id,
+            temperature_micros: float_micros(value.get("temperature")).unwrap_or(0),
+            top_p_micros: float_micros(value.get("top_p")).unwrap_or(0),
+            top_k: value.get("top_k").and_then(Value::as_u64).unwrap_or(0) as u32,
+            seed: value.get("seed").and_then(Value::as_u64).unwrap_or(0),
+            max_output_tokens: value
+                .get("max_output_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as u32,
+            stop_sequence_ref: 0,
+            safety_policy_ref: 0,
+            deterministic_claim: value
+                .get("deterministic")
+                .and_then(Value::as_bool)
+                .map(u8::from)
+                .unwrap_or(0),
+            flags: 0,
+            checksum: 0,
+        });
+    decoding_profiles.insert(key, decoding_profile_id);
+    Ok(decoding_profile_id)
+}
+
+fn push_human_review(
+    payload: &mut Vec<u8>,
+    tables: &mut AiDescriptorTablesV1,
+    next_payload_ref: &mut u32,
+    next_string_ref: &mut u32,
+    next_human_review_id: &mut u32,
+    value: &Value,
+    policy_ref: u32,
+) -> Result<u32, AiImportBuildError> {
+    let human_review_id = *next_human_review_id;
+    *next_human_review_id = next_human_review_id
+        .checked_add(1)
+        .ok_or_else(|| AiImportBuildError::Descriptor("too many AI human reviews".to_string()))?;
+    let notes_ref = value
+        .get("notes")
+        .map(|notes| push_json_payload_ref(payload, tables, next_payload_ref, notes))
+        .transpose()?
+        .unwrap_or(0);
+    let reviewer_role_ref = push_string_ref(
+        payload,
+        tables,
+        next_payload_ref,
+        next_string_ref,
+        string_field(value, &["reviewer_role", "role"]).unwrap_or(""),
+    )?;
+    tables.human_reviews.push(HumanReviewEntryV1 {
+        human_review_id,
+        review_kind: mapped_u8(value, "review_kind").unwrap_or(0),
+        reviewer_role_ref,
+        review_time_us: value
+            .get("review_time_us")
+            .and_then(Value::as_i64)
+            .unwrap_or(0),
+        rating_ppm: mapped_ppm_value(value.get("rating_ppm").or_else(|| value.get("rating")))?,
+        notes_ref,
+        policy_ref,
+        flags: 0,
+        checksum: 0,
+    });
+    Ok(human_review_id)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_preference_pair_from_sample(
+    payload: &mut Vec<u8>,
+    tables: &mut AiDescriptorTablesV1,
+    next_payload_ref: &mut u32,
+    sample: &ImportedSample,
+    judge_generator_provenance_ref: u64,
+    human_review_ref: u32,
+    evidence_ref: u32,
+    policy_ref: u32,
+) -> Result<(), AiImportBuildError> {
+    let input: Value = serde_json::from_slice(&sample.input).map_err(|error| {
+        AiImportBuildError::InvalidInput(format!("cannot parse preference input payload: {error}"))
+    })?;
+    let target: Value = serde_json::from_slice(&sample.target).map_err(|error| {
+        AiImportBuildError::InvalidInput(format!("cannot parse preference target payload: {error}"))
+    })?;
+    let prompt_ref = push_json_payload_ref(
+        payload,
+        tables,
+        next_payload_ref,
+        input.get("prompt").unwrap_or(&Value::Null),
+    )?;
+    let chosen_ref = push_json_payload_ref(
+        payload,
+        tables,
+        next_payload_ref,
+        target.get("chosen").unwrap_or(&Value::Null),
+    )?;
+    let rejected_ref = push_json_payload_ref(
+        payload,
+        tables,
+        next_payload_ref,
+        target.get("rejected").unwrap_or(&Value::Null),
+    )?;
+    tables.preference_pairs.push(PreferencePairEntryV1 {
+        preference_pair_id: sample.sample_id,
+        prompt_ref,
+        chosen_ref,
+        rejected_ref,
+        judge_generator_provenance_ref,
+        human_review_ref,
+        preference_strength_ppm: 1_000_000,
+        confidence_ppm: 1_000_000,
+        evidence_ref,
+        policy_ref,
+        flags: 0,
+        checksum: 0,
+    });
+    Ok(())
+}
+
+fn mapped_ppm_value(value: Option<&Value>) -> Result<u32, AiImportBuildError> {
+    let Some(value) = value else {
+        return Ok(1_000_000);
+    };
+    mapped_u32_ppm(&json!({"value": value}), Some("value"), &[], 1_000_000)
+}
+
+fn mapped_u8(value: &Value, field: &str) -> Option<u8> {
+    value
+        .get(field)
+        .and_then(Value::as_u64)
+        .and_then(|raw| u8::try_from(raw).ok())
+}
+
+fn string_field<'a>(value: &'a Value, fields: &[&str]) -> Option<&'a str> {
+    fields
+        .iter()
+        .find_map(|field| value.get(*field).and_then(Value::as_str))
+}
+
+fn float_micros(value: Option<&Value>) -> Option<u32> {
+    let raw = value?.as_f64()?;
+    if !(0.0..=1_000_000.0).contains(&raw) {
+        return None;
+    }
+    Some((raw * 1_000_000.0).round().min(u32::MAX as f64) as u32)
+}
+
+fn reproducibility_class_from_value(value: Option<&Value>) -> u8 {
+    match value {
+        Some(Value::Number(number)) => number
+            .as_u64()
+            .and_then(|raw| u8::try_from(raw).ok())
+            .unwrap_or(1)
+            .min(5),
+        Some(Value::String(value)) => match value.as_str() {
+            "deterministic" | "deterministic-fixture" => 2,
+            "externalAuditOnly" | "external-audit-only" => 3,
+            "runtimeAdvisory" | "runtime-advisory" => 1,
+            _ => 1,
+        },
+        _ => 1,
+    }
 }
 
 fn export_value(report: &Value, format: AiExportFormat) -> Result<AiExportData, AiAdapterError> {
@@ -1927,6 +2898,104 @@ fn arrow_scalar_to_json(array: &dyn Array, row_index: usize) -> Result<Value, St
     Err("Parquet import currently supports scalar Utf8, Int64, UInt64, Float64, and Boolean columns".to_string())
 }
 
+struct TrainingQualityDiagnostics {
+    replayability: String,
+    contamination_risk_count: usize,
+    diagnostics: Vec<AiWithheldDiagnostic>,
+}
+
+fn training_quality_diagnostics(sidecar: &CoveAiFile) -> TrainingQualityDiagnostics {
+    let tables = &sidecar.descriptor_tables;
+    let mut diagnostics = Vec::new();
+    let replayable_splits = tables.dataset_splits.iter().all(|split| {
+        split.source_snapshot_ref != 0
+            && split.hash_function_ref != 0
+            && split.filter_policy_ref != 0
+            && split.ordering_policy_ref != 0
+            && split.dedup_policy_ref != 0
+    });
+    let replayable_epochs = !tables.training_epoch_plans.is_empty()
+        && tables
+            .training_epoch_plans
+            .iter()
+            .all(|plan| plan.rng_algorithm_ref != 0 && plan.permutation_function_ref != 0);
+    if !replayable_splits {
+        diagnostics.push(AiWithheldDiagnostic {
+            code: "COVE_AI_TRAINING_STRICT_SPLIT_NOT_REPLAYABLE".to_string(),
+            sample_id: None,
+            message: "training splits are advisory because source snapshot, hash, filter, ordering, or dedup policy metadata is incomplete".to_string(),
+        });
+    }
+    if !replayable_epochs {
+        diagnostics.push(AiWithheldDiagnostic {
+            code: "COVE_AI_TRAINING_STRICT_EPOCH_NOT_REPLAYABLE".to_string(),
+            sample_id: None,
+            message:
+                "no replayable epoch plan declares both RNG algorithm and permutation function"
+                    .to_string(),
+        });
+    }
+    let synthetic_or_labeled = tables
+        .training_samples
+        .iter()
+        .any(|sample| sample.generator_provenance_ref != 0 || sample.label_ref != 0)
+        || !tables.training_labels.is_empty()
+        || !tables.preference_pairs.is_empty();
+    if synthetic_or_labeled && tables.generator_provenance.is_empty() {
+        diagnostics.push(AiWithheldDiagnostic {
+            code: "COVE_AI_TRAINING_STRICT_PROVENANCE_MISSING".to_string(),
+            sample_id: None,
+            message: "labels, preferences, or generated samples are present without generator provenance records".to_string(),
+        });
+    }
+    let sample_split_by_id = tables
+        .training_samples
+        .iter()
+        .map(|sample| (sample.sample_id, sample.split_ref))
+        .collect::<BTreeMap<_, _>>();
+    let mut groups = BTreeMap::<u32, BTreeSet<u32>>::new();
+    for sample in &tables.training_samples {
+        if sample.dedup_group_ref != 0 {
+            groups
+                .entry(sample.dedup_group_ref)
+                .or_default()
+                .insert(sample.split_ref);
+        }
+    }
+    for group in &tables.dedup_groups {
+        if let Some(split) = sample_split_by_id.get(&group.canonical_member_sample_id) {
+            groups
+                .entry(group.dedup_group_id as u32)
+                .or_default()
+                .insert(*split);
+        }
+    }
+    let contamination_risk_count = groups
+        .values()
+        .filter(|splits| splits.contains(&1) && (splits.contains(&2) || splits.contains(&3)))
+        .count();
+    if contamination_risk_count != 0 {
+        diagnostics.push(AiWithheldDiagnostic {
+            code: "COVE_AI_TRAINING_STRICT_DEDUP_CONTAMINATION".to_string(),
+            sample_id: None,
+            message: format!(
+                "{contamination_risk_count} dedup group(s) cross train and evaluation/test splits"
+            ),
+        });
+    }
+    let replayability = if replayable_splits && replayable_epochs {
+        "replayable"
+    } else {
+        "advisory"
+    }
+    .to_string();
+    TrainingQualityDiagnostics {
+        replayability,
+        contamination_risk_count,
+        diagnostics,
+    }
+}
+
 fn resolve_sidecar_path(path: &Path, options: &AiArchiveOpenOptions) -> Result<PathBuf, String> {
     if let Some(sidecar) = &options.cove_ai {
         return Ok(sidecar.clone());
@@ -1957,7 +3026,8 @@ fn resolve_sidecar_path(path: &Path, options: &AiArchiveOpenOptions) -> Result<P
                 .to_path_buf()
         });
         validate_covm_source_member_bytes(&base, &manifest, reference)?;
-        let sidecar_path = base.join(&reference.uri);
+        let sidecar_path = resolve_manifest_relative_path(&base, &reference.uri)
+            .map_err(|error| error.to_string())?;
         let sidecar_bytes = fs::read(&sidecar_path)
             .map_err(|error| format!("cannot read {}: {error}", sidecar_path.display()))?;
         reference
@@ -1984,7 +3054,8 @@ fn validate_covm_source_member_bytes(
         .iter()
         .find(|entry| entry.file_id == reference.source_file_id)
         .ok_or_else(|| "COVM AI sidecar source member is missing".to_string())?;
-    let source_path = base.join(&entry.uri);
+    let source_path =
+        resolve_manifest_relative_path(base, &entry.uri).map_err(|error| error.to_string())?;
     let bytes = fs::read(&source_path).map_err(|error| {
         format!(
             "cannot read COVM AI source member {}: {error}",
@@ -2445,6 +3516,138 @@ mod tests {
     }
 
     #[test]
+    fn mapped_import_populates_training_metadata_and_passes_strict_report() {
+        let options = AiImportOptions {
+            mapping: Some(AiImportMapping {
+                split_field: Some("split".to_string()),
+                quality_score_ppm_field: Some("quality".to_string()),
+                sample_weight_ppm_field: Some("weight".to_string()),
+                dedup_key_field: Some("dedup".to_string()),
+                labels_field: Some("labels".to_string()),
+                generator_field: Some("generator".to_string()),
+                human_review_field: Some("review".to_string()),
+                epoch_plan: Some(AiImportEpochPlanMapping {
+                    enabled: true,
+                    seed: Some(42),
+                    split: None,
+                }),
+                ..AiImportMapping::default()
+            }),
+            artifact_id: Some([8u8; 16]),
+            created_at_us: Some(1),
+            ..AiImportOptions::default()
+        };
+        let rows = [
+            json!({
+                "sample_id": "s1",
+                "split": "train",
+                "instruction": "Explain COVE-AI.",
+                "output": "COVE-AI archives training data.",
+                "quality": 0.9,
+                "weight": 0.5,
+                "dedup": "source-a",
+                "labels": [{"label": "accepted", "confidence": 0.8}],
+                "generator": {
+                    "provider": "local",
+                    "model": "fixture-model",
+                    "version": "1",
+                    "reproducibility_class": "deterministic"
+                },
+                "review": {"role": "annotator", "rating": 1.0}
+            }),
+            json!({
+                "sample_id": "s2",
+                "split": "validation",
+                "instruction": "Explain strict verification.",
+                "output": "Strict verification requires replay metadata.",
+                "dedup": "source-b",
+                "generator": {
+                    "provider": "local",
+                    "model": "fixture-model",
+                    "version": "1"
+                }
+            }),
+        ];
+        let samples = rows
+            .iter()
+            .enumerate()
+            .map(|(index, row)| imported_sample_from_value(index, row, &options).unwrap())
+            .collect::<Vec<_>>();
+        let bytes = build_training_sidecar(&samples, &options).unwrap();
+        let sidecar = CoveAiFile::parse(&bytes).unwrap();
+        assert_eq!(sidecar.descriptor_tables.training_labels.len(), 1);
+        assert_eq!(sidecar.descriptor_tables.generator_provenance.len(), 2);
+        assert_eq!(sidecar.descriptor_tables.model_actors.len(), 1);
+        assert_eq!(sidecar.descriptor_tables.dedup_groups.len(), 2);
+        assert_eq!(sidecar.descriptor_tables.training_epoch_plans.len(), 3);
+        assert_eq!(
+            sidecar.descriptor_tables.training_samples[0].quality_score_ppm,
+            900_000
+        );
+        assert_eq!(
+            sidecar.descriptor_tables.training_samples[0].sample_weight_ppm,
+            500_000
+        );
+        let archive = AiTrainingArchive {
+            path: PathBuf::from("memory.coveai"),
+            bytes,
+            sidecar,
+        };
+        let report = archive
+            .report(AiVerifyOptions {
+                policy_report: true,
+                strict_training: true,
+            })
+            .unwrap();
+        assert_eq!(report.replayability, "replayable");
+        assert_eq!(report.training_label_count, 1);
+        assert_eq!(report.generator_provenance_count, 2);
+        assert_eq!(report.contamination_risk_count, 0);
+    }
+
+    #[test]
+    fn strict_training_report_rejects_advisory_imports() {
+        let options = AiImportOptions {
+            artifact_id: Some([9u8; 16]),
+            created_at_us: Some(1),
+            ..AiImportOptions::default()
+        };
+        let sample = imported_sample_from_value(
+            0,
+            &json!({
+                "sample_id": "advisory",
+                "instruction": "Explain advisory archives.",
+                "output": "They are valid but not replayable."
+            }),
+            &options,
+        )
+        .unwrap();
+        let bytes = build_training_sidecar(&[sample], &options).unwrap();
+        let sidecar = CoveAiFile::parse(&bytes).unwrap();
+        let archive = AiTrainingArchive {
+            path: PathBuf::from("memory.coveai"),
+            bytes,
+            sidecar,
+        };
+        let report = archive
+            .report(AiVerifyOptions {
+                policy_report: true,
+                strict_training: false,
+            })
+            .unwrap();
+        assert_eq!(report.replayability, "advisory");
+        let error = archive
+            .report(AiVerifyOptions {
+                policy_report: true,
+                strict_training: true,
+            })
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("strict COVE-AI training verification failed"));
+    }
+
+    #[test]
     fn import_missing_required_payload_fields_uses_placeholders_and_diagnostics() {
         let sample = imported_sample_from_value(
             0,
@@ -2527,5 +3730,66 @@ mod tests {
         fs::write(&remote_source, b"{}\n").unwrap();
         assert_eq!(covm_source_uri(&sibling_source, &sidecar), "samples.jsonl");
         assert!(Path::new(&covm_source_uri(&remote_source, &sidecar)).is_absolute());
+    }
+
+    #[test]
+    fn covm_archive_open_rejects_source_member_escape() {
+        let root =
+            std::env::temp_dir().join(format!("cove-ai-adapters-covm-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let source = cove_core::writer::MinimalCoveWriter::write_empty_file().unwrap();
+        let validated = cove_core::reader::validate_bytes(&source).unwrap();
+        let entry = CovmFileEntryV1 {
+            file_id: validated.header.file_id,
+            uri: "../source.cove".into(),
+            file_len: validated.postscript.file_len,
+            footer_crc32c: validated.postscript.footer.crc32c,
+            digest_algorithm: DigestAlgorithm::None as u16,
+            digest: Vec::new(),
+            row_count: 0,
+            segment_count: 0,
+            file_stats_ref: 0,
+            file_exact_set_ref: 0,
+            flags: 0,
+        };
+        let manifest = CovmFile {
+            header: CovmHeaderV1::new([0xAC; 16], 1, 1, 1),
+            files: vec![entry.clone()],
+            postscript: cove_core::artifact::covm::CovmPostscriptV1 {
+                header_offset: 0,
+                header_len: 0,
+                entries_offset: 0,
+                entries_len: 0,
+                file_len: 0,
+                flags: 0,
+                checksum: 0,
+            },
+        };
+        let extension = CovmAiSidecarExtensionV1 {
+            flags: 0,
+            refs: vec![CovmAiSidecarRefV1::new(
+                entry.file_id,
+                CoveAiArtifactKind::CoveAiBundle,
+                "training.coveai".into(),
+                b"sidecar-bytes",
+            )
+            .unwrap()],
+        };
+        let manifest_bytes = manifest
+            .serialize_with_extension_region(&extension.serialize().unwrap())
+            .unwrap();
+        let manifest_path = root.join("training.covm");
+        fs::write(&manifest_path, manifest_bytes).unwrap();
+
+        let err = resolve_sidecar_path(
+            &manifest_path,
+            &AiArchiveOpenOptions {
+                cove_ai: None,
+                dataset_dir: Some(root.clone()),
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("parent-directory"), "{err}");
+        fs::remove_dir_all(root).unwrap();
     }
 }

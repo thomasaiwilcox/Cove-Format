@@ -3584,6 +3584,10 @@ fn write_temp_cove(label: &str, bytes: Vec<u8>) -> PathBuf {
     path
 }
 
+fn local_manifest_uri(path: &std::path::Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
 fn conformance_accept_path(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../conformance/accept")

@@ -9,12 +9,15 @@ use std::{
 
 use arrow_array::{ArrayRef, RecordBatch, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
-use cove::{explain_policy_for_mode, ExplainMode, PreparedQueryTextOptions, QueryTextError};
+use cove::{
+    explain_policy_for_mode, query_discovery_manifest_bytes, ExplainMode, PreparedQueryTextOptions,
+    QueryTextError,
+};
 use cove_ai_adapters::{
     build_ai_training_showcase, diff_archives, import_hf_dir, import_jsonl, import_parquet,
     open as open_ai_archive, stream_archive, write_export_file, AiArchiveOpenOptions,
-    AiExportFormat, AiExportOptions, AiImportOptions, AiImportSchema, AiSplitPolicy,
-    AiVerifyOptions,
+    AiExportFormat, AiExportOptions, AiImportMapping, AiImportOptions, AiImportSchema,
+    AiSplitPolicy, AiVerifyOptions,
 };
 use cove_core::{
     artifact::{
@@ -29,9 +32,15 @@ use cove_core::{
     checksum, compression,
     constants::{SectionKind, MAGIC_COVEAI, MAGIC_COVEMAP, MAGIC_COVEV},
     feature_binding::OperationKindV2,
+    manifest_path::resolve_manifest_relative_path,
     profile::{
         cove_map::{parse_embedded_section, EmbeddedMapSection},
         cove_o::CoveObjectSurface,
+    },
+    query_discovery::{
+        build_query_discovery_manifest, query_discovery_validation_context_for_source,
+        render_query_discovery_template, validate_query_discovery_manifest, MetadataDisclosureMode,
+        QueryDiscoveryOptions, QueryDiscoveryValidationFlag, QueryDiscoveryValidationStatus,
     },
     reader::{validate_bytes_with_options, ValidatedCoveFile, ValidationOptions},
     table::TableCatalog,

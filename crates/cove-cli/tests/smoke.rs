@@ -1116,6 +1116,70 @@ fn query_covm_manifest_registers_cove_t_member_tables() {
 }
 
 #[test]
+fn inspect_query_discovery_describes_covm_dataset_binding() {
+    let member = cove_t_events_bytes();
+    let manifest = covm_manifest_for_members(&[("events.cove", &member)]);
+    let manifest_path = temp_file("query-discovery-dataset.covm");
+    fs::write(&manifest_path, manifest).unwrap();
+
+    let output = run_cove(&[
+        "inspect",
+        "--query-discovery",
+        "--json",
+        manifest_path.to_str().unwrap(),
+    ]);
+
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        value["source_binding"]["source_kind"],
+        serde_json::json!("covm_dataset_snapshot")
+    );
+    assert_eq!(
+        value["source_binding"]["members"][0]["member_id"],
+        serde_json::json!("events.cove")
+    );
+    assert!(value["source_binding"]["members"][0]["file_digest"]
+        .as_str()
+        .unwrap()
+        .starts_with("sha256:"));
+}
+
+#[test]
+fn query_covm_dataset_rejects_manifest_member_escape() {
+    let member = cove_t_events_bytes();
+    let manifest = covm_manifest_for_members(&[("../events.cove", &member)]);
+    let manifest_path = temp_file("dataset-escape.covm");
+    fs::write(&manifest_path, manifest).unwrap();
+
+    let output = run_cove(&[
+        "query",
+        manifest_path.to_str().unwrap(),
+        "--dataset",
+        manifest_path.parent().unwrap().to_str().unwrap(),
+        "--format",
+        "jsonl",
+        "table(events).take(1)",
+    ]);
+
+    assert!(
+        !output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("parent-directory"),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn query_covm_manifest_auto_discovers_digest_bound_ai_sidecar_ref() {
     let member = cove_t_events_bytes();
     let validated = validate_bytes(&member).unwrap();
@@ -1354,6 +1418,35 @@ fn query_file_and_stdin_queries_execute() {
 }
 
 #[test]
+fn query_from_query_discovery_template_executes() {
+    let file = temp_file("events-query-template.cove");
+    fs::write(&file, cove_t_events_bytes()).unwrap();
+
+    let output = run_cove(&[
+        "query",
+        "--from-template",
+        "table_filter_select_take",
+        "--param",
+        "score=20",
+        "--param",
+        "columns=id,score",
+        "--format",
+        "jsonl",
+        file.to_str().unwrap(),
+    ]);
+
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        r#"{"id":2,"score":20}"#
+    );
+}
+
+#[test]
 fn table_output_respects_max_cell_width() {
     let file = temp_file("labels.cove");
     fs::write(&file, cove_t_labels_bytes()).unwrap();
@@ -1392,6 +1485,90 @@ fn inspect_cove_t_prints_query_suggestions() {
     assert!(stdout.contains("COVE-T"), "stdout={stdout}");
     assert!(stdout.contains("table(events)"));
     assert!(stdout.contains("table(events).select(id, score).take(10)"));
+}
+
+#[test]
+fn query_discovery_cli_emits_manifest_and_validation_envelope() {
+    let file = sample_path("events.cove");
+    let path = file.to_str().unwrap();
+
+    let inspect = run_cove(&[
+        "inspect",
+        "--query-discovery",
+        "--json",
+        "--policy",
+        "public",
+        "--audience",
+        "smoke-agent",
+        "--principal-class",
+        "public_agent",
+        "--policy-fingerprint",
+        "sha256:smoke",
+        path,
+    ]);
+    assert!(
+        inspect.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&inspect.stderr)
+    );
+    let manifest: serde_json::Value = serde_json::from_slice(&inspect.stdout).unwrap();
+    assert_eq!(
+        manifest["schema"],
+        serde_json::json!("cove.query_discovery.v1")
+    );
+    assert_eq!(
+        manifest["authority"],
+        serde_json::json!("advisory_discovery_not_archive_truth")
+    );
+    assert_eq!(manifest["coveql"]["profiles"], serde_json::json!(["table"]));
+    assert_eq!(
+        manifest["policy"]["audience"],
+        serde_json::json!("smoke-agent")
+    );
+    assert_eq!(
+        manifest["policy"]["principal_class"],
+        serde_json::json!("public_agent")
+    );
+    assert_eq!(
+        manifest["policy"]["policy_fingerprint"],
+        serde_json::json!("sha256:smoke")
+    );
+    assert!(manifest.get("validation_status").is_none());
+    assert!(manifest["surfaces"]["tables"][0]["root"]
+        .as_str()
+        .unwrap()
+        .starts_with("table("));
+    assert_eq!(
+        manifest["examples"][0]["query_validation"],
+        serde_json::json!("not_validated")
+    );
+    assert!(manifest["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|diagnostic| diagnostic["code"] == "QD_EXAMPLE_VALIDATION_FAILED"));
+
+    let alias = run_cove(&["inspect", "--agent", path]);
+    assert!(
+        alias.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&alias.stderr)
+    );
+    let alias_manifest: serde_json::Value = serde_json::from_slice(&alias.stdout).unwrap();
+    assert_eq!(alias_manifest["schema"], manifest["schema"]);
+
+    let doctor = run_cove(&["doctor", "--query-discovery", "--json", path]);
+    assert!(
+        doctor.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&doctor.stderr)
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&doctor.stdout).unwrap();
+    assert_eq!(envelope["manifest"]["schema"], manifest["schema"]);
+    assert_eq!(
+        envelope["validation"]["validation_status"],
+        serde_json::json!("valid")
+    );
 }
 
 #[test]
@@ -2476,6 +2653,9 @@ fn query_coveql_ai_descriptor_methods_smoke() {
 fn ai_training_archive_adoption_workflows_smoke() {
     let source = temp_file("training-adoption-source.jsonl");
     let archive = temp_file("training-adoption.coveai");
+    let mapped_source = temp_file("training-adoption-mapped-source.jsonl");
+    let mapped_archive = temp_file("training-adoption-mapped.coveai");
+    let mapping_file = temp_file("training-adoption-mapping.json");
     let stream_out = temp_file("training-adoption-stream.jsonl");
     let diff_report = temp_file("training-adoption-diff.json");
     let showcase_dir = temp_file("ai-training-showcase");
@@ -2544,6 +2724,108 @@ fn ai_training_archive_adoption_workflows_smoke() {
     );
     let verify_json: serde_json::Value = serde_json::from_str(&verify_stdout).unwrap();
     assert_eq!(verify_json["training_sample_count"], serde_json::json!(1));
+
+    fs::write(
+        &mapped_source,
+        [
+            serde_json::json!({
+                "sample_id": "mapped-1",
+                "instruction": "Explain mapped COVE-AI training archives.",
+                "output": "Mapped imports preserve richer training metadata.",
+                "split": "train",
+                "dedup": "mapped-source-1",
+                "labels": [{"label": "accepted", "confidence": 0.9}],
+                "generator": {"provider": "local", "model": "fixture-model", "version": "1"},
+                "review": {"role": "reviewer", "rating": 1.0}
+            })
+            .to_string(),
+            serde_json::json!({
+                "sample_id": "mapped-2",
+                "instruction": "Explain strict COVE-AI verification.",
+                "output": "Strict verification requires replay metadata.",
+                "split": "validation",
+                "dedup": "mapped-source-2",
+                "generator": {"provider": "local", "model": "fixture-model", "version": "1"}
+            })
+            .to_string(),
+        ]
+        .join("\n")
+            + "\n",
+    )
+    .unwrap();
+    fs::write(
+        &mapping_file,
+        serde_json::json!({
+            "split_field": "split",
+            "dedup_key_field": "dedup",
+            "labels_field": "labels",
+            "generator_field": "generator",
+            "human_review_field": "review",
+            "epoch_plan": {"enabled": true, "seed": 42}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let mapped_import = run_cove(&[
+        "ai",
+        "import",
+        "jsonl",
+        mapped_source.to_str().unwrap(),
+        "--out",
+        mapped_archive.to_str().unwrap(),
+        "--schema",
+        "instruction",
+        "--mapping",
+        mapping_file.to_str().unwrap(),
+    ]);
+    assert!(
+        mapped_import.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&mapped_import.stdout),
+        String::from_utf8_lossy(&mapped_import.stderr)
+    );
+    let mapped_verify = run_cove(&[
+        "ai",
+        "verify",
+        mapped_archive.to_str().unwrap(),
+        "--json",
+        "--policy-report",
+        "--strict-training",
+    ]);
+    let mapped_verify_stdout = String::from_utf8_lossy(&mapped_verify.stdout);
+    assert!(
+        mapped_verify.status.success(),
+        "stdout={mapped_verify_stdout}\nstderr={}",
+        String::from_utf8_lossy(&mapped_verify.stderr)
+    );
+    let mapped_verify_json: serde_json::Value =
+        serde_json::from_str(&mapped_verify_stdout).unwrap();
+    assert_eq!(
+        mapped_verify_json["replayability"],
+        serde_json::json!("replayable")
+    );
+    assert_eq!(
+        mapped_verify_json["training_label_count"],
+        serde_json::json!(1)
+    );
+    assert_eq!(
+        mapped_verify_json["generator_provenance_count"],
+        serde_json::json!(2)
+    );
+    let mapped_train_export = run_cove(&[
+        "train",
+        "export",
+        mapped_archive.to_str().unwrap(),
+        "--strict-training",
+        "--format",
+        "json",
+    ]);
+    assert!(
+        mapped_train_export.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&mapped_train_export.stdout),
+        String::from_utf8_lossy(&mapped_train_export.stderr)
+    );
 
     let covm_archive = archive.with_extension("covm");
     let verify_covm = run_cove(&[
@@ -3499,6 +3781,8 @@ fn delta_cli_commands_validate_plan_and_publish_delta_chains() {
     let base = temp_file("delta-cli-base.cove");
     let delta = temp_file("delta-cli-delta.covedelta");
     let manifest = temp_file("delta-cli-chain.covm");
+    let dataset_dir = base.parent().expect("temp file has parent").to_path_buf();
+    let dataset_arg = dataset_dir.to_str().unwrap();
     let base_bytes = cove_t_events_bytes();
     fs::write(&base, &base_bytes).unwrap();
     let first_delta_bytes = simple_delta_bytes_for_base_with_snapshot(&base_bytes, [0xB0; 16]);
@@ -3557,7 +3841,7 @@ fn delta_cli_commands_validate_plan_and_publish_delta_chains() {
         "validate",
         manifest.to_str().unwrap(),
         "--dataset",
-        "/",
+        dataset_arg,
         "--json",
     ]);
     assert!(
@@ -3576,7 +3860,7 @@ fn delta_cli_commands_validate_plan_and_publish_delta_chains() {
         "plan",
         manifest.to_str().unwrap(),
         "--dataset",
-        "/",
+        dataset_arg,
         "--as-of-csn",
         "1",
         "--json",
@@ -3596,7 +3880,7 @@ fn delta_cli_commands_validate_plan_and_publish_delta_chains() {
         "graph",
         manifest.to_str().unwrap(),
         "--dataset",
-        "/",
+        dataset_arg,
     ]);
     assert!(
         graph.status.success(),
@@ -3656,7 +3940,7 @@ fn delta_cli_commands_validate_plan_and_publish_delta_chains() {
         "validate",
         extended_manifest.to_str().unwrap(),
         "--dataset",
-        "/",
+        dataset_arg,
         "--json",
     ]);
     assert!(
@@ -3672,7 +3956,7 @@ fn delta_cli_commands_validate_plan_and_publish_delta_chains() {
         "reconstruct",
         manifest.to_str().unwrap(),
         "--dataset",
-        "/",
+        dataset_arg,
         "--out",
         reconstructed.to_str().unwrap(),
         "--json",
@@ -3695,7 +3979,7 @@ fn delta_cli_commands_validate_plan_and_publish_delta_chains() {
         "compact",
         manifest.to_str().unwrap(),
         "--dataset",
-        "/",
+        dataset_arg,
         "--out",
         compacted.to_str().unwrap(),
         "--publish-covm",
@@ -3749,7 +4033,7 @@ fn delta_cli_commands_validate_plan_and_publish_delta_chains() {
         "query",
         object_manifest.to_str().unwrap(),
         "--dataset",
-        "/",
+        dataset_arg,
         "--delta-plan",
         "--perf-report",
         "--format",
@@ -3791,7 +4075,7 @@ fn delta_cli_commands_validate_plan_and_publish_delta_chains() {
         "--report",
         "-",
         "--dataset",
-        "/",
+        dataset_arg,
         "--perf-report",
         object_manifest.to_str().unwrap(),
         object_query_export.to_str().unwrap(),
@@ -3846,7 +4130,7 @@ fn delta_cli_commands_validate_plan_and_publish_delta_chains() {
         "query",
         graph_manifest.to_str().unwrap(),
         "--dataset",
-        "/",
+        dataset_arg,
         "--perf-report",
         "--format",
         "jsonl",
@@ -3876,7 +4160,7 @@ fn delta_cli_commands_validate_plan_and_publish_delta_chains() {
         "--report",
         "-",
         "--dataset",
-        "/",
+        dataset_arg,
         "--columns",
         "score,status",
         "--filter",
@@ -3917,7 +4201,7 @@ fn delta_cli_commands_validate_plan_and_publish_delta_chains() {
         "query",
         object_manifest.to_str().unwrap(),
         "--dataset",
-        "/",
+        dataset_arg,
         "--source-publish-range",
         "1:2",
         "object(Thing).select(active)",
@@ -3938,7 +4222,7 @@ fn delta_cli_commands_validate_plan_and_publish_delta_chains() {
         object_manifest.to_str().unwrap(),
         source_publish_export.to_str().unwrap(),
         "--dataset",
-        "/",
+        dataset_arg,
         "--source-publish-range",
         "1:2",
     ]);
@@ -3981,7 +4265,7 @@ fn delta_cli_commands_validate_plan_and_publish_delta_chains() {
         "query",
         source_publish_manifest.to_str().unwrap(),
         "--dataset",
-        "/",
+        dataset_arg,
         "--source-publish-range",
         "12:18",
         "--perf-report",
@@ -4015,7 +4299,7 @@ fn delta_cli_commands_validate_plan_and_publish_delta_chains() {
         "--report",
         "-",
         "--dataset",
-        "/",
+        dataset_arg,
         "--source-publish-range",
         "12:18",
         source_publish_manifest.to_str().unwrap(),
@@ -4046,7 +4330,7 @@ fn delta_cli_commands_validate_plan_and_publish_delta_chains() {
         "--snapshot",
         object_manifest.to_str().unwrap(),
         "--dataset",
-        "/",
+        dataset_arg,
         "--out",
         snapshot_covi.to_str().unwrap(),
         "--object-properties",
@@ -4124,7 +4408,7 @@ fn delta_cli_commands_validate_plan_and_publish_delta_chains() {
         "--snapshot",
         object_manifest.to_str().unwrap(),
         "--dataset",
-        "/",
+        dataset_arg,
         "--out",
         snapshot_covm.to_str().unwrap(),
     ]);
@@ -4162,7 +4446,7 @@ fn delta_cli_commands_validate_plan_and_publish_delta_chains() {
         "--snapshot",
         object_manifest.to_str().unwrap(),
         "--dataset",
-        "/",
+        dataset_arg,
         "--out",
         snapshot_covx.to_str().unwrap(),
     ]);
@@ -4196,7 +4480,7 @@ fn delta_cli_commands_validate_plan_and_publish_delta_chains() {
         "build",
         object_manifest.to_str().unwrap(),
         "--dataset",
-        "/",
+        dataset_arg,
         "--out-dir",
         map_delta_bundle.to_str().unwrap(),
         "--projection-output",
@@ -4231,7 +4515,7 @@ fn delta_cli_commands_validate_plan_and_publish_delta_chains() {
         "--base",
         graph_manifest.to_str().unwrap(),
         "--dataset",
-        "/",
+        dataset_arg,
         "--mapping",
         sample_path("people.covemap").to_str().unwrap(),
         "--out",
@@ -4310,7 +4594,7 @@ fn delta_cli_commands_validate_plan_and_publish_delta_chains() {
         "--base",
         graph_manifest.to_str().unwrap(),
         "--dataset",
-        "/",
+        dataset_arg,
         "--mapping",
         sample_path("people.covemap").to_str().unwrap(),
         "--out",
@@ -4381,7 +4665,7 @@ fn delta_cli_commands_validate_plan_and_publish_delta_chains() {
         "query",
         semantic_map_update_manifest.to_str().unwrap(),
         "--dataset",
-        "/",
+        dataset_arg,
         "--format",
         "jsonl",
         "object(Person).where(score >= 50).select(score, status, nickname)",
@@ -4421,7 +4705,7 @@ fn delta_cli_commands_validate_plan_and_publish_delta_chains() {
         "validate",
         semantic_map_manifest.to_str().unwrap(),
         "--dataset",
-        "/",
+        dataset_arg,
         "--json",
     ]);
     assert!(
@@ -4434,7 +4718,7 @@ fn delta_cli_commands_validate_plan_and_publish_delta_chains() {
         "query",
         semantic_map_manifest.to_str().unwrap(),
         "--dataset",
-        "/",
+        dataset_arg,
         "--format",
         "jsonl",
         "object(Person).where(score >= 40).select(score, status, nickname)",
@@ -4456,7 +4740,7 @@ fn delta_cli_commands_validate_plan_and_publish_delta_chains() {
         "checkpoint",
         object_manifest.to_str().unwrap(),
         "--dataset",
-        "/",
+        dataset_arg,
         "--out",
         checkpoint.to_str().unwrap(),
         "--summary-out",

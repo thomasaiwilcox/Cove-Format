@@ -21,6 +21,8 @@ use cove_map::{
 };
 use serde_json::json;
 
+const ARROW_EXPORT_USAGE: &str = "usage: cove export arrow [--columns a,b] [--filter column=<name|index>,op=<eq|in|lt|lte|gt|gte|is-null|is-not-null>,value=<literal|a|b>] [--format ipc|json] [--report -|path] [--dataset dir] [--as-of-csn n|--as-of-commit-us n] [--delta-plan-json] <input.cove|manifest.covm> <output.arrow|output.json>\n       cove export arrow --query '<coveql>' [--format ipc|json] [--report -|path] [--dataset dir] [--as-of-csn n|--as-of-commit-us n] [--delta-plan|--delta-plan-json] <input.cove|manifest.covm> <output.arrow|output.json>";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OutputFormat {
     Ipc,
@@ -372,15 +374,21 @@ fn projection_filter(
         }),
         FilterOp::In => Ok(ProjectionFilter::InList {
             column,
-            literals: filter
-                .value
-                .as_deref()
-                .unwrap_or_default()
-                .split('|')
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(parse_projection_filter_literal)
-                .collect::<Result<Vec<_>, _>>()?,
+            literals: {
+                let literals = filter
+                    .value
+                    .as_deref()
+                    .unwrap_or_default()
+                    .split('|')
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(parse_projection_filter_literal)
+                    .collect::<Result<Vec<_>, _>>()?;
+                if literals.is_empty() {
+                    return Err("IN filter requires at least one non-empty value".to_string());
+                }
+                literals
+            },
         }),
         FilterOp::Eq | FilterOp::Lt | FilterOp::Lte | FilterOp::Gt | FilterOp::Gte => {
             let raw = filter
@@ -520,7 +528,67 @@ fn parse_i64_range(raw: &str, flag: &str) -> Result<(i64, i64), String> {
 }
 
 fn print_usage() {
-    eprintln!(
-        "usage: cove export arrow [--columns a,b] [--filter column=<name|index>,op=<eq|lt|lte|gt|gte|is-null|is-not-null>,value=<literal>] [--format ipc|json] [--report -|path] [--dataset dir] [--as-of-csn n|--as-of-commit-us n] [--delta-plan-json] <input.cove|manifest.covm> <output.arrow|output.json>\n       cove export arrow --query '<coveql>' [--format ipc|json] [--report -|path] [--dataset dir] [--as-of-csn n|--as-of-commit-us n] [--delta-plan|--delta-plan-json] <input.cove|manifest.covm> <output.arrow|output.json>"
-    );
+    eprintln!("{ARROW_EXPORT_USAGE}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cove_core::profile::cove_map::MapProjectionColumn;
+
+    #[test]
+    fn projection_filter_rejects_empty_in_list() {
+        let projection = projection_with_column("city");
+        let filter = parse_filter_dsl("column=city,op=in,value=").unwrap();
+        let error = projection_filter(&projection, &filter).unwrap_err();
+        assert!(error.contains("IN filter requires at least one non-empty value"));
+    }
+
+    #[test]
+    fn projection_filter_accepts_non_empty_in_list() {
+        let projection = projection_with_column("city");
+        let filter = parse_filter_dsl("column=city,op=in,value=lon|par").unwrap();
+        let converted = projection_filter(&projection, &filter).unwrap();
+        assert_eq!(
+            converted,
+            ProjectionFilter::InList {
+                column: "city".into(),
+                literals: vec![
+                    ProjectionFilterLiteral::Utf8("lon".into()),
+                    ProjectionFilterLiteral::Utf8("par".into())
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn usage_mentions_in_filter_syntax() {
+        assert!(ARROW_EXPORT_USAGE.contains("op=<eq|in|lt"));
+        assert!(ARROW_EXPORT_USAGE.contains("value=<literal|a|b>"));
+    }
+
+    fn projection_with_column(name: &str) -> MapProjectionEntry {
+        MapProjectionEntry {
+            projection_id: "test_projection".into(),
+            assertion_ids: Vec::new(),
+            output_table: None,
+            row_grain: None,
+            anchor: None,
+            temporal_mode: None,
+            columns: vec![MapProjectionColumn {
+                name: name.into(),
+                value: name.into(),
+                logical_type: None,
+                nested_shape: None,
+                conflict_policy: "reject".into(),
+                missing_policy: "null".into(),
+                lineage: None,
+            }],
+            multi_value_policy: None,
+            missing_policy: "null".into(),
+            ordering: Vec::new(),
+            evidence_policy: "none".into(),
+            output_modes: vec!["arrow".into()],
+        }
+    }
 }

@@ -194,6 +194,7 @@ pub(super) fn run_ai_training_archive_case(corpus: &Path) -> Result<Value, Strin
     let verify_report = archive
         .verify(AiVerifyOptions {
             policy_report: true,
+            strict_training: false,
         })
         .map_err(|err| err.to_string())?;
     let verify_latency_ns = verify_start.elapsed().as_nanos() as u64;

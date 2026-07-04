@@ -100,13 +100,14 @@ fn run_query(file: Option<&Path>, query: &str, options: QueryCommandOptions) -> 
     if let Some(explain) = options.explain.as_deref() {
         execute_options.resolve_options.security.explain_policy = explain_policy_for_cli(explain);
     }
+    let query = materialize_query_text(file, &bytes, query, &options)?;
     let mut physical_sidecars = options.physical_sidecars.clone();
     if !options.no_auto_sidecars && physical_sidecars.cove_ai_artifact.is_none() {
         if let Some(input) = file {
             physical_sidecars.cove_ai_artifact = discover_query_ai_sidecar(
                 input,
                 options.dataset.as_deref(),
-                query_selects_ai_operation(query, options.explain.as_deref()),
+                query_selects_ai_operation(&query, options.explain.as_deref()),
             )?;
         }
     }
@@ -146,10 +147,6 @@ fn run_query(file: Option<&Path>, query: &str, options: QueryCommandOptions) -> 
         explicit_manifest_members_for(&options)?
     } else {
         manifest_members_for(file, &bytes, &options)?
-    };
-    let query = match &options.query_file {
-        Some(query_file) => read_query_file(query_file)?,
-        None => query.to_string(),
     };
     let query = prepare_query_text(&query, options.take, options.explain.as_deref())?;
     let use_direct_delta_surface = delta_direct_surface.is_some()
@@ -316,7 +313,7 @@ fn discover_covm_referenced_ai_sidecar(
     }
     let mut last_error = None;
     for reference in &extension.refs {
-        let path = resolve_covm_ai_sidecar_path(input, dataset, &reference.uri);
+        let path = resolve_covm_ai_sidecar_path(input, dataset, &reference.uri)?;
         let sidecar_bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
             Err(error) => {
@@ -343,21 +340,20 @@ fn discover_covm_referenced_ai_sidecar(
     Ok(None)
 }
 
-fn resolve_covm_ai_sidecar_path(input: &Path, dataset: Option<&Path>, uri: &str) -> PathBuf {
-    let raw = PathBuf::from(uri);
-    if raw.is_absolute() {
-        return raw;
-    }
+fn resolve_covm_ai_sidecar_path(
+    input: &Path,
+    dataset: Option<&Path>,
+    uri: &str,
+) -> Result<PathBuf, String> {
     if let Some(dataset) = dataset {
-        let candidate = dataset.join(&raw);
+        let candidate =
+            resolve_manifest_relative_path(dataset, uri).map_err(|error| error.to_string())?;
         if candidate.is_file() {
-            return candidate;
+            return Ok(candidate);
         }
     }
-    input
-        .parent()
-        .map(|parent| parent.join(&raw))
-        .unwrap_or(raw)
+    let base = input.parent().unwrap_or_else(|| Path::new("."));
+    resolve_manifest_relative_path(base, uri).map_err(|error| error.to_string())
 }
 
 fn ai_sidecar_candidates(input: &Path) -> Vec<PathBuf> {
@@ -616,6 +612,31 @@ fn read_query_file(path: &Path) -> Result<String, String> {
         .map_err(|error| format!("cannot read query file {}: {error}", path.display()))
 }
 
+fn materialize_query_text(
+    file: Option<&Path>,
+    bytes: &[u8],
+    inline_query: &str,
+    options: &QueryCommandOptions,
+) -> Result<String, String> {
+    if let Some(template_id) = options.from_template.as_deref() {
+        let source_name = file.map(|path| path.display().to_string());
+        let manifest = build_query_discovery_manifest(
+            bytes,
+            QueryDiscoveryOptions {
+                source_name,
+                ..QueryDiscoveryOptions::default()
+            },
+        )
+        .map_err(|error| format!("cannot build query-discovery manifest: {error}"))?;
+        return render_query_discovery_template(&manifest, template_id, &options.template_params)
+            .map_err(|error| format!("cannot render query-discovery template: {error}"));
+    }
+    match &options.query_file {
+        Some(query_file) => read_query_file(query_file),
+        None => Ok(inline_query.to_string()),
+    }
+}
+
 fn manifest_members_for(
     file: Option<&Path>,
     bytes: &[u8],
@@ -639,7 +660,8 @@ fn manifest_members_for(
             if members.iter().any(|member| member.source == entry.uri) {
                 continue;
             }
-            let path = dataset_dir.join(&entry.uri);
+            let path = resolve_manifest_relative_path(dataset_dir, &entry.uri)
+                .map_err(|error| error.to_string())?;
             members.push(QueryArtifactMember {
                 source: entry.uri,
                 bytes: fs::read(&path)

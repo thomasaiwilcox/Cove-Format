@@ -4,7 +4,10 @@ use std::{
     sync::Arc,
 };
 
-use cove_core::{constants::DigestAlgorithm, digest::compute_digest, CoveError};
+use cove_core::{
+    constants::DigestAlgorithm, digest::compute_digest, manifest_path::resolve_manifest_local_path,
+    CoveError,
+};
 
 use crate::{
     bootstrap::local::bootstrap_local_path_with_options,
@@ -42,7 +45,7 @@ pub async fn bootstrap_overlay_snapshot_with_options_async(
             stats.overlay_files_hidden += 1;
             continue;
         }
-        let path = overlay_uri_to_path(overlay_file.uri.as_ref());
+        let path = overlay_uri_to_path(overlay_file.uri.as_ref())?;
         let state = bootstrap_local_path_with_options(&path, options.clone()).await?;
         validate_overlay_identity(
             overlay_file.expected_identity.as_ref(),
@@ -91,11 +94,8 @@ pub async fn bootstrap_overlay_snapshot_with_options_async(
     .map(Arc::new)
 }
 
-fn overlay_uri_to_path(uri: &str) -> PathBuf {
-    if let Some(rest) = uri.strip_prefix("file://") {
-        return PathBuf::from(rest);
-    }
-    PathBuf::from(uri)
+fn overlay_uri_to_path(uri: &str) -> Result<PathBuf, CoveError> {
+    resolve_manifest_local_path(uri)
 }
 
 fn validate_overlay_identity(

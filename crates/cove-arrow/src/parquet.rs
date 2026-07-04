@@ -4060,7 +4060,7 @@ mod tests {
     use parquet::arrow::ArrowWriter;
 
     use crate::{
-        compression::column_page_payload,
+        compression::{self, column_page_payload},
         constants::SectionKind,
         page::ColumnPageIndex,
         page_payload::{ColumnPagePayloadV1, PageBufferKind},
@@ -4254,6 +4254,191 @@ mod tests {
 
         CovxFile::parse(result.covx_bytes.as_ref().unwrap()).unwrap();
         CovmFile::parse(result.covm_bytes.as_ref().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn dictionary_zone_stats_use_domain_sort_order_for_filecode_ranks() {
+        let batch = RecordBatch::try_from_iter(vec![(
+            "city",
+            Arc::new(StringArray::from(vec!["b", "aa"])) as ArrayRef,
+        )])
+        .unwrap();
+        let options = ParquetConversionOptions {
+            dictionary_policy: ParquetDictionaryPolicy::Always,
+            stats_policy: ParquetStatsPolicy::Recompute,
+            morsel_row_count: 1,
+            ..ParquetConversionOptions::default()
+        };
+        let result = convert_parquet_bytes(&parquet_bytes(&batch), &options).unwrap();
+        let catalog = first_table_catalog(&result.cove_bytes);
+        let city = catalog.tables[0]
+            .columns
+            .iter()
+            .find(|column| column.name == "city")
+            .unwrap();
+        assert_eq!(city.physical, CovePhysicalKind::FileCode);
+
+        let city_stats = zone_stats_entries(&result.cove_bytes)
+            .into_iter()
+            .filter(|entry| entry.column_id == city.column_id)
+            .collect::<Vec<_>>();
+        assert_eq!(city_stats.len(), 2);
+        assert_eq!(
+            city_stats
+                .iter()
+                .map(|entry| (entry.min_domain_rank, entry.max_domain_rank))
+                .collect::<Vec<_>>(),
+            vec![(1, 1), (0, 0)]
+        );
+    }
+
+    #[test]
+    fn float_zone_stats_report_exact_distinct_and_run_counts() {
+        let batch = RecordBatch::try_from_iter(vec![(
+            "score",
+            Arc::new(Float64Array::from(vec![1.0, 1.0, 2.0])) as ArrayRef,
+        )])
+        .unwrap();
+        let options = ParquetConversionOptions {
+            stats_policy: ParquetStatsPolicy::Recompute,
+            morsel_row_count: 3,
+            ..ParquetConversionOptions::default()
+        };
+        let result = convert_parquet_bytes(&parquet_bytes(&batch), &options).unwrap();
+        let catalog = first_table_catalog(&result.cove_bytes);
+        let score = catalog.tables[0]
+            .columns
+            .iter()
+            .find(|column| column.name == "score")
+            .unwrap();
+        let score_stats = zone_stats_entries(&result.cove_bytes)
+            .into_iter()
+            .find(|entry| entry.column_id == score.column_id)
+            .unwrap();
+
+        assert_eq!(score_stats.distinct_count, 2);
+        assert_eq!(score_stats.run_count, 2);
+        assert!(score_stats
+            .stats
+            .flags
+            .contains(ZoneStatFlags::DISTINCT_EXACT));
+        assert!(!score_stats.stats.flags.contains(ZoneStatFlags::CONSTANT));
+    }
+
+    #[test]
+    fn float_zone_stats_flag_nan_without_using_nan_for_min_max() {
+        let batch = RecordBatch::try_from_iter(vec![(
+            "score",
+            Arc::new(Float64Array::from(vec![1.0, f64::NAN, 1.0])) as ArrayRef,
+        )])
+        .unwrap();
+        let options = ParquetConversionOptions {
+            stats_policy: ParquetStatsPolicy::Recompute,
+            morsel_row_count: 3,
+            ..ParquetConversionOptions::default()
+        };
+        let result = convert_parquet_bytes(&parquet_bytes(&batch), &options).unwrap();
+        let catalog = first_table_catalog(&result.cove_bytes);
+        let score = catalog.tables[0]
+            .columns
+            .iter()
+            .find(|column| column.name == "score")
+            .unwrap();
+        let score_stats = zone_stats_entries(&result.cove_bytes)
+            .into_iter()
+            .find(|entry| entry.column_id == score.column_id)
+            .unwrap();
+
+        assert_eq!(score_stats.distinct_count, 2);
+        assert_eq!(score_stats.run_count, 3);
+        assert!(score_stats.stats.flags.contains(ZoneStatFlags::HAS_NAN));
+        assert!(score_stats
+            .stats
+            .flags
+            .contains(ZoneStatFlags::DISTINCT_EXACT));
+        assert!(!score_stats.stats.flags.contains(ZoneStatFlags::CONSTANT));
+        assert_eq!(
+            score_stats.stats.min.as_ref().unwrap().bytes,
+            1.0f64.to_bits().to_le_bytes().to_vec()
+        );
+        assert_eq!(
+            score_stats.stats.max.as_ref().unwrap().bytes,
+            1.0f64.to_bits().to_le_bytes().to_vec()
+        );
+    }
+
+    #[test]
+    fn float_zone_stats_treat_signed_zero_as_one_logical_value() {
+        let batch = RecordBatch::try_from_iter(vec![(
+            "score",
+            Arc::new(Float64Array::from(vec![0.0, -0.0, 0.0])) as ArrayRef,
+        )])
+        .unwrap();
+        let options = ParquetConversionOptions {
+            stats_policy: ParquetStatsPolicy::Recompute,
+            morsel_row_count: 3,
+            ..ParquetConversionOptions::default()
+        };
+        let result = convert_parquet_bytes(&parquet_bytes(&batch), &options).unwrap();
+        let catalog = first_table_catalog(&result.cove_bytes);
+        let score = catalog.tables[0]
+            .columns
+            .iter()
+            .find(|column| column.name == "score")
+            .unwrap();
+        let score_stats = zone_stats_entries(&result.cove_bytes)
+            .into_iter()
+            .find(|entry| entry.column_id == score.column_id)
+            .unwrap();
+
+        assert_eq!(score_stats.distinct_count, 1);
+        assert_eq!(score_stats.run_count, 1);
+        assert!(score_stats.stats.flags.contains(ZoneStatFlags::CONSTANT));
+        assert_eq!(
+            score_stats.stats.min.as_ref().unwrap().bytes,
+            0.0f64.to_bits().to_le_bytes().to_vec()
+        );
+        assert_eq!(
+            score_stats.stats.max.as_ref().unwrap().bytes,
+            0.0f64.to_bits().to_le_bytes().to_vec()
+        );
+    }
+
+    #[test]
+    fn all_nan_float_zone_stats_keep_exact_counts_without_min_max() {
+        let batch = RecordBatch::try_from_iter(vec![(
+            "score",
+            Arc::new(Float64Array::from(vec![f64::NAN, f64::NAN])) as ArrayRef,
+        )])
+        .unwrap();
+        let options = ParquetConversionOptions {
+            stats_policy: ParquetStatsPolicy::Recompute,
+            morsel_row_count: 2,
+            ..ParquetConversionOptions::default()
+        };
+        let result = convert_parquet_bytes(&parquet_bytes(&batch), &options).unwrap();
+        let catalog = first_table_catalog(&result.cove_bytes);
+        let score = catalog.tables[0]
+            .columns
+            .iter()
+            .find(|column| column.name == "score")
+            .unwrap();
+        let score_stats = zone_stats_entries(&result.cove_bytes)
+            .into_iter()
+            .find(|entry| entry.column_id == score.column_id)
+            .unwrap();
+
+        assert_eq!(score_stats.distinct_count, 1);
+        assert_eq!(score_stats.run_count, 1);
+        assert!(score_stats.stats.flags.contains(ZoneStatFlags::HAS_NAN));
+        assert!(score_stats
+            .stats
+            .flags
+            .contains(ZoneStatFlags::DISTINCT_EXACT));
+        assert!(!score_stats.stats.flags.contains(ZoneStatFlags::HAS_MIN_MAX));
+        assert!(!score_stats.stats.flags.contains(ZoneStatFlags::CONSTANT));
+        assert!(score_stats.stats.min.is_none());
+        assert!(score_stats.stats.max.is_none());
     }
 
     #[test]
@@ -4667,5 +4852,29 @@ mod tests {
             }
         }
         out
+    }
+
+    fn zone_stats_entries(bytes: &[u8]) -> Vec<ZoneStatsEntry> {
+        let report = validate_bytes_with_options(
+            bytes,
+            ValidationOptions {
+                semantic: true,
+                verify_digests: false,
+                allow_unknown_optional_extensions: true,
+                ..ValidationOptions::default()
+            },
+        )
+        .unwrap();
+        report
+            .validated
+            .footer
+            .sections
+            .iter()
+            .filter(|entry| entry.section_kind == SectionKind::ZoneStats as u16)
+            .flat_map(|entry| {
+                let payload = compression::section_payload(bytes, entry).unwrap();
+                ZoneStatsSection::parse(&payload).unwrap().entries
+            })
+            .collect()
     }
 }

@@ -21,6 +21,12 @@ class TrainingArchive:
     def training_samples(self, split: Optional[str] = None, include_payloads: bool = False):
         return self._native.training_samples(split, include_payloads)
 
+    def training_sample_count(self, split: Optional[str] = None) -> int:
+        return self._native.training_sample_count(split)
+
+    def iter_training_samples(self, split: Optional[str] = None, include_payloads: bool = False) -> Iterator[dict]:
+        yield from self._native.iter_training_samples(split, include_payloads)
+
     def chunks(self, include_text: bool = False):
         return self._native.chunks(include_text)
 
@@ -36,10 +42,11 @@ class TrainingArchive:
         except ImportError as exc:
             raise ImportError("Install cove-ai[hf] to use to_hf_dataset().") from exc
 
-        rows = self.training_samples(split=split, include_payloads=include_payloads)
         if streaming:
-            return IterableDataset.from_generator(lambda: iter(rows))
-        return Dataset.from_list(rows)
+            return IterableDataset.from_generator(
+                lambda: self.iter_training_samples(split=split, include_payloads=include_payloads)
+            )
+        return Dataset.from_list(list(self.iter_training_samples(split=split, include_payloads=include_payloads)))
 
     def to_torch_iterable(self, split: Optional[str] = None, batch_size: int | None = None, include_payloads: bool = True):
         try:
@@ -51,12 +58,11 @@ class TrainingArchive:
 
         class CoveAiIterableDataset(IterableDataset):
             def __iter__(self_inner):
-                rows = archive.training_samples(split=split, include_payloads=include_payloads)
                 if batch_size is None:
-                    yield from rows
+                    yield from archive.iter_training_samples(split=split, include_payloads=include_payloads)
                     return
                 batch = []
-                for row in rows:
+                for row in archive.iter_training_samples(split=split, include_payloads=include_payloads):
                     batch.append(row)
                     if len(batch) == batch_size:
                         yield batch

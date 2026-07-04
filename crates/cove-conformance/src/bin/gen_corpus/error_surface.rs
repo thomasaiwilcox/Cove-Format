@@ -98,6 +98,10 @@ pub(super) fn write_error_surface_fixtures(writer: &mut CorpusWriter<'_>) {
             "reject/error_surface_cache_stale.json",
             "COVE_E_CACHE_STALE",
         ),
+        (
+            "reject/error_surface_query_discovery_invalid.json",
+            "COVE_E_QUERY_DISCOVERY_INVALID",
+        ),
     ] {
         write_fixture(
             root,

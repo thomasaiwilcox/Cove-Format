@@ -19,6 +19,14 @@ struct PyTrainingArchive {
     dataset_dir: Option<String>,
 }
 
+#[pyclass(name = "TrainingSampleIterator")]
+struct PyTrainingSampleIterator {
+    archive: cove_ai_adapters::AiTrainingArchive,
+    split: Option<String>,
+    include_payloads: bool,
+    index: usize,
+}
+
 #[pymethods]
 impl PyTrainingArchive {
     fn verify(&self, py: Python<'_>, policy_report: Option<bool>) -> PyResult<Py<PyAny>> {
@@ -26,6 +34,7 @@ impl PyTrainingArchive {
         let value = archive
             .verify(AiVerifyOptions {
                 policy_report: policy_report.unwrap_or(true),
+                strict_training: false,
             })
             .map_err(py_error)?;
         json_to_py(py, &value)
@@ -45,6 +54,46 @@ impl PyTrainingArchive {
             })
             .map_err(py_error)?;
         json_to_py(py, &Value::Array(rows))
+    }
+
+    fn training_sample_count(&self, split: Option<String>) -> PyResult<usize> {
+        let archive = self.open_native()?;
+        archive
+            .training_sample_count(split.as_deref())
+            .map_err(py_error)
+    }
+
+    fn training_sample_at(
+        &self,
+        py: Python<'_>,
+        index: usize,
+        split: Option<String>,
+        include_payloads: Option<bool>,
+    ) -> PyResult<Py<PyAny>> {
+        let archive = self.open_native()?;
+        let row = archive
+            .training_sample_at(
+                index,
+                AiSampleIteratorOptions {
+                    split,
+                    include_payloads: include_payloads.unwrap_or(false),
+                },
+            )
+            .map_err(py_error)?;
+        json_to_py(py, &row.unwrap_or(Value::Null))
+    }
+
+    fn iter_training_samples(
+        &self,
+        split: Option<String>,
+        include_payloads: Option<bool>,
+    ) -> PyResult<PyTrainingSampleIterator> {
+        Ok(PyTrainingSampleIterator {
+            archive: self.open_native()?,
+            split,
+            include_payloads: include_payloads.unwrap_or(false),
+            index: 0,
+        })
     }
 
     fn chunks(&self, py: Python<'_>, include_text: Option<bool>) -> PyResult<Py<PyAny>> {
@@ -104,6 +153,31 @@ impl PyTrainingArchive {
     }
 }
 
+#[pymethods]
+impl PyTrainingSampleIterator {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        let row = self
+            .archive
+            .training_sample_at(
+                self.index,
+                AiSampleIteratorOptions {
+                    split: self.split.clone(),
+                    include_payloads: self.include_payloads,
+                },
+            )
+            .map_err(py_error)?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        self.index += 1;
+        Ok(Some(json_to_py(py, &row)?))
+    }
+}
+
 impl PyTrainingArchive {
     fn open_native(&self) -> PyResult<cove_ai_adapters::AiTrainingArchive> {
         open_archive(
@@ -130,6 +204,7 @@ fn open(path: String, cove_ai: Option<String>, dataset_dir: Option<String>) -> P
 #[pymodule]
 fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyTrainingArchive>()?;
+    module.add_class::<PyTrainingSampleIterator>()?;
     module.add_function(wrap_pyfunction!(open, module)?)?;
     Ok(())
 }
