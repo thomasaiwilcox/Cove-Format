@@ -6,6 +6,8 @@ enum Command {
     Doctor {
         file: PathBuf,
         json: bool,
+        query_discovery: bool,
+        query_discovery_options: QueryDiscoveryCliOptions,
     },
     Inspect {
         file: PathBuf,
@@ -13,6 +15,8 @@ enum Command {
         json: bool,
         performance: bool,
         ai: bool,
+        query_discovery: bool,
+        query_discovery_options: QueryDiscoveryCliOptions,
     },
     Optimize {
         file: PathBuf,
@@ -91,6 +95,23 @@ enum Command {
     Help(HelpTopic),
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct QueryDiscoveryCliOptions {
+    policy: Option<String>,
+    audience: Option<String>,
+    principal_class: Option<String>,
+    policy_fingerprint: Option<String>,
+}
+
+impl QueryDiscoveryCliOptions {
+    fn has_explicit_binding(&self) -> bool {
+        self.policy.is_some()
+            || self.audience.is_some()
+            || self.principal_class.is_some()
+            || self.policy_fingerprint.is_some()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConvertFormat {
     Parquet,
@@ -146,6 +167,8 @@ struct QueryCommand {
     file: Option<PathBuf>,
     query: String,
     query_file: Option<PathBuf>,
+    from_template: Option<String>,
+    template_params: Vec<(String, String)>,
     format: OutputFormat,
     take: Option<usize>,
     explain: Option<String>,
@@ -173,6 +196,8 @@ struct QueryCommand {
 
 struct QueryCommandOptions {
     query_file: Option<PathBuf>,
+    from_template: Option<String>,
+    template_params: Vec<(String, String)>,
     format: OutputFormat,
     take: Option<usize>,
     explain: Option<String>,
@@ -327,10 +352,21 @@ fn parse_examples(args: Vec<String>) -> Result<Command, String> {
 
 fn parse_doctor(args: Vec<String>) -> Result<Command, String> {
     let mut json = false;
+    let mut query_discovery = false;
+    let mut query_discovery_options = QueryDiscoveryCliOptions::default();
     let mut file = None;
-    for arg in args {
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        if parse_query_discovery_binding_option(&arg, &mut args, &mut query_discovery_options)? {
+            continue;
+        }
         match arg.as_str() {
             "--json" => json = true,
+            "--query-discovery" => query_discovery = true,
+            "--agent" => {
+                query_discovery = true;
+                json = true;
+            }
             "-h" | "--help" => return Ok(Command::Help(HelpTopic::Global)),
             arg if arg.starts_with("--") => return Err(format!("unknown doctor option '{arg}'")),
             path => {
@@ -340,9 +376,19 @@ fn parse_doctor(args: Vec<String>) -> Result<Command, String> {
             }
         }
     }
+    if query_discovery_options.has_explicit_binding() && !query_discovery {
+        return Err("query-discovery policy options require --query-discovery".into());
+    }
+    if query_discovery && !json {
+        return Err("cove doctor --query-discovery requires --json".into());
+    }
     Ok(Command::Doctor {
-        file: file.ok_or_else(|| "usage: cove doctor [--json] <file>".to_string())?,
+        file: file.ok_or_else(|| {
+            "usage: cove doctor [--json] [--query-discovery] [--policy public|developer] [--audience name] <file>".to_string()
+        })?,
         json,
+        query_discovery,
+        query_discovery_options,
     })
 }
 
@@ -355,13 +401,24 @@ fn parse_inspect(args: Vec<String>) -> Result<Command, String> {
     let mut json = false;
     let mut performance = false;
     let mut ai = false;
+    let mut query_discovery = false;
+    let mut query_discovery_options = QueryDiscoveryCliOptions::default();
     let mut file = None;
-    for arg in args {
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        if parse_query_discovery_binding_option(&arg, &mut args, &mut query_discovery_options)? {
+            continue;
+        }
         match arg.as_str() {
             "--queries" => queries = true,
             "--json" => json = true,
             "--performance" => performance = true,
             "--ai" => ai = true,
+            "--query-discovery" => query_discovery = true,
+            "--agent" => {
+                query_discovery = true;
+                json = true;
+            }
             "-h" | "--help" => return Ok(Command::Help(HelpTopic::Inspect)),
             arg if arg.starts_with("--") => return Err(format!("unknown inspect option '{arg}'")),
             path => {
@@ -371,25 +428,85 @@ fn parse_inspect(args: Vec<String>) -> Result<Command, String> {
             }
         }
     }
+    if query_discovery_options.has_explicit_binding() && !query_discovery {
+        return Err("query-discovery policy options require --query-discovery".into());
+    }
+    if query_discovery && !json {
+        return Err("cove inspect --query-discovery requires --json".into());
+    }
     Ok(Command::Inspect {
         file: file.ok_or_else(|| {
-            "usage: cove inspect [--queries] [--performance] [--ai] [--json] <file>".to_string()
+            "usage: cove inspect [--queries] [--performance] [--ai] [--query-discovery] [--policy public|developer] [--audience name] [--json] <file>".to_string()
         })?,
         queries,
         json,
         performance,
         ai,
+        query_discovery,
+        query_discovery_options,
     })
+}
+
+fn parse_query_discovery_binding_option(
+    arg: &str,
+    args: &mut impl Iterator<Item = String>,
+    options: &mut QueryDiscoveryCliOptions,
+) -> Result<bool, String> {
+    if let Some(value) = query_discovery_value_option(arg, "--policy", args)? {
+        options.policy = Some(value);
+        return Ok(true);
+    }
+    if let Some(value) = query_discovery_value_option(arg, "--audience", args)? {
+        options.audience = Some(value);
+        return Ok(true);
+    }
+    if let Some(value) = query_discovery_value_option(arg, "--principal-class", args)? {
+        options.principal_class = Some(value);
+        return Ok(true);
+    }
+    if let Some(value) = query_discovery_value_option(arg, "--policy-fingerprint", args)? {
+        options.policy_fingerprint = Some(value);
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn query_discovery_value_option(
+    arg: &str,
+    option: &str,
+    args: &mut impl Iterator<Item = String>,
+) -> Result<Option<String>, String> {
+    if arg == option {
+        let value = args
+            .next()
+            .ok_or_else(|| format!("{option} requires a value"))?;
+        if value.starts_with("--") {
+            return Err(format!("{option} requires a value"));
+        }
+        return Ok(Some(value));
+    }
+    if let Some(value) = arg.strip_prefix(&format!("{option}=")) {
+        if value.is_empty() {
+            return Err(format!("{option} requires a value"));
+        }
+        return Ok(Some(value.to_string()));
+    }
+    Ok(None)
 }
 
 fn reject_mixed_inspect_modes(args: &[String]) -> Result<(), String> {
     let detailed = args.iter().any(|arg| arg == "--sections");
     let beginner = args
         .iter()
-        .any(|arg| matches!(arg.as_str(), "--queries" | "--performance" | "--ai"));
+        .any(|arg| {
+            matches!(
+                arg.as_str(),
+                "--queries" | "--performance" | "--ai" | "--query-discovery" | "--agent"
+            ) || is_query_discovery_value_option(arg)
+        });
     if detailed && beginner {
         return Err(
-            "`cove inspect --sections` cannot be combined with `--queries` or `--performance`; use beginner inspect without `--sections`, or detailed inspect without beginner-only options"
+            "`cove inspect --sections` cannot be combined with beginner inspect modes such as `--queries`, `--performance`, `--ai`, or `--query-discovery`; use beginner inspect without `--sections`, or detailed inspect without beginner-only options"
                 .into(),
         );
     }
@@ -398,15 +515,31 @@ fn reject_mixed_inspect_modes(args: &[String]) -> Result<(), String> {
 
 fn wants_detailed_inspect(args: &[String]) -> bool {
     let mut positional = 0usize;
-    for arg in args {
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
         match arg.as_str() {
             "--sections" => return true,
-            "--queries" | "--json" | "--performance" | "--ai" | "-h" | "--help" => {}
+            "--queries" | "--json" | "--performance" | "--ai" | "--query-discovery"
+            | "--agent" | "-h" | "--help" => {}
+            "--policy" | "--audience" | "--principal-class" | "--policy-fingerprint" => {
+                args.next();
+            }
+            _ if is_query_discovery_value_option(arg) => {}
             _ if arg.starts_with("--") => {}
             _ => positional += 1,
         }
     }
     positional > 1
+}
+
+fn is_query_discovery_value_option(arg: &str) -> bool {
+    matches!(
+        arg,
+        "--policy" | "--audience" | "--principal-class" | "--policy-fingerprint"
+    ) || arg.starts_with("--policy=")
+        || arg.starts_with("--audience=")
+        || arg.starts_with("--principal-class=")
+        || arg.starts_with("--policy-fingerprint=")
 }
 
 fn parse_convert(mut args: Vec<String>) -> Result<Command, String> {
@@ -684,6 +817,8 @@ fn parse_query(args: Vec<String>) -> Result<Command, String> {
     let mut delta_plan = false;
     let mut delta_plan_json = false;
     let mut query_file = None;
+    let mut from_template = None;
+    let mut template_params = Vec::new();
     let mut max_cell_width = 32usize;
     let mut positionals = Vec::new();
     let mut iter = args.into_iter().peekable();
@@ -901,13 +1036,41 @@ fn parse_query(args: Vec<String>) -> Result<Command, String> {
                     "--query-file requires a path or '-' for stdin".to_string()
                 })?));
             }
+            "--from-template" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--from-template requires a template id".to_string())?;
+                from_template = Some(parse_template_id(&value)?);
+            }
+            "--param" => {
+                let raw = iter
+                    .next()
+                    .ok_or_else(|| "--param requires name=value".to_string())?;
+                template_params.push(parse_template_param(&raw)?);
+            }
             "--json-diagnostics" => json_diagnostics = true,
             "-h" | "--help" => return Ok(Command::Help(HelpTopic::Query)),
+            arg if arg.starts_with("--from-template=") => {
+                from_template = Some(parse_template_id(&arg["--from-template=".len()..])?);
+            }
+            arg if arg.starts_with("--param=") => {
+                template_params.push(parse_template_param(&arg["--param=".len()..])?);
+            }
             arg if arg.starts_with("--") => return Err(format!("unknown query option '{arg}'")),
             positional => positionals.push(positional.to_string()),
         }
     }
-    let (file, query) = if query_file.is_some() {
+    if from_template.is_some() && query_file.is_some() {
+        return Err("--from-template cannot be combined with --query-file".into());
+    }
+    let (file, query) = if from_template.is_some() {
+        if positionals.len() != 1 {
+            return Err(
+                "usage: cove query [options] --from-template <id> --param name=value <file>".into(),
+            );
+        }
+        (Some(PathBuf::from(positionals.remove(0))), String::new())
+    } else if query_file.is_some() {
         match positionals.len() {
             0 if !external_tables.is_empty() => (None, String::new()),
             1 => (Some(PathBuf::from(positionals.remove(0))), String::new()),
@@ -929,6 +1092,8 @@ fn parse_query(args: Vec<String>) -> Result<Command, String> {
         file,
         query,
         query_file,
+        from_template,
+        template_params,
         format,
         take,
         explain,
@@ -952,6 +1117,23 @@ fn parse_query(args: Vec<String>) -> Result<Command, String> {
         delta_plan_json,
         max_cell_width,
     })))
+}
+
+fn parse_template_id(raw: &str) -> Result<String, String> {
+    if raw.trim().is_empty() || raw.starts_with("--") {
+        return Err("--from-template requires a template id".into());
+    }
+    Ok(raw.to_string())
+}
+
+fn parse_template_param(raw: &str) -> Result<(String, String), String> {
+    let (name, value) = raw
+        .split_once('=')
+        .ok_or_else(|| "--param requires name=value".to_string())?;
+    if name.trim().is_empty() {
+        return Err("--param requires a non-empty name".into());
+    }
+    Ok((name.trim().to_string(), value.to_string()))
 }
 
 fn parse_query_engine(value: &str) -> Result<QueryEngine, String> {
@@ -1126,6 +1308,40 @@ mod tests {
         assert_eq!(
             parse_args(args(&["canonicalize", "digest", "--json"])).unwrap(),
             Command::Canonicalise { args: forwarded }
+        );
+    }
+
+    #[test]
+    fn query_template_options_parse_and_reject_empty_template_ids() {
+        let command = parse_args(args(&[
+            "query",
+            "--from-template",
+            "table_filter_select_take",
+            "--param",
+            "status=active",
+            "people.cove",
+        ]))
+        .unwrap();
+        let Command::Query(command) = command else {
+            panic!("expected query command");
+        };
+        assert_eq!(
+            command.from_template.as_deref(),
+            Some("table_filter_select_take")
+        );
+        assert_eq!(
+            command.template_params,
+            vec![("status".to_string(), "active".to_string())]
+        );
+
+        assert_eq!(
+            parse_args(args(&["query", "--from-template=", "people.cove"])).unwrap_err(),
+            "--from-template requires a template id"
+        );
+        assert_eq!(
+            parse_args(args(&["query", "--from-template", "--param", "x=y", "people.cove"]))
+                .unwrap_err(),
+            "--from-template requires a template id"
         );
     }
 

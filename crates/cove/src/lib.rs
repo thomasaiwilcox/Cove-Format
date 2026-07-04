@@ -8,6 +8,7 @@
 use std::{error::Error, fmt, fs, path::Path};
 
 pub use cove_convert as convert;
+use cove_core::query_discovery::build_query_discovery_manifest_value;
 pub use cove_core::{
     artifact,
     constants::{self, DigestAlgorithm},
@@ -15,6 +16,18 @@ pub use cove_core::{
     footer, header,
     mount::{self, MountOptions, MountedCoveFile},
     postscript, profile,
+    query_discovery::{
+        build_query_discovery_manifest, embedded_query_discovery_manifests,
+        query_discovery_section_payload, query_discovery_validation_context_for_embedded_source,
+        query_discovery_validation_context_for_source, render_query_discovery_template,
+        QueryAiCapability, QueryDiscoveryAliasBinding, QueryDiscoveryBudget,
+        QueryDiscoveryCoveQlContract, QueryDiscoveryIdentifier, QueryDiscoveryManifest,
+        QueryDiscoveryOptions, QueryDiscoveryPolicy, QueryDiscoveryPropertyGlossaryEntry,
+        QueryDiscoveryRelationship, QueryDiscoverySourceBinding, QueryDiscoverySourceMember,
+        QueryDiscoverySurface, QueryDiscoveryValidationReport, QueryExample,
+        QueryExampleValidationStatus, QueryTemplate, QueryTemplateOperatorChain,
+        QueryTemplateParameterConstraint, QueryTemplateValidationStatus,
+    },
     reader::{self, ValidatedCoveFile},
     table,
     utility::hex_encode,
@@ -35,10 +48,10 @@ pub mod engine {
 pub mod prelude {
     pub use crate::{
         conversion_report, convert_file, convert_parquet_file, discover_query_surfaces_file,
-        explain_query_file, inspect_file, query_file, read_table, register_datafusion,
-        suggest_queries_for_file, validate_file, write_table, CoveFacadeError, ExplainOptions,
-        ExplainReport, FileInspection, PreparedQueryTextOptions, QueryOptions, QueryResult,
-        QueryTextError,
+        explain_query_file, inspect_file, query_discovery_manifest_file, query_file, read_table,
+        register_datafusion, suggest_queries_for_file, validate_file, write_table, CoveFacadeError,
+        ExplainOptions, ExplainReport, FileInspection, PreparedQueryTextOptions, QueryOptions,
+        QueryResult, QueryTextError,
     };
     pub use coveql::ExplainMode;
 }
@@ -316,6 +329,100 @@ pub fn discover_query_surfaces_file(
 
 pub fn discover_query_surfaces_bytes(bytes: &[u8]) -> QuerySurfaceDiscovery {
     coveql::discover_query_surfaces(bytes, QuerySurfaceDiscoveryOptions::default())
+}
+
+/// Build a canonical COVE-QD query-discovery manifest for a COVE artifact file.
+///
+/// # Errors
+///
+/// Returns a [`CoveFacadeError`] if the file cannot be read or the manifest
+/// cannot be generated from canonical metadata.
+pub fn query_discovery_manifest_file(
+    path: impl AsRef<Path>,
+    mut options: QueryDiscoveryOptions,
+) -> Result<QueryDiscoveryManifest, CoveFacadeError> {
+    let path = path.as_ref();
+    let bytes = fs::read(path)?;
+    if options.source_name.is_none() {
+        options.source_name = Some(path.display().to_string());
+    }
+    build_facade_query_discovery_manifest(&bytes, options)
+}
+
+/// Build a canonical COVE-QD query-discovery manifest from artifact bytes.
+///
+/// # Errors
+///
+/// Returns a [`CoveFacadeError`] if the manifest cannot be generated from
+/// canonical metadata or validated after example planning.
+pub fn query_discovery_manifest_bytes(
+    bytes: &[u8],
+    options: QueryDiscoveryOptions,
+) -> Result<QueryDiscoveryManifest, CoveFacadeError> {
+    build_facade_query_discovery_manifest(bytes, options)
+}
+
+fn build_facade_query_discovery_manifest(
+    bytes: &[u8],
+    options: QueryDiscoveryOptions,
+) -> Result<QueryDiscoveryManifest, CoveFacadeError> {
+    if !options.validate_examples {
+        return Ok(build_query_discovery_manifest(bytes, options)?);
+    }
+    let mut build_options = options;
+    build_options.validate_examples = false;
+    let mut value = build_query_discovery_manifest_value(bytes, &build_options)?;
+    validate_query_discovery_examples(bytes, &mut value);
+    let canonical = serde_json::to_vec(&value)
+        .map_err(|error| CoveError::QueryDiscoveryInvalid(error.to_string()))?;
+    Ok(QueryDiscoveryManifest::parse(&canonical)?)
+}
+
+fn validate_query_discovery_examples(bytes: &[u8], manifest: &mut serde_json::Value) {
+    let Some(examples) = manifest
+        .get_mut("examples")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+    let mut diagnostics = Vec::new();
+    for (index, example) in examples.iter_mut().enumerate() {
+        let Some(query) = example.get("query").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let validation = coveql::parse_resolve_and_plan_query(
+            bytes,
+            query,
+            coveql::ParseOptions::default(),
+            coveql::ResolveOptions::default(),
+            coveql::PlanOptions::default(),
+            reader::ValidationOptions::default(),
+        );
+        if validation.is_ok() {
+            example["query_validation"] = serde_json::json!("planned_dry_run");
+        } else {
+            example["query_validation"] = serde_json::json!("not_validated");
+            diagnostics.push(serde_json::json!({
+                "code": "QD_EXAMPLE_VALIDATION_FAILED",
+                "severity": "warning",
+                "message": "Generated example could not be validated by a no-payload planning dry-run.",
+                "target_kind": "json_pointer",
+                "target": format!("/examples/{index}"),
+                "withheld": false
+            }));
+        }
+    }
+    if diagnostics.is_empty() {
+        return;
+    }
+    let manifest_diagnostics = manifest
+        .as_object_mut()
+        .expect("query-discovery manifest value must be an object")
+        .entry("diagnostics")
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+    if let Some(existing) = manifest_diagnostics.as_array_mut() {
+        existing.extend(diagnostics);
+    }
 }
 
 /// Suggest CoveQL queries for the surfaces discovered in a COVE artifact file.
@@ -614,6 +721,110 @@ mod tests {
         assert!(discovery.queryable);
         let suggestions = suggest_queries_for_file(&cove_path).unwrap();
         assert!(!suggestions.is_empty());
+
+        let _ = std::fs::remove_file(csv_path);
+        let _ = std::fs::remove_file(cove_path);
+        let _ = std::fs::remove_dir(dir);
+    }
+
+    #[test]
+    fn query_discovery_does_not_create_roots_absent_from_canonical_metadata() {
+        let dir = temp_dir("cove_facade_qd_lie");
+        std::fs::create_dir_all(&dir).unwrap();
+        let csv_path = dir.join("events.csv");
+        let cove_path = dir.join("events.cove");
+        std::fs::write(&csv_path, "id,name\n1,Ada\n").unwrap();
+        let result = convert_file(
+            &csv_path,
+            convert::ConversionOptions {
+                source_format: Some(convert::SourceFormat::Csv),
+                ..convert::ConversionOptions::default()
+            },
+        )
+        .unwrap();
+        std::fs::write(&cove_path, &result.cove_bytes).unwrap();
+
+        let manifest =
+            query_discovery_manifest_file(&cove_path, QueryDiscoveryOptions::default()).unwrap();
+        let mut value = manifest.value().clone();
+        value["surfaces"]["tables"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "name": "fake",
+                "query_name": "fake",
+                "query_identifier": "fake",
+                "display_name": "fake",
+                "root": "table(fake)",
+                "columns": [{
+                    "name": "id",
+                    "query_name": "id",
+                    "query_identifier": "id",
+                    "display_name": "id",
+                    "logical_type": "int64",
+                    "nullable": false,
+                    "operations": ["select", "filter"]
+                }]
+            }));
+        value["templates"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "id": "lying_table",
+                "profiles": ["table"],
+                "binding_mode": "typed_ast_fragments",
+                "template_display": "table({table}).where({predicate}).select({columns}).take({limit})",
+                "operator_chain": [
+                    {"method": "root", "kind": "table", "arg": "{table}"},
+                    {"method": "where", "arg": "{predicate}"},
+                    {"method": "select", "arg": "{columns}"},
+                    {"method": "take", "arg": "{limit}"}
+                ],
+                "template_validation": "operator_chain_validated",
+                "parameters": [
+                    {
+                        "name": "table",
+                        "kind": "root_name",
+                        "allowed_query_identifiers": ["fake"]
+                    },
+                    {
+                        "name": "predicate",
+                        "kind": "predicate",
+                        "root": "table({table})",
+                        "allowed_query_identifiers_by_root": {"table(fake)": ["id"]},
+                        "allowed_operators": ["eq"],
+                        "allowed_literal_types": ["int64"],
+                        "max_depth": 1
+                    },
+                    {
+                        "name": "columns",
+                        "kind": "select_list",
+                        "root": "table({table})",
+                        "allowed_query_identifiers_by_root": {"table(fake)": ["id"]},
+                        "max_items": 1
+                    },
+                    {
+                        "name": "limit",
+                        "kind": "uint",
+                        "default": 1,
+                        "max": 1
+                    }
+                ]
+            }));
+        let canonical = serde_json::to_vec(&value).unwrap();
+        let lying_manifest = QueryDiscoveryManifest::parse(&canonical).unwrap();
+        let query = render_query_discovery_template(
+            &lying_manifest,
+            "lying_table",
+            &[
+                ("table".to_string(), "fake".to_string()),
+                ("id".to_string(), "1".to_string()),
+                ("columns".to_string(), "id".to_string()),
+            ],
+        )
+        .unwrap();
+
+        assert!(query_file(&cove_path, &query, QueryOptions::default()).is_err());
 
         let _ = std::fs::remove_file(csv_path);
         let _ = std::fs::remove_file(cove_path);

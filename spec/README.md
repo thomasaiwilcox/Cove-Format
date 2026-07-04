@@ -15,6 +15,8 @@ Start here by task:
 - Mapping source data into objects and associations: read `07-mapping/`.
 - Validating conformance or writer claims: read `08-conformance/`.
 - Using optional AI companion metadata: read `09-ai/`.
+- Publishing query-discovery metadata for CoveQL tooling and agents: read
+  `10-query-discovery/`.
 
 ## Document Map
 
@@ -30,3 +32,4 @@ Start here by task:
 | Mapping | [`cove-map.md`](07-mapping/cove-map.md) |
 | Conformance | [`profile-capability.md`](08-conformance/profile-capability.md), [`writer-profiles.md`](08-conformance/writer-profiles.md), [`validation-model.md`](08-conformance/validation-model.md), [`conformance-suite.md`](08-conformance/conformance-suite.md), [`utilities-governance.md`](08-conformance/utilities-governance.md) |
 | AI extension | [`cove-ai.md`](09-ai/cove-ai.md), [`cove-map-ai.md`](09-ai/cove-map-ai.md), [`cove-chunk.md`](09-ai/cove-chunk.md), [`cove-tok.md`](09-ai/cove-tok.md), [`cove-vec.md`](09-ai/cove-vec.md), [`cove-mmseq.md`](09-ai/cove-mmseq.md), [`cove-train.md`](09-ai/cove-train.md), [`coveql-ai.md`](09-ai/coveql-ai.md) |
+| Query discovery | [`cove-query-discovery.md`](10-query-discovery/cove-query-discovery.md) |

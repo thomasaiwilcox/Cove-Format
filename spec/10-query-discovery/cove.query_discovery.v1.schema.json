@@ -1,0 +1,807 @@
+{
+  "$id": "https://coveformat.org/schema/cove.query_discovery.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": true,
+  "allOf": [
+    {
+      "not": {
+        "anyOf": [
+          {
+            "required": [
+              "validation_status"
+            ]
+          },
+          {
+            "required": [
+              "validation_flags"
+            ]
+          }
+        ]
+      }
+    }
+  ],
+  "description": "Structural schema for the advisory COVE-QD CoveQL query discovery manifest. Canonicalization, duplicate-key rejection, freshness, and policy checks are enforced by the COVE-QD validation contract, not by JSON Schema alone.",
+  "properties": {
+    "ai": {
+      "additionalProperties": true,
+      "properties": {
+        "methods": {
+          "items": {
+            "$ref": "#/$defs/ai_method"
+          },
+          "type": "array"
+        },
+        "profile_available": {
+          "type": "boolean"
+        },
+        "sidecars": {
+          "items": {
+            "$ref": "#/$defs/ai_sidecar"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "alias_bindings": {
+      "items": {
+        "$ref": "#/$defs/alias_binding"
+      },
+      "type": "array"
+    },
+    "authority": {
+      "const": "advisory_discovery_not_archive_truth"
+    },
+    "canonicalization": {
+      "const": "rfc8785-jcs"
+    },
+    "coveql": {
+      "additionalProperties": true,
+      "properties": {
+        "allowed_explain_modes": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "capabilities": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "core_version": {
+          "type": "string"
+        },
+        "default_explain_mode": {
+          "type": "string"
+        },
+        "language_version": {
+          "type": "string"
+        },
+        "profile_contract_versions": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "profiles": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "roots": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "diagnostics": {
+      "items": {
+        "$ref": "#/$defs/diagnostic"
+      },
+      "type": "array"
+    },
+    "examples": {
+      "items": {
+        "$ref": "#/$defs/example"
+      },
+      "type": "array"
+    },
+    "generated_at": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "generated_by": {
+      "type": "object"
+    },
+    "manifest_features": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "manifest_id": {
+      "type": "string"
+    },
+    "policy": {
+      "additionalProperties": true,
+      "properties": {
+        "aggregate_disclosure": {
+          "type": "string"
+        },
+        "audience": {
+          "type": "string"
+        },
+        "descriptions_are_untrusted_data": {
+          "type": "boolean"
+        },
+        "field_names_may_be_redacted": {
+          "type": "boolean"
+        },
+        "forbidden_surfaces_withheld": {
+          "type": "boolean"
+        },
+        "metadata_disclosure": {
+          "type": "string"
+        },
+        "policy_fingerprint": {
+          "type": "string"
+        },
+        "principal_class": {
+          "type": "string"
+        },
+        "redaction_scope": {
+          "type": "string"
+        },
+        "visibility_scope": {
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "property_glossary": {
+      "items": {
+        "$ref": "#/$defs/property_glossary_entry"
+      },
+      "type": "array"
+    },
+    "relationships": {
+      "items": {
+        "$ref": "#/$defs/relationship"
+      },
+      "type": "array"
+    },
+    "resource_budgets": {
+      "additionalProperties": true,
+      "type": "object"
+    },
+    "root_index": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "schema": {
+      "const": "cove.query_discovery.v1"
+    },
+    "source_binding": {
+      "additionalProperties": true,
+      "properties": {
+        "as_of_csn": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "covm_snapshot": {
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "file_digest": {
+          "type": "string"
+        },
+        "file_length": {
+          "type": "string"
+        },
+        "members": {
+          "items": {
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "redaction_scope": {
+          "type": "string"
+        },
+        "source_kind": {
+          "enum": [
+            "cove_file",
+            "covm_dataset_snapshot",
+            "external_catalog_snapshot"
+          ]
+        },
+        "source_uri_hint": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "visibility_scope": {
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "surfaces": {
+      "additionalProperties": true,
+      "properties": {
+        "evidence": {
+          "items": {
+            "$ref": "#/$defs/surface"
+          },
+          "type": "array"
+        },
+        "objects": {
+          "items": {
+            "$ref": "#/$defs/surface"
+          },
+          "type": "array"
+        },
+        "projections": {
+          "items": {
+            "$ref": "#/$defs/surface"
+          },
+          "type": "array"
+        },
+        "tables": {
+          "items": {
+            "$ref": "#/$defs/surface"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "templates": {
+      "items": {
+        "$ref": "#/$defs/template"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "schema",
+    "canonicalization",
+    "authority",
+    "source_binding",
+    "coveql",
+    "surfaces",
+    "policy"
+  ],
+  "title": "COVE-QD CoveQL Query Discovery Manifest v1",
+  "type": "object",
+  "$defs": {
+    "ai_method": {
+      "additionalProperties": true,
+      "properties": {
+        "authority": {
+          "type": "string"
+        },
+        "capabilities": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "example": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "profiles": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "requires_sidecar": {
+          "type": "boolean"
+        },
+        "targets": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "ai_sidecar": {
+      "additionalProperties": true,
+      "properties": {
+        "digest": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "required_for": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "uri_hint": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "alias_binding": {
+      "additionalProperties": true,
+      "properties": {
+        "alias": {
+          "type": "string"
+        },
+        "policy_scope": {
+          "type": "string"
+        },
+        "query_identifier": {
+          "type": "string"
+        },
+        "target_kind": {
+          "type": "string"
+        },
+        "target_path": {
+          "type": "string"
+        },
+        "target_root": {
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "diagnostic": {
+      "additionalProperties": true,
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "severity": {
+          "enum": [
+            "info",
+            "warning",
+            "error"
+          ]
+        },
+        "target": {
+          "pattern": "^/",
+          "type": "string"
+        },
+        "target_kind": {
+          "const": "json_pointer"
+        },
+        "withheld": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "code",
+        "severity",
+        "message"
+      ],
+      "type": "object"
+    },
+    "example": {
+      "additionalProperties": true,
+      "properties": {
+        "expected_output": {
+          "type": "string"
+        },
+        "profiles": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "query": {
+          "type": "string"
+        },
+        "query_validation": {
+          "enum": [
+            "parsed_and_resolved",
+            "parsed_only",
+            "planned_dry_run",
+            "not_validated_policy_limited",
+            "not_validated_budget_limited",
+            "not_validated"
+          ]
+        },
+        "question": {
+          "type": "string"
+        },
+        "why": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "type": "object"
+    },
+    "operator_chain_entry": {
+      "additionalProperties": true,
+      "properties": {
+        "arg": {
+          "type": "string"
+        },
+        "capabilities": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "method": {
+          "type": "string"
+        },
+        "profiles": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "requires_sidecar": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "method"
+      ],
+      "type": "object"
+    },
+    "parameter": {
+      "additionalProperties": true,
+      "properties": {
+        "allowed_operators": {
+          "items": {
+            "enum": [
+              "eq",
+              "neq",
+              "lt",
+              "lte",
+              "gt",
+              "gte",
+              "and",
+              "or",
+              "not",
+              "in"
+            ]
+          },
+          "type": "array"
+        },
+        "allowed_literal_types": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "allowed_query_identifiers": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "allowed_query_identifiers_by_root": {
+          "additionalProperties": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "type": "object"
+        },
+        "default": {
+          "type": [
+            "integer",
+            "string",
+            "boolean",
+            "null"
+          ]
+        },
+        "kind": {
+          "not": {
+            "enum": [
+              "raw",
+              "raw_query",
+              "coveql",
+              "coveql_text",
+              "query_text",
+              "method_chain"
+            ]
+          },
+          "type": "string"
+        },
+        "max": {
+          "type": "integer"
+        },
+        "max_depth": {
+          "type": "integer"
+        },
+        "max_items": {
+          "type": "integer"
+        },
+        "name": {
+          "type": "string"
+        },
+        "root": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "kind"
+      ],
+      "type": "object"
+    },
+    "row_count_hint": {
+      "additionalProperties": false,
+      "properties": {
+        "precision": {
+          "enum": [
+            "exact",
+            "rounded",
+            "bucketed",
+            "suppressed",
+            "unknown"
+          ]
+        },
+        "value": {
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "property_glossary_entry": {
+      "additionalProperties": true,
+      "properties": {
+        "authority": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "lineage": {
+          "type": "object"
+        },
+        "logical_type": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "policy_notes": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "property_flags": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "query_identifier_path": {
+          "type": "string"
+        },
+        "query_path": {
+          "type": "string"
+        },
+        "safe_operations": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "sensitivity": {
+          "type": "string"
+        },
+        "value_examples": {
+          "items": true,
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "relationship": {
+      "additionalProperties": true,
+      "properties": {
+        "association_root": {
+          "type": "string"
+        },
+        "authority": {
+          "type": "string"
+        },
+        "cardinality_hint": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        },
+        "endpoint_properties": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "example": {
+          "type": "string"
+        },
+        "from_root": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "to_root": {
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "surface": {
+      "additionalProperties": true,
+      "properties": {
+        "columns": {
+          "items": {
+            "$ref": "#/$defs/surface_field"
+          },
+          "type": "array"
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "properties": {
+          "items": {
+            "$ref": "#/$defs/surface_field"
+          },
+          "type": "array"
+        },
+        "query_identifier": {
+          "type": "string"
+        },
+        "query_name": {
+          "type": "string"
+        },
+        "root": {
+          "type": "string"
+        },
+        "row_count_hint": {
+          "$ref": "#/$defs/row_count_hint"
+        }
+      },
+      "type": "object"
+    },
+    "surface_field": {
+      "additionalProperties": true,
+      "properties": {
+        "display_name": {
+          "type": "string"
+        },
+        "logical_type": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "nullable": {
+          "type": "boolean"
+        },
+        "operations": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "query_identifier": {
+          "type": "string"
+        },
+        "query_name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "query_identifier"
+      ],
+      "type": "object"
+    },
+    "template": {
+      "additionalProperties": true,
+      "properties": {
+        "binding_mode": {
+          "const": "typed_ast_fragments"
+        },
+        "expected_output": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "operator_chain": {
+          "items": {
+            "$ref": "#/$defs/operator_chain_entry"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "parameters": {
+          "items": {
+            "$ref": "#/$defs/parameter"
+          },
+          "type": "array"
+        },
+        "profiles": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "safety": {
+          "type": "object"
+        },
+        "template_display": {
+          "type": "string"
+        },
+        "template_validation": {
+          "enum": [
+            "operator_chain_validated",
+            "parameters_validated",
+            "representative_planned_dry_run",
+            "planned_dry_run",
+            "not_validated_policy_limited",
+            "not_validated_budget_limited",
+            "not_validated"
+          ]
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "binding_mode",
+        "operator_chain",
+        "parameters"
+      ],
+      "type": "object"
+    }
+  }
+}

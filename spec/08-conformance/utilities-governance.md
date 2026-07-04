@@ -19,6 +19,7 @@ The public COVE project SHOULD ship the following utilities and artifacts.
 - **cove-coverage:** Optional COVE-COVERAGE library for predicate normal forms, coverage providers, coverage sets, plan candidates, and proof validation.
 - **cove-index:** Optional COVE-I library for building, validating, and querying `.covi` secondary indexes.
 - **cove-cache:** Optional COVE-CACHE helpers for runtime/local predicate coverage caches and invalidation.
+- **cove-query-discovery:** Optional COVE-QD helpers for building, validating, rendering, and embedding query-discovery manifests.
 - **cove-runtime:** Optional COVE-R helpers for explicit reader sessions, registries, FFI adapter discovery, and engine compatibility hints.
 
 ### 80.2 CLI Tools
@@ -26,13 +27,14 @@ The public COVE project SHOULD ship the following utilities and artifacts.
 The public user-facing CLI is a single `cove` command with grouped subcommands:
 
 - **cove validate:** Validate structure, CRCs, digests, schema, dictionaries, sections, indexes, profiles, extensions, and conformance.
-- **cove inspect:** Print beginner-friendly artifact summaries by default, with detailed section inspection via `--sections`.
+- **cove inspect:** Print beginner-friendly artifact summaries by default, with detailed section inspection via `--sections` and query-discovery JSON via `--query-discovery --json`.
 - **cove dump:** Dump selected rows, columns, pages, morsels, dictionary values, or encoded array structures.
 - **cove query:** Execute CoveQL against queryable COVE artifacts and mappings.
 - **cove optimize:** Build safe acceleration sidecars and a performance discovery manifest.
 - **cove convert parquet|arrow|orc|csv:** Convert source files to COVE-T.
 - **cove convert report:** Emit machine-readable conversion fidelity reports for source-to-COVE and COVE-to-source conversions.
 - **cove map validate|preview|plan-keys|convert|build|doctor|suggest|parity|explain|diff|project|test:** Validate, preview, convert, build bundles, verify outputs, suggest starter mappings, compare projections, explain, diff, project, and test COVE-MAP artifacts.
+- **cove doctor --query-discovery --json:** Emit validation diagnostics for COVE-QD manifests and query-discovery generation.
 - **cove export arrow:** Export COVE-T tables to Arrow-compatible batches.
 - **cove perf explain-pruning|plan-cost:** Explain pruning decisions and estimate projected scan work.
 - **cove sidecar inspect index|coverage|layout|cache|runtime:** Inspect COVE-I, COVE-COVERAGE, COVE-L, COVE-CACHE, and COVE-R artifacts.
@@ -139,6 +141,7 @@ A benchmark MUST NOT claim format-level superiority when the result depends on o
 - COVE-COVERAGE proof-kind, proof-strength, coverage-granularity, and predicate-form registries,
 - COVE-I index-kind and index-capability registries,
 - COVE-CACHE compatibility and invalidation registry,
+- COVE-QD manifest schema, manifest-feature, template-parameter-kind, and diagnostic-code registries,
 - test vector registry,
 - implementation conformance levels,
 - performance benchmark methodology,
@@ -267,6 +270,7 @@ COVE keeps its archive-format identity while adding only the mechanisms that imp
 - COVE-COVERAGE coverage provider, coverage set, predicate normal-form, and plan-candidate structures;
 - COVE-I `.covi` secondary index artifact framing, index roots, and index-only capabilities;
 - COVE-CACHE runtime/local cache guidance and invalidation rules;
+- COVE-QD query-discovery manifest schema, query identifiers, structured templates, diagnostics, and embedded optional section rules;
 - stronger registry discipline for extensions and runtime bindings;
 - conformance vectors for registered codecs, fallback payloads, layout plans, split indexes, zero-copy maps, fast metadata, and runtime hint behaviour.
 

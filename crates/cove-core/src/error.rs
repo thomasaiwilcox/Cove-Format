@@ -89,6 +89,8 @@ pub enum CoveError {
     IndexOnlyUnsafe,
     /// COVE-CACHE entry is stale, corrupt, or incompatible with the requested operation.
     CacheStale,
+    /// COVE-QD query-discovery metadata is invalid for strict query generation.
+    QueryDiscoveryInvalid(String),
     /// Input buffer is too short to parse the requested structure.
     BufferTooShort,
     /// A field that MUST be zero contained a non-zero value.
@@ -240,6 +242,9 @@ impl fmt::Display for CoveError {
                 f,
                 "COVE_E_CACHE_STALE: cache entry stale, corrupt, or incompatible"
             ),
+            CoveError::QueryDiscoveryInvalid(s) => {
+                write!(f, "COVE_E_QUERY_DISCOVERY_INVALID: {s}")
+            }
             CoveError::BufferTooShort => {
                 write!(
                     f,
@@ -257,7 +262,7 @@ impl fmt::Display for CoveError {
 
 impl CoveError {
     /// Complete Spec §76 code inventory surfaced by [`Self::spec_code`].
-    pub const ALL_SPEC_CODES: [&'static str; 40] = [
+    pub const ALL_SPEC_CODES: [&'static str; 41] = [
         "COVE_E_BAD_MAGIC",
         "COVE_E_BAD_VERSION",
         "COVE_E_UNKNOWN_REQUIRED_FEATURE",
@@ -298,6 +303,7 @@ impl CoveError {
         "COVE_E_BAD_COVI",
         "COVE_E_INDEX_ONLY_UNSAFE",
         "COVE_E_CACHE_STALE",
+        "COVE_E_QUERY_DISCOVERY_INVALID",
     ];
 
     /// Return the closest Spec §76 error code for this error.
@@ -347,6 +353,7 @@ impl CoveError {
             CoveError::BadCovi => Some("COVE_E_BAD_COVI"),
             CoveError::IndexOnlyUnsafe => Some("COVE_E_INDEX_ONLY_UNSAFE"),
             CoveError::CacheStale => Some("COVE_E_CACHE_STALE"),
+            CoveError::QueryDiscoveryInvalid(_) => Some("COVE_E_QUERY_DISCOVERY_INVALID"),
             CoveError::Io(_) | CoveError::UnsupportedEncoding(_) => None,
         }
     }
@@ -406,7 +413,8 @@ mod tests {
         assert!(unique.contains("COVE_E_COVERAGE_STALE"));
         assert!(unique.contains("COVE_E_BAD_COVI"));
         assert!(unique.contains("COVE_E_INDEX_ONLY_UNSAFE"));
-        assert_eq!(unique.len(), 40);
+        assert!(unique.contains("COVE_E_QUERY_DISCOVERY_INVALID"));
+        assert_eq!(unique.len(), 41);
     }
 
     #[test]
@@ -490,6 +498,7 @@ impl PartialEq for CoveError {
             (UnknownRequiredFeature(lhs), UnknownRequiredFeature(rhs)) => lhs == rhs,
             (BadSection(lhs), BadSection(rhs))
             | (BadSchema(lhs), BadSchema(rhs))
+            | (QueryDiscoveryInvalid(lhs), QueryDiscoveryInvalid(rhs))
             | (UnsupportedEncoding(lhs), UnsupportedEncoding(rhs)) => lhs == rhs,
             (Io(lhs), Io(rhs)) => lhs.kind() == rhs.kind() && lhs.to_string() == rhs.to_string(),
             _ => false,

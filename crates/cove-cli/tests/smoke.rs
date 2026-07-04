@@ -1116,6 +1116,40 @@ fn query_covm_manifest_registers_cove_t_member_tables() {
 }
 
 #[test]
+fn inspect_query_discovery_describes_covm_dataset_binding() {
+    let member = cove_t_events_bytes();
+    let manifest = covm_manifest_for_members(&[("events.cove", &member)]);
+    let manifest_path = temp_file("query-discovery-dataset.covm");
+    fs::write(&manifest_path, manifest).unwrap();
+
+    let output = run_cove(&[
+        "inspect",
+        "--query-discovery",
+        "--json",
+        manifest_path.to_str().unwrap(),
+    ]);
+
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        value["source_binding"]["source_kind"],
+        serde_json::json!("covm_dataset_snapshot")
+    );
+    assert_eq!(
+        value["source_binding"]["members"][0]["member_id"],
+        serde_json::json!("events.cove")
+    );
+    assert!(value["source_binding"]["members"][0]["file_digest"]
+        .as_str()
+        .unwrap()
+        .starts_with("sha256:"));
+}
+
+#[test]
 fn query_covm_dataset_rejects_manifest_member_escape() {
     let member = cove_t_events_bytes();
     let manifest = covm_manifest_for_members(&[("../events.cove", &member)]);
@@ -1384,6 +1418,35 @@ fn query_file_and_stdin_queries_execute() {
 }
 
 #[test]
+fn query_from_query_discovery_template_executes() {
+    let file = temp_file("events-query-template.cove");
+    fs::write(&file, cove_t_events_bytes()).unwrap();
+
+    let output = run_cove(&[
+        "query",
+        "--from-template",
+        "table_filter_select_take",
+        "--param",
+        "score=20",
+        "--param",
+        "columns=id,score",
+        "--format",
+        "jsonl",
+        file.to_str().unwrap(),
+    ]);
+
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        r#"{"id":2,"score":20}"#
+    );
+}
+
+#[test]
 fn table_output_respects_max_cell_width() {
     let file = temp_file("labels.cove");
     fs::write(&file, cove_t_labels_bytes()).unwrap();
@@ -1422,6 +1485,90 @@ fn inspect_cove_t_prints_query_suggestions() {
     assert!(stdout.contains("COVE-T"), "stdout={stdout}");
     assert!(stdout.contains("table(events)"));
     assert!(stdout.contains("table(events).select(id, score).take(10)"));
+}
+
+#[test]
+fn query_discovery_cli_emits_manifest_and_validation_envelope() {
+    let file = sample_path("events.cove");
+    let path = file.to_str().unwrap();
+
+    let inspect = run_cove(&[
+        "inspect",
+        "--query-discovery",
+        "--json",
+        "--policy",
+        "public",
+        "--audience",
+        "smoke-agent",
+        "--principal-class",
+        "public_agent",
+        "--policy-fingerprint",
+        "sha256:smoke",
+        path,
+    ]);
+    assert!(
+        inspect.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&inspect.stderr)
+    );
+    let manifest: serde_json::Value = serde_json::from_slice(&inspect.stdout).unwrap();
+    assert_eq!(
+        manifest["schema"],
+        serde_json::json!("cove.query_discovery.v1")
+    );
+    assert_eq!(
+        manifest["authority"],
+        serde_json::json!("advisory_discovery_not_archive_truth")
+    );
+    assert_eq!(manifest["coveql"]["profiles"], serde_json::json!(["table"]));
+    assert_eq!(
+        manifest["policy"]["audience"],
+        serde_json::json!("smoke-agent")
+    );
+    assert_eq!(
+        manifest["policy"]["principal_class"],
+        serde_json::json!("public_agent")
+    );
+    assert_eq!(
+        manifest["policy"]["policy_fingerprint"],
+        serde_json::json!("sha256:smoke")
+    );
+    assert!(manifest.get("validation_status").is_none());
+    assert!(manifest["surfaces"]["tables"][0]["root"]
+        .as_str()
+        .unwrap()
+        .starts_with("table("));
+    assert_eq!(
+        manifest["examples"][0]["query_validation"],
+        serde_json::json!("not_validated")
+    );
+    assert!(manifest["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|diagnostic| diagnostic["code"] == "QD_EXAMPLE_VALIDATION_FAILED"));
+
+    let alias = run_cove(&["inspect", "--agent", path]);
+    assert!(
+        alias.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&alias.stderr)
+    );
+    let alias_manifest: serde_json::Value = serde_json::from_slice(&alias.stdout).unwrap();
+    assert_eq!(alias_manifest["schema"], manifest["schema"]);
+
+    let doctor = run_cove(&["doctor", "--query-discovery", "--json", path]);
+    assert!(
+        doctor.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&doctor.stderr)
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&doctor.stdout).unwrap();
+    assert_eq!(envelope["manifest"]["schema"], manifest["schema"]);
+    assert_eq!(
+        envelope["validation"]["validation_status"],
+        serde_json::json!("valid")
+    );
 }
 
 #[test]

@@ -34,6 +34,7 @@
 | COVE-COVERAGE corrupt/stale/unsupported | Ignore coverage artifact and use wider conservative plan or full scan unless operation requires it |
 | COVE-I stale/corrupt | Ignore index and scan unless operation explicitly requires the index |
 | COVE-CACHE stale/corrupt | Ignore cache and plan from validated metadata or full scan |
+| COVE-QD stale/corrupt/unsupported | Ignore query-discovery metadata for ordinary reads; reject or diagnose strict query-discovery use if required by a tooling-contract artifact |
 | `.covedelta` malformed | Reject selected delta-bearing snapshot |
 | Unsupported required delta feature | Reject selected snapshot or requested operation that needs the feature |
 | Delta chain digest mismatch | Reject selected delta-bearing snapshot |
@@ -132,6 +133,7 @@ Writers MUST publish COVE files by durable replace.
 | COVE_E_BAD_COVI | COVE-I secondary index artifact is malformed, stale, corrupt, or unsupported for the requested operation. |
 | COVE_E_INDEX_ONLY_UNSAFE | Requested metadata/index-only answer is not exact or not valid for the selected snapshot/overlay. |
 | COVE_E_CACHE_STALE | COVE-CACHE entry is stale, corrupt, approximate-may-under-include, or incompatible with the current runtime operation. |
+| COVE_E_QUERY_DISCOVERY_INVALID | COVE-QD query-discovery metadata is malformed, stale, policy-incompatible, unsupported, or not valid for strict query generation. |
 | COVE_E_BAD_COVEDELTA | `.covedelta` artifact is malformed, corrupt, or has invalid `CVD2` framing. |
 | COVE_E_DELTA_PROFILE_UNSUPPORTED | Delta-chain profile ID or version is unsupported. |
 | COVE_E_DELTA_REQUIRED_FEATURE_UNSUPPORTED | Required delta feature bit is unsupported for the requested operation. |

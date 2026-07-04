@@ -8,8 +8,9 @@ use crate::{
         PrimaryProfile, SectionKind, FEATURE_ARCHIVE_PROFILE, FEATURE_CODEC_EXTENSION_REGISTRY,
         FEATURE_CODEC_LZ4, FEATURE_CODEC_ZSTD, FEATURE_COVERAGE_METADATA, FEATURE_ENGINE_PROFILE,
         FEATURE_EXTENDED_FEATURE_SET, FEATURE_HARBOR_PROFILE, FEATURE_LAYOUT_PLAN,
-        FEATURE_OBJECT_PROFILE, FEATURE_RUNTIME_COMPATIBILITY_HINTS,
-        FEATURE_SECONDARY_INDEX_ARTIFACT, FEATURE_SEMANTIC_MAP, FEATURE_TABLE_PROFILE,
+        FEATURE_OBJECT_PROFILE, FEATURE_QUERY_DISCOVERY_METADATA,
+        FEATURE_RUNTIME_COMPATIBILITY_HINTS, FEATURE_SECONDARY_INDEX_ARTIFACT,
+        FEATURE_SEMANTIC_MAP, FEATURE_TABLE_PROFILE,
     },
     feature_binding::SectionFeatureBindingSectionV2,
     feature_scope::{ExtendedFeatureSetV2, FeatureScopeTable, ProfileCapabilityMatrixV2},
@@ -395,6 +396,7 @@ fn validate_section_profile_feature_bit(profile: u8, file_features: u64) -> Resu
         9 => FEATURE_RUNTIME_COMPATIBILITY_HINTS,
         10 => FEATURE_COVERAGE_METADATA,
         11 => FEATURE_SECONDARY_INDEX_ARTIFACT,
+        12 => FEATURE_QUERY_DISCOVERY_METADATA,
         _ => {
             return Err(CoveError::BadSection(format!(
                 "unknown profile {profile} in section directory"
@@ -453,6 +455,7 @@ fn validate_primary_profile_features(header: &CoveHeaderV1) -> Result<(), CoveEr
         PrimaryProfile::RuntimeCompatibility => FEATURE_RUNTIME_COMPATIBILITY_HINTS,
         PrimaryProfile::CoverageMetadata => FEATURE_COVERAGE_METADATA,
         PrimaryProfile::SecondaryIndex => FEATURE_SECONDARY_INDEX_ARTIFACT,
+        PrimaryProfile::QueryDiscovery => FEATURE_QUERY_DISCOVERY_METADATA,
         PrimaryProfile::CoveAiShared
         | PrimaryProfile::CoveMapAi
         | PrimaryProfile::CoveChunk
@@ -1087,6 +1090,11 @@ mod tests {
                 PrimaryProfile::RuntimeCompatibility,
                 FEATURE_RUNTIME_COMPATIBILITY_HINTS,
             ),
+            (
+                SectionKind::QueryDiscoveryManifest,
+                PrimaryProfile::QueryDiscovery,
+                FEATURE_QUERY_DISCOVERY_METADATA,
+            ),
         ];
 
         for (section_kind, profile, feature) in cases {
@@ -1160,6 +1168,28 @@ mod tests {
                 &runtime,
                 opts,
                 FeatureUseRequestV2::new().with_operation(OperationKindV2::RuntimeAdapterSelection),
+            )
+            .map(|_| ()),
+            Err(CoveError::ChecksumMismatch)
+        );
+
+        let mut query_discovery = optional_advisory_fixture(
+            SectionKind::QueryDiscoveryManifest,
+            PrimaryProfile::QueryDiscovery,
+            FEATURE_QUERY_DISCOVERY_METADATA,
+            vec![1; 16],
+        );
+        corrupt_first_section_byte(&mut query_discovery);
+        assert_eq!(
+            validate_bytes_for_feature_use(
+                &query_discovery,
+                ValidationOptions {
+                    semantic: false,
+                    verify_digests: false,
+                    allow_unknown_optional_extensions: true,
+                    optional_pushdown_policy: OptionalPushdownPolicy::FailOpen,
+                },
+                FeatureUseRequestV2::new().with_profile(PrimaryProfile::QueryDiscovery as u8),
             )
             .map(|_| ()),
             Err(CoveError::ChecksumMismatch)
@@ -2244,6 +2274,11 @@ mod tests {
                 5,
                 SectionKind::HarborMountHints as u16,
                 FEATURE_HARBOR_PROFILE,
+            ),
+            (
+                12,
+                SectionKind::QueryDiscoveryManifest as u16,
+                FEATURE_QUERY_DISCOVERY_METADATA,
             ),
         ];
 

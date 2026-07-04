@@ -26,6 +26,7 @@ pub(crate) fn profile_name(code: u8) -> String {
         Some(PrimaryProfile::EngineExecution) => "COVE-E (Engine Execution)".into(),
         Some(PrimaryProfile::HarborExecution) => "COVE-H (Harbor Execution)".into(),
         Some(PrimaryProfile::SemanticMapping) => "COVE-MAP (Semantic Mapping)".into(),
+        Some(PrimaryProfile::QueryDiscovery) => "COVE-QD (Query Discovery)".into(),
         Some(PrimaryProfile::CoveAiShared) => "COVE-AI Shared".into(),
         Some(PrimaryProfile::CoveMapAi) => "COVE-MAP-AI".into(),
         Some(PrimaryProfile::CoveChunk) => "COVE-CHUNK".into(),

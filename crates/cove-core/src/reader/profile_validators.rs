@@ -260,6 +260,7 @@ pub(super) fn validate_shared_semantics(
             | SectionKind::MapAiProfileCatalog
             | SectionKind::MapAiTemplateCatalog
             | SectionKind::MapAiTrainingPolicyCatalog
+            | SectionKind::QueryDiscoveryManifest
             | SectionKind::AiCompanionArtifactRef
             | SectionKind::AiSourceBinding
             | SectionKind::AiChunkProfile
@@ -705,6 +706,7 @@ pub(super) fn validate_cove_t_semantics_with_registered_page_scope(
             | SectionKind::MapAiProfileCatalog
             | SectionKind::MapAiTemplateCatalog
             | SectionKind::MapAiTrainingPolicyCatalog
+            | SectionKind::QueryDiscoveryManifest
             | SectionKind::AiCompanionArtifactRef
             | SectionKind::AiSourceBinding
             | SectionKind::AiChunkProfile

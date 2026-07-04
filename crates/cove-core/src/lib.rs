@@ -106,6 +106,7 @@ pub mod postscript;
 pub mod predicate;
 pub mod profile;
 pub mod pruning;
+pub mod query_discovery;
 pub mod reader;
 pub mod redaction;
 pub mod registry;

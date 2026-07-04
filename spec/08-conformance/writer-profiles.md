@@ -194,4 +194,17 @@ A COVE-MAP writer that claims object-conversion conformance MUST produce COVE-O 
 - invalidate entries on snapshot, manifest, schema, semantic-map, index, sidecar, visibility, or policy changes;
 - never treat cache entries as canonical truth.
 
+### 72.15 COVE-QD Query Discovery Profile
+
+**Recommended for writers, catalogs, SDKs, UIs, and agent-facing tooling that expose CoveQL discovery:**
+- emit `QUERY_DISCOVERY_MANIFEST` payloads as canonical UTF-8 JCS JSON using schema `cove.query_discovery.v1`;
+- set `FEATURE_QUERY_DISCOVERY_METADATA` as optional when embedding query-discovery metadata in ordinary data artifacts;
+- never set `FEATURE_QUERY_DISCOVERY_METADATA` in file-level `required_features` for ordinary data artifacts;
+- bind manifests to source, schema, dictionary, mapping, policy, principal, audience, and COVM snapshot state;
+- use non-self-referential source identity for embedded manifests;
+- expose query-safe `query_identifier` values rather than relying on display names;
+- use structured template operator chains and typed parameters rather than raw CoveQL string substitution;
+- validate examples and templates through parse, resolution, and no-payload planning dry-runs when policy and budget allow;
+- keep COVE-QD advisory: generated CoveQL still resolves against canonical metadata and policy.
+
 ---

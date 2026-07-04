@@ -5,14 +5,29 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<(), CliError> {
             Ok(())
         }
         Command::Examples { json } => run_examples(json),
-        Command::Doctor { file, json } => run_doctor(&file, json),
+        Command::Doctor {
+            file,
+            json,
+            query_discovery,
+            query_discovery_options,
+        } => run_doctor(&file, json, query_discovery, &query_discovery_options),
         Command::Inspect {
             file,
             queries,
             json,
             performance,
             ai,
-        } => run_inspect(&file, queries, json, performance, ai),
+            query_discovery,
+            query_discovery_options,
+        } => run_inspect(
+            &file,
+            queries,
+            json,
+            performance,
+            ai,
+            query_discovery,
+            &query_discovery_options,
+        ),
         Command::Optimize {
             file,
             out_dir,
@@ -43,6 +58,8 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<(), CliError> {
             &command.query,
             QueryCommandOptions {
                 query_file: command.query_file,
+                from_template: command.from_template,
+                template_params: command.template_params,
                 format: command.format,
                 take: command.take,
                 explain: command.explain,
@@ -85,4 +102,3 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<(), CliError> {
     };
     result.map_err(CliError::from)
 }
-

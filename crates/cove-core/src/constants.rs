@@ -126,6 +126,7 @@ pub const FEATURE_COVERAGE_PLAN_CANDIDATES: u64 = 0x0000_0020_0000_0000;
 pub const FEATURE_SECONDARY_INDEX_ARTIFACT: u64 = 0x0000_0040_0000_0000;
 pub const FEATURE_INDEX_ONLY_CAPABILITY: u64 = 0x0000_0080_0000_0000;
 pub const FEATURE_COVERAGE_CACHE_HINTS: u64 = 0x0000_0100_0000_0000;
+pub const FEATURE_QUERY_DISCOVERY_METADATA: u64 = 0x0000_0200_0000_0000;
 
 // ── COVE-AI feature bits (extended global feature word 1 / sidecar-local word) ─
 
@@ -199,7 +200,8 @@ pub const KNOWN_FEATURE_BITS_MASK: u64 = FEATURE_OBJECT_PROFILE
     | FEATURE_COVERAGE_PLAN_CANDIDATES
     | FEATURE_SECONDARY_INDEX_ARTIFACT
     | FEATURE_INDEX_ONLY_CAPABILITY
-    | FEATURE_COVERAGE_CACHE_HINTS;
+    | FEATURE_COVERAGE_CACHE_HINTS
+    | FEATURE_QUERY_DISCOVERY_METADATA;
 
 // ── Primary profile (header field) ──────────────────────────────────────────
 
@@ -232,6 +234,8 @@ pub enum PrimaryProfile {
     CoverageMetadata = 10,
     /// COVE-I secondary index carrier.
     SecondaryIndex = 11,
+    /// COVE-QD query discovery metadata carrier.
+    QueryDiscovery = 12,
     /// COVE-AI shared AI metadata carrier.
     CoveAiShared = 16,
     /// COVE-MAP-AI semantic slot and AI policy carrier.
@@ -266,6 +270,7 @@ impl PrimaryProfile {
             9 => Some(Self::RuntimeCompatibility),
             10 => Some(Self::CoverageMetadata),
             11 => Some(Self::SecondaryIndex),
+            12 => Some(Self::QueryDiscovery),
             16 => Some(Self::CoveAiShared),
             17 => Some(Self::CoveMapAi),
             18 => Some(Self::CoveChunk),
@@ -393,6 +398,9 @@ pub enum SectionKind {
     MapAiTemplateCatalog = 71,
     MapAiTrainingPolicyCatalog = 72,
 
+    // COVE-QD section (profile = 12)
+    QueryDiscoveryManifest = 90,
+
     // COVE-AI sections (profiles = 16..23)
     AiCompanionArtifactRef = 99,
     AiSourceBinding = 100,
@@ -491,6 +499,7 @@ impl SectionKind {
             70 => Some(Self::MapAiProfileCatalog),
             71 => Some(Self::MapAiTemplateCatalog),
             72 => Some(Self::MapAiTrainingPolicyCatalog),
+            90 => Some(Self::QueryDiscoveryManifest),
             99 => Some(Self::AiCompanionArtifactRef),
             100 => Some(Self::AiSourceBinding),
             101 => Some(Self::AiChunkProfile),
@@ -887,11 +896,14 @@ mod tests {
             PrimaryProfile::from_u8(11),
             Some(PrimaryProfile::SecondaryIndex)
         );
+        assert_eq!(
+            PrimaryProfile::from_u8(12),
+            Some(PrimaryProfile::QueryDiscovery)
+        );
     }
 
     #[test]
     fn primary_profile_from_u8_unknown() {
-        assert_eq!(PrimaryProfile::from_u8(12), None);
         assert_eq!(PrimaryProfile::from_u8(255), None);
     }
 
@@ -1425,7 +1437,7 @@ mod tests {
     #[test]
     fn known_feature_bits_mask_does_not_contain_future_bits() {
         // Bits beyond the defined range should not be in the mask.
-        let future_bit: u64 = 0x0000_0200_0000_0000;
+        let future_bit: u64 = 0x0000_0400_0000_0000;
         assert_eq!(KNOWN_FEATURE_BITS_MASK & future_bit, 0);
     }
 }

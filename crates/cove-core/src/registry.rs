@@ -311,6 +311,12 @@ pub const FEATURE_REGISTRY: &[FeatureInfo] = &[
         spec_section: "Spec §11",
         description: "File or manifest may reference runtime/local COVE-CACHE compatibility or invalidation hints.",
     },
+    FeatureInfo {
+        bit: FEATURE_QUERY_DISCOVERY_METADATA,
+        name: "FEATURE_QUERY_DISCOVERY_METADATA",
+        spec_section: "Spec §11 / COVE-QD §90",
+        description: "File, manifest, or catalog may contain advisory COVE-QD query-discovery metadata.",
+    },
 ];
 
 /// All section kinds assigned by Spec §14.
@@ -760,6 +766,15 @@ pub const SECTION_REGISTRY: &[SectionInfo] = &[
         description: "Slot-level AI training, label, split, weighting, and dedup policy.",
     },
     SectionInfo {
+        kind: SectionKind::QueryDiscoveryManifest,
+        id: 90,
+        wire_name: "QUERY_DISCOVERY_MANIFEST",
+        profiles: &[PrimaryProfile::QueryDiscovery],
+        required_feature: Some(FEATURE_QUERY_DISCOVERY_METADATA),
+        spec_section: "COVE-QD §91",
+        description: "Canonical UTF-8 JSON query-discovery manifest using schema cove.query_discovery.v1.",
+    },
+    SectionInfo {
         kind: SectionKind::AiCompanionArtifactRef,
         id: 99,
         wire_name: "AI_COMPANION_ARTIFACT_REF",
@@ -1145,6 +1160,11 @@ pub const ERROR_CODE_REGISTRY: &[ErrorCodeInfo] = &[
         spec_section: "Spec §76",
         meaning: "COVX/COVM sidecar does not match referenced COVE.",
     },
+    ErrorCodeInfo {
+        code: "COVE_E_QUERY_DISCOVERY_INVALID",
+        spec_section: "Spec §76 / COVE-QD §99",
+        meaning: "COVE-QD query-discovery metadata is malformed, stale, policy-incompatible, unsupported, or not valid for strict query generation.",
+    },
 ];
 
 const WRITER_PROFILE_CORE_MINIMAL: &[&str] = &[
@@ -1239,6 +1259,16 @@ const WRITER_PROFILE_MAP_CONVERSION: &[&str] = &[
     "semantically valid COVE-O output",
 ];
 
+const WRITER_PROFILE_QUERY_DISCOVERY: &[&str] = &[
+    "QUERY_DISCOVERY_MANIFEST canonical UTF-8 JCS JSON",
+    "FEATURE_QUERY_DISCOVERY_METADATA optional for ordinary data artifacts",
+    "source, schema, dictionary, map, policy, principal, audience, and COVM binding",
+    "query-safe identifiers rather than display names",
+    "structured template operator chains and typed parameters",
+    "no-payload validation of examples and templates when policy and budget allow",
+    "ordinary CoveQL resolution remains authoritative",
+];
+
 /// All writer profile tiers from Spec §72.
 pub const WRITER_PROFILE_REGISTRY: &[WriterProfileInfo] = &[
     WriterProfileInfo {
@@ -1288,6 +1318,12 @@ pub const WRITER_PROFILE_REGISTRY: &[WriterProfileInfo] = &[
         spec_section: "Spec §72.8",
         summary: "Recommended deterministic semantic mapping conversion output.",
         requirements: WRITER_PROFILE_MAP_CONVERSION,
+    },
+    WriterProfileInfo {
+        name: "COVE-QD Query Discovery Profile",
+        spec_section: "Spec §72.15 / COVE-QD §90",
+        summary: "Recommended query-discovery manifest writer output.",
+        requirements: WRITER_PROFILE_QUERY_DISCOVERY,
     },
 ];
 
@@ -1399,6 +1435,11 @@ pub const RECOVERY_BEHAVIOR_REGISTRY: &[RecoveryBehaviorInfo] = &[
         default_behavior: "Ignore COVM",
     },
     RecoveryBehaviorInfo {
+        condition: "COVE-QD stale/corrupt/unsupported",
+        spec_section: "Spec §74 / COVE-QD §99",
+        default_behavior: "Ignore query-discovery metadata for ordinary reads; reject or diagnose strict query-discovery use if required by a tooling-contract artifact",
+    },
+    RecoveryBehaviorInfo {
         condition: "Segment checksum mismatch",
         spec_section: "Spec §74",
         default_behavior: "Reject segment; fail read unless explicit best-effort mode",
@@ -1445,6 +1486,7 @@ const COMPAT_OPTIONAL_FEATURE_EXAMPLES: &[&str] = &[
     "Top-N summaries",
     "COVX sidecars",
     "COVM manifests",
+    "COVE-QD query-discovery manifests",
     "optional engine profile mappings",
 ];
 
@@ -1543,12 +1585,20 @@ mod tests {
             assert_eq!(SectionKind::from_u16(info.id), Some(info.kind));
             assert_eq!(info.kind as u16, info.id);
         }
-        assert_eq!(SECTION_REGISTRY.len(), 76);
+        assert_eq!(SECTION_REGISTRY.len(), 77);
         let exact_set = section_info(SectionKind::ExactSetIndex).unwrap();
         assert!(exact_set.profiles.contains(&PrimaryProfile::TableScan));
         assert!(exact_set
             .profiles
             .contains(&PrimaryProfile::ArchiveAcceleration));
+        let query_discovery = section_info(SectionKind::QueryDiscoveryManifest).unwrap();
+        assert!(query_discovery
+            .profiles
+            .contains(&PrimaryProfile::QueryDiscovery));
+        assert_eq!(
+            query_discovery.required_feature,
+            Some(FEATURE_QUERY_DISCOVERY_METADATA)
+        );
         let resolution = section_info(SectionKind::MapResolutionCatalog).unwrap();
         assert!(resolution
             .profiles
@@ -1562,14 +1612,15 @@ mod tests {
 
     #[test]
     fn spec_76_error_registry_contains_all_v1_codes() {
-        assert_eq!(ERROR_CODE_REGISTRY.len(), 26);
+        assert_eq!(ERROR_CODE_REGISTRY.len(), 27);
         assert!(error_code_info("COVE_E_BAD_MAGIC").is_some());
         assert!(error_code_info("COVE_E_SIDECAR_STALE").is_some());
+        assert!(error_code_info("COVE_E_QUERY_DISCOVERY_INVALID").is_some());
     }
 
     #[test]
     fn spec_72_writer_profile_registry_lists_all_v1_tiers() {
-        assert_eq!(WRITER_PROFILE_REGISTRY.len(), 8);
+        assert_eq!(WRITER_PROFILE_REGISTRY.len(), 9);
         assert!(writer_profile_info("COVE-Core Minimal Profile").is_some());
         assert!(writer_profile_info("COVE-O Object Checkpoint Profile").is_some());
         assert!(writer_profile_info("COVE-MAP Object Conversion Profile").is_some());
@@ -1581,7 +1632,7 @@ mod tests {
 
     #[test]
     fn spec_74_recovery_registry_covers_recovery_table() {
-        assert_eq!(RECOVERY_BEHAVIOR_REGISTRY.len(), 27);
+        assert_eq!(RECOVERY_BEHAVIOR_REGISTRY.len(), 28);
         assert_eq!(
             recovery_behavior_info("Bad header magic")
                 .unwrap()

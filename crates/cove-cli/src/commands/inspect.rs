@@ -1,6 +1,28 @@
-fn run_doctor(file: &Path, json: bool) -> Result<(), String> {
+fn run_doctor(
+    file: &Path,
+    json: bool,
+    query_discovery: bool,
+    query_discovery_cli_options: &QueryDiscoveryCliOptions,
+) -> Result<(), String> {
     let bytes =
         fs::read(file).map_err(|error| format!("cannot read {}: {error}", file.display()))?;
+    if query_discovery {
+        let options = query_discovery_options_for_file(file, query_discovery_cli_options)?;
+        let manifest = query_discovery_manifest_bytes(&bytes, options.clone())
+            .map_err(|error| format!("query discovery: {error}"))?;
+        let context = query_discovery_validation_context_for_source(&bytes, &options)
+            .map_err(|error| format!("query discovery validation: {error}"))?;
+        let validation = validate_query_discovery_manifest(&manifest, context);
+        if json {
+            let value = serde_json::json!({
+                "manifest": manifest.value(),
+                "validation": query_discovery_validation_json(&validation),
+            });
+            print_json_pretty(&value)?;
+            return Ok(());
+        }
+        return Err("cove doctor --query-discovery requires --json".into());
+    }
     let discovery = discover_query_surfaces(
         &bytes,
         QuerySurfaceDiscoveryOptions {
@@ -86,9 +108,25 @@ fn run_inspect(
     json: bool,
     performance: bool,
     ai: bool,
+    query_discovery: bool,
+    query_discovery_cli_options: &QueryDiscoveryCliOptions,
 ) -> Result<(), String> {
     let bytes =
         fs::read(file).map_err(|error| format!("cannot read {}: {error}", file.display()))?;
+    if query_discovery {
+        if !json {
+            return Err("cove inspect --query-discovery requires --json".into());
+        }
+        let manifest = query_discovery_manifest_bytes(
+            &bytes,
+            query_discovery_options_for_file(file, query_discovery_cli_options)?,
+        )
+        .map_err(|error| format!("query discovery: {error}"))?;
+        let text = std::str::from_utf8(manifest.raw_canonical_json())
+            .map_err(|error| format!("query discovery manifest is not UTF-8: {error}"))?;
+        println!("{text}");
+        return Ok(());
+    }
     if ai {
         return run_ai_inspect(file, &bytes, json);
     }
@@ -141,6 +179,78 @@ fn run_inspect(
         print_performance_discovery(&bundle);
     }
     Ok(())
+}
+
+fn query_discovery_options_for_file(
+    file: &Path,
+    cli_options: &QueryDiscoveryCliOptions,
+) -> Result<QueryDiscoveryOptions, String> {
+    let disclosure_mode = match cli_options.policy.as_deref().unwrap_or("public") {
+        "public" => MetadataDisclosureMode::Public,
+        "developer" => MetadataDisclosureMode::Developer,
+        other => {
+            return Err(format!(
+                "unsupported query-discovery policy '{other}'; expected public or developer"
+            ));
+        }
+    };
+    let default_binding_label = match disclosure_mode {
+        MetadataDisclosureMode::Public => "public",
+        MetadataDisclosureMode::Developer => "developer",
+    };
+    Ok(QueryDiscoveryOptions {
+        source_name: Some(file.display().to_string()),
+        disclosure_mode,
+        policy_fingerprint: cli_options.policy_fingerprint.clone(),
+        principal_class: Some(
+            cli_options
+                .principal_class
+                .as_deref()
+                .unwrap_or(default_binding_label)
+                .to_string(),
+        ),
+        audience: Some(
+            cli_options
+                .audience
+                .as_deref()
+                .unwrap_or(default_binding_label)
+                .to_string(),
+        ),
+        include_developer_diagnostics: disclosure_mode == MetadataDisclosureMode::Developer,
+        ..QueryDiscoveryOptions::default()
+    })
+}
+
+fn query_discovery_validation_json(
+    report: &cove_core::query_discovery::QueryDiscoveryValidationReport,
+) -> serde_json::Value {
+    serde_json::json!({
+        "validation_status": match report.validation_status {
+            QueryDiscoveryValidationStatus::Valid => "valid",
+            QueryDiscoveryValidationStatus::Stale => "stale",
+            QueryDiscoveryValidationStatus::Invalid => "invalid",
+        },
+        "validation_flags": report.validation_flags.iter().map(|flag| match flag {
+            QueryDiscoveryValidationFlag::PolicyFiltered => "policy_filtered",
+            QueryDiscoveryValidationFlag::DiagnosticsWithheld => "diagnostics_withheld",
+            QueryDiscoveryValidationFlag::ExamplesLimited => "examples_limited",
+            QueryDiscoveryValidationFlag::AiLimited => "ai_limited",
+        }).collect::<Vec<_>>(),
+        "diagnostics": report.diagnostics.iter().map(|diagnostic| {
+            serde_json::json!({
+                "code": &diagnostic.code,
+                "severity": match diagnostic.severity {
+                    cove_core::query_discovery::QueryDiscoveryDiagnosticSeverity::Info => "info",
+                    cove_core::query_discovery::QueryDiscoveryDiagnosticSeverity::Warning => "warning",
+                    cove_core::query_discovery::QueryDiscoveryDiagnosticSeverity::Error => "error",
+                },
+                "message": &diagnostic.message,
+                "target_kind": &diagnostic.target_kind,
+                "target": &diagnostic.target,
+                "withheld": diagnostic.withheld,
+            })
+        }).collect::<Vec<_>>(),
+    })
 }
 
 fn run_ai_inspect(file: &Path, bytes: &[u8], json: bool) -> Result<(), String> {
