@@ -254,6 +254,9 @@ fn synthetic_error_surface_error(code: &str) -> Option<CoveError> {
         "COVE_E_BAD_COVI" => Some(CoveError::BadCovi),
         "COVE_E_INDEX_ONLY_UNSAFE" => Some(CoveError::IndexOnlyUnsafe),
         "COVE_E_CACHE_STALE" => Some(CoveError::CacheStale),
+        "COVE_E_QUERY_DISCOVERY_INVALID" => Some(CoveError::QueryDiscoveryInvalid(
+            "synthetic error-surface fixture".into(),
+        )),
         _ => None,
     }
 }

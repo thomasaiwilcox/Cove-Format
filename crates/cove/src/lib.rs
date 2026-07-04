@@ -17,8 +17,9 @@ pub use cove_core::{
     mount::{self, MountOptions, MountedCoveFile},
     postscript, profile,
     query_discovery::{
-        build_query_discovery_manifest, embedded_query_discovery_manifests,
-        query_discovery_section_payload, query_discovery_validation_context_for_embedded_source,
+        build_query_discovery_manifest, canonical_query_discovery_json,
+        embedded_query_discovery_manifests, query_discovery_section_payload,
+        query_discovery_validation_context_for_embedded_source,
         query_discovery_validation_context_for_source, render_query_discovery_template,
         QueryAiCapability, QueryDiscoveryAliasBinding, QueryDiscoveryBudget,
         QueryDiscoveryCoveQlContract, QueryDiscoveryIdentifier, QueryDiscoveryManifest,
@@ -373,8 +374,7 @@ fn build_facade_query_discovery_manifest(
     build_options.validate_examples = false;
     let mut value = build_query_discovery_manifest_value(bytes, &build_options)?;
     validate_query_discovery_examples(bytes, &mut value);
-    let canonical = serde_json::to_vec(&value)
-        .map_err(|error| CoveError::QueryDiscoveryInvalid(error.to_string()))?;
+    let canonical = canonical_query_discovery_json(&value)?;
     Ok(QueryDiscoveryManifest::parse(&canonical)?)
 }
 
@@ -811,7 +811,7 @@ mod tests {
                     }
                 ]
             }));
-        let canonical = serde_json::to_vec(&value).unwrap();
+        let canonical = canonical_query_discovery_json(&value).unwrap();
         let lying_manifest = QueryDiscoveryManifest::parse(&canonical).unwrap();
         let query = render_query_discovery_template(
             &lying_manifest,

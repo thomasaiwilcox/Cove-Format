@@ -964,16 +964,71 @@ fn query_root_kind_hint(query: &str) -> Option<&'static str> {
         .and_then(root_kind_from_root)
 }
 
+/// Render a query-discovery manifest value as canonical JSON bytes.
+pub fn canonical_query_discovery_json(value: &Value) -> Result<Vec<u8>, CoveError> {
+    canonical_json_bytes(value)
+}
+
+pub(super) fn canonical_json_bytes(value: &Value) -> Result<Vec<u8>, CoveError> {
+    let mut out = Vec::new();
+    write_canonical_json_value(value, &mut out)?;
+    Ok(out)
+}
+
 fn validate_jcs_canonical(bytes: &[u8], value: &Value) -> Result<(), CoveError> {
-    let canonical = serde_json::to_vec(value).map_err(|err| {
-        query_discovery_error(format!(
-            "failed to render canonical JSON for validation: {err}"
-        ))
-    })?;
+    let canonical = canonical_json_bytes(value)?;
     if canonical != bytes {
         return Err(query_discovery_error(
             "manifest JSON is not canonical RFC 8785/JCS-compatible JSON",
         ));
+    }
+    Ok(())
+}
+
+fn write_canonical_json_value(value: &Value, out: &mut Vec<u8>) -> Result<(), CoveError> {
+    match value {
+        Value::Null => out.extend_from_slice(b"null"),
+        Value::Bool(true) => out.extend_from_slice(b"true"),
+        Value::Bool(false) => out.extend_from_slice(b"false"),
+        Value::Number(number) => out.extend_from_slice(number.to_string().as_bytes()),
+        Value::String(string) => {
+            serde_json::to_writer(out, string).map_err(|err| {
+                query_discovery_error(format!("failed to render canonical JSON string: {err}"))
+            })?;
+        }
+        Value::Array(items) => {
+            out.push(b'[');
+            for (index, item) in items.iter().enumerate() {
+                if index != 0 {
+                    out.push(b',');
+                }
+                write_canonical_json_value(item, out)?;
+            }
+            out.push(b']');
+        }
+        Value::Object(object) => {
+            out.push(b'{');
+            let mut keys = object.keys().collect::<Vec<_>>();
+            keys.sort_unstable();
+            for (index, key) in keys.into_iter().enumerate() {
+                if index != 0 {
+                    out.push(b',');
+                }
+                serde_json::to_writer(&mut *out, key).map_err(|err| {
+                    query_discovery_error(format!(
+                        "failed to render canonical JSON object key: {err}"
+                    ))
+                })?;
+                out.push(b':');
+                let Some(value) = object.get(key) else {
+                    return Err(query_discovery_error(
+                        "failed to render canonical JSON object: missing sorted key",
+                    ));
+                };
+                write_canonical_json_value(value, out)?;
+            }
+            out.push(b'}');
+        }
     }
     Ok(())
 }

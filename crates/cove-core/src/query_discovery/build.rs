@@ -25,6 +25,7 @@ use super::{
         projection_examples, projection_select_take_template, table_examples,
         table_filter_select_take_template,
     },
+    validate::canonical_json_bytes,
     QUERY_DISCOVERY_ADVISORY_AUTHORITY, QUERY_DISCOVERY_CANONICALIZATION_JCS,
     QUERY_DISCOVERY_SCHEMA_V1,
 };
@@ -34,9 +35,7 @@ pub fn build_query_discovery_manifest(
     options: QueryDiscoveryOptions,
 ) -> Result<QueryDiscoveryManifest, CoveError> {
     let value = build_query_discovery_manifest_value(bytes, &options)?;
-    let canonical = serde_json::to_vec(&value).map_err(|err| {
-        query_discovery_error(format!("failed to render query-discovery manifest: {err}"))
-    })?;
+    let canonical = canonical_json_bytes(&value)?;
     QueryDiscoveryManifest::parse(&canonical)
 }
 

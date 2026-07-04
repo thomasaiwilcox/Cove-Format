@@ -27,7 +27,7 @@ pub use embed::{
 pub use ident::coveql_identifier;
 pub use model::*;
 pub use render::render_query_discovery_template;
-pub use validate::validate_query_discovery_manifest;
+pub use validate::{canonical_query_discovery_json, validate_query_discovery_manifest};
 
 pub(crate) fn query_discovery_error(message: impl Into<String>) -> crate::CoveError {
     crate::CoveError::QueryDiscoveryInvalid(message.into())

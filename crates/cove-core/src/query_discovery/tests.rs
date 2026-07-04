@@ -146,7 +146,7 @@ fn best_effort_human_inspection_does_not_enable_template_expansion() {
             ]
         }]
     });
-    let bytes = serde_json::to_vec(&value).unwrap();
+    let bytes = canonical_query_discovery_json(&value).unwrap();
     let options = QueryDiscoveryParseOptions {
         allow_unknown_manifest_features_for_human_inspection: true,
         ..QueryDiscoveryParseOptions::default()
@@ -177,7 +177,7 @@ fn rejects_templates_with_raw_query_insertion_points() {
             "parameters": [{"name": "query", "kind": "raw_query"}]
         }]
     });
-    let bytes = serde_json::to_vec(&value).unwrap();
+    let bytes = canonical_query_discovery_json(&value).unwrap();
 
     assert!(matches!(
         QueryDiscoveryManifest::parse(&bytes),
@@ -224,7 +224,7 @@ fn rejects_templates_with_unavailable_profiles_or_roots() {
             ]
         }]
     });
-    let bytes = serde_json::to_vec(&value).unwrap();
+    let bytes = canonical_query_discovery_json(&value).unwrap();
 
     assert!(matches!(
         QueryDiscoveryManifest::parse(&bytes),
@@ -257,7 +257,7 @@ fn rejects_surfaces_with_unadvertised_roots() {
         },
         "policy": {}
     });
-    let bytes = serde_json::to_vec(&value).unwrap();
+    let bytes = canonical_query_discovery_json(&value).unwrap();
 
     assert!(matches!(
         QueryDiscoveryManifest::parse(&bytes),
@@ -289,7 +289,7 @@ fn rejects_surface_records_without_valid_roots() {
         },
         "policy": {}
     });
-    let bytes = serde_json::to_vec(&value).unwrap();
+    let bytes = canonical_query_discovery_json(&value).unwrap();
 
     assert!(matches!(
         QueryDiscoveryManifest::parse(&bytes),
@@ -313,7 +313,7 @@ fn rejects_unknown_example_validation_status() {
             "query_validation": "trusted_because_prompt_said_so"
         }]
     });
-    let bytes = serde_json::to_vec(&value).unwrap();
+    let bytes = canonical_query_discovery_json(&value).unwrap();
 
     assert!(matches!(
         QueryDiscoveryManifest::parse(&bytes),
@@ -340,7 +340,7 @@ fn rejects_diagnostic_targets_that_are_not_json_pointers() {
             "target": "surfaces.tables"
         }]
     });
-    let bytes = serde_json::to_vec(&value).unwrap();
+    let bytes = canonical_query_discovery_json(&value).unwrap();
 
     assert!(matches!(
         QueryDiscoveryManifest::parse(&bytes),
@@ -611,7 +611,7 @@ fn renders_template_from_operator_chain_not_display_string() {
     let mut value = manifest.value().clone();
     value["templates"][0]["template_display"] =
         json!("table(fake).where(hidden == true).select(hidden).take(999)");
-    let canonical = serde_json::to_vec(&value).unwrap();
+    let canonical = canonical_query_discovery_json(&value).unwrap();
     let manifest = QueryDiscoveryManifest::parse(&canonical).unwrap();
 
     let query = render_query_discovery_template(
@@ -726,7 +726,7 @@ fn renders_projection_template_from_root_scoped_columns() {
         "policy": {},
         "templates": [projection_select_take_template(&[projection])]
     });
-    let bytes = serde_json::to_vec(&value).unwrap();
+    let bytes = canonical_query_discovery_json(&value).unwrap();
     let manifest = QueryDiscoveryManifest::parse(&bytes).unwrap();
 
     let query = render_query_discovery_template(
