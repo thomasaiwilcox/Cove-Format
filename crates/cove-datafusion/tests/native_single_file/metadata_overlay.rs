@@ -789,12 +789,12 @@ async fn m4e_overlay_snapshot_applies_file_and_row_visibility() {
         snapshot_id: "overlay-1".into(),
         files: vec![
             OverlayFile {
-                uri: first.display().to_string().into(),
+                uri: local_manifest_uri(&first).into(),
                 expected_identity: Some(identity_for_state(first_state.state())),
                 visibility: RowVisibility::DeletedRanges(vec![RowRange { start: 1, len: 1 }]),
             },
             OverlayFile {
-                uri: second.display().to_string().into(),
+                uri: local_manifest_uri(&second).into(),
                 expected_identity: Some(identity_for_state(second_state.state())),
                 visibility: RowVisibility::VisibleRanges(Vec::new()),
             },
@@ -840,7 +840,7 @@ async fn m4e_overlay_rejects_stale_identity_unless_file_is_hidden() {
     let visible = CoveOverlaySnapshot {
         snapshot_id: "overlay-stale".into(),
         files: vec![OverlayFile {
-            uri: path.display().to_string().into(),
+            uri: local_manifest_uri(&path).into(),
             expected_identity: Some(identity.clone()),
             visibility: RowVisibility::All,
         }],
@@ -855,12 +855,12 @@ async fn m4e_overlay_rejects_stale_identity_unless_file_is_hidden() {
         snapshot_id: "overlay-hidden-stale".into(),
         files: vec![
             OverlayFile {
-                uri: path.display().to_string().into(),
+                uri: local_manifest_uri(&path).into(),
                 expected_identity: Some(identity),
                 visibility: RowVisibility::VisibleRanges(Vec::new()),
             },
             OverlayFile {
-                uri: path.display().to_string().into(),
+                uri: local_manifest_uri(&path).into(),
                 expected_identity: None,
                 visibility: RowVisibility::All,
             },
@@ -897,7 +897,7 @@ async fn m5_cove_e_metadata_survives_full_range_and_overlay_bootstrap() {
     let snapshot = CoveOverlaySnapshot {
         snapshot_id: "m5-overlay".into(),
         files: vec![OverlayFile {
-            uri: path.display().to_string().into(),
+            uri: local_manifest_uri(&path).into(),
             expected_identity: Some(identity_for_state(provider.state())),
             visibility: RowVisibility::All,
         }],
@@ -1005,7 +1005,7 @@ async fn m4e_overlay_rejects_uri_scheme_paths() {
     let snapshot = CoveOverlaySnapshot {
         snapshot_id: "overlay-file-uri".into(),
         files: vec![OverlayFile {
-            uri: format!("file://{}", path.display()).into(),
+            uri: format!("file://{}", local_manifest_uri(&path)).into(),
             expected_identity: None,
             visibility: RowVisibility::All,
         }],
@@ -1039,12 +1039,12 @@ async fn m5_metadata_filecode_group_by_counts_logical_values_across_files() {
         snapshot_id: "m5-group-overlay".into(),
         files: vec![
             OverlayFile {
-                uri: first.display().to_string().into(),
+                uri: local_manifest_uri(&first).into(),
                 expected_identity: Some(identity_for_state(first_state.state())),
                 visibility: RowVisibility::All,
             },
             OverlayFile {
-                uri: second.display().to_string().into(),
+                uri: local_manifest_uri(&second).into(),
                 expected_identity: Some(identity_for_state(second_state.state())),
                 visibility: RowVisibility::All,
             },

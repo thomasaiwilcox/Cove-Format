@@ -42,9 +42,15 @@ fn validate_manifest_path_uri(uri: &str, mode: ManifestPathMode) -> Result<(), C
             "manifest URI path must use forward slashes",
         ));
     }
-    if has_uri_scheme_or_windows_drive(uri) {
+    let has_windows_drive_prefix = has_windows_drive_prefix(uri);
+    if has_uri_scheme(uri) {
         return Err(invalid_manifest_path(
-            "manifest URI path must not include a URI scheme or drive prefix",
+            "manifest URI path must not include a URI scheme",
+        ));
+    }
+    if mode == ManifestPathMode::DatasetRelative && has_windows_drive_prefix {
+        return Err(invalid_manifest_path(
+            "manifest URI path must not include a drive prefix",
         ));
     }
 
@@ -82,9 +88,17 @@ fn validate_manifest_path_uri(uri: &str, mode: ManifestPathMode) -> Result<(), C
     Ok(())
 }
 
-fn has_uri_scheme_or_windows_drive(uri: &str) -> bool {
+fn has_uri_scheme(uri: &str) -> bool {
     let first_separator = uri.find('/').unwrap_or(uri.len());
-    uri[..first_separator].contains(':')
+    let Some(colon) = uri[..first_separator].find(':') else {
+        return false;
+    };
+    !(colon == 1 && has_windows_drive_prefix(uri))
+}
+
+fn has_windows_drive_prefix(uri: &str) -> bool {
+    let bytes = uri.as_bytes();
+    bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'/'
 }
 
 fn invalid_manifest_path(message: &'static str) -> CoveError {
@@ -129,8 +143,13 @@ mod tests {
             resolve_manifest_local_path("/tmp/part.cove").unwrap(),
             PathBuf::from("/tmp/part.cove")
         );
+        assert_eq!(
+            resolve_manifest_local_path("C:/tmp/part.cove").unwrap(),
+            PathBuf::from("C:/tmp/part.cove")
+        );
         for uri in [
             "file:///tmp/part.cove",
+            "s3://bucket/part.cove",
             "../part.cove",
             "nested/../part.cove",
         ] {

@@ -280,12 +280,12 @@ async fn filtered_filecode_group_count_uses_native_group_exec_across_swapped_dic
         snapshot_id: "native-filecode-group-swapped".into(),
         files: vec![
             OverlayFile {
-                uri: first.display().to_string().into(),
+                uri: local_manifest_uri(&first).into(),
                 expected_identity: Some(identity_for_state(first_state.state())),
                 visibility: RowVisibility::All,
             },
             OverlayFile {
-                uri: second.display().to_string().into(),
+                uri: local_manifest_uri(&second).into(),
                 expected_identity: Some(identity_for_state(second_state.state())),
                 visibility: RowVisibility::All,
             },
@@ -349,12 +349,12 @@ async fn filtered_filecode_distinct_uses_native_group_exec_across_swapped_dictio
         snapshot_id: "native-filecode-distinct-swapped".into(),
         files: vec![
             OverlayFile {
-                uri: first.display().to_string().into(),
+                uri: local_manifest_uri(&first).into(),
                 expected_identity: Some(identity_for_state(first_state.state())),
                 visibility: RowVisibility::All,
             },
             OverlayFile {
-                uri: second.display().to_string().into(),
+                uri: local_manifest_uri(&second).into(),
                 expected_identity: Some(identity_for_state(second_state.state())),
                 visibility: RowVisibility::All,
             },
@@ -425,12 +425,12 @@ async fn filecode_i64_group_aggregates_use_native_exec_across_swapped_dictionari
         snapshot_id: "native-filecode-i64-group-aggs-swapped".into(),
         files: vec![
             OverlayFile {
-                uri: first.display().to_string().into(),
+                uri: local_manifest_uri(&first).into(),
                 expected_identity: Some(identity_for_state(first_state.state())),
                 visibility: RowVisibility::All,
             },
             OverlayFile {
-                uri: second.display().to_string().into(),
+                uri: local_manifest_uri(&second).into(),
                 expected_identity: Some(identity_for_state(second_state.state())),
                 visibility: RowVisibility::All,
             },
