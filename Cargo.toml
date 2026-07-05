@@ -26,6 +26,7 @@ members = [
     "crates/coveql",
     "crates/cove-ai-adapters",
     "crates/cove-cli",
+    "crates/cove-mcp",
     "crates/cove-fuzz",
     "vendor/orc-rust",
 ]
