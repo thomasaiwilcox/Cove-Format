@@ -21,4 +21,4 @@ serde_json = "1"
 arrow-array = "58"
 arrow-ipc = "58"
 orc-rust = "0.8"
-parquet = { version = "58", default-features = false, features = ["arrow"] }
+parquet = { version = "59", default-features = false, features = ["arrow"] }
