@@ -226,6 +226,10 @@ Key paths:
   to inspect sample COVE files, run table/object/projection/evidence queries,
   export JSONL/CSV, work with resolver-backed mapping and delta snapshots, and
   read explain output.
+- [`docs/mcp-server.md`](./docs/mcp-server.md): configure and run the
+  `cove-mcp` server for MCP clients that need COVE-QD discovery, template
+  rendering, CoveQL validation, explain, bounded query execution, paging, and
+  diagnostics.
 - [`docs/customer360-showcase.md`](./docs/customer360-showcase.md): the
   data-science-oriented Customer 360 walkthrough for generating messy
   multi-source CRM/support/billing/event data, querying canonical customers and
