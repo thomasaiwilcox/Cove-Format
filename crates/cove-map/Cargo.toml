@@ -23,4 +23,4 @@ sha2 = "0.10"
 
 [dev-dependencies]
 orc-rust = "0.8"
-parquet = { version = "58", default-features = false, features = ["arrow"] }
+parquet = { version = "59", default-features = false, features = ["arrow"] }
