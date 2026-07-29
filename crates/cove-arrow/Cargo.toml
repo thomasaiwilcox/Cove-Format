@@ -16,7 +16,7 @@ digest-blake3 = ["cove-core/digest-blake3"]
 [dependencies]
 cove-core = { path = "../cove-core" }
 arrow-array = "58"
-arrow-buffer = "58"
+arrow-buffer = "59"
 arrow-data = "58"
 arrow-schema = "58"
 bytes = "1"
